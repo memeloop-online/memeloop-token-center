@@ -6825,15 +6825,7 @@ async fn rotated_credential_retains_all_state(world: &mut TokenCenterWorld) {
     assert_eq!(managed[0]["policy"], world.expected_policy);
     assert_eq!(managed[0]["available_balance"], world.expected_balance);
 
-    let stats = world
-        .client
-        .get(format!("{}/self/v1/stats", world.service_url))
-        .bearer_auth(&world.current_key)
-        .send()
-        .await
-        .expect("rotated continuity statistics");
-    assert_eq!(stats.status(), StatusCode::OK);
-    let stats: Value = stats.json().await.expect("rotated continuity stats JSON");
+    let stats = wait_for_settled_request_stats(world, 1).await;
     assert_eq!(stats["summary"]["total_requests"], 1);
     assert_eq!(stats["summary"]["input_tokens"], 7);
     assert_eq!(stats["summary"]["output_tokens"], 3);
@@ -7566,6 +7558,8 @@ async fn view_stats(world: &mut TokenCenterWorld) {
 
 #[then(expr = "the statistics contain {int} request and {int} tokens")]
 async fn stats_contain_request(world: &mut TokenCenterWorld, requests: i64, tokens: i64) {
+    world.response =
+        wait_for_settled_request_stats(world, requests.try_into().expect("request count")).await;
     assert_eq!(
         world.response["key_id"],
         world.stable_key_id.expect("key id").to_string()
@@ -7580,6 +7574,43 @@ async fn stats_contain_request(world: &mut TokenCenterWorld, requests: i64, toke
                 .unwrap_or_default(),
         tokens
     );
+}
+
+async fn wait_for_settled_request_stats(world: &TokenCenterWorld, expected: usize) -> Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let requests = world
+                .client
+                .get(format!("{}/self/v1/requests", world.service_url))
+                .bearer_auth(&world.current_key)
+                .send()
+                .await
+                .expect("settled request history")
+                .json::<Value>()
+                .await
+                .expect("settled request history JSON");
+            if requests.as_array().is_some_and(|rows| {
+                rows.len() >= expected
+                    && rows
+                        .iter()
+                        .all(|request| request["completed_at"].as_i64().is_some())
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("authoritative usage must settle before statistics are asserted");
+    let response = world
+        .client
+        .get(format!("{}/self/v1/stats", world.service_url))
+        .bearer_auth(&world.current_key)
+        .send()
+        .await
+        .expect("settled statistics");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.json().await.expect("settled statistics JSON")
 }
 
 #[then("the request detail contains the archived prompt and response")]
@@ -8112,9 +8143,15 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
         .find(|request| request["error_code"] == "upstream_failed_response")
         .expect("HTTP 200 response.failed terminal record");
     assert_eq!(failed["status_code"], 502, "{failed}");
-    assert_eq!(failed["usage_basis"], "not_observed", "{failed}");
-    assert_eq!(failed["cost"], "0", "{failed}");
-    assert_eq!(failed["output_tokens"], 0, "{failed}");
+    assert!(failed["usage_basis"].is_null(), "{failed}");
+    assert!(failed["completed_at"].is_null(), "{failed}");
+    assert!(failed["cost"].is_null(), "{failed}");
+    assert!(failed["usage"]["tokens"].is_null(), "{failed}");
+    assert!(failed["output_tokens"].is_null(), "{failed}");
+    assert_eq!(
+        failed["operational_terminal"]["financial_state"], "unknown",
+        "{failed}"
+    );
 
     let stats = world
         .client
@@ -8127,6 +8164,7 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
         .await
         .expect("failed Responses statistics JSON");
     assert_eq!(stats["summary"]["failed_requests"], 1, "{stats}");
+    assert!(stats["summary"]["total_cost"].is_null(), "{stats}");
     assert!(
         stats["errors"]
             .as_array()
@@ -8147,9 +8185,15 @@ async fn invalid_stream_is_unobserved_failure(world: &mut TokenCenterWorld) {
         requests[0]["error_code"], "upstream_invalid_usage",
         "{requests}"
     );
-    assert_eq!(requests[0]["usage_basis"], "not_observed", "{requests}");
-    assert_eq!(requests[0]["output_tokens"], 0, "{requests}");
-    assert_eq!(requests[0]["cost"], "0", "{requests}");
+    assert!(requests[0]["usage_basis"].is_null(), "{requests}");
+    assert!(requests[0]["completed_at"].is_null(), "{requests}");
+    assert!(requests[0]["usage"]["tokens"].is_null(), "{requests}");
+    assert!(requests[0]["output_tokens"].is_null(), "{requests}");
+    assert!(requests[0]["cost"].is_null(), "{requests}");
+    assert_eq!(
+        requests[0]["operational_terminal"]["financial_state"], "unknown",
+        "{requests}"
+    );
 
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 1, "{detail}");
@@ -8170,6 +8214,7 @@ async fn invalid_stream_is_unobserved_failure(world: &mut TokenCenterWorld) {
         .expect("invalid stream stats JSON");
     assert_eq!(stats["summary"]["failed_requests"], 1, "{stats}");
     assert_eq!(stats["summary"]["output_tokens"], 0, "{stats}");
+    assert!(stats["summary"]["total_cost"].is_null(), "{stats}");
 }
 
 async fn wait_for_invalid_stream_terminal_request(world: &TokenCenterWorld) -> Value {
@@ -8189,6 +8234,7 @@ async fn wait_for_invalid_stream_terminal_request(world: &TokenCenterWorld) -> V
             requests.len() == 1
                 && requests[0]["status_code"] == 502
                 && requests[0]["error_code"] == "upstream_invalid_usage"
+                && requests[0]["operational_terminal"]["financial_state"] == "unknown"
         }) {
             return latest;
         }

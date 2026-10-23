@@ -1081,7 +1081,16 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
 
 #[tokio::test]
 async fn unknown_failure_retries_operational_sql_after_financial_arbitration_without_replay() {
-    let fixture = codex_route_fixture("pending-unknown-operational-retry").await;
+    unknown_failure_retries_operational_projection(false).await;
+}
+
+#[tokio::test]
+async fn recovered_unknown_receipt_retries_operational_projection_without_replay() {
+    unknown_failure_retries_operational_projection(true).await;
+}
+
+async fn unknown_failure_retries_operational_projection(restart: bool) {
+    let mut fixture = codex_route_fixture("pending-unknown-operational-retry").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query(
         "CREATE TRIGGER fail_unknown_operational BEFORE INSERT ON proxy_operational_terminals \
@@ -1138,6 +1147,31 @@ async fn unknown_failure_retries_operational_sql_after_financial_arbitration_wit
     })
     .await
     .expect("unknown finance must retain its durable receipt");
+    let request_id = Uuid::parse_str(original["request_id"].as_str().unwrap()).unwrap();
+    assert!(original["conversation"].is_object());
+    assert!(
+        fixture
+            .state
+            .pending_terminals
+            .retained_conversation_for_test(receipt_id)
+            .await
+    );
+    let financial: (String, String, Option<i64>, i64, i64) = sqlx::query_as(
+        "SELECT p.unknown_reason, r.status, r.actual_micros, \
+         (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
+         (SELECT COUNT(*) FROM request_events WHERE request_id = p.request_id AND event_kind = 'finished') \
+         FROM pending_proxy_settlements p JOIN usage_reservations r ON r.id = p.reservation_id WHERE p.request_id = $1",
+    ).bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        financial,
+        (
+            "authoritative_usage_unavailable".to_owned(),
+            "reserved".to_owned(),
+            None,
+            0,
+            0
+        )
+    );
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM proxy_operational_terminals WHERE request_id = $1",
     )
@@ -1146,6 +1180,18 @@ async fn unknown_failure_retries_operational_sql_after_financial_arbitration_wit
     .await
     .unwrap();
     assert_eq!(count, 0);
+    if restart {
+        let directory = fixture
+            .state
+            .pending_terminals
+            .directory_for_test()
+            .to_path_buf();
+        fixture.state.pending_terminals.stop_for_test().await;
+        fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
+            directory,
+            fixture.state.db.independent_persistence_pool(),
+        );
+    }
     sqlx::query("DROP TRIGGER fail_unknown_operational")
         .execute(&pool)
         .await
@@ -1161,6 +1207,63 @@ async fn unknown_failure_retries_operational_sql_after_financial_arbitration_wit
         serde_json::from_slice::<Value>(&tokio::fs::read(path).await.unwrap()).unwrap(),
         original
     );
+    let payload: String = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(payload) = sqlx::query_scalar::<_, String>(
+                "SELECT request_json FROM conversation_semantic_payloads WHERE request_id = $1",
+            )
+            .bind(request_id.to_string())
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            {
+                break payload;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("financial arbitration must keep retrying the original semantic projection");
+    assert_eq!(
+        serde_json::from_str::<Value>(&payload).unwrap(),
+        original["conversation"]["request_json"]
+    );
+    let owner = Uuid::now_v7();
+    let tasks = fixture
+        .state
+        .db
+        .claim_conversation_projection_tasks(owner, 10)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].request_id, request_id);
+    assert!(
+        fixture
+            .state
+            .db
+            .project_claimed_conversation_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .project_claimed_conversation_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
+    let effects: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1), \
+         (SELECT COUNT(*) FROM ledger_entries WHERE source = $2), \
+         (SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'finished')",
+    )
+    .bind(request_id.to_string())
+    .bind(original["reservation"]["id"].as_str().unwrap())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(effects, (1, 0, 0));
     pool.close().await;
     upstream.verify().await;
 }

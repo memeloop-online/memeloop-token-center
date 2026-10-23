@@ -326,6 +326,7 @@ struct Pending {
     operational_running: bool,
     operational_acknowledged: bool,
     unknown_annotated: bool,
+    conversation_enqueued: bool,
     operational_reconcile: bool,
     preparation: Option<Preparation>,
     projection_retained: Option<Box<dyn Send>>,
@@ -457,10 +458,9 @@ impl Journal {
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for entry in pending
-            .values_mut()
-            .filter(|entry| entry.durable && entry.reconcile && !entry.running)
-        {
+        for entry in pending.values_mut().filter(|entry| {
+            entry.durable && entry.reconcile && entry.conversation_enqueued && !entry.running
+        }) {
             if let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
                 snapshot.conversation = None;
                 entry.projection_retained = None;
@@ -509,6 +509,7 @@ impl Journal {
                 operational_running: false,
                 operational_acknowledged: false,
                 unknown_annotated: false,
+                conversation_enqueued: false,
                 operational_reconcile: false,
                 preparation: Some(Box::pin(preparation)),
                 projection_retained: None,
@@ -701,6 +702,16 @@ impl Journal {
     }
 
     #[cfg(test)]
+    pub(crate) async fn retained_conversation_for_test(&self, receipt_id: Uuid) -> bool {
+        self.reap().await;
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&receipt_id)
+            .is_some_and(|entry| entry.snapshot.conversation.is_some())
+    }
+
+    #[cfg(test)]
     pub(crate) fn failed_publications_for_test(&self) -> u64 {
         self.publication_failures.load(Ordering::Relaxed)
     }
@@ -802,6 +813,7 @@ impl Journal {
                     operational_running: false,
                     operational_acknowledged: false,
                     unknown_annotated: false,
+                    conversation_enqueued: false,
                     operational_reconcile: false,
                     preparation: None,
                     projection_retained: None,
@@ -925,7 +937,9 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for entry in pending.values_mut().filter(|entry| {
-            !entry.running && !entry.reconcile && tokio::time::Instant::now() >= entry.retry_after
+            !entry.running
+                && (!entry.reconcile || (entry.unknown_annotated && !entry.conversation_enqueued))
+                && tokio::time::Instant::now() >= entry.retry_after
         }) {
             entry.running = true;
             let journal = self.clone();
@@ -1038,26 +1052,43 @@ impl Journal {
                                     }
                                 })
                         } else {
-                            // Unknown usage must not prevent semantic history
-                            // from committing. Missing operational evidence is
-                            // retried before this entry enters reconciliation.
-                            let projection = if let Some(conversation) = input.conversation.as_ref()
-                            {
-                                database
-                                    .enqueue_operational_conversation_projection(
-                                        claim,
-                                        receipt_id,
-                                        conversation,
-                                    )
-                                    .await
-                            } else {
-                                Ok(())
-                            };
-                            match projection {
-                                Ok(()) => database
-                                    .mark_pending_proxy_settlement_unknown(claim)
-                                    .await
-                                    .map(|()| None),
+                            match database.mark_pending_proxy_settlement_unknown(claim).await {
+                                Ok(()) => {
+                                    reconcile = true;
+                                    if let Some(entry) = self
+                                        .pending
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .get_mut(&receipt_id)
+                                    {
+                                        entry.unknown_annotated = true;
+                                        entry.reconcile = true;
+                                        entry.activity = None;
+                                    }
+                                    let projection =
+                                        if let Some(conversation) = input.conversation.as_ref() {
+                                            database
+                                                .enqueue_operational_conversation_projection(
+                                                    claim,
+                                                    receipt_id,
+                                                    conversation,
+                                                )
+                                                .await
+                                        } else {
+                                            Ok(())
+                                        };
+                                    projection.map(|()| {
+                                        if let Some(entry) = self
+                                            .pending
+                                            .lock()
+                                            .unwrap_or_else(|error| error.into_inner())
+                                            .get_mut(&receipt_id)
+                                        {
+                                            entry.conversation_enqueued = true;
+                                        }
+                                        None
+                                    })
+                                }
                                 Err(error) => Err(error),
                             }
                         }

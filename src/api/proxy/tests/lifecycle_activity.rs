@@ -174,6 +174,17 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
     assert_eq!(cancelled, 1);
     assert_eq!(fixture.state.proxy_lifecycles.active(), 0);
     drain_archive_capture(&fixture).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
+            if used == 0 && retained == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live journal must reap durable terminal payloads and release every memory permit");
     assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
     pool.close().await;
 }

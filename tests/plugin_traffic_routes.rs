@@ -704,7 +704,7 @@ async fn assert_selected_malformed_candidate_fails_closed(
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     preferred.verify().await;
     standby.verify().await;
-    wait_for_hint_terminal(&fixture, false).await;
+    wait_for_hint_terminal(&fixture, true).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let terminal: (i64, String, i64) = sqlx::query_as(
         "SELECT COALESCE(request.status_code, operational.status_code), COALESCE(request.error_code, operational.error_code),
@@ -729,7 +729,20 @@ async fn assert_selected_malformed_candidate_fails_closed(
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(financial, ("reserved".to_owned(), None, 0, 0));
+    assert_eq!(financial, ("settled".to_owned(), Some(0), 1, 1));
+    let requests = fixture
+        .state
+        .db
+        .list_requests(fixture.issued.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].completed_at.is_some());
+    assert_eq!(requests[0].billing.cost.as_deref(), Some("0"));
+    assert_eq!(
+        requests[0].usage_basis,
+        Some(memeloop_token_center::model::RequestUsageBasis::NotObserved)
+    );
     pool.close().await;
     assert_eq!(terminal, (502, "upstream_candidate_invalid".to_owned(), 1));
 }
