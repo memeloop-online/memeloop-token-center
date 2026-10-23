@@ -1,5 +1,78 @@
 use super::*;
 use axum::http::Method;
+use axum::response::IntoResponse;
+
+#[tokio::test]
+async fn prepaid_rate_rejections_remain_distinct_from_service_and_database_failures() {
+    use crate::error::{AppError, LimitReason};
+
+    for reason in [
+        LimitReason::RpmExhausted,
+        LimitReason::TpmExhausted,
+        LimitReason::ConcurrencyExhausted,
+        LimitReason::BalanceExhausted,
+    ] {
+        let response = AppError::LimitExceeded {
+            reason,
+            retry_after_seconds: Some(1),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["reason"], reason.as_str());
+        assert_eq!(
+            body["error"]["code"],
+            if reason == LimitReason::BalanceExhausted {
+                "insufficient_quota"
+            } else {
+                "rate_limit_exceeded"
+            }
+        );
+    }
+    for (error, expected_status, expected_code) in [
+        (
+            AppError::NoAuthorizedUpstreamCandidate,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_authorized_upstream_candidate",
+        ),
+        (
+            AppError::from(sqlx::Error::PoolClosed),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database_unavailable",
+        ),
+        (
+            AppError::from(sqlx::Error::PoolTimedOut),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_overloaded",
+        ),
+        (
+            AppError::Overloaded,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_overloaded",
+        ),
+        (
+            AppError::Upstream("fixture transport failure".into()),
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+        ),
+    ] {
+        let response = error.into_response();
+        assert_eq!(response.status(), expected_status);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["error"]["code"], expected_code);
+        assert!(body["error"].get("reason").is_none());
+    }
+}
 
 async fn call(
     application: &axum::Router,

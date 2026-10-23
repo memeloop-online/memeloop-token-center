@@ -36,3 +36,18 @@ Historic records default to owning their original token reservation. New reserva
 that did not use TPM keep that fact across resizing, cancellation, recovery,
 and settlement, even if the credential's policy changes in the meantime. They
 must never subtract tokens from a later finite request's window.
+
+## Failure attribution
+
+Configured credential RPM/TPM/concurrency rejection is HTTP 429 with
+`rate_limit_exceeded` and the matching `reason`; insufficient prepaid money is
+429 with `insufficient_quota`. Neither is a generic 503.
+
+A 503 must be attributed using the request's typed error and admission/dispatch
+evidence: `no_authorized_upstream_candidate` is local candidate rejection;
+`database_unavailable` and `database_storage_full` are database dependency
+failures. `service_overloaded` is not enough to identify the cause: a database
+pool timeout also uses that public code, with `error_kind=pool_timeout` in the
+existing database error log. Existing memory/dispatch rejection must be
+distinguished from a request actually sent to an upstream that replied 503.
+Do not infer a credential rate limit or add a substitute cap from status alone.
