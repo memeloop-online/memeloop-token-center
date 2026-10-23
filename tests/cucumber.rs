@@ -7650,6 +7650,7 @@ async fn request_detail_contains_archive(world: &mut TokenCenterWorld) {
 
 #[then("the requests form one logical conversation with a continuation edge")]
 async fn logical_conversation_continues(world: &mut TokenCenterWorld) {
+    wait_for_projected_conversation_requests(world, 2).await;
     let clusters = world
         .client
         .get(format!("{}/self/v1/conversations", world.service_url))
@@ -7687,6 +7688,7 @@ async fn logical_conversation_continues(world: &mut TokenCenterWorld) {
 
 #[then("the compacted request is linked to its explicit parent turn")]
 async fn compacted_request_links_to_parent(world: &mut TokenCenterWorld) {
+    wait_for_projected_conversation_requests(world, 2).await;
     let clusters = world
         .client
         .get(format!("{}/self/v1/conversations", world.service_url))
@@ -8022,12 +8024,11 @@ async fn own_conversation_detail(world: &TokenCenterWorld) -> Value {
         .expect("conversation detail JSON")
 }
 
-async fn wait_for_finished_conversation_requests(world: &TokenCenterWorld, expected: usize) {
+async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expected: usize) {
     let key_id = world
         .stable_key_id
         .expect("conversation key id")
         .to_string();
-    let key_needle = format!("\"key_id\":\"{key_id}\"");
     let response = world
         .client
         .get(format!(
@@ -8041,9 +8042,9 @@ async fn wait_for_finished_conversation_requests(world: &TokenCenterWorld, expec
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut stream = response.bytes_stream();
-    let finished = tokio::time::timeout(Duration::from_secs(5), async {
+    let mut projected = std::collections::HashSet::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
         let mut frame = String::new();
-        let mut count = 0;
         while let Some(chunk) = stream.next().await {
             frame.push_str(&String::from_utf8_lossy(
                 &chunk.expect("conversation request SSE chunk"),
@@ -8051,29 +8052,41 @@ async fn wait_for_finished_conversation_requests(world: &TokenCenterWorld, expec
             while let Some(end) = frame.find("\n\n") {
                 let event = frame[..end].to_owned();
                 frame.drain(..end + 2);
-                if event.contains("event: request.finished") && event.contains(&key_needle) {
-                    count += 1;
-                    if count >= expected {
-                        return count;
-                    }
+                let Some(data) = event
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
+                else {
+                    continue;
+                };
+                let event: Value =
+                    serde_json::from_str(data).expect("conversation request event JSON");
+                if event["event_kind"] != "projected" || event["key_id"] != key_id {
+                    continue;
+                }
+                let request_id = event["request_id"]
+                    .as_str()
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                    .expect("projected conversation request id");
+                projected.insert(request_id);
+                if projected.len() >= expected {
+                    return;
                 }
             }
         }
-        count
     })
     .await
-    .expect("finished conversation requests before timeout");
+    .unwrap_or_else(|_| {
+        panic!("expected {expected} projected conversation requests for key {key_id} before timeout, observed {projected:?}")
+    });
     assert!(
-        finished >= expected,
-        "expected {expected} finished conversation requests, observed {finished}"
+        projected.len() >= expected,
+        "expected {expected} projected conversation requests, observed {projected:?}"
     );
 }
 
 #[then("the two Responses requests have a direct continuation edge")]
 async fn responses_requests_have_direct_parent_edge(world: &mut TokenCenterWorld) {
-    // Request EOF can precede the terminal transaction. Wait for its durable finished events;
-    // conversation observations commit in that same transaction for these prepaid requests.
-    wait_for_finished_conversation_requests(world, 2).await;
+    wait_for_projected_conversation_requests(world, 2).await;
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 2, "{detail}");
     assert_eq!(
@@ -8291,6 +8304,7 @@ async fn send_compaction_chain_and_branch(world: &mut TokenCenterWorld, model: S
 
 #[then("the conversation contains two compaction edges followed by a branch edge")]
 async fn conversation_has_compactions_then_branch(world: &mut TokenCenterWorld) {
+    wait_for_projected_conversation_requests(world, 4).await;
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 4, "{detail}");
     let edges = detail["edges"].as_array().expect("conversation edges");
@@ -8390,6 +8404,7 @@ async fn client_sends_explicit_subagent_turns(world: &mut TokenCenterWorld, mode
 
 #[then("the paginated conversation exposes two explicit subagent edges")]
 async fn paginated_conversation_exposes_subagent_edges(world: &mut TokenCenterWorld) {
+    wait_for_projected_conversation_requests(world, 3).await;
     let clusters = world
         .client
         .get(format!(
@@ -8512,6 +8527,7 @@ async fn client_sends_implicit_subagent_hints(world: &mut TokenCenterWorld, mode
 
 #[then("no logical conversation contains a subagent edge")]
 async fn no_conversation_contains_subagent_edge(world: &mut TokenCenterWorld) {
+    wait_for_projected_conversation_requests(world, 3).await;
     let clusters = world
         .client
         .get(format!(
@@ -8615,6 +8631,7 @@ async fn claude_sends_metadata_linked_turns(world: &mut TokenCenterWorld, model:
 
 #[then("the Anthropic turns have a direct compaction edge")]
 async fn anthropic_turns_have_compaction_edge(world: &mut TokenCenterWorld) {
+    wait_for_projected_conversation_requests(world, 2).await;
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 2, "{detail}");
     assert_eq!(detail["edges"][0]["relation"], "compacts", "{detail}");
@@ -8687,6 +8704,7 @@ async fn send_chat_and_utility_requests(world: &mut TokenCenterWorld, model: Str
 
 #[then("only the chat request appears in logical conversations")]
 async fn utility_requests_do_not_pollute_conversations(world: &mut TokenCenterWorld) {
+    wait_for_projected_conversation_requests(world, 1).await;
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 1, "{detail}");
     assert_eq!(detail["requests"].as_array().map(Vec::len), Some(1));
@@ -8745,6 +8763,7 @@ async fn workbuddy_sends_openai_turns(world: &mut TokenCenterWorld, model: Strin
 
 #[then("the WorkBuddy requests form one logical conversation")]
 async fn workbuddy_requests_share_conversation(world: &mut TokenCenterWorld) {
+    wait_for_projected_conversation_requests(world, 2).await;
     let detail = own_conversation_detail(world).await;
     assert_eq!(detail["cluster"]["request_count"], 2, "{detail}");
     assert_eq!(detail["edges"][0]["relation"], "continues", "{detail}");
