@@ -10,6 +10,82 @@ const TEXT_ROUTES: [&str; 5] = [
 ];
 
 #[tokio::test]
+async fn small_declared_responses_need_no_spool_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let blocked = directory.path().join("not-a-directory");
+    std::fs::write(&blocked, b"blocked").unwrap();
+    let spool = request_spool::RequestSpoolAdmission::new(blocked);
+    let budget = memory::ProxyMemoryBudget::new(64 * 1024 * 1024);
+    for path in ["/v1/responses", "/v1/responses/compact"] {
+        for length in [2, MAX_DEFAULT_BODY] {
+            let expected = vec![b'x'; length];
+            let admitted = admit(
+                Request::post(path)
+                    .header(header::CONTENT_LENGTH, length)
+                    .body(Body::from(expected.clone()))
+                    .unwrap(),
+                Some(&budget),
+                &spool,
+            )
+            .await
+            .unwrap();
+            assert!(
+                admitted
+                    .extensions()
+                    .get::<Arc<request_spool::RequestSpool>>()
+                    .is_none()
+            );
+            assert_eq!(
+                budget.snapshot().0,
+                (length * memory::REQUEST_MEMORY_WEIGHT).div_ceil(64 * 1024) * 64 * 1024
+            );
+            assert_eq!(spool.snapshot().active_files, 0);
+            assert_eq!(spool.snapshot().used_bytes, 0);
+            let (parts, body) = admitted.into_parts();
+            assert_eq!(
+                to_bytes(body, MAX_DEFAULT_BODY).await.unwrap().as_ref(),
+                expected.as_slice()
+            );
+            drop(parts);
+            assert_eq!(budget.snapshot().0, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn small_declared_responses_cancel_without_spool_and_release_memory() {
+    let directory = tempfile::tempdir().unwrap();
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().join("unused"));
+    let budget = Arc::new(memory::ProxyMemoryBudget::new(64 * 1024 * 1024));
+    for path in ["/v1/responses", "/v1/responses/compact"] {
+        let (started, polled) = tokio::sync::oneshot::channel();
+        let body = Body::from_stream(futures_util::stream::once(async move {
+            let _ = started.send(());
+            std::future::pending::<Result<bytes::Bytes, Infallible>>().await
+        }));
+        let request = Request::post(path)
+            .header(header::CONTENT_LENGTH, 2)
+            .body(body)
+            .unwrap();
+        let active_budget = budget.clone();
+        let active_spool = spool.clone();
+        let task =
+            tokio::spawn(async move { admit(request, Some(&active_budget), &active_spool).await });
+        polled.await.unwrap();
+        assert_eq!(
+            budget.snapshot().0,
+            16 * 1024 * 1024 * memory::REQUEST_MEMORY_WEIGHT
+        );
+        assert_eq!(spool.snapshot().active_files, 0);
+        assert!(!directory.path().join("unused").exists());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+    }
+}
+
+#[tokio::test]
 async fn responses_empty_uploads_account_before_first_chunk_and_cancel() {
     let directory = tempfile::tempdir().unwrap();
     let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());

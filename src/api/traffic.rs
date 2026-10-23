@@ -56,11 +56,15 @@ pub(super) async fn proxy_openai_responses(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
-    axum::Extension(spool): axum::Extension<
-        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     >,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
+    let Some(axum::Extension(spool)) = spool else {
+        return super::proxy::proxy(state, headers, body, Protocol::OpenAiResponses, memory).await;
+    };
     if !memory.try_grow(
         spool.len(),
         crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
@@ -94,11 +98,22 @@ pub(super) async fn proxy_openai_responses_compact(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
-    axum::Extension(spool): axum::Extension<
-        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     >,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
+    let Some(axum::Extension(spool)) = spool else {
+        return super::proxy::proxy(
+            state,
+            headers,
+            body,
+            Protocol::OpenAiResponsesCompact,
+            memory,
+        )
+        .await;
+    };
     if !memory.try_grow(
         spool.len(),
         crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
