@@ -963,7 +963,9 @@ impl Database {
                     && !hints.compaction
                     && leaf.is_some()
                     && leaf != candidate_leaf
-                    && row.try_get::<Option<String>, _>("parent_turn_id")?.is_none()
+                    && row
+                        .try_get::<Option<String>, _>("parent_turn_id")?
+                        .is_none()
                     && row.try_get::<i64, _>("compaction")? == 0
                     && graph
                         .ancestors(candidate_leaf.as_deref())?
