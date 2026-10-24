@@ -166,7 +166,7 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
         .update_key_policy(
             fixture.key_id,
             KeyPolicy {
-                tokens_per_minute: 32 * 1024 * 1024,
+                tokens_per_minute: Some(32 * 1024 * 1024),
                 ..KeyPolicy::default()
             },
         )

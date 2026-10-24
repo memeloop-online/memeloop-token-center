@@ -164,9 +164,9 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
                 alias: "metered-unlimited-1024".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    requests_per_minute: 1,
-                    tokens_per_minute: 1,
-                    max_concurrency: 1,
+                    requests_per_minute: Some(1),
+                    tokens_per_minute: Some(1),
+                    max_concurrency: Some(1),
                     enforcement_mode: EnforcementMode::MeteredUnlimited,
                     ..KeyPolicy::default()
                 },
@@ -915,9 +915,9 @@ async fn postgres_prepaid_boundary_remains_fail_closed_under_parallel_admission(
                 alias: "prepaid-boundary".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    requests_per_minute: 100,
-                    tokens_per_minute: 100,
-                    max_concurrency: 8,
+                    requests_per_minute: Some(100),
+                    tokens_per_minute: Some(100),
+                    max_concurrency: Some(8),
                     enforcement_mode: EnforcementMode::Prepaid,
                     ..KeyPolicy::default()
                 },
@@ -1299,9 +1299,9 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                 alias: "proxy-admission-lock".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    requests_per_minute: 100_000,
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 8,
+                    requests_per_minute: Some(100_000),
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
@@ -1695,8 +1695,8 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
                 alias: "proxy-atomic".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 16,
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(16),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(10),
@@ -1986,8 +1986,8 @@ async fn postgres_synchronous_image_terminal_ack_recovery_is_exactly_once_withou
                 alias: "image-atomic".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 16,
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(16),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(10),

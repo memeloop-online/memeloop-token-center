@@ -57,6 +57,7 @@ async fn conversion_contract(url: &str) {
         .await
         .unwrap();
     for statement in [
+        "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
         "DROP TABLE application_plugin_release_resolutions",
         "DROP TABLE session_generated_titles",
         "DROP TABLE session_response_summaries",

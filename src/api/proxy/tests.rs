@@ -683,7 +683,7 @@ async fn codex_route_fixture_with_archive_directory(
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
-                    max_concurrency: 4,
+                    max_concurrency: Some(4),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::ONE,
@@ -951,7 +951,7 @@ async fn response_usage_fixture_with_uri_contract_driver_model_config_and_creden
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
-                    max_concurrency: 4,
+                    max_concurrency: Some(4),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::ONE,
@@ -1394,7 +1394,7 @@ async fn resilient_route_fixture(
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
-                    max_concurrency: 8,
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(100),
@@ -1804,7 +1804,7 @@ async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
         .update_key_policy(
             fixture.key_id,
             KeyPolicy {
-                tokens_per_minute: 2_000_000,
+                tokens_per_minute: Some(2_000_000),
                 ..KeyPolicy::default()
             },
         )

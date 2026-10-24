@@ -389,7 +389,7 @@ async fn same_model_accounts_are_explicitly_pinned_to_native_or_chat_transport()
                 currency: "USD".into(),
                 policy: KeyPolicy {
                     allowed_models: vec![native.model.clone()],
-                    max_concurrency: 4,
+                    max_concurrency: Some(4),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::ONE,

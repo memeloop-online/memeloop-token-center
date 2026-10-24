@@ -930,9 +930,9 @@ impl Database {
         .await?
         .try_get::<i64, _>("active")?
         .max(0) as u64;
-        let rpm_limit = u64::from(policy.requests_per_minute);
+        let rpm_limit = policy.requests_per_minute.map(u64::from);
         let tpm_limit = policy.tokens_per_minute;
-        let concurrency_limit = u64::from(policy.max_concurrency);
+        let concurrency_limit = policy.max_concurrency.map(u64::from);
         Ok(KeyLimitSnapshot {
             key_id,
             captured_at,
@@ -942,19 +942,19 @@ impl Database {
             rpm: KeyRateLimitSnapshot {
                 limit: rpm_limit,
                 used: requests_used,
-                remaining: rpm_limit.saturating_sub(requests_used),
-                reset_at: window_start + 60_000,
+                remaining: rpm_limit.map(|limit| limit.saturating_sub(requests_used)),
+                reset_at: rpm_limit.map(|_| window_start + 60_000),
             },
             tpm: KeyRateLimitSnapshot {
                 limit: tpm_limit,
                 used: tokens_used,
-                remaining: tpm_limit.saturating_sub(tokens_used),
-                reset_at: window_start + 60_000,
+                remaining: tpm_limit.map(|limit| limit.saturating_sub(tokens_used)),
+                reset_at: tpm_limit.map(|_| window_start + 60_000),
             },
             concurrency: KeyConcurrencySnapshot {
                 limit: policy.max_concurrency,
                 active,
-                remaining: concurrency_limit.saturating_sub(active),
+                remaining: concurrency_limit.map(|limit| limit.saturating_sub(active)),
             },
             daily_budget: key_budget_snapshot(
                 policy.daily_budget.as_deref(),
@@ -1319,15 +1319,18 @@ fn managed_key_view(row: AnyRow) -> Result<ManagedKeyView, AppError> {
     })
 }
 pub(crate) fn validate_key_policy(policy: &KeyPolicy) -> Result<(), AppError> {
-    if policy.requests_per_minute == 0
-        || policy.tokens_per_minute == 0
-        || policy.max_concurrency == 0
+    if policy.requests_per_minute == Some(0)
+        || policy.tokens_per_minute == Some(0)
+        || policy.max_concurrency == Some(0)
     {
         return Err(AppError::BadRequest(
             "RPM, TPM, and maximum concurrency must be positive".into(),
         ));
     }
-    if policy.tokens_per_minute > JSON_SAFE_INTEGER_MAX {
+    if policy
+        .tokens_per_minute
+        .is_some_and(|limit| limit > JSON_SAFE_INTEGER_MAX)
+    {
         return Err(AppError::BadRequest(format!(
             "TPM must not exceed the JSON safe integer maximum {JSON_SAFE_INTEGER_MAX}"
         )));
@@ -1413,6 +1416,41 @@ mod key_authentication_tests;
 #[cfg(test)]
 mod tests {
     use super::super::super::*;
+
+    #[test]
+    fn optional_policy_validation_keeps_zero_and_tpm_overflow_invalid() {
+        validate_key_policy(&KeyPolicy::default()).unwrap();
+        for policy in [
+            KeyPolicy {
+                requests_per_minute: Some(0),
+                ..KeyPolicy::default()
+            },
+            KeyPolicy {
+                tokens_per_minute: Some(0),
+                ..KeyPolicy::default()
+            },
+            KeyPolicy {
+                max_concurrency: Some(0),
+                ..KeyPolicy::default()
+            },
+            KeyPolicy {
+                tokens_per_minute: Some(JSON_SAFE_INTEGER_MAX + 1),
+                ..KeyPolicy::default()
+            },
+        ] {
+            assert!(matches!(
+                validate_key_policy(&policy),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+        validate_key_policy(&KeyPolicy {
+            requests_per_minute: Some(u32::MAX),
+            tokens_per_minute: Some(JSON_SAFE_INTEGER_MAX),
+            max_concurrency: Some(u32::MAX),
+            ..KeyPolicy::default()
+        })
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn direct_copy_checks_scope_tenant_hash_and_revocation() {
@@ -1588,7 +1626,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated.account_id, issued.account_id);
-        assert_eq!(authenticated.policy.requests_per_minute, 60);
+        assert_eq!(authenticated.policy.requests_per_minute, None);
         assert_eq!(
             database
                 .copy_key_credential(issued.key_id, pepper, None, true)
@@ -1754,9 +1792,9 @@ mod tests {
                     alias: "before".to_owned(),
                     currency: "USD".to_owned(),
                     policy: KeyPolicy {
-                        requests_per_minute: 3,
-                        tokens_per_minute: 1_000,
-                        max_concurrency: 1,
+                        requests_per_minute: Some(3),
+                        tokens_per_minute: Some(1_000),
+                        max_concurrency: Some(1),
                         daily_budget: Some("0.01".to_owned()),
                         weekly_budget: Some("0.02".to_owned()),
                         lifetime_budget: Some("0.03".to_owned()),
@@ -1805,13 +1843,13 @@ mod tests {
         assert_eq!(snapshot.key_id, issued.key_id);
         assert_eq!(snapshot.available_balance, "1.9999");
         assert_eq!(snapshot.reserved_balance, "0.0001");
-        assert_eq!(snapshot.rpm.limit, 3);
+        assert_eq!(snapshot.rpm.limit, Some(3));
         assert_eq!(snapshot.rpm.used, 1);
-        assert_eq!(snapshot.tpm.limit, 1_000);
+        assert_eq!(snapshot.tpm.limit, Some(1_000));
         assert_eq!(snapshot.tpm.used, 100);
-        assert_eq!(snapshot.concurrency.limit, 1);
+        assert_eq!(snapshot.concurrency.limit, Some(1));
         assert_eq!(snapshot.concurrency.active, 1);
-        assert_eq!(snapshot.concurrency.remaining, 0);
+        assert_eq!(snapshot.concurrency.remaining, Some(0));
         assert_eq!(snapshot.daily_budget.limit.as_deref(), Some("0.01"));
         assert_eq!(snapshot.daily_budget.settled, "0");
         assert_eq!(snapshot.daily_budget.reserved, "0.0001");
@@ -1827,7 +1865,7 @@ mod tests {
         database.settle_usage(&reservation, 0, 100).await.unwrap();
         let settled = database.key_limit_snapshot(issued.key_id).await.unwrap();
         assert_eq!(settled.concurrency.active, 0);
-        assert_eq!(settled.concurrency.remaining, 1);
+        assert_eq!(settled.concurrency.remaining, Some(1));
         assert_eq!(settled.daily_budget.settled, "0.0001");
         assert_eq!(settled.daily_budget.reserved, "0");
         let next = database
