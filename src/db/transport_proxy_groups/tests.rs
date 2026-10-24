@@ -488,6 +488,8 @@ async fn delayed_postgres_bootstrap_loads_managed_cache_without_blocking_cached_
                     label: "primary".into(),
                     proxy_url: Some(PRIMARY.into()),
                 }],
+                probe_url: None,
+                probe_attempts: None,
             },
             None,
             KEY,

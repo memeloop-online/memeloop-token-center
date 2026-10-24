@@ -703,6 +703,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "optional credential rate window ownership",
         sql: include_str!("../../../migrations/common/0134_optional_rate_limits.sql"),
     },
+    Migration {
+        version: 135,
+        name: "independent transport proxy reachability probe",
+        sql: include_str!("../../../migrations/common/0135_transport_proxy_probe.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1388,6 +1393,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 134,
         name: "optional credential rate window ownership",
         sql: include_str!("../../../migrations/common/0134_optional_rate_limits.sql"),
+    },
+    Migration {
+        version: 135,
+        name: "independent transport proxy reachability probe",
+        sql: include_str!("../../../migrations/common/0135_transport_proxy_probe.sql"),
     },
 ];
 

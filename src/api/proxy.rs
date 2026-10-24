@@ -1519,8 +1519,8 @@ async fn proxy_with_cancellation_guard(
                 }
             }
         }
-        // Selection may have waited for database admission; do not dispatch
-        // when the original deadline expired during that wait.
+        // Attempt count still bounds how many accounts one request may try.
+        // A failover clock does not refuse a candidate that is ready to send.
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
             tracing::warn!(%request_id, outbound_attempts, stage = reason,
                 failure_domain = "local_admission", delivery_evidence = "candidate_not_dispatched",

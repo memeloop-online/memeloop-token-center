@@ -44,7 +44,7 @@ test('real Codex config shapes localize transport controls and preserve advanced
       await retry.focus(); await page.keyboard.press('Enter');
       await workspace.getByLabel('连接尝试次数').waitFor();
       assert.doesNotMatch(await workspace.innerText(), /Pre-delivery|Maximum inactivity|One absolute budget/);
-      await workspace.getByText('建立连接的等待时限，必须小于请求总超时。', { exact: true }).waitFor();
+      await workspace.getByText('此数值仍须小于请求总超时。Codex 转发不会用它切断连接；代理是否可达由代理组上的独立探测判断。', { exact: true }).waitFor();
       await workspace.getByText('运行时传输策略', { exact: true }).waitFor();
       await workspace.getByText('单位见各字段；这些设置影响该账号的所有请求。', { exact: true }).waitFor();
       for (const title of ['最大 SSE 事件（字节）', '单个网络分片最大帧数据量（字节）', '终止事件最大暂存量（字节）',

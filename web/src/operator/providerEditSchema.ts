@@ -28,9 +28,9 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
   const policy = properties.properties?.transport_policy;
   if (zh && policy && typeof policy === 'object') {
     for (const [name, description] of Object.entries({
-      connect_timeout_millis: '建立连接的等待时限，必须小于请求总超时。留空或保存为 5000 毫秒时，Codex 客户端实际等待 60 秒，避免慢速代理握手被过早切断。',
-      read_timeout_millis: '收到响应头后等待首段内容，以及后续相邻内容之间允许的最长无数据时间。',
-      request_timeout_millis: '从首次发送到完整接收响应的总时限，包含系统允许的重放。',
+      connect_timeout_millis: '此数值仍须小于请求总超时。Codex 转发不会用它切断连接；代理是否可达由代理组上的独立探测判断。',
+      read_timeout_millis: 'Codex 转发不会因为一段时间没有新内容而中断。响应在上游结束、客户端取消或连接本身失败时结束。',
+      request_timeout_millis: 'Codex 转发（含压缩）没有总时限。请求在上游返回、客户端取消或连接本身失败时结束。',
       dispatch_max_in_flight: '此账号每个代理出口的可选请求并发上限。默认值 0 表示不添加派发限制，也不使用派发队列。正数会限制正在执行的请求（包括流式响应）；调低已设置的上限时，现有请求继续完成。',
       dispatch_max_queued: '仅在派发并发上限大于 0 时生效。设置可排队等待的请求数；0 表示并发满时立即拒绝新请求。',
       dispatch_queue_timeout_millis: '仅在派发并发上限大于 0 时生效。请求排队超过此时限会返回 503；该请求尚未派发或计费。',

@@ -731,15 +731,15 @@ impl ProviderCatalog {
                 },
                 "connect_timeout_millis": {
                     "type": "integer", "minimum": 100, "maximum": 60000, "default": 5000,
-                    "description": "Pre-delivery connection deadline; must be lower than the total request timeout. The Codex client raises a stored or omitted 5000 ms value to 60000 ms, still inside the request budget, so the historical default does not abort a slow proxy handshake."
+                    "description": "Stored with the account and still required to be lower than the total request timeout. A Codex forward does not use it as a connection deadline. Proxy reachability is a separate probe configured on the proxy group."
                 },
                 "read_timeout_millis": {
                     "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 600000,
-                    "description": "Maximum inactivity from response headers to the first body read and between later body reads."
+                    "description": "Stored with the account. A Codex forward does not abort when the body is quiet. The body ends when the upstream finishes, the client cancels, or the socket fails."
                 },
                 "request_timeout_millis": {
                     "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 1260000,
-                    "description": "One absolute budget from the first send through the complete response body, including the sole permitted classified HTTP 400 replay."
+                    "description": "Stored with the account. A Codex forward, including compaction, does not apply this absolute deadline. The attempt ends when the upstream answers, the client cancels, or the socket fails."
                 },
                 "memory_admission_wait_millis": {
                     "type": "integer", "minimum": 100, "maximum": 300000, "default": 30000,

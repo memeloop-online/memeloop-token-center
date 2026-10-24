@@ -35,6 +35,7 @@ impl Database {
         validate_name(&body.name)?;
         let members = members(body.members, &[])?;
         validate_endpoints(&members).await?;
+        let (probe_url, probe_attempts) = probe_settings(body.probe_url, body.probe_attempts)?;
         let ciphertext = seal_private_json(&members, key, MEMBERS_AAD)?;
         let mut tx = self.begin_write_transaction().await?;
         lock(&mut tx).await?;
@@ -42,8 +43,8 @@ impl Database {
         let id = Uuid::now_v7();
         available_name(&mut tx, &tenant_id, &body.name, id).await?;
         let now = unix_millis();
-        sqlx::query("INSERT INTO transport_proxy_groups (id, tenant_id, name, version, members_ciphertext, created_at, updated_at) VALUES ($1, $2, $3, 1, $4, $5, $5)")
-            .bind(id.to_string()).bind(&tenant_id).bind(&body.name).bind(ciphertext).bind(now).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO transport_proxy_groups (id, tenant_id, name, version, members_ciphertext, probe_url, probe_attempts, created_at, updated_at) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $7)")
+            .bind(id.to_string()).bind(&tenant_id).bind(&body.name).bind(ciphertext).bind(&probe_url).bind(probe_attempts).bind(now).execute(&mut *tx).await?;
         budget(&mut tx, key).await?;
         audit(&mut tx, &tenant_id, id, "create", 1, actor).await?;
         let row = sqlx::query(
@@ -104,8 +105,9 @@ impl Database {
         }
         let version = version.checked_add(1).ok_or(AppError::Internal)?;
         let ciphertext = seal_private_json(&next, key, MEMBERS_AAD)?;
-        sqlx::query("UPDATE transport_proxy_groups SET name = $1, version = $2, members_ciphertext = $3, updated_at = $4 WHERE id = $5")
-            .bind(&body.name).bind(version).bind(ciphertext).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
+        let (probe_url, probe_attempts) = probe_settings(body.probe_url, body.probe_attempts)?;
+        sqlx::query("UPDATE transport_proxy_groups SET name = $1, version = $2, members_ciphertext = $3, probe_url = $4, probe_attempts = $5, updated_at = $6 WHERE id = $7")
+            .bind(&body.name).bind(version).bind(ciphertext).bind(&probe_url).bind(probe_attempts).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
         for account in accounts {
             let account_id = parse_uuid(account.try_get("account_id")?)?;
             let initial = parse_uuid(account.try_get("initial_member_id")?)?;
