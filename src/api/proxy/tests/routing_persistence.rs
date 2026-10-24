@@ -447,7 +447,8 @@ async fn optional_routing_sql_never_holds_forwarding_or_lifecycle_capacity() {
                 .expect(1)
                 .mount(&upstream)
                 .await;
-            tokio::time::timeout(Duration::from_secs(1), async {
+            let mut phase = "forwarding";
+            let isolated = tokio::time::timeout(Duration::from_secs(1), async {
                 let response = send_codex_route(
                     &fixture,
                     &upstream,
@@ -459,17 +460,24 @@ async fn optional_routing_sql_never_holds_forwarding_or_lifecycle_capacity() {
                 )
                 .await;
                 assert_eq!(response.status(), StatusCode::OK, "{mode}, stream={stream}");
+                phase = "body";
                 let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
                     .await
                     .unwrap();
                 assert!(String::from_utf8_lossy(&body).contains("optional SQL cannot hold output"));
-                wait_for_request_settlement(&fixture, 1).await;
+                phase = "lifecycle";
                 while fixture.state.proxy_lifecycles.active() != lifecycle_capacity {
                     tokio::task::yield_now().await;
                 }
             })
-            .await
-            .expect("output, settlement and lifecycle capacity must precede optional SQL release");
+            .await;
+            assert!(
+                isolated.is_ok(),
+                "output and lifecycle capacity must precede optional SQL release: \
+                 mode={mode}, stream={stream}, phase={phase}, active={}, baseline={lifecycle_capacity}",
+                fixture.state.proxy_lifecycles.active()
+            );
+            wait_for_request_settlement(&fixture, 1).await;
             if mode == "saturation" {
                 assert!(
                     !fixture

@@ -7,6 +7,9 @@ pub(crate) mod prefix_storage;
 mod projection_retry;
 mod semantic_payload;
 
+#[cfg(test)]
+mod semantic_order_tests;
+
 use projection_retry::ConversationContentError;
 
 // Candidate selection reads at most 50 observations. Persisting the complete
@@ -48,6 +51,7 @@ struct ConversationSelection {
     compaction_overlap: bool,
     client_match: bool,
     write_edge: bool,
+    reverse_edge: bool,
 }
 
 pub(crate) struct ConversationObservationInput<'a> {
@@ -951,7 +955,24 @@ impl Database {
                 let branch_changed = hints.branch_id.is_some()
                     && candidate_branch.is_some()
                     && hints.branch_id.as_deref() != candidate_branch.as_deref();
-                let relation = if direct_parent && hints.subagent {
+                let reverse_prefix = !causally_prior
+                    && explicit_match
+                    && !direct_parent
+                    && !same_turn
+                    && !branch_changed
+                    && !hints.compaction
+                    && leaf.is_some()
+                    && leaf != candidate_leaf
+                    && row
+                        .try_get::<Option<String>, _>("parent_turn_id")?
+                        .is_none()
+                    && row.try_get::<i64, _>("compaction")? == 0
+                    && graph
+                        .ancestors(candidate_leaf.as_deref())?
+                        .contains(leaf.as_deref().unwrap());
+                let relation = if reverse_prefix {
+                    RelationKind::Continues
+                } else if direct_parent && hints.subagent {
                     RelationKind::Subagent
                 } else if same_turn {
                     RelationKind::Retry
@@ -981,7 +1002,7 @@ impl Database {
                     confidence,
                     direct_parent,
                     same_turn,
-                    semantic_prefix: exact_prefix,
+                    semantic_prefix: exact_prefix || reverse_prefix,
                     compaction_overlap,
                     client_match: same_client,
                     // A durable session id is sufficient to place observations in one
@@ -990,7 +1011,9 @@ impl Database {
                     // the parent/turn, the payload establishes a Merkle-prefix relation,
                     // or the client explicitly marks a compaction.
                     write_edge: direct_parent
-                        || (causally_prior && (same_turn || exact_prefix || hints.compaction)),
+                        || (causally_prior && (same_turn || exact_prefix || hints.compaction))
+                        || reverse_prefix,
+                    reverse_edge: reverse_prefix,
                 });
                 if direct_parent || same_turn || explicit_match || exact_prefix {
                     break;
@@ -1012,6 +1035,7 @@ impl Database {
                     compaction_overlap: false,
                     client_match: true,
                     write_edge: true,
+                    reverse_edge: false,
                 });
             }
         }
@@ -1099,13 +1123,18 @@ impl Database {
                 .is_some_and(|selection| selection.relation == RelationKind::Candidate),
         );
         if let Some(selection) = edge_selection {
+            let (from_observation_id, to_observation_id) = if selection.reverse_edge {
+                (observation_id.to_string(), selection.observation_id)
+            } else {
+                (selection.observation_id, observation_id.to_string())
+            };
             sqlx::query(
                 "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 2, $8)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(cluster_id.to_string())
-            .bind(selection.observation_id)
-            .bind(observation_id.to_string())
+            .bind(from_observation_id)
+            .bind(to_observation_id)
             .bind(relation_name(selection.relation))
             .bind(selection.confidence)
             .bind(serde_json::json!({
@@ -1427,10 +1456,8 @@ async fn fetch_structured_conversation_candidate(
         }
 
         // Archive projection can commit a later source-time observation first.
-        // A future row is valid only for explicit cluster membership; the caller
-        // still suppresses any edge that would reverse causal ancestry.
         let future = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)

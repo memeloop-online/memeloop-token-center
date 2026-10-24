@@ -4,6 +4,9 @@ use crate::plugin::application::descriptor_export::{
     DescriptorAuthoritySnapshot, DescriptorCandidateReceipt,
 };
 
+#[cfg(test)]
+mod tests;
+
 impl Database {
     pub(crate) async fn plugin_descriptor_authority_snapshot(
         &self,
@@ -255,7 +258,7 @@ impl Database {
             .checked_add(1)
             .filter(|n| *n > 0)
             .ok_or(AppError::Internal)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
         if reason != "rollback" {
             let frozen_base: Option<i64> = sqlx::query_scalar("SELECT r.base_revision FROM application_plugin_release_resolutions r JOIN application_plugin_installations i ON i.idempotency_hash=r.install_key_hash WHERE i.inventory_id=$1")
                 .bind(inventory_id).fetch_optional(&mut *tx).await?;
