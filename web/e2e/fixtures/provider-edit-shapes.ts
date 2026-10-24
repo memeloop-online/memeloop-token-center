@@ -14,7 +14,7 @@ export const codexTransportPolicySchema = {
     },
     connect_timeout_millis: {
       type: 'integer', minimum: 100, maximum: 60000, default: 5000,
-      description: 'Pre-delivery connection deadline; must be lower than the total request timeout.',
+      description: 'Pre-delivery connection deadline; must be lower than the total request timeout. The Codex client raises a stored or omitted 5000 ms value to 60000 ms, still inside the request budget, so the historical default does not abort a slow proxy handshake.',
     },
     read_timeout_millis: {
       type: 'integer', minimum: 1000, maximum: 1260000, default: 600000,

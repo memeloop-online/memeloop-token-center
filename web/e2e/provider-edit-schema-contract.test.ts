@@ -67,7 +67,7 @@ test('connection, localization and edit composition translate transport copy wit
     responses_output_limits: '默认策略（provider_default）会校验并移除客户端的输出限制提示；上游使用自身默认值，不强制执行请求指定的词元上限。由于 Codex OAuth 无法保证该限制，显式选择严格策略（strict）时会拒绝任何输出限制提示。额度始终按可信的模型上限预留，并按观测到的实际用量结算。',
   };
   const existingEditHelp: Record<string, string> = {
-    connect_timeout_millis: '建立连接的等待时限，必须小于请求总超时。',
+    connect_timeout_millis: '建立连接的等待时限，必须小于请求总超时。留空或保存为 5000 毫秒时，Codex 客户端实际等待 60 秒，避免慢速代理握手被过早切断。',
     read_timeout_millis: '收到响应头后等待首段内容，以及后续相邻内容之间允许的最长无数据时间。',
     request_timeout_millis: '从首次发送到完整接收响应的总时限，包含系统允许的重放。',
     dispatch_max_in_flight: '此账号每个代理出口的可选请求并发上限。默认值 0 表示不添加派发限制，也不使用派发队列。正数会限制正在执行的请求（包括流式响应）；调低已设置的上限时，现有请求继续完成。',

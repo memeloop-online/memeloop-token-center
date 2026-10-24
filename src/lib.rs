@@ -432,6 +432,20 @@ fn codex_http_protocol_test_builder(
     }
 }
 
+/// Historical Codex default. Slow SOCKS handshakes die at this exact deadline.
+const HISTORICAL_CONNECT_TIMEOUT: Duration = Duration::from_millis(5_000);
+/// Replacement used only for that historical value, still inside the request budget.
+const RELAXED_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn codex_connect_timeout(policy: provider::CodexTransportPolicy) -> Duration {
+    let configured = Duration::from_millis(policy.connect_timeout_millis);
+    if configured != HISTORICAL_CONNECT_TIMEOUT {
+        return configured;
+    }
+    let request_budget = Duration::from_millis(policy.request_timeout_millis);
+    RELAXED_CONNECT_TIMEOUT.min(request_budget.saturating_sub(Duration::from_millis(1)))
+}
+
 fn codex_http_client_builder(
     policy: provider::CodexTransportPolicy,
     keep_alive_interval: Duration,
@@ -456,8 +470,12 @@ fn codex_http_client_builder(
         policy,
         keep_alive_interval,
     );
+    // wreq's own defaults force-close a Linux socket after 30s without an ACK
+    // and probe TCP keepalive every 15s. Either one turns a slow proxy or a
+    // quiet upstream into 502/503 before the configured request budget ends.
+    // HTTP/2 keepalive above remains the liveness check.
     let builder = wreq::Client::builder()
-        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
+        .connect_timeout(codex_connect_timeout(policy))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.
@@ -467,7 +485,12 @@ fn codex_http_client_builder(
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
-        .http2_options(http2_options);
+        .http2_options(http2_options)
+        .tcp_keepalive(None::<Duration>)
+        .tcp_keepalive_interval(None::<Duration>)
+        .tcp_keepalive_retries(None::<u32>);
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(None::<Duration>);
     match policy.http_protocol {
         provider::CodexHttpProtocol::ProviderDefault => builder,
         provider::CodexHttpProtocol::Http1Only => builder.http1_only(),
@@ -636,6 +659,30 @@ mod tests {
         assert_eq!(
             format!("{:?}", options.headers_stream_dependency),
             format!("{:?}", original.headers_stream_dependency)
+        );
+    }
+
+    #[test]
+    fn historical_five_second_connect_timeout_no_longer_cuts_off_a_slow_proxy() {
+        let relaxed =
+            super::codex_connect_timeout(crate::provider::CodexTransportPolicy::default());
+        assert_eq!(relaxed, Duration::from_secs(60));
+        let mut explicit = crate::provider::CodexTransportPolicy::default();
+        explicit.connect_timeout_millis = 15_000;
+        assert_eq!(
+            super::codex_connect_timeout(explicit),
+            Duration::from_secs(15)
+        );
+        explicit.connect_timeout_millis = 100;
+        assert_eq!(
+            super::codex_connect_timeout(explicit),
+            Duration::from_millis(100)
+        );
+        explicit.connect_timeout_millis = 5_000;
+        explicit.request_timeout_millis = 6_000;
+        assert_eq!(
+            super::codex_connect_timeout(explicit),
+            Duration::from_millis(5_999)
         );
     }
 
