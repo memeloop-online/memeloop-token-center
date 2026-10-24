@@ -801,7 +801,7 @@ async fn assert_cooldown_failover_keeps_one_reservation(database_url: Option<Str
         standby.uri(),
         false,
         database_url,
-        None,
+        Some((100_000, Decimal::TEN)),
     )
     .await;
     put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;

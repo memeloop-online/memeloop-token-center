@@ -792,8 +792,10 @@ async fn assert_committed_receipt_replay_preserves_owned_key(changed_field: Opti
                     json!(key["credential_generation"].as_i64().unwrap() + 1);
             }
             "policy" => {
-                key["policy"]["requests_per_minute"] =
-                    json!(key["policy"]["requests_per_minute"].as_u64().unwrap() + 1);
+                let limit: Option<u32> =
+                    serde_json::from_value(key["policy"]["requests_per_minute"].clone()).unwrap();
+                key["policy"]["requests_per_minute"] = json!(limit.unwrap_or(0) + 1);
+                assert_ne!(key["policy"], receipt["conversation"]["key"]["policy"]);
             }
             "operational_terminal" => {
                 replayed_receipt["operational_terminal"]["completed_at"] = json!(
