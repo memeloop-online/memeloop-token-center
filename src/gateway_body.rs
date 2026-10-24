@@ -300,6 +300,65 @@ async fn admit_request_body_for_route(
     {
         return Err(GatewayBodyAdmissionError::UnsupportedEncoding);
     }
+    if let Some(reservation) = reservation.as_ref().filter(|_| {
+        route_class != GatewayBodyRouteClass::Responses
+            || declared_content_length.is_some_and(|length| length <= MAX_DEFAULT_BODY as u64)
+    }) {
+        let read_maximum = declared_content_length
+            .and_then(|length| usize::try_from(length).ok())
+            .unwrap_or(maximum)
+            .min(maximum);
+        let memory_maximum = if route_class == GatewayBodyRouteClass::Responses {
+            read_maximum
+        } else {
+            maximum
+        };
+        if reservation.try_grow(memory_maximum, memory::REQUEST_MEMORY_WEIGHT) {
+            let read = async {
+                let mut stream = body.into_data_stream();
+                let mut retained = bytes::BytesMut::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|_| {
+                        rejected_body(
+                            route_class,
+                            declared_content_length,
+                            maximum,
+                            GatewayBodyRejectionReason::BodyReadRejected,
+                        )
+                    })?;
+                    if retained.len().saturating_add(chunk.len()) > read_maximum {
+                        return Err(rejected_body(
+                            route_class,
+                            declared_content_length,
+                            maximum,
+                            GatewayBodyRejectionReason::BodyLimitExceeded,
+                        ));
+                    }
+                    let _frame_memory = if route_class == GatewayBodyRouteClass::Responses {
+                        Some(
+                            reservation
+                                .try_reserve_ingress_bytes(chunk.len())
+                                .ok_or(GatewayBodyAdmissionError::CapacityExhausted)?,
+                        )
+                    } else {
+                        None
+                    };
+                    retained.extend_from_slice(&chunk);
+                }
+                Ok(retained.freeze())
+            };
+            let bytes = read_with_deadline(deadline, read).await??;
+            reservation.release(
+                memory_maximum.saturating_sub(bytes.len()),
+                memory::REQUEST_MEMORY_WEIGHT,
+            );
+            parts.extensions.insert(reservation.clone());
+            return Ok(Request::from_parts(parts, Body::from(bytes)));
+        }
+        if route_class != GatewayBodyRouteClass::Responses {
+            return Err(GatewayBodyAdmissionError::CapacityExhausted);
+        }
+    }
     if route_class == GatewayBodyRouteClass::Responses {
         let read_maximum = declared_content_length
             .and_then(|length| usize::try_from(length).ok())
@@ -361,49 +420,6 @@ async fn admit_request_body_for_route(
         }
         parts.extensions.insert(Arc::new(spool));
         return Ok(Request::from_parts(parts, Body::empty()));
-    }
-    if let Some(reservation) = reservation {
-        let read_maximum = declared_content_length
-            .and_then(|length| usize::try_from(length).ok())
-            .unwrap_or(maximum)
-            .min(maximum);
-        // A transport can yield a frame larger than a dishonest Content-Length
-        // before reporting its framing error. Always cover the route maximum
-        // before the first poll; the declared length only tightens validation.
-        if !reservation.try_grow(maximum, memory::REQUEST_MEMORY_WEIGHT) {
-            return Err(GatewayBodyAdmissionError::CapacityExhausted);
-        }
-        let read = async {
-            let mut stream = body.into_data_stream();
-            let mut retained = bytes::BytesMut::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|_| {
-                    rejected_body(
-                        route_class,
-                        declared_content_length,
-                        maximum,
-                        GatewayBodyRejectionReason::BodyReadRejected,
-                    )
-                })?;
-                if retained.len().saturating_add(chunk.len()) > read_maximum {
-                    return Err(rejected_body(
-                        route_class,
-                        declared_content_length,
-                        maximum,
-                        GatewayBodyRejectionReason::BodyLimitExceeded,
-                    ));
-                }
-                retained.extend_from_slice(&chunk);
-            }
-            Ok(retained.freeze())
-        };
-        let bytes = read_with_deadline(deadline, read).await??;
-        reservation.release(
-            maximum.saturating_sub(bytes.len()),
-            memory::REQUEST_MEMORY_WEIGHT,
-        );
-        parts.extensions.insert(reservation);
-        return Ok(Request::from_parts(parts, Body::from(bytes)));
     }
     let bytes = read_with_deadline(deadline, to_bytes(body, maximum))
         .await?
@@ -502,14 +518,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_responses_body_retains_spool_bytes_until_request_drop() {
-        let budget = memory::ProxyMemoryBudget::new(48 * 1024 * 1024);
+    async fn small_responses_fallback_retains_spool_bytes_until_request_drop() {
+        let budget = memory::ProxyMemoryBudget::new(512 * 1024);
         let spool = test_request_spool();
         let request = Request::builder()
             .method("POST")
             .uri("/v1/responses")
-            .header(header::CONTENT_LENGTH, 16 * 1024)
-            .body(Body::from(vec![b'x'; 16 * 1024]))
+            .header(header::CONTENT_LENGTH, 256 * 1024)
+            .body(Body::from(vec![b'x'; 256 * 1024]))
             .unwrap();
         let admitted = admit_gateway_request_body_with_memory(
             request,
@@ -527,16 +543,16 @@ mod tests {
             .get::<Arc<request_spool::RequestSpool>>()
             .unwrap()
             .clone();
-        assert_eq!(owner.len(), 16 * 1024);
-        assert_eq!(spool.snapshot().used_bytes, 16 * 1024);
+        assert_eq!(owner.len(), 256 * 1024);
+        assert_eq!(spool.snapshot().used_bytes, 256 * 1024);
         assert_eq!(spool.snapshot().active_files, 1);
         drop(admitted);
-        assert_eq!(spool.snapshot().used_bytes, 16 * 1024);
+        assert_eq!(spool.snapshot().used_bytes, 256 * 1024);
         drop(owner);
         assert_eq!(spool.snapshot().used_bytes, 0);
         assert_eq!(spool.snapshot().active_files, 0);
         assert_eq!(budget.snapshot().0, 0);
-        assert!(budget.reservation().try_grow(48 * 1024 * 1024, 1));
+        assert!(budget.reservation().try_grow(512 * 1024, 1));
     }
 
     #[tokio::test(start_paused = true)]

@@ -7665,39 +7665,34 @@ async fn request_detail_contains_archive(world: &mut TokenCenterWorld) {
 
 #[then("the requests form one logical conversation with a continuation edge")]
 async fn logical_conversation_continues(world: &mut TokenCenterWorld) {
-    wait_for_projected_conversation_requests(world, 2).await;
-    let clusters = world
-        .client
-        .get(format!("{}/self/v1/conversations", world.service_url))
-        .bearer_auth(&world.current_key)
-        .send()
-        .await
-        .expect("conversation clusters")
-        .json::<Value>()
-        .await
-        .expect("conversation clusters JSON");
-    assert_eq!(clusters.as_array().map(Vec::len), Some(1));
-    assert_eq!(clusters[0]["request_count"], 2);
-    let cluster_id = clusters[0]["cluster_id"].as_str().expect("cluster id");
-    let detail = world
-        .client
-        .get(format!(
-            "{}/self/v1/conversations/{cluster_id}",
-            world.service_url
-        ))
-        .bearer_auth(&world.current_key)
-        .send()
-        .await
-        .expect("conversation detail")
-        .json::<Value>()
-        .await
-        .expect("conversation detail JSON");
-    assert_eq!(detail["edges"][0]["relation"], "continues");
+    let detail = tokio::time::timeout(Duration::from_secs(5), async {
+        wait_for_projected_conversation_requests(world, 2).await;
+        loop {
+            let detail = own_conversation_detail(world).await;
+            if detail["requests"]
+                .as_array()
+                .is_some_and(|requests| requests.len() >= 2)
+            {
+                return detail;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("projected conversation requests must be readable before the original deadline");
+    assert_eq!(detail["cluster"]["request_count"], 2, "{detail}");
+    assert_eq!(
+        detail["requests"].as_array().map(Vec::len),
+        Some(2),
+        "{detail}"
+    );
+    assert_eq!(detail["edges"][0]["relation"], "continues", "{detail}");
     assert!(
         detail["edges"][0]["confidence"]
             .as_f64()
             .unwrap_or_default()
-            >= 0.95
+            >= 0.95,
+        "{detail}"
     );
 }
 
