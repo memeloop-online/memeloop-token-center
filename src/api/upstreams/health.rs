@@ -53,6 +53,11 @@ fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> St
         "volcengine-seedance" => {
             format!("{base}/api/v3/contents/generations/tasks/__mtc_health_probe__")
         }
+        // The coding root is not an API. GET of that root is what marked a
+        // working Kimi account unavailable. The usage read is the same
+        // authenticated call the quota path already uses, and it does not
+        // start a generation.
+        "kimi-oauth" => format!("{base}/v1/usages"),
         _ => base.to_owned(),
     }
 }
@@ -287,6 +292,18 @@ async fn upstream_service_probe_body(state: &AppState, account_id: Uuid) -> Valu
             .header(header::CONNECTION, "Keep-Alive")
             .header("originator", crate::oauth::managed::codex::ORIGINATOR)
             .header("chatgpt-account-id", account_id)
+    } else if account.driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+        match crate::oauth::managed::kimi::apply_headers(request, &credential) {
+            Ok(request) => request,
+            Err(_) => {
+                return json!({
+                    "account_id": account_id,
+                    "status": "unhealthy",
+                    "error_code": "credential_invalid",
+                    "checked_at": unix_millis()
+                });
+            }
+        }
     } else {
         request
     };
@@ -425,6 +442,14 @@ mod tests {
         assert_eq!(
             upstream_health_probe_url("new-api", &json!({}), "https://zero.cat/"),
             "https://zero.cat/v1/models",
+        );
+    }
+
+    #[test]
+    fn kimi_health_uses_the_authenticated_usage_read() {
+        assert_eq!(
+            upstream_health_probe_url("kimi-oauth", &json!({}), "https://api.kimi.com/coding"),
+            "https://api.kimi.com/coding/v1/usages",
         );
     }
 }
