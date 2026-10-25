@@ -2,8 +2,6 @@
 pub(crate) mod durable;
 mod quota;
 #[cfg(test)]
-pub(crate) mod test_observe_gate;
-#[cfg(test)]
 use crate::plugin::routing::{GroupRoutingObserveInput, GroupRoutingOutcome};
 use crate::{
     AppState,
@@ -720,8 +718,6 @@ pub(crate) async fn observe_with_signal(
     outcome: GroupRoutingOutcome,
     transient_signal: Option<GroupRoutingTransientSignal>,
 ) -> Option<crate::plugin::routing::GroupRoutingExecutionDirective> {
-    #[cfg(test)]
-    test_observe_gate::wait(request_id).await;
     let snapshot = state.group_routing.as_ref()?;
     let policy = snapshot.policy(route, account, generation)?;
     let mut candidate = policy.candidate.clone();
