@@ -18,7 +18,7 @@ import { RequestRefreshControl } from '../traffic/RequestRefreshControl';
 import { mergeBatchedRequestPage } from '../traffic/requestRefresh';
 import { RequestOverflowReconciliation } from '../traffic/requestOverflowReconciliation';
 import {
-  emptyTypedFilterAst, mergeRefreshedRequestPage, requestViewFromEvent,
+  emptyTypedFilterAst, mergeRefreshedRequestPage, mergeSessionContext, requestViewFromEvent,
   summarizeVisibleRequests, typedFiltersActive, typedRequestQueryBody, visibleRequestMetricSeries,
 } from '../traffic/requestTraffic';
 
@@ -289,7 +289,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   useEffect(() => {
     // SSE batches never auto-refresh a filtered view. They only surface the
     // stale hint so the user can explicitly reload filtered history.
-    if (streamPaused || liveEvents.size === 0) return;
+    if (streamPaused || (loadingRef.current && requestsRef.current.length === 0) || liveEvents.size === 0) return;
     if (typedFiltersActive(filters)) {
       // Any published batch marks filtered results stale: the list itself
       // stays frozen until the user explicitly refreshes it.
@@ -330,8 +330,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
           reconciledOperationalEvents.current.set(request.request_id, event.event_id);
           setRequests(current => current.map(row => {
             if (row.request_id !== request.request_id || row.operational_terminal?.financial_state === 'applied') return row;
+            const hydrated = { ...next, egress: next.egress ?? row.egress,
+              session_context: mergeSessionContext(row.session_context, next) };
             const retained = liveEventsRef.current.get(row.request_id);
-            return retained ? requestViewFromEvent(retained, next) ?? next : next;
+            return retained ? requestViewFromEvent(retained, hydrated) ?? hydrated : hydrated;
           }));
         })
         .catch(reason => {
@@ -356,7 +358,14 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
       errorSource.current = undefined;
       setError('');
       const next = await api<RequestDetail>(`/internal/v1/requests/${requestId}${queryForTenant(tenant)}`, token, { signal: controller.signal });
-      if (requestSequence === detailSequence.current && selectedRequestId.current === requestId && !controller.signal.aborted) setDetail({ value: next, token, tenant, requestId });
+      if (requestSequence === detailSequence.current && selectedRequestId.current === requestId && !controller.signal.aborted) {
+        const row = requestsRef.current.find(request => request.request_id === requestId);
+        const previous = detailResult?.token === token && detailResult.tenant === tenant
+          && detailResult.requestId === requestId ? detailResult.value : row;
+        const hydrated = { ...next, egress: next.egress ?? previous?.egress,
+          session_context: mergeSessionContext(previous?.session_context, next) };
+        setDetail({ value: hydrated, token, tenant, requestId });
+      }
     } catch (reason) {
       if (requestSequence === detailSequence.current && !controller.signal.aborted) {
         errorSource.current = 'detail';
