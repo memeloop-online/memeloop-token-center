@@ -228,8 +228,6 @@ pub(crate) use requests::{
 pub(crate) use requests::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
 };
-#[cfg(test)]
-pub(crate) use routing::AdmittedConnectionFailure;
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
     ManagedModelRouteSyncResult, ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput,

@@ -30,8 +30,6 @@ pub(in crate::db) use catalog_policy::record_group_catalog_evidence;
 pub(crate) use grant_revisions::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
-#[cfg(test)]
-pub(crate) use health::AdmittedConnectionFailure;
 pub(crate) use health::{
     TransientHealthSignal, UpstreamAttemptAdmission, UpstreamFailureKind,
     UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,

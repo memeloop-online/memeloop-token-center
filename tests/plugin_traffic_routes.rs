@@ -342,45 +342,8 @@ struct HintRoutingFixture {
     database_url: String,
     issued: IssuedKey,
     model: String,
-    preferred_account_id: uuid::Uuid,
     standby_account_id: uuid::Uuid,
     unauthorized_account_id: uuid::Uuid,
-}
-
-async fn wait_for_hint_terminal(fixture: &HintRoutingFixture, financial: bool) {
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let requests = fixture
-                .state
-                .db
-                .list_requests(fixture.issued.key_id, 10)
-                .await
-                .unwrap();
-            if requests.len() == 1 {
-                let request = &requests[0];
-                if financial {
-                    if request.completed_at.is_some() {
-                        break;
-                    }
-                } else if request
-                    .operational_terminal
-                    .as_ref()
-                    .is_some_and(|terminal| {
-                        terminal.financial_state
-                            == memeloop_token_center::model::RequestFinancialState::Unknown
-                    })
-                {
-                    assert!(request.completed_at.is_none());
-                    assert!(request.usage.tokens.is_none());
-                    assert_eq!(request.billing.cost, None);
-                    break;
-                }
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("hint request reached its explicit financial or unknown terminal");
 }
 
 async fn hint_routing_fixture(
@@ -534,7 +497,6 @@ async fn hint_routing_fixture_with_database(
         database_url,
         issued,
         model,
-        preferred_account_id,
         standby_account_id,
         unauthorized_account_id,
     }
