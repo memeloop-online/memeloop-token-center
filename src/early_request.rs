@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -24,6 +24,7 @@ pub(crate) struct Journal {
     writes: Arc<tokio::sync::Mutex<()>>,
     pending_writes: Arc<tokio::sync::Semaphore>,
     deferred: Arc<Mutex<VecDeque<EarlyRequestTerminal>>>,
+    inflight: Arc<AtomicUsize>,
     written: Arc<AtomicU64>,
     replayed: AtomicU64,
     failed: AtomicU64,
@@ -38,6 +39,7 @@ impl Journal {
             writes: Arc::new(tokio::sync::Mutex::new(())),
             pending_writes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES)),
             deferred: Arc::new(Mutex::new(VecDeque::new())),
+            inflight: Arc::new(AtomicUsize::new(0)),
             written: Arc::new(AtomicU64::new(0)),
             replayed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -62,38 +64,34 @@ impl Journal {
         let Ok(_pending) = self.pending_writes.clone().try_acquire_owned() else {
             return self.unavailable(request_id, "journal_queue_full");
         };
-        let database = self.database.clone();
         let writes = self.writes.clone();
+        // Waiting for the local writer is a lost terminal: the response must
+        // say so. A database that is busy after the writer is acquired is not.
+        // That deadline must not cancel the queueing step itself.
+        let _writer = match tokio::time::timeout(WRITE_DEADLINE, writes.lock_owned()).await {
+            Ok(writer) => writer,
+            Err(_) => return self.unavailable(request_id, "journal_write_timeout"),
+        };
+        let database = self.database.clone();
         let written = self.written.clone();
         let deferred = self.deferred.clone();
         let wake = self.wake.clone();
         let queued = record.clone();
-        // Waiting for the local writer is a lost terminal: the response must
-        // say so. A database that is busy after the writer is acquired is not.
-        // The row is replayed once that writer finishes.
-        let result = tokio::time::timeout(WRITE_DEADLINE, async move {
-            let _writer = writes.lock_owned().await;
-            let write = database.record_early_request_terminal(&record);
-            tokio::pin!(write);
-            match tokio::time::timeout(WRITE_DEADLINE, &mut write).await {
-                Ok(Ok(())) => {
-                    written.fetch_add(1, Ordering::Relaxed);
-                    true
-                }
-                _ => {
-                    deferred
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .push_back(queued);
-                    wake.notify_one();
-                    true
-                }
+        let write = database.record_early_request_terminal(&record);
+        tokio::pin!(write);
+        match tokio::time::timeout(WRITE_DEADLINE, &mut write).await {
+            Ok(Ok(())) => {
+                written.fetch_add(1, Ordering::Relaxed);
+                true
             }
-        })
-        .await;
-        match result {
-            Ok(accepted) => accepted,
-            Err(_) => self.unavailable(request_id, "journal_write_timeout"),
+            _ => {
+                deferred
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push_back(queued);
+                wake.notify_one();
+                true
+            }
         }
     }
 
@@ -122,21 +120,36 @@ impl Journal {
             let count = queued.len().min(REPLAY_BATCH);
             queued.drain(..count).collect::<Vec<_>>()
         };
-        for record in deferred {
-            match database.record_early_request_terminal(&record).await {
+        if !deferred.is_empty() {
+            self.inflight.fetch_add(deferred.len(), Ordering::AcqRel);
+        }
+        let mut pending = deferred;
+        let mut index = 0;
+        while index < pending.len() {
+            match database
+                .record_early_request_terminal(&pending[index])
+                .await
+            {
                 Ok(()) => {
                     self.written.fetch_add(1, Ordering::Relaxed);
+                    self.inflight.fetch_sub(1, Ordering::AcqRel);
+                    index += 1;
                 }
                 Err(error) => {
                     tracing::warn!(
-                        request_id = %record.request_id,
+                        request_id = %pending[index].request_id,
                         error_category = error.diagnostic_category(),
                         "early request terminal retained for replay"
                     );
-                    self.deferred
+                    let retained = pending.split_off(index);
+                    self.inflight.fetch_sub(retained.len(), Ordering::AcqRel);
+                    let mut queued = self
+                        .deferred
                         .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .push_front(record);
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    for record in retained.into_iter().rev() {
+                        queued.push_front(record);
+                    }
                     return;
                 }
             }
@@ -215,7 +228,8 @@ impl Journal {
                     .deferred
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .is_empty();
+                    .is_empty()
+                    && self.inflight.load(Ordering::Acquire) == 0;
                 let mut pending = false;
                 if let Ok(mut entries) = tokio::fs::read_dir(&self.directory).await {
                     while let Ok(Some(entry)) = entries.next_entry().await {

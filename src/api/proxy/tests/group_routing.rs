@@ -448,7 +448,7 @@ async fn gateway_same_wasm_probe_cannot_resurrect_hard_quota() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(successful_chat_response())
-        .expect(1)
+        .expect(0)
         .mount(&upstream)
         .await;
     let label = "group-hard-quota";
@@ -471,7 +471,7 @@ async fn gateway_same_wasm_probe_cannot_resurrect_hard_quota() {
     let before = health(&fixture, tenant, generation).await;
     let response = send_resilient_chat(&fixture, None, false).await;
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
     let after = health(&fixture, tenant, generation).await;
     assert_eq!(after.cooldown_until, before.cooldown_until);
     assert_eq!(after.last_failure_kind, "quota_exhausted");

@@ -1289,7 +1289,7 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
                 .pending_terminals
                 .idle_conversation_retained_for_test(receipt_id)
                 .await
-                == Some(false)
+                == Some(true)
             {
                 let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
                 if used == 0 && retained == 0 {
@@ -1300,7 +1300,7 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
         }
     })
     .await
-    .expect("unknown with durable semantic enqueue must release its conversation and memory");
+    .expect("unknown with durable semantic enqueue must release memory and keep the receipt conversation");
     let owner = Uuid::now_v7();
     let tasks = fixture
         .state
@@ -1431,7 +1431,7 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
                     .pending_terminals
                     .idle_conversation_retained_for_test(receipt_id)
                     .await
-                    == Some(false)
+                    == Some(true)
             {
                 break;
             }
@@ -1440,7 +1440,7 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
     })
     .await
     .expect(
-        "durable semantic enqueue must release the in-memory conversation and every memory permit",
+        "durable semantic enqueue must release every memory permit and keep the receipt conversation",
     );
     assert!(
         fixture

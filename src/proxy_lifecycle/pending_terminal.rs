@@ -473,7 +473,13 @@ impl Journal {
             if !keep_unknown_evidence && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
                 snapshot.conversation = None;
             }
-            entry.projection_retained = None;
+            // The budgeted body can leave once its projection is durable.
+            // Until then the permit stays with the unenqueued evidence.
+            // The conversation value itself stays: it is the receipt, not the
+            // budgeted buffer.
+            if !keep_unknown_evidence || entry.conversation_enqueued {
+                entry.projection_retained = None;
+            }
         }
     }
 
