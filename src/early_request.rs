@@ -1,7 +1,8 @@
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -22,6 +23,7 @@ pub(crate) struct Journal {
     wake: Arc<Notify>,
     writes: Arc<tokio::sync::Mutex<()>>,
     pending_writes: Arc<tokio::sync::Semaphore>,
+    deferred: Arc<Mutex<VecDeque<EarlyRequestTerminal>>>,
     written: Arc<AtomicU64>,
     replayed: AtomicU64,
     failed: AtomicU64,
@@ -35,6 +37,7 @@ impl Journal {
             wake: Arc::new(Notify::new()),
             writes: Arc::new(tokio::sync::Mutex::new(())),
             pending_writes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES)),
+            deferred: Arc::new(Mutex::new(VecDeque::new())),
             written: Arc::new(AtomicU64::new(0)),
             replayed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -62,19 +65,35 @@ impl Journal {
         let database = self.database.clone();
         let writes = self.writes.clone();
         let written = self.written.clone();
+        let deferred = self.deferred.clone();
+        let wake = self.wake.clone();
+        let queued = record.clone();
+        // Waiting for the local writer is a lost terminal: the response must
+        // say so. A database that is busy after the writer is acquired is not.
+        // The row is replayed once that writer finishes.
         let result = tokio::time::timeout(WRITE_DEADLINE, async move {
             let _writer = writes.lock_owned().await;
-            let result = database.record_early_request_terminal(&record).await;
-            if result.is_ok() {
-                written.fetch_add(1, Ordering::Relaxed);
+            let write = database.record_early_request_terminal(&record);
+            tokio::pin!(write);
+            match tokio::time::timeout(WRITE_DEADLINE, &mut write).await {
+                Ok(Ok(())) => {
+                    written.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                _ => {
+                    deferred
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push_back(queued);
+                    wake.notify_one();
+                    true
+                }
             }
-            result
         })
         .await;
         match result {
-            Ok(Ok(())) => true,
+            Ok(accepted) => accepted,
             Err(_) => self.unavailable(request_id, "journal_write_timeout"),
-            _ => self.unavailable(request_id, "journal_unavailable"),
         }
     }
 
@@ -95,6 +114,33 @@ impl Journal {
     }
 
     async fn replay(&self, database: &Database) {
+        let deferred = {
+            let mut queued = self
+                .deferred
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let count = queued.len().min(REPLAY_BATCH);
+            queued.drain(..count).collect::<Vec<_>>()
+        };
+        for record in deferred {
+            match database.record_early_request_terminal(&record).await {
+                Ok(()) => {
+                    self.written.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %record.request_id,
+                        error_category = error.diagnostic_category(),
+                        "early request terminal retained for replay"
+                    );
+                    self.deferred
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .push_front(record);
+                    return;
+                }
+            }
+        }
         let Ok(mut entries) = tokio::fs::read_dir(&self.directory).await else {
             return;
         };
@@ -164,7 +210,12 @@ impl Journal {
     pub(crate) async fn drain_for_test(&self) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                self.wake.notify_one();
+                self.replay(&self.database).await;
+                let queued = self
+                    .deferred
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty();
                 let mut pending = false;
                 if let Ok(mut entries) = tokio::fs::read_dir(&self.directory).await {
                     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -172,7 +223,7 @@ impl Journal {
                             == Some("json");
                     }
                 }
-                if !pending {
+                if queued && !pending {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

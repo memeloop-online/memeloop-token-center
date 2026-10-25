@@ -325,8 +325,34 @@ async fn next_sendable_proxy_route(
         }
         let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
-        // A customer request is not a health sample and does not consult one.
-        // Account and proxy health come from their own periodic probes.
+        // A customer request is not a health sample and does not take a probe
+        // lease. Quota exhaustion is the provider's own deadline, so it still
+        // removes this account from the attempt.
+        if state
+            .db
+            .customer_attempt_blocked_by_quota(
+                planned.route.account_id,
+                planned.route.credential_generation,
+                planned.route.transport_revision,
+            )
+            .await?
+        {
+            tracing::warn!(
+                %request_id,
+                upstream_account_id = %planned.route.account_id,
+                candidate_rank = rank,
+                outbound_attempt,
+                admission_reason = "quota_exhausted",
+                stage = "upstream_admission_skip",
+                "proxy skipped an exhausted upstream before sending"
+            );
+            state.metrics.observe_upstream_health(
+                UpstreamHealthEvent::Skipped,
+                UpstreamHealthReason::Unavailable,
+            );
+            failover_reason = Some(UpstreamHealthReason::Unavailable);
+            continue;
+        }
         let admission = UpstreamAttemptAdmission::Observed;
         return prepare_admitted_proxy_route(AdmittedProxyRouteInput {
             request,

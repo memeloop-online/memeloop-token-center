@@ -462,21 +462,18 @@ impl Journal {
             .pending
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        for entry in pending.values_mut().filter(|entry| {
-            entry.durable
-                && entry.reconcile
-                && !entry.running
-                && !(entry.unknown_annotated
-                    && entry.snapshot.claim.is_some()
-                    && entry.snapshot.usage_basis
-                        != Some(crate::model::RequestUsageBasis::ProviderReported)
-                    && entry.snapshot.conversation.is_some()
-                    && !entry.conversation_enqueued)
-        }) {
-            if let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
+        for entry in pending
+            .values_mut()
+            .filter(|entry| entry.durable && entry.reconcile && !entry.running)
+        {
+            let keep_unknown_evidence = entry.unknown_annotated
+                && entry.snapshot.claim.is_some()
+                && entry.snapshot.usage_basis
+                    != Some(crate::model::RequestUsageBasis::ProviderReported);
+            if !keep_unknown_evidence && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
                 snapshot.conversation = None;
-                entry.projection_retained = None;
             }
+            entry.projection_retained = None;
         }
     }
 
@@ -784,7 +781,8 @@ impl Journal {
         self.pending
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .contains_key(&receipt_id)
+            .get(&receipt_id)
+            .is_some_and(|entry| entry.durable)
     }
 
     #[cfg(test)]
@@ -1233,10 +1231,35 @@ impl Journal {
             if durable {
                 entry.retained = None;
             }
+            if durable && reconcile {
+                let compact = entry.snapshot.clone();
+                let directory = self.directory.clone();
+                tokio::spawn(async move {
+                    write_compact_receipt(&directory, &compact).await;
+                });
+            }
             if reconcile || applied {
                 entry.activity = None;
             }
         }
+    }
+}
+
+async fn write_compact_receipt(directory: &std::path::Path, snapshot: &Snapshot) {
+    let mut compact = snapshot.clone();
+    // The request body stays in the process. The file only has to identify
+    // the financial hold after a restart, and it must not refill the spool.
+    compact.conversation = None;
+    let Ok(bytes) = serde_json::to_vec(&compact) else {
+        return;
+    };
+    if tokio::fs::create_dir_all(directory).await.is_err() {
+        return;
+    }
+    let final_path = directory.join(format!("{}.json", snapshot.receipt_id));
+    let temporary = directory.join(format!("{}.json.tmp", snapshot.receipt_id));
+    if tokio::fs::write(&temporary, bytes).await.is_ok() {
+        let _ = tokio::fs::rename(&temporary, final_path).await;
     }
 }
 
