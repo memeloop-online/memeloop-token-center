@@ -662,6 +662,7 @@ pub(crate) struct UpstreamAttemptGuard {
     failure_epoch: Option<Uuid>,
     lease_token: Option<Uuid>,
     owns_probe_lease: bool,
+    observe_only: bool,
     heartbeat_stop: Option<tokio::sync::oneshot::Sender<()>>,
     _shared_probe_permit: Option<SharedProbePermit>,
     delivery_recovery_attempted: bool,
@@ -681,6 +682,7 @@ struct UpstreamAttemptRecord {
     failure_epoch: Option<Uuid>,
     lease_token: Option<Uuid>,
     owns_probe_lease: bool,
+    observe_only: bool,
     recovered_on_delivery: bool,
 }
 
@@ -697,6 +699,7 @@ impl UpstreamAttemptGuard {
         shared_probe_permit: Option<SharedProbePermit>,
     ) -> Self {
         let (lease_token, failure_epoch) = match admission {
+            UpstreamAttemptAdmission::Observed => (None, None),
             UpstreamAttemptAdmission::Probe { lease_token }
             | UpstreamAttemptAdmission::SharedProbe { lease_token } => (Some(lease_token), None),
             UpstreamAttemptAdmission::Healthy { failure_epoch } => (None, Some(failure_epoch)),
@@ -762,6 +765,7 @@ impl UpstreamAttemptGuard {
             failure_epoch,
             lease_token,
             owns_probe_lease,
+            observe_only: matches!(admission, UpstreamAttemptAdmission::Observed),
             heartbeat_stop,
             _shared_probe_permit: shared_probe_permit,
             delivery_recovery_attempted: false,
@@ -851,15 +855,16 @@ impl UpstreamAttemptGuard {
             return;
         };
         let queue = state.routing_persistence.clone();
-        let mandatory = matches!(
-            terminal,
-            UpstreamAttemptTerminal::Failed {
-                kind: UpstreamFailureKind::Authentication
-                    | UpstreamFailureKind::RateLimited
-                    | UpstreamFailureKind::RateLimitedUntil { .. },
-                ..
-            }
-        );
+        let mandatory = !self.observe_only
+            && matches!(
+                terminal,
+                UpstreamAttemptTerminal::Failed {
+                    kind: UpstreamFailureKind::Authentication
+                        | UpstreamFailureKind::RateLimited
+                        | UpstreamFailureKind::RateLimitedUntil { .. },
+                    ..
+                }
+            );
         if mandatory {
             self.finish_delivery_recovery().await;
         }
@@ -898,6 +903,7 @@ impl UpstreamAttemptGuard {
             failure_epoch: self.failure_epoch,
             lease_token: self.lease_token,
             owns_probe_lease: self.owns_probe_lease,
+            observe_only: self.observe_only,
             recovered_on_delivery: self.recovered_on_delivery,
         };
         let delivery = self.delivery_recovery.take();
@@ -1001,6 +1007,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         failure_epoch,
         lease_token,
         owns_probe_lease,
+        observe_only,
         recovered_on_delivery,
     } = record;
     use crate::plugin::routing::GroupRoutingOutcome;
@@ -1085,6 +1092,66 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         .await
     };
     let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
+    if observe_only {
+        // The customer has already received its result. Health persistence and
+        // transport diagnostics share the existing bounded background queue.
+        let result = match terminal {
+            UpstreamAttemptTerminal::Succeeded => {
+                state
+                    .db
+                    .record_observed_upstream_account_success_at_revision(
+                        upstream_account_id,
+                        credential_generation,
+                        transport_revision,
+                    )
+                    .await
+            }
+            UpstreamAttemptTerminal::Failed {
+                kind,
+                reason,
+                failure_stage,
+            } => {
+                state
+                    .metrics
+                    .observe_upstream_health(UpstreamHealthEvent::Failure, reason);
+                if let Err(error) = state
+                    .db
+                    .record_upstream_transport_diagnostic(crate::db::UpstreamTransportDiagnostic {
+                        request_id,
+                        route_id,
+                        upstream_account_id,
+                        credential_generation,
+                        transport_revision,
+                        failure_kind: kind.as_str(),
+                        failure_stage,
+                        gateway_pod: &gateway_identity.pod,
+                        gateway_node: gateway_identity.node.as_deref(),
+                        failure_domain: &gateway_identity.failure_domain,
+                    })
+                    .await
+                {
+                    state.routing_persistence.record_failure_gap();
+                    tracing::warn!(%request_id, error_category = error.diagnostic_category(), "upstream transport observation could not be persisted");
+                }
+                state
+                    .db
+                    .record_upstream_account_failure_at_revision_with_health_config(
+                        upstream_account_id,
+                        credential_generation,
+                        transport_revision,
+                        kind,
+                        health,
+                    )
+                    .await
+            }
+            UpstreamAttemptTerminal::Inconclusive => return,
+        };
+        if let Err(error) = result {
+            state.routing_persistence.record_failure_gap();
+            tracing::warn!(%request_id, error_category = error.diagnostic_category(), "upstream health observation could not be persisted");
+        }
+        return;
+    }
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
             if let (Some(policy), Some(signal), Some(lease_token)) = (

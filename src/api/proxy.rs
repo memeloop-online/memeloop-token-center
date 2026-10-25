@@ -281,7 +281,9 @@ async fn next_sendable_proxy_route(
             );
             continue;
         }
-        if refresh_route_snapshot(state, &mut planned.route).await? != PreparedRouteReadiness::Ready
+        if !codex_transport::is_driver(&planned.route.driver)
+            && refresh_route_snapshot(state, &mut planned.route).await?
+                != PreparedRouteReadiness::Ready
         {
             tracing::warn!(
                 %request_id,
@@ -324,7 +326,11 @@ async fn next_sendable_proxy_route(
         }
         let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
-        let admission = if let Some(snapshot) = state.group_routing.as_ref()
+        // Account health describes completed requests. It must not turn the
+        // next Codex POST into a half-open probe or wait for a recovery lease.
+        let admission = if codex_transport::is_driver(&planned.route.driver) {
+            UpstreamAttemptAdmission::Observed
+        } else if let Some(snapshot) = state.group_routing.as_ref()
             && let Some((allow_probe, cooldown_ms)) = snapshot
                 .policy(
                     planned.route.route_id,
@@ -1760,17 +1766,6 @@ async fn proxy_with_cancellation_guard(
                     &buffered_request,
                     kind.error_code(),
                     Some(kind.terminal_cause()),
-                )
-                .await;
-            }
-            Err(ProxySendError::OuterDeadline) => {
-                upstream_attempt
-                    .complete(UpstreamAttemptTerminal::Inconclusive)
-                    .await;
-                return finish_proxy_failure_with_cause(
-                    &buffered_request,
-                    "upstream_transport_outer_deadline",
-                    Some(crate::model::RequestTerminalCause::TransportOuterDeadline),
                 )
                 .await;
             }

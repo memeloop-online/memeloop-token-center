@@ -83,108 +83,92 @@ async fn ordinary_client_error_does_not_cool_down_a_shared_account() {
 }
 
 #[tokio::test]
-async fn codex_retries_one_pre_delivery_connection_failure_before_breaker_accounting() {
+async fn codex_connect_failure_does_not_replay_and_keeps_transport_observation() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("memeloop_token_center=info")
+        .try_init();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
-            completed_codex_sse("recovered same-account retry"),
+            completed_codex_sse("next independent request"),
             "text/event-stream",
         ))
         .expect(1)
         .mount(&upstream)
         .await;
-    let fixture = codex_route_fixture("pre-delivery-connect-retry").await;
+    let fixture = codex_route_fixture("connect-observation").await;
     let response = routing::with_test_pre_delivery_connect_failures(
         1,
         send_codex_route(
             &fixture,
             &upstream,
             "/v1/responses",
-            json!({
-                "model": fixture.model,
-                "input": "retry a safe connection failure",
-                "stream": false
-            }),
-        ),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let health_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM upstream_account_health
-         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
-    )
-    .bind(fixture.upstream_account_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        health_rows, 0,
-        "a recovered same-account connection retry must not open the breaker"
-    );
-    pool.close().await;
-    upstream.verify().await;
-}
-
-#[tokio::test]
-async fn codex_exhausted_pre_delivery_connection_retries_record_one_local_domain() {
-    let upstream = MockServer::start().await;
-    let fixture = codex_route_fixture("pre-delivery-connect-exhausted").await;
-    let response = routing::with_test_pre_delivery_connect_failures(
-        2,
-        send_codex_route(
-            &fixture,
-            &upstream,
-            "/v1/responses",
-            json!({
-                "model": fixture.model,
-                "input": "exhaust safe connection retries",
-                "stream": true
-            }),
+            json!({"model": fixture.model, "input": "connect failure", "stream": false}),
         ),
     )
     .await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
+    assert!(upstream.received_requests().await.unwrap().is_empty());
+    fixture.state.routing_persistence.drain_for_test().await;
+    let diagnostics = fixture
+        .state
+        .db
+        .request_upstream_transport_diagnostics(request_id)
+        .await
+        .unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(
+        diagnostics[0].upstream_account_id,
+        fixture.upstream_account_id
+    );
+    assert_eq!(diagnostics[0].failure_kind, "connection");
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "next independent request", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("next independent request"));
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-            let domains: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM upstream_connection_failure_domains
-                 WHERE upstream_account_id = $1",
-            )
-            .bind(fixture.upstream_account_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            let global_failures: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(MAX(consecutive_failures), 0)
-                   FROM upstream_account_health WHERE upstream_account_id = $1",
-            )
-            .bind(fixture.upstream_account_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            pool.close().await;
-            if domains == 1 {
-                assert_eq!(
-                    global_failures, 0,
-                    "one gateway failure domain cannot suppress the account globally"
-                );
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            if rows.len() == 2
+                && rows
+                    .iter()
+                    .any(|row| row.status_code == Some(200) && row.completed_at.is_some())
+            {
+                let completed = rows
+                    .iter()
+                    .find(|row| row.status_code == Some(200))
+                    .unwrap();
+                assert_exactly_once_side_effects(
+                    &fixture,
+                    completed.request_id,
+                    Some("resp-codex"),
+                )
+                .await;
                 break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("terminal recording must retain the local failure-domain evidence");
+    .unwrap();
     upstream.verify().await;
 }
 
@@ -413,7 +397,7 @@ async fn streaming_transport_terminal_is_cached_before_immediate_same_session_re
 }
 
 #[tokio::test]
-async fn failed_codex_protocol_mismatch_opens_the_invalid_response_breaker() {
+async fn failed_codex_protocol_mismatch_retains_invalid_response_observation() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -534,7 +518,7 @@ async fn server_error_is_preserved_then_cools_the_account_for_the_next_request()
 }
 
 #[tokio::test]
-async fn incomplete_sse_probe_stays_unhealthy_and_next_request_fails_over() {
+async fn incomplete_sse_is_observed_without_redirecting_the_next_codex_request() {
     let fixture = codex_route_fixture("probe-incomplete-sse").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -551,10 +535,10 @@ async fn incomplete_sse_probe_stays_unhealthy_and_next_request_fails_over() {
         .and(path(codex_transport::RESPONSES_PATH))
         .and(header_matcher("chatgpt-account-id", "account-456"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(
-            completed_codex_sse("standby after failed probe"),
+            completed_codex_sse("unexpected standby"),
             "text/event-stream",
         ))
-        .expect(1)
+        .expect(0)
         .mount(&upstream)
         .await;
     add_codex_standby_route(&fixture, "codex-route-probe-incomplete-sse", "account-456").await;
@@ -583,6 +567,17 @@ async fn incomplete_sse_probe_stays_unhealthy_and_next_request_fails_over() {
     assert_eq!(failure_kind, "invalid_response");
     pool.close().await;
 
+    upstream.verify().await;
+    upstream.reset().await;
+    Mock::given(method("POST"))
+        .and(header_matcher("chatgpt-account-id", "account-123"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("same account after observation"),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
     let second = send_codex_route(
         &fixture,
         &upstream,
@@ -594,7 +589,7 @@ async fn incomplete_sse_probe_stays_unhealthy_and_next_request_fails_over() {
     let body = to_bytes(second.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("standby after failed probe"));
+    assert!(String::from_utf8_lossy(&body).contains("same account after observation"));
     upstream.verify().await;
 }
 

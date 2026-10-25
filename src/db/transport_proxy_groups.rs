@@ -16,11 +16,6 @@ mod tests;
 
 const MAX_EPOCH: u64 = (1 << 28) - 1;
 
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_BEFORE_PROXY_ADVANCE: std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
-}
-
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Group {
@@ -97,16 +92,6 @@ fn unavailable() -> AppError {
 }
 
 impl TransportProxyGroups {
-    #[cfg(test)]
-    pub(crate) async fn with_test_connect_failure_interleaving<F: std::future::Future>(
-        interleave: impl FnOnce() + 'static,
-        future: F,
-    ) -> F::Output {
-        TEST_BEFORE_PROXY_ADVANCE
-            .scope(std::cell::RefCell::new(Some(Box::new(interleave))), future)
-            .await
-    }
-
     pub(crate) fn parse(input: &str, key: &[u8]) -> Result<Self, AppError> {
         if input.len() > 256 * 1024 {
             return Err(unavailable());
@@ -375,14 +360,6 @@ impl ProxySelection {
             return Ok("not_grouped");
         };
         let snapshot = Snapshot::decode(*state);
-        #[cfg(test)]
-        if let Some(interleave) = TEST_BEFORE_PROXY_ADVANCE
-            .try_with(|hook| hook.borrow_mut().take())
-            .ok()
-            .flatten()
-        {
-            interleave();
-        }
         if entry.blocked.load(Ordering::Acquire)
             || u64::from(snapshot.credential_generation)
                 < entry.observed_generation.load(Ordering::Acquire)
@@ -442,8 +419,7 @@ impl Entry {
 
     /// Move the sticky exit after an independent probe failed. A customer
     /// request never calls this.
-    pub(super) fn advance_after_probe(&self) -> bool {
-        let state = self.state.load(Ordering::Acquire);
+    pub(super) fn advance_after_probe(&self, state: u64) -> bool {
         if state == 0 || self.blocked.load(Ordering::Acquire) {
             return false;
         }
@@ -473,14 +449,15 @@ impl Entry {
 }
 
 impl TransportProxyGroups {
+    #[cfg(test)]
     pub(crate) fn advance_sticky_after_probe(&self, account_id: Uuid) -> bool {
         if let Ok(managed) = self.managed.read()
             && let Some(entry) = managed.get(&account_id).and_then(|item| item.entry.clone())
         {
-            return entry.advance_after_probe();
+            return entry.advance_after_probe(entry.state.load(Ordering::Acquire));
         }
         self.groups
             .get(&account_id)
-            .is_some_and(|entry| entry.advance_after_probe())
+            .is_some_and(|entry| entry.advance_after_probe(entry.state.load(Ordering::Acquire)))
     }
 }

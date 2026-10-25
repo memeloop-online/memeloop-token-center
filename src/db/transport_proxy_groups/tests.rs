@@ -675,3 +675,38 @@ async fn locked_database_cannot_block_cached_selection_or_local_failover() {
         BACKUP
     );
 }
+
+#[test]
+fn stale_independent_probe_cannot_move_a_new_exit_or_credential_generation() {
+    let account_id = Uuid::now_v7();
+    let groups = groups(account_id, 1);
+    let source = credential();
+    groups.select(account_id, 1, &source).unwrap();
+    let entry = groups.groups.get(&account_id).unwrap();
+    let probed = entry.state.load(Ordering::Acquire);
+    assert!(entry.advance_after_probe(probed));
+    assert!(!entry.advance_after_probe(probed));
+    assert_eq!(
+        groups
+            .select(account_id, 1, &source)
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
+    let probed = entry.state.load(Ordering::Acquire);
+    groups.select(account_id, 2, &source).unwrap();
+    assert!(!entry.advance_after_probe(probed));
+    assert_eq!(
+        groups
+            .select(account_id, 2, &source)
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
+}

@@ -64,6 +64,9 @@ pub(crate) enum UpstreamFailureKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamAttemptAdmission {
+    /// Customer forwarding does not participate in circuit-breaker leases.
+    /// Its outcome is published by the existing background observer.
+    Observed,
     Healthy {
         /// Database-backed health epoch shared by every request admitted in
         /// the same healthy cohort. Success rotates it; only the first
@@ -1216,6 +1219,40 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Health for forwards that do not own a circuit-breaker lease is only an
+    /// observation. Preserve credential/revision fencing and hard quota/auth
+    /// evidence; never wait for this update before delivering customer output.
+    pub(crate) async fn record_observed_upstream_account_success_at_revision(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "UPDATE upstream_account_health
+             SET consecutive_failures = 0, cooldown_until = 0,
+                 probe_lease_until = 0, probe_lease_token = '',
+                 last_failure_kind = '', updated_at = $4
+             WHERE upstream_account_id = $1 AND credential_generation = $2
+               AND transport_revision = $3
+               AND last_failure_kind IN ('connection', 'unavailable', 'invalid_response', '')
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_health.upstream_account_id
+                   AND account.status = 'active'
+                   AND account.credential_generation = $2
+                   AND account.updated_at = $3
+               )",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(transport_revision)
+        .bind(unix_millis())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// A fully validated success may recover only the healthy cohort in which
     /// its request was admitted. The first transient failure retains that
     /// cohort's epoch, so a successful sibling can clear it immediately. The
@@ -2315,7 +2352,8 @@ mod tests {
             .iter()
             .find_map(|admission| match admission {
                 UpstreamAttemptAdmission::Probe { lease_token } => Some(*lease_token),
-                UpstreamAttemptAdmission::Healthy { .. }
+                UpstreamAttemptAdmission::Observed
+                | UpstreamAttemptAdmission::Healthy { .. }
                 | UpstreamAttemptAdmission::SharedProbe { .. }
                 | UpstreamAttemptAdmission::Unavailable { .. } => None,
             })

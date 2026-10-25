@@ -4,6 +4,7 @@ use std::time::Duration;
 use super::{Entry, Snapshot, TransportProxyGroups};
 use crate::db::unix_millis;
 
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 impl TransportProxyGroups {
@@ -69,7 +70,7 @@ async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> bool
             return false;
         }
     }
-    entry.advance_after_probe()
+    entry.advance_after_probe(state)
 }
 
 /// Any HTTP response means the proxy reached the configured address. Only a
@@ -79,7 +80,11 @@ async fn proxy_reaches(proxy_url: &str, target: &str) -> bool {
     let Ok(proxy) = wreq::Proxy::all(proxy_url) else {
         return false;
     };
+    // Only the independent probe has a clock. A blackholed exit must finish
+    // probing so later requests can use a reachable member.
     let builder = wreq::Client::builder()
+        .connect_timeout(PROBE_TIMEOUT)
+        .timeout(PROBE_TIMEOUT)
         .redirect(wreq::redirect::Policy::none())
         .retry(wreq::retry::Policy::never())
         .no_proxy()
@@ -111,5 +116,20 @@ async fn proxy_reaches(proxy_url: &str, target: &str) -> bool {
             );
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn blackholed_independent_probe_finishes_without_timing_out_a_customer() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("socks5h://{}", listener.local_addr().unwrap());
+        let probe = tokio::spawn(async move { proxy_reaches(&proxy, "https://example.com").await });
+        let (_silent_socket, _) = listener.accept().await.unwrap();
+        tokio::time::advance(PROBE_TIMEOUT).await;
+        assert!(!probe.await.unwrap());
     }
 }
