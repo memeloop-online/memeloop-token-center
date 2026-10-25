@@ -1,10 +1,7 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::AtomicU64,
-    },
+    sync::{Arc, Mutex, atomic::AtomicU64},
     time::Duration,
 };
 
@@ -774,7 +771,7 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .values()
-            .filter_map(|entry| serde_json::to_value(&entry.snapshot).ok())
+            .filter_map(|entry| serde_json::to_value(entry.snapshot.as_ref()).ok())
             .collect()
     }
 

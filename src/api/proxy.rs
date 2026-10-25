@@ -1574,7 +1574,15 @@ async fn proxy_with_cancellation_guard(
                 )
                 .await;
             }
-            Err(ProxySendError::RetryableConnection(_) | ProxySendError::CandidateUnavailable) => {
+            Err(ProxySendError::RetryableConnection(stage)) => {
+                return finish_unavailable(
+                    &buffered_request,
+                    connection_stage_code(stage),
+                    last_dispatch,
+                )
+                .await;
+            }
+            Err(ProxySendError::CandidateUnavailable) => {
                 return finish_unavailable(&buffered_request, "upstream_connection", last_dispatch)
                     .await;
             }
@@ -2238,7 +2246,8 @@ impl ConversationBody {
             Self::InMemory(body) => memory.release_conversation_working_copies(body.len()),
             #[cfg(test)]
             Self::Spool(spool) => {
-                spool.release_retained();
+                // The test double still has to reread the retained bytes. Dropping
+                // them here made projection fail after the budget charge was released.
                 memory.release_source_backed_conversation_working_copies(spool.len())
             }
             Self::ProjectedSpool {
@@ -2534,6 +2543,7 @@ async fn execute_component_provider(
                 request_id = %request.request_id,
                 is_timeout = error.is_timeout(),
                 is_connect = error.is_connect(),
+                failure_code = reqwest_connection_code(&error),
                 "component provider upstream request failed"
             );
             if let Some(attempt) = upstream_attempt.as_mut() {
@@ -2551,7 +2561,8 @@ async fn execute_component_provider(
                     })
                     .await;
             }
-            return finish_component_provider_failure(&request, "upstream_connection").await;
+            return finish_component_provider_failure(&request, reqwest_connection_code(&error))
+                .await;
         }
     };
     let upstream_status = upstream.status();
@@ -2788,6 +2799,45 @@ async fn execute_component_provider(
         attempt.complete(UpstreamAttemptTerminal::Succeeded).await;
     }
     result
+}
+
+fn connection_stage_code(stage: &str) -> &'static str {
+    match stage {
+        "proxy_connect" => "proxy_connect_failed",
+        "dns" => "dns_resolution_failed",
+        "tls" => "tls_handshake_failed",
+        "connect" => "upstream_connect_failed",
+        _ => "upstream_connection",
+    }
+}
+
+fn reqwest_connection_code(error: &reqwest::Error) -> &'static str {
+    let mut stage = if error.is_connect() {
+        "upstream_connect_failed"
+    } else if error.is_timeout() {
+        "upstream_transport_timeout"
+    } else {
+        "upstream_connection"
+    };
+    let mut source = std::error::Error::source(error);
+    for _ in 0..16 {
+        let Some(current) = source else {
+            break;
+        };
+        let name = std::any::type_name_of_val(current);
+        if name.contains("TunnelError") {
+            return "proxy_connect_failed";
+        }
+        if name.contains("rustls") {
+            stage = "tls_handshake_failed";
+        } else if stage == "upstream_connect_failed"
+            && (name.contains("ResolveError") || name.contains("dns::"))
+        {
+            stage = "dns_resolution_failed";
+        }
+        source = current.source();
+    }
+    stage
 }
 
 async fn finish_component_provider_failure(

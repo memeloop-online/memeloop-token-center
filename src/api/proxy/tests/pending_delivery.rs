@@ -511,7 +511,7 @@ async fn terminal_only_output_survives_post_dispatch_delivery_and_terminal_sql_f
 
 #[tokio::test]
 async fn durable_receipt_recovers_after_worker_replacement_with_original_usage() {
-    let mut fixture = codex_route_fixture("pending-worker-recovery").await;
+    let fixture = codex_route_fixture("pending-worker-recovery").await;
     install_terminal_fault(&fixture).await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -734,7 +734,7 @@ async fn changed_operational_observation_is_not_retired_by_a_matching_financial_
 }
 
 async fn assert_committed_receipt_replay_preserves_owned_key(changed_field: Option<&str>) {
-    let mut fixture = codex_route_fixture("pending-ack-recovery").await;
+    let fixture = codex_route_fixture("pending-ack-recovery").await;
     let held = fixture
         .state
         .pending_terminals
@@ -802,7 +802,7 @@ async fn assert_committed_receipt_replay_preserves_owned_key(changed_field: Opti
 
 #[tokio::test]
 async fn already_finished_without_matching_receipt_ack_keeps_durable_evidence() {
-    let mut fixture = codex_route_fixture("pending-unmatched-terminal").await;
+    let fixture = codex_route_fixture("pending-unmatched-terminal").await;
     install_terminal_fault(&fixture).await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -1111,7 +1111,7 @@ async fn recovered_unknown_receipt_retries_operational_projection_without_replay
 }
 
 async fn unknown_failure_retries_operational_projection(restart: bool) {
-    let mut fixture = codex_route_fixture("pending-unknown-operational-retry").await;
+    let fixture = codex_route_fixture("pending-unknown-operational-retry").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query(
         "CREATE TRIGGER fail_unknown_operational BEFORE INSERT ON proxy_operational_terminals \
@@ -1162,7 +1162,7 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert!(!delivered.contains("response.completed"));
     assert!(!delivered.contains("PRIVATE_CANARY"));
-    let (receipt_id, original) = wait_for_receipt(&fixture).await;
+    let (_receipt_id, original) = wait_for_receipt(&fixture).await;
     let receipt_id = Uuid::parse_str(original["receipt_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while !fixture

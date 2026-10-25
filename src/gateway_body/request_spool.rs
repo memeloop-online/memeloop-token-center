@@ -293,6 +293,19 @@ impl RequestSpool {
     }
 }
 
+fn storage_exhausted(code: i32) -> bool {
+    #[cfg(unix)]
+    {
+        code == rustix::io::Errno::NOSPC.raw_os_error()
+            || code == rustix::io::Errno::DQUOT.raw_os_error()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = code;
+        false
+    }
+}
+
 fn spool_io_error(error: io::Error) -> RequestSpoolCaptureError {
     tracing::error!(
         error_kind = ?error.kind(),
@@ -300,12 +313,7 @@ fn spool_io_error(error: io::Error) -> RequestSpoolCaptureError {
         "local request spool I/O unavailable"
     );
     match error.raw_os_error() {
-        Some(code)
-            if code == rustix::io::Errno::NOSPC.raw_os_error()
-                || code == rustix::io::Errno::DQUOT.raw_os_error() =>
-        {
-            RequestSpoolCaptureError::StorageFull
-        }
+        Some(code) if storage_exhausted(code) => RequestSpoolCaptureError::StorageFull,
         _ => RequestSpoolCaptureError::Unavailable,
     }
 }
@@ -378,6 +386,7 @@ mod tests {
         assert_eq!(admission.snapshot().active_files, 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn filesystem_full_and_quota_errors_are_distinct_from_unavailable() {
         for errno in [rustix::io::Errno::NOSPC, rustix::io::Errno::DQUOT] {
