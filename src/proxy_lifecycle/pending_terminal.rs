@@ -1,7 +1,9 @@
 use std::{
     collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex, atomic::AtomicU64},
+    sync::{Arc, Mutex},
+    #[cfg(test)]
+    sync::atomic::AtomicU64,
     time::Duration,
 };
 
@@ -342,6 +344,7 @@ pub(crate) struct Journal {
     wake: Notify,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tasks: Mutex<Vec<(Work, tokio::task::JoinHandle<()>)>>,
+    #[cfg(test)]
     publication_failures: AtomicU64,
     #[cfg(test)]
     writer_gate: Arc<tokio::sync::Semaphore>,
@@ -370,6 +373,7 @@ impl Journal {
             wake: Notify::new(),
             worker: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
+            #[cfg(test)]
             publication_failures: AtomicU64::new(0),
             #[cfg(test)]
             writer_gate: Arc::new(tokio::sync::Semaphore::new(1)),
