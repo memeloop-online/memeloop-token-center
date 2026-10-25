@@ -9,7 +9,6 @@ pub(super) fn parse_cache_usage_contract(value: &Value) -> TokenUsage {
 pub(crate) use routing::RequestAttemptBudget as MediaAttemptBudget;
 pub(crate) use routing::{
     UpstreamAttemptGuard as MediaAttemptGuard, UpstreamAttemptTerminal as MediaAttemptTerminal,
-    current_gateway_failure_domain,
 };
 
 pub(crate) async fn classify_media_rate_limit(

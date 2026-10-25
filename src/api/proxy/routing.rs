@@ -18,8 +18,7 @@ mod route_types;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
 pub(super) use admission::{
-    AdmittedProxyRouteInput, DeferredSharedProbe, NextSendableProxyRouteInput,
-    prepare_admitted_proxy_route,
+    AdmittedProxyRouteInput, NextSendableProxyRouteInput, prepare_admitted_proxy_route,
 };
 pub(super) use candidates::{
     CandidatePreparationSummary, candidate_reservation_bounds, exhausted_candidate_error,
