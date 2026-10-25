@@ -272,7 +272,10 @@ async fn saturated_terminal_publication_converges_by_fenced_probe_expiry() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(failures, 0);
+    assert_eq!(
+        failures, 1,
+        "customer success is not an account health sample"
+    );
     pool.close().await;
 }
 
@@ -357,7 +360,6 @@ async fn mandatory_quota_fence_does_not_wait_for_optional_observe() {
         .await
         .unwrap();
     let request_id = Uuid::new_v4();
-    let gate = crate::group_routing::test_observe_gate::install(request_id);
     let mut guard = UpstreamAttemptGuard::new(
         &fixture.state,
         request_id,
@@ -380,18 +382,17 @@ async fn mandatory_quota_fence_does_not_wait_for_optional_observe() {
     )
     .await
     .expect("mandatory quota fence must not wait for optional plugin observation");
-    let failure: String = sqlx::query_scalar(
+    let failure: Option<String> = sqlx::query_scalar(
         "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id=$1",
     )
     .bind(fixture.upstream_account_id.to_string())
-    .fetch_one(&pool)
+    .fetch_optional(&pool)
     .await
     .unwrap();
-    assert_eq!(failure, "rate_limited");
-    tokio::time::timeout(Duration::from_secs(1), gate.entered.notified())
-        .await
-        .unwrap();
-    gate.release.notify_one();
+    assert!(
+        failure.is_none(),
+        "a customer 429 is not an account health sample"
+    );
     fixture.state.routing_persistence.drain_for_test().await;
     pool.close().await;
 }

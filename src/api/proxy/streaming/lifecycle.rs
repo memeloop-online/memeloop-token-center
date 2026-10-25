@@ -400,16 +400,40 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             lifecycle_deadline,
         ),
     );
-    if let Err(error) = state
+    // The response body is already delivered. A contended writer must not keep
+    // the proxy lifecycle slot; the same observation continues in the background.
+    let observation = state
         .pending_terminals
-        .record_operational_observation(&state.db, request_id)
-        .await
-    {
-        tracing::error!(
-            %request_id,
-            error_category = error.diagnostic_category(),
-            "runtime terminal was not durable before the stream handler returned"
-        );
+        .record_operational_observation(&state.db, request_id);
+    match tokio::time::timeout(std::time::Duration::from_millis(250), observation).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(
+                %request_id,
+                error_category = error.diagnostic_category(),
+                "runtime terminal was not durable before the stream handler returned"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                %request_id,
+                "operational observation exceeded the response lifecycle budget"
+            );
+            let pending = state.pending_terminals.clone();
+            let database = state.db.clone();
+            tokio::spawn(async move {
+                if let Err(error) = pending
+                    .record_operational_observation(&database, request_id)
+                    .await
+                {
+                    tracing::error!(
+                        %request_id,
+                        error_category = error.diagnostic_category(),
+                        "background operational observation failed"
+                    );
+                }
+            });
+        }
     }
     let attempt_terminal =
         match streaming_upstream_evidence(false, transport_error, sse_summary.as_ref(), error_code)
