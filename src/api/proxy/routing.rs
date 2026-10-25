@@ -44,7 +44,6 @@ pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,
 };
-pub(crate) use recovery_wait::wait as wait_media_recovery;
 pub(super) use route_types::{
     PlannedProxyRoute, PreparedProxyRoute, ProxyRequestContext, ProxyRoutePlanInput,
     ProxyRouteResponse, ProxySendError, TransportFailureKind,

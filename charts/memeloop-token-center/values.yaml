@@ -117,7 +117,7 @@ roles:
     podDisruptionBudget: { enabled: false, minAvailable: 1 }
 
 # Writable node-local directory for terminal journals. Request bodies are not
-# stored here; they stay in process memory until the upstream returns a byte.
+# stored here; they stay in process memory until the upstream response finishes.
 requestSpool:
   mountPath: /var/lib/memeloop-token-center/request-spool
   sizeLimit: 160Mi
@@ -134,7 +134,7 @@ config:
   # Count admission for readers without complete shared byte accounting.
   # Metered default text bodies use bytes; other readers retain 1..8192 permits.
   gatewayBodyReadConcurrency: 1024
-  # `/v1/responses` keeps the upload in memory until the upstream returns a byte.
+  # `/v1/responses` keeps the upload in memory until the upstream response finishes.
   responsesBodyMaxBytes: 33554432
   # Independent multipart ceiling for `/v1/audio/transcriptions`; changing it
   # does not widen `/v1/responses` or other text endpoints.

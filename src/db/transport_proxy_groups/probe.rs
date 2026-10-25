@@ -30,7 +30,7 @@ impl TransportProxyGroups {
             return true;
         }
         if let Some(entry) = self.groups.get(&account_id) {
-            requested(&entry);
+            requested(entry);
             return true;
         }
         false
@@ -102,13 +102,23 @@ impl TransportProxyGroups {
 
 async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> ProbeOutcome {
     let state = entry.state.load(Ordering::Acquire);
-    if state == 0 {
-        return ProbeOutcome::Skipped;
-    }
-    let snapshot = Snapshot::decode(state);
-    let Some(proxy) = entry.group.proxies.get(snapshot.selected).cloned() else {
+    let proxy = if state == 0 {
+        entry.group.proxies.first().cloned()
+    } else {
+        let snapshot = Snapshot::decode(state);
+        entry.group.proxies.get(snapshot.selected).cloned()
+    };
+    let Some(proxy) = proxy else {
         return ProbeOutcome::Skipped;
     };
+    if state == 0 {
+        for _ in 0..attempts {
+            if proxy_reaches(&proxy, target).await {
+                return ProbeOutcome::Reachable;
+            }
+        }
+        return ProbeOutcome::Unreachable;
+    }
     for _ in 0..attempts {
         if proxy_reaches(&proxy, target).await {
             return ProbeOutcome::Reachable;

@@ -205,10 +205,3 @@ pub(crate) async fn restore_selected(
     }));
     Ok(restored)
 }
-
-pub(crate) fn deadline(state: &AppState) -> Option<tokio::time::Instant> {
-    state
-        .group_routing
-        .as_ref()
-        .map(|snapshot| snapshot.deadline)
-}

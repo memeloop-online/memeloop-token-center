@@ -211,6 +211,11 @@ impl Database {
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND r.archived_at IS NULL AND a.status = 'active'
+               AND NOT EXISTS (
+                 SELECT 1 FROM upstream_service_probes service_probe
+                 WHERE service_probe.upstream_account_id = a.id
+                   AND service_probe.status <> 'healthy'
+               )
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $4 AND g.model_route_id = r.id)
                  OR EXISTS (

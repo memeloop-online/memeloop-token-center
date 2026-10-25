@@ -6,7 +6,7 @@ pub(super) fn parse_cache_usage_contract(value: &Value) -> TokenUsage {
         .unwrap()
         .unwrap()
 }
-pub(crate) use routing::{RequestAttemptBudget as MediaAttemptBudget, wait_media_recovery};
+pub(crate) use routing::RequestAttemptBudget as MediaAttemptBudget;
 pub(crate) use routing::{
     UpstreamAttemptGuard as MediaAttemptGuard, UpstreamAttemptTerminal as MediaAttemptTerminal,
     current_gateway_failure_domain,
@@ -61,9 +61,9 @@ use conversation_hints::{client_name, conversation_hints};
 use lifecycle::{finish_unavailable, run_bounded_proxy_lifecycle};
 use routing::{
     AdmittedProxyRouteInput, CandidatePreparationSummary, CodexRetryTerminal,
-    CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput, PlannedProxyRoute,
-    PreparedProxyRoute, PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput,
-    ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
+    CodexRetryTerminalGuard, NextSendableProxyRouteInput, PlannedProxyRoute, PreparedProxyRoute,
+    PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput, ProxySendError,
+    UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
     exhausted_candidate_error, materialize_proxy_route, next_planned_proxy_candidate,
     plan_proxy_route, prepare_admitted_proxy_route, prepared_input_reservation_bound,
     refresh_route_snapshot, retain_pinned_text_candidates, send_proxy_route,
@@ -254,7 +254,7 @@ async fn next_sendable_proxy_route(
     let strict_choice_count_is_incompatible = matches!(request.protocol, Protocol::OpenAiChat)
         && openai_chat_choice_count(request.request_json)? != 1;
     let mut summary = CandidatePreparationSummary::default();
-    let mut transient_candidate = None;
+    let transient_candidate = None;
     while let Some(mut planned) = match planned_candidate.take() {
         Some(planned) => Some(planned),
         None => {

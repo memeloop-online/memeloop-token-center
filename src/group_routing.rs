@@ -708,6 +708,7 @@ async fn prepare_inner(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn observe_with_signal(
     state: &AppState,
     request_id: Uuid,

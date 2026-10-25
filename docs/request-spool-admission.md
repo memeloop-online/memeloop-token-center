@@ -4,7 +4,8 @@ Responses and compact Responses uploads authenticate before body polling and kee
 the upload in process memory. Each request keeps its configured body-size
 ceiling; invalid declared sizes are rejected before the buffer is retained and
 received bytes are checked before copying. Uploads have no body deadline. The
-raw buffer is released when the upstream returns its first byte. Terminal
+raw buffer is released when the upstream response finishes, including a streamed
+response. Terminal
 conversation projection keeps the already parsed semantic JSON, not a second
 copy of the upload, and not a copy for retry.
 
@@ -39,9 +40,8 @@ work. This change introduces no new upload deadline or concurrency cutoff.
 Request bodies are not written there. The chart still caps that directory so a
 journal cannot fill the node, and that cap is what kubelet enforces. It is not
 an application admission budget for uploads. Memory admission remains the limit
-on how much upload data a process may retain. The retained bytes are released
-after the upstream returns its first byte, so a long generation does not keep
-the raw upload.
+on how much upload data a process may retain. The retained bytes stay until that
+response finishes, so a long generation keeps the raw upload for the whole reply.
 
 The optional `gateway_archive` database pool is independent of ingress spooling.
 Its bounded background capture can retain an archive gap on failure; this change

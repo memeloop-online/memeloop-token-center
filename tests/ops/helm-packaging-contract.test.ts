@@ -298,7 +298,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     for (const values of [
       ['roles.gateway.resources.limits.memory=767Mi'],
       ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.memory=767Mi'],
-      ['config.proxyMemoryBudgetBytes=805306369'],
+      ['config.proxyMemoryBudgetBytes=1879048193'],
     ]) {
       const result = spawnSync(helm, ['template', 'invalid-workload-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `memory cross-field gate accepted ${values.join(',')}`);

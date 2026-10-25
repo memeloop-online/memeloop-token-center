@@ -12,6 +12,7 @@ use std::{
 
 type ProbeKey = (Uuid, i64);
 
+#[cfg(test)]
 fn transient_sample_for_outcome(
     outcome: crate::plugin::routing::GroupRoutingOutcome,
 ) -> Option<bool> {
@@ -32,6 +33,7 @@ fn active_transient_keeps_breaker_closed(
     !signal.should_open(policy.min_samples, policy.open_micros)
 }
 
+#[cfg(test)]
 fn active_transient_defers_probe_recovery(
     policy: crate::plugin::routing::GroupRoutingTransientPolicy,
     signal: crate::plugin::routing::GroupRoutingTransientSignal,
@@ -1047,8 +1049,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             failure_stage,
             ..
         } = terminal
-        {
-            if let Err(error) = state
+            && let Err(error) = state
                 .db
                 .record_upstream_transport_diagnostic(crate::db::UpstreamTransportDiagnostic {
                     request_id,
@@ -1063,10 +1064,9 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                     failure_domain: &gateway_identity.failure_domain,
                 })
                 .await
-            {
-                state.routing_persistence.record_failure_gap();
-                tracing::warn!(%request_id, error_category = error.diagnostic_category(), "upstream transport observation could not be persisted");
-            }
+        {
+            state.routing_persistence.record_failure_gap();
+            tracing::warn!(%request_id, error_category = error.diagnostic_category(), "upstream transport observation could not be persisted");
         }
         let _ = (
             health,

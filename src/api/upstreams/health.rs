@@ -114,7 +114,7 @@ pub(crate) async fn run_upstream_service_probes(
         let now = unix_millis();
         let due = match state
             .db
-            .upstream_service_probes_due(now.saturating_sub(60_000), 4)
+            .upstream_service_probes_due(now.saturating_sub(60_000), 32)
             .await
         {
             Ok(due) => due,
@@ -126,10 +126,24 @@ pub(crate) async fn run_upstream_service_probes(
                 continue;
             }
         };
+        let mut inflight = tokio::task::JoinSet::new();
         for account_id in due {
+            let state = state.clone();
+            inflight.spawn(async move {
+                run_upstream_service_probe(&state, account_id).await;
+            });
+        }
+        while !inflight.is_empty() {
             tokio::select! { biased;
-                _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
-                _ = run_upstream_service_probe(&state, account_id) => {}
+                _ = crate::worker::wait_for_shutdown(&mut shutdown) => {
+                    inflight.abort_all();
+                    return;
+                }
+                joined = inflight.join_next() => {
+                    if joined.is_none() {
+                        break;
+                    }
+                }
             }
         }
     }
@@ -255,7 +269,7 @@ async fn upstream_service_probe_body(state: &AppState, account_id: Uuid) -> Valu
     let request = outbound
         .get(probe_url)
         .header(header::ACCEPT, "application/json")
-        .timeout(Duration::from_secs(30));
+        .timeout(Duration::from_secs(10));
     let request = if account.driver == "openai-codex" {
         let account_id = match crate::oauth::managed::codex::account_header_value(&credential) {
             Ok(account_id) => account_id,
