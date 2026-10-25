@@ -1,6 +1,7 @@
 //! Runtime completion is not permission to settle an unknown financial result.
-//! These writes run in the API's owned background responsibility, never as a
-//! prerequisite for delivering a response.
+//! The gateway writes this observation before returning a finished response so
+//! a delivered 502 cannot stay blank. Financial settlement stays asynchronous.
+use super::super::parse_uuid;
 use super::super::*;
 
 #[cfg(test)]
@@ -220,5 +221,89 @@ impl Database {
             receipt_id,
             operational_digest,
         })
+    }
+
+    /// A gateway that died after admitting a request stops renewing its owner
+    /// lease. Record that the connection is over so the list does not keep
+    /// showing the request as still running. Billing stays unknown.
+    pub(crate) async fn close_expired_proxy_owners(&self, limit: i64) -> Result<u64, AppError> {
+        let now = self
+            .request_owner_now(&mut *self.pool.acquire().await?)
+            .await?;
+        let rows = sqlx::query(
+            "SELECT p.request_id, p.tenant_id, p.key_id, p.account_id, p.reservation_id, p.owner_token, p.fence, p.contract_digest, p.contract_json, q.created_at FROM pending_proxy_settlements p JOIN request_records q ON q.id = p.request_id AND q.tenant_id = p.tenant_id AND q.key_id = p.key_id AND q.reservation_id = p.reservation_id WHERE p.state = 'pending' AND q.completed_at IS NULL AND q.proxy_owner_expires_at IS NOT NULL AND q.proxy_owner_expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = p.request_id AND o.reservation_id = p.reservation_id) ORDER BY q.proxy_owner_expires_at, p.request_id LIMIT $2",
+        )
+        .bind(now)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut closed = 0_u64;
+        for row in rows {
+            let request_id = parse_uuid(row.try_get("request_id")?)?;
+            let contract: serde_json::Value =
+                serde_json::from_str(&row.try_get::<String, _>("contract_json")?)
+                    .map_err(|_| AppError::Internal)?;
+            let claim = PendingProxySettlementClaim {
+                request_id,
+                tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+                key_id: parse_uuid(row.try_get("key_id")?)?,
+                account_id: parse_uuid(row.try_get("account_id")?)?,
+                reservation_id: parse_uuid(row.try_get("reservation_id")?)?,
+                owner_token: parse_uuid(row.try_get("owner_token")?)?,
+                fence: parse_uuid(row.try_get("fence")?)?,
+                contract_digest: row.try_get("contract_digest")?,
+                input_token_ceiling: contract
+                    .get("input_ceiling")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or(AppError::Internal)?,
+                output_token_ceiling: contract
+                    .get("output_ceiling")
+                    .and_then(serde_json::Value::as_i64)
+                    .ok_or(AppError::Internal)?,
+                requested_service_tier: contract
+                    .get("tier")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("default")
+                    .to_owned(),
+            };
+            let created_at: i64 = row.try_get("created_at")?;
+            let terminal = PendingProxyOperationalTerminal {
+                status_code: 502,
+                error_code: Some("gateway_owner_lost".to_owned()),
+                terminal_cause: None,
+                stage: Some("response_delivery".to_owned()),
+                completed_at: now.max(created_at),
+                duration_ms: now.saturating_sub(created_at).max(0),
+                first_output_ms: None,
+                generation_duration_ms: None,
+                response_object: format!("gap://{request_id}/response"),
+            };
+            let receipt_id = Uuid::now_v7();
+            match self
+                .record_pending_proxy_operational_terminal(
+                    &claim,
+                    receipt_id,
+                    &terminal,
+                    ProxyRequestUpstreamAttribution::KeepSelected,
+                )
+                .await
+            {
+                Ok(_) => {
+                    if self
+                        .mark_pending_proxy_settlement_unknown(&claim)
+                        .await
+                        .is_err()
+                    {
+                        tracing::error!(%request_id, "expired proxy owner terminal was recorded but its settlement remains unmarked");
+                    }
+                    closed += 1;
+                }
+                Err(AppError::Conflict(_)) => {}
+                Err(error) => {
+                    tracing::error!(%request_id, error_category = error.diagnostic_category(), "expired proxy owner could not be closed");
+                }
+            }
+        }
+        Ok(closed)
     }
 }

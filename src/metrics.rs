@@ -1185,7 +1185,7 @@ fn render_runtime(output: &mut String, runtime: &RuntimeMetrics) {
         }
     }
     output.push_str(
-        "# HELP memeloop_token_center_request_spool_bytes Bytes written to live process-local request spool files.\n",
+        "# HELP memeloop_token_center_request_spool_bytes Bytes retained in memory for live request uploads.\n",
     );
     output.push_str("# TYPE memeloop_token_center_request_spool_bytes gauge\n");
     let _ = writeln!(

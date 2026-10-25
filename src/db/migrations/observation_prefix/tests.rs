@@ -66,6 +66,9 @@ async fn conversion_contract(url: &str) {
         "DROP TABLE plugin_installer_network_snapshots",
         "DROP TABLE plugin_installer_network_preferences",
         "DROP TABLE pending_proxy_settlements",
+        "DROP TABLE upstream_service_probes",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_status",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_checked_at",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)

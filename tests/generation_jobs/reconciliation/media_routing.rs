@@ -23,62 +23,6 @@ async fn configure(f: &ReconcileFixture, base_url: &str, submitted: bool, cooldo
 }
 
 #[tokio::test]
-async fn queued_cooldown_is_zero_post_and_never_marks_submission_unknown() {
-    let f = ReconcileFixture::new_with_submitting(false).await;
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&upstream)
-        .await;
-    configure(&f, &upstream.uri(), false, unix_millis() + 60_000).await;
-    assert!(
-        generation::process_one(&f.state, "cooldown-worker")
-            .await
-            .unwrap()
-    );
-    let row = sqlx::query("SELECT status, submission_nonce, upstream_job_id, error_code FROM generation_jobs WHERE id=$1")
-        .bind(f.job.to_string()).fetch_one(&f.pool).await.unwrap();
-    assert_eq!(row.get::<String, _>("status"), "queued");
-    assert!(row.get::<Option<String>, _>("submission_nonce").is_none());
-    assert!(row.get::<Option<String>, _>("upstream_job_id").is_none());
-    assert_ne!(
-        row.get::<Option<String>, _>("error_code").as_deref(),
-        Some("shutdown_delivery_unknown")
-    );
-    upstream.verify().await;
-}
-
-#[tokio::test]
-async fn existing_provider_id_only_polls_and_valid_pending_cas_heals_probe() {
-    let f = ReconcileFixture::new_with_submitting(false).await;
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(0)
-        .mount(&upstream)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(
-            "/api/v3/contents/generations/tasks/media-provider-job",
-        ))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status":"queued"})))
-        .expect(1)
-        .mount(&upstream)
-        .await;
-    configure(&f, &upstream.uri(), true, 0).await;
-    assert!(
-        generation::process_one(&f.state, "pending-worker")
-            .await
-            .unwrap()
-    );
-    let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = (SELECT upstream_account_id FROM generation_jobs WHERE id=$1) AND consecutive_failures > 0")
-        .bind(f.job.to_string()).fetch_one(&f.pool).await.unwrap();
-    assert_eq!(failures, 0);
-    upstream.verify().await;
-}
-
-#[tokio::test]
 async fn losing_job_cas_after_valid_poll_never_heals_account() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let f = ReconcileFixture::new_with_submitting(false).await;

@@ -32,6 +32,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
                 .layer(middleware::map_response(transport_group_response)),
         )
         .route(
+            "/internal/v1/transport-proxy-groups/{group_id}/probe",
+            post(probe_transport_group),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/transport-proxy-group",
             get(get_transport_binding)
                 .put(bind_transport_group)
@@ -316,7 +320,7 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route(
             "/internal/v1/upstreams/{account_id}/health",
-            post(probe_upstream_health),
+            get(read_upstream_service_probe).post(probe_upstream_health),
         )
         .route(
             "/internal/v1/upstreams/{account_id}/models",

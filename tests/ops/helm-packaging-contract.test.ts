@@ -157,8 +157,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
-    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 1Gi/);
-    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 256Mi/);
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 2Gi/);
+    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
     count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: "\/var\/lib\/memeloop-token-center\/request-spool"/, 3);
@@ -298,7 +298,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     for (const values of [
       ['roles.gateway.resources.limits.memory=767Mi'],
       ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.memory=767Mi'],
-      ['config.proxyMemoryBudgetBytes=805306369'],
+      ['config.proxyMemoryBudgetBytes=1879048193'],
     ]) {
       const result = spawnSync(helm, ['template', 'invalid-workload-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `memory cross-field gate accepted ${values.join(',')}`);
@@ -317,13 +317,12 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     assert.equal(smallerSpool.status, 0, smallerSpool.stderr);
     assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
     for (const budget of ['268435456', '805306368']) {
-      const result = spawnSync(helm, ['template', 'invalid-body-memory-budget', chart,
+      const result = spawnSync(helm, ['template', 'body-memory-budget', chart,
         '--set', 'config.responsesBodyMaxBytes=67108864',
         '--set', `config.proxyMemoryBudgetBytes=${budget}`,
         '--set', 'roles.gateway.resources.limits.memory=1280Mi'],
       { cwd: repository, encoding: 'utf8', shell: false });
-      assert.notEqual(result.status, 0, '64Mi body accepted insufficient retained-memory headroom');
-      assert.match(result.stderr, /responsesBodyMaxBytes times 12 plus 1Mi/);
+      assert.equal(result.status, 0, `body size must not force a 12x memory budget: ${result.stderr}`);
     }
 
     if (process.env.KUBECONFORM_BIN) {

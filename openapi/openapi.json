@@ -4912,6 +4912,56 @@
       }
     },
     "/internal/v1/upstreams/{account_id}/health": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "readUpstreamProviderHealth",
+        "summary": "Read the latest independent upstream service probe",
+        "description": "Returns the stored result of the periodic or manually requested service\nprobe. Customer requests do not update this result. `null` means no probe\nhas completed yet.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored probe, or null when none has completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/UpstreamHealthResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
       "post": {
         "tags": [
           "Upstream providers"
@@ -5189,6 +5239,67 @@
           },
           "503": {
             "description": "Configuration storage temporarily unavailable."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxy-groups/{group_id}/probe": {
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "probeTransportProxyGroup",
+        "summary": "Queue an independent reachability probe for a proxy group",
+        "description": "Marks the group's current exits for the next independent probe. The probe\nuses its own connection and does not carry a customer request. The stored\nverdict is visible on the group after that probe finishes.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Probe requested for the accounts currently bound in this process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "requested_accounts"
+                  ],
+                  "properties": {
+                    "requested_accounts": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
@@ -16261,6 +16372,32 @@
           },
           "bound_account_count": {
             "type": "integer"
+          },
+          "probe_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "probe_attempts": {
+            "type": "integer"
+          },
+          "last_probe_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "healthy",
+              "unhealthy",
+              null
+            ]
+          },
+          "last_probe_checked_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "created_at": {
             "type": "integer"
