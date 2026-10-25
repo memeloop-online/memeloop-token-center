@@ -98,7 +98,12 @@ async fn http2_failure_upstream(
                                         .body(())
                                         .unwrap();
                                     let mut body = response.send_response(headers, false).unwrap();
-                                    body.send_reset(http2::Reason::CANCEL);
+                                    // Let the connection driver flush the headers before
+                                    // resetting the body, rather than cancelling queued headers.
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                        body.send_reset(http2::Reason::CANCEL);
+                                    });
                                 }
                                 Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset | Failure::RejectedFinalReset => {
                                     let headers = http::Response::builder()

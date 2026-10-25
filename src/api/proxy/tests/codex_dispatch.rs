@@ -514,7 +514,7 @@ async fn dispatch_queue_timeout_and_capacity_have_no_durable_admission_side_effe
 }
 
 #[tokio::test]
-async fn connect_retry_and_classified_400_replay_hold_one_dispatch_permit() {
+async fn classified_400_replay_holds_one_dispatch_permit() {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -546,14 +546,11 @@ async fn connect_retry_and_classified_400_replay_hold_one_dispatch_permit() {
         .expect(2)
         .mount(&upstream)
         .await;
-    let response = routing::with_test_pre_delivery_connect_failures(
-        1,
-        send_codex_route(
-            &fixture,
-            &upstream,
-            "/v1/responses",
-            json!({"model": fixture.model, "input": "retry", "stream": false}),
-        ),
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "retry", "stream": false}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);

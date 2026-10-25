@@ -31,8 +31,10 @@ test('proxy group copy explains choices and uncertain saves without permission-s
   assert.equal(english.candidate(1), 'Network exit 1');
   assert.equal(english.groupSummary('Research', 1, 1), 'Research · 1 exit · 1 account');
   assert.equal(english.groupSummary('Research', 2, 0), 'Research · 2 exits · 0 accounts');
-  assert.match(chinese.purpose, /优先沿用当前出口/);
-  assert.match(english.purpose, /current exit stays selected/);
+  assert.match(chinese.purpose, /请求继续使用当前出口/);
+  assert.match(chinese.purpose, /独立可达性探测/);
+  assert.match(english.purpose, /Requests keep the current exit/);
+  assert.match(english.purpose, /separate reachability probe/);
   assert.match(chinese.closePending, /关闭不会取消保存/);
   assert.match(english.closePending, /Closing does not cancel the save/);
   for (const copy of [chinese, english]) {

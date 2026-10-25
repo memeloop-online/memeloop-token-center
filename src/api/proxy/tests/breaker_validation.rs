@@ -84,9 +84,6 @@ async fn ordinary_client_error_does_not_cool_down_a_shared_account() {
 
 #[tokio::test]
 async fn codex_connect_failure_does_not_replay_and_keeps_transport_observation() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("memeloop_token_center=info")
-        .try_init();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(

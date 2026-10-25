@@ -324,7 +324,7 @@ async fn managed_binding_stamp_reaches_send_stage_without_bad_request() {
 }
 
 #[tokio::test]
-async fn connection_failures_visit_each_group_member_once() {
+async fn connection_failure_keeps_sticky_member_without_replaying() {
     let fixture = fixture("sticky-group-connect").await;
     let first = selection(&fixture).await;
     let (response, remaining) = routing::with_test_send_failures(
@@ -344,10 +344,9 @@ async fn connection_failures_visit_each_group_member_once() {
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert_eq!(remaining, 0);
+    assert_eq!(remaining, 1, "a customer POST must not rotate and replay");
     let selected = selection(&fixture).await;
-    assert_eq!(selected.0, BACKUP);
-    assert_eq!(selected.1, first.1 + 1);
+    assert_eq!(selected, first);
 }
 
 #[tokio::test]
