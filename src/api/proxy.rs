@@ -719,19 +719,16 @@ async fn execute_component_primary(
     }
     // A customer request does not wait on, or become, an account health probe.
     let _ = recovery_wait_deadline;
-    let admission = UpstreamAttemptAdmission::Observed;
-    let upstream_attempt = match admission {
-        admission => Some(UpstreamAttemptGuard::new(
-            request.state,
-            request.request_id,
-            primary.route.route_id,
-            primary.route.account_id,
-            primary.route.credential_generation,
-            primary.route.transport_revision,
-            admission,
-            None,
-        )),
-    };
+    let upstream_attempt = Some(UpstreamAttemptGuard::new(
+        request.state,
+        request.request_id,
+        primary.route.route_id,
+        primary.route.account_id,
+        primary.route.credential_generation,
+        primary.route.transport_revision,
+        UpstreamAttemptAdmission::Observed,
+        None,
+    ));
     let mut active_route = match materialize_proxy_route(request.state, primary).await {
         Ok(prepared) => prepared,
         Err(_) => return finish_proxy_failure(&request, "provider_candidate_invalid").await,
