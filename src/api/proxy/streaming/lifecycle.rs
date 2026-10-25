@@ -386,6 +386,9 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             "upstream_response_body"
         },
     );
+    if let Some(conversation) = conversation.as_ref() {
+        conversation.release_retained_upload();
+    }
     state.pending_terminals.submit_with_preparation(
         snapshot,
         memory.clone(),
@@ -397,6 +400,17 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             lifecycle_deadline,
         ),
     );
+    if let Err(error) = state
+        .pending_terminals
+        .record_operational_observation(&state.db, request_id)
+        .await
+    {
+        tracing::error!(
+            %request_id,
+            error_category = error.diagnostic_category(),
+            "runtime terminal was not durable before the stream handler returned"
+        );
+    }
     let attempt_terminal =
         match streaming_upstream_evidence(false, transport_error, sse_summary.as_ref(), error_code)
         {

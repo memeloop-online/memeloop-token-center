@@ -1,11 +1,12 @@
 # Responses request spool ownership
 
-Responses and compact Responses uploads authenticate before body polling and use
-anonymous node-local temporary files. Each request keeps its configured body-size
-ceiling; invalid declared sizes are rejected before file creation and received
-bytes are checked before writing. Uploads have no body deadline. Files remain
-available for terminal conversation projection and close when their last owner
-and any outstanding blocking file operation finish.
+Responses and compact Responses uploads authenticate before body polling and keep
+the upload in process memory. Each request keeps its configured body-size
+ceiling; invalid declared sizes are rejected before the buffer is retained and
+received bytes are checked before copying. Uploads have no body deadline. The
+raw buffer is released when the upstream returns its first byte. Terminal
+conversation projection keeps the already parsed semantic JSON, not a second
+copy of the upload, and not a copy for retry.
 
 There is no aggregate logical disk-byte admission budget. The retired
 `MTC_RESPONSES_REQUEST_SPOOL_BYTES` environment variable is no longer read and the
@@ -21,11 +22,10 @@ introduced. Helm override files require an explicit migration deleting
 an exposed setting that no longer controls admission.
 
 `memeloop_token_center_request_spool_bytes{measure="used"}` counts bytes
-successfully written to live spool files, including partial captures. It does
-not count promised upload lengths, filesystem allocation blocks, or RSS. Active
-file telemetry counts successfully opened files, including files retained by
-blocking tasks after cancellation. The old synthetic limit and capacity-rejection
-metric series are removed.
+retained in memory for live uploads, including partial captures. It does not
+count promised upload lengths or RSS. Active-buffer telemetry counts opened
+uploads, including buffers retained by a blocking copy after cancellation. The
+old synthetic limit and capacity-rejection metric series are removed.
 
 The spool still charges metadata, a 64 KiB write-copy allowance, and each retained
 transport frame to the existing proxy RAM budget. Each request awaits its
@@ -35,14 +35,13 @@ The existing RAM checks can still reject requests; fair RAM waiting, oversized
 transport-frame allocation, and whole-process memory accounting are separate
 work. This change introduces no new upload deadline or concurrency cutoff.
 
-Use disk-backed storage for `requestSpool.mountPath`. The chart retains its real
-`requestSpool.sizeLimit` and ephemeral-storage resource validation. Those settings
-are deployment storage limits, not application admission counters or guarantees
-of available filesystem space. Real ENOSPC and EDQUOT errors fail closed with
-HTTP 503, `request_spool_storage_full`, and `Retry-After: 1`; other file I/O errors
-remain `request_spool_unavailable`. No RAM fallback is used. Anonymous-file
-cleanup, symlink rejection and digest verification remain in place. A tmpfs
-mount would consume memory despite the separate logical RAM accounting.
+`requestSpool.mountPath` is only the writable directory for terminal journals.
+Request bodies are not written there. The chart still caps that directory so a
+journal cannot fill the node, and that cap is what kubelet enforces. It is not
+an application admission budget for uploads. Memory admission remains the limit
+on how much upload data a process may retain. The retained bytes are released
+after the upstream returns its first byte, so a long generation does not keep
+the raw upload.
 
 The optional `gateway_archive` database pool is independent of ingress spooling.
 Its bounded background capture can retain an archive gap on failure; this change

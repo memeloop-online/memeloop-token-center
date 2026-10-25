@@ -2239,15 +2239,19 @@ impl ConversationBody {
             Self::InMemory(body) => memory.release_conversation_working_copies(body.len()),
             #[cfg(test)]
             Self::Spool(spool) => {
+                spool.release_retained();
                 memory.release_source_backed_conversation_working_copies(spool.len())
             }
             Self::ProjectedSpool {
                 spool,
                 retained_bytes,
                 ..
-            } => memory.release_source_backed_conversation_working_copies(
-                spool.len().saturating_sub(*retained_bytes),
-            ),
+            } => {
+                spool.release_retained();
+                memory.release_source_backed_conversation_working_copies(
+                    spool.len().saturating_sub(*retained_bytes),
+                )
+            }
         }
     }
 }
@@ -2290,6 +2294,15 @@ impl ProxyConversation {
 
     fn release_working_copies(&self, memory: &crate::gateway_body::memory::ProxyMemoryReservation) {
         self.request_body.release_working_copies(memory);
+    }
+
+    fn release_retained_upload(&self) {
+        match &self.request_body {
+            ConversationBody::InMemory(_) => {}
+            #[cfg(test)]
+            ConversationBody::Spool(spool) => spool.release_retained(),
+            ConversationBody::ProjectedSpool { spool, .. } => spool.release_retained(),
+        }
     }
 
     fn reject_projection(&self) {
@@ -3028,6 +3041,9 @@ async fn finish_buffered_request_before_deadline(
         BufferedResponseStorage::InlineLocalJson(stored_response) => (Some(stored_response), false),
         BufferedResponseStorage::Omit => (None, false),
     };
+    if let Some(conversation) = request.conversation.as_ref() {
+        conversation.release_retained_upload();
+    }
     let request_id = request.request_id;
     let (usage, mut usage_basis) = usage;
     let usage = match crate::db::normalize_proxy_usage_with_output_limit(
@@ -3106,6 +3122,18 @@ async fn finish_buffered_request_before_deadline(
             projection_deadline,
         ),
     );
+    if let Err(error) = request
+        .state
+        .pending_terminals
+        .record_operational_observation(&request.state.db, request_id)
+        .await
+    {
+        tracing::error!(
+            %request_id,
+            error_category = error.diagnostic_category(),
+            "runtime terminal was not durable before the client response returned"
+        );
+    }
     if archive_response {
         persistence::capture(
             request.state,

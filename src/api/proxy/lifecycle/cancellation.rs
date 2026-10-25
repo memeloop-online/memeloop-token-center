@@ -149,6 +149,22 @@ impl Drop for CancellationGuard {
                 owner.stage,
             );
             let _ = owner.pending.attach_activity(request_id, permit);
+            let pending = owner.pending.clone();
+            let database = owner.database.clone();
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(async move {
+                    if let Err(error) = pending
+                        .record_operational_observation(&database, request_id)
+                        .await
+                    {
+                        tracing::error!(
+                            %request_id,
+                            error_category = error.diagnostic_category(),
+                            "cancelled request terminal was not durable"
+                        );
+                    }
+                });
+            }
             return;
         }
         let duration_ms = owner.context.elapsed_millis_at(Instant::now());
