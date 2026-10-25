@@ -18,7 +18,7 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
   try {
     const page = await browser.newPage();
     page.on('pageerror', error => context.diagnostic(error.message));
-    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.addInitScript(() => { if (!localStorage.getItem('mtc-locale')) localStorage.setItem('mtc-locale', 'en'); });
     const writes: Record<string, any>[] = [];
     let catalogReads = 0;
     await page.route('**/internal/v1/**', async route => {
@@ -36,6 +36,8 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     const picker = page.getByRole('combobox', { name: 'Group routing strategy' });
     assert.equal(await page.locator('.group-strategy-editor form').count(), 0, 'native ordering has no empty configuration form');
     await picker.selectOption('weighted');
+    assert.equal(await picker.locator('option:checked').innerText(), 'Weighted distribution');
+    await page.getByText('Distribute requests by configured weights for members with different capacities.', { exact: true }).waitFor();
     const factor = page.getByLabel('Weight factor', { exact: false });
     assert.equal(await factor.inputValue(), '3');
     assert.equal(await page.locator('.group-strategy-editor textarea').count(), 0);
@@ -63,6 +65,14 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     await page.getByRole('button', { name: 'Save group strategy' }).click();
     await page.waitForFunction(() => document.querySelector('.group-strategy-editor [role="status"]')?.textContent === 'Group strategy saved');
     assert.equal(writes[2].routing_strategy, null);
+    await page.evaluate(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    await page.goto(base);
+    const chinesePicker = page.getByRole('combobox', { name: '组路由策略', exact: true });
+    await chinesePicker.selectOption('weighted');
+    assert.equal(await chinesePicker.locator('option:checked').innerText(), '加权分配');
+    await page.getByText('按配置的权重分配请求，适合容量不同的成员。', { exact: true }).waitFor();
+    assert.equal((await page.locator('.group-strategy-editor').innerText()).includes('group-routing-v1'), false);
+    await page.evaluate(() => localStorage.setItem('mtc-locale', 'en'));
     const readsBefore = catalogReads;
     await page.goto(`${base}?kind=credential`);
     await page.getByRole('heading', { name: 'Credential groups' }).waitFor();

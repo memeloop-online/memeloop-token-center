@@ -1284,8 +1284,8 @@ function RouteFields({ token, tenant, draft, existingSelection, upstreams, provi
 
 function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers, renderModelRouteActions }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[]; renderModelRouteActions?: (route: ModelRouteView) => ReactNode }) {
   const routePageSize = 100;
-  const maximumFocusedRoutePages = 100;
   const { locale, t } = useI18n();
+  const [modelSearch, setModelSearch] = useState('');
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
   const [credentials, setCredentials] = useState<KeyView[]>([]);
@@ -1313,7 +1313,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
   scopeRef.current = { token, tenant, writeTenant };
   const upstreamsRef = useRef(upstreams);
   upstreamsRef.current = upstreams;
-  const load = async (requestedFocusRouteId = '') => {
+  const load = async () => {
     loadAbort.current?.abort();
     const controller = new AbortController();
     loadAbort.current = controller;
@@ -1328,7 +1328,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       const visitedCursors = new Set<string>();
       let beforeCreatedAt: number | undefined;
       let beforeId: string | undefined;
-      for (let pageIndex = 0; pageIndex < maximumFocusedRoutePages; pageIndex += 1) {
+      for (;;) {
         const routeQuery = new URLSearchParams({ limit: String(routePageSize) });
         if (beforeCreatedAt !== undefined && beforeId) {
           routeQuery.set('before_created_at', String(beforeCreatedAt));
@@ -1336,7 +1336,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
         }
         const page = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant, routeQuery.toString())}`, loadToken, { signal: controller.signal });
         nextRoutes.push(...page);
-        if (!requestedFocusRouteId || page.some((route) => route.id === requestedFocusRouteId) || page.length < routePageSize) break;
+        if (page.length < routePageSize) break;
         const last = page.at(-1);
         if (!last || !Number.isSafeInteger(last.created_at) || !last.id) throw new Error(t('providerCatalog.routesIncomplete'));
         const cursor = `${last.created_at}\u0000${last.id}`;
@@ -1344,7 +1344,6 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
         visitedCursors.add(cursor);
         beforeCreatedAt = last.created_at;
         beforeId = last.id;
-        if (pageIndex === maximumFocusedRoutePages - 1) throw new Error(t('providerCatalog.routesIncomplete'));
       }
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       setRoutes(nextRoutes); setError('');
@@ -1389,10 +1388,11 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     }
     const focus = canUsePrefill ? '' : consumeRouteFocus(writeTenant) ?? '';
     setFocusRouteId(focus);
-    void load(focus);
+    void load();
     return () => { loadAbort.current?.abort(); credentialLoadAbort.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('model-routes', tenant, routes, (route) => route.enabled);
+  const matchingRoutes = statusFilter.values.filter(route => `${route.public_model} ${route.upstream_model}`.toLocaleLowerCase(locale).includes(modelSearch.trim().toLocaleLowerCase(locale)));
   useEffect(() => {
     if (focusRouteId && routes.some((route) => route.id === focusRouteId && !route.enabled) && !statusFilter.showInactive) {
       statusFilter.setSelection('all');
@@ -1485,8 +1485,11 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
   };
-  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="management-layout">
-    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div ref={successNotice} tabIndex={-1} className="notice success" role="status">{message}</div>}<div className="table-scroll"><table className="model-route-list"><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{statusFilter.values.map((route) => <tr key={route.id} tabIndex={focusRouteId === route.id ? -1 : undefined} data-route-id={route.id} className={focusRouteId === route.id ? 'route-focus' : undefined}>{!tenant && <td><code>{tenantDisplayName(route.tenant_external_id ?? '—', locale)}</code></td>}<td><code className="route-model-name">{route.public_model}</code></td><td><RouteListSource route={route} groups={providerGroups.groups} accounts={upstreams} /></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code className="route-model-name">{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('routes.archive')}</button>{renderModelRouteActions?.(route)}</div></td></tr>)}</tbody></table>{statusFilter.values.length === 0 && <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />}</div>
+  return <>{confirmationDialog}<WriteScopeNotice tenant={writeTenant} /><section className="routing-group-managers">
+    <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
+    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={credentialRouteOptions(routes.filter(canManage), scopedUpstreams, providers, locale)} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
+  </section><section className="management-layout">
+    <article className="panel"><div className="panel-title"><div><h2>{t('routes.title')}</h2><p className="muted">{t('routes.description')}</p></div><ResourceListStatusFilterControl filter={statusFilter} inactiveLabel={t('resourceList.inactive')} /></div>{error && <div className="notice error" role="alert">{error}</div>}{providerGroups.error && <div className="notice error" role="alert">{providerGroups.error}</div>}{routeGroups.error && <div className="notice error" role="alert">{routeGroups.error}</div>}{credentialError && <div className="notice error" role="alert">{credentialError}</div>}{message && <div ref={successNotice} tabIndex={-1} className="notice success" role="status">{message}</div>}<label>{t('routes.searchModels')}<Input type="search" value={modelSearch} onChange={event => setModelSearch(event.target.value)} /></label><div className="table-scroll"><table className="model-route-list"><thead><tr>{!tenant && <th>{t('credentials.tenant')}</th>}<th>{t('routes.publicModel')}</th><th>{t('routes.upstream')}</th><th>{t('routes.groups')}</th><th>{t('routes.upstreamModel')}</th><th>{t('routes.protocol')}</th><th>{t('routes.priority')}</th><th>{t('request.status')}</th><th>{t('routes.actions')}</th></tr></thead><tbody>{matchingRoutes.map((route) => <tr key={route.id} tabIndex={focusRouteId === route.id ? -1 : undefined} data-route-id={route.id} className={focusRouteId === route.id ? 'route-focus' : undefined}>{!tenant && <td><code>{tenantDisplayName(route.tenant_external_id ?? '—', locale)}</code></td>}<td><code className="route-model-name">{route.public_model}</code></td><td><RouteListSource route={route} groups={providerGroups.groups} accounts={upstreams} /></td><td><div className="table-chip-list">{(route.route_group_ids ?? []).map((id) => <span key={id}>{routeGroups.groups.find((value) => value.id === id)?.name ?? id}</span>)}</div></td><td><code className="route-model-name">{route.upstream_model}</code></td><td>{route.protocol}</td><td>{formatNumber(route.priority, locale)}</td><td><span className={`status ${route.enabled ? 'ok' : 'pending'}`}>{route.enabled ? t('common.enabled') : t('common.disabled')}</span></td><td><div className="row-actions"><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => beginEdit(route)}>{t('routes.edit')}</button><button type="button" className="secondary" disabled={busy === route.id || !canManage(route)} onClick={() => void setEnabled(route, !route.enabled)}>{route.enabled ? t('routes.disable') : t('routes.enable')}</button><button type="button" className="danger" title={route.enabled ? t('routes.disableBeforeDelete') : undefined} disabled={busy === route.id || !canManage(route) || route.enabled} onClick={() => void remove(route)}>{t('routes.archive')}</button>{renderModelRouteActions?.(route)}</div></td></tr>)}</tbody></table>{matchingRoutes.length === 0 && (modelSearch.trim() ? <div className="empty">{t('routes.noModelMatches')}</div> : <ResourceListStatusEmpty totalCount={statusFilter.totalCount} normalLabel={t('common.enabled')} empty={t('routes.empty')} />)}</div>
     </article>
     <CreateJourney title={editing ? t('routes.editTitle', { model: editing.public_model }) : t('routes.createTitle')} description={t('routes.description')} open={workspaceOpen} busy={Boolean(busy)} onOpenChange={(open) => { setWorkspaceOpen(open); if (!open) setEditing(undefined); }} onOpen={() => { setCredentialsRequested(true); setMessage(''); }}>
       {message && workspaceOpen && <div className="notice success" role="status">{message}</div>}
@@ -1494,9 +1497,6 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       <RouteFields key={editing?.id ?? 'create'} token={token} tenant={writeTenant} draft={editing ? editForm : form} existingSelection={Boolean(editing)} upstreams={scopedUpstreams} providers={providers} providerGroups={providerGroups.groups} routeGroups={routeGroups.groups} credentials={credentials} onChange={editing ? setEditForm : setForm} onCatalogValidity={(valid, allowCustom) => editing ? setEditCatalog({ valid, allowCustom }) : setFormCatalog({ valid, allowCustom })} />
       <div className="journey-actions"><p>{t('routes.description')}</p><Button appearance="primary" type="button" disabled={Boolean(busy) || !canSubmit(editing ? editForm : form, editing ? editCatalog.valid : formCatalog.valid)} onClick={() => void (editing ? saveEdit() : createRoute())}>{t(editing ? 'common.save' : 'routes.create')}</Button></div>
     </CreateJourney>
-  </section><section className="routing-group-managers">
-    <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
-    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={credentialRouteOptions(routes.filter(canManage), scopedUpstreams, providers, locale)} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
   </section></>;
 }
 

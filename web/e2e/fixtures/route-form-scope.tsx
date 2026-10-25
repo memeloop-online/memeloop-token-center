@@ -18,6 +18,16 @@ const routes: Array<Record<string, unknown>> = parameters.has('existing') ? [{
   upstream_account_ids: ['personal'], included_provider_group_ids: [], excluded_provider_group_ids: [], route_group_ids: ['group-personal'], granted_credential_ids: [exactId],
   custom_model_confirmed: parameters.get('confirmed') === 'true', enabled: true, grant_revision: 7, created_at: 1, updated_at: 42,
 }] : [];
+if (parameters.has('paged')) {
+  routes.push(...Array.from({ length: 101 }, (_, index) => ({
+    id: `route-${index}`, tenant_external_id: 'fixture',
+    public_model: index === 100 ? 'Kimi K3 (256K)' : `Model ${index}`,
+    upstream_model: index === 100 ? 'kimi-k3-256k' : `model-${index}`,
+    upstream_account_ids: ['personal'], candidate_upstream_account_ids: ['personal'],
+    route_group_ids: [], protocol: 'openai', priority: 0, enabled: true,
+    created_at: 1000 - index, updated_at: 1,
+  })));
+}
 function json(value: unknown, status = 200) { return new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } }); }
 window.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
@@ -32,7 +42,12 @@ window.fetch = async (input, init) => {
   }
   if (url.pathname === '/internal/v1/provider-types') return json([{ id: driver, display_name: driver === 'openai-codex' ? 'Codex' : 'Kimi Code', protocols: ['openai'] }]);
   if (url.pathname === '/internal/v1/upstreams') return json(accounts);
-  if (url.pathname === '/internal/v1/model-routes') return json(routes);
+  if (url.pathname === '/internal/v1/model-routes') {
+    const cursor = url.searchParams.get('before_id');
+    const start = cursor ? routes.findIndex(route => route.id === cursor) + 1 : 0;
+    return json(routes.slice(start, start + Number(url.searchParams.get('limit') || 100)));
+  }
+  if (url.pathname === '/internal/v1/plugins/group-routing-strategies') return json([]);
   if (url.pathname === '/internal/v1/provider-groups') return json(parameters.has('groups') ? [
     { id: 'custom-providers', tenant_external_id: 'fixture', name: '自定义供应商组', member_ids: ['personal', 'team'], member_count: 2, created_at: 1, updated_at: 1 },
     { id: 'excluded-providers', tenant_external_id: 'fixture', name: '排除团队', member_ids: ['team'], member_count: 1, created_at: 1, updated_at: 1 },

@@ -6,6 +6,7 @@ import { localizeSchema, useI18n } from '../i18n';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator } from '../safeValidator';
 import type { GroupView } from '../types';
+import { groupStrategyCopy } from './groupStrategyCopy';
 
 export interface GroupRoutingStrategyOption {
   id: string;
@@ -95,9 +96,10 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onS
     }}>{t('common.retry')}</button>}
     <label>{t('groups.strategy')}<select disabled={saving} value={pluginId} onChange={event => { setPluginId(event.target.value); setConfig(catalog.find(value => value.id === event.target.value)?.default ?? {}); setMessage(''); }}>
       <option value="">{t('groups.strategyNative')}</option>
-      {pluginId && !option && <option value={pluginId} disabled>{pluginId} — {t('groups.strategyUnavailable')}</option>}
-      {catalog.map(value => <option key={value.id} value={value.id}>{value.id}</option>)}
+      {pluginId && !option && <option value={pluginId} disabled>{t('groups.strategyUnavailable')}</option>}
+      {catalog.map(value => <option key={value.id} value={value.id}>{groupStrategyCopy(value.id, value.schema, locale).name}</option>)}
     </select></label>
+    {option && <p className="muted">{groupStrategyCopy(option.id, option.schema, locale).description}</p>}
     {pluginId && !option && !loading && <p role="alert">{t('groups.strategyUnavailable')}</p>}
     <label>{t('groups.strategyPriority')}<input type="number" step="1" min={-2147483648} max={2147483647} value={priority} disabled={saving} onChange={event => setPriority(event.target.value)} /></label>
     <p className="muted">{t('groups.strategyPriorityHelp')}</p>
