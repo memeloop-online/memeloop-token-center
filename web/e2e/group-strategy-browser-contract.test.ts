@@ -25,7 +25,11 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
       const url = route.request().url();
       if (url.endsWith('/plugins/group-routing-strategies')) {
         catalogReads++;
-        await route.fulfill({ json: [{ id: 'weighted', version: 'group-routing-v1', default: { factor: 3 }, schema: { type: 'object', required: ['factor'], properties: { factor: { type: 'integer', title: 'Weight factor', minimum: 1 } } } }] });
+        await route.fulfill({ json: [
+          { id: 'weighted', version: 'group-routing-v1', default: { factor: 3 }, schema: { type: 'object', required: ['factor'], properties: { factor: { type: 'integer', title: 'Weight factor', minimum: 1 } } } },
+          { id: 'mtc-preferred-account', version: 'group-routing-v1', default: {}, schema: { type: 'object', properties: {} } },
+          { id: 'mtc-soonest-reset', version: 'group-routing-v1', default: {}, schema: { type: 'object', properties: {} } },
+        ] });
       } else if (route.request().method() === 'PUT') {
         writes.push(route.request().postDataJSON());
         await route.fulfill(writes.length === 1 ? { status: 409, json: { error: { message: 'conflict' } } } : { json: { id: 'group', name: 'Group', member_ids: [], member_count: 0, created_at: 1, updated_at: 4, strategy_version: 5 } });
@@ -70,6 +74,8 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     const chinesePicker = page.getByRole('combobox', { name: '组路由策略', exact: true });
     await chinesePicker.selectOption('weighted');
     assert.equal(await chinesePicker.locator('option:checked').innerText(), '加权分配');
+    assert.equal(await chinesePicker.locator('option[value="mtc-preferred-account"]').innerText(), '优先指定账号');
+    assert.equal(await chinesePicker.locator('option[value="mtc-soonest-reset"]').innerText(), '额度较早重置优先');
     await page.getByText('按配置的权重分配请求，适合容量不同的成员。', { exact: true }).waitFor();
     assert.equal((await page.locator('.group-strategy-editor').innerText()).includes('group-routing-v1'), false);
     await page.evaluate(() => localStorage.setItem('mtc-locale', 'en'));
