@@ -1,9 +1,9 @@
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
-    #[cfg(test)]
-    sync::atomic::AtomicU64,
     time::Duration,
 };
 
