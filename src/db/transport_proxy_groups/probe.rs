@@ -1,16 +1,42 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use sqlx::AnyPool;
+
 use super::{Entry, Snapshot, TransportProxyGroups};
 use crate::db::unix_millis;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
+enum ProbeOutcome {
+    Reachable,
+    Unreachable,
+    Skipped,
+}
+
 impl TransportProxyGroups {
     /// Probe configured exits on their own connection. A customer request never
     /// waits for this and never supplies the verdict.
-    pub(crate) fn spawn_due_probes(&self) {
+    pub(crate) fn request_account_probe(&self, account_id: uuid::Uuid) -> bool {
+        let requested = |entry: &Entry| {
+            entry.probe_requested.store(true, Ordering::Release);
+        };
+        if let Ok(managed) = self.managed.read()
+            && let Some(item) = managed.get(&account_id)
+            && let Some(entry) = &item.entry
+        {
+            requested(entry);
+            return true;
+        }
+        if let Some(entry) = self.groups.get(&account_id) {
+            requested(&entry);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn spawn_due_probes(&self, pool: &AnyPool) {
         let Ok(managed) = self.managed.read() else {
             return;
         };
@@ -39,38 +65,57 @@ impl TransportProxyGroups {
             }
             entry.probe_requested.store(false, Ordering::Release);
             let attempts = entry.probe_attempts.load(Ordering::Acquire).clamp(1, 8);
+            let pool = pool.clone();
+            let account_id = entry.group.account_id;
             tokio::spawn(async move {
-                let switched = probe_current_member(&entry, &url, attempts).await;
+                let outcome = probe_current_member(&entry, &url, attempts).await;
                 entry
                     .last_probe_millis
                     .store(unix_millis().max(0) as u64, Ordering::Release);
                 entry.probe_inflight.store(false, Ordering::Release);
-                if switched {
-                    tracing::info!(
-                        account_id = %entry.group.account_id,
-                        "independent proxy probe moved the sticky exit"
-                    );
+                let status = match outcome {
+                    ProbeOutcome::Reachable => "healthy",
+                    ProbeOutcome::Unreachable => {
+                        tracing::info!(
+                            %account_id,
+                            "independent proxy probe moved the sticky exit"
+                        );
+                        "unhealthy"
+                    }
+                    ProbeOutcome::Skipped => return,
+                };
+                if let Err(error) = sqlx::query(
+                    "UPDATE transport_proxy_groups SET last_probe_status = $1, last_probe_checked_at = $2 WHERE id = (SELECT group_id FROM transport_proxy_bindings WHERE account_id = $3)",
+                )
+                .bind(status)
+                .bind(unix_millis())
+                .bind(account_id.to_string())
+                .execute(&pool)
+                .await
+                {
+                    tracing::warn!(%account_id, %error, "independent proxy probe result was not stored");
                 }
             });
         }
     }
 }
 
-async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> bool {
+async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> ProbeOutcome {
     let state = entry.state.load(Ordering::Acquire);
     if state == 0 {
-        return false;
+        return ProbeOutcome::Skipped;
     }
     let snapshot = Snapshot::decode(state);
     let Some(proxy) = entry.group.proxies.get(snapshot.selected).cloned() else {
-        return false;
+        return ProbeOutcome::Skipped;
     };
     for _ in 0..attempts {
         if proxy_reaches(&proxy, target).await {
-            return false;
+            return ProbeOutcome::Reachable;
         }
     }
-    entry.advance_after_probe(state)
+    entry.advance_after_probe(state);
+    ProbeOutcome::Unreachable
 }
 
 /// Any HTTP response means the proxy reached the configured address. Only a

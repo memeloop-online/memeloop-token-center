@@ -194,6 +194,8 @@ pub(super) fn view(row: &AnyRow, tenant_external_id: &str, key: &[u8]) -> Result
         "members":members, "bound_account_count":row.try_get::<i64,_>("bound_account_count")?,
         "probe_url":row.try_get::<Option<String>,_>("probe_url")?,
         "probe_attempts":row.try_get::<i64,_>("probe_attempts")?,
+        "last_probe_status":row.try_get::<Option<String>,_>("last_probe_status")?,
+        "last_probe_checked_at":row.try_get::<Option<i64>,_>("last_probe_checked_at")?,
         "created_at":row.try_get::<i64,_>("created_at")?,"updated_at":row.try_get::<i64,_>("updated_at")?
     }))
 }

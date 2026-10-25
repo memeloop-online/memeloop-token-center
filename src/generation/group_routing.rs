@@ -129,35 +129,10 @@ pub(crate) async fn admit(
     {
         return Err(AppError::Forbidden);
     }
-    let admission = if let Some((allow_probe, cooldown_ms)) =
-        policy.and_then(|policy| policy.transient_probe_controls())
-    {
-        state
-            .db
-            .claim_upstream_account_attempt_at_revision_with_strategy(
-                tenant_id,
-                route.account_id,
-                route.credential_generation,
-                route.transport_revision,
-                state.config.upstream_health,
-                allow_probe,
-                Some(cooldown_ms),
-                false,
-                Some(crate::api::current_gateway_failure_domain()),
-            )
-            .await?
-    } else {
-        state
-            .db
-            .claim_upstream_account_attempt_at_revision_with_health_config(
-                route.account_id,
-                route.credential_generation,
-                route.transport_revision,
-                state.config.upstream_health,
-                Some(crate::api::current_gateway_failure_domain()),
-            )
-            .await?
-    };
+    let _ = policy;
+    // A customer generation uses the selected account. Account health comes
+    // only from the independent service probe, never from this request.
+    let admission = UpstreamAttemptAdmission::Observed;
     match admission {
         UpstreamAttemptAdmission::Unavailable {
             transient_wait_eligible: true,

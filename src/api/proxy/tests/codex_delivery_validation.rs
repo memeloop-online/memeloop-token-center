@@ -500,18 +500,17 @@ async fn streaming_codex_rejects_usage_without_canonical_total_after_delivery() 
     .expect("streaming lifecycle must finish before upstream health is inspected");
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let health = sqlx::query(
-        "SELECT consecutive_failures, last_failure_kind
-         FROM upstream_account_health WHERE upstream_account_id = $1",
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(health.get::<i64, _>("consecutive_failures"), 1);
     assert_eq!(
-        health.get::<String, _>("last_failure_kind"),
-        "invalid_response"
+        health_rows, 0,
+        "invalid usage is request evidence, not an account health sample"
     );
     pool.close().await;
     upstream.verify().await;

@@ -24,27 +24,6 @@ fn health_probe_transport_error(
     }
 }
 
-fn suppressed_health_body(
-    account_id: Uuid,
-    failure: &str,
-    retry_at: i64,
-    checked_at: i64,
-) -> Value {
-    let error_code = match failure {
-        "quota_exhausted" => "quota_exhausted",
-        "rate_limited" => "rate_limited",
-        _ => "upstream_unavailable",
-    };
-    json!({
-        "account_id": account_id,
-        "status": "unhealthy",
-        "error_code": error_code,
-        "retry_at": retry_at,
-        "source": "routing_state",
-        "checked_at": checked_at
-    })
-}
-
 fn upstream_health_probe_url(driver: &str, config: &Value, base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
     match driver {
@@ -94,64 +73,139 @@ pub(in crate::api) async fn probe_upstream_health(
         require_service_tenant(&service, tenant)?;
         state.db.require_upstream_tenant(account_id, tenant).await?;
     }
-    let account_driver = state.db.upstream_driver(account_id).await?;
+    Ok(Json(run_upstream_service_probe(&state, account_id).await))
+}
+
+pub(in crate::api) async fn read_upstream_service_probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<ManagementTenantQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    if let Some(tenant) = query
+        .tenant_external_id
+        .as_deref()
+        .or(service.tenant_external_id.as_deref())
+    {
+        require_service_tenant(&service, tenant)?;
+        state.db.require_upstream_tenant(account_id, tenant).await?;
+    }
+    Ok(Json(
+        state
+            .db
+            .upstream_service_probe(account_id)
+            .await?
+            .unwrap_or(Value::Null),
+    ))
+}
+
+pub(crate) async fn run_upstream_service_probes(
+    state: crate::AppState,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticks = tokio::time::interval(Duration::from_secs(60));
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! { biased;
+            _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
+            _ = ticks.tick() => {}
+        }
+        let now = unix_millis();
+        let due = match state
+            .db
+            .upstream_service_probes_due(now.saturating_sub(60_000), 4)
+            .await
+        {
+            Ok(due) => due,
+            Err(error) => {
+                tracing::warn!(
+                    error_category = error.diagnostic_category(),
+                    "upstream service probe schedule failed"
+                );
+                continue;
+            }
+        };
+        for account_id in due {
+            tokio::select! { biased;
+                _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
+                _ = run_upstream_service_probe(&state, account_id) => {}
+            }
+        }
+    }
+}
+
+async fn run_upstream_service_probe(state: &AppState, account_id: Uuid) -> Value {
+    let body = upstream_service_probe_body(state, account_id).await;
+    if let Err(error) = state
+        .db
+        .store_upstream_service_probe(account_id, &body)
+        .await
+    {
+        tracing::warn!(%account_id, error_category = error.diagnostic_category(), "upstream service probe result was not stored");
+    }
+    body
+}
+
+async fn upstream_service_probe_body(state: &AppState, account_id: Uuid) -> Value {
+    let account_driver = match state.db.upstream_driver(account_id).await {
+        Ok(driver) => driver,
+        Err(_) => {
+            return json!({"account_id": account_id, "status": "unhealthy", "error_code": "health_state_unavailable", "source": "connection_probe", "checked_at": unix_millis()});
+        }
+    };
     if !state.providers.is_public(&account_driver) {
-        return Ok(Json(json!({
+        return json!({
             "account_id": account_id,
             "status": "unhealthy",
             "error_code": "provider_retired",
             "checked_at": unix_millis()
-        })));
+        });
     }
-    let (account, credential) = state
+    let (account, credential) = match state
         .db
         .upstream_account_with_credential(account_id, state.config.key_pepper.as_bytes())
-        .await?;
+        .await
+    {
+        Ok(loaded) => loaded,
+        Err(_) => {
+            return json!({
+                "account_id": account_id,
+                "status": "unhealthy",
+                "error_code": "health_state_unavailable",
+                "source": "connection_probe",
+                "checked_at": unix_millis()
+            });
+        }
+    };
     if credential.validate(unix_millis()).is_err() {
-        return Ok(Json(json!({
+        return json!({
             "account_id": account_id,
             "status": "unhealthy",
             "error_code": "credential_invalid",
             "checked_at": unix_millis()
-        })));
-    }
-    let checked_at = unix_millis();
-    match state
-        .db
-        .upstream_manual_health_suppression(account_id, account.credential_generation, checked_at)
-        .await
-    {
-        Ok(Some((failure, retry_at))) => {
-            return Ok(Json(suppressed_health_body(
-                account_id, &failure, retry_at, checked_at,
-            )));
-        }
-        Ok(None) => {}
-        Err(_) => {
-            // Do not send a probe when the current-generation routing state
-            // cannot be read: it may be suppressing traffic after a quota or
-            // capacity failure. The response is deliberately detail-free.
-            return Ok(Json(json!({
-                "account_id": account_id,
-                "status": "unhealthy",
-                "error_code": "health_state_unavailable",
-                "source": "local_state",
-                "checked_at": checked_at
-            })));
-        }
+        });
     }
     let credential = if account.driver == "openai-codex"
         || crate::oauth::authorization_code::supports_managed_transport(&credential)
     {
-        state
-            .transport_proxy_groups
-            .select_config(
-                account.id,
-                account.credential_generation,
-                &credential,
-                &account.config,
-            )?
-            .credential
+        match state.transport_proxy_groups.select_config(
+            account.id,
+            account.credential_generation,
+            &credential,
+            &account.config,
+        ) {
+            Ok(selected) => selected.credential,
+            Err(_) => {
+                return json!({
+                    "account_id": account_id,
+                    "status": "unhealthy",
+                    "error_code": "destination_invalid",
+                    "source": "connection_probe",
+                    "checked_at": unix_millis()
+                });
+            }
+        }
     } else {
         credential
     };
@@ -159,12 +213,12 @@ pub(in crate::api) async fn probe_upstream_health(
     let base_url = match validate_config(&account.config) {
         Ok(base_url) => base_url,
         Err(_) => {
-            return Ok(Json(json!({
+            return json!({
                 "account_id": account_id,
                 "status": "unhealthy",
                 "error_code": "destination_invalid",
                 "checked_at": unix_millis()
-            })));
+            });
         }
     };
     let outbound = match if account.driver == "openai-codex" {
@@ -188,12 +242,12 @@ pub(in crate::api) async fn probe_upstream_health(
     } {
         Ok(client) => client,
         Err(_) => {
-            return Ok(Json(json!({
+            return json!({
                 "account_id": account_id,
                 "status": "unhealthy",
                 "error_code": "destination_invalid",
                 "checked_at": unix_millis()
-            })));
+            });
         }
     };
     let probe_url = upstream_health_probe_url(&account.driver, &account.config, &base_url);
@@ -201,17 +255,17 @@ pub(in crate::api) async fn probe_upstream_health(
     let request = outbound
         .get(probe_url)
         .header(header::ACCEPT, "application/json")
-        .timeout(Duration::from_secs(5));
+        .timeout(Duration::from_secs(30));
     let request = if account.driver == "openai-codex" {
         let account_id = match crate::oauth::managed::codex::account_header_value(&credential) {
             Ok(account_id) => account_id,
             Err(_) => {
-                return Ok(Json(json!({
+                return json!({
                     "account_id": account_id,
                     "status": "unhealthy",
                     "error_code": "credential_invalid",
                     "checked_at": unix_millis()
-                })));
+                });
             }
         };
         request
@@ -225,12 +279,12 @@ pub(in crate::api) async fn probe_upstream_health(
     let request = match credential.apply(request, unix_millis()) {
         Ok(request) => request,
         Err(_) => {
-            return Ok(Json(json!({
+            return json!({
                 "account_id": account_id,
                 "status": "unhealthy",
                 "error_code": "credential_invalid",
                 "checked_at": unix_millis()
-            })));
+            });
         }
     };
     let response = request.send().await;
@@ -247,43 +301,8 @@ pub(in crate::api) async fn probe_upstream_health(
             } else {
                 health_probe_error(&account.driver, upstream_status)
             };
-            if error_code.is_none() {
-                // A request that began while the account was healthy can race
-                // with a routed generation failure. Re-read the same account
-                // and credential generation before reporting healthy; this
-                // never acquires a lease or changes the breaker.
-                let completed_at = unix_millis();
-                match state
-                    .db
-                    .upstream_manual_health_suppression(
-                        account_id,
-                        account.credential_generation,
-                        completed_at,
-                    )
-                    .await
-                {
-                    Ok(Some((failure, retry_at))) => {
-                        return Ok(Json(suppressed_health_body(
-                            account_id,
-                            &failure,
-                            retry_at,
-                            completed_at,
-                        )));
-                    }
-                    Ok(None) => {}
-                    Err(_) => {
-                        return Ok(Json(json!({
-                            "account_id": account_id,
-                            "status": "unhealthy",
-                            "error_code": "health_state_unavailable",
-                            "source": "local_state",
-                            "checked_at": completed_at
-                        })));
-                    }
-                }
-            }
             let healthy = error_code.is_none();
-            Ok(Json(json!({
+            json!({
                 "account_id": account_id,
                 "status": if healthy { "healthy" } else { "unhealthy" },
                 "error_code": error_code,
@@ -291,9 +310,9 @@ pub(in crate::api) async fn probe_upstream_health(
                 "upstream_status": upstream_status.as_u16(),
                 "latency_ms": latency_ms,
                 "checked_at": checked_at
-            })))
+            })
         }
-        Err(error) => Ok(Json(json!({
+        Err(error) => json!({
             "account_id": account_id,
             "status": "unhealthy",
             "error_code": health_probe_transport_error(
@@ -303,7 +322,7 @@ pub(in crate::api) async fn probe_upstream_health(
             ),
             "latency_ms": latency_ms,
             "checked_at": checked_at
-        }))),
+        }),
     }
 }
 

@@ -1607,14 +1607,15 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
     assert!(!body.contains("transient upstream detail must stay private"));
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let failure_kind: String = sqlx::query_scalar(
-        "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
+    let health_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_account_health
+         WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     )
     .bind(fixture.upstream_account_id.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(failure_kind, "unavailable");
+    assert_eq!(health_rows, 0);
     let actual: String = sqlx::query_scalar(
         "SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1",
     )
@@ -1634,9 +1635,9 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
 
 #[tokio::test]
 async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
-    for (label, second_status, failure_kind) in [
-        ("429", StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
-        ("5xx", StatusCode::BAD_GATEWAY, "unavailable"),
+    for (label, second_status) in [
+        ("429", StatusCode::TOO_MANY_REQUESTS),
+        ("5xx", StatusCode::BAD_GATEWAY),
     ] {
         let fixture_name = format!("retry-then-{label}-failover");
         let fixture = codex_route_fixture(&fixture_name).await;
@@ -1750,14 +1751,15 @@ async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
             fixture.route_id
         };
         fixture.state.routing_persistence.drain_for_test().await;
-        let actual_failure: String = sqlx::query_scalar(
-            "SELECT last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1",
+        let health_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_account_health
+             WHERE upstream_account_id = $1 AND consecutive_failures > 0",
         )
         .bind(fixture.upstream_account_id.to_string())
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(actual_failure, failure_kind, "{label}");
+        assert_eq!(health_rows, 0, "{label}");
         pool.close().await;
         if should_failover {
             assert_exactly_once_side_effects_for(

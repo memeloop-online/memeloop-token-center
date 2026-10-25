@@ -343,6 +343,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
           <Field label={copy.probeUrl}><Input maxLength={200} value={probeUrl} onChange={(_, data) => setProbeUrl(data.value)} placeholder="https://example.com/" /></Field>
           <Field label={copy.probeAttempts}><Input type="number" required min={1} max={8} value={probeAttempts} onChange={(_, data) => setProbeAttempts(data.value)} /></Field>
           <p>{copy.probeHint}</p>
+          {editing && editing.last_probe_checked_at ? <p>{copy.lastProbe(editing.last_probe_status ?? '', new Date(editing.last_probe_checked_at).toLocaleString(locale))}</p> : null}
           {requiresReplacement && <Field label={copy.replacement} required>
             <Select value={replacement} onChange={event => setReplacement(event.target.value)} required>
               <option value="">{copy.selectSavedMember}</option>
@@ -352,6 +353,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
           </Field>}
           <div className="button-row">
             <Button type="submit" appearance="primary" disabled={!name.trim() || !validMembers || !validProbe || requiresReplacement && !replacement}>{copy.save}</Button>
+            {editing?.id ? <Button type="button" disabled={busy || !editing?.probe_url} onClick={() => { const groupId = editing?.id; if (!groupId) return; void mutate(async () => { await request(`${transportProxyGroupsPath}/${encodeURIComponent(groupId)}/probe${query}`, { method: 'POST' }); }, copy.probeQueued); }}>{copy.probeNow}</Button> : null}
             <Button type="button" onClick={async () => { if (await confirm(copy.discardEdit)) { setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); } }}>{copy.cancelEdit}</Button>
           </div>
         </FormSection>

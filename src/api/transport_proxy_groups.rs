@@ -132,6 +132,41 @@ pub(super) async fn get_transport_group(
     )
 }
 
+pub(super) async fn probe_transport_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(query): Query<TenantQuery>,
+) -> axum::response::Response {
+    response(
+        async {
+            authority(&headers, &state, &query.tenant_external_id).await?;
+            state
+                .db
+                .get_transport_group(
+                    id,
+                    &query.tenant_external_id,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await?;
+            let accounts = state.db.transport_group_bound_accounts(id).await?;
+            let requested = accounts
+                .iter()
+                .filter(|account| {
+                    state
+                        .transport_proxy_groups
+                        .request_account_probe(**account)
+                })
+                .count();
+            Ok((
+                StatusCode::ACCEPTED,
+                serde_json::json!({ "requested_accounts": requested }),
+            ))
+        }
+        .await,
+    )
+}
+
 pub(super) async fn create_transport_group(
     State(state): State<AppState>,
     headers: HeaderMap,

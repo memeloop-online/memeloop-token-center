@@ -227,6 +227,17 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [busy, setBusy] = useState('');
   const providerList = useRef<HTMLElement>(null);
   const [health, setHealth] = useState<Record<string, UpstreamHealth>>({});
+  useEffect(() => {
+    if (!token || !workspaceAccountId) return;
+    let cancelled = false;
+    void api<UpstreamHealth | null>(`/internal/v1/upstreams/${workspaceAccountId}/health${queryForTenant(writeTenant)}`, token)
+      .then(result => {
+        if (cancelled || !result?.checked_at) return;
+        setHealth(current => ({ ...current, [workspaceAccountId]: result }));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [token, writeTenant, workspaceAccountId]);
   const [deletionReadiness, setDeletionReadiness] = useState<Record<string, UpstreamDeletionReadiness>>({});
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');

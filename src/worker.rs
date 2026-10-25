@@ -211,6 +211,12 @@ pub async fn run_until_shutdown_with_oauth_stop(
         crate::upstream_quota::observations::run(quota_state, quota_shutdown).await;
         "quota_observations"
     });
+    let probe_state = state.clone();
+    let probe_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        crate::api::run_upstream_service_probes(probe_state, probe_shutdown).await;
+        "upstream_service_probes"
+    });
 
     macro_rules! periodic {
         ($name:literal, $period:expr, $operation:expr) => {{

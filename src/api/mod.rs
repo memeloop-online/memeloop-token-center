@@ -89,6 +89,7 @@ mod traffic;
 mod transport_proxy_groups;
 mod upstreams;
 use transport_proxy_groups::*;
+pub(crate) use upstreams::run_upstream_service_probes;
 mod usage_analysis;
 mod web;
 

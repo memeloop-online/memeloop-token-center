@@ -109,6 +109,7 @@ pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
 mod upstream_quota_reset;
+mod upstream_service_probes;
 mod usage_analysis;
 mod validation;
 
