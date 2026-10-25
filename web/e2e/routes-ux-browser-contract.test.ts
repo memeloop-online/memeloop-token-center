@@ -28,7 +28,7 @@ test('route groups precede the catalog and model search includes later authorize
         return Boolean(managers.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING);
       });
       assert.equal(beforeList, true);
-      const members = page.locator('[data-group-kind="route"]').getByRole('combobox');
+      const members = page.locator('[data-group-kind="route"]').getByRole('combobox', { name: '路由成员', exact: true });
       await members.fill('kimi-k3-256k');
       const choice = page.getByRole('option').filter({ hasText: 'Kimi K3 (256K)' });
       await choice.waitFor();
