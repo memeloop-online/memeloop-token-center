@@ -47,11 +47,11 @@ impl RequestAttemptBudget {
         let policy =
             crate::provider::CodexTransportPolicy::parse(route.config.get("transport_policy"))
                 .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?;
+        // The stored failover clock is not a dispatch gate. A forward ends when
+        // the upstream answers, the client cancels, or the socket fails.
         let budget = Self {
             max_attempts: policy.candidate_attempts,
-            deadline_window: Some(std::time::Duration::from_millis(
-                policy.failover_deadline_millis,
-            )),
+            deadline_window: None,
             deadline: None,
             version: policy.version,
         };
@@ -87,19 +87,14 @@ impl RequestAttemptBudget {
             policy_source = source,
             policy_version = self.version,
             candidate_attempts = self.max_attempts,
-            failover_deadline_enabled = deadline_millis.is_some(),
+            failover_deadline_enabled = false,
             failover_deadline_millis = deadline_millis.unwrap_or(0),
             "proxy request attempt budget frozen"
         );
     }
 
     pub(in crate::api::proxy) fn terminal_reason(&self, attempts: usize) -> Option<&'static str> {
-        if self
-            .deadline
-            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-        {
-            Some("upstream_failover_deadline")
-        } else if attempts >= self.max_attempts {
+        if attempts >= self.max_attempts {
             Some("upstream_attempts_exhausted")
         } else {
             None
@@ -114,13 +109,7 @@ impl RequestAttemptBudget {
     where
         F: std::future::Future<Output = Result<ProxyRouteResponse, ProxySendError>>,
     {
-        if !wait_for_compaction
-            && self
-                .deadline
-                .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-        {
-            return Err(ProxySendError::OuterDeadline);
-        }
+        let _ = (wait_for_compaction, self.deadline);
         send.await
     }
 }
@@ -192,7 +181,7 @@ mod tests {
                     RequestAttemptBudget::from_primary(&route(driver, policy), Uuid::from_u128(3))
                         .unwrap();
                 assert_eq!(budget.max_attempts, attempts);
-                assert_eq!(budget.deadline_window.is_some(), deadline != 0);
+                assert!(budget.deadline_window.is_none());
                 assert!(budget.deadline.is_none());
             });
             let bytes = log.0.lock().unwrap();
@@ -201,7 +190,7 @@ mod tests {
             assert_eq!(fields["policy_source"], source);
             assert_eq!(fields["candidate_attempts"], attempts);
             assert_eq!(fields["failover_deadline_millis"], deadline);
-            assert_eq!(fields["failover_deadline_enabled"], deadline != 0);
+            assert_eq!(fields["failover_deadline_enabled"], false);
             assert_eq!(fields["policy_version"], 1);
             assert_eq!(fields["transport_revision"], 42);
             assert_eq!(fields["credential_generation"], 7);
@@ -232,10 +221,7 @@ mod tests {
             Some("upstream_attempts_exhausted")
         );
         tokio::time::advance(std::time::Duration::from_millis(1000)).await;
-        assert_eq!(
-            budget.terminal_reason(0),
-            Some("upstream_failover_deadline")
-        );
+        assert_eq!(budget.terminal_reason(0), None);
         let next = RequestAttemptBudget::from_primary(&primary, Uuid::from_u128(4)).unwrap();
         assert_eq!(next.max_attempts, 8);
         assert_eq!(next.terminal_reason(1), None);
@@ -290,15 +276,21 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(1)).await;
         let result = budget
             .send(
-                async { panic!("expired selection must not dispatch") },
+                async {
+                    Err(ProxySendError::NonRetryableTransport(
+                        TransportFailureKind::Request,
+                    ))
+                },
                 false,
             )
             .await;
-        assert!(matches!(result, Err(ProxySendError::OuterDeadline)));
-        assert_eq!(
-            budget.terminal_reason(1),
-            Some("upstream_failover_deadline")
-        );
+        assert!(matches!(
+            result,
+            Err(ProxySendError::NonRetryableTransport(
+                TransportFailureKind::Request
+            ))
+        ));
+        assert_eq!(budget.terminal_reason(1), None);
     }
 
     #[tokio::test(start_paused = true)]
@@ -328,14 +320,23 @@ mod tests {
             ))
         );
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(310));
-        assert_eq!(
-            budget.terminal_reason(1),
-            Some("upstream_failover_deadline")
-        );
+        assert_eq!(budget.terminal_reason(1), None);
         let result = budget
-            .send(async { panic!("expired selection must not replay") }, false)
+            .send(
+                async {
+                    Err(ProxySendError::NonRetryableTransport(
+                        TransportFailureKind::Request,
+                    ))
+                },
+                false,
+            )
             .await;
-        assert!(matches!(result, Err(ProxySendError::OuterDeadline)));
+        assert!(matches!(
+            result,
+            Err(ProxySendError::NonRetryableTransport(
+                TransportFailureKind::Request
+            ))
+        ));
     }
 
     #[tokio::test(start_paused = true)]
@@ -381,15 +382,15 @@ mod tests {
         assert_eq!(budget.terminal_reason(0), None);
 
         budget.arm();
-        let armed = budget.deadline.unwrap();
+        assert!(budget.deadline.is_none());
         tokio::time::advance(std::time::Duration::from_millis(500)).await;
         budget.arm();
-        assert_eq!(budget.deadline, Some(armed), "arming is one-shot");
+        assert!(
+            budget.deadline.is_none(),
+            "a stored failover clock is not armed"
+        );
         assert_eq!(budget.terminal_reason(0), None);
         tokio::time::advance(std::time::Duration::from_millis(500)).await;
-        assert_eq!(
-            budget.terminal_reason(0),
-            Some("upstream_failover_deadline")
-        );
+        assert_eq!(budget.terminal_reason(0), None);
     }
 }

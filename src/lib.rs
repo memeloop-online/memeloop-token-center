@@ -456,8 +456,12 @@ fn codex_http_client_builder(
         policy,
         keep_alive_interval,
     );
+    // No connect timeout and no kernel TCP user timeout. A stored
+    // connect_timeout_millis is not a socket deadline. The forward ends when
+    // the upstream answers, the client cancels, or the socket itself fails.
+    // wreq would otherwise force-close a Linux socket after 30s without an ACK
+    // and probe TCP keepalive every 15s. HTTP/2 keepalive remains.
     let builder = wreq::Client::builder()
-        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.
@@ -467,7 +471,12 @@ fn codex_http_client_builder(
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
-        .http2_options(http2_options);
+        .http2_options(http2_options)
+        .tcp_keepalive(None::<Duration>)
+        .tcp_keepalive_interval(None::<Duration>)
+        .tcp_keepalive_retries(None::<u32>);
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(None::<Duration>);
     match policy.http_protocol {
         provider::CodexHttpProtocol::ProviderDefault => builder,
         provider::CodexHttpProtocol::Http1Only => builder.http1_only(),

@@ -21,6 +21,10 @@ pub(crate) struct CreateGroup {
     pub tenant_external_id: String,
     pub name: String,
     pub members: Vec<MemberInput>,
+    #[serde(default)]
+    pub probe_url: Option<String>,
+    #[serde(default)]
+    pub probe_attempts: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -31,6 +35,10 @@ pub(crate) struct UpdateGroup {
     pub name: String,
     pub members: Vec<MemberInput>,
     pub replacement_member_id: Option<Uuid>,
+    #[serde(default)]
+    pub probe_url: Option<String>,
+    #[serde(default)]
+    pub probe_attempts: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +156,33 @@ pub(super) fn members(
     Ok(output)
 }
 
+pub(crate) fn probe_settings(
+    url: Option<String>,
+    attempts: Option<u8>,
+) -> Result<(Option<String>, i64), AppError> {
+    let attempts = i64::from(attempts.unwrap_or(2));
+    if !(1..=8).contains(&attempts) {
+        return Err(invalid());
+    }
+    let url = url.and_then(|value| {
+        let trimmed = value.trim().to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    });
+    if let Some(url) = &url {
+        if url.len() > 200 {
+            return Err(invalid());
+        }
+        let parsed = url::Url::parse(url).map_err(|_| invalid())?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || parsed.host_str().is_none()
+            || !parsed.username().is_empty()
+        {
+            return Err(invalid());
+        }
+    }
+    Ok((url, attempts))
+}
+
 pub(super) fn view(row: &AnyRow, tenant_external_id: &str, key: &[u8]) -> Result<Value, AppError> {
     let members = open_members(row, key)?.into_iter().map(|member| {
         let parsed = url::Url::parse(&member.proxy_url).map_err(|_| AppError::Internal)?;
@@ -157,6 +192,8 @@ pub(super) fn view(row: &AnyRow, tenant_external_id: &str, key: &[u8]) -> Result
         "id":row.try_get::<String,_>("id")?, "tenant_external_id":tenant_external_id,
         "name":row.try_get::<String,_>("name")?, "version":row.try_get::<i64,_>("version")?,
         "members":members, "bound_account_count":row.try_get::<i64,_>("bound_account_count")?,
+        "probe_url":row.try_get::<Option<String>,_>("probe_url")?,
+        "probe_attempts":row.try_get::<i64,_>("probe_attempts")?,
         "created_at":row.try_get::<i64,_>("created_at")?,"updated_at":row.try_get::<i64,_>("updated_at")?
     }))
 }

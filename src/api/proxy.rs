@@ -281,7 +281,9 @@ async fn next_sendable_proxy_route(
             );
             continue;
         }
-        if refresh_route_snapshot(state, &mut planned.route).await? != PreparedRouteReadiness::Ready
+        if !codex_transport::is_driver(&planned.route.driver)
+            && refresh_route_snapshot(state, &mut planned.route).await?
+                != PreparedRouteReadiness::Ready
         {
             tracing::warn!(
                 %request_id,
@@ -324,7 +326,11 @@ async fn next_sendable_proxy_route(
         }
         let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
-        let admission = if let Some(snapshot) = state.group_routing.as_ref()
+        // Account health describes completed requests. It must not turn the
+        // next Codex POST into a half-open probe or wait for a recovery lease.
+        let admission = if codex_transport::is_driver(&planned.route.driver) {
+            UpstreamAttemptAdmission::Observed
+        } else if let Some(snapshot) = state.group_routing.as_ref()
             && let Some((allow_probe, cooldown_ms)) = snapshot
                 .policy(
                     planned.route.route_id,
@@ -1519,8 +1525,8 @@ async fn proxy_with_cancellation_guard(
                 }
             }
         }
-        // Selection may have waited for database admission; do not dispatch
-        // when the original deadline expired during that wait.
+        // Attempt count still bounds how many accounts one request may try.
+        // A failover clock does not refuse a candidate that is ready to send.
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
             tracing::warn!(%request_id, outbound_attempts, stage = reason,
                 failure_domain = "local_admission", delivery_evidence = "candidate_not_dispatched",
@@ -1760,17 +1766,6 @@ async fn proxy_with_cancellation_guard(
                     &buffered_request,
                     kind.error_code(),
                     Some(kind.terminal_cause()),
-                )
-                .await;
-            }
-            Err(ProxySendError::OuterDeadline) => {
-                upstream_attempt
-                    .complete(UpstreamAttemptTerminal::Inconclusive)
-                    .await;
-                return finish_proxy_failure_with_cause(
-                    &buffered_request,
-                    "upstream_transport_outer_deadline",
-                    Some(crate::model::RequestTerminalCause::TransportOuterDeadline),
                 )
                 .await;
             }

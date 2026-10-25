@@ -113,57 +113,29 @@ pub(super) async fn send_reqwest_proxy_route(
         adapter,
     )
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
-    let mut attempted = Vec::with_capacity(4);
-    loop {
-        let mut selection = state
-            .transport_proxy_groups
-            .select_config(
-                route.route.account_id,
-                route.route.credential_generation,
-                &route.route.credential,
-                &route.route.config,
-            )
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
-        if !selection
-            .select_unattempted(&attempted)
-            .map_err(|_| ProxySendError::CandidateUnavailable)?
-        {
-            return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
-        }
-        if let Some(member) = selection.member() {
-            attempted.push(member);
-        }
-        let result = send_reqwest_proxy_route_once(
-            state,
-            headers,
-            protocol,
-            request_id,
-            route,
-            &selection.credential,
-            request_timeout,
+    let selection = state
+        .transport_proxy_groups
+        .select_config(
+            route.route.account_id,
+            route.route.credential_generation,
+            &route.route.credential,
+            &route.route.config,
         )
-        .await;
-        if advance_after_preconnect_failure(&selection, &attempted, &result)? {
-            continue;
-        }
-        return result;
+        .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let result = send_reqwest_proxy_route_once(
+        state,
+        headers,
+        protocol,
+        request_id,
+        route,
+        &selection.credential,
+        request_timeout,
+    )
+    .await;
+    if matches!(result, Err(ProxySendError::RetryableConnection(_))) {
+        selection.request_independent_probe();
     }
-}
-
-fn advance_after_preconnect_failure(
-    selection: &crate::db::ProxySelection,
-    attempted: &[usize],
-    result: &Result<ProxyRouteResponse, ProxySendError>,
-) -> Result<bool, ProxySendError> {
-    if matches!(result, Err(ProxySendError::RetryableConnection(_)))
-        && attempted.len() < selection.member_count()
-    {
-        selection
-            .advance_after_connect_failure(attempted)
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
-        return Ok(true);
-    }
-    Ok(false)
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -467,7 +439,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn generic_group_advances_only_before_delivery_and_never_revisits_members() {
+    fn generic_group_connection_failure_keeps_the_sticky_exit() {
         let account_id = Uuid::now_v7();
         let groups = crate::db::TransportProxyGroups::parse(
             &json!([{
@@ -482,39 +454,21 @@ mod tests {
             "type":"oauth", "access_token":"fixture", "proxy_url":"socks5h://10.20.30.40:1080", "proxy_network_scope":"private"
         })).unwrap();
         let selected = groups.select(account_id, 1, &credential).unwrap();
-        for error in [
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout),
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Body),
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Request),
-            ProxySendError::AmbiguousResponse("upstream_invalid_response"),
-            ProxySendError::CandidateUnavailable,
-            ProxySendError::Credential,
-        ] {
-            assert!(!advance_after_preconnect_failure(&selected, &[0], &Err(error)).unwrap());
-            assert_eq!(
-                groups.select(account_id, 1, &credential).unwrap().member(),
-                Some(0)
-            );
-        }
-        assert!(
-            advance_after_preconnect_failure(
-                &selected,
-                &[0],
-                &Err(ProxySendError::RetryableConnection("connect"))
-            )
-            .unwrap()
+        selected.request_independent_probe();
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(0)
         );
-        let mut backup = groups.select(account_id, 1, &credential).unwrap();
-        assert_eq!(backup.member(), Some(1));
-        assert!(
-            !advance_after_preconnect_failure(
-                &backup,
-                &[0, 1],
-                &Err(ProxySendError::RetryableConnection("connect"))
-            )
-            .unwrap()
+        assert!(groups.advance_sticky_after_probe(account_id));
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(1)
         );
-        assert!(!backup.select_unattempted(&[0, 1]).unwrap());
+        assert!(groups.advance_sticky_after_probe(account_id));
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(0)
+        );
     }
 
     fn compact_response(status: StatusCode, body: &'static str) -> reqwest::Response {

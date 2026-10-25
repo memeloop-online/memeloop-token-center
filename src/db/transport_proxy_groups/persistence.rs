@@ -17,6 +17,7 @@ impl TransportProxyGroups {
                         tracing::debug!(account_id = %entry.group.account_id, "optional proxy selection persistence deferred");
                     }
                 }
+                current.spawn_due_probes();
                 drop(current);
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }

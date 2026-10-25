@@ -42,8 +42,6 @@ async fn http2_failure_upstream(
                     let count = count.clone();
                     connections.spawn(async move {
                         let mut connection = http2::server::handshake(stream).await.unwrap();
-                        let mut held_headers = Vec::new();
-                        let mut held_streams = Vec::new();
                         let mut held_requests = Vec::new();
                         while let Some(accepted) = connection.accept().await {
                             let Ok((request, mut response)) = accepted else {
@@ -92,14 +90,20 @@ async fn http2_failure_upstream(
                                     body.send_data(Bytes::from_static(br#"{"error":{"type":"rate_limit_error","message":"Rate limit reached"}}"#), true).unwrap();
                                 }
                                 Failure::ResetThenRateLimitThenReset => response.send_reset(http2::Reason::CANCEL),
-                                Failure::PreHeaderSilence => held_headers.push(response),
+                                Failure::PreHeaderSilence => response.send_reset(http2::Reason::CANCEL),
                                 Failure::PostHeaderSilence => {
                                     let headers = http::Response::builder()
                                         .status(200)
                                         .header(http::header::CONTENT_TYPE, "text/event-stream")
                                         .body(())
                                         .unwrap();
-                                    held_streams.push(response.send_response(headers, false).unwrap());
+                                    let mut body = response.send_response(headers, false).unwrap();
+                                    // Let the connection driver flush the headers before
+                                    // resetting the body, rather than cancelling queued headers.
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                        body.send_reset(http2::Reason::CANCEL);
+                                    });
                                 }
                                 Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset | Failure::RejectedFinalReset => {
                                     let headers = http::Response::builder()
@@ -208,6 +212,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         Failure::RejectedPriorReset
             | Failure::RejectedFinalReset
             | Failure::PreHeaderReset
+            | Failure::PreHeaderSilence
             | Failure::PreHeaderRefusedReset
     ) {
         2
@@ -233,11 +238,11 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     assert_eq!(rows[0].billing.cost, None);
     let expected_error = match failure {
         Failure::PreHeaderReset
+        | Failure::PreHeaderSilence
         | Failure::PreHeaderRefusedReset
         | Failure::ResetThenTransientThenReset
         | Failure::ResetThenRateLimitThenReset => "upstream_transport_http2_reset",
-        Failure::PreHeaderSilence => "upstream_request_timeout",
-        Failure::PostHeaderSilence => "upstream_read_timeout",
+        Failure::PostHeaderSilence => "upstream_http2_reset",
         Failure::RejectedReset
         | Failure::RejectedPlain
         | Failure::RejectedPriorReset

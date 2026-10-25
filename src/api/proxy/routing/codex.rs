@@ -18,14 +18,10 @@ pub(in crate::api::proxy) use retry::{CodexRetryTerminal, CodexRetryTerminalGuar
 #[derive(Clone, Copy, Debug)]
 pub(in crate::api::proxy) struct CodexRuntimeTransportPolicy {
     pub(in crate::api::proxy) connect_attempts: usize,
-    pub(in crate::api::proxy) connect_retry_delay: std::time::Duration,
     pub(in crate::api::proxy) shared_probe_attempts: u32,
     pub(in crate::api::proxy) source: &'static str,
     pub(in crate::api::proxy) version: u32,
     pub(in crate::api::proxy) sse_framing_limits: crate::provider::SseFramingLimits,
-    connect_timeout: std::time::Duration,
-    read_timeout: std::time::Duration,
-    request_timeout: std::time::Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -46,7 +42,6 @@ struct CodexRequestDeadline {
 #[derive(Clone, Copy)]
 enum CandidatePreparationFailure {
     ProxyGroupSelection,
-    ProxyMemberSelection,
     TransportSnapshot,
 }
 
@@ -54,7 +49,6 @@ impl CandidatePreparationFailure {
     fn label(self) -> &'static str {
         match self {
             Self::ProxyGroupSelection => "proxy_group_selection_unavailable",
-            Self::ProxyMemberSelection => "proxy_member_selection_unavailable",
             Self::TransportSnapshot => "transport_snapshot_unavailable",
         }
     }
@@ -91,7 +85,6 @@ pub(in crate::api::proxy) fn runtime_transport_policy(
         .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?;
     Ok(CodexRuntimeTransportPolicy {
         connect_attempts: policy.connect_attempts,
-        connect_retry_delay: std::time::Duration::from_millis(policy.connect_retry_delay_millis),
         shared_probe_attempts: policy
             .shared_probe_attempts
             .unwrap_or(default_shared_probe_attempts),
@@ -102,9 +95,6 @@ pub(in crate::api::proxy) fn runtime_transport_policy(
             "global_default"
         },
         sse_framing_limits: policy.sse_framing_limits(),
-        connect_timeout: std::time::Duration::from_millis(policy.connect_timeout_millis),
-        read_timeout: std::time::Duration::from_millis(policy.read_timeout_millis),
-        request_timeout: std::time::Duration::from_millis(policy.request_timeout_millis),
     })
 }
 
@@ -196,13 +186,13 @@ pub(super) async fn send_proxy_route(
         stage = "sse_framing_policy_snapshot",
         "upstream SSE framing policy frozen"
     );
-    // Native compaction may compute silently for an arbitrary duration. Its
-    // lifetime follows upstream completion or downstream cancellation. Other
-    // requests retain one configured deadline across any permitted replay.
+    // Compaction and ordinary generation share one rule: no gateway clock.
+    // The attempt ends when the upstream answers, the client cancels, or the
+    // socket fails. `wait_for_compaction` remains part of the route record.
+    let _ = route.wait_for_compaction;
     let deadline = CodexRequestDeadline {
-        request: (!route.wait_for_compaction)
-            .then(|| tokio::time::Instant::now() + transport_policy.request_timeout),
-        read_inactivity: transport_policy.read_timeout,
+        request: None,
+        read_inactivity: std::time::Duration::ZERO,
     };
     loop {
         let (response, upstream_activity, egress_selection) = match send_codex_attempt(
@@ -337,210 +327,103 @@ async fn send_codex_attempt(
         candidate_rank,
         outbound_attempt,
         transport_policy,
-        deadline,
+        deadline: _,
     } = context;
-    let mut attempted = Vec::with_capacity(4);
-    let select_proxy = || {
-        CandidatePreparationFailure::ProxyGroupSelection.map_result(
-            state.transport_proxy_groups.select_config(
-                route.route.account_id,
-                route.route.credential_generation,
-                &route.route.credential,
-                &route.route.config,
-            ),
-            &route.route,
-            context,
-        )
+    let selection = CandidatePreparationFailure::ProxyGroupSelection.map_result(
+        state.transport_proxy_groups.select_config(
+            route.route.account_id,
+            route.route.credential_generation,
+            &route.route.credential,
+            &route.route.config,
+        ),
+        &route.route,
+        context,
+    )?;
+    tracing::debug!(
+        %request_id,
+        upstream_account_id = %route.route.account_id,
+        transport_revision = route.route.transport_revision,
+        credential_generation = route.route.credential_generation,
+        candidate_rank,
+        outbound_attempt,
+        member_index = ?selection.member_index(),
+        member_count = selection.member_count(),
+        selection_epoch = selection.generation,
+        group_selection_version = ?selection.group_selection_version(),
+        request_local = selection.is_request_local(),
+        configured_connect_attempts = transport_policy.connect_attempts,
+        stage = "codex_proxy_member_selection",
+        "Codex request uses the sticky proxy exit"
+    );
+    let mut transport_route = route.route.clone();
+    transport_route.credential = selection.credential.clone();
+    let client_snapshot = CandidatePreparationFailure::TransportSnapshot.map_result(
+        state
+            .codex_clients
+            .transport_snapshot_with_diagnostics(&transport_route, selection.generation),
+        &route.route,
+        context,
+    )?;
+    let transport_identity = send_diagnostics::TransportIdentity {
+        client_instance_id: client_snapshot.instance_id,
+        cache_hit: client_snapshot.cache_hit,
+        selected_proxy_matches_client_key: client_snapshot
+            .matches_selected_proxy(&selection.credential),
+        connect_attempt: 1,
+        proxy_member_index: selection.member_index(),
+        proxy_member_count: selection.member_count(),
+        selection_epoch: selection.generation,
+        group_selection_version: selection.group_selection_version(),
+        request_local_selection: selection.is_request_local(),
     };
-    let mut selection = select_proxy()?;
-    let (connect_attempt_limit, connect_budget_source) = match selection.member_count() {
-        count if count > 1 => (count, "proxy_group_members"),
-        _ => (transport_policy.connect_attempts, "transport_policy"),
-    };
-    for connect_attempt in 1..=connect_attempt_limit {
-        if connect_attempt > 1 {
-            selection = select_proxy()?;
-        }
-        let has_unattempted = CandidatePreparationFailure::ProxyMemberSelection.map_result(
-            selection.select_unattempted(&attempted),
-            &route.route,
-            context,
-        )?;
-        tracing::debug!(
+    let phase = proxy_diagnostics::Phase::account(
+        proxy_diagnostics::Context::for_request(request_id),
+        "codex_transport_attempt",
+        Some(route.route.account_id),
+        Some(route.route.credential_generation),
+    );
+    let result = send_codex_attempt_once(
+        state,
+        headers,
+        target_url,
+        route,
+        session_id,
+        (
+            &client_snapshot.client,
+            &selection.credential,
+            transport_identity,
+            selection.egress_snapshot(),
+        ),
+        context,
+        h2_recovery_available,
+    )
+    .await;
+    phase.finish(
+        match &result {
+            Ok(_) => "response_headers",
+            Err(ProxySendError::RetryableConnection(_)) => "connect_not_delivered",
+            Err(_) => "failed",
+        },
+        result
+            .as_ref()
+            .ok()
+            .map(|(response, ..)| response.status().as_u16()),
+        None,
+    );
+    if let Err(ProxySendError::RetryableConnection(failure_stage)) = &result {
+        selection.request_independent_probe();
+        tracing::warn!(
             %request_id,
             upstream_account_id = %route.route.account_id,
-            transport_revision = route.route.transport_revision,
-            credential_generation = route.route.credential_generation,
             candidate_rank,
             outbound_attempt,
-            connect_attempt,
-            connect_attempt_limit,
-            connect_budget_source,
-            configured_connect_attempts = transport_policy.connect_attempts,
             member_index = ?selection.member_index(),
-            member_count = selection.member_count(),
-            selection_epoch = selection.generation,
-            group_selection_version = ?selection.group_selection_version(),
-            request_local = selection.is_request_local(),
-            attempted_members = ?attempted,
-            has_unattempted,
-            stage = "codex_proxy_member_selection",
-            "Codex request-scoped proxy selection"
+            failure_stage,
+            stage = "codex_proxy_probe_requested",
+            "Codex connection failure keeps the sticky exit and requests an independent probe"
         );
-        if !has_unattempted {
-            return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
-        }
-        if let Some(member) = selection.member() {
-            if attempted.contains(&member) {
-                return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
-            }
-            attempted.push(member);
-        }
-        let mut transport_route = route.route.clone();
-        transport_route.credential = selection.credential.clone();
-        let client_snapshot = CandidatePreparationFailure::TransportSnapshot.map_result(
-            state
-                .codex_clients
-                .transport_snapshot_with_diagnostics(&transport_route, selection.generation),
-            &route.route,
-            context,
-        )?;
-        let transport_identity = send_diagnostics::TransportIdentity {
-            client_instance_id: client_snapshot.instance_id,
-            cache_hit: client_snapshot.cache_hit,
-            selected_proxy_matches_client_key: client_snapshot
-                .matches_selected_proxy(&selection.credential),
-            connect_attempt,
-            proxy_member_index: selection.member_index(),
-            proxy_member_count: selection.member_count(),
-            selection_epoch: selection.generation,
-            group_selection_version: selection.group_selection_version(),
-            request_local_selection: selection.is_request_local(),
-        };
-        let phase = proxy_diagnostics::Phase::account(
-            proxy_diagnostics::Context::for_request(request_id),
-            "codex_transport_attempt",
-            Some(route.route.account_id),
-            Some(route.route.credential_generation),
-        );
-        let result = send_codex_attempt_once(
-            state,
-            headers,
-            target_url,
-            route,
-            session_id,
-            (
-                &client_snapshot.client,
-                &selection.credential,
-                transport_identity,
-                selection.egress_snapshot(),
-            ),
-            context,
-            h2_recovery_available,
-        )
-        .await;
-        phase.finish(
-            match &result {
-                Ok(_) => "response_headers",
-                Err(ProxySendError::RetryableConnection(_)) => "connect_not_delivered",
-                Err(_) => "failed",
-            },
-            result
-                .as_ref()
-                .ok()
-                .map(|(response, ..)| response.status().as_u16()),
-            None,
-        );
-        if matches!(&result, Err(ProxySendError::RetryableConnection(_)))
-            && selection.member().is_some()
-        {
-            let cas_outcome = selection
-                .advance_after_connect_failure_outcome(&attempted)
-                .map_err(|_| ProxySendError::CandidateUnavailable)?;
-            tracing::debug!(
-                %request_id,
-                upstream_account_id = %route.route.account_id,
-                transport_revision = route.route.transport_revision,
-                credential_generation = route.route.credential_generation,
-                candidate_rank,
-                outbound_attempt,
-                connect_attempt,
-                member_index = ?selection.member_index(),
-                member_count = selection.member_count(),
-                selection_epoch = selection.generation,
-                group_selection_version = ?selection.group_selection_version(),
-                attempted_members = ?attempted,
-                cas_outcome,
-                stage = "codex_proxy_member_advance",
-                "Codex connection failure proxy selection outcome"
-            );
-        }
-        match result {
-            Err(ProxySendError::RetryableConnection(failure_stage))
-                if connect_attempt < connect_attempt_limit =>
-            {
-                tracing::warn!(
-                    %request_id,
-                    upstream_account_id = %route.route.account_id,
-                    candidate_rank,
-                    outbound_attempt,
-                    connect_attempt,
-                    connect_attempt_limit,
-                    connect_budget_source,
-                    configured_connect_attempts = transport_policy.connect_attempts,
-                    transport_policy_source = transport_policy.source,
-                    transport_policy_version = transport_policy.version,
-                    failure_kind = "connection",
-                    failure_stage,
-                    stage = "codex_pre_delivery_connect_retry",
-                    "retrying a Codex connection failure before breaker accounting"
-                );
-                // Do not start a retry whose own typed connection deadline
-                // cannot fit in the remaining absolute request budget. Every
-                // attempt so admitted can still prove non-delivery before the
-                // request-level ambiguity boundary.
-                if deadline.request.is_some_and(|request_deadline| {
-                    !connect_retry_fits_before_request_deadline(
-                        request_deadline,
-                        transport_policy.connect_retry_delay,
-                        transport_policy.connect_timeout,
-                    )
-                }) {
-                    return Err(ProxySendError::RetryableConnection(failure_stage));
-                }
-                tokio::time::sleep(transport_policy.connect_retry_delay).await;
-            }
-            result @ Err(ProxySendError::RetryableConnection(failure_stage)) => {
-                tracing::warn!(
-                    %request_id,
-                    upstream_account_id = %route.route.account_id,
-                    candidate_rank,
-                    outbound_attempt,
-                    connect_attempt,
-                    connect_attempt_limit,
-                    connect_budget_source,
-                    configured_connect_attempts = transport_policy.connect_attempts,
-                    transport_policy_source = transport_policy.source,
-                    transport_policy_version = transport_policy.version,
-                    failure_kind = "connection",
-                    failure_stage,
-                    stage = "codex_pre_delivery_connect_exhausted",
-                    "Codex connection retries were exhausted before breaker accounting"
-                );
-                return result;
-            }
-            result => return result,
-        }
     }
-    unreachable!("bounded Codex connection attempt loop always returns")
-}
-
-fn connect_retry_fits_before_request_deadline(
-    request_deadline: tokio::time::Instant,
-    retry_delay: std::time::Duration,
-    connect_timeout: std::time::Duration,
-) -> bool {
-    tokio::time::Instant::now() + retry_delay + connect_timeout < request_deadline
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1191,21 +1074,5 @@ mod timeout_tests {
             tokio::time::Instant::now() - started,
             std::time::Duration::from_secs(1)
         );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn connection_retry_requires_room_for_its_typed_deadline() {
-        let now = tokio::time::Instant::now();
-        let deadline = now + std::time::Duration::from_secs(3);
-        assert!(connect_retry_fits_before_request_deadline(
-            deadline,
-            std::time::Duration::from_millis(500),
-            std::time::Duration::from_millis(2_499),
-        ));
-        assert!(!connect_retry_fits_before_request_deadline(
-            deadline,
-            std::time::Duration::from_millis(500),
-            std::time::Duration::from_millis(2_500),
-        ));
     }
 }

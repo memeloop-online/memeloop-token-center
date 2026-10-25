@@ -81,7 +81,6 @@ async fn local_candidate_failures_log_only_fixed_reasons_and_preserve_dispositio
         .finish();
     let reasons = [
         CandidatePreparationFailure::ProxyGroupSelection,
-        CandidatePreparationFailure::ProxyMemberSelection,
         CandidatePreparationFailure::TransportSnapshot,
     ];
     tracing::subscriber::with_default(subscriber, || {

@@ -18,6 +18,8 @@ export interface TransportProxyGroup {
   version: number;
   members: TransportProxyMember[];
   bound_account_count: number;
+  probe_url?: string | null;
+  probe_attempts?: number;
 }
 
 export interface TransportProxyBinding {
