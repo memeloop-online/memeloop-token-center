@@ -3,13 +3,15 @@ pub(crate) mod durable;
 mod quota;
 #[cfg(test)]
 pub(crate) mod test_observe_gate;
+#[cfg(test)]
+use crate::plugin::routing::{GroupRoutingObserveInput, GroupRoutingOutcome};
 use crate::{
     AppState,
     error::AppError,
     plugin::routing::{
         GROUP_ROUTING_V2_VERSION, GroupRoutingCandidate, GroupRoutingDirective, GroupRoutingHealth,
-        GroupRoutingInput, GroupRoutingObserveInput, GroupRoutingOutcome,
-        GroupRoutingTransientPolicy, GroupRoutingTransientSignal, transient_health_window_ms,
+        GroupRoutingInput, GroupRoutingTransientPolicy, GroupRoutingTransientSignal,
+        transient_health_window_ms,
     },
     provider::AuthorizedUpstreamCandidate,
 };
