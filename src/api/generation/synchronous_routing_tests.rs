@@ -459,15 +459,15 @@ async fn image_invalid_body_observes_once_and_same_key_remains_uncertain_after_e
     assert_eq!(body["error"]["retryable"], false);
     assert_eq!(body["error"]["reconciliation_available"], true);
     fixture.state.routing_persistence.drain_for_test().await;
-    assert!(
-        fixture
-            .state
-            .db
-            .group_routing_health(fixture.tenant, fixture.account, 1)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let health = fixture
+        .state
+        .db
+        .group_routing_health(fixture.tenant, fixture.account, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(health.consecutive_failures, 0);
+    assert!(health.last_failure_kind.is_empty());
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("UPDATE synchronous_image_idempotency SET lease_expires_at = 0 WHERE key_id = $1")
         .bind(fixture.key_id.to_string())
@@ -782,15 +782,15 @@ async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
                 .is_none()
         );
         pool.close().await;
-        assert!(
-            fixture
-                .state
-                .db
-                .group_routing_health(fixture.tenant, fixture.account, 1)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        let health = fixture
+            .state
+            .db
+            .group_routing_health(fixture.tenant, fixture.account, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_failure_kind.is_empty());
         let replay = post(
             fixture.state.clone(),
             &fixture.credential,
@@ -1294,15 +1294,15 @@ async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_u
     .unwrap();
     assert_eq!(response.status(), StatusCode::CONFLICT);
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-    assert!(
-        fixture
-            .state
-            .db
-            .group_routing_health(fixture.tenant, fixture.account, 1)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let health = fixture
+        .state
+        .db
+        .group_routing_health(fixture.tenant, fixture.account, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(health.consecutive_failures, 0);
+    assert!(health.last_failure_kind.is_empty());
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let row=sqlx::query("SELECT r.status, q.submission_started_at, q.submission_uncertain_at, q.completed_at FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.key_id=$1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
