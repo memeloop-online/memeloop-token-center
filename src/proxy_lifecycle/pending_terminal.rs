@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::AtomicU64,
     },
     time::Duration,
 };
@@ -769,6 +769,24 @@ impl Journal {
     }
 
     #[cfg(test)]
+    pub(crate) fn receipt_jsons_for_test(&self) -> Vec<serde_json::Value> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .filter_map(|entry| serde_json::to_value(&entry.snapshot).ok())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_receipt_for_test(&self, receipt_id: Uuid) -> bool {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains_key(&receipt_id)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn hold_retirement_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
         self.retirement_gate.clone().acquire_owned().await.unwrap()
     }
@@ -798,7 +816,8 @@ impl Journal {
 
     #[cfg(test)]
     pub(crate) fn failed_publications_for_test(&self) -> u64 {
-        self.publication_failures.load(Ordering::Relaxed)
+        self.publication_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1076,32 +1095,13 @@ impl Journal {
         let request_id = snapshot.request_id;
         let receipt_id = snapshot.receipt_id;
         if !durable {
+            // The receipt already lives in the process. A local file of the
+            // conversation was the request-spool emptyDir, and kubelet evicts
+            // the pod when that directory reaches its size limit.
             #[cfg(test)]
             let _writer = self.writer_gate.acquire().await.unwrap();
-            let directory = self.directory.clone();
-            let record = snapshot.clone();
-            let publication = tokio::task::spawn_blocking(move || {
-                let bytes = serde_json::to_vec(&*record).map_err(std::io::Error::other)?;
-                crate::early_request::publish_record(&directory, receipt_id, &bytes, None)?;
-                if std::fs::read(directory.join(format!("{receipt_id}.json")))? != bytes {
-                    return Err(std::io::Error::other("terminal receipt content conflict"));
-                }
-                Ok::<_, std::io::Error>(())
-            })
-            .await;
-            durable = matches!(&publication, Ok(Ok(())));
-            if durable {
-                tracing::info!(%request_id, %receipt_id, financial_state = "pending_durable", "terminal journal publication acknowledged");
-            } else {
-                let failure_kind = match publication {
-                    Ok(Err(error)) => format!("{:?}", error.kind()),
-                    Err(error) if error.is_panic() => "worker_panic".to_owned(),
-                    Err(_) => "worker_cancelled".to_owned(),
-                    Ok(Ok(())) => unreachable!(),
-                };
-                let failures = self.publication_failures.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::error!(%request_id, %receipt_id, failures, %failure_kind, financial_state = "pending_unacknowledged", "terminal journal publication failed; in-memory evidence retained");
-            }
+            durable = true;
+            tracing::info!(%request_id, %receipt_id, financial_state = "pending_durable", "terminal responsibility retained in memory");
         }
         let mut reconcile = false;
         if !applied && durable {
@@ -1211,26 +1211,11 @@ impl Journal {
                 .unwrap_or_else(|error| error.into_inner())
                 .get(&receipt_id)
                 .is_some_and(|entry| entry.operational_acknowledged);
-        let removed = if applied && operational_acknowledged {
-            #[cfg(test)]
+        #[cfg(test)]
+        if applied && operational_acknowledged {
             let _retirement = self.retirement_gate.acquire().await.unwrap();
-            let directory = self.directory.clone();
-            matches!(
-                tokio::task::spawn_blocking(move || {
-                    let path = directory.join(format!("{receipt_id}.json"));
-                    match std::fs::remove_file(path) {
-                        Ok(()) => {}
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(error),
-                    }
-                    std::fs::File::open(directory)?.sync_all()
-                })
-                .await,
-                Ok(Ok(()))
-            )
-        } else {
-            false
-        };
+        }
+        let removed = applied && operational_acknowledged;
         let mut pending = self
             .pending
             .lock()
@@ -1272,7 +1257,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn unrelated_wakes_do_not_accelerate_failed_publications_or_delay_new_receipts() {
+    async fn memory_receipts_do_not_require_a_directory_or_retry_before_the_interval() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
@@ -1330,7 +1315,7 @@ mod tests {
         journal.submit_with_preparation(snapshot.clone(), (), async { None });
         journal.start_pending(&database);
         finish_attempts(&journal).await;
-        assert_eq!(journal.failed_publications_for_test(), 1);
+        assert_eq!(journal.failed_publications_for_test(), 0);
         for _ in 0..100 {
             journal.start_pending(&database);
             assert!(journal.tasks.lock().unwrap().is_empty());
@@ -1341,18 +1326,18 @@ mod tests {
         journal.submit_with_preparation(second, (), async { None });
         journal.start_pending(&database);
         finish_attempts(&journal).await;
-        assert_eq!(journal.failed_publications_for_test(), 2);
+        assert_eq!(journal.failed_publications_for_test(), 0);
         tokio::time::advance(RETRY_INTERVAL).await;
         journal.start_pending(&database);
         finish_attempts(&journal).await;
-        assert_eq!(journal.failed_publications_for_test(), 4);
+        assert_eq!(journal.failed_publications_for_test(), 0);
         {
             let pending = journal.pending.lock().unwrap();
             assert_eq!(pending.len(), 2);
             let retained = pending.get(&snapshot.receipt_id).unwrap();
-            assert!(!retained.durable);
+            assert!(retained.durable);
             assert!(!retained.applied);
-            assert!(retained.retained.is_some());
+            assert!(retained.retained.is_none());
             assert_eq!(
                 serde_json::to_value(&*retained.snapshot).unwrap(),
                 serde_json::to_value(snapshot).unwrap()

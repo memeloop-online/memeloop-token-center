@@ -1,6 +1,5 @@
 use std::{
-    io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -13,13 +12,13 @@ use tokio::sync::Notify;
 use crate::db::{Database, EarlyRequestTerminal};
 
 const MAX_RECORD_BYTES: u64 = 4096;
-const MAX_PENDING_RECORDS: usize = 16_384;
 const REPLAY_BATCH: usize = 64;
 const MAX_PENDING_WRITES: usize = 64;
 const WRITE_DEADLINE: Duration = Duration::from_millis(250);
 
 pub(crate) struct Journal {
     directory: PathBuf,
+    database: Database,
     wake: Arc<Notify>,
     writes: Arc<tokio::sync::Mutex<()>>,
     pending_writes: Arc<tokio::sync::Semaphore>,
@@ -32,6 +31,7 @@ impl Journal {
     pub(crate) fn new(directory: PathBuf, database: Database) -> Arc<Self> {
         let journal = Arc::new(Self {
             directory,
+            database: database.clone(),
             wake: Arc::new(Notify::new()),
             writes: Arc::new(tokio::sync::Mutex::new(())),
             pending_writes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES)),
@@ -56,30 +56,23 @@ impl Journal {
 
     pub(crate) async fn append(&self, record: EarlyRequestTerminal) -> bool {
         let request_id = record.request_id;
-        let Ok(pending) = self.pending_writes.clone().try_acquire_owned() else {
+        let Ok(_pending) = self.pending_writes.clone().try_acquire_owned() else {
             return self.unavailable(request_id, "journal_queue_full");
         };
-        let directory = self.directory.clone();
+        let database = self.database.clone();
         let writes = self.writes.clone();
         let written = self.written.clone();
-        let wake = self.wake.clone();
         let result = tokio::time::timeout(WRITE_DEADLINE, async move {
-            let writer = writes.lock_owned().await;
-            tokio::task::spawn_blocking(move || {
-                let _writer = writer;
-                let _pending = pending;
-                let result = write_record(&directory, &record);
-                if result.is_ok() {
-                    written.fetch_add(1, Ordering::Relaxed);
-                    wake.notify_one();
-                }
-                result
-            })
-            .await
+            let _writer = writes.lock_owned().await;
+            let result = database.record_early_request_terminal(&record).await;
+            if result.is_ok() {
+                written.fetch_add(1, Ordering::Relaxed);
+            }
+            result
         })
         .await;
         match result {
-            Ok(Ok(Ok(()))) => true,
+            Ok(Ok(())) => true,
             Err(_) => self.unavailable(request_id, "journal_write_timeout"),
             _ => self.unavailable(request_id, "journal_unavailable"),
         }
@@ -188,63 +181,6 @@ impl Journal {
         .await
         .expect("early terminal journal drained");
     }
-}
-
-fn write_record(directory: &Path, record: &EarlyRequestTerminal) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(std::io::Error::other("early terminal metadata limit"));
-    }
-    publish_record(
-        directory,
-        record.request_id,
-        &bytes,
-        Some(MAX_PENDING_RECORDS),
-    )
-}
-
-pub(crate) fn publish_record(
-    directory: &Path,
-    request_id: uuid::Uuid,
-    bytes: &[u8],
-    capacity: Option<usize>,
-) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(directory)?;
-    let mut ancestor = PathBuf::new();
-    for component in directory.components() {
-        ancestor.push(component);
-        if std::fs::symlink_metadata(&ancestor)?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(std::io::Error::other("early terminal directory symlink"));
-        }
-    }
-    if capacity.is_some_and(|limit| {
-        std::fs::read_dir(directory)
-            .map(|entries| entries.take(limit).count() >= limit)
-            .unwrap_or(true)
-    }) {
-        return Err(std::io::Error::other("early terminal journal capacity"));
-    }
-    let path = directory.join(format!("{request_id}.json"));
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    temporary.write_all(bytes)?;
-    temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(&path) {
-        Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.error),
-    }
-    std::fs::File::open(directory)?.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

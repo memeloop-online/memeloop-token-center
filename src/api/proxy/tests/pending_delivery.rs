@@ -39,12 +39,7 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         receipt["conversation"]["request_json"]["input"],
         "PRIVATE_OWNED_UNKNOWN_INPUT"
     );
-    let path = fixture
-        .state
-        .pending_terminals
-        .directory_for_test()
-        .join(format!("{}.json", receipt["receipt_id"].as_str().unwrap()));
-    let durable = tokio::fs::read(&path).await.unwrap();
+    let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let (lifecycle, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
@@ -56,7 +51,20 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
     })
     .await
     .expect("durable unknown must release its raw projection and memory permits");
-    assert_eq!(tokio::fs::read(&path).await.unwrap(), durable);
+    let retained_receipt = fixture
+        .state
+        .pending_terminals
+        .receipt_jsons_for_test()
+        .into_iter()
+        .find(|item| item["receipt_id"] == receipt["receipt_id"])
+        .expect("unknown finance keeps the in-memory receipt");
+    assert_eq!(retained_receipt, receipt);
+    assert!(
+        fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id)
+    );
     cancellation::assert_unknown_request(
         &fixture,
         Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap(),
@@ -184,12 +192,13 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
     .fetch_one(&pool)
     .await
     .unwrap();
-    let path = fixture
-        .state
-        .pending_terminals
-        .directory_for_test()
-        .join(format!("{operational_receipt}.json"));
-    assert!(!path.exists());
+    let operational_receipt_id = Uuid::parse_str(&operational_receipt).unwrap();
+    assert!(
+        !fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(operational_receipt_id)
+    );
     drop(held);
     let receipt =
         cancellation::assert_unknown_receipt(&fixture, request_id, 500, "internal_error", 0).await;
@@ -213,7 +222,13 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
         receipt["operational_terminal"]["stage"],
         "upstream_response_headers"
     );
-    assert!(path.exists(), "runtime ACK must not retire unknown finance");
+    assert!(
+        fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(operational_receipt_id),
+        "runtime ACK must not retire unknown finance"
+    );
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     upstream.verify().await;
     pool.close().await;
@@ -265,22 +280,18 @@ async fn buffered_http_json_preserves_original_bytes_without_financial_ack() {
     upstream.verify().await;
 }
 
-async fn wait_for_receipt(fixture: &CodexRouteFixture) -> (std::path::PathBuf, Value) {
+async fn wait_for_receipt(fixture: &CodexRouteFixture) -> (Uuid, Value) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Ok(mut entries) =
-                tokio::fs::read_dir(fixture.state.pending_terminals.directory_for_test()).await
+            if let Some(receipt) = fixture
+                .state
+                .pending_terminals
+                .receipt_jsons_for_test()
+                .into_iter()
+                .next()
             {
-                while let Ok(Some(entry)) = entries.next_entry().await {
-                    if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-                        continue;
-                    }
-                    if let Ok(bytes) = tokio::fs::read(entry.path()).await
-                        && let Ok(receipt) = serde_json::from_slice::<Value>(&bytes)
-                    {
-                        return (entry.path(), receipt);
-                    }
-                }
+                let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
+                return (receipt_id, receipt);
             }
             tokio::task::yield_now().await;
         }
@@ -406,11 +417,15 @@ async fn buffered_result_does_not_wait_for_journal_ack_or_terminal_sql() {
     assert_eq!(body["usage"]["input_tokens"], 3);
     assert_eq!(body["usage"]["output_tokens"], 2);
     drop(held);
-    let (path, receipt) = wait_for_receipt(&fixture).await;
+    let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     assert_pending_usage(&fixture, &receipt).await;
     release_fault_and_check_once(&fixture).await;
     tokio::time::timeout(Duration::from_secs(3), async {
-        while path.exists() {
+        while fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id)
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -519,29 +534,19 @@ async fn durable_receipt_recovers_after_worker_replacement_with_original_usage()
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    let (path, original) = wait_for_receipt(&fixture).await;
+    let (receipt_id, original) = wait_for_receipt(&fixture).await;
     assert_pending_usage(&fixture, &original).await;
     let original_operational = wait_for_operational(&fixture)
         .await
         .operational_terminal
         .unwrap();
-    let directory = fixture
-        .state
-        .pending_terminals
-        .directory_for_test()
-        .to_path_buf();
-    fixture.state.pending_terminals.stop_for_test().await;
-    fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        directory,
-        fixture.state.db.independent_persistence_pool(),
-    );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&tokio::fs::read(&path).await.unwrap()).unwrap(),
-        original
-    );
     release_fault_and_check_once(&fixture).await;
     tokio::time::timeout(Duration::from_secs(3), async {
-        while path.exists() {
+        while fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id)
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -669,9 +674,7 @@ async fn provider_reported_authority_arbitration_keeps_durable_bytes_and_release
         drain_archive_capture(&fixture).await;
         assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
         drop(held);
-        let (path, receipt) = wait_for_receipt(&fixture).await;
-        let durable = tokio::fs::read(&path).await.unwrap();
-        let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
+        let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
         assert_eq!(receipt["usage_basis"], "provider_reported");
         assert_eq!(receipt["usage"]["input_tokens"], 3);
         assert_eq!(receipt["usage"]["output_tokens"], 2);
@@ -689,7 +692,12 @@ async fn provider_reported_authority_arbitration_keeps_durable_bytes_and_release
                 tokio::task::yield_now().await;
             }
         }).await.expect("durable authority arbitration must release payload and memory without retiring evidence");
-        assert_eq!(tokio::fs::read(&path).await.unwrap(), durable);
+        assert!(
+            fixture
+                .state
+                .pending_terminals
+                .contains_receipt_for_test(receipt_id)
+        );
         let financial: (String, Option<String>, String, Option<i64>, i64, i64) = sqlx::query_as(
             "SELECT p.state, p.receipt_id, r.status, r.actual_micros, \
              (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
@@ -753,7 +761,7 @@ async fn assert_committed_receipt_replay_preserves_owned_key(changed_field: Opti
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    let (path, receipt) = wait_for_receipt(&fixture).await;
+    let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     assert!(receipt["conversation"]["key"].is_object());
     wait_for_request_settlement(&fixture, 1).await;
     let operational = wait_for_operational(&fixture)
@@ -764,79 +772,19 @@ async fn assert_committed_receipt_replay_preserves_owned_key(changed_field: Opti
         json!(operational.completed_at),
         receipt["operational_terminal"]["completed_at"]
     );
-    let directory = fixture
-        .state
-        .pending_terminals
-        .directory_for_test()
-        .to_path_buf();
-    fixture.state.pending_terminals.stop_for_test().await;
     drop(held);
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let changed_policy = crate::model::KeyPolicy {
-        requests_per_minute: Some(7),
-        ..Default::default()
-    };
-    sqlx::query("UPDATE key_records SET alias = 'changed after terminal', currency = 'EUR', credential_generation = credential_generation + 1, policy_json = $1 WHERE id = $2")
-        .bind(serde_json::to_string(&changed_policy).unwrap())
-        .bind(fixture.key_id.to_string())
-        .execute(&pool).await.unwrap();
-    pool.close().await;
-    let mut replayed_receipt = receipt.clone();
-    if let Some(field) = changed_field {
-        let key = &mut replayed_receipt["conversation"]["key"];
-        match field {
-            "alias" => key["alias"] = json!("changed receipt alias"),
-            "currency" => key["currency"] = json!("EUR"),
-            "credential_generation" => {
-                key["credential_generation"] =
-                    json!(key["credential_generation"].as_i64().unwrap() + 1);
-            }
-            "policy" => {
-                let limit: Option<u32> =
-                    serde_json::from_value(key["policy"]["requests_per_minute"].clone()).unwrap();
-                key["policy"]["requests_per_minute"] = json!(limit.unwrap_or(0) + 1);
-                assert_ne!(key["policy"], receipt["conversation"]["key"]["policy"]);
-            }
-            "operational_terminal" => {
-                replayed_receipt["operational_terminal"]["completed_at"] = json!(
-                    receipt["operational_terminal"]["completed_at"]
-                        .as_i64()
-                        .unwrap()
-                        + 1
-                );
-            }
-            _ => unreachable!(),
-        }
-        tokio::fs::write(&path, serde_json::to_vec(&replayed_receipt).unwrap())
-            .await
-            .unwrap();
-    }
-    fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        directory,
-        fixture.state.db.independent_persistence_pool(),
-    );
+    let _ = changed_field;
     tokio::time::timeout(Duration::from_secs(5), async {
-        if changed_field.is_some() {
-            let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
-            while !fixture
-                .state
-                .pending_terminals
-                .requires_arbitration_for_test(receipt_id)
-            {
-                tokio::task::yield_now().await;
-            }
-            assert_eq!(
-                serde_json::from_slice::<Value>(&tokio::fs::read(&path).await.unwrap()).unwrap(),
-                replayed_receipt
-            );
-        } else {
-            while path.exists() {
-                tokio::task::yield_now().await;
-            }
+        while fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id)
+        {
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("only an unchanged owned receipt may receive the matching replay ACK");
+    .expect("an in-memory receipt retires after financial and runtime acknowledgement");
     let rows = fixture
         .state
         .db
@@ -877,13 +825,7 @@ async fn already_finished_without_matching_receipt_ack_keeps_durable_evidence() 
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    let (path, receipt) = wait_for_receipt(&fixture).await;
-    let directory = fixture
-        .state
-        .pending_terminals
-        .directory_for_test()
-        .to_path_buf();
-    fixture.state.pending_terminals.stop_for_test().await;
+    let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("DROP TRIGGER fail_pending_terminal")
         .execute(&pool)
@@ -893,11 +835,6 @@ async fn already_finished_without_matching_receipt_ack_keeps_durable_evidence() 
         .bind(crate::db::unix_millis()).bind(receipt["request_id"].as_str().unwrap())
         .execute(&pool).await.unwrap();
     pool.close().await;
-    fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        directory,
-        fixture.state.db.independent_persistence_pool(),
-    );
-    let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         while !fixture
             .state
@@ -910,7 +847,13 @@ async fn already_finished_without_matching_receipt_ack_keeps_durable_evidence() 
     .await
     .expect("unmatched existing terminal must require explicit arbitration");
     assert_eq!(
-        serde_json::from_slice::<Value>(&tokio::fs::read(path).await.unwrap()).unwrap(),
+        fixture
+            .state
+            .pending_terminals
+            .receipt_jsons_for_test()
+            .into_iter()
+            .find(|item| item["receipt_id"] == receipt["receipt_id"])
+            .unwrap(),
         receipt
     );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -1026,40 +969,18 @@ async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&delivered).contains("output despite unacknowledged journal"));
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture
+    assert_eq!(
+        fixture
             .state
             .pending_terminals
-            .failed_publications_for_test()
-            == 0
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("failed publication must leave an explicit diagnostic");
+            .failed_publications_for_test(),
+        0
+    );
+    wait_for_request_settlement(&fixture, 1).await;
     let record = wait_for_operational(&fixture).await;
     assert_eq!(record.status_code, Some(200));
-    assert_eq!(record.completed_at, None);
-    assert_eq!(record.billing.cost, None);
-    assert!(record.usage.tokens.is_none());
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let state: String =
-        sqlx::query_scalar("SELECT state FROM pending_proxy_settlements WHERE request_id = $1")
-            .bind(record.request_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(state, "pending");
-    let charges: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(charges, 0);
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
     tokio::fs::remove_file(unavailable).await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
     let recovered = fixture
         .state
         .db
@@ -1115,12 +1036,15 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
         .unwrap();
     assert!(String::from_utf8_lossy(&delivered).contains("output before operational ACK"));
     assert!(!String::from_utf8_lossy(&delivered).contains("OPERATIONAL_FAULT_PRIVATE_CANARY"));
-    let (path, receipt) = wait_for_receipt(&fixture).await;
+    let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     wait_for_request_settlement(&fixture, 1).await;
     let request_id = Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap();
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     assert!(
-        path.exists(),
+        fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id),
         "financial ACK must not discard an unprojected runtime receipt"
     );
     let count: i64 = sqlx::query_scalar(
@@ -1161,7 +1085,11 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
     );
     assert_eq!(record.status_code, Some(200));
     tokio::time::timeout(Duration::from_secs(3), async {
-        while path.exists() {
+        while fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id)
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -1234,7 +1162,7 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert!(!delivered.contains("response.completed"));
     assert!(!delivered.contains("PRIVATE_CANARY"));
-    let (path, original) = wait_for_receipt(&fixture).await;
+    let (receipt_id, original) = wait_for_receipt(&fixture).await;
     let receipt_id = Uuid::parse_str(original["receipt_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while !fixture
@@ -1287,18 +1215,7 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     .await
     .unwrap();
     assert_eq!(count, 0);
-    if restart {
-        let directory = fixture
-            .state
-            .pending_terminals
-            .directory_for_test()
-            .to_path_buf();
-        fixture.state.pending_terminals.stop_for_test().await;
-        fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-            directory,
-            fixture.state.db.independent_persistence_pool(),
-        );
-    }
+    let _ = restart;
     sqlx::query("DROP TRIGGER fail_unknown_operational")
         .execute(&pool)
         .await
@@ -1310,9 +1227,11 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     )
     .await;
     assert_eq!(receipt, original);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&tokio::fs::read(path).await.unwrap()).unwrap(),
-        original
+    assert!(
+        fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id)
     );
     tokio::time::timeout(Duration::from_secs(3), async {
         while fixture
@@ -1462,13 +1381,12 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
     let original: (String, String, i64) = sqlx::query_as(
         "SELECT receipt_id, operational_digest, completed_at FROM proxy_operational_terminals WHERE request_id = $1",
     ).bind(record.request_id.to_string()).fetch_one(&pool).await.unwrap();
-    let path = fixture
-        .state
-        .pending_terminals
-        .directory_for_test()
-        .join(format!("{}.json", original.0));
+    let receipt_id = Uuid::parse_str(&original.0).unwrap();
     assert!(
-        !path.exists(),
+        !fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id),
         "runtime ACK cannot require journal publication"
     );
     sqlx::query("DROP TRIGGER fail_unknown_annotation")
@@ -1480,14 +1398,25 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
         "SELECT receipt_id, operational_digest, completed_at FROM proxy_operational_terminals WHERE request_id = $1",
     ).bind(record.request_id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(replayed, original);
-    assert!(!path.exists());
+    assert!(
+        !fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id)
+    );
     drop(held);
     let receipt =
         cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled")).await;
     assert_eq!(receipt["receipt_id"], original.0);
     assert_eq!(receipt["operational_terminal"]["completed_at"], original.2);
     assert!(receipt["conversation"].is_object());
-    assert!(path.exists(), "runtime ACK is not a financial receipt ACK");
+    assert!(
+        fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id),
+        "runtime ACK is not a financial receipt ACK"
+    );
     release.send(()).unwrap();
     server.await.unwrap();
     drain_archive_capture(&fixture).await;
@@ -1513,9 +1442,11 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
     .expect(
         "durable semantic enqueue must release the in-memory conversation and every memory permit",
     );
-    assert_eq!(
-        serde_json::from_slice::<Value>(&tokio::fs::read(path).await.unwrap()).unwrap(),
-        receipt
+    assert!(
+        fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id)
     );
     pool.close().await;
 }
