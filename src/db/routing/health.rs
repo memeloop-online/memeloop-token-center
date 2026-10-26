@@ -1304,7 +1304,11 @@ impl Database {
         .bind(success_epoch.to_string())
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let recovered = result.rows_affected() == 1;
+        if recovered {
+            self.note_service_available(upstream_account_id).await;
+        }
+        Ok(recovered)
     }
 
     #[cfg(test)]
@@ -1438,7 +1442,11 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let recovered = result.rows_affected() == 1;
+        if recovered {
+            self.note_service_available(upstream_account_id).await;
+        }
+        Ok(recovered)
     }
 
     #[cfg(test)]
@@ -2370,12 +2378,28 @@ mod tests {
                 .count(),
             1
         );
+        sqlx::query(
+            "INSERT INTO upstream_service_probes (upstream_account_id, status, checked_at)
+             VALUES ($1, 'unhealthy', 1)",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
         assert!(
             database
                 .record_upstream_account_probe_success(account_id, 1, lease_token)
                 .await
                 .unwrap()
         );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM upstream_service_probes WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "healthy");
         assert!(
             database
                 .claim_upstream_account_attempt(account_id, 1)

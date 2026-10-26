@@ -118,6 +118,56 @@ impl Database {
         Ok(())
     }
 
+    /// A completed upstream response is availability evidence. Refresh the
+    /// service probe immediately so a later request is not still ranked or
+    /// badged from the failure this success already disproved.
+    pub(crate) async fn mark_upstream_service_available(
+        &self,
+        account_id: Uuid,
+    ) -> Result<(), AppError> {
+        let now = super::unix_millis();
+        let account_id = account_id.to_string();
+        sqlx::query(
+            "INSERT INTO upstream_service_probes (
+                 upstream_account_id, status, error_code, latency_ms, checked_at
+             ) VALUES ($1, 'healthy', NULL, NULL, $2)
+             ON CONFLICT (upstream_account_id) DO UPDATE SET
+               status = 'healthy',
+               error_code = NULL,
+               latency_ms = NULL,
+               checked_at = excluded.checked_at",
+        )
+        .bind(&account_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        // The exit badge is the same kind of availability. A request that just
+        // succeeded through this account is newer evidence than the last
+        // independent exit probe.
+        sqlx::query(
+            "UPDATE transport_proxy_groups
+                SET last_probe_status = 'healthy', last_probe_checked_at = $2
+              WHERE id = (
+                SELECT group_id FROM transport_proxy_bindings WHERE account_id = $1
+              )",
+        )
+        .bind(&account_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn note_service_available(&self, account_id: Uuid) {
+        if let Err(error) = self.mark_upstream_service_available(account_id).await {
+            tracing::warn!(
+                %account_id,
+                error_category = error.diagnostic_category(),
+                "successful upstream attempt did not refresh service availability"
+            );
+        }
+    }
+
     pub(crate) async fn probe_account_context(
         &self,
         account_id: Uuid,

@@ -209,8 +209,9 @@ async fn prepare_authorized_proxy_routes(
     )
     .await?
     else {
-        // Normalized grants are the sole downstream authorization source. A
-        // missing route must never fall back to unscoped process secrets.
+        // The candidate query already widened to any active account on this
+        // route. Reaching here means nothing active remains to send. Do not
+        // invent a credential that is not an upstream account.
         return Err(exhausted_candidate_error(protocol, request_json, &summary)?);
     };
     candidate_preparation.finish("completed", None, None);
