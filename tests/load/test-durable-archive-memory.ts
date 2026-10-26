@@ -58,7 +58,7 @@ test("drain exempts only one explicitly owned unknown hold and its exact durable
 });
 
 test("unknown requires owned semantics exactly once while retaining its receipt, hold and no financial ACK", () => {
-  const responseObject = 'inline-json:{"error":{"message":"upstream request failed","type":"upstream_error"}}';
+  const responseObject = 'inline-json:{"error":{"code":"upstream_invalid_response","message":"上游请求失败。上游响应无效。","message_en":"upstream request failed. the upstream response was invalid.","type":"upstream_error"}}';
   const claim = {
     request_id: "request", tenant_id: "tenant", key_id: "key", account_id: "account",
     reservation_id: "reservation", owner_token: "owner", fence: "fence", contract_digest: "digest",

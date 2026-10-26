@@ -603,9 +603,12 @@ async fn finish_non_sse_proxy_response(
             } else {
                 (
                     StatusCode::BAD_GATEWAY,
-                    Bytes::from_static(
-                        b"{\"error\":{\"message\":\"upstream returned an invalid response\",\"type\":\"upstream_error\"}}",
-                    ),
+                    Bytes::from(crate::error::explained_failure_body(
+                        "上游请求失败",
+                        "upstream request failed",
+                        "upstream_invalid_response",
+                        crate::error::ErrorFacts::new(),
+                    )),
                     "upstream_invalid_response",
                 )
             };
@@ -1962,9 +1965,12 @@ async fn proxy_with_cancellation_guard(
             } else if !valid_output {
                 (
                     StatusCode::BAD_GATEWAY,
-                    Bytes::from_static(
-                        b"{\"error\":{\"message\":\"upstream returned an invalid response\",\"type\":\"upstream_error\"}}",
-                    ),
+                    Bytes::from(crate::error::explained_failure_body(
+                        "上游请求失败",
+                        "upstream request failed",
+                        "upstream_invalid_response",
+                        crate::error::ErrorFacts::new(),
+                    )),
                 )
             } else {
                 (

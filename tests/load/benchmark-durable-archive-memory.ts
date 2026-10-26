@@ -30,7 +30,7 @@ type ArchiveGapBaseline = {
   successful_request_archive_gaps: number; successful_response_archive_gaps: number;
   request_persistence: Record<string, number>; persistence: Record<string, number>;
 };
-const SAFE_UPSTREAM_ERROR = '{"error":{"message":"upstream request failed","type":"upstream_error"}}';
+const SAFE_UPSTREAM_ERROR = '{"error":{"code":"upstream_invalid_response","message":"上游请求失败。上游响应无效。","message_en":"upstream request failed. the upstream response was invalid.","type":"upstream_error"}}';
 
 export function archiveDrainReady(row: Record<string, unknown>, retainedRequestCipherBytes?: number): boolean {
   const expected = retainedRequestCipherBytes === undefined ? 0 : 1;
