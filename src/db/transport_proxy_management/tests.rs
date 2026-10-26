@@ -281,7 +281,7 @@ async fn contract(database: &Database) {
     };
     assert!(
         database
-            .update_transport_group(id, unchanged(None), None, KEY)
+            .update_transport_group(id, unchanged(Some(Uuid::now_v7())), None, KEY)
             .await
             .is_err()
     );
@@ -293,7 +293,7 @@ async fn contract(database: &Database) {
         1
     );
     database
-        .update_transport_group(id, unchanged(Some(backup)), None, KEY)
+        .update_transport_group(id, unchanged(None), None, KEY)
         .await
         .unwrap();
     let probed = database
@@ -379,12 +379,15 @@ async fn contract(database: &Database) {
             .0,
         BACKUP
     );
+    let (binding, backup) =
+        final_members_contract(database, &runtime, account.id, id, &tenant).await;
+    let group_version = binding["group_version"].as_i64().unwrap();
     let unbound = database
         .unbind_transport_group(
             account.id,
             UnbindGroup {
                 tenant_external_id: tenant.clone(),
-                expected_group_version: 2,
+                expected_group_version: group_version,
                 expected_binding_version: 1,
                 expected_credential_generation: binding["credential_generation"].as_i64().unwrap(),
                 expected_updated_at: binding["updated_at"].as_i64().unwrap(),
@@ -424,7 +427,7 @@ async fn contract(database: &Database) {
             id,
             DeleteGroup {
                 tenant_external_id: tenant,
-                expected_version: 2,
+                expected_version: group_version,
             },
             None,
         )
@@ -438,6 +441,178 @@ async fn contract(database: &Database) {
     .await
     .unwrap();
     assert_eq!(audits, 2);
+}
+
+async fn final_members_contract(
+    database: &Database,
+    runtime: &TransportProxyGroups,
+    account_id: Uuid,
+    group_id: Uuid,
+    tenant: &str,
+) -> (Value, Uuid) {
+    let mut group = database
+        .get_transport_group(group_id, tenant, KEY)
+        .await
+        .unwrap();
+    let mut binding = database
+        .get_transport_binding(account_id, tenant)
+        .await
+        .unwrap();
+    for stage in 0..4 {
+        let (account, credential) = database
+            .upstream_account_with_credential(account_id, KEY)
+            .await
+            .unwrap();
+        let before = runtime
+            .select_config(
+                account_id,
+                account.credential_generation,
+                &credential,
+                &account.config,
+            )
+            .unwrap();
+        let before_proxy = before.credential.proxy().unwrap().0.to_owned();
+        if stage == 1 {
+            assert!(before.advance_after_connect_failure(&[1]).unwrap());
+            runtime
+                .synchronize_managed_for_test(&database.pool)
+                .await
+                .unwrap();
+        }
+        let final_members = match stage {
+            0 => serde_json::json!([
+                {"label": "new first", "proxy_url": PRIMARY},
+                {"id": group["members"][0]["id"], "label": "retained selected"}
+            ]),
+            1 => serde_json::json!([
+                {"label": "new initial", "proxy_url": "socks5h://10.20.30.42:1080"},
+                {"id": group["members"][0]["id"], "label": "retained selected"}
+            ]),
+            2 => serde_json::json!([
+                {"id": group["members"][0]["id"], "label": "retained initial"},
+                {"id": group["members"][1]["id"], "label": "changed selected",
+                 "proxy_url": "socks5h://10.20.30.43:1080"}
+            ]),
+            _ => serde_json::json!([
+                {"label": "all new first", "proxy_url": BACKUP},
+                {"label": "all new second", "proxy_url": PRIMARY}
+            ]),
+        };
+        let update = serde_json::json!({
+            "tenant_external_id": tenant,
+            "expected_version": group["version"],
+            "name": "final members",
+            "members": final_members
+        });
+        let saved = database
+            .update_transport_group(
+                group_id,
+                serde_json::from_value(update.clone()).unwrap(),
+                None,
+                KEY,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            saved["version"].as_i64().unwrap(),
+            group["version"].as_i64().unwrap() + 1
+        );
+        assert!(matches!(
+            database
+                .update_transport_group(
+                    group_id,
+                    serde_json::from_value(update).unwrap(),
+                    None,
+                    KEY
+                )
+                .await,
+            Err(AppError::ProxyGroupConflict("proxy_group_version_conflict"))
+        ));
+        let current = database
+            .get_transport_binding(account_id, tenant)
+            .await
+            .unwrap();
+        assert_eq!(current["binding_version"], binding["binding_version"]);
+        assert_eq!(
+            current["credential_generation"].as_i64().unwrap(),
+            binding["credential_generation"].as_i64().unwrap() + 1
+        );
+        assert_eq!(current["group_version"], saved["version"]);
+        let initial_index = usize::from(stage == 0);
+        let selected_index = usize::from(stage < 2);
+        assert_eq!(
+            current["initial_member_id"],
+            saved["members"][initial_index]["id"]
+        );
+        if stage < 2 {
+            assert_eq!(saved["members"][1]["id"], group["members"][0]["id"]);
+        } else if stage == 3 {
+            for member in saved["members"].as_array().unwrap() {
+                assert!(
+                    group["members"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|old| old["id"] != member["id"])
+                );
+            }
+        }
+        let (updated_account, updated_credential) = database
+            .upstream_account_with_credential(account_id, KEY)
+            .await
+            .unwrap();
+        runtime
+            .synchronize_managed_for_test(&database.pool)
+            .await
+            .unwrap();
+        let cold = TransportProxyGroups::parse("[]", KEY).unwrap();
+        cold.refresh_managed(&database.pool).await.unwrap();
+        for reader in [runtime, &cold] {
+            let selected = reader
+                .select_config(
+                    account_id,
+                    updated_account.credential_generation,
+                    &updated_credential,
+                    &updated_account.config,
+                )
+                .unwrap()
+                .egress_snapshot()
+                .unwrap();
+            assert_eq!(
+                selected.member_id.unwrap().to_string(),
+                saved["members"][selected_index]["id"].as_str().unwrap()
+            );
+        }
+        assert_eq!(before.credential.proxy().unwrap().0, before_proxy);
+        group = saved;
+        binding = current;
+    }
+    assert!(
+        database
+            .update_transport_group(
+                group_id,
+                serde_json::from_value(serde_json::json!({
+                    "tenant_external_id": tenant,
+                    "expected_version": group["version"],
+                    "name": "empty",
+                    "members": []
+                }))
+                .unwrap(),
+                None,
+                KEY
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .get_transport_group(group_id, tenant, KEY)
+            .await
+            .unwrap(),
+        group
+    );
+    let selected = Uuid::parse_str(group["members"][0]["id"].as_str().unwrap()).unwrap();
+    (binding, selected)
 }
 
 #[tokio::test]
