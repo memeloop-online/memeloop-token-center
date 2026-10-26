@@ -332,7 +332,7 @@ async fn bill_model_probe(
     };
     let route = match state
         .db
-        .probe_billing_route(account_id, key.key_id, &model)
+        .probe_billing_route(account_id, key.key_id, model)
         .await
     {
         Ok(Some(route)) => route,

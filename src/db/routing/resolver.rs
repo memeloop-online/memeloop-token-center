@@ -373,7 +373,9 @@ impl Database {
                     END AS BIGINT) AS probe_rank
              FROM model_routes r
              JOIN upstream_accounts a
-               ON a.tenant_id = r.tenant_id AND a.status = 'active'
+               ON a.id = r.upstream_account_id
+              AND a.tenant_id = r.tenant_id
+              AND a.status = 'active'
              LEFT JOIN upstream_service_probes service_probe
                ON service_probe.upstream_account_id = a.id
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
@@ -1032,7 +1034,7 @@ mod tests {
                 tenant_uuid,
                 "gpt-fallback",
                 "openai",
-                selection.clone(),
+                selection,
             )
             .await
             .unwrap();
