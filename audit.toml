@@ -1,0 +1,11 @@
+# Same temporary exceptions as deny.toml. cargo audit does not read deny.toml.
+# wreq-util 3.0.0-rc.14 still requires zstd 0.13.3; drop these when that crate
+# publishes a release on zstd >=0.14.3.
+
+[advisories]
+ignore = [
+  "RUSTSEC-2026-0391",
+  "RUSTSEC-2026-0398",
+  "RUSTSEC-2026-0403",
+  "RUSTSEC-2026-0410",
+]
