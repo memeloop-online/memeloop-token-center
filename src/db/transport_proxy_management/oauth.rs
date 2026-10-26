@@ -135,7 +135,11 @@ impl Database {
                     == Some(session.to_string().as_str())
             });
             if config.get(CONFIG_KEY)
-                != Some(&serde_json::to_value(stamp).map_err(|_| AppError::internal("oauth_validate_oauth_transport_group_tx_2"))?)
+                != Some(
+                    &serde_json::to_value(stamp).map_err(|_| {
+                        AppError::internal("oauth_validate_oauth_transport_group_tx_2")
+                    })?,
+                )
                 || stamp.group_id != Some(snapshot.reference.group_id)
                 || stamp.group_version != Some(snapshot.reference.expected_group_version)
                 || (!installed_session

@@ -250,7 +250,10 @@ impl NativeClient<'_> {
             .and_then(Value::as_object)
             .ok_or_else(|| AppError::upstream("antigravity_model_catalog_is_invalid"))?;
         if models.len() > 4096 {
-            return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("antigravity_list_models")));
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("antigravity_list_models"),
+            ));
         }
         Ok(models
             .keys()
@@ -454,15 +457,16 @@ pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
                     .get("data")
                     .and_then(Value::as_str)
                     .filter(|data| data.len() <= IMAGE_LIMIT)
-                    .ok_or_else(|| {
-                        AppError::upstream("antigravity_image_data_is_invalid")
-                    })?;
-                let bytes = STANDARD.decode(data).map_err(|_| {
-                    AppError::upstream("antigravity_image_encoding_is_invalid")
-                })?;
+                    .ok_or_else(|| AppError::upstream("antigravity_image_data_is_invalid"))?;
+                let bytes = STANDARD
+                    .decode(data)
+                    .map_err(|_| AppError::upstream("antigravity_image_encoding_is_invalid"))?;
                 total = total.saturating_add(bytes.len());
                 if bytes.is_empty() || total > IMAGE_LIMIT || result.images.len() >= 16 {
-                    return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("antigravity_decode_images")));
+                    return Err(AppError::upstream_with(
+                        "upstream_unavailable",
+                        crate::error::ErrorFacts::new().stage("antigravity_decode_images"),
+                    ));
                 }
                 result.images.push(GeneratedImage {
                     mime_type: mime.into(),
@@ -482,15 +486,20 @@ async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("antigravity_bounded_body")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("antigravity_bounded_body"),
+        ));
     }
     let mut output = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| AppError::upstream("antigravity_response_interrupted"))?;
+        let chunk = chunk.map_err(|_| AppError::upstream("antigravity_response_interrupted"))?;
         if output.len().saturating_add(chunk.len()) > limit {
-            return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("antigravity_bounded_body")));
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("antigravity_bounded_body"),
+            ));
         }
         output.extend_from_slice(&chunk);
     }

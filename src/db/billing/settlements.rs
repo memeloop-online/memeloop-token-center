@@ -205,7 +205,9 @@ fn settlement_correction_preview_from_row(
     let key_id = parse_uuid(row.try_get("key_id")?)?;
     let cost_micros: i64 = row.try_get("cost_micros")?;
     if cost_micros < 0 {
-        return Err(AppError::internal("settlements_settlement_correction_preview_from_row_1"));
+        return Err(AppError::internal(
+            "settlements_settlement_correction_preview_from_row_1",
+        ));
     }
     let input_tokens: i64 = row.try_get("input_tokens")?;
     let cached_input_tokens: i64 = row.try_get("cached_input_tokens")?;
@@ -287,8 +289,9 @@ fn settlement_correction_preview_from_row(
         SettlementCorrectionReviewState::InvariantMismatch
     };
     let archive_state_value: String = row.try_get("archive_state")?;
-    let archive_state =
-        RequestArchiveState::from_storage(&archive_state_value).ok_or(AppError::internal("settlements_settlement_correction_preview_from_row_1"))?;
+    let archive_state = RequestArchiveState::from_storage(&archive_state_value).ok_or(
+        AppError::internal("settlements_settlement_correction_preview_from_row_1"),
+    )?;
     Ok(SettlementCorrectionPreviewView {
         request_id,
         reservation_id,
@@ -459,12 +462,18 @@ async fn publish_settlement_row(
 fn account_settlement_from_row(row: &AnyRow) -> Result<AccountSettlementView, AppError> {
     let cost_micros: i64 = row.try_get("cost_micros")?;
     if cost_micros < 0 {
-        return Err(AppError::internal("settlements_account_settlement_from_row_1"));
+        return Err(AppError::internal(
+            "settlements_account_settlement_from_row_1",
+        ));
     }
     let kind = match row.try_get::<String, _>("request_kind")?.as_str() {
         "text" => AccountSettlementKind::Text,
         "generation" => AccountSettlementKind::Generation,
-        _ => return Err(AppError::internal("settlements_account_settlement_from_row_2")),
+        _ => {
+            return Err(AppError::internal(
+                "settlements_account_settlement_from_row_2",
+            ));
+        }
     };
     Ok(AccountSettlementView {
         settlement_id: parse_uuid(row.try_get("settlement_id")?)?,
@@ -484,7 +493,11 @@ fn account_settlement_from_row(row: &AnyRow) -> Result<AccountSettlementView, Ap
         output_tokens: row.try_get("output_tokens")?,
         usage_basis: row
             .try_get::<Option<String>, _>("usage_basis")?
-            .map(|value| RequestUsageBasis::from_storage(&value).ok_or(AppError::internal("settlements_account_settlement_from_row_3")))
+            .map(|value| {
+                RequestUsageBasis::from_storage(&value).ok_or(AppError::internal(
+                    "settlements_account_settlement_from_row_3",
+                ))
+            })
             .transpose()?,
     })
 }

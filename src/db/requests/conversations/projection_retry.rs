@@ -89,7 +89,9 @@ mod tests {
                 std::io::ErrorKind::ConnectionReset,
             ))),
             ConversationContentError::Database(sqlx::Error::PoolTimedOut),
-            ConversationContentError::Application(AppError::internal("projection_retry_transport_and_application_errors_do_not_authori")),
+            ConversationContentError::Application(AppError::internal(
+                "projection_retry_transport_and_application_errors_do_not_authori",
+            )),
             ConversationContentError::Application(AppError::Conflict("invalid snapshot".into())),
         ] {
             assert_eq!(error.retryable_sqlstate(), None);

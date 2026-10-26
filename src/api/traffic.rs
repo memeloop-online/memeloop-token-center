@@ -517,7 +517,10 @@ async fn apply_traffic_plugin(
         .request_json
         .unwrap_or(original_request_json);
     if !request_json.is_object() {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
+        ));
     }
     let rewritten_model = request_json
         .get("model")
@@ -529,18 +532,23 @@ async fn apply_traffic_plugin(
         .or(rewritten_model)
         .unwrap_or_else(|| requested_model.clone());
     if model.trim().is_empty() || model.len() > 200 {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
+        ));
     }
     request_json["model"] = Value::String(model.clone());
     if crate::gateway_body::memory::json_encoded_length(&request_json)? > MAX_IMAGE_REQUEST_BODY {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
+        ));
     }
     let upstream_account_hint = plugin_decision
         .upstream_account_id
         .map(|value| {
-            Uuid::parse_str(&value).map_err(|_| {
-                AppError::upstream("plugin_returned_an_invalid_upstream_account_id")
-            })
+            Uuid::parse_str(&value)
+                .map_err(|_| AppError::upstream("plugin_returned_an_invalid_upstream_account_id"))
         })
         .transpose()?;
     Ok(AppliedTraffic {
@@ -571,9 +579,7 @@ pub(super) async fn prepare_component_provider(
         plugins.prepare_provider_request(&provider_id, context, &config, &request_json)
     })
     .await?
-    .ok_or_else(|| {
-        AppError::upstream("component_provider_adapter_is_declared_but_unavailable")
-    })
+    .ok_or_else(|| AppError::upstream("component_provider_adapter_is_declared_but_unavailable"))
 }
 
 pub(super) async fn normalize_component_provider(
@@ -603,16 +609,17 @@ pub(super) async fn normalize_component_provider(
         plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
     })
     .await?
-    .ok_or_else(|| {
-        AppError::upstream("component_provider_adapter_is_declared_but_unavailable")
-    })
+    .ok_or_else(|| AppError::upstream("component_provider_adapter_is_declared_but_unavailable"))
 }
 
 pub(super) fn component_provider_url(base_url: &str, path: &str) -> Result<String, AppError> {
     let base = network::checked_http_url(base_url)?;
     let target = network::checked_http_url(&format!("{}{}", base_url.trim_end_matches('/'), path))?;
     if target.origin() != base.origin() {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("traffic_component_provider_url")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_component_provider_url"),
+        ));
     }
     Ok(target.into())
 }

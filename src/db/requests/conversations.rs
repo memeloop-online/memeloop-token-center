@@ -108,6 +108,9 @@ struct ConversationSemanticSnapshot {
 const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 
+/// 网关结算只把请求身份放进队列。
+/// 不在这里解析原始请求 JSON 或原始返回 JSON。
+/// 会话正文归档由 worker 读取这两个 locator 之后写入 CNPG。
 pub(crate) async fn enqueue_conversation_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     input: ConversationProjectionEnqueueInput<'_>,
@@ -115,34 +118,29 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let ConversationProjectionEnqueueInput {
         request_id,
         key,
-        request_json,
+        request_json: _,
         hints,
         client_name,
         upstream_response_id,
         observed_at,
-        content_materialized,
+        content_materialized: _,
     } = input;
-    // Exact-capacity serialization keeps the retained request envelope bounded
-    // while the terminal transaction also owns the response ciphertext.
-    let payload = if content_materialized {
-        None
-    } else {
-        Some(semantic_payload::encode(request_id, key, request_json)?)
-    };
-    let (request_json, semantic_snapshot) = {
-        let atoms = extract_atoms(request_json);
-        let nodes = build_prefix(&atoms);
+    // 结算不解析原始请求 JSON。worker 稍后按 locator 读取两份原始文档并写会话正文。
+    let payload: Option<(String, String)> = None;
+    let request_json = "{}".to_owned();
+    let semantic_snapshot = {
         let snapshot = ConversationSemanticSnapshot {
-            leaf: nodes.last().map(|node| node.node_hash.clone()),
-            atom_hashes: bounded_atom_hashes(&atoms),
-            payload_digest: payload.as_ref().map(|(_, digest)| digest.clone()),
+            leaf: None,
+            atom_hashes: Vec::new(),
+            payload_digest: None,
         };
-        (
-            "{}".to_owned(),
-            Some(serde_json::to_string(&snapshot).map_err(|_| AppError::internal("conversations_enqueue_conversation_projection_in_transaction_1"))?),
-        )
+        Some(serde_json::to_string(&snapshot).map_err(|_| {
+            AppError::internal("conversations_enqueue_conversation_projection_in_transaction_1")
+        })?)
     };
-    let hints_json = serde_json::to_string(hints).map_err(|_| AppError::internal("conversations_enqueue_conversation_projection_in_transaction_2"))?;
+    let hints_json = serde_json::to_string(hints).map_err(|_| {
+        AppError::internal("conversations_enqueue_conversation_projection_in_transaction_2")
+    })?;
     let key_snapshot = serde_json::json!({
         "account_id": key.account_id,
         "alias": key.alias,
@@ -202,16 +200,12 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
             || (existing.try_get::<i64, _>("payload_required")? != 0) != payload.is_some()
         {
             return Err(AppError::Conflict(
-                "conversation projection evidence does not match its owner".into(),
+                "会话正文归档的入队记录和已有记录不一致".into(),
             ));
         }
         if completed {
-            // A matching replay must not resurrect a consumed body payload.
             return Ok(());
         }
-    }
-    if let Some((body, digest)) = payload {
-        semantic_payload::persist(transaction, request_id, key, &body, &digest).await?;
     }
     Ok(())
 }
@@ -375,6 +369,163 @@ impl Database {
             .collect()
     }
 
+    /// 读取这条请求上的原始请求 JSON locator 和原始返回 JSON locator。
+    /// 没有记录时两个都空，调用方应跳过会话正文归档，而不是让客户端失败。
+    pub async fn session_body_locators(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Option<(String, Option<String>)>, AppError> {
+        let row = sqlx::query(
+            "SELECT request_object, response_object FROM request_records WHERE id = $1 LIMIT 1",
+        )
+        .bind(request_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        Ok(Some((
+            row.try_get("request_object")?,
+            row.try_get("response_object")?,
+        )))
+    }
+
+    /// 把已经整理好的会话正文写入 CNPG。媒体 locator 记在 `conversation_media_parts`。
+    /// 不读取对象存储，也不碰 `generation_assets`。
+    pub async fn prepare_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        atoms: &[SemanticAtom],
+        nodes: &[PrefixNode],
+        media: &[crate::conversation::SessionMediaLocator],
+    ) -> Result<bool, AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        let now = unix_millis();
+        let row = sqlx::query(
+            "SELECT tenant_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+        )
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .bind(now)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(row) = row else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        let tenant_id: String = row.try_get("tenant_id")?;
+        let observed_at: i64 = row.try_get("observed_at")?;
+        materialize_conversation_content_in_transaction(
+            &mut transaction,
+            &tenant_id,
+            atoms,
+            nodes,
+            observed_at,
+        )
+        .await?;
+        for item in media {
+            if item.part_index < 0
+                || item.byte_length < 0
+                || item.media_type.is_empty()
+                || item.media_type.len() > 128
+                || item.content_blake3.len() != 64
+                || item.object_locator.is_empty()
+                || item.object_locator.len() > 1024
+                || item.turn_id.is_empty()
+            {
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO conversation_media_parts (tenant_id, turn_id, part_index, media_type, byte_length, content_blake3, object_locator) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT(tenant_id, turn_id, part_index) DO NOTHING",
+            )
+            .bind(&tenant_id)
+            .bind(&item.turn_id)
+            .bind(item.part_index)
+            .bind(&item.media_type)
+            .bind(item.byte_length)
+            .bind(&item.content_blake3)
+            .bind(&item.object_locator)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        let snapshot = ConversationSemanticSnapshot {
+            leaf: nodes.last().map(|node| node.node_hash.clone()),
+            atom_hashes: bounded_atom_hashes(atoms),
+            payload_digest: None,
+        };
+        let encoded = serde_json::to_string(&snapshot)
+            .map_err(|_| AppError::internal("conversations_prepare_session_body_archive_1"))?;
+        let updated = sqlx::query(
+            "UPDATE conversation_projection_outbox SET semantic_snapshot_json = $1, semantic_payload_snapshot_json = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+        )
+        .bind(encoded)
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
+    /// 缺少 locator 或原始文档读不出来时结束这条队列记录。
+    /// 不清理 `request_object` / `response_object`，因此回收不会把还能引用的对象删掉。
+    pub async fn skip_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        reason: &str,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        let note = serde_json::json!({ "session_body_skip": reason }).to_string();
+        let updated = sqlx::query(
+            "UPDATE conversation_projection_outbox SET projected_at = $1, semantic_snapshot_json = $2, semantic_payload_snapshot_json = NULL, lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $4",
+        )
+        .bind(now)
+        .bind(note)
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    /// 训练导出只读 CNPG 里的会话正文。不打开、不列出对象存储。
+    pub async fn export_training_dialogue(
+        &self,
+        tenant_id: Uuid,
+        leaf_node_hash: &str,
+    ) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
+        let rows = sqlx::query(
+            "WITH RECURSIVE chain AS ( \
+                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2 \
+                UNION ALL \
+                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n \
+                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash \
+                WHERE c.depth > 0 AND c.depth < 4096 \
+            ) \
+            SELECT a.content_json FROM chain c \
+            JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash \
+            ORDER BY c.depth ASC LIMIT 4096",
+        )
+        .bind(tenant_id.to_string())
+        .bind(leaf_node_hash)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut turns = Vec::with_capacity(rows.len());
+        for row in rows {
+            let content: String = row.try_get("content_json")?;
+            let value = serde_json::from_str(&content)
+                .map_err(|_| AppError::internal("conversations_export_training_dialogue_1"))?;
+            turns.push(value);
+        }
+        Ok(crate::conversation::training_dialogue(&turns))
+    }
+
     /// Materializes one task claimed by `lease_owner`. The observation writes,
     /// request membership update, usage reclassification, and `projected_at`
     /// acknowledgement commit atomically, making a retry exactly-once.
@@ -402,7 +553,13 @@ impl Database {
             };
             let snapshot: Option<ConversationSemanticSnapshot> = prepare
                 .try_get::<Option<String>, _>("semantic_snapshot_json")?
-                .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::internal("conversations_project_claimed_conversation_projection_task_1")))
+                .map(|encoded| {
+                    serde_json::from_str(&encoded).map_err(|_| {
+                        AppError::internal(
+                            "conversations_project_claimed_conversation_projection_task_1",
+                        )
+                    })
+                })
                 .transpose()?;
             let payload_required = prepare.try_get::<i64, _>("payload_required")? != 0;
             if payload_required
@@ -881,8 +1038,8 @@ impl Database {
                 );
             }
         }
-        let atom_hashes_json =
-            serde_json::to_string(&fingerprint).map_err(|_| AppError::internal("conversations_site_11"))?;
+        let atom_hashes_json = serde_json::to_string(&fingerprint)
+            .map_err(|_| AppError::internal("conversations_site_11"))?;
         let has_semantic_atoms = !atom_hashes.is_empty();
         debug_assert!(atom_hashes_json.len() <= MAX_CONVERSATION_FINGERPRINT_JSON_BYTES);
         let current_node_hashes: HashSet<&str> =
@@ -1064,7 +1221,8 @@ impl Database {
         };
 
         let execution_metadata = hints.execution_metadata();
-        let labels_json = serde_json::to_string(&hints.labels).map_err(|_| AppError::internal("conversations_site_12"))?;
+        let labels_json = serde_json::to_string(&hints.labels)
+            .map_err(|_| AppError::internal("conversations_site_12"))?;
 
         sqlx::query(
             "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version, turn_id, parent_turn_id, branch_id, compaction, session_name, trace_id, span_id, parent_span_id, agent_id, parent_agent_id, task_kind, labels_json, metadata_source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 2, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
@@ -1340,8 +1498,8 @@ impl Database {
         let edge_rows = if page_request_ids.is_empty() {
             Vec::new()
         } else {
-            let request_ids_json =
-                serde_json::to_string(&page_request_ids).map_err(|_| AppError::internal("conversations_site_13"))?;
+            let request_ids_json = serde_json::to_string(&page_request_ids)
+                .map_err(|_| AppError::internal("conversations_site_13"))?;
             let query = match self.backend {
                 DatabaseBackend::PostgreSql => {
                     "SELECT source_o.request_id AS from_request_id, target_o.request_id AS to_request_id, e.relation_kind, e.confidence_millis, e.evidence_json FROM conversation_edges e JOIN conversation_observations target_o ON target_o.id = e.to_observation_id LEFT JOIN conversation_observations source_o ON source_o.id = e.from_observation_id WHERE e.cluster_id = $1 AND target_o.key_id = $2 AND (source_o.key_id = $3 OR source_o.id IS NULL) AND target_o.request_id IN (SELECT jsonb_array_elements_text(CAST($4 AS JSONB))) ORDER BY target_o.created_at ASC, target_o.id ASC, e.id ASC LIMIT $5"
@@ -1541,7 +1699,9 @@ async fn emit_conversation_projected_event_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if inserted.rows_affected() != 1 {
-        return Err(AppError::internal("conversations_emit_conversation_projected_event_in_transaction_1"));
+        return Err(AppError::internal(
+            "conversations_emit_conversation_projected_event_in_transaction_1",
+        ));
     }
     Ok(())
 }
@@ -1677,7 +1837,9 @@ async fn merge_conversation_clusters_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if target_projection.rows_affected() != 1 {
-        return Err(AppError::internal("conversations_merge_conversation_clusters_in_transaction_1"));
+        return Err(AppError::internal(
+            "conversations_merge_conversation_clusters_in_transaction_1",
+        ));
     }
 
     // Migration 0031 intentionally retained inert historical cross-key edges.
@@ -1700,7 +1862,9 @@ async fn merge_conversation_clusters_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if moved_observations.rows_affected() == 0 {
-        return Err(AppError::internal("conversations_merge_conversation_clusters_in_transaction_2"));
+        return Err(AppError::internal(
+            "conversations_merge_conversation_clusters_in_transaction_2",
+        ));
     }
     sqlx::query(
         "UPDATE request_records SET conversation_cluster_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND conversation_cluster_id = $4",
@@ -1939,7 +2103,9 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if updated.rows_affected() != 1 {
-        return Err(AppError::internal("conversations_attach_conversation_upstream_response_in_transacti"));
+        return Err(AppError::internal(
+            "conversations_attach_conversation_upstream_response_in_transacti",
+        ));
     }
     reconcile_unresolved_explicit_parents_in_transaction(
         transaction,
@@ -2059,7 +2225,9 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     archive_state: crate::model::RequestArchiveState::from_storage(
                         row.try_get::<String, _>("archive_state")?.as_str(),
                     )
-                    .ok_or(AppError::internal("conversations_conversation_request_views_1"))?,
+                    .ok_or(AppError::internal(
+                        "conversations_conversation_request_views_1",
+                    ))?,
                     credential_identity: None,
                     session_context: Some(RequestSessionContext {
                         session_id: row.try_get("session_id")?,
@@ -2259,7 +2427,9 @@ impl Database {
         snapshot: Option<&ConversationSemanticSnapshot>,
     ) -> Result<(), AppError> {
         let (leaf, fingerprint) = conversation_prefix_from_request_json(request_json.as_bytes())
-            .map_err(|_| AppError::internal("conversations_materialize_streamed_conversation_content_1"))?;
+            .map_err(|_| {
+                AppError::internal("conversations_materialize_streamed_conversation_content_1")
+            })?;
         if let Some(snapshot) = snapshot
             && (snapshot.leaf != leaf || snapshot.atom_hashes != fingerprint)
         {
@@ -2323,7 +2493,9 @@ async fn insert_streamed_conversation_content(
             instance_hash,
         } = atom;
         let Ok(content_json) = serde_json::to_string(&content) else {
-            failed = Some(AppError::internal("conversations_insert_streamed_conversation_content_1").into());
+            failed = Some(
+                AppError::internal("conversations_insert_streamed_conversation_content_1").into(),
+            );
             break;
         };
         drop(content);
@@ -2360,7 +2532,11 @@ async fn insert_streamed_conversation_content(
     drop(rx);
     let walk_result = match walk.await {
         Ok(result) => result,
-        Err(_) => return Err(AppError::internal("conversations_insert_streamed_conversation_content_2").into()),
+        Err(_) => {
+            return Err(
+                AppError::internal("conversations_insert_streamed_conversation_content_2").into(),
+            );
+        }
     };
     if let Some(error) = failed {
         return Err(error);
@@ -2370,9 +2546,13 @@ async fn insert_streamed_conversation_content(
     }
     match walk_result {
         Ok(()) => Ok(()),
-        Err(crate::conversation::RequestAtomError::Json(_)) => Err(AppError::internal("conversations_insert_streamed_conversation_content_3").into()),
+        Err(crate::conversation::RequestAtomError::Json(_)) => {
+            Err(AppError::internal("conversations_insert_streamed_conversation_content_3").into())
+        }
         // The sender only fails when this task drops the receiver after its own error.
-        Err(crate::conversation::RequestAtomError::Visitor(())) => Err(AppError::internal("conversations_insert_streamed_conversation_content_4").into()),
+        Err(crate::conversation::RequestAtomError::Visitor(())) => {
+            Err(AppError::internal("conversations_insert_streamed_conversation_content_4").into())
+        }
     }
 }
 
@@ -2467,7 +2647,11 @@ async fn materialize_conversation_content_with_statement_error(
                 .bind(&atom.instance_hash)
                 .bind(&atom.role)
                 .bind(&atom.kind)
-                .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::internal("conversations_materialize_conversation_content_with_statement_er"))?)
+                .bind(serde_json::to_string(&atom.content).map_err(|_| {
+                    AppError::internal(
+                        "conversations_materialize_conversation_content_with_statement_er",
+                    )
+                })?)
                 .bind(observed_at);
         }
         query.execute(&mut **transaction).await?;
@@ -2594,8 +2778,7 @@ mod tests {
         });
         let text = serde_json::to_string(&body).unwrap();
         let tenant = Uuid::now_v7().to_string();
-        let (leaf, fingerprint) =
-            conversation_prefix_from_request_json(text.as_bytes()).unwrap();
+        let (leaf, fingerprint) = conversation_prefix_from_request_json(text.as_bytes()).unwrap();
         let mismatch = db
             .materialize_streamed_conversation_content(
                 Uuid::now_v7(),
@@ -2642,7 +2825,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rows.len(), atoms.len());
-        assert!(atoms.len() > CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT);
+        assert!(
+            atoms.len() > CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT
+        );
         for (row, (atom, node)) in rows.iter().zip(atoms.iter().zip(&nodes)) {
             let depth: i64 = row.try_get("depth").unwrap();
             let node_hash: String = row.try_get("node_hash").unwrap();
@@ -2661,7 +2846,10 @@ mod tests {
             assert_eq!(instance_hash, atom.instance_hash);
             assert_eq!(content_json, serde_json::to_string(&atom.content).unwrap());
         }
-        assert_eq!(leaf.as_deref(), nodes.last().map(|node| node.node_hash.as_str()));
+        assert_eq!(
+            leaf.as_deref(),
+            nodes.last().map(|node| node.node_hash.as_str())
+        );
         assert_eq!(
             fingerprint,
             atoms

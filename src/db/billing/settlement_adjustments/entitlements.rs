@@ -127,7 +127,9 @@ pub(super) async fn rollback_entitlement_tail(
                     AppError::Conflict("settlement funding reduction overflowed".into())
                 })?;
         }
-        rollback_sequence = rollback_sequence.checked_add(1).ok_or(AppError::internal("entitlements_rollback_entitlement_tail_2"))?;
+        rollback_sequence = rollback_sequence.checked_add(1).ok_or(AppError::internal(
+            "entitlements_rollback_entitlement_tail_2",
+        ))?;
         sqlx::query(
             "INSERT INTO settlement_adjustment_entitlement_rollbacks (event_id, rollback_sequence, entitlement_cycle_id, amount_micros, created_at) VALUES ($1, $2, $3, $4, $5)",
         )

@@ -16,7 +16,8 @@ fn validate_directory(directory: &Path) -> Result<(), AppError> {
     {
         return Err(AppError::Forbidden);
     }
-    let metadata = std::fs::symlink_metadata(directory).map_err(|_| AppError::internal("prepare_validate_directory_1"))?;
+    let metadata = std::fs::symlink_metadata(directory)
+        .map_err(|_| AppError::internal("prepare_validate_directory_1"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(AppError::Forbidden);
     }
@@ -31,7 +32,10 @@ pub fn check_inventory_directory(directory: &Path) -> Result<(), AppError> {
 pub fn prepare_inventory_directory(directory: &Path) -> Result<(), AppError> {
     validate_directory(directory)?;
     let inventory = directory.join("inventory.json");
-    if inventory.try_exists().map_err(|_| AppError::internal("prepare_prepare_inventory_directory_1"))? {
+    if inventory
+        .try_exists()
+        .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_1"))?
+    {
         return validate_existing(&inventory);
     }
     // Publish only a complete fsynced file; create-new on the final filename
@@ -45,9 +49,13 @@ pub fn prepare_inventory_directory(directory: &Path) -> Result<(), AppError> {
         options.mode(0o640);
     }
     let result = (|| {
-        let mut file = options.open(&temporary).map_err(|_| AppError::internal("prepare_prepare_inventory_directory_2"))?;
-        file.write_all(b"{}").map_err(|_| AppError::internal("prepare_prepare_inventory_directory_3"))?;
-        file.sync_all().map_err(|_| AppError::internal("prepare_prepare_inventory_directory_4"))?;
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_2"))?;
+        file.write_all(b"{}")
+            .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_3"))?;
+        file.sync_all()
+            .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_4"))?;
         match std::fs::hard_link(&temporary, &inventory) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -63,7 +71,8 @@ pub fn prepare_inventory_directory(directory: &Path) -> Result<(), AppError> {
 }
 
 fn validate_existing(path: &Path) -> Result<(), AppError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| AppError::internal("prepare_validate_existing_1"))?;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| AppError::internal("prepare_validate_existing_1"))?;
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(AppError::Forbidden);
     }

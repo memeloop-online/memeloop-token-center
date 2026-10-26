@@ -135,7 +135,10 @@ pub(super) fn input_schema() -> Value {
 pub(super) fn url(base: &str, path: &str) -> Result<String, AppError> {
     let mut parsed = url::Url::parse(base).map_err(|_| AppError::internal("wasu_wan_url_1"))?;
     if parsed.path() != "/v1" {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("wasu_wan_url")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_url"),
+        ));
     }
     parsed.set_path(path);
     parsed.set_query(None);
@@ -151,7 +154,10 @@ pub(super) fn ack_output(body: &Value) -> Result<&Value, AppError> {
         output.get("task_status").and_then(Value::as_str),
         Some("PENDING" | "RUNNING" | "SUCCEEDED")
     ) {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("wasu_wan_ack_output")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_ack_output"),
+        ));
     }
     let task_id = output
         .get("task_id")
@@ -166,7 +172,10 @@ fn poll_output<'body>(body: &'body Value, task_id: &str) -> Result<&'body Value,
         .get("output")
         .ok_or_else(|| AppError::upstream("wasu_wan_query_response_has_no_output"))?;
     if output.get("task_id").and_then(Value::as_str) != Some(task_id) {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("wasu_wan_poll_output")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_poll_output"),
+        ));
     }
     Ok(output)
 }
@@ -182,7 +191,10 @@ fn billed_seconds(body: &Value, reserved: i64) -> Result<i64, AppError> {
         || duration != output_duration
         || duration.is_none_or(|value| value <= 0 || value > reserved)
     {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("wasu_wan_billed_seconds")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_billed_seconds"),
+        ));
     }
     duration.ok_or(AppError::internal("wasu_wan_billed_seconds_1"))
 }
@@ -238,7 +250,10 @@ pub(super) async fn poll(
             attempt.valid = true;
             terminal_provider_success(state, worker_id, job, route, billed_units, vec![asset]).await
         }
-        _ => Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("wasu_wan_poll"))),
+        _ => Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_poll"),
+        )),
     }
 }
 

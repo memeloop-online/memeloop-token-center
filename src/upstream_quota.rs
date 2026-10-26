@@ -1052,9 +1052,8 @@ async fn get_codex_json_with_routes(
             // connection/request deadline. The account's connection limit
             // (including a 15s SOCKS handshake) runs inside session.deadline.
             let proxy_url = routes.map_or(auth.proxy_url, |routes| routes.proxy_url(route));
-            let http = crate::build_codex_http_client_with_proxy(policy, proxy_url).map_err(|_| {
-                retry::Failure::terminal("quota_destination_invalid", "client")
-            })?;
+            let http = crate::build_codex_http_client_with_proxy(policy, proxy_url)
+                .map_err(|_| retry::Failure::terminal("quota_destination_invalid", "client"))?;
             let mut request = http
                 .get(url)
                 .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))

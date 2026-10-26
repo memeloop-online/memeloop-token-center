@@ -1,6 +1,6 @@
-use std::{ffi::OsString, sync::Mutex};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::{ffi::OsString, sync::Mutex};
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -637,7 +637,10 @@ async fn official_cosign_contract_accepts_rotated_key_and_keeps_private_auth_out
             );
             assert!(
                 crate::windows_dir::is_restricted_to_current_user(
-                    &invocation.current_directory.join("docker").join("config.json")
+                    &invocation
+                        .current_directory
+                        .join("docker")
+                        .join("config.json")
                 )
                 .unwrap()
             );

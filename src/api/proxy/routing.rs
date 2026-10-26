@@ -219,7 +219,8 @@ pub(super) fn plan_proxy_route(
             key_id: key.key_id.to_string(),
             protocol: protocol.name().to_owned(),
             model: model.to_owned(),
-            config_json: serde_json::to_string(&route.config).map_err(|_| AppError::internal("routing_site_1"))?,
+            config_json: serde_json::to_string(&route.config)
+                .map_err(|_| AppError::internal("routing_site_1"))?,
         };
         Some(context)
     } else {
@@ -310,7 +311,11 @@ fn configured_output_reservation_bound(
         }
         return codex_transport::trusted_reservation_token_bound(config, upstream_model).map_err(
             |_| {
-                AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("routing_configured_output_reservation_bound"))
+                AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new()
+                        .stage("routing_configured_output_reservation_bound"),
+                )
             },
         );
     }
@@ -405,10 +410,14 @@ pub(super) async fn materialize_proxy_route(
         let plugins = wire_shim_runtime(state);
         let configurations = plugins
             .resolved_traffic_configurations(
-                context.tenant_id.parse().map_err(|_| AppError::internal("routing_materialize_proxy_route_2"))?,
+                context
+                    .tenant_id
+                    .parse()
+                    .map_err(|_| AppError::internal("routing_materialize_proxy_route_2"))?,
             )
             .await?;
-        let body = String::from_utf8(forwarded_body).map_err(|_| AppError::internal("routing_materialize_proxy_route_3"))?;
+        let body = String::from_utf8(forwarded_body)
+            .map_err(|_| AppError::internal("routing_materialize_proxy_route_3"))?;
         let driver = planned.route.driver.clone();
         let protocol = context.protocol.clone();
         let outcome = crate::api::plugin_execution::run(

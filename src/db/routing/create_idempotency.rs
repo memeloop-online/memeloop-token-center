@@ -76,7 +76,8 @@ pub(super) fn request_fingerprint(
         granted_credential_ids: input.granted_credential_ids,
         custom_model_confirmed: input.custom_model_confirmed,
     };
-    let bytes = serde_json::to_vec(&canonical).map_err(|_| AppError::internal("create_idempotency_request_fingerprint_1"))?;
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|_| AppError::internal("create_idempotency_request_fingerprint_1"))?;
     Ok(blake3::derive_key(ROUTE_CREATE_FINGERPRINT_DOMAIN, &bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -153,7 +154,9 @@ pub(super) async fn claim_route_create(
     find_owned_route_create(tx, tenant_id, idempotency_key, request_fingerprint, now)
         .await?
         .map(RouteCreateClaim::Reused)
-        .ok_or(AppError::internal("create_idempotency_claim_route_create_1"))
+        .ok_or(AppError::internal(
+            "create_idempotency_claim_route_create_1",
+        ))
 }
 
 async fn delete_expired_claim_for_key(

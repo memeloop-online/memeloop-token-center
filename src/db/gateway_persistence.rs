@@ -85,14 +85,45 @@ impl GatewayPersistence {
         })
     }
 
+    fn fitting_byte_charge(bytes: usize) -> Option<u32> {
+        if bytes > BYTE_LIMIT {
+            return None;
+        }
+        u32::try_from(bytes).ok()
+    }
+
     fn try_admit(&self, bytes: usize) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let charge = Self::fitting_byte_charge(bytes)?;
         let slot = self.slots.clone().try_acquire_owned().ok()?;
-        let bytes = self
-            .bytes
-            .clone()
-            .try_acquire_many_owned(u32::try_from(bytes).ok()?)
-            .ok()?;
+        let bytes = self.bytes.clone().try_acquire_many_owned(charge).ok()?;
         Some((slot, bytes))
+    }
+
+    /// Waits for a task slot, and for byte permits when the charge fits.
+    /// A raw request JSON larger than the byte semaphore is still archived:
+    /// those permits are process memory, not object storage, and waiting for
+    /// more permits than the semaphore holds would never complete.
+    async fn acquire_archive_permits(
+        &self,
+        bytes: usize,
+    ) -> (OwnedSemaphorePermit, Option<OwnedSemaphorePermit>) {
+        let slot = self
+            .slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("gateway archive slot semaphore stays open");
+        let bytes = match Self::fitting_byte_charge(bytes) {
+            Some(charge) => Some(
+                self.bytes
+                    .clone()
+                    .acquire_many_owned(charge)
+                    .await
+                    .expect("gateway archive byte semaphore stays open"),
+            ),
+            None => None,
+        };
+        (slot, bytes)
     }
 }
 
@@ -165,7 +196,9 @@ impl Database {
         let request_id = input.request_id;
         let tenant_id = input.key.tenant_id;
         if input.request_object != format!("gap://{request_id}/request") {
-            return Err(AppError::internal("gateway_persistence_start_proxy_request_with_deferred_archive_1"));
+            return Err(AppError::internal(
+                "gateway_persistence_start_proxy_request_with_deferred_archive_1",
+            ));
         }
         let reservation = self
             .start_proxy_forwarding_request_with_output_limit(
@@ -194,84 +227,76 @@ impl Database {
             .saturating_mul(3)
             .saturating_add(nodes.saturating_mul(256))
             .saturating_add(4 * 1024 * 1024);
-        let archive_admission = if body.len() > super::archive_spool::REQUEST_ARCHIVE_PLAIN_LIMIT {
-            self.gateway_persistence
-                .retention_limit
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%request_id, reason = "retention_limit", "request archive omitted");
-            RequestArchiveAdmission::GapRetentionLimit
-        } else if let Some(permits) = self.gateway_persistence.try_admit(charge) {
-            self.gateway_persistence
-                .accepted
-                .fetch_add(1, Ordering::Relaxed);
-            let body = Bytes::copy_from_slice(body);
-            let pepper = pepper.to_vec();
-            let mut database = self.clone();
-            database.pool = self.gateway_persistence.pool.clone();
-            database.pool_role = "gateway_archive";
+        // Memory permits bound concurrent archive work. They are not object
+        // storage being full, and they never omit the raw request JSON or
+        // fail admission because of a hardcoded byte limit.
+        let persistence = self.gateway_persistence.clone();
+        let immediate = persistence.try_admit(charge);
+        persistence.accepted.fetch_add(1, Ordering::Relaxed);
+        let body = Bytes::copy_from_slice(body);
+        let pepper = pepper.to_vec();
+        let mut database = self.clone();
+        database.pool = persistence.pool.clone();
+        database.pool_role = "gateway_archive";
+        tokio::spawn(async move {
+            let _permits = match immediate {
+                Some((slot, bytes)) => (slot, Some(bytes)),
+                None => persistence.acquire_archive_permits(charge).await,
+            };
+            // Permit wait is outside the capture deadline. A full memory
+            // semaphore must not expire the job and drop the raw request JSON.
             let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
-            tokio::spawn(async move {
-                let _permits = permits;
-                let capture = async {
-                    let _writer = database
-                        .gateway_persistence
-                        .writer
-                        .acquire()
-                        .await
-                        .map_err(|_| AppError::internal("gateway_persistence_start_proxy_request_with_deferred_archive_1"))?;
-                    if let Err(error) = database.publish_proxy_started_event(identity).await {
-                        tracing::warn!(%request_id, reason = error.diagnostic_category(), "request started event omitted");
-                    }
-                    let retained =
-                        crate::api::proxy::archive_retention::prepare_json_body_if_valid(&body);
-                    let body = retained.as_ref().map_or_else(
-                        || body.clone(),
-                        |retained| {
-                            crate::api::proxy::archive_retention::encode_json_body(&body, retained)
-                        },
-                    );
-                    drop(retained);
-                    database
-                        .capture_deferred_request_archive(
-                            identity,
-                            &body,
-                            &pepper,
-                            compression_enabled,
+            let capture = async {
+                let _writer = database
+                    .gateway_persistence
+                    .writer
+                    .acquire()
+                    .await
+                    .map_err(|_| {
+                        AppError::internal(
+                            "gateway_persistence_start_proxy_request_with_deferred_archive_1",
                         )
-                        .await
-                };
-                let result = tokio::time::timeout_at(
-                    deadline,
-                    ARCHIVE_DEADLINE
-                        .scope((database.gateway_persistence.clone(), deadline), capture),
-                )
-                .await;
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => {
-                        database
-                            .gateway_persistence
-                            .failed
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(%request_id, reason = error.diagnostic_category(), "request archive omitted; durable gap retained")
-                    }
-                    Err(_) => {
-                        database
-                            .gateway_persistence
-                            .failed
-                            .fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(%request_id, reason = "timeout", "request archive deadline; durable gap retained unless capture committed")
-                    }
+                    })?;
+                if let Err(error) = database.publish_proxy_started_event(identity).await {
+                    tracing::warn!(%request_id, reason = error.diagnostic_category(), "request started event omitted");
                 }
-            });
-            RequestArchiveAdmission::Queued
-        } else {
-            self.gateway_persistence
-                .capacity
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(%request_id, reason = "queue_full", "request archive omitted");
-            RequestArchiveAdmission::GapCapacity
-        };
+                let retained =
+                    crate::api::proxy::archive_retention::prepare_json_body_if_valid(&body);
+                let body = retained.as_ref().map_or_else(
+                    || body.clone(),
+                    |retained| {
+                        crate::api::proxy::archive_retention::encode_json_body(&body, retained)
+                    },
+                );
+                drop(retained);
+                database
+                    .capture_deferred_request_archive(identity, &body, &pepper, compression_enabled)
+                    .await
+            };
+            let result = tokio::time::timeout_at(
+                deadline,
+                ARCHIVE_DEADLINE.scope((database.gateway_persistence.clone(), deadline), capture),
+            )
+            .await;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    database
+                        .gateway_persistence
+                        .failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(%request_id, reason = error.diagnostic_category(), "request archive omitted; durable gap retained")
+                }
+                Err(_) => {
+                    database
+                        .gateway_persistence
+                        .failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(%request_id, reason = "timeout", "request archive deadline; durable gap retained unless capture committed")
+                }
+            }
+        });
+        let archive_admission = RequestArchiveAdmission::Queued;
         // Byte-exact archive tests must finish optional request capture before
         // dispatch can race it with settlement on SQLite's single writer.
         // This barrier is opt-in, task-local and tied to this database instance;
@@ -335,11 +360,11 @@ impl Database {
             .await?
         {
             return Err(AppError::capacity(
-            "request_archive_capture_failed",
-            crate::error::ErrorFacts::new()
-                .phase("deferred_request_archive")
-                .stage("capacity"),
-        ));
+                "request_archive_capture_failed",
+                crate::error::ErrorFacts::new()
+                    .phase("deferred_request_archive")
+                    .stage("capacity"),
+            ));
         }
         hold.commit(transaction).await?;
         capacity.release().await;

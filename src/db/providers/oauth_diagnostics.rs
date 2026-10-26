@@ -47,9 +47,13 @@ impl Database {
             outcome,
             failure,
         };
-        let encoded = serde_json::to_string(&diagnostic).map_err(|_| AppError::internal("oauth_diagnostics_record_upstream_oauth_refresh_failure_1"))?;
+        let encoded = serde_json::to_string(&diagnostic).map_err(|_| {
+            AppError::internal("oauth_diagnostics_record_upstream_oauth_refresh_failure_1")
+        })?;
         if encoded.len() > 2048 {
-            return Err(AppError::internal("oauth_diagnostics_record_upstream_oauth_refresh_failure_1"));
+            return Err(AppError::internal(
+                "oauth_diagnostics_record_upstream_oauth_refresh_failure_1",
+            ));
         }
         let changed = sqlx::query(
             "UPDATE upstream_credentials SET oauth_refresh_diagnostic_json = $1 WHERE upstream_account_id = $2 AND generation = $3 AND EXISTS (SELECT 1 FROM upstream_oauth_refresh_leases l JOIN upstream_accounts a ON a.id = l.account_id AND a.credential_generation = l.credential_generation WHERE l.account_id = $2 AND l.credential_generation = $3 AND l.created_at = $4 AND l.idempotency_key = $5)",

@@ -152,7 +152,8 @@ fn copy_retained(entry: &PreinstalledInventory, destination: &Path) -> Result<()
     if found.len() != entry.grants.len() {
         return Err(AppError::Forbidden);
     }
-    rustix::fs::fsync(&destination).map_err(|_| AppError::internal("retained_installation_copy_retained_1"))
+    rustix::fs::fsync(&destination)
+        .map_err(|_| AppError::internal("retained_installation_copy_retained_1"))
 }
 
 #[cfg(target_os = "linux")]
@@ -234,12 +235,15 @@ fn copy_package(
                 {
                     return Err(AppError::Forbidden);
                 }
-                output.sync_all().map_err(|_| AppError::internal("retained_installation_copy_package_1"))?;
+                output
+                    .sync_all()
+                    .map_err(|_| AppError::internal("retained_installation_copy_package_1"))?;
             } else {
                 return Err(AppError::Forbidden);
             }
         }
-        rustix::fs::fsync(&target).map_err(|_| AppError::internal("retained_installation_copy_package_2"))?;
+        rustix::fs::fsync(&target)
+            .map_err(|_| AppError::internal("retained_installation_copy_package_2"))?;
     }
     Ok(())
 }

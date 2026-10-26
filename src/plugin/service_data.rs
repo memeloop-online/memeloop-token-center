@@ -36,12 +36,15 @@ pub(crate) struct PluginServiceDataCollected {
 #[derive(Debug)]
 pub(crate) struct PluginServiceDataCollectionFailure {
     pub(crate) code: PluginServiceDataRefreshErrorCode,
-    pub(crate) error: AppError,
+    pub(crate) error: Box<AppError>,
 }
 
 impl PluginServiceDataCollectionFailure {
     fn new(code: PluginServiceDataRefreshErrorCode, error: AppError) -> Self {
-        Self { code, error }
+        Self {
+            code,
+            error: Box::new(error),
+        }
     }
 }
 
@@ -112,7 +115,11 @@ impl PluginRuntime {
         endpoint_id: &str,
     ) -> Result<PluginServiceDataView, AppError> {
         let target = self.service_data_target(plugin_id, endpoint_id)?;
-        let database = &self.kv.as_ref().ok_or(AppError::internal("service_data_service_data_1"))?.database;
+        let database = &self
+            .kv
+            .as_ref()
+            .ok_or(AppError::internal("service_data_service_data_1"))?
+            .database;
         let snapshot = database
             .plugin_service_data_snapshot(
                 runtime_revision,
@@ -174,7 +181,9 @@ impl PluginRuntime {
                 ));
             }
         };
-        let fetched_at = snapshot.fetched_at.ok_or(AppError::internal("service_data_service_data_2"))?;
+        let fetched_at = snapshot
+            .fetched_at
+            .ok_or(AppError::internal("service_data_service_data_2"))?;
         let fresh_until = fetched_at.saturating_add(
             i64::try_from(target.endpoint.cache_ttl_seconds)
                 .unwrap_or(i64::MAX)

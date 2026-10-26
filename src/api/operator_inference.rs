@@ -54,7 +54,10 @@ async fn execute(
         .authenticate_key(&copied.key, state.config.key_pepper.as_bytes())
         .await?;
     drop(copied);
-    let bytes = Bytes::from(serde_json::to_vec(&body.request).map_err(|_| AppError::internal("operator_inference_execute_1"))?);
+    let bytes = Bytes::from(
+        serde_json::to_vec(&body.request)
+            .map_err(|_| AppError::internal("operator_inference_execute_1"))?,
+    );
     let memory = state.proxy_memory_budget.reservation();
     if !memory.try_grow(
         bytes.len(),

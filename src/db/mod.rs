@@ -203,6 +203,10 @@ pub use providers::{
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
 pub(crate) use requests::RequestArchiveAdmission;
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use requests::{
+    ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
+};
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
@@ -211,9 +215,8 @@ pub use requests::{
     StatsFilter, normalize_proxy_usage,
 };
 pub(crate) use requests::{
-    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution,
-    SessionRoutingTerminalInput, SwitchProxyCandidateInput, allocate_request_event_cursor,
-    attach_conversation_upstream_response_in_transaction, is_session_avoid_terminal,
+    MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, SessionRoutingTerminalInput,
+    SwitchProxyCandidateInput, allocate_request_event_cursor, is_session_avoid_terminal,
     normalize_proxy_usage_with_output_limit, price_token_usage,
     record_request_finished_in_transaction, record_request_started_in_transaction,
     reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
@@ -435,7 +438,9 @@ impl Database {
             .await
             .map_err(|error| match error {
                 DatabaseReadinessError::Dependency(error) => error,
-                DatabaseReadinessError::SchemaOutdated(_) => AppError::internal("db_mod_readiness_check_1"),
+                DatabaseReadinessError::SchemaOutdated(_) => {
+                    AppError::internal("db_mod_readiness_check_1")
+                }
             })
     }
 

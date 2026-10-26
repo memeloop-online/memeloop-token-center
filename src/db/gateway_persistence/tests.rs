@@ -574,7 +574,7 @@ async fn unavailable_optional_pool_keeps_reservation_and_durable_gap() {
 }
 
 #[tokio::test]
-async fn saturated_slots_and_bytes_degrade_without_waiting_or_losing_safety_state() {
+async fn saturated_memory_permits_queue_the_raw_request_without_blocking_admission() {
     let fixture = Fixture::new().await;
     for by_bytes in [false, true] {
         let permits = if by_bytes {
@@ -599,14 +599,32 @@ async fn saturated_slots_and_bytes_degrade_without_waiting_or_losing_safety_stat
         let request_id = Uuid::new_v4();
         let admitted = tokio::time::timeout(Duration::from_secs(1), fixture.admit(request_id))
             .await
-            .expect("saturation must never await capacity")
+            .expect("memory permits must not block admission")
             .unwrap();
-        assert_eq!(
-            admitted.archive_admission,
-            RequestArchiveAdmission::GapCapacity
-        );
+        assert_eq!(admitted.archive_admission, RequestArchiveAdmission::Queued);
         fixture.assert_reserved(request_id).await;
         drop(permits);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let count: i64 = sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'pending'",
+                )
+                .bind(request_id.to_string())
+                .fetch_one(&fixture.database.pool)
+                .await
+                .unwrap();
+                if count == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("memory permits must still archive the raw request JSON");
+        fixture
+            .database
+            .drain_gateway_persistence_for_test()
+            .await;
     }
     assert_eq!(
         fixture
@@ -625,7 +643,8 @@ async fn saturated_slots_and_bytes_degrade_without_waiting_or_losing_safety_stat
         BYTE_LIMIT
     );
     let metrics = fixture.database.gateway_persistence_metrics();
-    assert!(metrics.contains("request_persistence_total{outcome=\"capacity\"} 2\n"));
+    assert!(metrics.contains("request_persistence_total{outcome=\"accepted\"} 2\n"));
+    assert!(metrics.contains("request_persistence_total{outcome=\"capacity\"} 0\n"));
     assert!(metrics.contains("request_persistence_total{outcome=\"failed\"} 0\n"));
     assert!(metrics.contains("request_persistence_jobs 0\n"));
     assert!(metrics.contains("request_persistence_bytes 0\n"));
@@ -720,7 +739,10 @@ async fn safety_database_failure_never_enqueues_archive_work() {
         .execute(&fixture.database.pool).await.unwrap();
     assert!(matches!(
         fixture.admit(Uuid::new_v4()).await,
-        Err(AppError::Capacity { code: "request_record_persist_failed", .. })
+        Err(AppError::Capacity {
+            code: "request_record_persist_failed",
+            ..
+        })
     ));
     assert_eq!(
         fixture

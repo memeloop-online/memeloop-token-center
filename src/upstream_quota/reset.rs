@@ -46,8 +46,8 @@ async fn fresh_snapshot(
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
-    let mut budget =
-        codex_quota_budget(&account.config).map_err(|_| temporarily_unavailable("quota_reset_budget"))?;
+    let mut budget = codex_quota_budget(&account.config)
+        .map_err(|_| temporarily_unavailable("quota_reset_budget"))?;
     // Even the reset workflow's credit precheck remains a single attempt.
     // Consumption below is a separate no-retry transport and never enters the reader.
     budget.attempt_limit = 1;
@@ -59,8 +59,9 @@ async fn fresh_snapshot(
     let observed_started_at = unix_millis();
     let account_header =
         crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
-    let policy = crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))
-        .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
+    let policy =
+        crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))
+            .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
     let (credential_header, credential_value) = credential
         .request_header(observed_started_at)
         .map_err(|_| blocked())?
@@ -166,7 +167,8 @@ pub(crate) async fn prepare(
         .quota_reset_prepare_replay(account, actor, &prepare_idempotency_hash)
         .await?
     {
-        let operation_id = Uuid::parse_str(&operation.id).map_err(|_| AppError::internal("reset_prepare_1"))?;
+        let operation_id =
+            Uuid::parse_str(&operation.id).map_err(|_| AppError::internal("reset_prepare_1"))?;
         return Ok(PreparedReset {
             operation,
             confirmation_token: confirmation_token(

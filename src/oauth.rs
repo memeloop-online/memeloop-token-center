@@ -39,7 +39,8 @@ const MAX_OAUTH_LOGIN_STATE_BYTES: usize = 64 * 1024;
 
 pub(crate) fn validate_oauth_login_config(config: &serde_json::Value) -> Result<String, AppError> {
     let base_url = crate::provider::validate_config(config)?;
-    let bytes = serde_json::to_vec(config).map_err(|_| AppError::internal("oauth_validate_oauth_login_config_1"))?;
+    let bytes = serde_json::to_vec(config)
+        .map_err(|_| AppError::internal("oauth_validate_oauth_login_config_1"))?;
     if bytes.len() > MAX_OAUTH_LOGIN_CONFIG_BYTES {
         return Err(AppError::BadRequest(
             "OAuth provider configuration exceeds the login-session limit".into(),
@@ -53,7 +54,8 @@ pub(crate) fn seal_oauth_login_state<T: serde::Serialize>(
     key_material: &[u8],
     aad: &[u8],
 ) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(state).map_err(|_| AppError::internal("oauth_seal_oauth_login_state_1"))?;
+    let bytes = serde_json::to_vec(state)
+        .map_err(|_| AppError::internal("oauth_seal_oauth_login_state_1"))?;
     if bytes.len() > MAX_OAUTH_LOGIN_STATE_BYTES {
         return Err(AppError::BadRequest(
             "OAuth login state exceeds the session limit".into(),

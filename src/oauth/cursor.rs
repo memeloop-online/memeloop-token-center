@@ -513,7 +513,10 @@ pub async fn poll_cursor_login(
     let tokens: CursorTokens = serde_json::from_slice(&body)
         .map_err(|_| AppError::upstream("cursor_oauth_returned_invalid_json"))?;
     if tokens.access_token.is_empty() {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("cursor_poll_cursor_login")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("cursor_poll_cursor_login"),
+        ));
     }
     let expires_at = token_expiry_millis(&tokens.access_token)
         .unwrap_or_else(|| now.saturating_add(60 * 60 * 1000));
@@ -631,7 +634,10 @@ pub async fn refresh_cursor_credential(
     let tokens: CursorTokens = serde_json::from_slice(&body)
         .map_err(|_| AppError::upstream("cursor_oauth_refresh_returned_invalid_json"))?;
     if tokens.access_token.is_empty() {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("cursor_refresh_cursor_credential")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("cursor_refresh_cursor_credential"),
+        ));
     }
     let expires_at = token_expiry_millis(&tokens.access_token)
         .unwrap_or_else(|| now.saturating_add(60 * 60 * 1000));

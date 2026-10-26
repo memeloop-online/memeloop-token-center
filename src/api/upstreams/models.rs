@@ -205,7 +205,12 @@ pub(in crate::api) async fn discover_upstream_model(
     )
     .await
     .unwrap_or(Err("connection_failed"))
-    .map_err(|_code| AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("models_discover_upstream_model")))?;
+    .map_err(|_code| {
+        AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("models_discover_upstream_model"),
+        )
+    })?;
     let matches = values
         .iter()
         .filter(|value| value.get("slug").and_then(Value::as_str) == Some(query.model.as_str()))
@@ -668,7 +673,11 @@ async fn sync_account_models_selected(
                         "selected model is absent from authenticated upstream metadata".into(),
                     )
                 } else {
-                    AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("models_sync_account_models_selected"))
+                    AppError::upstream_with(
+                        "upstream_unavailable",
+                        crate::error::ErrorFacts::new()
+                            .stage("models_sync_account_models_selected"),
+                    )
                 });
             }
         }

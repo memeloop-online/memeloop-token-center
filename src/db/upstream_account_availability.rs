@@ -168,7 +168,9 @@ impl MetricsAccumulator {
             return Ok(());
         };
         if currency.is_empty() {
-            return Err(AppError::internal("upstream_account_availability_accumulate_1"));
+            return Err(AppError::internal(
+                "upstream_account_availability_accumulate_1",
+            ));
         }
         self.requests = self.requests.saturating_add(row.try_get("requests")?);
         self.successful_requests = self
@@ -314,7 +316,9 @@ impl Database {
             if !matches!(source.as_str(), "request" | "generation")
                 || !matches!(status.as_str(), "success" | "failure")
             {
-                return Err(AppError::internal("upstream_account_availability_upstream_account_availability_1"));
+                return Err(AppError::internal(
+                    "upstream_account_availability_upstream_account_availability_1",
+                ));
             }
             let error_code: String = row.try_get("error_code")?;
             outcomes_by_account

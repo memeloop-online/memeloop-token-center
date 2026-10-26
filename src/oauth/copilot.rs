@@ -653,7 +653,8 @@ async fn poll_at(
             header: "authorization".into(),
             prefix: "Bearer ".into(),
             adapter_state: Some(
-                serde_json::to_value(adapter_state).map_err(|_| AppError::internal("copilot_site_1"))?,
+                serde_json::to_value(adapter_state)
+                    .map_err(|_| AppError::internal("copilot_site_1"))?,
             ),
             proxy_network_scope: state.proxy_url.as_ref().map(|_| OutboundScope::Private),
             proxy_url: state.proxy_url,
@@ -1050,7 +1051,9 @@ async fn refresh_at(
         expires_at: Some(copilot.expires_at),
         header: "authorization".into(),
         prefix: "Bearer ".into(),
-        adapter_state: Some(serde_json::to_value(state).map_err(|_| AppError::internal("copilot_refresh_at_1"))?),
+        adapter_state: Some(
+            serde_json::to_value(state).map_err(|_| AppError::internal("copilot_refresh_at_1"))?,
+        ),
         proxy_url: credential.proxy().map(|(url, _)| url.to_owned()),
         proxy_network_scope: credential.proxy().map(|(_, scope)| scope),
     })

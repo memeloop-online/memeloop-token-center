@@ -43,7 +43,8 @@ impl ApplicationPlugins {
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(_) => return Err(AppError::internal("empty_register_empty_1")),
             }
-            let metadata = std::fs::symlink_metadata(&directory).map_err(|_| AppError::internal("empty_register_empty_2"))?;
+            let metadata = std::fs::symlink_metadata(&directory)
+                .map_err(|_| AppError::internal("empty_register_empty_2"))?;
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
                 || std::fs::read_dir(&directory)

@@ -1147,12 +1147,12 @@ fn synchronous_image_claim_from_row(
         "pending" => Ok(SynchronousImageIdempotencyClaim::Pending { request_id }),
         "completed" => Ok(SynchronousImageIdempotencyClaim::Completed {
             request_id,
-            response_status: row
-                .try_get::<Option<i64>, _>("response_status")?
-                .ok_or(AppError::internal("synchronous_synchronous_image_claim_from_row_1"))?,
-            response_object: row
-                .try_get::<Option<String>, _>("response_object")?
-                .ok_or(AppError::internal("synchronous_synchronous_image_claim_from_row_2"))?,
+            response_status: row.try_get::<Option<i64>, _>("response_status")?.ok_or(
+                AppError::internal("synchronous_synchronous_image_claim_from_row_1"),
+            )?,
+            response_object: row.try_get::<Option<String>, _>("response_object")?.ok_or(
+                AppError::internal("synchronous_synchronous_image_claim_from_row_2"),
+            )?,
         }),
         "failed" => Ok(SynchronousImageIdempotencyClaim::Failed {
             request_id,
@@ -1160,7 +1160,9 @@ fn synchronous_image_claim_from_row(
                 .try_get::<Option<String>, _>("error_code")?
                 .unwrap_or_else(|| "image_generation_failed".to_owned()),
         }),
-        _ => Err(AppError::internal("synchronous_synchronous_image_claim_from_row_3")),
+        _ => Err(AppError::internal(
+            "synchronous_synchronous_image_claim_from_row_3",
+        )),
     }
 }
 
@@ -1242,7 +1244,9 @@ async fn recover_expired_synchronous_image_owner(
         enforcement_mode: EnforcementMode::from_storage(
             row.try_get::<String, _>("enforcement_mode")?.as_str(),
         )
-        .ok_or(AppError::internal("synchronous_recover_expired_synchronous_image_owner_1"))?,
+        .ok_or(AppError::internal(
+            "synchronous_recover_expired_synchronous_image_owner_1",
+        ))?,
         reserved_micros: row.try_get("reserved_micros")?,
         input_micros_per_million: 0,
         output_micros_per_million: 0,
@@ -1271,8 +1275,12 @@ async fn recover_expired_synchronous_image_owner(
             && error_code.is_none()
             && response_object.is_some();
         if is_success {
-            let response_status = status_code.ok_or(AppError::internal("synchronous_recover_expired_synchronous_image_owner_2"))?;
-            let response_object = response_object.ok_or(AppError::internal("synchronous_recover_expired_synchronous_image_owner_3"))?;
+            let response_status = status_code.ok_or(AppError::internal(
+                "synchronous_recover_expired_synchronous_image_owner_2",
+            ))?;
+            let response_object = response_object.ok_or(AppError::internal(
+                "synchronous_recover_expired_synchronous_image_owner_3",
+            ))?;
             let updated = sqlx::query(
                 "UPDATE synchronous_image_idempotency SET status = 'completed', response_status = $1, response_object = $2, error_code = NULL, completed_at = $3 WHERE key_id = $4 AND idempotency_key = $5 AND request_id = $6 AND status = 'pending'",
             )
@@ -1457,7 +1465,9 @@ async fn recover_non_idempotent_synchronous_image_terminal(
         && row.try_get::<i64, _>("cost_micros")?
             == row
                 .try_get::<Option<i64>, _>("actual_micros")?
-                .ok_or(AppError::internal("synchronous_recover_non_idempotent_synchronous_image_terminal_1"))?
+                .ok_or(AppError::internal(
+                    "synchronous_recover_non_idempotent_synchronous_image_terminal_1",
+                ))?
         && synchronous_image_assets_match(tx, input.request_id, input.assets).await?;
     if !exact {
         return Err(AppError::Conflict(
@@ -1473,7 +1483,9 @@ async fn recover_non_idempotent_synchronous_image_terminal(
         Ok(SynchronousImageIdempotencyClaim::Completed {
             request_id: input.request_id,
             response_status: input.status_code,
-            response_object: stored_response.ok_or(AppError::internal("synchronous_recover_non_idempotent_synchronous_image_terminal_2"))?,
+            response_object: stored_response.ok_or(AppError::internal(
+                "synchronous_recover_non_idempotent_synchronous_image_terminal_2",
+            ))?,
         })
     }
 }

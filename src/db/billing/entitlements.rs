@@ -297,8 +297,8 @@ impl Database {
                 )
             })?
             .try_get("policy_json")?;
-            let effective_policy =
-                serde_json::from_str(&policy_json).map_err(|_| AppError::internal("entitlements_site_1"))?;
+            let effective_policy = serde_json::from_str(&policy_json)
+                .map_err(|_| AppError::internal("entitlements_site_1"))?;
             input.audit.key_id = credential.key_id;
             input.audit.entitlement_id = entitlement.entitlement.entitlement_id;
             super::cloud::record_cloud_subscription_event_in_transaction(&mut tx, input.audit, now)
@@ -343,8 +343,8 @@ impl Database {
         }
 
         if active_snapshot {
-            let policy_json =
-                serde_json::to_string(&input.policy).map_err(|_| AppError::internal("entitlements_site_3"))?;
+            let policy_json = serde_json::to_string(&input.policy)
+                .map_err(|_| AppError::internal("entitlements_site_3"))?;
             let updated = sqlx::query(
                 "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
             )
@@ -429,7 +429,8 @@ pub(super) async fn reconcile_entitlement_in_transaction(
     operation: EntitlementOperation,
     idempotency_key: &str,
 ) -> Result<(EntitlementReconcileResult, bool), AppError> {
-    let canonical = serde_json::to_vec(&operation).map_err(|_| AppError::internal("entitlements_reconcile_entitlement_in_transaction_1"))?;
+    let canonical = serde_json::to_vec(&operation)
+        .map_err(|_| AppError::internal("entitlements_reconcile_entitlement_in_transaction_1"))?;
     let request_hash = format!("{:x}", Sha256::digest(&canonical));
     let now = unix_millis();
     let reconciliation_id = Uuid::now_v7();
@@ -477,7 +478,8 @@ pub(super) async fn reconcile_entitlement_in_transaction(
             replace_entitlement_snapshot(tx, tenant_id, &input, reconciliation_id, now).await?
         }
     };
-    let response_json = serde_json::to_string(&result).map_err(|_| AppError::internal("entitlements_reconcile_entitlement_in_transaction_3"))?;
+    let response_json = serde_json::to_string(&result)
+        .map_err(|_| AppError::internal("entitlements_reconcile_entitlement_in_transaction_3"))?;
     sqlx::query(
         "INSERT INTO entitlement_reconciliations (id, tenant_id, idempotency_key, request_hash, response_json, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
     )
@@ -1125,7 +1127,8 @@ fn canonicalize_entitlement_operation(
             let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
                 AppError::BadRequest("proration metadata must be valid JSON".into())
             })?;
-            *raw = serde_json::to_string(&value).map_err(|_| AppError::internal("entitlements_canonicalize_1"))?;
+            *raw = serde_json::to_string(&value)
+                .map_err(|_| AppError::internal("entitlements_canonicalize_1"))?;
         }
         Ok(())
     }

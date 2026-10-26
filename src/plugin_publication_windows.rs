@@ -69,9 +69,7 @@ pub(crate) fn claim_directory(root: &Path, owner: &[u8]) -> io::Result<Directory
     loop {
         match windows_dir::read_limited(&parent, OsStr::new(&binding), OWNER_LIMIT) {
             Ok(bytes) if bytes == identity.as_bytes() => break,
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound && Instant::now() < deadline =>
-            {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(_) => return Err(io::ErrorKind::AlreadyExists.into()),
@@ -87,9 +85,8 @@ pub(crate) fn link_file_at(
     directory: &Directory,
     relative: &Path,
 ) -> io::Result<()> {
-    let source_parent = windows_dir::open_directory(
-        source.parent().ok_or(io::ErrorKind::InvalidInput)?,
-    )?;
+    let source_parent =
+        windows_dir::open_directory(source.parent().ok_or(io::ErrorKind::InvalidInput)?)?;
     let source_name = source.file_name().ok_or(io::ErrorKind::InvalidInput)?;
     let target_parent = parent_directory(directory, relative)?;
     let target_name = relative.file_name().ok_or(io::ErrorKind::InvalidInput)?;

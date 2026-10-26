@@ -139,9 +139,10 @@ async fn begin_proxy_archive_attempt_with_retry(
     for delay in RETRY_DELAYS {
         match database.begin_archive_staging_attempt(input.clone()).await {
             Ok(result) => return Ok(result),
-            Err(AppError::Internal { code, .. })
-                if code == "proxy_lifecycle_begin_proxy_archive_attempt_with_retry_1" =>
-            {
+            Err(AppError::Internal {
+                code: "proxy_lifecycle_begin_proxy_archive_attempt_with_retry_1",
+                ..
+            }) => {
                 tokio::time::sleep(delay).await;
             }
             Err(error) => return Err(error),
@@ -175,9 +176,10 @@ pub(crate) async fn finish_proxy_request_with_retry(
             .await
         {
             Ok(result) => return Ok(result),
-            Err(AppError::Internal { code, .. })
-                if code == "proxy_lifecycle_finish_proxy_request_with_retry_1" =>
-            {
+            Err(AppError::Internal {
+                code: "proxy_lifecycle_finish_proxy_request_with_retry_1",
+                ..
+            }) => {
                 tokio::time::sleep(delay).await;
             }
             Err(error) => return Err(error),

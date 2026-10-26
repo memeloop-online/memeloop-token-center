@@ -1,9 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     io,
     path::{Path, PathBuf},
 };
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 #[cfg(feature = "experimental-plugin-revisions")]
 use std::{process::Stdio, time::Duration};
 

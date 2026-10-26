@@ -80,7 +80,9 @@ impl ArchiveWriter {
     pub async fn write(&mut self, mut bytes: Bytes) -> Result<(), AppError> {
         let next_size = self
             .size_bytes
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| AppError::internal("multipart_write_1"))?)
+            .checked_add(
+                u64::try_from(bytes.len()).map_err(|_| AppError::internal("multipart_write_1"))?,
+            )
             .ok_or_else(|| AppError::storage("archive_object_size_overflow"))?;
         if self.inner.is_none() {
             return Err(AppError::storage("archive_writer_is_already_closed"));

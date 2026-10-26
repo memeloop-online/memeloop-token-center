@@ -88,7 +88,8 @@ impl Database {
                 "invalid plugin configuration concurrency metadata".into(),
             ));
         }
-        let value_json = serde_json::to_string(&input.value).map_err(|_| AppError::internal("plugin_configurations_put_plugin_configuration_1"))?;
+        let value_json = serde_json::to_string(&input.value)
+            .map_err(|_| AppError::internal("plugin_configurations_put_plugin_configuration_1"))?;
         if value_json.len() > 1024 * 1024 {
             return Err(AppError::BadRequest(
                 "plugin configuration exceeds the 1 MiB limit".into(),
@@ -150,7 +151,9 @@ impl Database {
             return Ok(StoredPluginConfiguration {
                 plugin_id: input.plugin_id,
                 tenant_id: input.tenant_id,
-                value: serde_json::from_str(&value_json).map_err(|_| AppError::internal("plugin_configurations_put_plugin_configuration_2"))?,
+                value: serde_json::from_str(&value_json).map_err(|_| {
+                    AppError::internal("plugin_configurations_put_plugin_configuration_2")
+                })?,
                 schema_digest,
                 version,
                 updated_at,

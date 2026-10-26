@@ -277,7 +277,9 @@ impl Snapshot {
                 ]
                 .into_iter()
                 .find(|cause| cause.as_str() == value.as_str())
-                .ok_or(crate::error::AppError::internal("pending_terminal_terminal_1"))
+                .ok_or(crate::error::AppError::internal(
+                    "pending_terminal_terminal_1",
+                ))
             })
             .transpose()?;
         if self.version != 1
@@ -286,7 +288,9 @@ impl Snapshot {
                 .checked_add(self.output_token_ceiling)
                 != Some(self.reservation.reserved_tokens)
         {
-            return Err(crate::error::AppError::internal("pending_terminal_terminal_2"));
+            return Err(crate::error::AppError::internal(
+                "pending_terminal_terminal_2",
+            ));
         }
         Ok(FinishProxyRequest {
             terminal_cause,
@@ -571,11 +575,16 @@ impl Journal {
         let claim = snapshot
             .claim
             .as_ref()
-            .ok_or(crate::error::AppError::internal("pending_terminal_record_operational_observation_1"))?;
-        let terminal = snapshot
-            .operational_terminal
-            .as_ref()
-            .ok_or(crate::error::AppError::internal("pending_terminal_record_operational_observation_2"))?;
+            .ok_or(crate::error::AppError::internal(
+                "pending_terminal_record_operational_observation_1",
+            ))?;
+        let terminal =
+            snapshot
+                .operational_terminal
+                .as_ref()
+                .ok_or(crate::error::AppError::internal(
+                    "pending_terminal_record_operational_observation_2",
+                ))?;
         let expected_digest = snapshot.operational_digest()?;
         let ack = database
             .record_pending_proxy_operational_terminal(
@@ -1152,7 +1161,9 @@ impl Journal {
                                             usage_invalid: false,
                                         }))
                                     } else {
-                                        Err(crate::error::AppError::internal("pending_terminal_attempt_1"))
+                                        Err(crate::error::AppError::internal(
+                                            "pending_terminal_attempt_1",
+                                        ))
                                     }
                                 })
                         } else {

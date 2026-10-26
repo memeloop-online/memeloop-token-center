@@ -159,7 +159,9 @@ async fn execute(state: &AppState, task: &SessionTitleTask) -> Result<Option<Str
         "x-mtc-client-name",
         HeaderValue::from_static("session-title"),
     );
-    let body = Bytes::from(serde_json::to_vec(&request).map_err(|_| AppError::internal("session_titles_execute_1"))?);
+    let body = Bytes::from(
+        serde_json::to_vec(&request).map_err(|_| AppError::internal("session_titles_execute_1"))?,
+    );
     let memory = state.proxy_memory_budget.reservation();
     let response = proxy_with_identity(
         state.clone(),

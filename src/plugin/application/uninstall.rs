@@ -170,7 +170,8 @@ fn prepare_subset(
         return Ok(());
     }
     let temporary = parent.join(format!(".mtc-subset-{}", uuid::Uuid::now_v7()));
-    std::fs::create_dir(&temporary).map_err(|_| AppError::internal("uninstall_prepare_subset_1"))?;
+    std::fs::create_dir(&temporary)
+        .map_err(|_| AppError::internal("uninstall_prepare_subset_1"))?;
     let result = (|| {
         let mut packages = Vec::new();
         let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
@@ -184,7 +185,9 @@ fn prepare_subset(
             ));
         } else {
             let mut count = 0;
-            for entry in Dir::read_from(&source).map_err(|_| AppError::internal("uninstall_prepare_subset_2"))? {
+            for entry in Dir::read_from(&source)
+                .map_err(|_| AppError::internal("uninstall_prepare_subset_2"))?
+            {
                 let entry = entry.map_err(|_| AppError::internal("uninstall_prepare_subset_3"))?;
                 if entry.file_name().to_bytes().starts_with(b".") {
                     continue;
@@ -274,7 +277,11 @@ fn prepare_subset(
                     )
                     .map_err(|_| AppError::internal("uninstall_site_1"))?,
                 );
-                if !lock.metadata().map_err(|_| AppError::internal("uninstall_site_2"))?.is_file() {
+                if !lock
+                    .metadata()
+                    .map_err(|_| AppError::internal("uninstall_site_2"))?
+                    .is_file()
+                {
                     return Err(AppError::Forbidden);
                 }
                 lock.try_lock()
@@ -323,12 +330,17 @@ fn copy_package(
         if relative.as_os_str().len() > 240 {
             return Err(AppError::Forbidden);
         }
-        let metadata = source.metadata().map_err(|_| AppError::internal("uninstall_copy_package_1"))?;
+        let metadata = source
+            .metadata()
+            .map_err(|_| AppError::internal("uninstall_copy_package_1"))?;
         let target = destination.join(&relative);
         if metadata.is_dir() {
-            std::fs::create_dir(&target).map_err(|_| AppError::internal("uninstall_copy_package_2"))?;
+            std::fs::create_dir(&target)
+                .map_err(|_| AppError::internal("uninstall_copy_package_2"))?;
             directories.push(target);
-            for entry in Dir::read_from(&source).map_err(|_| AppError::internal("uninstall_copy_package_3"))? {
+            for entry in Dir::read_from(&source)
+                .map_err(|_| AppError::internal("uninstall_copy_package_3"))?
+            {
                 let entry = entry.map_err(|_| AppError::internal("uninstall_copy_package_4"))?;
                 let name = entry.file_name();
                 if name.to_bytes() == b"." || name.to_bytes() == b".." {
@@ -373,7 +385,9 @@ fn copy_package(
             if copied > 64 * 1024 * 1024 || total > 80 * 1024 * 1024 + 16384 {
                 return Err(AppError::Forbidden);
             }
-            target.sync_all().map_err(|_| AppError::internal("uninstall_copy_package_7"))?;
+            target
+                .sync_all()
+                .map_err(|_| AppError::internal("uninstall_copy_package_7"))?;
         } else {
             return Err(AppError::Forbidden);
         }
@@ -393,8 +407,7 @@ fn prepare_subset(
     retained: &std::collections::BTreeSet<String>,
 ) -> Result<(), AppError> {
     use std::ffi::OsStr;
-    let source_dir =
-        crate::windows_dir::open_directory(source).map_err(|_| AppError::Forbidden)?;
+    let source_dir = crate::windows_dir::open_directory(source).map_err(|_| AppError::Forbidden)?;
     let parent_path = destination.parent().ok_or(AppError::Forbidden)?;
     let parent = crate::windows_dir::open_writable_directory(parent_path)
         .map_err(|_| AppError::Forbidden)?;
@@ -410,10 +423,14 @@ fn prepare_subset(
         if crate::windows_dir::open_file(&source_dir, OsStr::new("plugin.json")).is_ok()
             || crate::windows_dir::open_subdir(&source_dir, OsStr::new("plugin.json")).is_ok()
         {
-            packages.push(("package".to_owned(), source_dir.try_clone().map_err(|_| AppError::Forbidden)?));
+            packages.push((
+                "package".to_owned(),
+                source_dir.try_clone().map_err(|_| AppError::Forbidden)?,
+            ));
         } else {
             let mut count = 0;
-            for entry in crate::windows_dir::read_names(&source_dir).map_err(|_| AppError::internal("uninstall_prepare_subset_8"))?
+            for entry in crate::windows_dir::read_names(&source_dir)
+                .map_err(|_| AppError::internal("uninstall_prepare_subset_8"))?
             {
                 if entry.to_string_lossy().starts_with('.') {
                     continue;
@@ -431,11 +448,9 @@ fn prepare_subset(
         let mut found = std::collections::BTreeSet::new();
         let mut inventory_bytes = 0u64;
         for (package_name, package) in packages {
-            let Ok(bytes) = crate::windows_dir::read_limited(
-                &package,
-                OsStr::new("plugin.json"),
-                1024 * 1024,
-            ) else {
+            let Ok(bytes) =
+                crate::windows_dir::read_limited(&package, OsStr::new("plugin.json"), 1024 * 1024)
+            else {
                 continue;
             };
             let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
@@ -455,7 +470,9 @@ fn prepare_subset(
         if &found != retained {
             return Err(AppError::Forbidden);
         }
-        temporary.sync().map_err(|_| AppError::internal("uninstall_prepare_subset_9"))?;
+        temporary
+            .sync()
+            .map_err(|_| AppError::internal("uninstall_prepare_subset_9"))?;
         match crate::windows_dir::rename_noreplace(
             &parent,
             OsStr::new(&temporary_name),
@@ -470,7 +487,9 @@ fn prepare_subset(
             }
             Err(_) => return Err(AppError::internal("uninstall_prepare_subset_1")),
         }
-        parent.sync().map_err(|_| AppError::internal("uninstall_prepare_subset_10"))?;
+        parent
+            .sync()
+            .map_err(|_| AppError::internal("uninstall_prepare_subset_10"))?;
         Ok(())
     })();
     if result.is_err() {
@@ -514,7 +533,9 @@ fn copy_retained_tree(
         if path_len > 240 {
             return Err(AppError::Forbidden);
         }
-        for entry in crate::windows_dir::read_names(&directory).map_err(|_| AppError::internal("uninstall_copy_retained_tree_2"))? {
+        for entry in crate::windows_dir::read_names(&directory)
+            .map_err(|_| AppError::internal("uninstall_copy_retained_tree_2"))?
+        {
             let child_name = entry.as_os_str();
             let child_len = child_name.as_encoded_bytes().len();
             entries += 1;
@@ -534,7 +555,10 @@ fn copy_retained_tree(
                 }
                 Err(_) => return Err(AppError::Forbidden),
             };
-            let length = input.metadata().map_err(|_| AppError::internal("uninstall_copy_retained_tree_4"))?.len();
+            let length = input
+                .metadata()
+                .map_err(|_| AppError::internal("uninstall_copy_retained_tree_4"))?
+                .len();
             files += 1;
             if files > 65 || length > 64 * 1024 * 1024 {
                 return Err(AppError::Forbidden);
@@ -551,9 +575,13 @@ fn copy_retained_tree(
             {
                 return Err(AppError::Forbidden);
             }
-            output.sync_all().map_err(|_| AppError::internal("uninstall_copy_retained_tree_7"))?;
+            output
+                .sync_all()
+                .map_err(|_| AppError::internal("uninstall_copy_retained_tree_7"))?;
         }
-        destination.sync().map_err(|_| AppError::internal("uninstall_copy_retained_tree_8"))?;
+        destination
+            .sync()
+            .map_err(|_| AppError::internal("uninstall_copy_retained_tree_8"))?;
     }
     Ok(())
 }

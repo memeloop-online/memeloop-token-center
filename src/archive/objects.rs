@@ -49,8 +49,8 @@ impl ArchiveStore {
             let mut body = BytesMut::with_capacity(download.object_size as usize);
             let mut stream = download.stream;
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk
-                    .map_err(|_| AppError::storage("archive_compressed_read_failed"))?;
+                let chunk =
+                    chunk.map_err(|_| AppError::storage("archive_compressed_read_failed"))?;
                 if body.len().saturating_add(chunk.len()) > maximum {
                     return Err(AppError::storage("local_storage_failed"));
                 }

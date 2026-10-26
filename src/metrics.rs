@@ -1825,7 +1825,12 @@ mod tests {
                     metrics.observe_proxy_memory_error(stage, crate::error::AppError::Overloaded);
                 assert!(matches!(error, crate::error::AppError::Overloaded));
             }
-            let error = metrics.observe_proxy_memory_error(stage, crate::error::AppError::internal("metrics_memory_rejection_stages_render_exactly_six_fixed_series"));
+            let error = metrics.observe_proxy_memory_error(
+                stage,
+                crate::error::AppError::internal(
+                    "metrics_memory_rejection_stages_render_exactly_six_fixed_series",
+                ),
+            );
             assert!(matches!(error, crate::error::AppError::Internal { .. }));
         }
         assert_eq!(

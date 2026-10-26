@@ -17,8 +17,12 @@ impl SelectedEgress {
     pub fn capture(selected_proxy_url: Option<&str>) -> Result<Self, AppError> {
         let address = selected_proxy_url
             .map(|value| {
-                let parsed = url::Url::parse(value).map_err(|_| AppError::internal("egress_capture_1"))?;
-                let host = parsed.host_str().ok_or(AppError::internal("egress_capture_1"))?.to_owned();
+                let parsed =
+                    url::Url::parse(value).map_err(|_| AppError::internal("egress_capture_1"))?;
+                let host = parsed
+                    .host_str()
+                    .ok_or(AppError::internal("egress_capture_1"))?
+                    .to_owned();
                 if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
                     return Err(AppError::internal("egress_capture_2"));
                 }
@@ -89,9 +93,10 @@ impl Database {
         &self,
         attempt: &RequestEgressAttempt,
     ) -> Result<(), AppError> {
-        let snapshot = serde_json::to_string(&attempt.selected).map_err(|_| AppError::internal("egress_record_request_egress_attempt_1"))?;
-        let transport =
-            serde_json::to_string(&attempt.transport).map_err(|_| AppError::internal("egress_record_request_egress_attempt_2"))?;
+        let snapshot = serde_json::to_string(&attempt.selected)
+            .map_err(|_| AppError::internal("egress_record_request_egress_attempt_1"))?;
+        let transport = serde_json::to_string(&attempt.transport)
+            .map_err(|_| AppError::internal("egress_record_request_egress_attempt_2"))?;
         let binding = attempt
             .connection_binding
             .as_ref()
@@ -194,9 +199,7 @@ impl Database {
                         .try_get::<Option<String>, _>("connection_binding_json")?
                         .map(|value| serde_json::from_str(&value))
                         .transpose()
-                        .map_err(|_| {
-                            AppError::storage("egress_connection_binding_is_malformed")
-                        })?,
+                        .map_err(|_| AppError::storage("egress_connection_binding_is_malformed"))?,
                     request_payload_bytes: row.try_get("request_payload_bytes")?,
                     response_payload_bytes: row.try_get("response_payload_bytes")?,
                     completed: row.try_get::<i64, _>("completed")? != 0,
@@ -270,8 +273,7 @@ impl Database {
 }
 
 fn decode_selected(snapshot: &str) -> Result<SelectedEgress, AppError> {
-    serde_json::from_str(snapshot)
-        .map_err(|_| AppError::storage("egress_snapshot_is_malformed"))
+    serde_json::from_str(snapshot).map_err(|_| AppError::storage("egress_snapshot_is_malformed"))
 }
 
 #[cfg(test)]

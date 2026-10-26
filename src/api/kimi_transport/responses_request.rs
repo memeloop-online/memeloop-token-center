@@ -824,8 +824,9 @@ pub(in crate::api) fn convert_with_dialect(
                 }
                 let id = item["call_id"].as_str().unwrap_or("");
                 let arguments = if item["type"] == "custom_tool_call" {
-                    serde_json::to_string(&json!({"input":item["input"]}))
-                        .map_err(|_| AppError::internal("responses_request_convert_with_dialect_1"))?
+                    serde_json::to_string(&json!({"input":item["input"]})).map_err(|_| {
+                        AppError::internal("responses_request_convert_with_dialect_1")
+                    })?
                 } else {
                     item["arguments"].as_str().unwrap_or("").into()
                 };
@@ -841,13 +842,17 @@ pub(in crate::api) fn convert_with_dialect(
                 if !merge {
                     messages.push(json!({"role":"assistant","tool_calls":[]}));
                 }
-                let message = messages.last_mut().ok_or(AppError::internal("responses_request_convert_with_dialect_1"))?;
+                let message = messages.last_mut().ok_or(AppError::internal(
+                    "responses_request_convert_with_dialect_1",
+                ))?;
                 if message.get("tool_calls").is_none() {
                     message["tool_calls"] = json!([]);
                 }
                 message["tool_calls"]
                     .as_array_mut()
-                    .ok_or(AppError::internal("responses_request_convert_with_dialect_2"))?
+                    .ok_or(AppError::internal(
+                        "responses_request_convert_with_dialect_2",
+                    ))?
                     .push(call);
                 if preserve_reasoning && !reasoning.is_empty() {
                     message["reasoning_content"] = Value::String(std::mem::take(&mut reasoning));

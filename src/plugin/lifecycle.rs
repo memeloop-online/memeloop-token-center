@@ -34,7 +34,8 @@ pub struct PluginGrant {
 
 pub fn manifest_digest(manifest: &super::PluginManifest) -> Result<String, AppError> {
     super::plugin_configuration_schema_digest(
-        &serde_json::to_value(manifest).map_err(|_| AppError::internal("lifecycle_manifest_digest_1"))?,
+        &serde_json::to_value(manifest)
+            .map_err(|_| AppError::internal("lifecycle_manifest_digest_1"))?,
     )
 }
 
@@ -210,7 +211,9 @@ impl RuntimeSnapshot {
             // shared plugin circuit, including for another tenant.
             input_sizes.validate(index, &plugin_context, &current, model_changed)?;
             let epoch = {
-                let mut circuits = self.circuits.lock().map_err(|_| AppError::internal("lifecycle_apply_traffic_with_config_and_memory_1"))?;
+                let mut circuits = self.circuits.lock().map_err(|_| {
+                    AppError::internal("lifecycle_apply_traffic_with_config_and_memory_1")
+                })?;
                 let circuit = circuits.entry(id.clone()).or_default();
                 let Some(epoch) = circuit.admit(Instant::now()) else {
                     return Ok(unavailable(id, "policy_circuit_open"));
@@ -227,7 +230,9 @@ impl RuntimeSnapshot {
                 configurations,
                 memory,
             );
-            let mut circuits = self.circuits.lock().map_err(|_| AppError::internal("lifecycle_apply_traffic_with_config_and_memory_2"))?;
+            let mut circuits = self.circuits.lock().map_err(|_| {
+                AppError::internal("lifecycle_apply_traffic_with_config_and_memory_2")
+            })?;
             let circuit = circuits.entry(id.clone()).or_default();
             if matches!(result, Err(AppError::PluginInputTooLarge)) {
                 // Defensive propagation if the executor discovers an input
@@ -331,7 +336,10 @@ impl RuntimeRevisions {
                 error,
             )
         })?;
-        let mut state = self.state.write().map_err(|_| AppError::internal("lifecycle_replace_1"))?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| AppError::internal("lifecycle_replace_1"))?;
         let revision = next_revision(&state, expected_revision).map_err(|error| {
             rejected(
                 RevisionReason::Reload,
@@ -358,7 +366,10 @@ impl RuntimeRevisions {
     }
 
     pub fn rollback(&self, expected_revision: u64) -> Result<RevisionReceipt, AppError> {
-        let mut state = self.state.write().map_err(|_| AppError::internal("lifecycle_rollback_1"))?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| AppError::internal("lifecycle_rollback_1"))?;
         let revision = next_revision(&state, expected_revision).map_err(|error| {
             rejected(
                 RevisionReason::Rollback,
@@ -391,7 +402,10 @@ impl RuntimeRevisions {
                 error,
             )
         })?;
-        let runtime = state.previous.pop().ok_or(AppError::internal("lifecycle_rollback_1"))?;
+        let runtime = state
+            .previous
+            .pop()
+            .ok_or(AppError::internal("lifecycle_rollback_1"))?;
         state.current = snapshot(runtime, revision, RevisionReason::Rollback);
         Ok(state.current.receipt)
     }
@@ -422,7 +436,9 @@ fn next_revision(state: &State, expected: u64) -> Result<u64, AppError> {
     if state.current.receipt.revision != expected {
         return Err(AppError::Conflict("plugin runtime revision changed".into()));
     }
-    expected.checked_add(1).ok_or(AppError::internal("lifecycle_next_revision_1"))
+    expected
+        .checked_add(1)
+        .ok_or(AppError::internal("lifecycle_next_revision_1"))
 }
 
 pub(super) fn snapshot(
@@ -605,7 +621,11 @@ mod tests {
         let marker = "secret-config-token-provider-response";
         for error in [
             AppError::BadRequest(marker.into()),
-            AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("lifecycle_rejection_diagnostic_is_versioned_and_drops_untrusted_")),
+            AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new()
+                    .stage("lifecycle_rejection_diagnostic_is_versioned_and_drops_untrusted_"),
+            ),
             AppError::Conflict(marker.into()),
             AppError::storage("local_storage_failed"),
         ] {

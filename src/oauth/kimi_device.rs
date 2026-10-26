@@ -479,7 +479,9 @@ fn claim_result(
             lease_owner,
             login: Box::new(open_private_json(&ready_ciphertext, key, READY_AAD)?),
         },
-        OAuthLoginClaim::Claimed { .. } => return Err(AppError::internal("kimi_device_claim_result_1")),
+        OAuthLoginClaim::Claimed { .. } => {
+            return Err(AppError::internal("kimi_device_claim_result_1"));
+        }
     })
 }
 

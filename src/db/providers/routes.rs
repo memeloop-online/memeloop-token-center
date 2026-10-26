@@ -535,8 +535,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::internal("routes_resolve_upstream_with_hint_1"))?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("routes_resolve_upstream_with_hint_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;

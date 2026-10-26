@@ -581,7 +581,10 @@ impl ApplicationPlugins {
                 })?;
                 if let Some((username, password)) = &policy.ephemeral_proxy_credentials {
                     use tokio::io::AsyncWriteExt;
-                    let mut stdin = child.stdin.take().ok_or(AppError::internal("installation_perform_install_2"))?;
+                    let mut stdin = child
+                        .stdin
+                        .take()
+                        .ok_or(AppError::internal("installation_perform_install_2"))?;
                     let payload =
                         serde_json::to_vec(&json!({"username":username,"password":password}))
                             .map_err(|_| AppError::internal("installation_perform_install_6"))?;
@@ -589,9 +592,15 @@ impl ApplicationPlugins {
                         .write_all(&payload)
                         .await
                         .map_err(|_| AppError::internal("installation_perform_install_7"))?;
-                    stdin.shutdown().await.map_err(|_| AppError::internal("installation_perform_install_8"))?;
+                    stdin
+                        .shutdown()
+                        .await
+                        .map_err(|_| AppError::internal("installation_perform_install_8"))?;
                 }
-                let mut stderr = child.stderr.take().ok_or(AppError::internal("installation_perform_install_3"))?;
+                let mut stderr = child
+                    .stderr
+                    .take()
+                    .ok_or(AppError::internal("installation_perform_install_3"))?;
                 let capture = async {
                     use tokio::io::AsyncReadExt;
                     let mut captured = Vec::new();
@@ -690,7 +699,8 @@ impl ApplicationPlugins {
         .map_err(|_| AppError::internal("installation_review_runtime_1"))?;
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let metadata = std::fs::symlink_metadata(&root).map_err(|_| AppError::internal("installation_review_runtime_2"))?;
+            let metadata = std::fs::symlink_metadata(&root)
+                .map_err(|_| AppError::internal("installation_review_runtime_2"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -833,7 +843,9 @@ impl ApplicationPlugins {
             )
         })
         .await
-        .map_err(|_| AppError::internal("installation_reclaim_unreferenced_installation_attempts_1"))?
+        .map_err(|_| {
+            AppError::internal("installation_reclaim_unreferenced_installation_attempts_1")
+        })?
     }
 }
 
@@ -865,7 +877,8 @@ fn reclaim_installation_attempt_roots(
         if reclaimed >= ATTEMPT_RECLAMATION_LIMIT {
             break;
         }
-        let entry = entry.map_err(|_| AppError::internal("installation_reclaim_installation_attempt_roots_1"))?;
+        let entry = entry
+            .map_err(|_| AppError::internal("installation_reclaim_installation_attempt_roots_1"))?;
         let entry_name = entry.file_name();
         let (attempt_id, root, recovery_entry) =
             if let Some(attempt_id) = inventory_attempt_id(&entry_name) {
@@ -936,7 +949,9 @@ fn allow_missing_plugin_root<T>(result: std::io::Result<T>) -> Result<Option<T>,
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(AppError::internal("installation_allow_missing_plugin_root_1")),
+        Err(_) => Err(AppError::internal(
+            "installation_allow_missing_plugin_root_1",
+        )),
     }
 }
 
@@ -1246,7 +1261,8 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
     let parent = root.parent().ok_or(AppError::Forbidden)?;
     let name = root.file_name().ok_or(AppError::Forbidden)?;
     let temporary = parent.join(format!(".mtc-inventory-claim-{}", uuid::Uuid::now_v7()));
-    std::fs::create_dir(&temporary).map_err(|_| AppError::internal("installation_claim_inventory_root_1"))?;
+    std::fs::create_dir(&temporary)
+        .map_err(|_| AppError::internal("installation_claim_inventory_root_1"))?;
     let marker = temporary.join(".mtc-install-owner");
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
@@ -1256,7 +1272,8 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
             .map_err(|_| AppError::internal("installation_claim_inventory_root_2"))?;
         file.write_all(owner.as_bytes())
             .map_err(|_| AppError::internal("installation_claim_inventory_root_3"))?;
-        file.sync_all().map_err(|_| AppError::internal("installation_claim_inventory_root_4"))?;
+        file.sync_all()
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_4"))?;
         std::fs::File::open(&temporary)
             .and_then(|file| file.sync_all())
             .map_err(|_| AppError::internal("installation_claim_inventory_root_5"))?;
@@ -1278,7 +1295,9 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
         .map_err(|_| AppError::internal("installation_claim_inventory_root_6"))?;
         match renameat_with(
             &directory,
-            temporary.file_name().ok_or(AppError::internal("installation_claim_inventory_root_2"))?,
+            temporary
+                .file_name()
+                .ok_or(AppError::internal("installation_claim_inventory_root_2"))?,
             &directory,
             name,
             RenameFlags::NOREPLACE,
@@ -1353,9 +1372,12 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
 }
 
 fn inventory_attempt_storage_id(attempt_id: &str) -> Result<String, AppError> {
-    let attempt = uuid::Uuid::parse_str(attempt_id).map_err(|_| AppError::internal("installation_inventory_attempt_storage_id_1"))?;
+    let attempt = uuid::Uuid::parse_str(attempt_id)
+        .map_err(|_| AppError::internal("installation_inventory_attempt_storage_id_1"))?;
     if attempt.to_string() != attempt_id {
-        return Err(AppError::internal("installation_inventory_attempt_storage_id_1"));
+        return Err(AppError::internal(
+            "installation_inventory_attempt_storage_id_1",
+        ));
     }
     Ok(format!("mtc-attempt-{attempt}"))
 }
@@ -1416,8 +1438,11 @@ async fn package_checkpoint(
         let (source, digest) = reference.rsplit_once('@').ok_or(AppError::Forbidden)?;
         let mut found = None;
         let mut count = 0;
-        for entry in std::fs::read_dir(&root).map_err(|_| AppError::internal("installation_package_checkpoint_2"))? {
-            let entry = entry.map_err(|_| AppError::internal("installation_package_checkpoint_3"))?;
+        for entry in std::fs::read_dir(&root)
+            .map_err(|_| AppError::internal("installation_package_checkpoint_2"))?
+        {
+            let entry =
+                entry.map_err(|_| AppError::internal("installation_package_checkpoint_3"))?;
             if entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
@@ -1426,7 +1451,8 @@ async fn package_checkpoint(
                 return Err(AppError::Forbidden);
             }
             let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::internal("installation_package_checkpoint_4"))?;
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| AppError::internal("installation_package_checkpoint_4"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -1490,13 +1516,17 @@ fn package_tree_digest(root: &std::path::Path) -> Result<String, AppError> {
     let mut total = 0;
     while let Some(relative) = pending.pop() {
         let path = root.join(&relative);
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::internal("installation_package_tree_digest_1"))?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| AppError::internal("installation_package_tree_digest_1"))?;
         if metadata.file_type().is_symlink() || relative.as_os_str().len() > 240 {
             return Err(AppError::Forbidden);
         }
         if metadata.is_dir() {
-            for entry in std::fs::read_dir(path).map_err(|_| AppError::internal("installation_package_tree_digest_2"))? {
-                let entry = entry.map_err(|_| AppError::internal("installation_package_tree_digest_3"))?;
+            for entry in std::fs::read_dir(path)
+                .map_err(|_| AppError::internal("installation_package_tree_digest_2"))?
+            {
+                let entry =
+                    entry.map_err(|_| AppError::internal("installation_package_tree_digest_3"))?;
                 entries += 1;
                 if entries > 64 * 240 {
                     return Err(AppError::Forbidden);
@@ -1513,7 +1543,9 @@ fn package_tree_digest(root: &std::path::Path) -> Result<String, AppError> {
             let mut hash = Sha256::new();
             let mut buffer = [0u8; 65536];
             loop {
-                let count = file.read(&mut buffer).map_err(|_| AppError::internal("installation_package_tree_digest_5"))?;
+                let count = file
+                    .read(&mut buffer)
+                    .map_err(|_| AppError::internal("installation_package_tree_digest_5"))?;
                 if count == 0 {
                     break;
                 }
@@ -1571,11 +1603,12 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
     // Preserve existing public-key review digests; keyless identities are part
     // of the reviewed authority and invalidate checkpoints when changed.
     if let Some(identity) = &policy.cosign_keyless {
-        trust["keyless"] = serde_json::to_value(identity).map_err(|_| AppError::internal("installation_trust_digest_3"))?;
+        trust["keyless"] = serde_json::to_value(identity)
+            .map_err(|_| AppError::internal("installation_trust_digest_3"))?;
     }
     if !policy.source_keyless.is_empty() {
-        trust["source_keyless"] =
-            serde_json::to_value(&policy.source_keyless).map_err(|_| AppError::internal("installation_trust_digest_4"))?;
+        trust["source_keyless"] = serde_json::to_value(&policy.source_keyless)
+            .map_err(|_| AppError::internal("installation_trust_digest_4"))?;
     }
     super::super::plugin_configuration_schema_digest(&trust)
 }
@@ -1643,15 +1676,18 @@ pub(super) async fn append_inventory_file(
         let mut inventory: BTreeMap<String, PreinstalledInventory> =
             serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
         if let Some(existing) = inventory.get(&id) {
-            if serde_json::to_value(existing).map_err(|_| AppError::internal("installation_append_inventory_file_4"))?
-                == serde_json::to_value(&entry).map_err(|_| AppError::internal("installation_append_inventory_file_5"))?
+            if serde_json::to_value(existing)
+                .map_err(|_| AppError::internal("installation_append_inventory_file_4"))?
+                == serde_json::to_value(&entry)
+                    .map_err(|_| AppError::internal("installation_append_inventory_file_5"))?
             {
                 return Ok(());
             }
             return Err(AppError::Conflict("inventory ID is immutable".into()));
         }
         inventory.insert(id, entry);
-        let bytes = serde_json::to_vec(&inventory).map_err(|_| AppError::internal("installation_append_inventory_file_6"))?;
+        let bytes = serde_json::to_vec(&inventory)
+            .map_err(|_| AppError::internal("installation_append_inventory_file_6"))?;
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(AppError::Forbidden);
         }
@@ -1669,9 +1705,12 @@ pub(super) async fn append_inventory_file(
                     .permissions(),
             )
             .map_err(|_| AppError::internal("installation_append_inventory_file_9"))?;
-            file.write_all(&bytes).map_err(|_| AppError::internal("installation_append_inventory_file_10"))?;
-            file.sync_all().map_err(|_| AppError::internal("installation_append_inventory_file_11"))?;
-            std::fs::rename(&temporary, &path).map_err(|_| AppError::internal("installation_append_inventory_file_12"))?;
+            file.write_all(&bytes)
+                .map_err(|_| AppError::internal("installation_append_inventory_file_10"))?;
+            file.sync_all()
+                .map_err(|_| AppError::internal("installation_append_inventory_file_11"))?;
+            std::fs::rename(&temporary, &path)
+                .map_err(|_| AppError::internal("installation_append_inventory_file_12"))?;
             std::fs::File::open(parent)
                 .and_then(|file| file.sync_all())
                 .map_err(|_| AppError::internal("installation_append_inventory_file_13"))

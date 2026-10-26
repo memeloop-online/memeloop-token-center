@@ -584,7 +584,9 @@ async fn refresh_plugin_service_data(
                 .unwrap_or(Err(
                     crate::plugin::service_data::PluginServiceDataCollectionFailure {
                         code: crate::db::PluginServiceDataRefreshErrorCode::ComponentExecution,
-                        error: crate::error::AppError::internal("worker_refresh_plugin_service_data_1"),
+                        error: Box::new(crate::error::AppError::internal(
+                            "worker_refresh_plugin_service_data_1",
+                        )),
                     },
                 ))
         } else {
@@ -911,6 +913,8 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
     }
 }
 
+const SESSION_BODY_ARCHIVE_READ_LIMIT: usize = 128 * 1024 * 1024;
+
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
     let tasks = match state
         .db
@@ -922,16 +926,12 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             state
                 .metrics
                 .observe_background_projection(BackgroundProjectionKind::Conversation, false);
-            tracing::error!(%error, "worker failed to claim conversation projection tasks");
+            tracing::error!(%error, "worker 未能领取会话正文归档任务");
             return;
         }
     };
     for task in tasks {
-        match state
-            .db
-            .project_claimed_conversation_projection_task(lease_owner, task.request_id)
-            .await
-        {
+        match archive_session_body(state, lease_owner, task.request_id).await {
             Ok(true) => state
                 .metrics
                 .observe_background_projection(BackgroundProjectionKind::Conversation, true),
@@ -943,10 +943,137 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
                 tracing::error!(
                     %error,
                     request_id = %task.request_id,
-                    "worker failed to project conversation task"
+                    "会话正文归档没有写完，客户端请求已经结束"
                 );
             }
         }
+    }
+}
+
+/// 读取原始请求 JSON 和原始返回 JSON 的 locator，整理会话正文并写入 CNPG。
+/// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
+async fn archive_session_body(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+) -> Result<bool, AppError> {
+    let Some((request_locator, return_locator)) =
+        state.db.session_body_locators(request_id).await?
+    else {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_request_locator",
+        )
+        .await;
+    };
+    if request_locator.is_empty() {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_request_locator",
+        )
+        .await;
+    }
+    let Some(return_locator) = return_locator.filter(|locator| !locator.is_empty()) else {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_return_locator",
+        )
+        .await;
+    };
+    let request_bytes = match load_raw_document(state, &request_locator).await {
+        Ok(bytes) => bytes,
+        Err(reason) => return skip_session_body(state, lease_owner, request_id, reason).await,
+    };
+    let return_bytes = match load_raw_document(state, &return_locator).await {
+        Ok(bytes) => bytes,
+        Err(reason) => return skip_session_body(state, lease_owner, request_id, reason).await,
+    };
+    let Ok(request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes) else {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_archive_unreadable",
+        )
+        .await;
+    };
+    let Ok(return_document) = crate::conversation::raw_return_document(&return_bytes) else {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_archive_unreadable",
+        )
+        .await;
+    };
+    let mut body =
+        crate::conversation::session_body_from_documents(&request_document, &return_document);
+    let pending_media = body.take_media_bytes();
+    for (turn_index, part_index, bytes) in pending_media {
+        match state.archive.put_content(bytes::Bytes::from(bytes)).await {
+            Ok(locator) => body.set_media_locator(turn_index, part_index, locator),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    %request_id,
+                    "会话正文归档未能把媒体字节写成 blake3 对象"
+                );
+                return Err(error);
+            }
+        }
+    }
+    let (atoms, nodes) = body.into_prefix();
+    let media = body.media_locators(&atoms);
+    if !state
+        .db
+        .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
+        .await?
+    {
+        return Ok(false);
+    }
+    state
+        .db
+        .project_claimed_conversation_projection_task(lease_owner, request_id)
+        .await
+}
+
+async fn skip_session_body(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+    reason: &'static str,
+) -> Result<bool, AppError> {
+    tracing::warn!(%request_id, reason, "会话正文归档跳过这条请求");
+    state
+        .db
+        .skip_session_body_archive(lease_owner, request_id, reason)
+        .await?;
+    Ok(false)
+}
+
+async fn load_raw_document(state: &AppState, locator: &str) -> Result<Vec<u8>, &'static str> {
+    if locator.starts_with("gap://")
+        || locator.starts_with("metadata-only-json:")
+        || locator.starts_with("provider-reference-json:")
+    {
+        return Err("session_body_skipped_archive_unreadable");
+    }
+    if let Some(inline) = locator.strip_prefix("inline-json:") {
+        return Ok(inline.as_bytes().to_vec());
+    }
+    match state
+        .archive
+        .get_bounded(locator, SESSION_BODY_ARCHIVE_READ_LIMIT)
+        .await
+    {
+        Ok(bytes) => Ok(bytes.to_vec()),
+        Err(_) => Err("session_body_skipped_archive_unreadable"),
     }
 }
 

@@ -116,8 +116,7 @@ pub(super) async fn read_bounded_upstream(
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     let reserved = if let Some(conversation) = conversation {
-        conversation
-            .reserve_for_buffered_response(memory, reservation_maximum, deadline)
+        conversation.reserve_for_buffered_response(memory, reservation_maximum, deadline)
     } else {
         memory.reserve_buffered_response(reservation_maximum, deadline)
     };
@@ -250,7 +249,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(matches!(rejected, Err(BoundedUpstreamError::MemoryCapacity)));
+        assert!(matches!(
+            rejected,
+            Err(BoundedUpstreamError::MemoryCapacity)
+        ));
         assert!(!polled.load(Ordering::SeqCst));
         assert_eq!(budget.snapshot().0, 1024 * 1024);
         drop(held);

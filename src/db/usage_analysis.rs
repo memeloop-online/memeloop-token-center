@@ -223,7 +223,9 @@ impl Database {
             .await?;
         let (summary, time_series) = take_summary_time_series(&mut projections)?;
         if !projections.is_empty() {
-            return Err(AppError::internal("usage_analysis_aggregate_usage_analysis_trends_for_tenant_id_1"));
+            return Err(AppError::internal(
+                "usage_analysis_aggregate_usage_analysis_trends_for_tenant_id_1",
+            ));
         }
         snapshot.record_completion(UsageAnalysisMainProjectionSet::Trends);
         snapshot.commit().await?;
@@ -343,7 +345,11 @@ impl Database {
                         units,
                     },
                 ),
-                _ => return Err(AppError::internal("usage_analysis_aggregate_usage_analysis_for_tenant_id_1")),
+                _ => {
+                    return Err(AppError::internal(
+                        "usage_analysis_aggregate_usage_analysis_for_tenant_id_1",
+                    ));
+                }
             }
         }
         generation_units_by_modality.sort_by(|left, right| {
@@ -440,7 +446,9 @@ impl Database {
             .into_iter()
             .map(|((_kind, id), accumulator)| {
                 Ok(UsageAnalysisHeatmapBucket {
-                    hour_of_week: id.parse().map_err(|_| AppError::internal("usage_analysis_site_1"))?,
+                    hour_of_week: id
+                        .parse()
+                        .map_err(|_| AppError::internal("usage_analysis_site_1"))?,
                     metrics: accumulator.finish(),
                 })
             })
@@ -1228,8 +1236,16 @@ fn take_summary_time_series(
         .collect::<Vec<_>>();
     let mut time_series = Vec::with_capacity(time_keys.len());
     for key in time_keys {
-        let bucket_start = key.1.parse().map_err(|_| AppError::internal("usage_analysis_take_summary_time_series_1"))?;
-        let metrics = projections.remove(&key).ok_or(AppError::internal("usage_analysis_take_summary_time_series_1"))?.finish();
+        let bucket_start = key
+            .1
+            .parse()
+            .map_err(|_| AppError::internal("usage_analysis_take_summary_time_series_1"))?;
+        let metrics = projections
+            .remove(&key)
+            .ok_or(AppError::internal(
+                "usage_analysis_take_summary_time_series_1",
+            ))?
+            .finish();
         time_series.push(UsageAnalysisTimeBucket {
             bucket_start,
             metrics,

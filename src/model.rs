@@ -646,9 +646,7 @@ pub struct EntitlementReconcileResult {
 /// delivery-contract marker, is not an in-flight stage.
 pub(crate) fn recorded_in_flight_stage(value: Option<String>) -> Option<String> {
     match value.as_deref() {
-        Some("upstream_response_headers" | "upstream_response_body" | "response_delivery") => {
-            value
-        }
+        Some("upstream_response_headers" | "upstream_response_body" | "response_delivery") => value,
         _ => None,
     }
 }

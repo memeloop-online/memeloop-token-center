@@ -229,7 +229,8 @@ async fn start_claude_login_at(
         return Err(AppError::internal("claude_start_claude_login_at_1"));
     }
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    let mut login_url = Url::parse(&endpoints.authorize).map_err(|_| AppError::internal("claude_start_claude_login_at_3"))?;
+    let mut login_url = Url::parse(&endpoints.authorize)
+        .map_err(|_| AppError::internal("claude_start_claude_login_at_3"))?;
     login_url
         .query_pairs_mut()
         .append_pair("code", "true")
@@ -428,7 +429,9 @@ async fn complete_claude_login_at(
         } => Ok(ClaudeCompleteResult::Pending {
             retry_after_seconds,
         }),
-        OAuthLoginClaim::Claimed { .. } => Err(AppError::internal("claude_complete_claude_login_at_1")),
+        OAuthLoginClaim::Claimed { .. } => {
+            Err(AppError::internal("claude_complete_claude_login_at_1"))
+        }
     }
 }
 

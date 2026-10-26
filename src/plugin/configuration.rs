@@ -59,7 +59,13 @@ impl PluginRuntime {
         self.resolve_snapshot_with(
             tenant_id,
             || async {
-                let database = &self.kv.as_ref().ok_or(AppError::internal("configuration_resolved_traffic_snapshot_1"))?.database;
+                let database = &self
+                    .kv
+                    .as_ref()
+                    .ok_or(AppError::internal(
+                        "configuration_resolved_traffic_snapshot_1",
+                    ))?
+                    .database;
                 database.plugin_configuration_layers(tenant_id).await
             },
             Instant::now,

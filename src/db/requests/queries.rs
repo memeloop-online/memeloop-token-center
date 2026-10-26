@@ -1473,14 +1473,20 @@ fn request_credential_identity_from_row(
         tenant_external_id,
         key_id: parse_uuid(
             row.try_get::<Option<String>, _>("credential_key_id")?
-                .ok_or(AppError::internal("queries_request_credential_identity_from_row_1"))?,
+                .ok_or(AppError::internal(
+                    "queries_request_credential_identity_from_row_1",
+                ))?,
         )?,
         key_alias: row
             .try_get::<Option<String>, _>("key_alias")?
-            .ok_or(AppError::internal("queries_request_credential_identity_from_row_2"))?,
+            .ok_or(AppError::internal(
+                "queries_request_credential_identity_from_row_2",
+            ))?,
         principal_external_id: row
             .try_get::<Option<String>, _>("principal_external_id")?
-            .ok_or(AppError::internal("queries_request_credential_identity_from_row_3"))?,
+            .ok_or(AppError::internal(
+                "queries_request_credential_identity_from_row_3",
+            ))?,
     }))
 }
 
@@ -1489,7 +1495,8 @@ pub(crate) fn request_usage_basis_from_row(
 ) -> Result<Option<crate::model::RequestUsageBasis>, AppError> {
     row.try_get::<Option<String>, _>("usage_basis")?
         .map(|value| {
-            crate::model::RequestUsageBasis::from_storage(&value).ok_or(AppError::internal("queries_request_usage_basis_from_row_1"))
+            crate::model::RequestUsageBasis::from_storage(&value)
+                .ok_or(AppError::internal("queries_request_usage_basis_from_row_1"))
         })
         .transpose()
 }
@@ -1526,7 +1533,8 @@ fn request_lifecycle_projection(
 }
 
 fn request_archive_state(value: String) -> Result<RequestArchiveState, AppError> {
-    RequestArchiveState::from_storage(&value).ok_or(AppError::internal("queries_request_archive_state_1"))
+    RequestArchiveState::from_storage(&value)
+        .ok_or(AppError::internal("queries_request_archive_state_1"))
 }
 
 fn request_session_context_from_row(
@@ -1539,11 +1547,17 @@ fn request_session_context_from_row(
     let association = match association.as_str() {
         "confirmed" => RequestSessionAssociation::Confirmed,
         "unlinked" => RequestSessionAssociation::Unlinked,
-        _ => return Err(AppError::internal("queries_request_session_context_from_row_1")),
+        _ => {
+            return Err(AppError::internal(
+                "queries_request_session_context_from_row_1",
+            ));
+        }
     };
     let session_id: Option<String> = row.try_get("session_id")?;
     if association == RequestSessionAssociation::Confirmed && session_id.is_none() {
-        return Err(AppError::internal("queries_request_session_context_from_row_2"));
+        return Err(AppError::internal(
+            "queries_request_session_context_from_row_2",
+        ));
     }
     Ok(Some(RequestSessionContext {
         session_id,
@@ -1733,7 +1747,9 @@ fn request_event_views(rows: Vec<AnyRow>) -> Result<Vec<RequestEventView>, AppEr
                 },
                 error_code: error_code.clone(),
                 terminal_cause_code,
-                in_flight_stage: crate::model::recorded_in_flight_stage(row.try_get("in_flight_stage")?),
+                in_flight_stage: crate::model::recorded_in_flight_stage(
+                    row.try_get("in_flight_stage")?,
+                ),
                 supplier_error: crate::supplier_error::supplier_error_from_record(
                     row.try_get::<Option<String>, _>("supplier_error_inline_json")?
                         .as_deref(),
@@ -1921,8 +1937,8 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
     let (response_json, provider_metadata_only) = result_json
         .as_deref()
         .map(|value| {
-            let mut value =
-                serde_json::from_str::<serde_json::Value>(value).map_err(|_| AppError::internal("queries_generation_archive_refs_from_row_1"))?;
+            let mut value = serde_json::from_str::<serde_json::Value>(value)
+                .map_err(|_| AppError::internal("queries_generation_archive_refs_from_row_1"))?;
             let provider_metadata_only = value
                 .as_object_mut()
                 .and_then(|value| value.remove("provider_reference"))
@@ -1954,7 +1970,11 @@ fn generation_archive_refs_from_row(row: AnyRow) -> Result<RequestArchiveRefs, A
             Some("media_body_not_archived_by_policy".to_owned()),
         ),
         "succeeded" | "failed" | "cancelled" => (RequestArchiveState::Bound, None),
-        _ => return Err(AppError::internal("queries_generation_archive_refs_from_row_1")),
+        _ => {
+            return Err(AppError::internal(
+                "queries_generation_archive_refs_from_row_1",
+            ));
+        }
     };
     let archive_state = combined_archive_state(request_archive_state, response_archive_state);
     Ok(RequestArchiveRefs {

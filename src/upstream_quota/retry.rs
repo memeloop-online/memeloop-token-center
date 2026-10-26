@@ -90,7 +90,13 @@ impl Failure {
     }
 }
 
-fn transport_stage(proxy: bool, dns: bool, tls: bool, connect: bool, timeout: bool) -> &'static str {
+fn transport_stage(
+    proxy: bool,
+    dns: bool,
+    tls: bool,
+    connect: bool,
+    timeout: bool,
+) -> &'static str {
     if proxy {
         "proxy_connect"
     } else if dns {

@@ -54,7 +54,8 @@ fn conflict() -> AppError {
 }
 
 fn digest(value: &Value) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| AppError::internal("pending_settlement_digest_1"))?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| AppError::internal("pending_settlement_digest_1"))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 

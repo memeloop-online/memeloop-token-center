@@ -49,7 +49,9 @@ impl Database {
         rows.iter()
             .map(|row| {
                 let id: String = row.try_get("id")?;
-                Uuid::parse_str(&id).map_err(|_| AppError::internal("upstream_service_probes_upstream_service_probes_due_1"))
+                Uuid::parse_str(&id).map_err(|_| {
+                    AppError::internal("upstream_service_probes_upstream_service_probes_due_1")
+                })
             })
             .collect()
     }
@@ -298,7 +300,9 @@ impl Database {
         rows.iter()
             .map(|row| {
                 let id: String = row.try_get("account_id")?;
-                Uuid::parse_str(&id).map_err(|_| AppError::internal("upstream_service_probes_transport_group_bound_accounts_1"))
+                Uuid::parse_str(&id).map_err(|_| {
+                    AppError::internal("upstream_service_probes_transport_group_bound_accounts_1")
+                })
             })
             .collect()
     }

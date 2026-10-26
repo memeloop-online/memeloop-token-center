@@ -96,8 +96,13 @@ fn capture_cpu_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
         .build()
         .map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_1"))?;
     std::thread::sleep(duration);
-    let report = profiler.report().build().map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_2"))?;
-    let profile = report.pprof().map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_3"))?;
+    let report = profiler
+        .report()
+        .build()
+        .map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_2"))?;
+    let profile = report
+        .pprof()
+        .map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_3"))?;
     let mut output = Vec::with_capacity(profile.encoded_len().min(MAX_CPU_PROFILE_BYTES));
     profile
         .encode(&mut output)
@@ -152,17 +157,20 @@ fn capture_heap_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
     std::thread::sleep(duration);
     let path = PathBuf::from("/tmp").join(format!("memeloop-token-center-{}.heap", Uuid::now_v7()));
     let temporary = TemporaryProfile(path);
-    let path = CString::new(temporary.0.as_os_str().as_bytes()).map_err(|_| AppError::internal("diagnostics_capture_heap_profile_1"))?;
+    let path = CString::new(temporary.0.as_os_str().as_bytes())
+        .map_err(|_| AppError::internal("diagnostics_capture_heap_profile_1"))?;
     // SAFETY: `prof.dump` expects a pointer to a NUL-terminated path and
     // jemalloc consumes it synchronously before CString is dropped.
     crate::jemalloc_control::write_pointer(b"prof.dump\0", path.as_ptr())
         .map_err(|_| AppError::internal("diagnostics_capture_heap_profile_2"))?;
     drop(active);
-    let metadata = std::fs::metadata(&temporary.0).map_err(|_| AppError::internal("diagnostics_capture_heap_profile_3"))?;
+    let metadata = std::fs::metadata(&temporary.0)
+        .map_err(|_| AppError::internal("diagnostics_capture_heap_profile_3"))?;
     if metadata.len() > MAX_HEAP_PROFILE_BYTES as u64 {
         return Err(AppError::internal("diagnostics_capture_heap_profile_2"));
     }
-    std::fs::read(&temporary.0).map_err(|_| AppError::internal("diagnostics_capture_heap_profile_4"))
+    std::fs::read(&temporary.0)
+        .map_err(|_| AppError::internal("diagnostics_capture_heap_profile_4"))
 }
 
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]

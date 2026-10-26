@@ -6,10 +6,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
-#[cfg(unix)]
 use rustix::fs::{Mode, OFlags, mkdirat, openat};
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
+use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
 use super::{DescriptorInventory, PluginInventoryDescriptor, PreinstalledInventory};
 use crate::{
@@ -519,7 +519,11 @@ fn promote_verified_package(
                 rustix::fs::AtFlags::REMOVEDIR,
             ))?;
         }
-        Err(_) => return Err(AppError::internal("descriptor_import_promote_verified_package_1")),
+        Err(_) => {
+            return Err(AppError::internal(
+                "descriptor_import_promote_verified_package_1",
+            ));
+        }
     }
     #[cfg(windows)]
     {
@@ -539,9 +543,16 @@ fn promote_verified_package(
                     return Err(AppError::Forbidden);
                 }
                 storage(crate::windows_dir::remove_tree(&verified))?;
-                storage(crate::windows_dir::remove_dir(staging, OsStr::new(plugin_id)))?;
+                storage(crate::windows_dir::remove_dir(
+                    staging,
+                    OsStr::new(plugin_id),
+                ))?;
             }
-            Err(_) => return Err(AppError::internal("descriptor_import_promote_verified_package_2")),
+            Err(_) => {
+                return Err(AppError::internal(
+                    "descriptor_import_promote_verified_package_2",
+                ));
+            }
         }
         storage(root.sync())?;
         return storage(staging.sync());
@@ -569,7 +580,10 @@ fn validate_paths(
     plugin_dir: &Path,
     output: &Path,
 ) -> Result<(), AppError> {
-    if !plugin_dir.is_absolute() || plugin_dir.components().any(|part| !path_component_allowed(part))
+    if !plugin_dir.is_absolute()
+        || plugin_dir
+            .components()
+            .any(|part| !path_component_allowed(part))
     {
         return Err(AppError::Forbidden);
     }
@@ -587,7 +601,8 @@ fn direct_child<'path>(
     parent: &Path,
     child: &'path Path,
 ) -> Result<&'path std::ffi::OsStr, AppError> {
-    if child.parent() != Some(parent) || child.components().any(|part| !path_component_allowed(part))
+    if child.parent() != Some(parent)
+        || child.components().any(|part| !path_component_allowed(part))
     {
         return Err(AppError::Forbidden);
     }
@@ -666,8 +681,11 @@ fn read_at(directory: &DirHandle, name: &str) -> Result<Vec<u8>, AppError> {
     }
     #[cfg(windows)]
     {
-        match crate::windows_dir::read_limited(directory, std::ffi::OsStr::new(name), MAX_BYTES as u64)
-        {
+        match crate::windows_dir::read_limited(
+            directory,
+            std::ffi::OsStr::new(name),
+            MAX_BYTES as u64,
+        ) {
             Ok(bytes) => Ok(bytes),
             Err(error)
                 if error.kind() == std::io::ErrorKind::InvalidData
@@ -722,7 +740,8 @@ fn read_bundle(
 }
 
 fn encoded(value: &impl Serialize) -> Result<Vec<u8>, AppError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| AppError::internal("descriptor_import_encoded_1"))?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| AppError::internal("descriptor_import_encoded_1"))?;
     if bytes.len() > MAX_BYTES {
         return Err(AppError::Forbidden);
     }
@@ -1055,10 +1074,15 @@ mod tests {
             assert!(std::error::Error::source(&failure).is_none());
             assert_eq!(failure.into_app_error().to_string(), expected);
         }
-        let failure =
-            DescriptorImportFailure::validation(Phase::DescriptorValidate, AppError::internal("descriptor_import_unknown_diagnostics_do_not_infer_cause_or_disc"));
+        let failure = DescriptorImportFailure::validation(
+            Phase::DescriptorValidate,
+            AppError::internal("descriptor_import_unknown_diagnostics_do_not_infer_cause_or_disc"),
+        );
         assert_eq!(failure.diagnostic().cause, Cause::Unknown);
-        assert!(matches!(failure.into_app_error(), AppError::Internal { .. }));
+        assert!(matches!(
+            failure.into_app_error(),
+            AppError::Internal { .. }
+        ));
     }
 
     #[tokio::test]
@@ -1106,7 +1130,10 @@ mod tests {
                 cause: Cause::Unknown
             }
         );
-        assert!(matches!(failure.into_app_error(), AppError::Internal { .. }));
+        assert!(matches!(
+            failure.into_app_error(),
+            AppError::Internal { .. }
+        ));
         assert!(matches!(
             import_plugin_descriptor(&options).await,
             Err(AppError::Internal { .. })
@@ -1125,7 +1152,10 @@ mod tests {
                 cause: Cause::Storage
             }
         );
-        assert!(matches!(failure.into_app_error(), AppError::Internal { .. }));
+        assert!(matches!(
+            failure.into_app_error(),
+            AppError::Internal { .. }
+        ));
         assert!(matches!(
             import_plugin_descriptor(&options).await,
             Err(AppError::Internal { .. })
@@ -1465,7 +1495,8 @@ mod tests {
             std::fs::remove_file(directory.path().join("empty")).unwrap();
         }
         #[cfg(windows)]
-        if std::os::windows::fs::symlink_dir(external.path(), directory.path().join("empty")).is_ok()
+        if std::os::windows::fs::symlink_dir(external.path(), directory.path().join("empty"))
+            .is_ok()
         {
             assert!(import_plugin_descriptor(&options).await.is_err());
             assert!(!options.output_dir.exists());

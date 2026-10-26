@@ -393,7 +393,8 @@ fn valid_owner_purpose(owner: ArchiveStagingOwner, purpose: ArchiveStagingPurpos
 }
 
 fn parse_canonical_uuid(value: &str) -> Result<Uuid, AppError> {
-    let parsed = Uuid::parse_str(value).map_err(|_| AppError::internal("archive_staging_parse_canonical_uuid_1"))?;
+    let parsed = Uuid::parse_str(value)
+        .map_err(|_| AppError::internal("archive_staging_parse_canonical_uuid_1"))?;
     (parsed.to_string() == value)
         .then_some(parsed)
         .ok_or(AppError::internal("archive_staging_parse_canonical_uuid_2"))
@@ -435,11 +436,12 @@ mod tests {
         let locator = conversation_media_locator(key, &hash).unwrap();
         assert_eq!(
             locator,
-            format!(
-                "staging/proxy/{owner_id}/media/{attempt_id}/{hash}"
-            )
+            format!("staging/proxy/{owner_id}/media/{attempt_id}/{hash}")
         );
-        assert_eq!(ArchiveStagingPurpose::parse("media").unwrap(), ArchiveStagingPurpose::Media);
+        assert_eq!(
+            ArchiveStagingPurpose::parse("media").unwrap(),
+            ArchiveStagingPurpose::Media
+        );
         assert!(
             ArchiveStagingKey::new(
                 ArchiveStagingOwner::GenerationJob(owner_id),

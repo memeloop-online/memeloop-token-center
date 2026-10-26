@@ -215,7 +215,10 @@ impl UpstreamCredential {
                 }
                 validate_optional_private_proxy(proxy_url.as_deref(), *proxy_network_scope)?;
                 if expires_at.is_some_and(|expires_at| expires_at <= now) {
-                    return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("credential_validate")));
+                    return Err(AppError::upstream_with(
+                        "upstream_unavailable",
+                        crate::error::ErrorFacts::new().stage("credential_validate"),
+                    ));
                 }
                 (access_token, header, prefix)
             }
@@ -275,10 +278,14 @@ impl UpstreamCredential {
                     PROVIDER_ADAPTER_SECRET_PATCH_KEY.into(),
                     Value::String(encoded),
                 );
-                validate_adapter_state(adapter_state.as_ref().ok_or(AppError::internal("credential_with_provider_adapter_secret_patch_1"))?)?;
+                validate_adapter_state(adapter_state.as_ref().ok_or(AppError::internal(
+                    "credential_with_provider_adapter_secret_patch_1",
+                ))?)?;
                 Ok(self)
             }
-            _ => Err(AppError::internal("credential_with_provider_adapter_secret_patch_2")),
+            _ => Err(AppError::internal(
+                "credential_with_provider_adapter_secret_patch_2",
+            )),
         }
     }
 
@@ -472,7 +479,8 @@ impl UpstreamCredential {
 }
 
 pub(crate) fn validate_provider_adapter_secret_patch(patch: &Value) -> Result<Vec<u8>, AppError> {
-    let patch = serde_json::to_vec(patch).map_err(|_| AppError::internal("credential_validate_provider_adapter_secret_patch_1"))?;
+    let patch = serde_json::to_vec(patch)
+        .map_err(|_| AppError::internal("credential_validate_provider_adapter_secret_patch_1"))?;
     if patch.len() > MAX_PROVIDER_ADAPTER_SECRET_PATCH_BYTES {
         return Err(AppError::BadRequest(
             "OAuth provider secret configuration exceeds its storage limit".into(),
@@ -563,9 +571,11 @@ pub fn validate_adapter_state(state: &Value) -> Result<(), AppError> {
     if let Some(object) = provider_state.as_object_mut()
         && object.remove(PROVIDER_ADAPTER_SECRET_PATCH_KEY).is_some()
     {
-        decode_provider_adapter_secret_patch(state)?.ok_or(AppError::internal("credential_validate_adapter_state_1"))?;
+        decode_provider_adapter_secret_patch(state)?
+            .ok_or(AppError::internal("credential_validate_adapter_state_1"))?;
     }
-    let encoded = serde_json::to_vec(&provider_state).map_err(|_| AppError::internal("credential_validate_adapter_state_1"))?;
+    let encoded = serde_json::to_vec(&provider_state)
+        .map_err(|_| AppError::internal("credential_validate_adapter_state_1"))?;
     if encoded.len() > MAX_ADAPTER_STATE_BYTES {
         return Err(AppError::BadRequest(
             "managed OAuth adapter state exceeds its size limit".into(),
@@ -620,25 +630,37 @@ fn apply_provider_adapter_secret_patch(
     mut config: Value,
     patch: &Value,
 ) -> Result<Value, AppError> {
-    let entries = patch.as_array().ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_1"))?;
+    let entries = patch.as_array().ok_or(AppError::internal(
+        "credential_apply_provider_adapter_secret_patch_1",
+    ))?;
     for entry in entries {
-        let entry = entry.as_object().ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_2"))?;
+        let entry = entry.as_object().ok_or(AppError::internal(
+            "credential_apply_provider_adapter_secret_patch_2",
+        ))?;
         if entry.len() != 2 {
-            return Err(AppError::internal("credential_apply_provider_adapter_secret_patch_3"));
+            return Err(AppError::internal(
+                "credential_apply_provider_adapter_secret_patch_3",
+            ));
         }
         let path = entry
             .get("path")
             .and_then(Value::as_array)
-            .ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_4"))?
+            .ok_or(AppError::internal(
+                "credential_apply_provider_adapter_secret_patch_4",
+            ))?
             .iter()
             .map(|segment| {
                 segment
                     .as_str()
                     .map(str::to_owned)
-                    .ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_5"))
+                    .ok_or(AppError::internal(
+                        "credential_apply_provider_adapter_secret_patch_5",
+                    ))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let value = entry.get("value").cloned().ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_6"))?;
+        let value = entry.get("value").cloned().ok_or(AppError::internal(
+            "credential_apply_provider_adapter_secret_patch_6",
+        ))?;
         if path.is_empty() {
             config = value;
             continue;
@@ -647,14 +669,23 @@ fn apply_provider_adapter_secret_patch(
         for segment in &path[..path.len() - 1] {
             target = target
                 .as_object_mut()
-                .ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_7"))?
+                .ok_or(AppError::internal(
+                    "credential_apply_provider_adapter_secret_patch_7",
+                ))?
                 .entry(segment.clone())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
         }
         target
             .as_object_mut()
-            .ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_8"))?
-            .insert(path.last().cloned().ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_9"))?, value);
+            .ok_or(AppError::internal(
+                "credential_apply_provider_adapter_secret_patch_8",
+            ))?
+            .insert(
+                path.last().cloned().ok_or(AppError::internal(
+                    "credential_apply_provider_adapter_secret_patch_9",
+                ))?,
+                value,
+            );
     }
     Ok(config)
 }
@@ -724,7 +755,8 @@ pub(crate) fn seal_private_json_with_nonce<T: Serialize>(
     aad: &[u8],
     nonce: [u8; 12],
 ) -> Result<String, AppError> {
-    let plaintext = serde_json::to_vec(value).map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_1"))?;
+    let plaintext = serde_json::to_vec(value)
+        .map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_1"))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&current_encryption_key(key_material)?)
         .map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_2"))?;
     let ciphertext = cipher
@@ -781,11 +813,14 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
     let nonce = URL_SAFE_NO_PAD
         .decode(nonce.ok_or(AppError::internal("credential_open_private_json_3"))?)
         .map_err(|_| AppError::internal("credential_open_private_json_1"))?;
-    let nonce: [u8; 12] = nonce.try_into().map_err(|_| AppError::internal("credential_open_private_json_2"))?;
+    let nonce: [u8; 12] = nonce
+        .try_into()
+        .map_err(|_| AppError::internal("credential_open_private_json_2"))?;
     let ciphertext = URL_SAFE_NO_PAD
         .decode(ciphertext.ok_or(AppError::internal("credential_open_private_json_4"))?)
         .map_err(|_| AppError::internal("credential_open_private_json_3"))?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| AppError::internal("credential_open_private_json_4"))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key)
+        .map_err(|_| AppError::internal("credential_open_private_json_4"))?;
     let plaintext = cipher
         .decrypt(
             (&nonce).into(),
@@ -795,7 +830,8 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
             },
         )
         .map_err(|_| AppError::internal("credential_open_private_json_5"))?;
-    serde_json::from_slice(&plaintext).map_err(|_| AppError::internal("credential_open_private_json_6"))
+    serde_json::from_slice(&plaintext)
+        .map_err(|_| AppError::internal("credential_open_private_json_6"))
 }
 
 pub(super) fn current_encryption_key(key_material: &[u8]) -> Result<[u8; 32], AppError> {

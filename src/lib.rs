@@ -12,7 +12,6 @@ mod early_request;
 pub mod error;
 pub mod filter_ast;
 mod gateway_body;
-mod simple_http;
 pub mod generation;
 mod group_routing;
 #[cfg(not(target_env = "msvc"))]
@@ -43,8 +42,6 @@ mod plugin_publication;
 ))]
 #[path = "plugin_publication_windows.rs"]
 mod plugin_publication;
-#[cfg(windows)]
-mod windows_dir;
 pub mod plugin_release;
 #[cfg(any(
     feature = "experimental-plugin-revisions",
@@ -60,8 +57,11 @@ pub mod schema;
 pub mod server;
 mod session_response;
 mod session_response_worker;
+mod simple_http;
 pub mod supplier_error;
 mod upstream_quota;
+#[cfg(windows)]
+mod windows_dir;
 pub mod worker;
 
 use std::{sync::Arc, time::Duration};
@@ -78,14 +78,14 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // matching the read timeout to the overall deadline does not make it unbounded.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
-pub(crate) use simple_http::{
-    build_codex_http_client_with_policy, build_codex_http_client_with_proxy,
-};
 #[cfg(test)]
 pub(crate) use simple_http::{
-    build_codex_http2_test_client, build_codex_http_client, codex_http_client_builder,
-    codex_http_client_builder_with_proxy, codex_http_protocol_test_builder,
-    CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+    CODEX_HTTP2_KEEP_ALIVE_INTERVAL, build_codex_http_client, build_codex_http2_test_client,
+    codex_http_client_builder, codex_http_client_builder_with_proxy,
+    codex_http_protocol_test_builder,
+};
+pub(crate) use simple_http::{
+    build_codex_http_client_with_policy, build_codex_http_client_with_proxy,
 };
 // Each streaming response archive owns a 5 MiB multipart buffer. Keep the
 // upstream/request concurrency independent, but bound simultaneous archive

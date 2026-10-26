@@ -139,7 +139,9 @@ impl Database {
         let applied_delta_micros = input
             .desired_rebate_micros
             .checked_sub(current_desired)
-            .ok_or(AppError::internal("settlement_adjustments_mod_reconcile_settlement_adjustment_1"))?;
+            .ok_or(AppError::internal(
+                "settlement_adjustments_mod_reconcile_settlement_adjustment_1",
+            ))?;
 
         // Net-cost funding semantics: generic funding (gross - original
         // entitlement funding) is rebated first. Only the excess is returned
@@ -147,7 +149,9 @@ impl Database {
         let non_entitlement_micros = baseline
             .gross_micros
             .checked_sub(baseline.original_entitlement_micros)
-            .ok_or(AppError::internal("settlement_adjustments_mod_reconcile_settlement_adjustment_2"))?;
+            .ok_or(AppError::internal(
+                "settlement_adjustments_mod_reconcile_settlement_adjustment_2",
+            ))?;
         let target_entitlement_rollback = cumulative_rebate_micros
             .checked_sub(non_entitlement_micros)
             .unwrap_or(0)

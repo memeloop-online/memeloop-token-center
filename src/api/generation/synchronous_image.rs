@@ -66,7 +66,8 @@ fn unretained_image_replay(request_id: Uuid) -> Response {
 pub(super) fn image_metadata_locator(metadata: Value) -> Result<String, AppError> {
     Ok(format!(
         "metadata-only-json:{}",
-        serde_json::to_string(&metadata).map_err(|_| AppError::internal("synchronous_image_image_metadata_locator_1"))?
+        serde_json::to_string(&metadata)
+            .map_err(|_| AppError::internal("synchronous_image_image_metadata_locator_1"))?
     ))
 }
 
@@ -92,14 +93,18 @@ pub(super) async fn image_idempotency_replay_response(
             let status = u16::try_from(response_status)
                 .ok()
                 .and_then(|status| StatusCode::from_u16(status).ok())
-                .ok_or(AppError::internal("synchronous_image_image_idempotency_replay_response_1"))?;
+                .ok_or(AppError::internal(
+                    "synchronous_image_image_idempotency_replay_response_1",
+                ))?;
             Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::CONTENT_LENGTH, response.len())
                 .header(REQUEST_ID_HEADER, request_id.to_string())
                 .body(Body::from(response))
-                .map_err(|_| AppError::internal("synchronous_image_image_idempotency_replay_response_1"))
+                .map_err(|_| {
+                    AppError::internal("synchronous_image_image_idempotency_replay_response_1")
+                })
         }
         SynchronousImageIdempotencyClaim::Failed {
             request_id,
@@ -111,7 +116,9 @@ pub(super) async fn image_idempotency_replay_response(
         SynchronousImageIdempotencyClaim::Uncertain { request_id } => {
             Ok(uncertain_image_response(request_id, None))
         }
-        SynchronousImageIdempotencyClaim::Claimed => Err(AppError::internal("synchronous_image_image_idempotency_replay_response_2")),
+        SynchronousImageIdempotencyClaim::Claimed => Err(AppError::internal(
+            "synchronous_image_image_idempotency_replay_response_2",
+        )),
     }
 }
 
@@ -188,9 +195,7 @@ impl SynchronousImageSendError {
     fn is_connect(&self) -> bool {
         match self {
             Self::Reqwest(error) => error.is_connect(),
-            Self::Codex(error) => {
-                crate::simple_http::classify_transport(error).pre_delivery()
-            }
+            Self::Codex(error) => crate::simple_http::classify_transport(error).pre_delivery(),
         }
     }
 
@@ -560,7 +565,11 @@ where
     loop {
         match tokio::time::timeout(heartbeat_interval, semaphore.acquire()).await {
             Ok(Ok(permit)) => return Ok(Some(permit)),
-            Ok(Err(_)) => return Err(AppError::internal("synchronous_image_acquire_image_permit_with_heartbeat_1")),
+            Ok(Err(_)) => {
+                return Err(AppError::internal(
+                    "synchronous_image_acquire_image_permit_with_heartbeat_1",
+                ));
+            }
             Err(_) if !heartbeat().await? => return Ok(None),
             Err(_) => {}
         }
@@ -625,14 +634,17 @@ async fn commit_synchronous_image_terminal(
         match result {
             Ok(result) => return Ok(result),
             Err(AppError::Internal { code, .. })
-                if code == "synchronous_image_commit_synchronous_image_terminal_1" && attempt < 2 =>
+                if code == "synchronous_image_commit_synchronous_image_terminal_1"
+                    && attempt < 2 =>
             {
                 tokio::time::sleep(Duration::from_millis(25 * (attempt + 1))).await;
             }
             Err(error) => return Err(error),
         }
     }
-    Err(AppError::internal("synchronous_image_commit_synchronous_image_terminal_2"))
+    Err(AppError::internal(
+        "synchronous_image_commit_synchronous_image_terminal_2",
+    ))
 }
 
 pub(super) async fn fail_image_request(
@@ -784,7 +796,9 @@ async fn finish_openai_image_response(
                 return fail_image_request(context, "upstream_image_invalid_payload").await;
             }
             Err(super::openai_image_response::OpenAiImageBuildError::Internal) => {
-                return Err(AppError::internal("synchronous_image_finish_openai_image_response_1"));
+                return Err(AppError::internal(
+                    "synchronous_image_finish_openai_image_response_1",
+                ));
             }
         };
     let response_object = if provider_assets.is_empty() {
@@ -843,7 +857,10 @@ pub(in crate::api) fn openai_image_urls(
         .and_then(Value::as_array)
         .ok_or_else(|| AppError::upstream("image_upstream_response_has_no_data_array"))?;
     if usize::try_from(expected_count).ok() != Some(data.len()) {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("synchronous_image_openai_image_urls")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("synchronous_image_openai_image_urls"),
+        ));
     }
     let mut urls = Vec::new();
     for item in data {
@@ -856,7 +873,10 @@ pub(in crate::api) fn openai_image_urls(
             (Some(url), None) => urls.push(url),
             (None, Some(encoded)) if is_valid_bounded_base64(encoded, MAX_IMAGE_RESPONSE) => {}
             _ => {
-                return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("synchronous_image_openai_image_urls")));
+                return Err(AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new().stage("synchronous_image_openai_image_urls"),
+                ));
             }
         }
     }
@@ -889,14 +909,18 @@ pub(in crate::api) fn sanitize_openai_image_response(
         let mut object = match item {
             Value::Object(object) => object,
             _ => {
-                return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("synchronous_image_sanitize_openai_image_response")));
+                return Err(AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new()
+                        .stage("synchronous_image_sanitize_openai_image_response"),
+                ));
             }
         };
         let mut sanitized = serde_json::Map::new();
         if object.get("url").and_then(Value::as_str).is_some() {
-            let asset = assets.next().ok_or_else(|| {
-                AppError::upstream("image_upstream_asset_metadata_is_incomplete")
-            })?;
+            let asset = assets
+                .next()
+                .ok_or_else(|| AppError::upstream("image_upstream_asset_metadata_is_incomplete"))?;
             sanitized.insert(
                 "url".to_owned(),
                 Value::String(format!(
@@ -917,7 +941,11 @@ pub(in crate::api) fn sanitize_openai_image_response(
         } else if let Some(Value::String(encoded)) = object.remove("b64_json") {
             sanitized.insert("b64_json".to_owned(), Value::String(encoded));
         } else {
-            return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("synchronous_image_sanitize_openai_image_response")));
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new()
+                    .stage("synchronous_image_sanitize_openai_image_response"),
+            ));
         }
         if let Some(Value::String(revised_prompt)) =
             object.remove("revised_prompt").filter(|prompt| {
@@ -931,7 +959,11 @@ pub(in crate::api) fn sanitize_openai_image_response(
         sanitized_data.push(Value::Object(sanitized));
     }
     if assets.next().is_some() {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("synchronous_image_sanitize_openai_image_response")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new()
+                .stage("synchronous_image_sanitize_openai_image_response"),
+        ));
     }
     let mut response = serde_json::Map::new();
     response.insert("created".to_owned(), json!(created));
@@ -1110,7 +1142,9 @@ fn build_responses_tool_image_segments(
     suffix.extend_from_slice(b"\"}]");
     if let Some(usage) = parsed.usage {
         suffix.extend_from_slice(b",\"usage\":");
-        serde_json::to_writer(&mut suffix, &usage).map_err(|_| AppError::internal("synchronous_image_build_responses_tool_image_segments_1"))?;
+        serde_json::to_writer(&mut suffix, &usage).map_err(|_| {
+            AppError::internal("synchronous_image_build_responses_tool_image_segments_1")
+        })?;
     }
     suffix.push(b'}');
     let suffix = Bytes::from(suffix);
@@ -1118,9 +1152,15 @@ fn build_responses_tool_image_segments(
         .len()
         .checked_add(image.len())
         .and_then(|length| length.checked_add(suffix.len()))
-        .ok_or(AppError::internal("synchronous_image_build_responses_tool_image_segments_1"))?;
+        .ok_or(AppError::internal(
+            "synchronous_image_build_responses_tool_image_segments_1",
+        ))?;
     if response_len > MAX_IMAGE_RESPONSE {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("synchronous_image_build_responses_tool_image_segments")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new()
+                .stage("synchronous_image_build_responses_tool_image_segments"),
+        ));
     }
     Ok(([prefix, image, suffix], response_len))
 }
@@ -1159,7 +1199,10 @@ pub(in crate::api) fn extract_responses_tool_image(
     let mut images = Vec::with_capacity(1);
     take_image_results(&mut response, &mut images);
     if !has_one_valid_bounded_image(&images) {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("synchronous_image_extract_responses_tool_image")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("synchronous_image_extract_responses_tool_image"),
+        ));
     }
     Ok((images.pop().expect("one image was validated"), usage))
 }

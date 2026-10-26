@@ -117,7 +117,10 @@ where
     let permit = match tokio::time::timeout(capacity_timeout, permits.acquire_owned()).await {
         Err(_) => {
             observation.outcome = Outcome::CapacityTimeout;
-            return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("plugin_execution_run_with_limits")));
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("plugin_execution_run_with_limits"),
+            ));
         }
         Ok(Err(_)) => {
             observation.outcome = Outcome::CapacityClosed;

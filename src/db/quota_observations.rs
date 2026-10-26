@@ -82,7 +82,9 @@ impl Database {
                     OR (p.recovery_priority=0 AND p.recovery_mark>COALESCE(q.last_attempt_at,0)))
             ORDER BY p.recovery_priority,COALESCE(q.last_attempt_at,0),a.id LIMIT $3");
         sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(serde_json::to_string(plugins).map_err(|_| AppError::internal("quota_observations_quota_observation_targets_1"))?)
+            .bind(serde_json::to_string(plugins).map_err(|_| {
+                AppError::internal("quota_observations_quota_observation_targets_1")
+            })?)
             .bind(now)
             .bind(limit.clamp(1, 16))
             .fetch_all(&self.pool)
@@ -90,10 +92,12 @@ impl Database {
             .into_iter()
             .map(|row| {
                 Ok(QuotaObservationTarget {
-                    account_id: Uuid::parse_str(&row.try_get::<String, _>("id")?)
-                        .map_err(|_| AppError::internal("quota_observations_quota_observation_targets_2"))?,
-                    tenant_id: Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?)
-                        .map_err(|_| AppError::internal("quota_observations_quota_observation_targets_3"))?,
+                    account_id: Uuid::parse_str(&row.try_get::<String, _>("id")?).map_err(
+                        |_| AppError::internal("quota_observations_quota_observation_targets_2"),
+                    )?,
+                    tenant_id: Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?).map_err(
+                        |_| AppError::internal("quota_observations_quota_observation_targets_3"),
+                    )?,
                     tenant_external_id: row.try_get("external_id")?,
                     generation: row.try_get("credential_generation")?,
                     config_revision: row.try_get("updated_at")?,
@@ -215,8 +219,9 @@ impl Database {
                     "quota_observation_payload_limit".into(),
                 ));
             }
-            let value: RoutingQuotaObservation =
-                serde_json::from_str(&json).map_err(|_| AppError::internal("quota_observations_routing_quota_observations_1"))?;
+            let value: RoutingQuotaObservation = serde_json::from_str(&json).map_err(|_| {
+                AppError::internal("quota_observations_routing_quota_observations_1")
+            })?;
             if value.observed_at >= 0
                 && value.observed_at <= now
                 && value.valid_until > now

@@ -218,7 +218,9 @@ impl Database {
                         lease_owner,
                         ready_ciphertext: row
                             .try_get::<Option<String>, _>("ready_ciphertext")?
-                            .ok_or(AppError::internal("oauth_sessions_claim_oauth_login_poll_impl_1"))?,
+                            .ok_or(AppError::internal(
+                                "oauth_sessions_claim_oauth_login_poll_impl_1",
+                            ))?,
                     })
                 } else {
                     Ok(OAuthLoginClaim::Pending {

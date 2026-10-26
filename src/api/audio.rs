@@ -128,7 +128,10 @@ pub(super) async fn create_audio_transcription(
             .any(|value| value == AUDIO_PROTOCOL)
         || !provider.modalities.iter().any(|value| value == "audio")
     {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("audio_create_audio_transcription")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("audio_create_audio_transcription"),
+        ));
     }
     let generation_price = state
         .db
@@ -324,7 +327,10 @@ pub(super) async fn create_audio_transcription(
                     "audio_upstream_rejected",
                 )
                 .await?;
-                return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("audio_upstream")));
+                return Err(AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new().stage("audio_upstream"),
+                ));
             }
             let upstream_body = match read_audio_response_bounded(upstream, deadline).await {
                 Ok(body) => body,
@@ -340,7 +346,10 @@ pub(super) async fn create_audio_transcription(
                         error.code(),
                     )
                     .await?;
-                    return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("audio_upstream")));
+                    return Err(AppError::upstream_with(
+                        "upstream_unavailable",
+                        crate::error::ErrorFacts::new().stage("audio_upstream"),
+                    ));
                 }
             };
             let normalized = match normalize_audio_response(
@@ -392,7 +401,8 @@ pub(super) async fn create_audio_transcription(
             attempt
                 .complete_committed(MediaAttemptTerminal::Succeeded)
                 .await;
-            let body = serde_json::to_vec(&normalized).map_err(|_| AppError::internal("audio_site_1"))?;
+            let body =
+                serde_json::to_vec(&normalized).map_err(|_| AppError::internal("audio_site_1"))?;
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "application/json")
@@ -695,7 +705,8 @@ fn upstream_form(
     if let Some(hotwords) = metadata.hotwords.as_ref() {
         form = form.text(
             "hotwords",
-            serde_json::to_string(hotwords).map_err(|_| AppError::internal("audio_upstream_form_2"))?,
+            serde_json::to_string(hotwords)
+                .map_err(|_| AppError::internal("audio_upstream_form_2"))?,
         );
     }
     if let Some(temperature) = metadata.temperature {
@@ -796,9 +807,9 @@ fn normalize_audio_response(
     verbose.insert("text".to_owned(), Value::String(text.to_owned()));
     for field in ["task", "language"] {
         if let Some(value) = object.get(field) {
-            let value = value.as_str().ok_or_else(|| {
-                AppError::upstream("audio_upstream_must_be_a_string")
-            })?;
+            let value = value
+                .as_str()
+                .ok_or_else(|| AppError::upstream("audio_upstream_must_be_a_string"))?;
             verbose.insert(field.to_owned(), Value::String(value.to_owned()));
         }
     }
@@ -813,7 +824,10 @@ fn normalize_audio_response(
             .as_array()
             .ok_or_else(|| AppError::upstream("audio_upstream_segments_must_be_an_array"))?;
         if upstream_segments.len() > 100_000 {
-            return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("audio_normalize_audio_response")));
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("audio_normalize_audio_response"),
+            ));
         }
         for segment in upstream_segments {
             let start = finite_non_negative(segment.get("start"), "start")?;
@@ -823,17 +837,21 @@ fn normalize_audio_response(
                 .and_then(Value::as_str)
                 .ok_or_else(|| AppError::upstream("audio_segment_text_is_missing"))?;
             if end < start {
-                return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("audio_normalize_audio_response")));
+                return Err(AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new().stage("audio_normalize_audio_response"),
+                ));
             }
-            let segment = segment.as_object().ok_or_else(|| {
-                AppError::upstream("audio_upstream_segment_must_be_an_object")
-            })?;
+            let segment = segment
+                .as_object()
+                .ok_or_else(|| AppError::upstream("audio_upstream_segment_must_be_an_object"))?;
             let mut normalized = serde_json::Map::new();
             for field in ["id", "seek"] {
                 if let Some(value) = segment.get(field) {
-                    value.as_i64().filter(|value| *value >= 0).ok_or_else(|| {
-                        AppError::upstream("audio_segment_is_invalid")
-                    })?;
+                    value
+                        .as_i64()
+                        .filter(|value| *value >= 0)
+                        .ok_or_else(|| AppError::upstream("audio_segment_is_invalid"))?;
                     normalized.insert(field.to_owned(), value.clone());
                 }
             }
@@ -849,7 +867,10 @@ fn normalize_audio_response(
                     .iter()
                     .any(|token| token.as_i64().filter(|value| *value >= 0).is_none())
                 {
-                    return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("audio_normalize_audio_response")));
+                    return Err(AppError::upstream_with(
+                        "upstream_unavailable",
+                        crate::error::ErrorFacts::new().stage("audio_normalize_audio_response"),
+                    ));
                 }
                 normalized.insert("tokens".to_owned(), Value::Array(tokens.clone()));
             }
@@ -863,9 +884,7 @@ fn normalize_audio_response(
                     value
                         .as_f64()
                         .filter(|value| value.is_finite())
-                        .ok_or_else(|| {
-                            AppError::upstream("audio_segment_is_invalid")
-                        })?;
+                        .ok_or_else(|| AppError::upstream("audio_segment_is_invalid"))?;
                     normalized.insert(field.to_owned(), value.clone());
                 }
             }
@@ -890,7 +909,10 @@ fn normalize_audio_response(
             let start = finite_non_negative(word.get("start"), "word start")?;
             let end = finite_non_negative(word.get("end"), "word end")?;
             if end < start {
-                return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("audio_normalize_audio_response")));
+                return Err(AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new().stage("audio_normalize_audio_response"),
+                ));
             }
             normalized_words.push(json!({"word": text, "start": start, "end": end}));
         }
@@ -909,7 +931,8 @@ fn finite_non_negative(value: Option<&Value>, _field: &str) -> Result<f64, AppEr
 fn metadata_only_locator(metadata: Value) -> Result<String, AppError> {
     Ok(format!(
         "metadata-only-json:{}",
-        serde_json::to_string(&metadata).map_err(|_| AppError::internal("audio_metadata_only_locator_1"))?
+        serde_json::to_string(&metadata)
+            .map_err(|_| AppError::internal("audio_metadata_only_locator_1"))?
     ))
 }
 

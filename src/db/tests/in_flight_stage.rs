@@ -105,14 +105,21 @@ async fn assert_in_flight_stage_contract(database_url: &str) {
             .unwrap();
         assert_eq!(detail.view.status_code, None, "{stage}");
         assert_eq!(detail.view.error_code, None, "{stage}");
-        assert_eq!(detail.view.in_flight_stage.as_deref(), Some(stage), "{stage}");
+        assert_eq!(
+            detail.view.in_flight_stage.as_deref(),
+            Some(stage),
+            "{stage}"
+        );
         let error_code: Option<String> =
             sqlx::query_scalar("SELECT error_code FROM request_records WHERE id = $1")
                 .bind(request_id.to_string())
                 .fetch_one(&database.pool)
                 .await
                 .unwrap();
-        assert_eq!(error_code, None, "{stage} must not become a settlement marker");
+        assert_eq!(
+            error_code, None,
+            "{stage} must not become a settlement marker"
+        );
     }
     assert!(
         database

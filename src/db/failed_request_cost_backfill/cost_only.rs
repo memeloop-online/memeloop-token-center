@@ -25,7 +25,9 @@ pub(super) async fn subtract_costs(
             .ok_or(AppError::internal("cost_only_subtract_costs_1"))?;
         for dimension in dimensions(candidate) {
             let total = deltas.entry(dimension).or_default();
-            *total = total.checked_add(delta).ok_or(AppError::internal("cost_only_subtract_costs_2"))?;
+            *total = total
+                .checked_add(delta)
+                .ok_or(AppError::internal("cost_only_subtract_costs_2"))?;
         }
     }
     for ((table_index, terms), delta) in deltas {
@@ -49,7 +51,11 @@ pub(super) async fn subtract_costs(
         let mut query = sqlx::query(sqlx::AssertSqlSafe(statement)).bind(delta);
         for (column, value) in &terms {
             query = if column.ends_with("_bucket") {
-                query.bind(value.parse::<i64>().map_err(|_| AppError::internal("cost_only_subtract_costs_1"))?)
+                query.bind(
+                    value
+                        .parse::<i64>()
+                        .map_err(|_| AppError::internal("cost_only_subtract_costs_1"))?,
+                )
             } else {
                 query.bind(value)
             };

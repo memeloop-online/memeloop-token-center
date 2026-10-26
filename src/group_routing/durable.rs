@@ -112,8 +112,8 @@ pub(crate) async fn restore_selected(
     {
         return Err(AppError::internal("durable_restore_selected_1"));
     }
-    let stored: DurablePlan =
-        serde_json::from_value(value.clone()).map_err(|_| AppError::internal("durable_restore_selected_2"))?;
+    let stored: DurablePlan = serde_json::from_value(value.clone())
+        .map_err(|_| AppError::internal("durable_restore_selected_2"))?;
     if stored.version != 1
         || stored.tenant_id != tenant_id
         || stored.policies.len() > 1024
@@ -169,9 +169,10 @@ pub(crate) async fn restore_selected(
                 candidates: vec![policy.directive.clone()],
             },
         )?;
-        let route = Uuid::parse_str(&policy.candidate.route_id).map_err(|_| AppError::internal("durable_restore_selected_3"))?;
-        let account =
-            Uuid::parse_str(&policy.candidate.account_id).map_err(|_| AppError::internal("durable_restore_selected_4"))?;
+        let route = Uuid::parse_str(&policy.candidate.route_id)
+            .map_err(|_| AppError::internal("durable_restore_selected_3"))?;
+        let account = Uuid::parse_str(&policy.candidate.account_id)
+            .map_err(|_| AppError::internal("durable_restore_selected_4"))?;
         if model_route_id != Some(route) || account != upstream_account_id {
             continue;
         }
@@ -183,8 +184,8 @@ pub(crate) async fn restore_selected(
             tracing::warn!(%job_id, stage = "media_group_routing_revision_unavailable", "pinned strategy unavailable; native health policy retained without running replacement code");
             continue;
         }
-        let generation =
-            i64::try_from(policy.candidate.generation).map_err(|_| AppError::internal("durable_restore_selected_5"))?;
+        let generation = i64::try_from(policy.candidate.generation)
+            .map_err(|_| AppError::internal("durable_restore_selected_5"))?;
         if policies
             .insert((route, account, generation), policy)
             .is_some()

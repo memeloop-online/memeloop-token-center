@@ -472,7 +472,11 @@ mod tests {
             super::ProbeDisposition::Skip(_)
         ));
         assert!(matches!(
-            classify_probe_error(&AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("health_admission_gaps_are_not_stored_as_upstream_failures"))),
+            classify_probe_error(&AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new()
+                    .stage("health_admission_gaps_are_not_stored_as_upstream_failures")
+            )),
             super::ProbeDisposition::Store("upstream_unavailable")
         ));
     }

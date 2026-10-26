@@ -190,7 +190,10 @@ fn validate_wire_shim_output(
     set_headers: &[(String, String)],
 ) -> Result<(), AppError> {
     if request_json.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES || !set_headers.is_empty() {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("plugin_validate_wire_shim_output")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_wire_shim_output"),
+        ));
     }
     Ok(())
 }
@@ -717,7 +720,10 @@ impl PluginRuntime {
             .wire_shim_component
             .as_ref()
             .ok_or(AppError::internal("plugin_finalize_wire_shim_1"))?;
-        let engine = self.engine.as_ref().ok_or(AppError::internal("plugin_finalize_wire_shim_2"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("plugin_finalize_wire_shim_2"))?;
         let limits = StoreLimitsBuilder::new()
             .memory_size(WIRE_SHIM_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
@@ -730,8 +736,16 @@ impl PluginRuntime {
             HostState {
                 plugin_id: plugin.manifest.id.clone(),
                 capabilities: plugin.manifest.capabilities.clone(),
-                http: self.http.as_ref().ok_or(AppError::internal("plugin_finalize_wire_shim_3"))?.clone(),
-                runtime: self.runtime.as_ref().ok_or(AppError::internal("plugin_finalize_wire_shim_4"))?.clone(),
+                http: self
+                    .http
+                    .as_ref()
+                    .ok_or(AppError::internal("plugin_finalize_wire_shim_3"))?
+                    .clone(),
+                runtime: self
+                    .runtime
+                    .as_ref()
+                    .ok_or(AppError::internal("plugin_finalize_wire_shim_4"))?
+                    .clone(),
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
@@ -758,8 +772,8 @@ impl PluginRuntime {
                     .map(|value| value.default.clone())
             })
             .unwrap_or_else(empty_json_object);
-        context.config_json =
-            serde_json::to_string(&configuration).map_err(|_| AppError::internal("plugin_finalize_wire_shim_1"))?;
+        context.config_json = serde_json::to_string(&configuration)
+            .map_err(|_| AppError::internal("plugin_finalize_wire_shim_1"))?;
         let context = wire_shim_component::memeloop::token_center0_3_0::types::RequestContext {
             tenant_id: context.tenant_id,
             principal_id: context.principal_id,
@@ -942,7 +956,9 @@ impl PluginRuntime {
                 None
             };
             let wire_shim_component = if manifest.contributions.wire_shim.is_some() {
-                let component = component.as_ref().ok_or(AppError::internal("plugin_site_1"))?;
+                let component = component
+                    .as_ref()
+                    .ok_or(AppError::internal("plugin_site_1"))?;
                 let mut linker = Linker::<HostState>::new(&engine);
                 register_wire_shim_host_imports(&mut linker)
                     .map_err(|_| plugin_runtime_failure("wire_shim_linker_configuration"))?;
@@ -1136,7 +1152,13 @@ impl PluginRuntime {
         if self.plugins.is_empty() {
             return Ok(());
         }
-        let database = &self.kv.as_ref().ok_or(AppError::internal("plugin_validate_stored_configurations_1"))?.database;
+        let database = &self
+            .kv
+            .as_ref()
+            .ok_or(AppError::internal(
+                "plugin_validate_stored_configurations_1",
+            ))?
+            .database;
         database
             .visit_plugin_configurations(|stored| {
                 let Some(plugin) = self
@@ -1162,7 +1184,9 @@ impl PluginRuntime {
                 plugin
                     .configuration_validator
                     .as_ref()
-                    .ok_or(AppError::internal("plugin_validate_stored_configurations_2"))?
+                    .ok_or(AppError::internal(
+                        "plugin_validate_stored_configurations_2",
+                    ))?
                     .validate(&stored.value)
             })
             .await
@@ -1206,8 +1230,12 @@ impl PluginRuntime {
                 ..TrafficDecision::default()
             });
         };
-        let http = self.http.as_ref().ok_or(AppError::internal("plugin_apply_traffic_with_config_and_memory_1"))?;
-        let runtime = self.runtime.as_ref().ok_or(AppError::internal("plugin_apply_traffic_with_config_and_memory_2"))?;
+        let http = self.http.as_ref().ok_or(AppError::internal(
+            "plugin_apply_traffic_with_config_and_memory_1",
+        ))?;
+        let runtime = self.runtime.as_ref().ok_or(AppError::internal(
+            "plugin_apply_traffic_with_config_and_memory_2",
+        ))?;
         let mut input_sizes = TrafficInputSizes::new(&self.plugins, configurations)?;
         let mut current = request_json.clone();
         let mut decision = TrafficDecision {
@@ -1221,10 +1249,12 @@ impl PluginRuntime {
             let (mut plugin_context, model_changed) =
                 decision.project_context(&context, &mut current);
             input_sizes.validate(index, &plugin_context, &current, model_changed)?;
-            let request = serde_json::to_string(&current).map_err(|_| AppError::internal("plugin_apply_traffic_with_config_and_memory_1"))?;
+            let request = serde_json::to_string(&current)
+                .map_err(|_| AppError::internal("plugin_apply_traffic_with_config_and_memory_1"))?;
             plugin_context.config_json =
-                serde_json::to_string(traffic_configuration(plugin, configurations))
-                    .map_err(|_| AppError::internal("plugin_apply_traffic_with_config_and_memory_2"))?;
+                serde_json::to_string(traffic_configuration(plugin, configurations)).map_err(
+                    |_| AppError::internal("plugin_apply_traffic_with_config_and_memory_2"),
+                )?;
             let component = plugin.component.as_ref().ok_or_else(|| {
                 AppError::storage("plugin_contributes_a_traffic_policy_without_a_component")
             })?;
@@ -1371,9 +1401,18 @@ impl PluginRuntime {
         let Some(component) = plugin.component.as_ref() else {
             return Ok(None);
         };
-        let engine = self.engine.as_ref().ok_or(AppError::internal("plugin_list_provider_models_1"))?;
-        let http = self.http.as_ref().ok_or(AppError::internal("plugin_list_provider_models_2"))?;
-        let runtime = self.runtime.as_ref().ok_or(AppError::internal("plugin_list_provider_models_3"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("plugin_list_provider_models_1"))?;
+        let http = self
+            .http
+            .as_ref()
+            .ok_or(AppError::internal("plugin_list_provider_models_2"))?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(AppError::internal("plugin_list_provider_models_3"))?;
         let limits = StoreLimitsBuilder::new()
             .memory_size(PLUGIN_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
@@ -1405,17 +1444,19 @@ impl PluginRuntime {
             .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
         let bindings = Plugin::instantiate(&mut store, component, &linker)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?;
-        let config_json = serde_json::to_string(config).map_err(|_| AppError::internal("plugin_list_provider_models_1"))?;
+        let config_json = serde_json::to_string(config)
+            .map_err(|_| AppError::internal("plugin_list_provider_models_1"))?;
         let models_json = bindings
             .memeloop_token_center_upstream_provider()
             .call_list_models(&mut store, &config_json)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
             .map_err(|error| plugin_reported_error(&plugin.manifest.id, "list-models", &error))?;
-        let models: Value = serde_json::from_str(&models_json).map_err(|_| {
-            AppError::upstream("plugin_returned_invalid_models_json")
-        })?;
+        let models: Value = serde_json::from_str(&models_json)
+            .map_err(|_| AppError::upstream("plugin_returned_invalid_models_json"))?;
         if !models.is_array() {
-            return Err(AppError::upstream("plugin_models_response_must_be_a_json_array"));
+            return Err(AppError::upstream(
+                "plugin_models_response_must_be_a_json_array",
+            ));
         }
         Ok(Some(models))
     }
@@ -1433,13 +1474,19 @@ impl PluginRuntime {
         let Some((plugin, provider)) = self.component_provider(provider_id)? else {
             return Ok(None);
         };
-        let component = plugin.component.as_ref().ok_or_else(|| {
-            AppError::storage("plugin_component_provider_is_unavailable")
-        })?;
-        let engine = self.engine.as_ref().ok_or(AppError::internal("plugin_prepare_provider_request_1"))?;
+        let component = plugin
+            .component
+            .as_ref()
+            .ok_or_else(|| AppError::storage("plugin_component_provider_is_unavailable"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("plugin_prepare_provider_request_1"))?;
         let (mut store, bindings) = self.instantiate(plugin, component, engine)?;
-        let config_json = serde_json::to_string(config).map_err(|_| AppError::internal("plugin_prepare_provider_request_1"))?;
-        let request_json = serde_json::to_string(request).map_err(|_| AppError::internal("plugin_prepare_provider_request_2"))?;
+        let config_json = serde_json::to_string(config)
+            .map_err(|_| AppError::internal("plugin_prepare_provider_request_1"))?;
+        let request_json = serde_json::to_string(request)
+            .map_err(|_| AppError::internal("plugin_prepare_provider_request_2"))?;
         if config_json.len().saturating_add(request_json.len()) > MAX_COMPONENT_PROVIDER_BODY {
             return Err(AppError::upstream_with(
                 "plugin_prepared_request_exceeds_the_4_mib_abi_limit",
@@ -1462,18 +1509,19 @@ impl PluginRuntime {
                     .limit(encoded_body_limit(MAX_COMPONENT_PROVIDER_BODY) as u64),
             ));
         }
-        let envelope: PreparedProviderEnvelope = serde_json::from_str(&result).map_err(|_| {
-            AppError::upstream("plugin_returned_an_invalid_prepared_request")
-        })?;
+        let envelope: PreparedProviderEnvelope = serde_json::from_str(&result)
+            .map_err(|_| AppError::upstream("plugin_returned_an_invalid_prepared_request"))?;
         if envelope.streaming {
-            return Err(AppError::upstream("plugin_requested_unsupported_streaming_transport"));
+            return Err(AppError::upstream(
+                "plugin_requested_unsupported_streaming_transport",
+            ));
         }
         let method = validate_provider_method(&envelope.method)?;
         validate_provider_path(&envelope.path)?;
         validate_provider_headers(&envelope.headers, true)?;
-        let body = STANDARD.decode(envelope.body_base64).map_err(|_| {
-            AppError::upstream("plugin_returned_invalid_request_body_encoding")
-        })?;
+        let body = STANDARD
+            .decode(envelope.body_base64)
+            .map_err(|_| AppError::upstream("plugin_returned_invalid_request_body_encoding"))?;
         if body.len() > MAX_COMPONENT_PROVIDER_BODY {
             return Err(AppError::upstream_with(
                 "plugin_prepared_request_body_exceeds_4_mib",
@@ -1516,11 +1564,7 @@ impl PluginRuntime {
                 "plugin_upstream_response_exceeds_its_declared_limit",
                 crate::error::ErrorFacts::new()
                     .bytes(upstream_body.len() as u64)
-                    .limit(
-                        adapter
-                            .max_response_bytes
-                            .min(MAX_COMPONENT_PROVIDER_BODY) as u64,
-                    ),
+                    .limit(adapter.max_response_bytes.min(MAX_COMPONENT_PROVIDER_BODY) as u64),
             ));
         }
         validate_provider_headers(upstream_headers, false)?;
@@ -1538,10 +1582,14 @@ impl PluginRuntime {
                     .limit(encoded_body_limit(adapter.max_response_bytes) as u64),
             ));
         }
-        let component = plugin.component.as_ref().ok_or_else(|| {
-            AppError::storage("plugin_component_provider_is_unavailable")
-        })?;
-        let engine = self.engine.as_ref().ok_or(AppError::internal("plugin_normalize_provider_response_2"))?;
+        let component = plugin
+            .component
+            .as_ref()
+            .ok_or_else(|| AppError::storage("plugin_component_provider_is_unavailable"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("plugin_normalize_provider_response_2"))?;
         let (mut store, bindings) = self.instantiate(plugin, component, engine)?;
         let result = bindings
             .memeloop_token_center_upstream_provider()
@@ -1556,9 +1604,8 @@ impl PluginRuntime {
                     .limit(encoded_body_limit(adapter.max_response_bytes) as u64),
             ));
         }
-        let envelope: NormalizedProviderEnvelope = serde_json::from_str(&result).map_err(|_| {
-            AppError::upstream("plugin_returned_an_invalid_normalized_response")
-        })?;
+        let envelope: NormalizedProviderEnvelope = serde_json::from_str(&result)
+            .map_err(|_| AppError::upstream("plugin_returned_an_invalid_normalized_response"))?;
         if !(200..=599).contains(&envelope.status) {
             return Err(AppError::upstream_status(
                 "plugin_returned_an_invalid_downstream_status",
@@ -1566,19 +1613,15 @@ impl PluginRuntime {
             ));
         }
         validate_provider_headers(&envelope.headers, false)?;
-        let body = STANDARD.decode(envelope.body_base64).map_err(|_| {
-            AppError::upstream("plugin_returned_invalid_normalized_body_encoding")
-        })?;
+        let body = STANDARD
+            .decode(envelope.body_base64)
+            .map_err(|_| AppError::upstream("plugin_returned_invalid_normalized_body_encoding"))?;
         if body.len() > adapter.max_response_bytes || body.len() > MAX_COMPONENT_PROVIDER_BODY {
             return Err(AppError::upstream_with(
                 "plugin_normalized_response_body_exceeds_its_declared_limit",
                 crate::error::ErrorFacts::new()
                     .bytes(body.len() as u64)
-                    .limit(
-                        adapter
-                            .max_response_bytes
-                            .min(MAX_COMPONENT_PROVIDER_BODY) as u64,
-                    ),
+                    .limit(adapter.max_response_bytes.min(MAX_COMPONENT_PROVIDER_BODY) as u64),
             ));
         }
         Ok(Some(NormalizedProviderResponse {
@@ -1616,7 +1659,9 @@ impl PluginRuntime {
             return Ok(None);
         }
         if plugin.component.is_none() {
-            return Err(AppError::storage("plugin_declared_a_component_provider_without_a_component"));
+            return Err(AppError::storage(
+                "plugin_declared_a_component_provider_without_a_component",
+            ));
         }
         Ok(Some((plugin, provider)))
     }
@@ -1627,8 +1672,14 @@ impl PluginRuntime {
         component: &Component,
         engine: &Engine,
     ) -> Result<(Store<HostState>, Plugin), AppError> {
-        let http = self.http.as_ref().ok_or(AppError::internal("plugin_instantiate_1"))?;
-        let runtime = self.runtime.as_ref().ok_or(AppError::internal("plugin_instantiate_2"))?;
+        let http = self
+            .http
+            .as_ref()
+            .ok_or(AppError::internal("plugin_instantiate_1"))?;
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(AppError::internal("plugin_instantiate_2"))?;
         let limits = StoreLimitsBuilder::new()
             .memory_size(PLUGIN_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
@@ -1695,7 +1746,10 @@ fn validate_provider_method(value: &str) -> Result<reqwest::Method, AppError> {
             | reqwest::Method::PATCH
             | reqwest::Method::DELETE
     ) {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("plugin_validate_provider_method")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_provider_method"),
+        ));
     }
     Ok(method)
 }
@@ -1708,7 +1762,10 @@ fn validate_provider_path(value: &str) -> Result<(), AppError> {
         || value.contains('#')
         || value.chars().any(char::is_control)
     {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("plugin_validate_provider_path")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_provider_path"),
+        ));
     }
     Ok(())
 }
@@ -1718,7 +1775,10 @@ fn validate_provider_headers(
     reject_credentials: bool,
 ) -> Result<(), AppError> {
     if headers.len() > 64 {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers"),
+        ));
     }
     let mut total = 0_usize;
     for (name, value) in headers {
@@ -1743,11 +1803,17 @@ fn validate_provider_headers(
                 "authorization" | "cookie" | "x-api-key" | "host" | "content-length"
             ));
         if forbidden {
-            return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers")));
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers"),
+            ));
         }
     }
     if total > 16 * 1024 {
-        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers")));
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("plugin_validate_provider_headers"),
+        ));
     }
     Ok(())
 }
@@ -2492,7 +2558,9 @@ fn validate_service_data_contributions(manifest: &PluginManifest) -> Result<(), 
                     || !safe_plugin_token(&adapter.normalizer, 64)
                     || !adapter.config.is_object()
                     || serde_json::to_vec(&adapter.config)
-                        .map_err(|_| AppError::internal("plugin_validate_service_data_contributions_1"))?
+                        .map_err(|_| {
+                            AppError::internal("plugin_validate_service_data_contributions_1")
+                        })?
                         .len()
                         > MAX_PLUGIN_SERVICE_DATA_BODY_BYTES
                 {
@@ -2687,7 +2755,8 @@ fn safe_plugin_label(value: &str) -> bool {
 
 pub fn plugin_configuration_schema_digest(schema: &Value) -> Result<String, AppError> {
     let canonical = canonical_json(schema);
-    let bytes = serde_json::to_vec(&canonical).map_err(|_| AppError::internal("plugin_plugin_configuration_schema_digest_1"))?;
+    let bytes = serde_json::to_vec(&canonical)
+        .map_err(|_| AppError::internal("plugin_plugin_configuration_schema_digest_1"))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -2705,7 +2774,8 @@ pub fn plugin_configuration_request_hash(
         "schema_digest": schema_digest,
         "value": canonical_json(value)
     });
-    let bytes = serde_json::to_vec(&payload).map_err(|_| AppError::internal("plugin_plugin_configuration_request_hash_1"))?;
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|_| AppError::internal("plugin_plugin_configuration_request_hash_1"))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -3205,7 +3275,10 @@ fn plugin_runtime_failure(code: &'static str) -> AppError {
     // The fixed low-cardinality code is safe for logs and metrics. Never retain
     // the underlying fs/Wasmtime/HTTP error: those strings may include mount
     // paths, URLs, configuration fragments, or guest-controlled custom text.
-    AppError::storage_with("plugin_runtime_failed", crate::error::ErrorFacts::new().stage(code))
+    AppError::storage_with(
+        "plugin_runtime_failed",
+        crate::error::ErrorFacts::new().stage(code),
+    )
 }
 
 fn plugin_reported_error(_plugin_id: &str, _operation: &str, error: &str) -> AppError {

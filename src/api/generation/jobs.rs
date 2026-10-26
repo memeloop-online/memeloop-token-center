@@ -60,7 +60,9 @@ pub(in crate::api) async fn create_generation_for_modality(
             .get(&route.driver)
             .is_some_and(|provider| provider.modalities.iter().any(|value| value == modality));
         if !adapter.supports_modality(modality) || !provider_supports_modality {
-            return Err(AppError::upstream("generation_route_for_does_not_support_generation"));
+            return Err(AppError::upstream(
+                "generation_route_for_does_not_support_generation",
+            ));
         }
     }
     adapter.normalize_input(&mut body.input)?;

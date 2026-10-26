@@ -24,7 +24,10 @@ pub(super) async fn finish_dispatch_failure(
     let mut response = finish_local_buffered_error_with_upstream_attribution(
         request,
         status,
-        Bytes::from(serde_json::to_vec(&body).map_err(|_| AppError::internal("lifecycle_finish_dispatch_failure_1"))?),
+        Bytes::from(
+            serde_json::to_vec(&body)
+                .map_err(|_| AppError::internal("lifecycle_finish_dispatch_failure_1"))?,
+        ),
         "application/json",
         (
             TokenUsage::default(),
@@ -56,7 +59,10 @@ pub(super) async fn finish_unavailable(
             crate::error::ErrorFacts::new(),
         )),
         "application/json",
-        (TokenUsage::default(), crate::model::RequestUsageBasis::NotObserved),
+        (
+            TokenUsage::default(),
+            crate::model::RequestUsageBasis::NotObserved,
+        ),
         Some(error_code.to_owned()),
         ProxyRequestUpstreamAttribution::LastDispatched(last_dispatched_upstream),
     )

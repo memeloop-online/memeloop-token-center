@@ -1768,7 +1768,10 @@ async fn proxy_with_cancellation_guard(
     let route_driver = Some(active_route.route.driver.as_str());
     let response_headers = if protocol.is_anthropic() || responses_anthropic_route {
         crate::api::anthropic::downstream_response_headers(
-            upstream.as_ref().ok_or(AppError::internal("proxy_site_4"))?.headers(),
+            upstream
+                .as_ref()
+                .ok_or(AppError::internal("proxy_site_4"))?
+                .headers(),
         )
     } else {
         HeaderMap::new()
@@ -2125,7 +2128,10 @@ fn trusted_input_token_overhead_ceiling(
         .as_i64()
         .filter(|ceiling| (0..=MAX_INPUT_TOKEN_OVERHEAD_CEILING).contains(ceiling))
         .ok_or_else(|| {
-            AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("proxy_trusted_input_token_overhead_ceiling"))
+            AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("proxy_trusted_input_token_overhead_ceiling"),
+            )
         })
 }
 
@@ -2321,9 +2327,10 @@ impl ConversationBody {
         match self {
             Self::InMemory(body) => Ok(body.clone()),
             #[cfg(test)]
-            Self::Spool(spool) => spool.read_all().await.map_err(|_| {
-                AppError::capacity_error("request_spool_read_failed")
-            }),
+            Self::Spool(spool) => spool
+                .read_all()
+                .await
+                .map_err(|_| AppError::capacity_error("request_spool_read_failed")),
             Self::ProjectedSpool { .. } => Err(AppError::internal("proxy_read_1")),
         }
     }
@@ -2474,7 +2481,8 @@ impl ProxyConversation {
             }
         };
         let request_body = self.request_body.read().await?;
-        let request_json = serde_json::from_slice(&request_body).map_err(|_| AppError::internal("proxy_project_2"))?;
+        let request_json = serde_json::from_slice(&request_body)
+            .map_err(|_| AppError::internal("proxy_project_2"))?;
         Ok(ProxyConversationProjection {
             conversation: self,
             request_json: std::sync::Arc::new(request_json),
@@ -2784,8 +2792,12 @@ async fn execute_component_provider(
                     .complete(upstream_error_health_terminal(error.code()))
                     .await;
             }
-            return finish_component_provider_failure(&request, Some("component_response"), error.code())
-                .await;
+            return finish_component_provider_failure(
+                &request,
+                Some("component_response"),
+                error.code(),
+            )
+            .await;
         }
     };
     let mut normalized = match normalize_component_provider(
@@ -3039,7 +3051,8 @@ async fn finish_proxy_failure_with_cause(
     ));
     let stored_response = format!(
         "inline-json:{}",
-        std::str::from_utf8(&body).map_err(|_| AppError::internal("proxy_finish_proxy_failure_with_cause_1"))?
+        std::str::from_utf8(&body)
+            .map_err(|_| AppError::internal("proxy_finish_proxy_failure_with_cause_1"))?
     );
     finish_buffered_request_with_upstream_attribution_and_response_object(
         request,
@@ -3092,9 +3105,13 @@ async fn finish_local_buffered_error_with_upstream_attribution(
     const MAX_INLINE_LOCAL_ERROR_BYTES: usize = 4 * 1024;
     if body.len() > MAX_INLINE_LOCAL_ERROR_BYTES || serde_json::from_slice::<Value>(&body).is_err()
     {
-        return Err(AppError::internal("proxy_finish_local_buffered_error_with_upstream_attribution_1"));
+        return Err(AppError::internal(
+            "proxy_finish_local_buffered_error_with_upstream_attribution_1",
+        ));
     }
-    let body_text = std::str::from_utf8(&body).map_err(|_| AppError::internal("proxy_finish_local_buffered_error_with_upstream_attribution_1"))?;
+    let body_text = std::str::from_utf8(&body).map_err(|_| {
+        AppError::internal("proxy_finish_local_buffered_error_with_upstream_attribution_1")
+    })?;
     let stored_response = format!("inline-json:{body_text}");
     finish_buffered_request_with_upstream_attribution_and_response_object(
         request,

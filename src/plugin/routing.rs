@@ -873,7 +873,10 @@ impl PluginRuntime {
             .find(|plugin| plugin.manifest.id == plugin_id)
             .ok_or_else(invalid)?;
         let component = plugin.component.as_ref().ok_or_else(invalid)?;
-        let engine = self.engine.as_ref().ok_or(AppError::internal("routing_call_group_routing_1"))?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("routing_call_group_routing_1"))?;
         let timeout = EXECUTION_LIMIT
             .min(self.execution_timeout)
             .min(Duration::from_millis(remaining_deadline_ms));
@@ -885,8 +888,16 @@ impl PluginRuntime {
                 // Routing never receives network or KV, even if another
                 // contribution in the same package declares these capabilities.
                 capabilities: Vec::new(),
-                http: self.http.as_ref().ok_or(AppError::internal("routing_call_group_routing_2"))?.clone(),
-                runtime: self.runtime.as_ref().ok_or(AppError::internal("routing_call_group_routing_3"))?.clone(),
+                http: self
+                    .http
+                    .as_ref()
+                    .ok_or(AppError::internal("routing_call_group_routing_2"))?
+                    .clone(),
+                runtime: self
+                    .runtime
+                    .as_ref()
+                    .ok_or(AppError::internal("routing_call_group_routing_3"))?
+                    .clone(),
                 kv: None,
                 limits: StoreLimitsBuilder::new()
                     .memory_size(PLUGIN_MEMORY_BYTES)

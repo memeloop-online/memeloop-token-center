@@ -146,7 +146,9 @@ mod tests {
         let (lost, mut receiver) = watch::channel(false);
         let started = tokio::time::Instant::now();
         renew_owner_until_lost(started, lost, || {
-            std::future::ready(Err(AppError::internal("owner_unrenewable_owner_loses_authority_at_the_last_confirmed_le")))
+            std::future::ready(Err(AppError::internal(
+                "owner_unrenewable_owner_loses_authority_at_the_last_confirmed_le",
+            )))
         })
         .await;
         assert!(*receiver.borrow_and_update());

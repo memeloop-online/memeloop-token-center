@@ -6351,7 +6351,9 @@ fn upstream_usage_rejects_negative_and_extreme_token_counts() {
 fn response_archive_cleanup_requires_conclusive_database_ownership() {
     let stored = "staging/proxy/00000000-0000-0000-0000-000000000000/response/00000000-0000-0000-0000-000000000001/body";
     assert!(!response_archive_requires_cleanup(
-        &Err(AppError::internal("proxy_tests_response_archive_cleanup_requires_conclusive_databas")),
+        &Err(AppError::internal(
+            "proxy_tests_response_archive_cleanup_requires_conclusive_databas"
+        )),
         stored
     ));
     assert!(response_archive_requires_cleanup(

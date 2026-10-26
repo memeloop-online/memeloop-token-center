@@ -60,10 +60,13 @@ impl ArchiveStore {
         let mut size = 0_u64;
         let mut digest = blake3::Hasher::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk
-                .map_err(|_| AppError::storage("archive_cas_object_integrity_failure"))?;
+            let chunk =
+                chunk.map_err(|_| AppError::storage("archive_cas_object_integrity_failure"))?;
             size = size
-                .checked_add(u64::try_from(chunk.len()).map_err(|_| AppError::internal("cas_verify_exact_object_1"))?)
+                .checked_add(
+                    u64::try_from(chunk.len())
+                        .map_err(|_| AppError::internal("cas_verify_exact_object_1"))?,
+                )
                 .ok_or_else(|| AppError::storage("archive_cas_object_integrity_failure"))?;
             digest.update(&chunk);
         }

@@ -68,7 +68,9 @@ async fn proxy_openai_image_generation(
             .db
             .lookup_synchronous_image_idempotency(
                 key.key_id,
-                image_idempotency.as_ref().ok_or(AppError::internal("synchronous_entry_proxy_openai_image_generation_1"))?,
+                image_idempotency.as_ref().ok_or(AppError::internal(
+                    "synchronous_entry_proxy_openai_image_generation_1",
+                ))?,
             )
             .await?
         {
@@ -115,7 +117,9 @@ async fn proxy_openai_image_generation(
             && !native_codex
             && !crate::provider::is_openai_compatible_http_driver(&route.driver)
         {
-            return Err(AppError::upstream("generation_driver_does_not_implement_the_openai_images_api"));
+            return Err(AppError::upstream(
+                "generation_driver_does_not_implement_the_openai_images_api",
+            ));
         }
         let price = state.db.generation_price(&model, &key.currency).await?;
         if !matches!(price.billing_unit.as_str(), "image" | "job") {

@@ -58,11 +58,15 @@ impl Database {
         base_revision: i64,
         retained: Option<&crate::plugin::application::PreinstalledInventory>,
     ) -> Result<PluginReleaseResolution, AppError> {
-        let json = serde_json::to_string(release).map_err(|_| AppError::internal("plugin_release_resolutions_save_plugin_release_resolution_1"))?;
+        let json = serde_json::to_string(release).map_err(|_| {
+            AppError::internal("plugin_release_resolutions_save_plugin_release_resolution_1")
+        })?;
         let retained = retained
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| AppError::internal("plugin_release_resolutions_save_plugin_release_resolution_2"))?;
+            .map_err(|_| {
+                AppError::internal("plugin_release_resolutions_save_plugin_release_resolution_2")
+            })?;
         sqlx::query("INSERT INTO application_plugin_release_resolutions (id,operation_key,actor,release_url,descriptor_sha256,resolved_json,created_at,base_revision,retained_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(operation_key) DO NOTHING")
             .bind(Uuid::now_v7().to_string()).bind(operation_key).bind(actor)
             .bind(&release.release_url).bind(&release.descriptor_sha256).bind(json).bind(unix_millis()).bind(base_revision).bind(retained)
@@ -115,9 +119,13 @@ fn resolution(row: AnyRow) -> Result<PluginReleaseResolution, AppError> {
         base_revision: row.try_get("base_revision")?,
         retained: row
             .try_get::<Option<String>, _>("retained_json")?
-            .map(|json| serde_json::from_str(&json).map_err(|_| AppError::internal("plugin_release_resolutions_resolution_1")))
+            .map(|json| {
+                serde_json::from_str(&json)
+                    .map_err(|_| AppError::internal("plugin_release_resolutions_resolution_1"))
+            })
             .transpose()?,
-        release: serde_json::from_str(&json).map_err(|_| AppError::internal("plugin_release_resolutions_resolution_2"))?,
+        release: serde_json::from_str(&json)
+            .map_err(|_| AppError::internal("plugin_release_resolutions_resolution_2"))?,
     })
 }
 

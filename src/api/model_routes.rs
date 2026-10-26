@@ -121,11 +121,13 @@ pub(super) async fn create_model_route(
                 .await?
         }
     };
-    let mut value = serde_json::to_value(created.route).map_err(|_| AppError::internal("model_routes_create_model_route_1"))?;
+    let mut value = serde_json::to_value(created.route)
+        .map_err(|_| AppError::internal("model_routes_create_model_route_1"))?;
     let Value::Object(ref mut object) = value else {
         return Err(AppError::internal("model_routes_create_model_route_1"));
     };
-    let routing = serde_json::to_value(created.routing).map_err(|_| AppError::internal("model_routes_create_model_route_2"))?;
+    let routing = serde_json::to_value(created.routing)
+        .map_err(|_| AppError::internal("model_routes_create_model_route_2"))?;
     let Value::Object(routing) = routing else {
         return Err(AppError::internal("model_routes_create_model_route_2"));
     };
@@ -167,7 +169,9 @@ fn route_create_idempotency_key(
         ));
     }
     let (hash, _) = crate::crypto::hash_credential(value, state.config.key_pepper.as_bytes());
-    let hash: [u8; 32] = hash.try_into().map_err(|_| AppError::internal("model_routes_route_create_idempotency_key_1"))?;
+    let hash: [u8; 32] = hash
+        .try_into()
+        .map_err(|_| AppError::internal("model_routes_route_create_idempotency_key_1"))?;
     Ok(Some(RouteCreateIdempotencyKey::from_hmac_sha256(hash)))
 }
 
@@ -326,11 +330,13 @@ pub(super) async fn update_model_route(
             },
         )
         .await?;
-    let mut value = serde_json::to_value(route).map_err(|_| AppError::internal("model_routes_update_model_route_1"))?;
+    let mut value = serde_json::to_value(route)
+        .map_err(|_| AppError::internal("model_routes_update_model_route_1"))?;
     let Value::Object(ref mut object) = value else {
         return Err(AppError::internal("model_routes_update_model_route_1"));
     };
-    let Value::Object(routing) = serde_json::to_value(routing).map_err(|_| AppError::internal("model_routes_update_model_route_2"))?
+    let Value::Object(routing) = serde_json::to_value(routing)
+        .map_err(|_| AppError::internal("model_routes_update_model_route_2"))?
     else {
         return Err(AppError::internal("model_routes_update_model_route_2"));
     };

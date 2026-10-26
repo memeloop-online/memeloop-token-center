@@ -282,10 +282,12 @@ pub(crate) async fn bind_google_identity(
         ..
     } = credential
     else {
-        return Err(AppError::internal("authorization_code_bind_google_identity_1"));
+        return Err(AppError::internal(
+            "authorization_code_bind_google_identity_1",
+        ));
     };
-    state["authorization_code"]["identity"] =
-        serde_json::to_value(identity).map_err(|_| AppError::internal("authorization_code_bind_google_identity_1"))?;
+    state["authorization_code"]["identity"] = serde_json::to_value(identity)
+        .map_err(|_| AppError::internal("authorization_code_bind_google_identity_1"))?;
     Ok(())
 }
 
@@ -398,10 +400,14 @@ async fn bind_declared_identity_with_transport(
         ..
     } = credential
     else {
-        return Err(AppError::internal("authorization_code_bind_declared_identity_with_transport_1"));
+        return Err(AppError::internal(
+            "authorization_code_bind_declared_identity_with_transport_1",
+        ));
     };
     state["authorization_code"]["provider_identity"] =
-        serde_json::to_value(identity).map_err(|_| AppError::internal("authorization_code_bind_declared_identity_with_transport_1"))?;
+        serde_json::to_value(identity).map_err(|_| {
+            AppError::internal("authorization_code_bind_declared_identity_with_transport_1")
+        })?;
     Ok(())
 }
 
@@ -468,8 +474,11 @@ pub(crate) fn reauthorization_client(
     let client = match (state.login_client, requested) {
         (Some(installed), None) => installed,
         (Some(installed), Some(requested)) => {
-            if serde_json::to_value(&installed).map_err(|_| AppError::internal("authorization_code_reauthorization_client_1"))?
-                != serde_json::to_value(&requested).map_err(|_| AppError::internal("authorization_code_reauthorization_client_2"))?
+            if serde_json::to_value(&installed)
+                .map_err(|_| AppError::internal("authorization_code_reauthorization_client_1"))?
+                != serde_json::to_value(&requested).map_err(|_| {
+                    AppError::internal("authorization_code_reauthorization_client_2")
+                })?
             {
                 return Err(AppError::BadRequest(
                     "reauthorization cannot change the installed OAuth client or scopes".into(),
@@ -696,7 +705,8 @@ pub async fn start(
     getrandom::fill(&mut random).map_err(|_| AppError::internal("authorization_code_start_1"))?;
     let verifier = URL_SAFE_NO_PAD.encode(&random[..32]);
     let state = URL_SAFE_NO_PAD.encode(&random[32..]);
-    let mut url = Url::parse(&input.adapter.login_url).map_err(|_| AppError::internal("authorization_code_start_2"))?;
+    let mut url = Url::parse(&input.adapter.login_url)
+        .map_err(|_| AppError::internal("authorization_code_start_2"))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &input.client.client_id)
@@ -1079,7 +1089,9 @@ fn credential_with_state(
             .or_else(|| old_refresh.cloned()),
         expires_at: Some(
             now.checked_add(tokens.expires_in * 1000)
-                .ok_or(AppError::internal("authorization_code_credential_with_state_1"))?,
+                .ok_or(AppError::internal(
+                    "authorization_code_credential_with_state_1",
+                ))?,
         ),
         header: "authorization".into(),
         prefix: "Bearer ".into(),
@@ -1168,8 +1180,7 @@ async fn dispatch_token_request(
             status.as_u16(),
         ));
     }
-    serde_json::from_slice(&body)
-        .map_err(|_| AppError::upstream("invalid_oauth_token_response"))
+    serde_json::from_slice(&body).map_err(|_| AppError::upstream("invalid_oauth_token_response"))
 }
 
 fn encode_token_form(form: &[(&str, String)]) -> String {

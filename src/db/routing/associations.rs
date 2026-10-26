@@ -264,16 +264,23 @@ pub(in crate::db) async fn ensure_explicit_custom_reservation_bounds(
         }
         let config_json: String = account.try_get("config_json")?;
         let previous_updated_at: i64 = account.try_get("updated_at")?;
-        let mut config: Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::internal("associations_ensure_explicit_custom_reservation_bounds_1"))?;
-        let object = config.as_object_mut().ok_or(AppError::internal("associations_ensure_explicit_custom_reservation_bounds_1"))?;
+        let mut config: Value = serde_json::from_str(&config_json).map_err(|_| {
+            AppError::internal("associations_ensure_explicit_custom_reservation_bounds_1")
+        })?;
+        let object = config.as_object_mut().ok_or(AppError::internal(
+            "associations_ensure_explicit_custom_reservation_bounds_1",
+        ))?;
         let current = object.get("reservation_token_bounds");
         let legacy = object.get("output_token_limits");
         let (bounds, needs_normalization) = match (current, legacy) {
             (Some(Value::Object(bounds)), None) => (bounds.clone(), false),
             (None, Some(Value::Object(bounds))) => (bounds.clone(), true),
             (None, None) => (serde_json::Map::new(), true),
-            _ => return Err(AppError::internal("associations_ensure_explicit_custom_reservation_bounds_2")),
+            _ => {
+                return Err(AppError::internal(
+                    "associations_ensure_explicit_custom_reservation_bounds_2",
+                ));
+            }
         };
         let has_valid_bound = bounds.get(upstream_model).is_some_and(|bound| {
             bound
@@ -282,7 +289,9 @@ pub(in crate::db) async fn ensure_explicit_custom_reservation_bounds(
         });
         if !has_valid_bound {
             if bounds.contains_key(upstream_model) {
-                return Err(AppError::internal("associations_ensure_explicit_custom_reservation_bounds_3"));
+                return Err(AppError::internal(
+                    "associations_ensure_explicit_custom_reservation_bounds_3",
+                ));
             }
             // No evidence is not an upper bound. In particular, never use the
             // parser's integer safety maximum as a billable output quantity.
@@ -292,7 +301,9 @@ pub(in crate::db) async fn ensure_explicit_custom_reservation_bounds(
         }
         object.remove("output_token_limits");
         object.insert("reservation_token_bounds".to_owned(), Value::Object(bounds));
-        let next_config = serde_json::to_string(&config).map_err(|_| AppError::internal("associations_ensure_explicit_custom_reservation_bounds_2"))?;
+        let next_config = serde_json::to_string(&config).map_err(|_| {
+            AppError::internal("associations_ensure_explicit_custom_reservation_bounds_2")
+        })?;
         let next_updated_at = unix_millis().max(previous_updated_at.saturating_add(1));
         let updated = sqlx::query(
             "UPDATE upstream_accounts SET config_json = $1, updated_at = $2 WHERE tenant_id = $3 AND id = $4 AND updated_at = $5",

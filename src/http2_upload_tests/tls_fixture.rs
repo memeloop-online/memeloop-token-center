@@ -127,7 +127,9 @@ impl TlsFixture {
             ],
         )
         .await;
-        let root_pem = tokio::fs::read(directory.path().join("ca.pem")).await.unwrap();
+        let root_pem = tokio::fs::read(directory.path().join("ca.pem"))
+            .await
+            .unwrap();
         let certificate = rustls::pki_types::CertificateDer::from(
             tokio::fs::read(directory.path().join("server.der"))
                 .await

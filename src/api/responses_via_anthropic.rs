@@ -667,7 +667,9 @@ fn apply_tool_choice(
     if choice.and_then(Value::as_str) == Some("none") {
         output
             .as_object_mut()
-            .ok_or(AppError::internal("responses_via_anthropic_apply_tool_choice_1"))?
+            .ok_or(AppError::internal(
+                "responses_via_anthropic_apply_tool_choice_1",
+            ))?
             .remove("tools");
         return Ok(());
     }

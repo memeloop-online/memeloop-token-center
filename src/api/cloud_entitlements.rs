@@ -259,7 +259,8 @@ pub(in crate::api) async fn sync_memeloop_cloud_subscription(
     let payload: CloudSubscriptionWebhook = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("request body must match the webhook schema".into()))?;
     validate_cloud_principal_identity(&payload.tenant_external_id, &payload.principal_external_id)?;
-    let canonical = serde_json::to_vec(&payload).map_err(|_| AppError::internal("cloud_entitlements_sync_memeloop_cloud_subscription_1"))?;
+    let canonical = serde_json::to_vec(&payload)
+        .map_err(|_| AppError::internal("cloud_entitlements_sync_memeloop_cloud_subscription_1"))?;
     let event_digest = digest(&[canonical.as_slice()]);
     let policy: KeyPolicy = payload.policy.clone().into();
     crate::db::validate_key_policy(&policy)?;

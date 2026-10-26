@@ -68,8 +68,7 @@ pub(crate) async fn prepare_route_for_protocol(
             break;
         }
     }
-    let native =
-        native.ok_or_else(|| AppError::upstream("route_is_not_configured"))?;
+    let native = native.ok_or_else(|| AppError::upstream("route_is_not_configured"))?;
     if !state.plugins.has_group_routing_hooks() {
         return Ok(native);
     }

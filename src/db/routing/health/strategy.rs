@@ -165,12 +165,15 @@ impl Database {
             || !(1_000..=crate::plugin::routing::MAX_TRANSIENT_HEALTH_WINDOW_MS)
                 .contains(&window_ms)
         {
-            return Err(AppError::internal("strategy_record_transient_health_sample_at_1"));
+            return Err(AppError::internal(
+                "strategy_record_transient_health_sample_at_1",
+            ));
         }
         let window_ms = window_ms as i64;
         let window_started_at =
-            crate::plugin::routing::transient_health_window_start(now, window_ms as u64)
-                .ok_or(AppError::internal("strategy_record_transient_health_sample_at_2"))?;
+            crate::plugin::routing::transient_health_window_start(now, window_ms as u64).ok_or(
+                AppError::internal("strategy_record_transient_health_sample_at_2"),
+            )?;
         let sample = if transient_failure {
             TRANSIENT_EWMA_SCALE
         } else {

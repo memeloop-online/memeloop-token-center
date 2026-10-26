@@ -18,11 +18,12 @@ use super::{AppError, Database, DatabaseBackend, allocate_request_event_cursor};
 use crate::archive_staging::ArchiveStagingPurpose;
 use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingWriteLease};
 
+/// Former per-document plain ceiling. Raw request JSON and raw response JSON
+/// are archived in full; object-storage cipher budget is independent of it.
+#[cfg_attr(not(test), allow(dead_code))]
 const PLAIN_LIMIT: i64 = 64 * 1024 * 1024;
-/// Bodies above the default Responses envelope remain valid inference input,
-/// but retaining them during a configured larger-ingress deployment would let
-/// a few conversations monopolize the durable spool. They therefore keep only
-/// irreversible gap evidence.
+/// Legacy name for the former 16MiB request ceiling. Raw request JSON is
+/// archived at any size; this value is not a capture cutoff.
 pub(crate) const REQUEST_ARCHIVE_PLAIN_LIMIT: usize = 16 * 1024 * 1024;
 const CIPHER_CHUNK_LIMIT: usize = 512 * 1024;
 const CIPHER_LIMIT: i64 = 256 * 1024 * 1024;
@@ -73,9 +74,13 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
     reason: &'static str,
 ) -> Result<(), AppError> {
     if !matches!(reason, "capacity" | "retention_limit") {
-        return Err(AppError::internal("archive_spool_insert_request_archive_gap_in_transaction_1"));
+        return Err(AppError::internal(
+            "archive_spool_insert_request_archive_gap_in_transaction_1",
+        ));
     }
-    let byte_count = i64::try_from(body.len()).map_err(|_| AppError::internal("archive_spool_insert_request_archive_gap_in_transaction_2"))?;
+    let byte_count = i64::try_from(body.len()).map_err(|_| {
+        AppError::internal("archive_spool_insert_request_archive_gap_in_transaction_2")
+    })?;
     let digest = blake3::hash(body).to_hex().to_string();
     let inserted = sqlx::query(
         "INSERT INTO request_archive_spools (
@@ -102,7 +107,9 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() != 1 {
-        return Err(AppError::internal("archive_spool_insert_request_archive_gap_in_transaction_1"));
+        return Err(AppError::internal(
+            "archive_spool_insert_request_archive_gap_in_transaction_1",
+        ));
     }
     Ok(())
 }
@@ -204,23 +211,31 @@ impl Database {
                 || chunk.ciphertext.is_empty()
                 || chunk.ciphertext.len() > CIPHER_CHUNK_LIMIT
             {
-                return Err(AppError::internal("archive_spool_capture_buffered_archive_spool_in_transaction_1"));
+                return Err(AppError::internal(
+                    "archive_spool_capture_buffered_archive_spool_in_transaction_1",
+                ));
             }
             bytes = bytes
                 .checked_add(chunk.byte_count)
-                .ok_or(AppError::internal("archive_spool_capture_buffered_archive_spool_in_transaction_2"))?;
+                .ok_or(AppError::internal(
+                    "archive_spool_capture_buffered_archive_spool_in_transaction_2",
+                ))?;
             accounted = accounted
                 .checked_add(chunk.ciphertext.len() as i64 + CHUNK_OVERHEAD)
-                .ok_or(AppError::internal("archive_spool_capture_buffered_archive_spool_in_transaction_3"))?;
+                .ok_or(AppError::internal(
+                    "archive_spool_capture_buffered_archive_spool_in_transaction_3",
+                ))?;
         }
-        if bytes > PLAIN_LIMIT || accounted > CIPHER_LIMIT {
+        if accounted > CIPHER_LIMIT {
             return Ok(false);
         }
         let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).fetch_one(&mut **tx).await?;
         if valid != 1 {
-            return Err(AppError::internal("archive_spool_capture_buffered_archive_spool_in_transaction_4"));
+            return Err(AppError::internal(
+                "archive_spool_capture_buffered_archive_spool_in_transaction_4",
+            ));
         }
         if let Some(row) = spool_row(tx, identity, purpose).await? {
             // A repeated call can acknowledge only this exact sealed batch.
@@ -229,13 +244,17 @@ impl Database {
                 || row.try_get::<i64, _>("byte_count")? != bytes
                 || row.try_get::<i64, _>("expires_at")? <= now
             {
-                return Err(AppError::internal("archive_spool_capture_buffered_archive_spool_in_transaction_5"));
+                return Err(AppError::internal(
+                    "archive_spool_capture_buffered_archive_spool_in_transaction_5",
+                ));
             }
             for chunk in chunks {
                 let same: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1 AND seq = $2 AND ciphertext = $3 AND byte_count = $4")))
                     .bind(identity.request_id.to_string()).bind(chunk.seq).bind(&chunk.ciphertext).bind(chunk.byte_count).fetch_one(&mut **tx).await?;
                 if same != 1 {
-                    return Err(AppError::internal("archive_spool_capture_buffered_archive_spool_in_transaction_6"));
+                    return Err(AppError::internal(
+                        "archive_spool_capture_buffered_archive_spool_in_transaction_6",
+                    ));
                 }
             }
             return Ok(true);
@@ -318,51 +337,78 @@ impl Database {
         let chunk_count = body
             .len()
             .div_ceil(crate::response_archive_spool::CHUNK_BYTES);
-        if chunk_count > CHUNK_LIMIT as usize || body.len() > PLAIN_LIMIT as usize {
+        if chunk_count > CHUNK_LIMIT as usize {
             return Ok(false);
         }
         let mut accounted = SPOOL_OVERHEAD;
         for bytes in body.chunks(crate::response_archive_spool::CHUNK_BYTES) {
-            let cipher_bytes = archive.sealed_len(bytes.len()).ok_or(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"))?;
+            let cipher_bytes = archive.sealed_len(bytes.len()).ok_or(AppError::internal(
+                "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+            ))?;
             accounted = accounted
                 .checked_add(cipher_bytes as i64 + CHUNK_OVERHEAD)
-                .ok_or(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"))?;
+                .ok_or(AppError::internal(
+                    "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                ))?;
         }
         if accounted > CIPHER_LIMIT {
             return Ok(false);
         }
         let prepared_first_batch = prepared_first_batch
-            .map(|prepared| prepared.into_chunks_for(archive).ok_or(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact")))
+            .map(|prepared| {
+                prepared.into_chunks_for(archive).ok_or(AppError::internal(
+                    "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                ))
+            })
             .transpose()?;
         let expected_prepared =
             chunk_count.min(crate::response_archive_spool::CAPTURE_INSERT_BATCH_CHUNKS);
         if let Some(chunks) = prepared_first_batch.as_deref() {
             if chunks.len() != expected_prepared {
-                return Err(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"));
+                return Err(AppError::internal(
+                    "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                ));
             }
             for (seq, chunk) in chunks.iter().enumerate() {
                 let start = seq
                     .checked_mul(crate::response_archive_spool::CHUNK_BYTES)
-                    .ok_or(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"))?;
+                    .ok_or(AppError::internal(
+                        "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                    ))?;
                 let expected_bytes = body
                     .len()
                     .saturating_sub(start)
                     .min(crate::response_archive_spool::CHUNK_BYTES);
-                if chunk.seq != i64::try_from(seq).map_err(|_| AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"))?
+                if chunk.seq
+                    != i64::try_from(seq).map_err(|_| {
+                        AppError::internal(
+                            "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                        )
+                    })?
                     || chunk.byte_count
-                        != i64::try_from(expected_bytes).map_err(|_| AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"))?
+                        != i64::try_from(expected_bytes).map_err(|_| {
+                            AppError::internal(
+                                "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                            )
+                        })?
                 {
-                    return Err(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"));
+                    return Err(AppError::internal(
+                        "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                    ));
                 }
             }
         }
-        let byte_count = i64::try_from(body.len()).map_err(|_| AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"))?;
+        let byte_count = i64::try_from(body.len()).map_err(|_| {
+            AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact")
+        })?;
         let gap_locator = format!("gap://{}/{}", identity.request_id, purpose.as_str());
         let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object = $4)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).bind(gap_locator).fetch_one(&mut **tx).await?;
         if valid != 1 {
-            return Err(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"));
+            return Err(AppError::internal(
+                "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+            ));
         }
         if let Some(row) = spool_row(tx, identity, purpose).await? {
             if row.try_get::<String, _>("state")? != "pending"
@@ -370,7 +416,9 @@ impl Database {
                 || row.try_get::<i64, _>("byte_count")? != byte_count
                 || row.try_get::<i64, _>("expires_at")? <= now
             {
-                return Err(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"));
+                return Err(AppError::internal(
+                    "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                ));
             }
             let mut actual_accounted = SPOOL_OVERHEAD;
             for (seq, bytes) in body
@@ -383,11 +431,15 @@ impl Database {
                     .bind(identity.request_id.to_string()).bind(seq as i64).bind(&ciphertext)
                     .bind(bytes.len() as i64).fetch_one(&mut **tx).await?;
                 if same != 1 {
-                    return Err(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"));
+                    return Err(AppError::internal(
+                        "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                    ));
                 }
             }
             if row.try_get::<i64, _>("cipher_bytes")? != actual_accounted {
-                return Err(AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact"));
+                return Err(AppError::internal(
+                    "archive_spool_capture_reserved_buffered_archive_body_in_transact",
+                ));
             }
             return Ok(true);
         }
@@ -599,8 +651,12 @@ impl Database {
             return Ok(spool_write_rejected(identity, "append", "invalid_chunk"));
         };
         self.append_response_archive_spool_batch_with(identity, first.seq, chunks.len(), |seq| {
-            let offset = usize::try_from(seq - first.seq).map_err(|_| AppError::internal("archive_spool_append_response_archive_spool_batch_1"))?;
-            let chunk = chunks.get(offset).ok_or(AppError::internal("archive_spool_append_response_archive_spool_batch_1"))?;
+            let offset = usize::try_from(seq - first.seq).map_err(|_| {
+                AppError::internal("archive_spool_append_response_archive_spool_batch_1")
+            })?;
+            let chunk = chunks.get(offset).ok_or(AppError::internal(
+                "archive_spool_append_response_archive_spool_batch_1",
+            ))?;
             Ok(ArchiveSpoolChunk {
                 seq: chunk.seq,
                 byte_count: chunk.byte_count,
@@ -651,22 +707,27 @@ impl Database {
             ));
         }
         let count: i64 = row.try_get("chunk_count")?;
-        let batch_count = i64::try_from(chunk_count).map_err(|_| AppError::internal("archive_spool_append_response_archive_spool_batch_with_1"))?;
+        let batch_count = i64::try_from(chunk_count).map_err(|_| {
+            AppError::internal("archive_spool_append_response_archive_spool_batch_with_1")
+        })?;
         let validate = |chunk: &ArchiveSpoolChunk, expected_seq: i64| {
             chunk.seq == expected_seq
                 && chunk.byte_count > 0
-                && chunk.byte_count <= PLAIN_LIMIT
                 && !chunk.ciphertext.is_empty()
                 && chunk.ciphertext.len() <= CIPHER_CHUNK_LIMIT
         };
         if first_seq < count {
             let end = first_seq
                 .checked_add(batch_count)
-                .ok_or(AppError::internal("archive_spool_append_response_archive_spool_batch_with_1"))?;
+                .ok_or(AppError::internal(
+                    "archive_spool_append_response_archive_spool_batch_with_1",
+                ))?;
             let mut accepted = end <= count;
             if accepted {
                 for offset in 0..batch_count {
-                    let expected_seq = first_seq.checked_add(offset).ok_or(AppError::internal("archive_spool_append_response_archive_spool_batch_with_2"))?;
+                    let expected_seq = first_seq.checked_add(offset).ok_or(AppError::internal(
+                        "archive_spool_append_response_archive_spool_batch_with_2",
+                    ))?;
                     let chunk = next_chunk(expected_seq)?;
                     if !validate(&chunk, expected_seq) {
                         accepted = false;
@@ -699,27 +760,34 @@ impl Database {
         let mut byte_count = 0_i64;
         let mut cipher_bytes = 0_i64;
         for offset in 0..batch_count {
-            let expected_seq = first_seq.checked_add(offset).ok_or(AppError::internal("archive_spool_append_response_archive_spool_batch_with_3"))?;
+            let expected_seq = first_seq.checked_add(offset).ok_or(AppError::internal(
+                "archive_spool_append_response_archive_spool_batch_with_3",
+            ))?;
             let chunk = next_chunk(expected_seq)?;
             if !validate(&chunk, expected_seq) {
                 return Ok(spool_write_rejected(identity, "append", "invalid_chunk"));
             }
             byte_count = byte_count
                 .checked_add(chunk.byte_count)
-                .ok_or(AppError::internal("archive_spool_append_response_archive_spool_batch_with_4"))?;
-            if existing_bytes > PLAIN_LIMIT - byte_count {
-                return Ok(spool_write_rejected(
-                    identity,
-                    "append",
-                    "sequence_or_plain_capacity",
+                .ok_or(AppError::internal(
+                    "archive_spool_append_response_archive_spool_batch_with_4",
+                ))?;
+            if existing_bytes.checked_add(byte_count).is_none() {
+                return Err(AppError::internal(
+                    "archive_spool_append_response_archive_spool_batch_with_4",
                 ));
             }
             cipher_bytes = cipher_bytes
                 .checked_add(
-                    i64::try_from(chunk.ciphertext.len()).map_err(|_| AppError::internal("archive_spool_append_response_archive_spool_batch_with_2"))?
-                        + CHUNK_OVERHEAD,
+                    i64::try_from(chunk.ciphertext.len()).map_err(|_| {
+                        AppError::internal(
+                            "archive_spool_append_response_archive_spool_batch_with_2",
+                        )
+                    })? + CHUNK_OVERHEAD,
                 )
-                .ok_or(AppError::internal("archive_spool_append_response_archive_spool_batch_with_5"))?;
+                .ok_or(AppError::internal(
+                    "archive_spool_append_response_archive_spool_batch_with_5",
+                ))?;
             // Insert each prepared chunk immediately. The transaction remains
             // atomic, while the caller can release its plaintext before the
             // next ciphertext is prepared instead of retaining both batches.
@@ -1199,7 +1267,9 @@ impl Database {
                 }
             })
             .await
-            .map_err(|_| AppError::internal("archive_spool_cleanup_response_archive_spools_with_budget_1"))??;
+            .map_err(|_| {
+                AppError::internal("archive_spool_cleanup_response_archive_spools_with_budget_1")
+            })??;
             match batch {
                 Some(cleaned) => completed += u64::from(cleaned),
                 None => break,
@@ -1362,7 +1432,8 @@ impl Database {
         }
         if !matches!(previous_state.as_str(), "bound" | "gap") {
             hold.phase("event_cursor");
-            let request_id = Uuid::parse_str(&id).map_err(|_| AppError::internal("archive_spool_site_1"))?;
+            let request_id =
+                Uuid::parse_str(&id).map_err(|_| AppError::internal("archive_spool_site_1"))?;
             emit_response_archive_transition_event_in_transaction(
                 &mut tx,
                 purpose,
@@ -1503,7 +1574,9 @@ async fn emit_response_archive_transition_event_in_transaction(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() != 1 {
-        return Err(AppError::internal("archive_spool_emit_response_archive_transition_event_in_transact"));
+        return Err(AppError::internal(
+            "archive_spool_emit_response_archive_transition_event_in_transact",
+        ));
     }
     Ok(())
 }
@@ -1559,7 +1632,8 @@ fn add_chunk_accounting(accounted: &mut i64, ciphertext: &str) -> Result<(), App
     if ciphertext.len() > CIPHER_CHUNK_LIMIT {
         return Err(AppError::internal("archive_spool_add_chunk_accounting_1"));
     }
-    let cipher_bytes = i64::try_from(ciphertext.len()).map_err(|_| AppError::internal("archive_spool_add_chunk_accounting_1"))?;
+    let cipher_bytes = i64::try_from(ciphertext.len())
+        .map_err(|_| AppError::internal("archive_spool_add_chunk_accounting_1"))?;
     *accounted = accounted
         .checked_add(cipher_bytes + CHUNK_OVERHEAD)
         .ok_or(AppError::internal("archive_spool_add_chunk_accounting_2"))?;
@@ -1622,7 +1696,8 @@ async fn locked_live_task(
 
 fn identity_from_row(row: &AnyRow) -> Result<ArchiveSpoolIdentity, AppError> {
     let parse = |name| -> Result<Uuid, AppError> {
-        Uuid::parse_str(&row.try_get::<String, _>(name)?).map_err(|_| AppError::internal("archive_spool_identity_from_row_1"))
+        Uuid::parse_str(&row.try_get::<String, _>(name)?)
+            .map_err(|_| AppError::internal("archive_spool_identity_from_row_1"))
     };
     Ok(ArchiveSpoolIdentity {
         request_id: parse("request_id")?,

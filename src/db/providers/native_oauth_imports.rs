@@ -105,7 +105,9 @@ impl Database {
         let mut prepared = Vec::with_capacity(2);
         for input in inputs {
             prepared.push((
-                serde_json::to_string(&input.config).map_err(|_| AppError::internal("native_oauth_imports_import_native_kimi_oauth_cohort_1"))?,
+                serde_json::to_string(&input.config).map_err(|_| {
+                    AppError::internal("native_oauth_imports_import_native_kimi_oauth_cohort_1")
+                })?,
                 seal_credential(&input.credential, key_material)?,
                 input,
             ));
@@ -605,9 +607,9 @@ async fn rotate_native_kimi_credential(
             "native Kimi OAuth refresh is in progress; retry the import".into(),
         ));
     }
-    let generation = current_generation
-        .checked_add(1)
-        .ok_or(AppError::internal("native_oauth_imports_rotate_native_kimi_credential_1"))?;
+    let generation = current_generation.checked_add(1).ok_or(AppError::internal(
+        "native_oauth_imports_rotate_native_kimi_credential_1",
+    ))?;
     let updated_at = now.max(current_updated_at.saturating_add(1));
     let revoked = sqlx::query(
         "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL",

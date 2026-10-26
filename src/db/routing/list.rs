@@ -192,7 +192,9 @@ impl Database {
             .into_iter()
             .map(|route| {
                 let route_id = route.id;
-                let association = associations.remove(&route_id).ok_or(AppError::internal("list_list_enriched_model_routes_page_3"))?;
+                let association = associations
+                    .remove(&route_id)
+                    .ok_or(AppError::internal("list_list_enriched_model_routes_page_3"))?;
                 Ok(EnrichedModelRouteView {
                     route,
                     route_id,

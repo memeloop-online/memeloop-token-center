@@ -46,7 +46,10 @@ pub(super) async fn execute(
         "x-mtc-client-name",
         HeaderValue::from_static("filter-assistant"),
     );
-    let body = Bytes::from(serde_json::to_vec(&request).map_err(|_| AppError::internal("filter_assistant_execute_1"))?);
+    let body = Bytes::from(
+        serde_json::to_vec(&request)
+            .map_err(|_| AppError::internal("filter_assistant_execute_1"))?,
+    );
     let memory = state.proxy_memory_budget.reservation();
     let response = proxy_with_identity(
         state,

@@ -533,7 +533,10 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
     assert_eq!(killed, 1);
     assert!(matches!(
         disconnected.await.unwrap(),
-        Err(AppError::Capacity { code: "request_archive_commit_failed", .. })
+        Err(AppError::Capacity {
+            code: "request_archive_commit_failed",
+            ..
+        })
     ));
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(fixture.gate)
@@ -614,7 +617,10 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
     assert!(matches!(
         db.start_proxy_request_with_archive(input(), &body, pepper)
             .await,
-        Err(AppError::Capacity { code: "request_archive_capture_failed", .. })
+        Err(AppError::Capacity {
+            code: "request_archive_capture_failed",
+            ..
+        })
     ));
     let reservations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")

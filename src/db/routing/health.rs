@@ -434,9 +434,7 @@ impl Database {
                     upstream_account_id: Uuid::parse_str(
                         &row.try_get::<String, _>("upstream_account_id")?,
                     )
-                    .map_err(|_| {
-                        AppError::storage("transport_diagnostic_account_is_malformed")
-                    })?,
+                    .map_err(|_| AppError::storage("transport_diagnostic_account_is_malformed"))?,
                     credential_generation: row.try_get("credential_generation")?,
                     transport_revision: row.try_get("transport_revision")?,
                     failure_kind: row.try_get("failure_kind")?,
@@ -988,9 +986,7 @@ impl Database {
         token
             .map(|token| {
                 Uuid::parse_str(&token)
-                    .map_err(|_| {
-                        AppError::storage("upstream_probe_lease_token_is_malformed")
-                    })
+                    .map_err(|_| AppError::storage("upstream_probe_lease_token_is_malformed"))
                     .map(|lease_token| UpstreamAttemptAdmission::SharedProbe { lease_token })
             })
             .transpose()

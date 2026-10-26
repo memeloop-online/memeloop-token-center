@@ -54,7 +54,8 @@ impl PluginInventoryDescriptor {
             }
             entry.package_references()?;
         }
-        let bytes = serde_json::to_vec(self).map_err(|_| AppError::internal("descriptor_validate_1"))?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|_| AppError::internal("descriptor_validate_1"))?;
         if bytes.len() > MAX_DESCRIPTOR_BYTES {
             return Err(AppError::Forbidden);
         }
@@ -178,7 +179,8 @@ impl DescriptorInventory {
 
 fn value_digest(value: &impl Serialize) -> Result<String, AppError> {
     plugin_configuration_schema_digest(
-        &serde_json::to_value(value).map_err(|_| AppError::internal("descriptor_value_digest_1"))?,
+        &serde_json::to_value(value)
+            .map_err(|_| AppError::internal("descriptor_value_digest_1"))?,
     )
 }
 

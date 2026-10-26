@@ -597,7 +597,10 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
     assert!(matches!(
         db.start_proxy_request_with_archive(input(), &body, pepper)
             .await,
-        Err(AppError::Capacity { code: "request_archive_capture_failed", .. })
+        Err(AppError::Capacity {
+            code: "request_archive_capture_failed",
+            ..
+        })
     ));
     let reservations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
@@ -650,7 +653,7 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
 }
 
 #[tokio::test]
-async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool_capacity() {
+async fn request_above_legacy_plain_limit_archives_the_raw_bytes() {
     use crate::db::{CreateKeyInput, RequestArchiveAdmission, StartProxyRequest};
     let (_dir, db, _) = fixture().await;
     let pepper = b"archive-retention-limit-pepper-over-32-bytes";
@@ -703,28 +706,22 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
         .unwrap();
     assert_eq!(
         admitted.archive_admission,
-        RequestArchiveAdmission::GapRetentionLimit
+        RequestArchiveAdmission::Captured
     );
-    assert_eq!(budget(&db).await, 0);
-    let gap = sqlx::query(
-        "SELECT state, last_error_code, gap_reason, body_byte_count, body_blake3, cipher_bytes,
-                cleaned_at
+    assert!(budget(&db).await > 0);
+    let stored = sqlx::query(
+        "SELECT state, byte_count, cipher_bytes, gap_reason, cleaned_at
          FROM request_archive_spools WHERE request_id = $1",
     )
     .bind(request_id.to_string())
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(gap.get::<String, _>("state"), "gap");
-    assert_eq!(gap.get::<String, _>("last_error_code"), "capacity");
-    assert_eq!(gap.get::<String, _>("gap_reason"), "retention_limit");
-    assert_eq!(gap.get::<i64, _>("body_byte_count"), body.len() as i64);
-    assert_eq!(
-        gap.get::<String, _>("body_blake3"),
-        blake3::hash(&body).to_hex().to_string()
-    );
-    assert_eq!(gap.get::<i64, _>("cipher_bytes"), 0);
-    assert!(gap.get::<Option<i64>, _>("cleaned_at").is_some());
+    assert_eq!(stored.get::<String, _>("state"), "pending");
+    assert_eq!(stored.get::<i64, _>("byte_count"), body.len() as i64);
+    assert!(stored.get::<i64, _>("cipher_bytes") > 0);
+    assert!(stored.get::<Option<String>, _>("gap_reason").is_none());
+    assert!(stored.get::<Option<i64>, _>("cleaned_at").is_none());
     sqlx::query(
         "UPDATE request_records
          SET completed_at = 2, status_code = 200,
@@ -741,15 +738,14 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
         .unwrap();
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Gap
+        crate::model::RequestArchiveState::Pending
     );
-    assert_eq!(
-        refs.request_archive_reason.as_deref(),
-        Some("retention_limit")
-    );
+    assert!(refs.request_archive_reason.is_none());
+    let charged = budget(&db).await;
+    assert!(charged > 0);
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
-    assert_eq!(budget(&db).await, 0);
+    assert_eq!(budget(&db).await, charged);
 }
 
 #[tokio::test]
@@ -1395,11 +1391,14 @@ async fn gap_cleanup_immediately_releases_exact_cipher_bytes_and_preserves_audit
             .unwrap()
     );
     assert!(
-        !db.append_response_archive_spool(id, 1, 1, "x")
+        db.append_response_archive_spool(id, 1, 1, "x")
             .await
             .unwrap()
     );
-    assert_eq!(budget(&db).await, SPOOL_OVERHEAD + 8 + CHUNK_OVERHEAD);
+    assert_eq!(
+        budget(&db).await,
+        SPOOL_OVERHEAD + 8 + CHUNK_OVERHEAD + 1 + CHUNK_OVERHEAD
+    );
     db.fail_response_archive_spool(id, "payload-bearing-untrusted-reason")
         .await
         .unwrap();
@@ -1424,7 +1423,7 @@ async fn gap_cleanup_immediately_releases_exact_cipher_bytes_and_preserves_audit
         .await
         .unwrap();
     assert_eq!(rows, 1);
-    let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE state = 'gap' AND cleaned_at IS NOT NULL AND byte_count = $1").bind(PLAIN_LIMIT).fetch_one(&db.pool).await.unwrap();
+    let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE state = 'gap' AND cleaned_at IS NOT NULL AND byte_count = $1").bind(PLAIN_LIMIT + 1).fetch_one(&db.pool).await.unwrap();
     assert_eq!(audit, 1);
 }
 

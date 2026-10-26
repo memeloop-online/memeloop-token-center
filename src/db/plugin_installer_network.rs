@@ -269,26 +269,37 @@ impl Database {
                         key,
                     )
                     .await?;
-                let mut parsed =
-                    url::Url::parse(&group.selected_proxy_url).map_err(|_| AppError::internal("plugin_installer_network_resolve_installer_network_1"))?;
+                let mut parsed = url::Url::parse(&group.selected_proxy_url).map_err(|_| {
+                    AppError::internal("plugin_installer_network_resolve_installer_network_1")
+                })?;
                 let decode = |value: &str| {
                     percent_encoding::percent_decode_str(value)
                         .decode_utf8()
                         .map(|value| value.into_owned())
-                        .map_err(|_| AppError::internal("plugin_installer_network_resolve_installer_network_2"))
+                        .map_err(|_| {
+                            AppError::internal(
+                                "plugin_installer_network_resolve_installer_network_2",
+                            )
+                        })
                 };
                 snapshot.username = (!parsed.username().is_empty())
                     .then(|| decode(parsed.username()))
                     .transpose()?;
                 snapshot.password = parsed.password().map(decode).transpose()?;
-                parsed.set_username("").map_err(|_| AppError::internal("plugin_installer_network_resolve_installer_network_3"))?;
-                parsed.set_password(None).map_err(|_| AppError::internal("plugin_installer_network_resolve_installer_network_4"))?;
+                parsed.set_username("").map_err(|_| {
+                    AppError::internal("plugin_installer_network_resolve_installer_network_3")
+                })?;
+                parsed.set_password(None).map_err(|_| {
+                    AppError::internal("plugin_installer_network_resolve_installer_network_4")
+                })?;
                 snapshot.proxy_url = Some(parsed.to_string());
                 snapshot.group = Some(group);
             }
         }
         let (host, addresses) = crate::network::validate_installer_proxy_endpoint(
-            snapshot.proxy_url.as_deref().ok_or(AppError::internal("plugin_installer_network_resolve_installer_network_1"))?,
+            snapshot.proxy_url.as_deref().ok_or(AppError::internal(
+                "plugin_installer_network_resolve_installer_network_1",
+            ))?,
             snapshot.group.is_some(),
         )
         .await?;
@@ -459,9 +470,13 @@ impl Database {
 fn selection_digest(input: &InstallerNetworkInput, key: &[u8]) -> Result<String, AppError> {
     use hmac::{Hmac, Mac};
     // The digest stays server-side. Never add it or the input to audit/review.
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| AppError::internal("plugin_installer_network_selection_digest_1"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| AppError::internal("plugin_installer_network_selection_digest_1"))?;
     mac.update(b"mtc/plugin-installer-network/selection/v1");
-    mac.update(&serde_json::to_vec(input).map_err(|_| AppError::internal("plugin_installer_network_selection_digest_2"))?);
+    mac.update(
+        &serde_json::to_vec(input)
+            .map_err(|_| AppError::internal("plugin_installer_network_selection_digest_2"))?,
+    );
     Ok(mac
         .finalize()
         .into_bytes()

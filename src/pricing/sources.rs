@@ -30,7 +30,6 @@ fn price_upstream(code: &'static str, source: &str) -> AppError {
     )
 }
 
-
 pub(super) async fn fetch_source(
     http: &reqwest::Client,
     source: &'static str,

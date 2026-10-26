@@ -287,7 +287,8 @@ pub(in crate::api) async fn prepare_image_request(
                 .into(),
         ));
     }
-    let body = serde_json::to_vec(body).map_err(|_| AppError::internal("codex_transport_prepare_image_request_1"))?;
+    let body = serde_json::to_vec(body)
+        .map_err(|_| AppError::internal("codex_transport_prepare_image_request_1"))?;
 
     let selection = state.transport_proxy_groups.select_config(
         route.account_id,
@@ -1908,8 +1909,7 @@ pub(super) async fn buffer_response(
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     let reserved = if let Some(conversation) = conversation {
-        conversation
-            .reserve_for_buffered_response(memory, maximum, deadline)
+        conversation.reserve_for_buffered_response(memory, maximum, deadline)
     } else {
         memory.reserve_buffered_response(maximum, deadline)
     };
@@ -2877,10 +2877,7 @@ mod tests {
     fn buffered_parser_accounts_live_events_and_retains_completed_output_until_release() {
         let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(512 * 1024);
         let memory = budget.reservation();
-        assert!(
-            memory
-                .reserve_buffered_response(64 * 1024, tokio::time::Instant::now())
-        );
+        assert!(memory.reserve_buffered_response(64 * 1024, tokio::time::Instant::now()));
         let baseline = budget.snapshot().0;
         let mut parser = BufferedResponsesParser::default();
         let progress = b"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-1\",\"status\":\"in_progress\"}}\n\n";
@@ -2904,10 +2901,7 @@ mod tests {
     fn buffered_parser_releases_parse_memory_on_error_and_honors_actual_budget_exhaustion() {
         let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(128 * 1024);
         let memory = budget.reservation();
-        assert!(
-            memory
-                .reserve_buffered_response(1024, tokio::time::Instant::now())
-        );
+        assert!(memory.reserve_buffered_response(1024, tokio::time::Instant::now()));
         let baseline = budget.snapshot().0;
         let mut parser = BufferedResponsesParser::default();
         assert!(

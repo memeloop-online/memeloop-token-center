@@ -487,7 +487,8 @@ fn safe_generation_result(
                 "job",
                 job_id,
                 provider_assets,
-                provider_key_material.ok_or(AppError::internal("finish_safe_generation_result_1"))?,
+                provider_key_material
+                    .ok_or(AppError::internal("finish_safe_generation_result_1"))?,
             )?;
             Ok(serde_json::json!({
                 "provider": provider,
@@ -515,11 +516,15 @@ fn provider_generation_result_matches(
         .as_object_mut()
         .and_then(|value| value.remove("provider_reference"))
         .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or(AppError::internal("finish_provider_generation_result_matches_1"))?;
+        .ok_or(AppError::internal(
+            "finish_provider_generation_result_matches_1",
+        ))?;
     expected
         .as_object_mut()
         .and_then(|value| value.remove("provider_reference"))
-        .ok_or(AppError::internal("finish_provider_generation_result_matches_2"))?;
+        .ok_or(AppError::internal(
+            "finish_provider_generation_result_matches_2",
+        ))?;
     let existing_assets = crate::generation::open_provider_asset_reference(
         "job",
         job_id,

@@ -143,7 +143,10 @@ async fn require_members_tenant(
             query = query.bind(id.to_string());
         }
         let found: i64 = query.fetch_one(&mut **tx).await?.try_get("found")?;
-        if found != i64::try_from(chunk.len()).map_err(|_| AppError::internal("members_require_members_tenant_1"))? {
+        if found
+            != i64::try_from(chunk.len())
+                .map_err(|_| AppError::internal("members_require_members_tenant_1"))?
+        {
             return Err(AppError::NotFound);
         }
     }

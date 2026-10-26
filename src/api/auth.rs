@@ -53,7 +53,11 @@ pub(super) async fn authenticate_control_before_body(
         .await
         {
             Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return Err(AppError::internal("auth_authenticate_control_before_body_1")),
+            Ok(Err(_)) => {
+                return Err(AppError::internal(
+                    "auth_authenticate_control_before_body_1",
+                ));
+            }
             Err(_) => {
                 return Ok(control_body_rejection(
                     StatusCode::TOO_MANY_REQUESTS,
@@ -263,10 +267,12 @@ async fn admit_authenticated_gateway_body(
         .cloned();
     if audio_request {
         request.extensions_mut().insert(AudioRequestResources {
-            lifecycle: std::sync::Arc::new(
-                media_lifecycle_permit.take().ok_or(AppError::internal("auth_admit_authenticated_gateway_body_1"))?,
-            ),
-            memory: memory.clone().ok_or(AppError::internal("auth_admit_authenticated_gateway_body_2"))?,
+            lifecycle: std::sync::Arc::new(media_lifecycle_permit.take().ok_or(
+                AppError::internal("auth_admit_authenticated_gateway_body_1"),
+            )?),
+            memory: memory.clone().ok_or(AppError::internal(
+                "auth_admit_authenticated_gateway_body_2",
+            ))?,
         });
     }
     let response = next.run(request).await;

@@ -78,7 +78,9 @@ pub(crate) fn open_provider_asset_reference(
 ) -> Result<Vec<ProviderGenerationAsset>, AppError> {
     let envelope = reference
         .strip_prefix(PROVIDER_REFERENCE_PREFIX)
-        .ok_or(AppError::internal("generation_open_provider_asset_reference_1"))?;
+        .ok_or(AppError::internal(
+            "generation_open_provider_asset_reference_1",
+        ))?;
     let aad = provider_reference_aad(owner_kind, owner_id);
     let reference: ProviderAssetReference = open_private_json(envelope, key_material, &aad)?;
     Ok(reference.assets)
@@ -151,7 +153,8 @@ where
 {
     tokio::pin!(future);
     let period = std::time::Duration::from_millis(
-        u64::try_from(ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS).map_err(|_| AppError::internal("generation_await_with_staging_heartbeat_1"))?,
+        u64::try_from(ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS)
+            .map_err(|_| AppError::internal("generation_await_with_staging_heartbeat_1"))?,
     );
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     loop {
@@ -388,7 +391,8 @@ async fn comfyui_billed_pixels(
         .ok_or_else(|| AppError::storage("generation_input_archive_is_invalid"))?;
     let (pixels_per_output, reserved_outputs) = comfyui_pixel_contract(input)
         .map_err(|_| AppError::storage("generation_pixel_contract_is_invalid"))?;
-    let actual_outputs = i64::try_from(actual_outputs).map_err(|_| AppError::internal("generation_comfyui_billed_pixels_1"))?;
+    let actual_outputs = i64::try_from(actual_outputs)
+        .map_err(|_| AppError::internal("generation_comfyui_billed_pixels_1"))?;
     if actual_outputs > reserved_outputs {
         return Ok(None);
     }
@@ -424,7 +428,10 @@ async fn process_claimed(
         }
         for asset in &staged.assets {
             let size = state.archive.head_size(&asset.object_locator).await?;
-            if size != u64::try_from(asset.size_bytes).map_err(|_| AppError::internal("generation_process_claimed_1"))? {
+            if size
+                != u64::try_from(asset.size_bytes)
+                    .map_err(|_| AppError::internal("generation_process_claimed_1"))?
+            {
                 return terminal_failure(state, worker_id, job, "generation_staging_lost").await;
             }
         }
@@ -436,7 +443,10 @@ async fn process_claimed(
         .await?
         .ok_or_else(|| AppError::upstream("generation_upstream_snapshot_is_unavailable"))?;
     if job.status == "cancelling" {
-        let upstream_job_id = job.upstream_job_id.as_deref().ok_or(AppError::internal("generation_process_claimed_1"))?;
+        let upstream_job_id = job
+            .upstream_job_id
+            .as_deref()
+            .ok_or(AppError::internal("generation_process_claimed_1"))?;
         return cancel_upstream_generation(state, worker_id, job, &route, upstream_job_id).await;
     }
     match job.upstream_job_id.as_deref() {
@@ -584,7 +594,8 @@ async fn submit_attempt(
         if !capabilities.provable_submit_idempotency {
             return terminal_failure(state, worker_id, job, "submission_outcome_unknown").await;
         }
-        job.submission_nonce.ok_or(AppError::internal("generation_submit_attempt_1"))?
+        job.submission_nonce
+            .ok_or(AppError::internal("generation_submit_attempt_1"))?
     } else {
         let nonce = uuid::Uuid::now_v7();
         state
@@ -1241,9 +1252,10 @@ pub(crate) async fn provider_asset_get(
 ) -> Result<reqwest::RequestBuilder, AppError> {
     ensure_asset_origin(route, url)?;
     let client = route_http(state, route, url).await?;
-    let asset_url = url::Url::parse(url)
-        .map_err(|_| AppError::upstream("generation_asset_url_is_invalid"))?;
-    let base_url = url::Url::parse(&route.base_url).map_err(|_| AppError::internal("generation_provider_asset_get_1"))?;
+    let asset_url =
+        url::Url::parse(url).map_err(|_| AppError::upstream("generation_asset_url_is_invalid"))?;
+    let base_url = url::Url::parse(&route.base_url)
+        .map_err(|_| AppError::internal("generation_provider_asset_get_1"))?;
     let request = client.get(url);
     if asset_url.origin() == base_url.origin() {
         route.credential.apply(request, unix_millis())
@@ -1324,8 +1336,13 @@ pub(crate) async fn provider_asset_is_obtainable(
             sanitized_http_error(&error, "generation asset validation response")
         })?;
         bytes = bytes
-            .checked_add(u64::try_from(chunk.len()).map_err(|_| AppError::internal("generation_provider_asset_is_obtainable_1"))?)
-            .ok_or(AppError::internal("generation_provider_asset_is_obtainable_1"))?;
+            .checked_add(
+                u64::try_from(chunk.len())
+                    .map_err(|_| AppError::internal("generation_provider_asset_is_obtainable_1"))?,
+            )
+            .ok_or(AppError::internal(
+                "generation_provider_asset_is_obtainable_1",
+            ))?;
         if bytes > 1 {
             return Ok(false);
         }
@@ -1387,7 +1404,8 @@ fn sanitized_http_error(error: &reqwest::Error, operation: &'static str) -> AppE
 pub(crate) fn ensure_asset_origin(route: &ResolvedUpstream, asset: &str) -> Result<(), AppError> {
     let asset = url::Url::parse(asset)
         .map_err(|_| AppError::upstream("generation_asset_url_is_invalid"))?;
-    let base = url::Url::parse(&route.base_url).map_err(|_| AppError::internal("generation_ensure_asset_origin_1"))?;
+    let base = url::Url::parse(&route.base_url)
+        .map_err(|_| AppError::internal("generation_ensure_asset_origin_1"))?;
     let asset_origin = asset.origin().ascii_serialization();
     let base_origin = base.origin().ascii_serialization();
     let configured = route
@@ -1478,7 +1496,8 @@ pub(crate) fn provider_generation_asset(
     asset_id[8] = (asset_id[8] & 0x3f) | 0x80;
     Ok(ProviderGenerationAsset {
         asset_id: uuid::Uuid::from_bytes(asset_id),
-        index: i64::try_from(index).map_err(|_| AppError::internal("generation_provider_generation_asset_1"))?,
+        index: i64::try_from(index)
+            .map_err(|_| AppError::internal("generation_provider_generation_asset_1"))?,
         url: url.to_owned(),
         expires_at,
         filename: safe_asset_filename(filename, index, &mime_type),
@@ -1720,7 +1739,8 @@ fn unknown_generation_status(driver: &str) -> AppError {
 }
 
 fn generation_url(base_url: &str, segments: &[&str]) -> Result<String, AppError> {
-    let mut url = url::Url::parse(base_url).map_err(|_| AppError::internal("generation_generation_url_1"))?;
+    let mut url =
+        url::Url::parse(base_url).map_err(|_| AppError::internal("generation_generation_url_1"))?;
     url.set_query(None);
     url.set_fragment(None);
     let mut path = url

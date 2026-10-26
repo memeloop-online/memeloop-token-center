@@ -169,7 +169,8 @@ impl Database {
         let now = unix_millis();
         let service_id = Uuid::now_v7();
         let issued = crypto::issue_service_credential(service_id, pepper);
-        let scopes_json = serde_json::to_string(&input.scopes).map_err(|_| AppError::internal("service_tokens_create_service_token_1"))?;
+        let scopes_json = serde_json::to_string(&input.scopes)
+            .map_err(|_| AppError::internal("service_tokens_create_service_token_1"))?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO service_principals (id, name, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'active', 1, $3, $4)",
@@ -260,8 +261,8 @@ impl Database {
         }
         let generation = row.try_get::<i64, _>("credential_generation")? + 1;
         let scopes_json: String = row.try_get("scopes_json")?;
-        let scopes: Vec<String> =
-            serde_json::from_str(&scopes_json).map_err(|_| AppError::internal("service_tokens_rotate_service_token_1"))?;
+        let scopes: Vec<String> = serde_json::from_str(&scopes_json)
+            .map_err(|_| AppError::internal("service_tokens_rotate_service_token_1"))?;
         validate_service_scopes(&scopes)?;
         let tenant_external_id: Option<String> = row.try_get("tenant_external_id")?;
         let name: String = row.try_get("name")?;
@@ -396,7 +397,8 @@ fn service_token_view(row: AnyRow) -> Result<ServiceTokenView, AppError> {
         fingerprint: row.try_get("fingerprint")?,
         credential_copy_available: row.try_get::<i64, _>("credential_copy_available")? != 0
             && row.try_get::<String, _>("status")? == "active",
-        scopes: serde_json::from_str(&scopes_json).map_err(|_| AppError::internal("service_tokens_service_token_view_1"))?,
+        scopes: serde_json::from_str(&scopes_json)
+            .map_err(|_| AppError::internal("service_tokens_service_token_view_1"))?,
         tenant_external_id: row.try_get("tenant_external_id")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,

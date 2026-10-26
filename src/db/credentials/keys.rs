@@ -462,7 +462,8 @@ impl Database {
         let account_id = Uuid::now_v7();
         let key_id = Uuid::now_v7();
         let issued = crypto::issue_credential(key_id, pepper);
-        let policy_json = serde_json::to_string(&input.policy).map_err(|_| AppError::internal("keys_create_key_with_source_1"))?;
+        let policy_json = serde_json::to_string(&input.policy)
+            .map_err(|_| AppError::internal("keys_create_key_with_source_1"))?;
         let initial_balance_micros = decimal_to_micros(input.initial_balance)?;
         let mut tx = self.begin_write_transaction().await?;
 
@@ -638,7 +639,8 @@ impl Database {
         policy: KeyPolicy,
     ) -> Result<KeyPolicy, AppError> {
         validate_key_policy(&policy)?;
-        let policy_json = serde_json::to_string(&policy).map_err(|_| AppError::internal("keys_update_key_policy_1"))?;
+        let policy_json = serde_json::to_string(&policy)
+            .map_err(|_| AppError::internal("keys_update_key_policy_1"))?;
         let result = sqlx::query(
             "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND status = 'active'",
         )
@@ -732,7 +734,8 @@ impl Database {
         .await?;
         let response = IssuedKey {
             key_id,
-            account_id: Uuid::parse_str(&account_id).map_err(|_| AppError::internal("keys_rotate_key_1"))?,
+            account_id: Uuid::parse_str(&account_id)
+                .map_err(|_| AppError::internal("keys_rotate_key_1"))?,
             alias,
             currency,
             credential_generation: generation,
@@ -880,8 +883,8 @@ impl Database {
         .await?
         .ok_or(AppError::NotFound)?;
         let policy_json: String = context.try_get("policy_json")?;
-        let policy: KeyPolicy =
-            serde_json::from_str(&policy_json).map_err(|_| AppError::internal("keys_key_limit_snapshot_1"))?;
+        let policy: KeyPolicy = serde_json::from_str(&policy_json)
+            .map_err(|_| AppError::internal("keys_key_limit_snapshot_1"))?;
         let key_reserved_micros: i64 = context.try_get("key_reserved_micros")?;
         let settled_lifetime_micros: i64 = context.try_get("settled_lifetime_micros")?;
         let daily_settled: i64 = sqlx::query(
@@ -1218,7 +1221,9 @@ fn provisioned_cloud_credential_from_stable_row(
     let key_id = parse_uuid(row.try_get("id")?)?;
     let account_id = parse_uuid(row.try_get("account_id")?)?;
     let fingerprint: Option<String> = row.try_get("fingerprint")?;
-    let fingerprint = fingerprint.ok_or(AppError::internal("keys_provisioned_cloud_credential_from_stable_row_1"))?;
+    let fingerprint = fingerprint.ok_or(AppError::internal(
+        "keys_provisioned_cloud_credential_from_stable_row_1",
+    ))?;
     let status: String = row.try_get("status")?;
     let generation: i64 = row.try_get("credential_generation")?;
     let generation_active = row.try_get::<i64, _>("generation_active")? != 0;
@@ -1241,7 +1246,9 @@ fn provisioned_cloud_credential_from_stable_row(
                     || issued.fingerprint != fingerprint
                     || secret_fingerprint != fingerprint
                 {
-                    return Err(AppError::internal("keys_provisioned_cloud_credential_from_stable_row_2"));
+                    return Err(AppError::internal(
+                        "keys_provisioned_cloud_credential_from_stable_row_2",
+                    ));
                 }
                 Ok(issued.key)
             })
@@ -1313,7 +1320,8 @@ fn managed_key_view(row: AnyRow) -> Result<ManagedKeyView, AppError> {
         credential_copy_available: row.try_get::<i64, _>("credential_copy_available")? != 0,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
-        policy: serde_json::from_str(&policy_json).map_err(|_| AppError::internal("keys_managed_key_view_1"))?,
+        policy: serde_json::from_str(&policy_json)
+            .map_err(|_| AppError::internal("keys_managed_key_view_1"))?,
         available_balance: micros_to_decimal_string(row.try_get("available_micros")?),
         reserved_balance: micros_to_decimal_string(row.try_get("reserved_micros")?),
     })

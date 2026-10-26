@@ -26,9 +26,8 @@ pub(crate) enum GenerationProtocolAdapter {
 
 impl GenerationProtocolAdapter {
     pub(crate) fn for_route(route: &ResolvedUpstream) -> Result<Self, AppError> {
-        Self::detect(&route.driver, &route.config, &route.upstream_model).ok_or_else(|| {
-            AppError::upstream("generation_driver_cannot_execute_asynchronous_jobs")
-        })
+        Self::detect(&route.driver, &route.config, &route.upstream_model)
+            .ok_or_else(|| AppError::upstream("generation_driver_cannot_execute_asynchronous_jobs"))
     }
 
     pub(crate) fn detect(driver: &str, config: &Value, upstream_model: &str) -> Option<Self> {

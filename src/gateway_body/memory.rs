@@ -499,7 +499,8 @@ pub(crate) fn json_encoded_length(
         }
     }
     let mut count = Count(0);
-    serde_json::to_writer(&mut count, value).map_err(|_| crate::error::AppError::internal("memory_flush_1"))?;
+    serde_json::to_writer(&mut count, value)
+        .map_err(|_| crate::error::AppError::internal("memory_flush_1"))?;
     Ok(count.0)
 }
 
@@ -661,8 +662,11 @@ mod tests {
         for _ in 0..4 {
             let request = budget.reservation();
             assert!(request.try_grow(1024, 3));
-            assert!(request
-                .finalize_request(tokio::time::Instant::now() + std::time::Duration::from_secs(1)));
+            assert!(
+                request.finalize_request(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(1)
+                )
+            );
             assert!(request.reserve_buffered_response(
                 16 * 1024 * 1024,
                 tokio::time::Instant::now() + std::time::Duration::from_secs(1)

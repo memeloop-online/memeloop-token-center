@@ -74,7 +74,9 @@ impl Database {
     ) -> Result<GenerationJobView, AppError> {
         match self.create_generation_job_idempotent(input, None).await? {
             CreateGenerationJobResult::Created(job) => Ok(job),
-            CreateGenerationJobResult::Replayed(_) => Err(AppError::internal("jobs_create_generation_job_1")),
+            CreateGenerationJobResult::Replayed(_) => {
+                Err(AppError::internal("jobs_create_generation_job_1"))
+            }
         }
     }
 
@@ -522,7 +524,9 @@ impl Database {
         if indeterminate {
             Ok(AttachGenerationJobResult::Indeterminate)
         } else {
-            Err(AppError::internal("jobs_attach_generation_job_request_staged_1"))
+            Err(AppError::internal(
+                "jobs_attach_generation_job_request_staged_1",
+            ))
         }
     }
 
@@ -1047,12 +1051,18 @@ impl Database {
             .transpose()?;
         let staged_assets = row
             .try_get::<Option<String>, _>("staged_assets_json")?
-            .map(|value| serde_json::from_str(&value).map_err(|_| AppError::internal("jobs_claim_generation_job_1")))
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|_| AppError::internal("jobs_claim_generation_job_1"))
+            })
             .transpose()?;
         Ok(Some(GenerationJobWork {
             routing_snapshot: row
                 .try_get::<Option<String>, _>("routing_snapshot")?
-                .map(|value| serde_json::from_str(&value).map_err(|_| AppError::internal("jobs_claim_generation_job_2")))
+                .map(|value| {
+                    serde_json::from_str(&value)
+                        .map_err(|_| AppError::internal("jobs_claim_generation_job_2"))
+                })
                 .transpose()?,
             job_id: parse_uuid(row.try_get("id")?)?,
             created_at: row.try_get("created_at")?,
@@ -1135,8 +1145,8 @@ impl Database {
             return Ok(None);
         }
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::internal("jobs_load_generation_upstream_snapshot_1"))?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("jobs_load_generation_upstream_snapshot_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -1298,7 +1308,8 @@ impl Database {
         worker_id: &str,
         staged: &GenerationStagedAssets,
     ) -> Result<(), AppError> {
-        let staged_json = serde_json::to_string(staged).map_err(|_| AppError::internal("jobs_save_generation_staged_assets_1"))?;
+        let staged_json = serde_json::to_string(staged)
+            .map_err(|_| AppError::internal("jobs_save_generation_staged_assets_1"))?;
         generation_update_claimed(
             sqlx::query(
                 "UPDATE generation_jobs SET staged_assets_json = $1, updated_at = $2 WHERE id = $3 AND lease_owner = $4 AND status = 'running' AND upstream_job_id IS NOT NULL AND staged_assets_json IS NULL",
@@ -1338,7 +1349,8 @@ impl Database {
             ));
         }
         let now = unix_millis();
-        let staged_json = serde_json::to_string(staged).map_err(|_| AppError::internal("jobs_save_generation_staged_assets_staged_1"))?;
+        let staged_json = serde_json::to_string(staged)
+            .map_err(|_| AppError::internal("jobs_save_generation_staged_assets_staged_1"))?;
         let mut transaction = self.pool.begin().await?;
         let saved = sqlx::query(
             "UPDATE generation_jobs SET staged_assets_json = $1, updated_at = $2 WHERE id = $3 AND lease_owner = $4 AND status = 'running' AND upstream_job_id IS NOT NULL AND staged_assets_json IS NULL",
@@ -1492,7 +1504,9 @@ async fn fail_preparing_generation_in_transaction(
         enforcement_mode: EnforcementMode::from_storage(
             row.try_get::<String, _>("enforcement_mode")?.as_str(),
         )
-        .ok_or(AppError::internal("jobs_fail_preparing_generation_in_transaction_1"))?,
+        .ok_or(AppError::internal(
+            "jobs_fail_preparing_generation_in_transaction_1",
+        ))?,
         reserved_micros: row.try_get("reserved_micros")?,
         input_micros_per_million: 0,
         output_micros_per_million: 0,
@@ -1503,7 +1517,9 @@ async fn fail_preparing_generation_in_transaction(
     if reservation_status == "reserved" {
         settle_token_usage_in_transaction(tx, &reservation, &TokenUsage::default(), now).await?;
     } else if actual_micros != Some(0) {
-        return Err(AppError::internal("jobs_fail_preparing_generation_in_transaction_2"));
+        return Err(AppError::internal(
+            "jobs_fail_preparing_generation_in_transaction_2",
+        ));
     }
     let failed = sqlx::query(
         "UPDATE generation_jobs SET status = 'failed', billed_units = 0, cost_micros = 0, error_code = $1, completed_at = $2, updated_at = $3, lease_owner = NULL, lease_expires_at = NULL, request_object = $4 WHERE id = $5 AND status = 'preparing'",
@@ -1545,7 +1561,8 @@ pub(super) fn generation_job_view(row: AnyRow) -> Result<GenerationJobView, AppE
     let result_json: Option<String> = row.try_get("result_json")?;
     let mut result = result_json
         .map(|value| {
-            serde_json::from_str::<serde_json::Value>(&value).map_err(|_| AppError::internal("jobs_generation_job_view_1"))
+            serde_json::from_str::<serde_json::Value>(&value)
+                .map_err(|_| AppError::internal("jobs_generation_job_view_1"))
         })
         .transpose()?;
     if let Some(result) = result.as_mut().and_then(serde_json::Value::as_object_mut) {

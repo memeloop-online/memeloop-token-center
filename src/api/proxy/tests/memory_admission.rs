@@ -97,14 +97,11 @@ async fn source_backed_conversation_releases_all_raw_request_permits() {
     };
     let combined_budget = crate::gateway_body::memory::ProxyMemoryBudget::new(320 * 1024);
     let combined_memory = combined_budget.reservation();
-    assert!(
-        !combined_conversation
-            .reserve_for_buffered_response(
-                &combined_memory,
-                64 * 1024,
-                tokio::time::Instant::now(),
-            )
-    );
+    assert!(!combined_conversation.reserve_for_buffered_response(
+        &combined_memory,
+        64 * 1024,
+        tokio::time::Instant::now(),
+    ));
     assert_eq!(combined_budget.snapshot().0, 0);
 
     // Source-backed native streams have released all raw working copies before
@@ -199,9 +196,7 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     let held = fixture.state.proxy_memory_budget.reservation();
     let retained_partition = fixture.state.config.proxy_memory_budget_bytes as usize / 4;
     assert!(held.try_grow(retained_partition, 1));
-    assert!(
-        held.finalize_request(tokio::time::Instant::now() + Duration::from_secs(1))
-    );
+    assert!(held.finalize_request(tokio::time::Instant::now() + Duration::from_secs(1)));
     let dispatched = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let signal = dispatched.clone();
     let upstream = MockServer::start().await;
@@ -293,16 +288,16 @@ async fn executed_response_rejects_memory_without_waiting_or_replaying_upstream(
     let output_len = ingress_allowance / 3 / 2 + 64 * 1024;
     let upstream_body = completed_codex_sse(&"x".repeat(output_len));
     assert!(
-        upstream_body.len().saturating_mul(crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT)
+        upstream_body
+            .len()
+            .saturating_mul(crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT)
             > ingress_allowance,
         "declared response must not fit in the memory left after ingress"
     );
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(upstream_body, "text/event-stream"),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_raw(upstream_body, "text/event-stream"))
         .expect(1)
         .mount(&upstream)
         .await;
@@ -338,10 +333,7 @@ async fn executed_response_rejects_memory_without_waiting_or_replaying_upstream(
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
     let body = String::from_utf8(bytes.to_vec()).unwrap();
-    assert!(
-        body.contains("upstream_response_memory_capacity"),
-        "{body}"
-    );
+    assert!(body.contains("upstream_response_memory_capacity"), "{body}");
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     let rows = tokio::time::timeout(Duration::from_secs(3), async {
         loop {

@@ -478,7 +478,8 @@ async fn upload(
             attempt.object_locator.clone()
         };
         if stored.object_locator != expected_locator
-            || stored.size_bytes != u64::try_from(total).map_err(|_| AppError::internal("upload_upload_1"))?
+            || stored.size_bytes
+                != u64::try_from(total).map_err(|_| AppError::internal("upload_upload_1"))?
             || stored.blake3_digest != digest.finalize().to_hex().as_str()
         {
             return Err(AppError::internal("upload_upload_6"));
@@ -676,7 +677,12 @@ mod tests {
             None
         );
         assert!(matches!(
-            observe_claim(async { Err::<Option<()>, _>(AppError::internal("upload_empty_claim_and_database_error_remain_distinct_1")) }).await,
+            observe_claim(async {
+                Err::<Option<()>, _>(AppError::internal(
+                    "upload_empty_claim_and_database_error_remain_distinct_1",
+                ))
+            })
+            .await,
             Err(AppError::Internal { .. })
         ));
     }

@@ -520,7 +520,9 @@ async fn poll_codex_device_login_at(
     let token = if let Some(token) = state.issued_token.clone() {
         token
     } else {
-        let device_token = state.device_token.as_ref().ok_or(AppError::internal("codex_device_poll_codex_device_login_at_1"))?;
+        let device_token = state.device_token.as_ref().ok_or(AppError::internal(
+            "codex_device_poll_codex_device_login_at_1",
+        ))?;
         state.exchange_dispatched = true;
         db.replace_oauth_login_poll_state(
             state.session_id,

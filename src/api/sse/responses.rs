@@ -471,8 +471,11 @@ impl ResponsesStreamingSanitizer {
             self.terminal_hold.begin();
         }
         if failure {
-            self.append_output(output, &safe_failure_event("upstream_rejected", "response_failed"))
-                .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
+            self.append_output(
+                output,
+                &safe_failure_event("upstream_rejected", "response_failed"),
+            )
+            .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
         } else {
             self.append_safe_sse_fields(&event, output)?;
         }

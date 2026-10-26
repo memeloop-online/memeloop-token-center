@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     collections::BTreeSet,
     ffi::OsString,
@@ -8,8 +10,6 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};

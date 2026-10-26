@@ -52,8 +52,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::internal("resolver_reload_prepared_upstream_snapshot_1"))?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("resolver_reload_prepared_upstream_snapshot_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -105,8 +105,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::internal("resolver_reload_persisted_generation_upstream_1"))?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("resolver_reload_persisted_generation_upstream_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -456,7 +456,9 @@ impl Database {
         };
         let config_json: String = row.try_get("config_json")?;
         let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::internal("resolver_materialize_authorized_upstream_candidate_1"))?;
+            serde_json::from_str(&config_json).map_err(|_| {
+                AppError::internal("resolver_materialize_authorized_upstream_candidate_1")
+            })?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -641,7 +643,8 @@ impl RoutingCandidate {
             credential_generation: row.try_get("credential_generation")?,
             priority: row.try_get("priority")?,
             scheduling_weight,
-            probe_rank: u8::try_from(probe_rank).map_err(|_| AppError::internal("resolver_from_row_1"))?,
+            probe_rank: u8::try_from(probe_rank)
+                .map_err(|_| AppError::internal("resolver_from_row_1"))?,
         })
     }
 }

@@ -32,16 +32,16 @@ const READ_CONTROL: u32 = 0x0002_0000;
 const SYNCHRONIZE: u32 = 0x0010_0000;
 const FILE_GENERIC_READ: u32 =
     READ_CONTROL | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | FILE_READ_EA | SYNCHRONIZE;
-const FILE_GENERIC_WRITE: u32 =
-    READ_CONTROL | FILE_ADD_FILE | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | FILE_ADD_SUBDIRECTORY
-        | SYNCHRONIZE;
+const FILE_GENERIC_WRITE: u32 = READ_CONTROL
+    | FILE_ADD_FILE
+    | FILE_WRITE_ATTRIBUTES
+    | FILE_WRITE_EA
+    | FILE_ADD_SUBDIRECTORY
+    | SYNCHRONIZE;
 const READ_DIRECTORY_ACCESS: u32 =
     READ_CONTROL | FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
-const DIRECTORY_ACCESS: u32 = READ_DIRECTORY_ACCESS
-    | FILE_GENERIC_WRITE
-    | FILE_DELETE_CHILD
-    | DELETE
-    | FILE_WRITE_ATTRIBUTES;
+const DIRECTORY_ACCESS: u32 =
+    READ_DIRECTORY_ACCESS | FILE_GENERIC_WRITE | FILE_DELETE_CHILD | DELETE | FILE_WRITE_ATTRIBUTES;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
@@ -146,17 +146,9 @@ unsafe extern "system" {
         flags: u32,
         template: isize,
     ) -> isize;
-    fn GetFileInformationByHandle(
-        handle: isize,
-        information: *mut ByHandleFileInformation,
-    ) -> i32;
+    fn GetFileInformationByHandle(handle: isize, information: *mut ByHandleFileInformation) -> i32;
     fn FlushFileBuffers(handle: isize) -> i32;
-    fn GetFinalPathNameByHandleW(
-        handle: isize,
-        buffer: *mut u16,
-        size: u32,
-        flags: u32,
-    ) -> u32;
+    fn GetFinalPathNameByHandleW(handle: isize, buffer: *mut u16, size: u32, flags: u32) -> u32;
     fn SetFileInformationByHandle(
         handle: isize,
         class: i32,
@@ -489,7 +481,8 @@ pub(crate) fn read_names(parent: &Directory) -> io::Result<Vec<OsString>> {
         if status < 0 {
             return Err(nt_error(status));
         }
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len() * 8) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast::<u8>(), buffer.len() * 8) };
         let mut offset = 0usize;
         loop {
             if offset + 12 > bytes.len() {
@@ -1045,18 +1038,23 @@ fn file_attributes(handle: isize) -> io::Result<u32> {
 
 fn final_path(handle: isize) -> io::Result<PathBuf> {
     let mut buffer = vec![0u16; 1024];
-    let mut length = unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+    let mut length =
+        unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
     if length == 0 {
         return Err(io::Error::last_os_error());
     }
     if length as usize >= buffer.len() {
         buffer.resize(length as usize + 1, 0);
-        length = unsafe { GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0) };
+        length = unsafe {
+            GetFinalPathNameByHandleW(handle, buffer.as_mut_ptr(), buffer.len() as u32, 0)
+        };
         if length == 0 || length as usize >= buffer.len() {
             return Err(io::Error::last_os_error());
         }
     }
-    Ok(PathBuf::from(OsString::from_wide(&buffer[..length as usize])))
+    Ok(PathBuf::from(OsString::from_wide(
+        &buffer[..length as usize],
+    )))
 }
 
 fn flush(handle: isize) -> io::Result<()> {
@@ -1141,19 +1139,14 @@ fn current_user_sid() -> io::Result<Vec<u8>> {
         return Err(io::Error::last_os_error());
     }
     let mut buffer = vec![0u8; needed as usize];
-    let ok = unsafe {
-        GetTokenInformation(
-            token,
-            TOKEN_USER,
-            buffer.as_mut_ptr(),
-            needed,
-            &mut needed,
-        )
-    };
+    let ok =
+        unsafe { GetTokenInformation(token, TOKEN_USER, buffer.as_mut_ptr(), needed, &mut needed) };
     if ok == 0 {
         return Err(io::Error::last_os_error());
     }
-    let sid_pointer = usize::from_ne_bytes(buffer[..std::mem::size_of::<usize>()].try_into().unwrap()) as *const u8;
+    let sid_pointer =
+        usize::from_ne_bytes(buffer[..std::mem::size_of::<usize>()].try_into().unwrap())
+            as *const u8;
     if sid_pointer.is_null() {
         return Err(io::Error::other("current user token has no SID"));
     }

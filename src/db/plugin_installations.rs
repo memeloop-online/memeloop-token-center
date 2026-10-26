@@ -172,7 +172,9 @@ impl Database {
         attempt: &str,
         checkpoints: &std::collections::BTreeMap<String, PackageCheckpoint>,
     ) -> Result<(), AppError> {
-        let encoded = serde_json::to_string(checkpoints).map_err(|_| AppError::internal("plugin_installations_checkpoint_plugin_installation_1"))?;
+        let encoded = serde_json::to_string(checkpoints).map_err(|_| {
+            AppError::internal("plugin_installations_checkpoint_plugin_installation_1")
+        })?;
         if checkpoints.len() > 16 || encoded.len() > 65536 {
             return Err(AppError::Forbidden);
         }

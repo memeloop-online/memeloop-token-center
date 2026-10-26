@@ -20,7 +20,8 @@ pub struct CompiledSchema(jsonschema::Validator);
 
 impl CompiledSchema {
     pub fn validate(&self, instance: &Value) -> Result<(), AppError> {
-        let encoded = serde_json::to_vec(instance).map_err(|_| AppError::internal("schema_validate_1"))?;
+        let encoded =
+            serde_json::to_vec(instance).map_err(|_| AppError::internal("schema_validate_1"))?;
         if encoded.len() > MAX_INSTANCE_BYTES {
             return Err(AppError::BadRequest(
                 "JSON Schema instance exceeds the 1 MiB limit".into(),

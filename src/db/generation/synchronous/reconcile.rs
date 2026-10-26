@@ -128,9 +128,10 @@ impl Database {
             .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).execute(&mut *tx).await?;
         let credential = sqlx::query("SELECT c.scopes_json, c.tenant_external_id FROM service_credentials c JOIN service_principals s ON s.id = c.service_principal_id AND s.credential_generation = c.generation WHERE s.id = $1 AND c.generation = $2 AND s.status = 'active' AND c.revoked_at IS NULL")
             .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).fetch_optional(&mut *tx).await?.ok_or(AppError::Forbidden)?;
-        let scopes: Vec<String> =
-            serde_json::from_str(&credential.try_get::<String, _>("scopes_json")?)
-                .map_err(|_| AppError::internal("reconcile_resolve_image_generation_quarantine_2"))?;
+        let scopes: Vec<String> = serde_json::from_str(
+            &credential.try_get::<String, _>("scopes_json")?,
+        )
+        .map_err(|_| AppError::internal("reconcile_resolve_image_generation_quarantine_2"))?;
         crate::db::credentials::validate_service_scopes(&scopes)
             .map_err(|_| AppError::Forbidden)?;
         if !scopes.iter().any(|s| s == "generations:reconcile")
@@ -284,7 +285,9 @@ fn view(row: &AnyRow) -> Result<ImageGenerationQuarantineView, AppError> {
     let completed_at: Option<i64> = row.try_get("completed_at")?;
     let resolution: Option<ImageGenerationQuarantineResolution> = row
         .try_get::<Option<String>, _>("resolution_json")?
-        .map(|value| serde_json::from_str(&value).map_err(|_| AppError::internal("reconcile_view_1")))
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|_| AppError::internal("reconcile_view_1"))
+        })
         .transpose()?;
     let revision = blake3::hash(
         &serde_json::to_vec(&(

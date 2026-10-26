@@ -413,7 +413,8 @@ pub(super) async fn put_filter_assistant_settings(
             "filter assistant settings changed; reload before saving".into(),
         ));
     }
-    let value = serde_json::to_vec(&settings).map_err(|_| AppError::internal("control_requests_put_filter_assistant_settings_2"))?;
+    let value = serde_json::to_vec(&settings)
+        .map_err(|_| AppError::internal("control_requests_put_filter_assistant_settings_2"))?;
     state
         .db
         .replace_filter_assistant_settings(
@@ -494,7 +495,8 @@ async fn load_filter_preset_state(
     else {
         return Ok(FilterPresetState::default());
     };
-    serde_json::from_slice(&value).map_err(|_| AppError::internal("control_requests_load_filter_preset_state_1"))
+    serde_json::from_slice(&value)
+        .map_err(|_| AppError::internal("control_requests_load_filter_preset_state_1"))
 }
 
 async fn store_filter_preset_state(
@@ -503,7 +505,8 @@ async fn store_filter_preset_state(
     tenant: Option<&str>,
     stored: &FilterPresetState,
 ) -> Result<(), AppError> {
-    let value = serde_json::to_vec(stored).map_err(|_| AppError::internal("control_requests_store_filter_preset_state_1"))?;
+    let value = serde_json::to_vec(stored)
+        .map_err(|_| AppError::internal("control_requests_store_filter_preset_state_1"))?;
     state
         .db
         .plugin_kv_put(

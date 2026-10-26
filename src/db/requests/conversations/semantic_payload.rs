@@ -139,8 +139,10 @@ pub(super) fn encode(
         ));
     }
     let mut bytes = Vec::with_capacity(length);
-    serde_json::to_writer(&mut bytes, request).map_err(|_| AppError::internal("semantic_payload_encode_1"))?;
-    let body = String::from_utf8(bytes).map_err(|_| AppError::internal("semantic_payload_encode_2"))?;
+    serde_json::to_writer(&mut bytes, request)
+        .map_err(|_| AppError::internal("semantic_payload_encode_1"))?;
+    let body =
+        String::from_utf8(bytes).map_err(|_| AppError::internal("semantic_payload_encode_2"))?;
     let digest = digest(
         &request_id.to_string(),
         &key.tenant_id.to_string(),
@@ -171,7 +173,10 @@ pub(super) async fn persist(
             &key.principal_id.to_string(),
             digest,
         )?;
-        if serde_json::to_string(&decoded).map_err(|_| AppError::internal("semantic_payload_persist_1"))? != body {
+        if serde_json::to_string(&decoded)
+            .map_err(|_| AppError::internal("semantic_payload_persist_1"))?
+            != body
+        {
             return Err(AppError::Conflict(
                 "conversation semantic payload changed".into(),
             ));
