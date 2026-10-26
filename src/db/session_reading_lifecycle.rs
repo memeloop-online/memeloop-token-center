@@ -16,7 +16,7 @@ pub(crate) async fn merge_session_reading_in_transaction(
         .bind(target).bind(tenant).bind(key).bind(source).execute(&mut **tx).await?;
     // Keep a destination title if one exists. A ready source title can replace
     // an unfinished destination job, whose old lease/revision is invalidated.
-    sqlx::query("INSERT INTO session_generated_titles (tenant_id, key_id, session_id, title, state, next_attempt_at, updated_at) SELECT tenant_id, key_id, $1, title, CASE WHEN title IS NULL THEN 'pending' ELSE 'ready' END, $5, $5 FROM session_generated_titles WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4 ON CONFLICT(tenant_id, key_id, session_id) DO UPDATE SET title = excluded.title, state = 'ready', revision = session_generated_titles.revision + 1, lease_owner = NULL, lease_until = NULL, attempts = 0, error_code = NULL, updated_at = excluded.updated_at WHERE session_generated_titles.title IS NULL AND excluded.title IS NOT NULL")
+    sqlx::query("INSERT INTO session_generated_titles (tenant_id, key_id, session_id, title, title_source, name_sync_id, state, next_attempt_at, updated_at) SELECT tenant_id, key_id, $1, title, title_source, name_sync_id, CASE WHEN title IS NULL THEN 'pending' ELSE 'ready' END, $5, $5 FROM session_generated_titles WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4 ON CONFLICT(tenant_id, key_id, session_id) DO UPDATE SET title = excluded.title, title_source = excluded.title_source, name_sync_id = excluded.name_sync_id, state = 'ready', revision = session_generated_titles.revision + 1, lease_owner = NULL, lease_until = NULL, attempts = 0, error_code = NULL, updated_at = excluded.updated_at WHERE session_generated_titles.title IS NULL AND excluded.title IS NOT NULL")
         .bind(target).bind(tenant).bind(key).bind(source).bind(unix_millis()).execute(&mut **tx).await?;
     sqlx::query("DELETE FROM session_generated_titles WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3")
         .bind(tenant).bind(key).bind(source).execute(&mut **tx).await?;
@@ -51,6 +51,8 @@ mod tests {
         db.finish_session_title(&task, Some("Preserved title"), None)
             .await
             .unwrap();
+        sqlx::query("UPDATE session_generated_titles SET title_source='manual' WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3")
+            .bind(tenant.to_string()).bind(key.to_string()).bind(source.to_string()).execute(&db.pool).await.unwrap();
         db.request_session_title(tenant, key, target).await.unwrap();
         let destination_task = db
             .claim_session_title(Uuid::now_v7())
@@ -105,6 +107,10 @@ mod tests {
                 .title
                 .as_deref(),
             Some("Preserved title")
+        );
+        assert_eq!(
+            db.session_title(tenant, key, target).await.unwrap().source,
+            "manual"
         );
         let moved = SessionContextScope {
             session_id: target,

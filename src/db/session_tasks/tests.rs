@@ -273,3 +273,236 @@ async fn subtree_union_days_and_related_changes_do_not_copy_facts() {
         .unwrap();
     assert_eq!(facts, 2);
 }
+
+#[tokio::test]
+async fn metadata_batches_exceed_one_hundred_and_retain_unresolved_parents() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("batches.db").display()
+    ))
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    let owner = key(&db, "batches").await;
+    let parent_thread = Uuid::now_v7();
+    let child_thread = Uuid::now_v7();
+    let edges = [ThreadParent {
+        child_thread_id: child_thread,
+        parent_thread_id: parent_thread,
+        evidence: "thread_spawn_edges".into(),
+    }];
+    assert_eq!(
+        db.import_session_parents(owner.tenant_id, &edges)
+            .await
+            .unwrap()["linked"],
+        0
+    );
+    let parent = session(&db, &owner, parent_thread).await;
+    let child = session(&db, &owner, child_thread).await;
+    let mut identities = vec![parent.clone(), child.clone()];
+    let mut threads = vec![parent_thread.to_string(), child_thread.to_string()];
+    for _ in 0..99 {
+        let thread = Uuid::now_v7();
+        identities.push(session(&db, &owner, thread).await);
+        threads.push(thread.to_string());
+    }
+    let resolved = db
+        .resolve_session_threads(owner.tenant_id, None, &threads)
+        .await
+        .unwrap();
+    assert_eq!(resolved["sessions"].as_array().unwrap().len(), 101);
+    let batch = db
+        .enqueue_unnamed_session_titles(owner.tenant_id, &identities)
+        .await
+        .unwrap();
+    assert_eq!(batch["results"].as_array().unwrap().len(), 101);
+    assert!(
+        batch["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["status"] == "already_queued")
+    );
+    assert_eq!(
+        db.import_session_parents(owner.tenant_id, &edges)
+            .await
+            .unwrap()["linked"],
+        1
+    );
+    assert_eq!(
+        db.import_session_parents(owner.tenant_id, &edges)
+            .await
+            .unwrap()["linked"],
+        0
+    );
+    for identity in &identities {
+        fact(&db, owner.tenant_id, identity, 86_400_001).await;
+    }
+    let analysis = db
+        .analyze_session_tasks(
+            owner.tenant_id,
+            &identities,
+            "related",
+            None,
+            &SessionTaskOptions {
+                include_subtrees: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(analysis["totals"]["requests"], 101);
+    assert_eq!(analysis["identities"].as_array().unwrap().len(), 101);
+    let other_key = key(&db, "batches").await;
+    let other_child = session(&db, &other_key, child_thread).await;
+    db.import_session_parents(owner.tenant_id, &edges)
+        .await
+        .unwrap();
+    fact(&db, owner.tenant_id, &other_child, 86_400_001).await;
+    assert_eq!(
+        db.analyze_session_tasks(
+            owner.tenant_id,
+            &[parent.clone()],
+            "subtree",
+            None,
+            &SessionTaskOptions::default()
+        )
+        .await
+        .unwrap()["totals"]["requests"],
+        3
+    );
+    assert_eq!(
+        db.analyze_session_tasks(
+            owner.tenant_id,
+            &[parent],
+            "subtree",
+            Some(owner.key_id),
+            &SessionTaskOptions::default()
+        )
+        .await
+        .unwrap()["totals"]["requests"],
+        2
+    );
+}
+
+#[tokio::test]
+async fn fixed_offset_days_and_idempotent_names_preserve_exact_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("offset.db").display()
+    ))
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    let owner = key(&db, "offset").await;
+    let thread = Uuid::now_v7();
+    let identity = session(&db, &owner, thread).await;
+    fact(&db, owner.tenant_id, &identity, 86_400_000 - 1).await;
+    fact(&db, owner.tenant_id, &identity, 86_400_000 + 1).await;
+    let analysis = db
+        .analyze_session_tasks(
+            owner.tenant_id,
+            &[identity.clone()],
+            "session",
+            None,
+            &SessionTaskOptions {
+                timezone_offset_minutes: Some(480),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(analysis["active_days"], 1);
+    assert_eq!(analysis["calendar_span_days"], 1);
+    assert_eq!(analysis["daily"][0]["day_start_at"], 57_600_000);
+    let revision = db
+        .session_title(owner.tenant_id, owner.key_id, identity.session_id)
+        .await
+        .unwrap()
+        .revision;
+    let update = |explicit: Uuid| SessionNameUpdate {
+        title: "同步名称".into(),
+        source: "codex".into(),
+        explicit_session_id: Some(explicit.to_string()),
+        expected_revision: revision,
+        expected_unnamed: true,
+        idempotency_key: Some("collector-revision-1".into()),
+    };
+    let named = db
+        .update_session_name(owner.tenant_id, &identity, update(thread))
+        .await
+        .unwrap();
+    let retry = db
+        .update_session_name(owner.tenant_id, &identity, update(thread))
+        .await
+        .unwrap();
+    assert_eq!(retry.revision, named.revision);
+    assert!(matches!(
+        db.update_session_name(owner.tenant_id, &identity, update(Uuid::now_v7()))
+            .await,
+        Err(AppError::NotFound)
+    ));
+    sqlx::query("UPDATE conversation_observations SET session_name='Observed' WHERE key_id=$1 AND cluster_id=$2")
+        .bind(owner.key_id.to_string()).bind(identity.session_id.to_string()).execute(&db.pool).await.unwrap();
+    assert!(matches!(
+        db.update_session_name(
+            owner.tenant_id,
+            &identity,
+            SessionNameUpdate {
+                title: "Must not overwrite".into(),
+                source: "manual".into(),
+                expected_revision: named.revision,
+                expected_unnamed: true,
+                ..Default::default()
+            }
+        )
+        .await,
+        Err(AppError::Conflict(_))
+    ));
+}
+
+#[tokio::test]
+async fn postgres_task_days_honor_iana_dst_and_unknown_costs() {
+    let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let db = Database::connect(&url).await.unwrap();
+    db.migrate().await.unwrap();
+    let owner = key(&db, &format!("task-dst-{}", Uuid::now_v7())).await;
+    let identity = session(&db, &owner, Uuid::now_v7()).await;
+    for timestamp in [
+        1_772_944_200_000,
+        1_772_947_800_000,
+        1_773_027_000_000,
+        1_773_030_600_000,
+    ] {
+        fact(&db, owner.tenant_id, &identity, timestamp).await;
+    }
+    sqlx::query("UPDATE request_stats_facts SET currency='',cost_micros=0 WHERE tenant_id=$1 AND created_at=$2")
+        .bind(owner.tenant_id.to_string()).bind(1_773_030_600_000_i64).execute(&db.pool).await.unwrap();
+    let analysis = db
+        .analyze_session_tasks(
+            owner.tenant_id,
+            &[identity],
+            "session",
+            None,
+            &SessionTaskOptions {
+                timezone: "America/New_York".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(analysis["timezone"], "America/New_York");
+    assert_eq!(analysis["active_days"], 3);
+    assert_eq!(analysis["calendar_span_days"], 3);
+    assert_eq!(analysis["daily"][1]["usage"]["requests"], 2);
+    let middle = analysis["daily"][1]["day_start_at"].as_i64().unwrap();
+    let last = analysis["daily"][2]["day_start_at"].as_i64().unwrap();
+    assert_eq!(last - middle, 23 * 3_600_000);
+    assert_eq!(analysis["totals"]["requests"], 4);
+    assert_eq!(analysis["totals"]["unknown_cost_requests"], 1);
+    assert_eq!(analysis["totals"]["costs"]["USD"], 21);
+}

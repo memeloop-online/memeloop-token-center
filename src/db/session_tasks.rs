@@ -205,6 +205,16 @@ impl Database {
         let mut tx = self.pool.begin().await?;
         lock_session_tenant(&mut tx, tenant).await?;
         require_session(&mut tx, tenant, identity).await?;
+        if update.source == "codex" {
+            let thread = update.explicit_session_id.as_deref().ok_or_else(|| {
+                AppError::BadRequest("explicit_session_id is required for codex names".into())
+            })?;
+            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE key_id = $1 AND cluster_id = $2 AND explicit_session_id = $3")
+                .bind(identity.key_id.to_string()).bind(identity.session_id.to_string()).bind(thread).fetch_one(&mut *tx).await?;
+            if matched == 0 {
+                return Err(AppError::NotFound);
+            }
+        }
         if let Some(idempotency) = &update.idempotency_key {
             let prior=sqlx::query("SELECT title,title_source FROM session_generated_titles WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3 AND name_sync_id=$4")
                 .bind(tenant.to_string()).bind(identity.key_id.to_string()).bind(identity.session_id.to_string()).bind(idempotency).fetch_optional(&mut *tx).await?;
@@ -223,15 +233,7 @@ impl Database {
                     .await;
             }
         }
-        if update.source == "codex" {
-            let thread = update.explicit_session_id.as_deref().ok_or_else(|| {
-                AppError::BadRequest("explicit_session_id is required for codex names".into())
-            })?;
-            let matched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE key_id = $1 AND cluster_id = $2 AND explicit_session_id = $3")
-                .bind(identity.key_id.to_string()).bind(identity.session_id.to_string()).bind(thread).fetch_one(&mut *tx).await?;
-            if matched == 0 {
-                return Err(AppError::NotFound);
-            }
+        if update.source == "codex" || update.expected_unnamed {
             let named: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE key_id = $1 AND cluster_id = $2 AND session_name IS NOT NULL AND TRIM(session_name) <> ''")
                 .bind(identity.key_id.to_string()).bind(identity.session_id.to_string()).fetch_one(&mut *tx).await?;
             if named > 0 {
