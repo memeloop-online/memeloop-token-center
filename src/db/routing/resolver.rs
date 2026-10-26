@@ -201,21 +201,25 @@ impl Database {
             avoid_route_account,
             selection_seed,
         } = selection;
+        // A non-healthy service probe stays eligible and sorts last. Excluding
+        // it made the probe unable to reach the same account after a failure.
         let rows = sqlx::query(
              "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight,
                      a.id AS account_id, a.driver, a.updated_at AS transport_revision,
-                     a.credential_generation
+                     a.credential_generation,
+                     CAST(CASE
+                       WHEN service_probe.status = 'healthy' THEN 0
+                       WHEN service_probe.status IS NULL THEN 1
+                       ELSE 2
+                     END AS BIGINT) AS probe_rank
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidates
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
+             LEFT JOIN upstream_service_probes service_probe
+               ON service_probe.upstream_account_id = a.id
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND r.archived_at IS NULL AND a.status = 'active'
-               AND NOT EXISTS (
-                 SELECT 1 FROM upstream_service_probes service_probe
-                 WHERE service_probe.upstream_account_id = a.id
-                   AND service_probe.status <> 'healthy'
-               )
                AND (
                  EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $4 AND g.model_route_id = r.id)
                  OR EXISTS (
@@ -496,12 +500,17 @@ struct RoutingCandidate {
     credential_generation: i64,
     priority: i64,
     scheduling_weight: i64,
+    probe_rank: u8,
 }
 
 impl RoutingCandidate {
     fn from_row(row: AnyRow) -> Result<Self, AppError> {
         let scheduling_weight: i64 = row.try_get("scheduling_weight")?;
         if !(1..=1_000_000).contains(&scheduling_weight) {
+            return Err(AppError::Internal);
+        }
+        let probe_rank: i64 = row.try_get("probe_rank")?;
+        if !(0..=2).contains(&probe_rank) {
             return Err(AppError::Internal);
         }
         Ok(Self {
@@ -512,6 +521,7 @@ impl RoutingCandidate {
             credential_generation: row.try_get("credential_generation")?,
             priority: row.try_get("priority")?,
             scheduling_weight,
+            probe_rank: u8::try_from(probe_rank).map_err(|_| AppError::Internal)?,
         })
     }
 }
@@ -535,7 +545,8 @@ impl HintDisposition {
 
 /// This boundary accepts only a mutable slice of host-authorized candidates:
 /// a policy hint can reorder, but cannot append, remove, or materialize an
-/// account. Health admission, transport validation and budget reservation
+/// account. A service probe reorders the same set and never removes an
+/// account. Cooldown admission, transport validation and budget reservation
 /// remain later host-owned checks, including for the preferred candidate.
 fn order_authorized_candidates(
     candidates: &mut [RoutingCandidate],
@@ -559,6 +570,7 @@ fn order_authorized_candidates(
         hint_rank(hint, left)
             .cmp(&hint_rank(hint, right))
             .then_with(|| avoid_rank(avoid, left).cmp(&avoid_rank(avoid, right)))
+            .then_with(|| left.probe_rank.cmp(&right.probe_rank))
             .then_with(|| left.priority.cmp(&right.priority))
             .then_with(|| {
                 weighted_rendezvous_score(key_id, selection_seed, left)
@@ -612,6 +624,7 @@ mod tests {
             credential_generation: 1,
             priority: 0,
             scheduling_weight: 100,
+            probe_rank: 0,
         }
     }
 
@@ -627,6 +640,32 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn unhealthy_probe_sorts_last_and_stays_eligible() {
+        let healthy = Uuid::from_u128(101);
+        let unknown = Uuid::from_u128(102);
+        let unhealthy = Uuid::from_u128(103);
+        let mut candidates = vec![candidate(unhealthy), candidate(unknown), candidate(healthy)];
+        candidates[0].probe_rank = 2;
+        candidates[0].priority = -100;
+        candidates[1].probe_rank = 1;
+        candidates[1].priority = -50;
+        order_authorized_candidates(
+            &mut candidates,
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            None,
+            None,
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.account_id)
+                .collect::<Vec<_>>(),
+            vec![healthy, unknown, unhealthy]
+        );
     }
 
     #[test]

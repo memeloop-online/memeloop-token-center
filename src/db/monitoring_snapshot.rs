@@ -616,8 +616,9 @@ fn upstream_health_from_row(row: &AnyRow) -> Result<(String, MonitoringHealth), 
         return Ok((name, unknown_health()));
     };
     // Candidate selection and this badge both read upstream_service_probes.
-    // No probe row stays eligible and is shown as unknown, not as receiving
-    // traffic. A non-healthy probe excludes the account and is shown as such.
+    // No probe row is unknown. A non-healthy probe stays eligible and is only
+    // ordered after healthy and unknown accounts; the badge still shows it
+    // as unhealthy.
     let probe_status: Option<String> = row.try_get("probe_status")?;
     let observed_at: Option<i64> = row.try_get("probe_checked_at")?;
     let status = if account_status != "active" {

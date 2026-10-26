@@ -1075,9 +1075,19 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
     .unwrap();
     assert!(compact["conversation"].is_null());
     assert_eq!(compact["usage"], receipt["usage"]);
-    assert_eq!(compact["financial_ack"]["receipt_id"], receipt["receipt_id"]);
-    assert_eq!(compact["financial_ack"]["request_id"], receipt["request_id"]);
-    assert!(compact["financial_ack"]["receipt_digest"].as_str().is_some());
+    assert_eq!(
+        compact["financial_ack"]["receipt_id"],
+        receipt["receipt_id"]
+    );
+    assert_eq!(
+        compact["financial_ack"]["request_id"],
+        receipt["request_id"]
+    );
+    assert!(
+        compact["financial_ack"]["receipt_digest"]
+            .as_str()
+            .is_some()
+    );
     fixture.state.pending_terminals.stop_for_test().await;
     sqlx::query("DROP TRIGGER fail_operational_terminal")
         .execute(&pool)

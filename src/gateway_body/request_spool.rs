@@ -139,16 +139,21 @@ impl RequestSpoolAdmission {
                         .lock()
                         .map_err(|_| io::Error::other("request spool ownership unavailable"))?
                         .record_written(write_bytes.len());
-                    Ok::<_, io::Error>(write_bytes)
+                    // Release the caller's frame inside the blocking section.
+                    // The join result can outlive cancellation, so it must not
+                    // keep this slice.
+                    drop(write_bytes);
+                    Ok::<_, io::Error>(())
                 });
                 #[cfg(test)]
                 if let Some(pause) = &self.usage.blocking_write {
                     pause.record(&writing);
                 }
-                let piece = writing
+                writing
                     .await
                     .map_err(|_| RequestSpoolCaptureError::Unavailable)?
                     .map_err(spool_io_error)?;
+                let piece = chunk.slice(offset..end);
                 hasher.update(&piece);
                 retained.extend_from_slice(&piece);
                 length = next;

@@ -514,7 +514,7 @@ async fn store_filter_preset_state(
         .await
 }
 
-pub(super) async fn load_filter_assistant_settings(
+pub(in crate::api) async fn load_filter_assistant_settings(
     state: &AppState,
     tenant: &str,
 ) -> Result<Option<FilterAssistantSettings>, AppError> {

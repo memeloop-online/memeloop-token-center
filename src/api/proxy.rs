@@ -816,7 +816,7 @@ pub(super) async fn proxy(
 ) -> Result<Response, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
     proxy_with_identity_and_conversation_spool(
-        state, headers, body, protocol, key, None, memory, None,
+        state, headers, body, protocol, key, None, None, memory, None,
     )
     .await
 }
@@ -837,6 +837,7 @@ pub(super) async fn proxy_spooled_responses(
         protocol,
         key,
         None,
+        None,
         memory,
         Some(spool),
     )
@@ -844,7 +845,8 @@ pub(super) async fn proxy_spooled_responses(
 }
 
 /// Internal callers must establish an explicit billing identity. A pinned route
-/// narrows normal grants; it never grants access or falls back to another route.
+/// or account narrows normal grants; it never grants access or falls back.
+#[allow(clippy::too_many_arguments)]
 pub(in crate::api) async fn proxy_with_identity(
     state: AppState,
     headers: HeaderMap,
@@ -853,6 +855,7 @@ pub(in crate::api) async fn proxy_with_identity(
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    pinned_account: Option<Uuid>,
 ) -> Result<Response, AppError> {
     proxy_with_identity_and_conversation_spool(
         state,
@@ -861,8 +864,35 @@ pub(in crate::api) async fn proxy_with_identity(
         protocol,
         key,
         pinned_route,
+        pinned_account,
         memory,
         None,
+    )
+    .await
+}
+
+/// The billing key and route grant still decide access. The account pin only
+/// keeps candidates for that account after those checks.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::api) async fn proxy_with_pinned_account(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    protocol: Protocol,
+    key: AuthenticatedKey,
+    pinned_route: Uuid,
+    pinned_account: Uuid,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+) -> Result<Response, AppError> {
+    proxy_with_identity(
+        state,
+        headers,
+        body,
+        protocol,
+        key,
+        Some(pinned_route),
+        memory,
+        Some(pinned_account),
     )
     .await
 }
@@ -875,6 +905,7 @@ async fn proxy_with_identity_and_conversation_spool(
     protocol: Protocol,
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
+    pinned_account: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 ) -> Result<Response, AppError> {
@@ -886,6 +917,7 @@ async fn proxy_with_identity_and_conversation_spool(
         protocol,
         key,
         pinned_route,
+        pinned_account,
         memory,
         conversation_spool,
         &mut cancellation,
@@ -903,6 +935,7 @@ async fn proxy_with_cancellation_guard(
     protocol: Protocol,
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
+    pinned_account: Option<Uuid>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     cancellation: &mut lifecycle::CancellationGuard,
@@ -1002,6 +1035,12 @@ async fn proxy_with_cancellation_guard(
         "authorized candidate query completed"
     );
     retain_pinned_text_candidates(&state, pinned_route, &mut candidates)?;
+    if let Some(account_id) = pinned_account {
+        candidates.retain(|candidate| candidate.account_id == account_id);
+        if candidates.is_empty() {
+            return Err(AppError::Forbidden);
+        }
+    }
     let strategy_candidates =
         crate::group_routing::candidate_snapshot_if_enabled(&state, &candidates);
     let request_context = ProxyRequestContext {
