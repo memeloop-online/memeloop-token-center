@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn codex_quota_exhaustion_fails_over_once_and_future_request_skips_until_reset() {
+async fn codex_explicit_quota_rejection_fails_over_and_is_observed_without_admission_wait() {
     let fixture = codex_route_fixture("quota-reset-failover").await;
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
@@ -11,7 +11,7 @@ async fn codex_quota_exhaustion_fails_over_once_and_future_request_skips_until_r
             "error": {"type":"usage_limit_reached", "resets_in_seconds":3600,
                 "message":"fixture private exhausted quota"}
         })))
-        .expect(1)
+        .expect(2)
         .mount(&upstream)
         .await;
     Mock::given(method("POST"))
@@ -40,11 +40,11 @@ async fn codex_quota_exhaustion_fails_over_once_and_future_request_skips_until_r
             .unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("fixture private exhausted quota"));
     }
+    fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let row = sqlx::query("SELECT last_failure_kind, cooldown_until-updated_at AS remaining FROM upstream_account_health WHERE upstream_account_id = $1")
+    let health_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1 AND consecutive_failures > 0")
         .bind(fixture.upstream_account_id.to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!(row.get::<String, _>("last_failure_kind"), "quota_exhausted");
-    assert!((3_590_000..=3_600_000).contains(&row.get::<i64, _>("remaining")));
+    assert_eq!(health_rows, 0);
     let actual: String = sqlx::query_scalar("SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(actual, standby.to_string());

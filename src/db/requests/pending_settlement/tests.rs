@@ -420,7 +420,10 @@ async fn applied_receipt_ack_requires_the_complete_persisted_conversation_key_sn
             "alias" => changed.alias.push_str("-changed"),
             "currency" => changed.currency = "EUR".into(),
             "credential_generation" => changed.credential_generation += 1,
-            "policy" => changed.policy.requests_per_minute += 1,
+            "policy" => {
+                changed.policy.requests_per_minute =
+                    Some(changed.policy.requests_per_minute.unwrap_or(0) + 1);
+            }
             "key_id" => changed.key_id = Uuid::now_v7(),
             "tenant_id" => changed.tenant_id = Uuid::now_v7(),
             "principal_id" => changed.principal_id = Uuid::now_v7(),

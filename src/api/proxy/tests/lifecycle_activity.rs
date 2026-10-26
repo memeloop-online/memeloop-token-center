@@ -42,9 +42,9 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         .update_key_policy(
             fixture.key_id,
             KeyPolicy {
-                max_concurrency: 100,
-                requests_per_minute: 1000,
-                tokens_per_minute: 10_000_000,
+                max_concurrency: Some(100),
+                requests_per_minute: Some(1000),
+                tokens_per_minute: Some(10_000_000),
                 ..KeyPolicy::default()
             },
         )
@@ -111,15 +111,32 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         assert!(String::from_utf8_lossy(&bytes).contains("response.completed"));
     }
     server.await.unwrap();
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        fixture.state.proxy_lifecycles.wait_for_idle(),
-    )
+    tokio::time::timeout(Duration::from_secs(5), async {
+        fixture.state.proxy_lifecycles.wait_for_idle().await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let owner = Uuid::now_v7();
+        loop {
+            let ready: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records q LEFT JOIN proxy_operational_terminals o ON o.request_id = q.id LEFT JOIN pending_proxy_settlements p ON p.request_id = q.id WHERE q.key_id = $1 AND (q.completed_at IS NOT NULL OR (o.completed_at IS NOT NULL AND p.unknown_reason IS NOT NULL))")
+                .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+            if ready == 65 {
+                for request_id in fixture.state.db.claim_terminal_projection_tasks(owner, 32).await.unwrap() {
+                    assert!(fixture.state.db.project_claimed_terminal_projection_task(owner, request_id).await.unwrap());
+                }
+                let finished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE key_id = $1 AND event_kind = 'finished'")
+                    .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+                if finished == 64 {
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+        pool.close().await;
+    })
     .await
     .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let rows = sqlx::query(
-        "SELECT q.status_code, r.status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id",
+        "SELECT COALESCE(q.status_code, o.status_code) AS status_code, q.completed_at, q.status_code AS financial_status, r.status, r.actual_micros, p.state AS pending_state, p.unknown_reason, o.error_code AS operational_error, o.completed_at AS operational_completed, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id LEFT JOIN pending_proxy_settlements p ON p.request_id = q.id LEFT JOIN proxy_operational_terminals o ON o.request_id = q.id",
     )
     .fetch_all(&pool)
     .await
@@ -130,13 +147,44 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         let status = row.get::<i64, _>("status_code");
         assert!(status == 200 || status == 499, "terminal status {status}");
         cancelled += usize::from(status == 499);
-        assert_eq!(row.get::<String, _>("status"), "settled");
-        assert_eq!(row.get::<i64, _>("ledger_count"), 1);
-        assert_eq!(row.get::<i64, _>("event_count"), 1);
+        if status == 499 {
+            assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
+            assert_eq!(row.get::<Option<i64>, _>("financial_status"), None);
+            assert_eq!(row.get::<String, _>("status"), "reserved");
+            assert_eq!(row.get::<Option<i64>, _>("actual_micros"), None);
+            assert_eq!(row.get::<String, _>("pending_state"), "pending");
+            assert_eq!(
+                row.get::<String, _>("unknown_reason"),
+                "authoritative_usage_unavailable"
+            );
+            assert_eq!(
+                row.get::<String, _>("operational_error"),
+                "client_cancelled"
+            );
+            assert!(row.get::<Option<i64>, _>("operational_completed").is_some());
+            assert_eq!(row.get::<i64, _>("ledger_count"), 0);
+            assert_eq!(row.get::<i64, _>("event_count"), 0);
+        } else {
+            assert!(row.get::<Option<i64>, _>("completed_at").is_some());
+            assert_eq!(row.get::<String, _>("status"), "settled");
+            assert_eq!(row.get::<i64, _>("ledger_count"), 1);
+            assert_eq!(row.get::<i64, _>("event_count"), 1);
+        }
     }
     assert_eq!(cancelled, 1);
     assert_eq!(fixture.state.proxy_lifecycles.active(), 0);
     drain_archive_capture(&fixture).await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
+            if used == 0 && retained == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live journal must reap durable terminal payloads and release every memory permit");
     assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
     pool.close().await;
 }

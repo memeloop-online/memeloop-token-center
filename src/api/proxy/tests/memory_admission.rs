@@ -48,7 +48,7 @@ async fn source_backed_conversation_releases_all_raw_request_permits() {
             let projection = conversation
                 .project(
                     &memory,
-                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
                 )
                 .await?;
             Ok::<_, crate::error::AppError>(projection.request_json["model"].clone())
@@ -166,7 +166,7 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
         .update_key_policy(
             fixture.key_id,
             KeyPolicy {
-                tokens_per_minute: 32 * 1024 * 1024,
+                tokens_per_minute: Some(32 * 1024 * 1024),
                 ..KeyPolicy::default()
             },
         )

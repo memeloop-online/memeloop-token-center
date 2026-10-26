@@ -195,6 +195,20 @@ fn write_record(directory: &Path, record: &EarlyRequestTerminal) -> std::io::Res
     if bytes.len() as u64 > MAX_RECORD_BYTES {
         return Err(std::io::Error::other("early terminal metadata limit"));
     }
+    publish_record(
+        directory,
+        record.request_id,
+        &bytes,
+        Some(MAX_PENDING_RECORDS),
+    )
+}
+
+pub(crate) fn publish_record(
+    directory: &Path,
+    request_id: uuid::Uuid,
+    bytes: &[u8],
+    capacity: Option<usize>,
+) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -213,16 +227,16 @@ fn write_record(directory: &Path, record: &EarlyRequestTerminal) -> std::io::Res
             return Err(std::io::Error::other("early terminal directory symlink"));
         }
     }
-    if std::fs::read_dir(directory)?
-        .take(MAX_PENDING_RECORDS)
-        .count()
-        >= MAX_PENDING_RECORDS
-    {
+    if capacity.is_some_and(|limit| {
+        std::fs::read_dir(directory)
+            .map(|entries| entries.take(limit).count() >= limit)
+            .unwrap_or(true)
+    }) {
         return Err(std::io::Error::other("early terminal journal capacity"));
     }
-    let path = directory.join(format!("{}.json", record.request_id));
+    let path = directory.join(format!("{request_id}.json"));
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    temporary.write_all(&bytes)?;
+    temporary.write_all(bytes)?;
     temporary.as_file().sync_all()?;
     match temporary.persist_noclobber(&path) {
         Ok(_) => {}

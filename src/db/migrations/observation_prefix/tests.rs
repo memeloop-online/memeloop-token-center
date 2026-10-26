@@ -52,16 +52,23 @@ async fn conversion_contract(url: &str) {
             .execute(&database.pool).await.unwrap();
         historical_requests.push((request, key.tenant_id, empty));
     }
-    sqlx::query("DROP TABLE pending_proxy_settlements")
+    sqlx::query("DROP TABLE proxy_operational_terminals")
         .execute(&database.pool)
         .await
         .unwrap();
     for statement in [
+        "ALTER TABLE transport_proxy_groups DROP COLUMN probe_url",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN probe_attempts",
+        "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
         "DROP TABLE application_plugin_release_resolutions",
         "DROP TABLE session_generated_titles",
         "DROP TABLE session_response_summaries",
         "DROP TABLE plugin_installer_network_snapshots",
         "DROP TABLE plugin_installer_network_preferences",
+        "DROP TABLE pending_proxy_settlements",
+        "DROP TABLE upstream_service_probes",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_status",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_checked_at",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)

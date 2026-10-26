@@ -1,7 +1,7 @@
 export function transportProxyGroupCopy(locale: string) {
   return locale.startsWith('zh') ? {
     title: '代理组', manage: '管理代理组', chooseGroup: '选择代理组',
-    purpose: '为账号设置多个备用网络出口。系统优先沿用当前出口，无法建立连接时再尝试其他出口。',
+    purpose: '为账号设置多个备用网络出口。请求继续使用当前出口。只有该组配置的独立可达性探测按设定次数失败后，之后的请求才会改用下一个出口。',
     selectTenant: '请先选择要管理的租户。', checking: '正在加载代理组入口…',
     denied: '你没有管理代理组的权限，请联系管理员开通。',
     unavailable: '暂时无法打开代理组，请重试。', retry: '重试',
@@ -31,6 +31,9 @@ export function transportProxyGroupCopy(locale: string) {
     replaceAddress: '替换代理地址（留空保留原值）', requiredAddress: '私网代理地址（必填）', address: '私网代理地址',
     removeMember: '移除出口', addressHint: '使用私网或集群内服务的socks5h地址，不要重复添加。保存后可查看协议、主机和端口；认证信息不会再次显示。',
     addMember: '添加出口', replacement: '移除当前出口后使用', selectSavedMember: '请选择已保存的备用出口', unnamed: '未命名出口',
+    probeUrl: '探测地址', probeAttempts: '探测次数', probeNow: '立即探测', probeQueued: '已安排独立探测。探测不携带客户请求，结果会在下一次刷新后显示。',
+    lastProbe: (status: string, time: string) => `上次独立探测：${status === 'healthy' ? '可达' : '不可达'} · ${time}`,
+    probeHint: '探测使用单独连接，不携带客户请求。留空则不自动更换出口。任意 HTTP 响应都表示当前出口可达；只有连续这么多次连不上探测地址，后续请求才会改用下一个出口。',
     replacementHint: '若要换成新出口，请先添加并保存，再移除旧出口。', save: '保存代理组', cancelEdit: '取消编辑',
     discardEdit: '放弃尚未保存的代理组修改？', saved: '代理组配置已保存。',
     account: '账号', selectAccount: '请选择账号', noAccounts: '当前租户没有可设置代理组的Codex订阅账号。',
@@ -53,7 +56,7 @@ export function transportProxyGroupCopy(locale: string) {
     },
   } : {
     title: 'Proxy groups', manage: 'Manage proxy groups', chooseGroup: 'Choose proxy group',
-    purpose: 'Give an account backup network exits. The current exit stays selected; another is tried only when a connection cannot be established.',
+    purpose: 'Give an account backup network exits. Requests keep the current exit. A later request changes exit only after the group’s separate reachability probe fails the configured number of times.',
     selectTenant: 'Select the tenant you want to manage.', checking: 'Loading proxy group access…',
     denied: 'You do not have permission to manage proxy groups. Contact an administrator.',
     unavailable: 'Proxy groups cannot be opened right now. Try again.', retry: 'Retry',
@@ -83,6 +86,9 @@ export function transportProxyGroupCopy(locale: string) {
     replaceAddress: 'Replacement proxy address (leave blank to keep it)', requiredAddress: 'Private proxy address (required)', address: 'Private proxy address',
     removeMember: 'Remove exit', addressHint: 'Use a private or in-cluster socks5h address, without duplicates. Saved protocol, host and port remain visible; authentication details are never shown again.',
     addMember: 'Add exit', replacement: 'Exit to use after removing the current one', selectSavedMember: 'Choose a saved backup exit', unnamed: 'Unnamed exit',
+    probeUrl: 'Probe address', probeAttempts: 'Probe attempts', probeNow: 'Probe now', probeQueued: 'An independent probe is queued. It does not carry a customer request; the result appears after the next refresh.',
+    lastProbe: (status: string, time: string) => `Last independent probe: ${status === 'healthy' ? 'reachable' : 'unreachable'} · ${time}`,
+    probeHint: 'The probe uses its own connection and does not carry a customer request. Leave the address empty to keep the current exit. Any HTTP response means this exit can reach the address; only this many consecutive connection failures move later requests to the next exit.',
     replacementHint: 'To use a new exit, add and save it before removing the old one.', save: 'Save proxy group', cancelEdit: 'Cancel editing',
     discardEdit: 'Discard unsaved proxy group changes?', saved: 'Proxy group configuration saved.',
     account: 'Account', selectAccount: 'Choose an account', noAccounts: 'This tenant has no Codex subscription accounts that can use proxy groups.',

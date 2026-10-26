@@ -141,6 +141,7 @@ async fn subset_removal_restart_last_broken_plugin_and_replay() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(receipt["revision"], 2);
     let restarted = AppState::initialize(config.clone()).await.unwrap();
+    restarted.refresh_application_plugins().await.unwrap();
     let pinned = restarted.clone().pin_application_plugins().await.unwrap();
     assert_eq!(pinned.plugins.manifests().len(), 1);
     assert_eq!(pinned.plugins.manifests()[0].id, "retained-plugin");
@@ -175,6 +176,7 @@ async fn subset_removal_restart_last_broken_plugin_and_replay() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(empty["revision"], 3);
     let final_state = AppState::initialize(config).await.unwrap();
+    final_state.refresh_application_plugins().await.unwrap();
     assert!(
         final_state
             .clone()
@@ -379,6 +381,7 @@ async fn concurrent_removals_never_rebase_onto_each_other() {
         authority.status().await.unwrap().current.unwrap().revision,
         2
     );
+    state.refresh_application_plugins().await.unwrap();
     assert_eq!(
         state
             .clone()

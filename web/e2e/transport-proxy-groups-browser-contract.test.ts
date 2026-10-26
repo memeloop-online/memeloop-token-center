@@ -404,8 +404,8 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await assertWorkspaceFocus(page);
       const fixture = await page.evaluate(() => window.proxyGroupFixture);
       assert.deepEqual(fixture.writes.map(write => write.method), ['POST', 'PUT', 'PUT', 'DELETE', 'DELETE']);
-      assert.deepEqual(fixture.writes[0].body, { tenant_external_id: 'fixture', name: '研发出口组', members: [{ label: '主出口', proxy_url: privateProxySecret }] });
-      assert.deepEqual(fixture.writes[1].body, { tenant_external_id: 'fixture', name: '共享出口组', expected_version: 1, members: [{ id: 'raw-member-id-0', label: '主出口' }] });
+      assert.deepEqual(fixture.writes[0].body, { tenant_external_id: 'fixture', name: '研发出口组', probe_url: null, probe_attempts: 2, members: [{ label: '主出口', proxy_url: privateProxySecret }] });
+      assert.deepEqual(fixture.writes[1].body, { tenant_external_id: 'fixture', name: '共享出口组', expected_version: 1, probe_url: null, probe_attempts: 2, members: [{ id: 'raw-member-id-0', label: '主出口' }] });
       assert.deepEqual(fixture.writes[2].body, { tenant_external_id: 'fixture', expected_binding_version: 0, expected_credential_generation: 7, expected_updated_at: 100, group_id: 'raw-group-id', expected_group_version: 2, initial_member_id: 'raw-member-id-0' });
       assert.deepEqual(fixture.writes[3].body, { tenant_external_id: 'fixture', expected_binding_version: 1, expected_credential_generation: 8, expected_updated_at: 101, expected_group_version: 2, single_proxy_member_id: 'raw-member-id-0' });
       assert.deepEqual(fixture.writes[4].body, { tenant_external_id: 'fixture', expected_version: 2 });

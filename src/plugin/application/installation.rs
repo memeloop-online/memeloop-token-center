@@ -543,13 +543,6 @@ impl ApplicationPlugins {
         .await?;
         if let Some(resolution) = &resolution {
             self.verify_installation_base(resolution).await?;
-            if let Some(retained) = &resolution.retained {
-                super::retained_installation::retain_approved_installations(
-                    retained,
-                    &inventory_root,
-                )
-                .await?;
-            }
         }
         for reference in &input.packages {
             bounded_install_phase(PACKAGE_DEADLINE, async {
@@ -636,11 +629,31 @@ impl ApplicationPlugins {
             .await?;
         }
         bounded_install_phase(STORAGE_DEADLINE, async {
+            // Install into this fresh attempt before copying the base. Only IDs
+            // from successfully signature-verified packages may replace grants;
+            // release metadata and the requested repository name are not IDs.
+            let retained = retained_after_verified_packages(
+                resolution
+                    .as_ref()
+                    .and_then(|value| value.retained.as_ref()),
+                &input.packages,
+                &checkpoints,
+                &inventory_root,
+                &trust,
+            )
+            .await?;
+            if let Some(retained) = &retained {
+                super::retained_installation::retain_approved_installations(
+                    retained,
+                    &inventory_root,
+                )
+                .await?;
+            }
             let runtime = self.review_runtime(inventory_root).await?;
+            if let Some(retained) = &retained {
+                super::retained_installation::verify_retained_grants(retained, &runtime)?;
+            }
             if let Some(resolution) = &resolution {
-                if let Some(retained) = &resolution.retained {
-                    super::retained_installation::verify_retained_grants(retained, &runtime)?;
-                }
                 self.verify_installation_base(resolution).await?;
             }
             let digest = review_digest(&runtime, &trust)?;
@@ -728,11 +741,6 @@ impl ApplicationPlugins {
             .plugin_root
             .join(inventory_attempt_storage_id(&record.attempt_id)?);
         let runtime = self.review_runtime(root.clone()).await?;
-        if let Some(resolution) = &resolution
-            && let Some(retained) = &resolution.retained
-        {
-            super::retained_installation::verify_retained_grants(retained, &runtime)?;
-        }
         let trust = trust_digest(&policy).await?;
         if review_digest(&runtime, &trust)? != digest {
             return Err(AppError::Conflict(
@@ -746,6 +754,19 @@ impl ApplicationPlugins {
                     "installed package changed after verification".into(),
                 ));
             }
+        }
+        let retained = retained_after_verified_packages(
+            resolution
+                .as_ref()
+                .and_then(|value| value.retained.as_ref()),
+            &record.packages,
+            &record.checkpoints,
+            &root,
+            &trust,
+        )
+        .await?;
+        if let Some(retained) = &retained {
+            super::retained_installation::verify_retained_grants(retained, &runtime)?;
         }
         runtime.validate_stored_configurations().await?;
         let identities = runtime.package_identities();
@@ -769,8 +790,8 @@ impl ApplicationPlugins {
             })
             .collect::<Result<BTreeMap<_, _>, AppError>>()?;
         if let Some(resolution) = &resolution {
-            if let Some(retained) = &resolution.retained {
-                // Preserve previous exact approvals without expanding them.
+            if let Some(retained) = &retained {
+                // Preserve other exact approvals; replacements need fresh approval.
                 for (id, versions) in &retained.grants {
                     grants.insert(id.clone(), versions.clone());
                 }
@@ -1342,6 +1363,36 @@ fn inventory_attempt_storage_id(attempt_id: &str) -> Result<String, AppError> {
 #[cfg(not(target_os = "linux"))]
 fn claim_inventory_root(_root: &std::path::Path, _owner: &str) -> Result<(), AppError> {
     Err(AppError::Forbidden)
+}
+
+/// Keep the frozen base intact for retries, including resolutions created before
+/// replacement installs were supported. Never derive exclusions from unverified
+/// release metadata or from arbitrary packages present in the attempt directory.
+async fn retained_after_verified_packages(
+    retained: Option<&PreinstalledInventory>,
+    packages: &[String],
+    checkpoints: &BTreeMap<String, PackageCheckpoint>,
+    root: &std::path::Path,
+    trust: &str,
+) -> Result<Option<PreinstalledInventory>, AppError> {
+    let Some(retained) = retained else {
+        return Ok(None);
+    };
+    if checkpoints.len() != packages.len() {
+        return Err(AppError::Forbidden);
+    }
+    let mut replacements = BTreeSet::new();
+    for reference in packages {
+        let checkpoint = checkpoints.get(reference).ok_or(AppError::Forbidden)?;
+        if !checkpoint_matches(root, reference, trust, checkpoint).await?
+            || !replacements.insert(checkpoint.plugin_id.clone())
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
+    let mut retained = retained.clone();
+    retained.grants.retain(|id, _| !replacements.contains(id));
+    Ok(Some(retained))
 }
 
 async fn package_checkpoint(
@@ -2370,6 +2421,7 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         .await;
         assert_eq!(status, StatusCode::OK, "{published}");
         assert_eq!(published["revision"], 2);
+        state.refresh_application_plugins().await.unwrap();
         let (status, manifests) = call(
             &state,
             "GET",
@@ -3014,6 +3066,311 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         )
         .await;
         assert!(failed.is_err(), "lost ownership must cancel work");
+    }
+
+    #[tokio::test]
+    async fn upgrade_preserves_six_packages_and_reviews_replacement_permissions() {
+        let (directory, state, _, _) = fixture().await;
+        let authority = state.application_plugins.as_ref().unwrap();
+        let base = directory.path().join("frozen-base");
+        let ids = [
+            "new-plugin",
+            "keep-a",
+            "keep-b",
+            "keep-c",
+            "keep-d",
+            "keep-e",
+            "keep-f",
+        ];
+        for id in ids {
+            let path = base.join(id);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("plugin.json"),
+                serde_json::to_vec(&json!({
+                    "id":id,"version":"1.0.0","wit_version":"0.2.0","wasm":null,
+                    "capabilities":[],"contributions":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(path.join(".mtc-oci-install.json"), serde_json::to_vec(&json!({
+                "format_version":1,"source":format!("ghcr.io/example/{id}"),
+                "digest":format!("sha256:{}", "b".repeat(64)),"signature_policy":"cosign-public-key"
+            })).unwrap()).unwrap();
+            std::fs::write(path.join("asset.txt"), format!("exact original asset {id}")).unwrap();
+        }
+        let runtime = authority.review_runtime(base.clone()).await.unwrap();
+        let identities = runtime.package_identities();
+        let frozen = PreinstalledInventory {
+            root: base.clone(),
+            grants: runtime
+                .manifests()
+                .into_iter()
+                .map(|manifest| {
+                    let grant = PluginGrant {
+                        version: manifest.version.clone(),
+                        capabilities: manifest.capabilities.clone(),
+                        manifest_digest: lifecycle::manifest_digest(&manifest).unwrap(),
+                        identity: identities[&manifest.id].clone(),
+                    };
+                    (manifest.id, vec![grant])
+                })
+                .collect(),
+        };
+        let original_bytes = ids
+            .into_iter()
+            .map(|id| (id, package_tree_digest(&base.join(id)).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let reference = format!("ghcr.io/example/new@sha256:{}", "a".repeat(64));
+        let release = serde_json::from_value(json!({
+            "release_url":"https://github.com/example/new/releases/download/v2/release.json",
+            "descriptor_sha256":format!("sha256:{}", "c".repeat(64)),
+            "source":"ghcr.io/example/new",
+            "descriptor":{"format_version":1,"reference":reference,
+                "signer":{"issuer":"https://token.actions.githubusercontent.com",
+                    "identity":"https://github.com/example/new/.github/workflows/publish.yml@refs/tags/v2"}}
+        })).unwrap();
+        let resolution = state
+            .db
+            .save_plugin_release_resolution(
+                "upgrade-resolution",
+                "bootstrap",
+                &release,
+                1,
+                Some(&frozen),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .confirm_plugin_release_resolution(
+                &resolution.id,
+                &resolution.release.descriptor_sha256,
+                "bootstrap",
+                "upgrade-key",
+            )
+            .await
+            .unwrap();
+        let (record, run) = state
+            .db
+            .begin_plugin_installation(
+                "upgraded",
+                &json!([reference]),
+                "upgrade-request",
+                "upgrade-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(run);
+        let root = directory
+            .path()
+            .join("private-install-root")
+            .join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
+        claim_inventory_root(&root, &record.attempt_id).unwrap();
+        let path = root.join("new-plugin");
+        std::fs::create_dir_all(&path).unwrap();
+        // As in fixture(), seed successful signed-installer output. Distribution
+        // tests independently enforce real signature verification and NOREPLACE.
+        std::fs::write(path.join("plugin.json"), serde_json::to_vec(&json!({
+            "id":"new-plugin","version":"2.0.0","wit_version":"0.2.0","wasm":null,
+            "capabilities":[{"kind":"http","allowed_origins":["https://example.com"]}],"contributions":{}
+        })).unwrap()).unwrap();
+        std::fs::write(path.join(".mtc-oci-install.json"), serde_json::to_vec(&json!({
+            "format_version":1,"source":"ghcr.io/example/new","digest":format!("sha256:{}", "a".repeat(64)),"signature_policy":"cosign-keyless"
+        })).unwrap()).unwrap();
+        let mut policy = authority.install_policy().await.unwrap();
+        authority
+            .installation_release_policy("upgrade-key", "bootstrap", &mut policy)
+            .await
+            .unwrap();
+        let trust = trust_digest(&policy).await.unwrap();
+        let checkpoints = BTreeMap::from([(
+            reference.clone(),
+            package_checkpoint(&root, &reference, &trust).await.unwrap(),
+        )]);
+        state
+            .db
+            .checkpoint_plugin_installation(&record.id, &record.attempt_id, &checkpoints)
+            .await
+            .unwrap();
+        // A failed old attempt may already have a successfully verified package.
+        // Retry must keep the frozen full base, but discard that attempt's paths
+        // and checkpoints before accepting freshly verified output.
+        state
+            .db
+            .finish_plugin_installation(&record.id, &record.attempt_id, None)
+            .await
+            .unwrap();
+        assert!(!authority.inventory.read().await.contains_key("upgraded"));
+        assert_eq!(
+            state
+                .db
+                .optional_application_plugin_head()
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        let (retry, run) = state
+            .db
+            .begin_plugin_installation(
+                "upgraded",
+                &json!([reference]),
+                "upgrade-request",
+                "upgrade-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(run);
+        assert_eq!(record.id, retry.id);
+        assert_ne!(record.attempt_id, retry.attempt_id);
+        assert!(retry.checkpoints.is_empty());
+        let old_root = root;
+        let record = retry;
+        let root = directory
+            .path()
+            .join("private-install-root")
+            .join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
+        claim_inventory_root(&root, &record.attempt_id).unwrap();
+        std::fs::create_dir(root.join("new-plugin")).unwrap();
+        for file in ["plugin.json", ".mtc-oci-install.json"] {
+            std::fs::copy(
+                old_root.join("new-plugin").join(file),
+                root.join("new-plugin").join(file),
+            )
+            .unwrap();
+        }
+        let checkpoints = BTreeMap::from([(
+            reference.clone(),
+            package_checkpoint(&root, &reference, &trust).await.unwrap(),
+        )]);
+        state
+            .db
+            .checkpoint_plugin_installation(&record.id, &record.attempt_id, &checkpoints)
+            .await
+            .unwrap();
+        // Missing/failed installation, a stale trust policy, or duplicate package
+        // IDs cannot authorize removing any frozen grant.
+        assert!(
+            retained_after_verified_packages(
+                Some(&frozen),
+                &record.packages,
+                &BTreeMap::new(),
+                &root,
+                &trust
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            retained_after_verified_packages(
+                Some(&frozen),
+                &record.packages,
+                &checkpoints,
+                &root,
+                "changed-trust"
+            )
+            .await
+            .is_err()
+        );
+        let duplicate_requests = vec![reference.clone(), reference.clone()];
+        assert!(
+            retained_after_verified_packages(
+                Some(&frozen),
+                &duplicate_requests,
+                &checkpoints,
+                &root,
+                &trust
+            )
+            .await
+            .is_err()
+        );
+        let retained = retained_after_verified_packages(
+            Some(&frozen),
+            &record.packages,
+            &checkpoints,
+            &root,
+            &trust,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained.grants.len(), 6);
+        assert!(!retained.grants.contains_key("new-plugin"));
+        assert_eq!(frozen.grants.len(), 7);
+        let input = InstallPluginRequest {
+            inventory_id: "upgraded".into(),
+            packages: record.packages.clone(),
+            release_resolution_id: None,
+            release_descriptor_sha256: None,
+            network: None,
+        };
+        // Resume the successfully checkpointed new package through the actual
+        // installation orchestration, with the legacy full-seven resolution.
+        let (digest, review) = authority
+            .perform_install(&record.id, &record.attempt_id, &input, &policy)
+            .await
+            .unwrap();
+        let runtime = authority.review_runtime(root.clone()).await.unwrap();
+        super::super::retained_installation::verify_retained_grants(&retained, &runtime).unwrap();
+        assert_eq!(runtime.manifests().len(), 7);
+        for id in &ids[1..] {
+            assert_eq!(
+                package_tree_digest(&root.join(id)).unwrap(),
+                original_bytes[id]
+            );
+        }
+        assert_eq!(digest, review_digest(&runtime, &trust).unwrap());
+        state
+            .db
+            .finish_plugin_installation(&record.id, &record.attempt_id, Some((&digest, &review)))
+            .await
+            .unwrap();
+        assert!(!authority.inventory.read().await.contains_key("upgraded"));
+        authority
+            .approve_installation(&record.id, &digest, "bootstrap")
+            .await
+            .unwrap();
+        let inventory = authority.inventory.read().await;
+        let approved = &inventory["upgraded"];
+        assert_eq!(approved.grants["new-plugin"][0].version, "2.0.0");
+        assert_eq!(approved.grants["new-plugin"][0].capabilities.len(), 1);
+        for id in &ids[1..] {
+            assert_eq!(
+                serde_json::to_value(&approved.grants[*id]).unwrap(),
+                serde_json::to_value(&frozen.grants[*id]).unwrap()
+            );
+        }
+        drop(inventory);
+        for id in ids {
+            assert_eq!(
+                package_tree_digest(&base.join(id)).unwrap(),
+                original_bytes[id]
+            );
+        }
+        assert_eq!(
+            state
+                .db
+                .optional_application_plugin_head()
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        let persisted = state
+            .db
+            .installation_plugin_release_resolution("upgrade-key", "bootstrap")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.retained.unwrap().grants.len(), 7);
     }
 
     #[tokio::test]

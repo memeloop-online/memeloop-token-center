@@ -101,6 +101,7 @@ pub struct AppState {
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) responses_request_spool: gateway_body::request_spool::RequestSpoolAdmission,
     pub(crate) early_requests: Arc<early_request::Journal>,
+    pub(crate) pending_terminals: Arc<proxy_lifecycle::pending_terminal::Journal>,
     /// Shared bounded lifecycle admission for synchronous media requests.
     pub(crate) image_response_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_rejections: Arc<gateway_body::GatewayBodyRejectionMetrics>,
@@ -178,6 +179,16 @@ impl AppState {
         let early_requests = early_request::Journal::new(
             std::path::Path::new(&config.responses_request_spool_path)
                 .join("early-terminals")
+                .join(
+                    blake3::hash(config.database_url.as_bytes())
+                        .to_hex()
+                        .as_str(),
+                ),
+            db.independent_persistence_pool(),
+        );
+        let pending_terminals = proxy_lifecycle::pending_terminal::Journal::new(
+            std::path::Path::new(&config.responses_request_spool_path)
+                .join("pending-terminals-v1")
                 .join(
                     blake3::hash(config.database_url.as_bytes())
                         .to_hex()
@@ -265,6 +276,7 @@ impl AppState {
             )),
             responses_request_spool,
             early_requests,
+            pending_terminals,
             // Cloned request/router states share the same bounded synchronous
             // media budget (OpenAI Images and Audio transcription);
             // independently initialized applications do not contend with it.
@@ -358,6 +370,14 @@ impl AppState {
         self
     }
 
+    #[cfg(feature = "experimental-plugin-revisions")]
+    pub async fn refresh_application_plugins(&self) -> Result<(), error::AppError> {
+        if let Some(authority) = &self.application_plugins {
+            authority.refresh_current().await?;
+        }
+        Ok(())
+    }
+
     /// Called once at a request entry point. A cloned request state retains the
     /// atomic runtime/catalog pair through policy, prepare, retries and normalize.
     pub(crate) async fn pin_application_plugins(self) -> Result<Self, error::AppError> {
@@ -367,7 +387,7 @@ impl AppState {
             if !state.application_plugins_pinned
                 && let Some(authority) = &state.application_plugins
             {
-                if let Some(snapshot) = authority.pin_if_published().await? {
+                if let Some(snapshot) = authority.current_snapshot()? {
                     state = state.with_pinned_application_plugins(snapshot);
                 }
                 state.application_plugins_pinned = true;
@@ -436,8 +456,12 @@ fn codex_http_client_builder(
         policy,
         keep_alive_interval,
     );
+    // No connect timeout and no kernel TCP user timeout. A stored
+    // connect_timeout_millis is not a socket deadline. The forward ends when
+    // the upstream answers, the client cancels, or the socket itself fails.
+    // wreq would otherwise force-close a Linux socket after 30s without an ACK
+    // and probe TCP keepalive every 15s. HTTP/2 keepalive remains.
     let builder = wreq::Client::builder()
-        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.
@@ -447,7 +471,12 @@ fn codex_http_client_builder(
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
         .emulation(emulation)
-        .http2_options(http2_options);
+        .http2_options(http2_options)
+        .tcp_keepalive(None::<Duration>)
+        .tcp_keepalive_interval(None::<Duration>)
+        .tcp_keepalive_retries(None::<u32>);
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    let builder = builder.tcp_user_timeout(None::<Duration>);
     match policy.http_protocol {
         provider::CodexHttpProtocol::ProviderDefault => builder,
         provider::CodexHttpProtocol::Http1Only => builder.http1_only(),

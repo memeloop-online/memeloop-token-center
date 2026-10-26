@@ -488,6 +488,8 @@ async fn delayed_postgres_bootstrap_loads_managed_cache_without_blocking_cached_
                     label: "primary".into(),
                     proxy_url: Some(PRIMARY.into()),
                 }],
+                probe_url: None,
+                probe_attempts: None,
             },
             None,
             KEY,
@@ -665,6 +667,41 @@ async fn locked_database_cannot_block_cached_selection_or_local_failover() {
     assert_eq!(
         groups
             .select(account_id, 1, &source)
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
+}
+
+#[test]
+fn stale_independent_probe_cannot_move_a_new_exit_or_credential_generation() {
+    let account_id = Uuid::now_v7();
+    let groups = groups(account_id, 1);
+    let source = credential();
+    groups.select(account_id, 1, &source).unwrap();
+    let entry = groups.groups.get(&account_id).unwrap();
+    let probed = entry.state.load(Ordering::Acquire);
+    assert!(entry.advance_after_probe(probed));
+    assert!(!entry.advance_after_probe(probed));
+    assert_eq!(
+        groups
+            .select(account_id, 1, &source)
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
+    let probed = entry.state.load(Ordering::Acquire);
+    groups.select(account_id, 2, &source).unwrap();
+    assert!(!entry.advance_after_probe(probed));
+    assert_eq!(
+        groups
+            .select(account_id, 2, &source)
             .unwrap()
             .credential
             .proxy()

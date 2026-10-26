@@ -58,7 +58,7 @@ async fn control(state: &AppState, action: &str, key: &str, body: Value) -> Valu
         .unwrap();
     assert!(
         response.status().is_success(),
-        "control action {action}: {}",
+        "control action {action}, operation {key}: {}",
         response.status()
     );
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -335,6 +335,7 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
             }
             _ => {}
         }
+        gateway_state.refresh_application_plugins().await.unwrap();
         for (index, (name, path, request)) in cases.iter().enumerate() {
             let response = client
                 .post(format!("{gateway}{path}"))

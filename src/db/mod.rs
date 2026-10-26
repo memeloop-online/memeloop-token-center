@@ -84,6 +84,8 @@ pub(crate) use requests::EarlyRequestTerminal;
 pub(crate) use requests::pending_settlement::{
     PendingProxySettlementAck, PendingProxySettlementClaim, PendingProxySettlementEvidence,
 };
+#[allow(unused_imports)] // Separately owned API journal integration.
+pub(crate) use requests::{PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck};
 mod rotation;
 mod routing;
 pub use routing::egress;
@@ -107,6 +109,7 @@ pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
 mod upstream_quota_reset;
+mod upstream_service_probes;
 mod usage_analysis;
 mod validation;
 
@@ -225,15 +228,15 @@ pub(crate) use requests::{
 pub(crate) use requests::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
 };
-pub(crate) use routing::{
-    AdmittedConnectionFailure, GrantedModelCapabilitySource, UpstreamAttemptAdmission,
-    UpstreamFailureKind, UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
-};
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
     ManagedModelRouteSyncResult, ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput,
     RouteCreateDisposition, RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
     UpdateRoutedModelRouteInput,
+};
+pub(crate) use routing::{
+    GrantedModelCapabilitySource, UpstreamAttemptAdmission, UpstreamFailureKind,
+    UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
 };
 pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,
@@ -632,6 +635,13 @@ impl Database {
         &self,
     ) -> Result<Transaction<'static, Any>, sqlx::Error> {
         let started = tokio::time::Instant::now();
+        if let Some(deadline) = self.gateway_archive_retry_deadline() {
+            return Box::pin(self.begin_gateway_archive_transaction(deadline))
+                .await
+                .inspect_err(|error| {
+                    self.observe_pool_timeout("write_transaction", started, error);
+                });
+        }
         // SQLite's default deferred transaction can fail immediately with
         // SQLITE_BUSY when a read-before-write transaction races another
         // writer: the shared lock cannot be upgraded after that writer has

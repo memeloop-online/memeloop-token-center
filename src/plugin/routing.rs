@@ -118,6 +118,7 @@ impl GroupRoutingTransientSignal {
         self.sample_count >= u64::from(minimum_samples) && self.ewma_micros >= open_threshold_micros
     }
 
+    #[cfg(test)]
     pub(crate) fn should_recover(
         self,
         recover_threshold_micros: u32,

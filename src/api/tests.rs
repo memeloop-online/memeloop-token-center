@@ -13,6 +13,8 @@ use wiremock::{
 use super::*;
 use crate::config::{ArchiveBackend, Config};
 
+mod optional_limits;
+
 pub(super) async fn test_state() -> (AppState, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -734,10 +736,31 @@ async fn upstream_rate_limit_status_is_preserved_but_its_body_is_sanitized() {
     assert!(!body.contains("must-not-reach-client"));
     assert!(!body.contains("provider-sensitive-token"));
 
-    let requests = state.db.list_requests(issued.key_id, 10).await.unwrap();
+    let requests = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let requests = state.db.list_requests(issued.key_id, 10).await.unwrap();
+            if requests.len() == 1
+                && requests[0]
+                    .operational_terminal
+                    .as_ref()
+                    .is_some_and(|terminal| {
+                        terminal.financial_state == crate::model::RequestFinancialState::Unknown
+                    })
+            {
+                break requests;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("upstream rejection must become operationally terminal without settling unknown usage");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].status_code, Some(429));
     assert_eq!(requests[0].error_code.as_deref(), Some("http_429"));
+    assert!(requests[0].completed_at.is_none());
+    assert!(requests[0].usage.tokens.is_none());
+    assert!(requests[0].billing.cost.is_none());
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -748,7 +771,7 @@ async fn generation_archive_is_written_only_by_the_admitted_idempotency_owner() 
         "job",
         KeyPolicy {
             allowed_models: vec!["generation-api-model-archive-owner".to_owned()],
-            max_concurrency: 1,
+            max_concurrency: Some(1),
             ..KeyPolicy::default()
         },
         Decimal::TEN,
@@ -829,8 +852,8 @@ async fn generation_quota_and_rpm_rejections_do_not_write_the_archive() {
         "job",
         KeyPolicy {
             allowed_models: vec!["generation-api-model-rpm".to_owned()],
-            requests_per_minute: 1,
-            max_concurrency: 8,
+            requests_per_minute: Some(1),
+            max_concurrency: Some(8),
             ..KeyPolicy::default()
         },
         Decimal::TEN,

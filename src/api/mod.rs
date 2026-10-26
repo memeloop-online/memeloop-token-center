@@ -64,11 +64,8 @@ pub(crate) mod plugin_execution;
 mod plugin_installer_network;
 mod plugins;
 pub(crate) mod proxy;
-pub(crate) use proxy::{MediaAttemptBudget, wait_media_recovery};
-pub(crate) use proxy::{
-    MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit,
-    current_gateway_failure_domain,
-};
+pub(crate) use proxy::MediaAttemptBudget;
+pub(crate) use proxy::{MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit};
 mod proxy_diagnostics;
 mod request_detail;
 mod request_normalization;
@@ -89,6 +86,7 @@ mod traffic;
 mod transport_proxy_groups;
 mod upstreams;
 use transport_proxy_groups::*;
+pub(crate) use upstreams::run_upstream_service_probes;
 mod usage_analysis;
 mod web;
 
@@ -193,11 +191,7 @@ use crate::{
     },
     plugin::{PreparedProviderRequest, memeloop::token_center::types::RequestContext},
     provider::{ResolvedUpstream, UpstreamCredential, validate_config},
-    proxy_lifecycle::{
-        MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_FINALIZATION_LIFETIME, abandon_proxy_archive_attempt,
-        confirm_proxy_delivery_with_retry, finish_proxy_request_with_retry,
-        prepare_proxy_delivery_with_retry, response_archive_requires_cleanup,
-    },
+    proxy_lifecycle::{MAX_DOWNSTREAM_SEND_WAIT, MAX_PROXY_FINALIZATION_LIFETIME},
 };
 
 #[cfg(test)]

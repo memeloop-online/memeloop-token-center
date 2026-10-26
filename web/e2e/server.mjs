@@ -12,6 +12,8 @@ const listenHost = baseURL.hostname;
 const listenPort = baseURL.port || '80';
 const mockPort = Number(process.env.MTC_E2E_MOCK_PORT ?? 41740);
 const testDirectory = mkdtempSync(join(tmpdir(), 'memeloop-token-center-e2e-'));
+const requestSpoolPath = join(testDirectory, 'request-spool');
+mkdirSync(requestSpoolPath, { mode: 0o700 });
 const pluginRoot = join(testDirectory, 'plugins');
 const configurablePlugin = join(pluginRoot, 'browser-configuration');
 mkdirSync(configurablePlugin, { recursive: true });
@@ -356,6 +358,7 @@ upstream.listen(mockPort, '127.0.0.1', () => {
         MTC_SERVICE_TOKEN: process.env.MTC_E2E_SERVICE_TOKEN ?? 'browser-e2e-bootstrap-not-a-real-token',
         MTC_ARCHIVE_BACKEND: 'filesystem',
         MTC_ARCHIVE_PATH: join(testDirectory, 'archive'),
+        MTC_RESPONSES_REQUEST_SPOOL_PATH: requestSpoolPath,
         MTC_PLUGIN_DIR: pluginRoot,
         MTC_WEB_ROOT: join(webRoot, 'dist'),
         MTC_ALLOW_OAUTH_LOOPBACK: 'true',

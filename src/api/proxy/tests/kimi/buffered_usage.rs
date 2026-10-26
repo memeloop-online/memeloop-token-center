@@ -120,6 +120,7 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
             .as_ref(),
         raw_body.as_slice()
     );
+    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db

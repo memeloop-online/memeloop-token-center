@@ -1,4 +1,5 @@
 use std::{
+    error::Error as _,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -16,6 +17,8 @@ use futures_util::StreamExt;
 pub(crate) mod memory;
 pub(crate) mod request_spool;
 
+#[cfg(test)]
+mod body_read_classification_tests;
 #[cfg(test)]
 mod metered_tests;
 
@@ -39,7 +42,7 @@ impl Drop for GatewayBodyReadActivity {
 const MAX_DEFAULT_BODY: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_BODY: usize = 16 * 1024 * 1024;
 pub(crate) const GATEWAY_BODY_ROUTE_CLASS_COUNT: usize = 4;
-pub(crate) const GATEWAY_BODY_REJECTION_REASON_COUNT: usize = 3;
+pub(crate) const GATEWAY_BODY_REJECTION_REASON_COUNT: usize = 4;
 
 /// Fixed route classes prevent request paths from becoming metric labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +82,7 @@ pub(crate) enum GatewayBodyRejectionReason {
     DeclaredContentLengthExceedsLimit,
     BodyReadRejected,
     CapacityExhausted,
+    BodyLimitExceeded,
 }
 
 impl GatewayBodyRejectionReason {
@@ -86,6 +90,7 @@ impl GatewayBodyRejectionReason {
         Self::DeclaredContentLengthExceedsLimit,
         Self::BodyReadRejected,
         Self::CapacityExhausted,
+        Self::BodyLimitExceeded,
     ];
 
     pub(crate) const fn index(self) -> usize {
@@ -93,6 +98,7 @@ impl GatewayBodyRejectionReason {
             Self::DeclaredContentLengthExceedsLimit => 0,
             Self::BodyReadRejected => 1,
             Self::CapacityExhausted => 2,
+            Self::BodyLimitExceeded => 3,
         }
     }
 
@@ -101,6 +107,7 @@ impl GatewayBodyRejectionReason {
             Self::DeclaredContentLengthExceedsLimit => "declared_content_length_exceeds_limit",
             Self::BodyReadRejected => "body_read_rejected",
             Self::CapacityExhausted => "capacity_exhausted",
+            Self::BodyLimitExceeded => "body_limit_exceeded",
         }
     }
 }
@@ -336,8 +343,13 @@ async fn admit_request_body_for_route(
             request_spool::RequestSpoolCaptureError::Unavailable => {
                 GatewayBodyAdmissionError::RequestSpoolUnavailable
             }
-            request_spool::RequestSpoolCaptureError::TooLarge
-            | request_spool::RequestSpoolCaptureError::BodyReadRejected => rejected_body(
+            request_spool::RequestSpoolCaptureError::TooLarge => rejected_body(
+                route_class,
+                declared_content_length,
+                maximum,
+                GatewayBodyRejectionReason::BodyLimitExceeded,
+            ),
+            request_spool::RequestSpoolCaptureError::BodyReadRejected => rejected_body(
                 route_class,
                 declared_content_length,
                 maximum,
@@ -378,7 +390,7 @@ async fn admit_request_body_for_route(
                         route_class,
                         declared_content_length,
                         maximum,
-                        GatewayBodyRejectionReason::BodyReadRejected,
+                        GatewayBodyRejectionReason::BodyLimitExceeded,
                     ));
                 }
                 retained.extend_from_slice(&chunk);
@@ -395,13 +407,16 @@ async fn admit_request_body_for_route(
     }
     let bytes = read_with_deadline(deadline, to_bytes(body, maximum))
         .await?
-        .map_err(|_| {
-            rejected_body(
-                route_class,
-                declared_content_length,
-                maximum,
-                GatewayBodyRejectionReason::BodyReadRejected,
-            )
+        .map_err(|error| {
+            let reason = if error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+            {
+                GatewayBodyRejectionReason::BodyLimitExceeded
+            } else {
+                GatewayBodyRejectionReason::BodyReadRejected
+            };
+            rejected_body(route_class, declared_content_length, maximum, reason)
         })?;
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }

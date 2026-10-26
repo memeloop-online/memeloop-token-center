@@ -358,7 +358,7 @@ async fn ensure_and_subscription_share_identity_without_mutation() {
         .await
         .unwrap();
     assert_eq!(managed[0].available_balance, "0");
-    assert_eq!(managed[0].policy.requests_per_minute, 10);
+    assert_eq!(managed[0].policy.requests_per_minute, Some(10));
     assert!(
         fixture
             .state

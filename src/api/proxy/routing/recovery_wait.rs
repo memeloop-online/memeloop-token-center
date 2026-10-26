@@ -249,7 +249,8 @@ pub(crate) async fn wait(
                     );
                     Ok(Check::Ready((route, admission, guard)))
                 }
-                UpstreamAttemptAdmission::SharedProbe { .. } => Ok(Check::Stop),
+                UpstreamAttemptAdmission::Observed
+                | UpstreamAttemptAdmission::SharedProbe { .. } => Ok(Check::Stop),
             }
         });
         async move { task.await.map_err(|_| AppError::Internal)? }

@@ -1010,9 +1010,9 @@ async fn atomic_generation_fixture(database_url: &str) -> AtomicGenerationFixtur
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
-                    requests_per_minute: 60,
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 8,
+                    requests_per_minute: Some(60),
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,

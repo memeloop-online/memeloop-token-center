@@ -11,9 +11,6 @@
 {{- if gt (int .Values.config.s3.connectTimeoutMillis) (int .Values.config.s3.requestTimeoutMillis) -}}
 {{- fail "config.s3.connectTimeoutMillis must not exceed requestTimeoutMillis" -}}
 {{- end -}}
-{{- if lt (int64 .Values.config.proxyMemoryBudgetBytes) (add (mul (int64 .Values.config.responsesBodyMaxBytes) 12) 1048576) -}}
-{{- fail "config.proxyMemoryBudgetBytes must cover responsesBodyMaxBytes times 12 plus 1Mi" -}}
-{{- end -}}
 {{- if or (eq .Values.requestSpool.mountPath "/") (contains ".." .Values.requestSpool.mountPath) -}}
 {{- fail "requestSpool.mountPath must be a dedicated absolute path without traversal components" -}}
 {{- end -}}

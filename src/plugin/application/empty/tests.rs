@@ -151,6 +151,7 @@ async fn empty_inventory_http_registration_replay_audit_and_restart() {
         .unwrap();
     assert_eq!(published.revision, 1);
     let gateway = AppState::initialize((*state.config).clone()).await.unwrap();
+    gateway.refresh_application_plugins().await.unwrap();
     let pinned = gateway.pin_application_plugins().await.unwrap();
     assert!(pinned.plugins.manifests().is_empty());
     assert_eq!(

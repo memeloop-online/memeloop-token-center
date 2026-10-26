@@ -32,6 +32,11 @@ async fn complete(post: Post) {
 }
 
 async fn settled(fixture: &CodexRouteFixture, status: i64) {
+    if status != 200 {
+        let receipt = cancellation::single_unknown_receipt(fixture).await;
+        assert_eq!(receipt["status_code"], status);
+        return;
+    }
     wait_for_request_settlement(fixture, 1).await;
     let rows = fixture
         .state
@@ -41,13 +46,8 @@ async fn settled(fixture: &CodexRouteFixture, status: i64) {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(status));
-    if status == 200 {
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
-        assert_eq!(rows[0].cost, "0.00001");
-    } else {
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-        assert_eq!(rows[0].cost, "0");
-    }
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
+    assert_eq!(rows[0].cost, "0.00001");
     assert_exactly_once_side_effects(
         fixture,
         rows[0].request_id,

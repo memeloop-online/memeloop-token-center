@@ -41,7 +41,7 @@ impl TransportProxyGroups {
     }
 
     pub(crate) async fn refresh_managed(&self, pool: &AnyPool) -> Result<(), AppError> {
-        let rows = sqlx::query("SELECT b.account_id, b.version AS binding_version, b.group_id, b.initial_member_id, b.replacement_member_id, g.version AS group_version, g.name AS group_name, g.members_ciphertext, a.credential_generation, a.config_json, s.group_fingerprint AS saved_fingerprint, s.credential_generation AS saved_generation, s.selection_generation AS saved_epoch, s.base_index AS saved_base, s.selected_index AS saved_selected FROM transport_proxy_bindings b JOIN upstream_accounts a ON a.id = b.account_id LEFT JOIN transport_proxy_groups g ON g.id = b.group_id LEFT JOIN upstream_transport_proxy_selections s ON s.account_id = b.account_id WHERE b.group_id IS NOT NULL ORDER BY b.account_id LIMIT 257")
+        let rows = sqlx::query("SELECT b.account_id, b.version AS binding_version, b.group_id, b.initial_member_id, b.replacement_member_id, g.version AS group_version, g.name AS group_name, g.members_ciphertext, g.probe_url, g.probe_attempts, a.credential_generation, a.config_json, s.group_fingerprint AS saved_fingerprint, s.credential_generation AS saved_generation, s.selection_generation AS saved_epoch, s.base_index AS saved_base, s.selected_index AS saved_selected FROM transport_proxy_bindings b JOIN upstream_accounts a ON a.id = b.account_id LEFT JOIN transport_proxy_groups g ON g.id = b.group_id LEFT JOIN upstream_transport_proxy_selections s ON s.account_id = b.account_id WHERE b.group_id IS NOT NULL ORDER BY b.account_id LIMIT 257")
             .fetch_all(pool).await?;
         let mut next = BTreeMap::new();
         let mut active = 0usize;
@@ -180,6 +180,11 @@ impl TransportProxyGroups {
             } else {
                 None
             };
+            if let Some(active) = &entry {
+                let probe_url: Option<String> = row.try_get("probe_url")?;
+                let probe_attempts: Option<i64> = row.try_get("probe_attempts")?;
+                active.configure_probe(probe_url, probe_attempts.unwrap_or(2));
+            }
             next.insert(
                 account_id,
                 ManagedEntry {

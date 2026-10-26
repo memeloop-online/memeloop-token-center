@@ -15,7 +15,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 132
+  schemaVersion: 136
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -44,8 +44,10 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
-      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
+      # Request is what the scheduler reserves. The limit is higher so a burst
+      # of in-memory request bodies can allocate without pinning that RAM up front.
+      requests: { cpu: 100m, memory: 512Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: "1", memory: 2Gi, ephemeral-storage: 256Mi }
     autoscaling:
       # Size this together with config.databaseMaxConnections and the database
       # connection budget before enabling.
@@ -103,8 +105,8 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
-      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
+      requests: { cpu: 100m, memory: 512Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: "1", memory: 2Gi, ephemeral-storage: 256Mi }
     autoscaling:
       enabled: false
       minReplicas: 1
@@ -114,8 +116,8 @@ roles:
       behavior: {}
     podDisruptionBudget: { enabled: false, minAvailable: 1 }
 
-# Authenticated Responses bodies are first written to bounded node-local disk.
-# The file is request-owned and unlinked on completion, rejection, or cancellation.
+# Writable node-local directory for terminal journals. Request bodies are not
+# stored here; they stay in process memory until the upstream response finishes.
 requestSpool:
   mountPath: /var/lib/memeloop-token-center/request-spool
   sizeLimit: 160Mi
@@ -127,12 +129,12 @@ config:
   # Legacy compatibility value; proxy lifecycle admission uses the byte budget.
   proxyLifecycleConcurrency: 64
   # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
-  # this budget + 256Mi; raising body max also requires budget >= max * 12 + 1Mi.
+  # this budget + 256Mi. The budget is not a multiple of the maximum body.
   proxyMemoryBudgetBytes: 536870912
   # Count admission for readers without complete shared byte accounting.
   # Metered default text bodies use bytes; other readers retain 1..8192 permits.
   gatewayBodyReadConcurrency: 1024
-  # `/v1/responses` uses disk-backed spools with bounded RAM and a per-request ceiling.
+  # `/v1/responses` keeps the upload in memory until the upstream response finishes.
   responsesBodyMaxBytes: 33554432
   # Independent multipart ceiling for `/v1/audio/transcriptions`; changing it
   # does not widen `/v1/responses` or other text endpoints.

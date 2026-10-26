@@ -20,6 +20,9 @@ use rust_decimal::Decimal;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+#[path = "support/postgres_isolation.rs"]
+mod postgres_isolation;
+
 static POSTGRES_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
@@ -161,9 +164,9 @@ async fn postgres_metered_unlimited_admits_and_settles_1024_same_key_requests_wi
                 alias: "metered-unlimited-1024".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    requests_per_minute: 1,
-                    tokens_per_minute: 1,
-                    max_concurrency: 1,
+                    requests_per_minute: Some(1),
+                    tokens_per_minute: Some(1),
+                    max_concurrency: Some(1),
                     enforcement_mode: EnforcementMode::MeteredUnlimited,
                     ..KeyPolicy::default()
                 },
@@ -458,6 +461,10 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         return;
     };
     let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    // Claims are global within a database, not scoped to this test's tenant.
+    // Failed earlier integration binaries may leave older eligible jobs.
+    let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
+    let database_url = isolated.url().to_owned();
     let database = Database::connect_with_max(&database_url, 96).await.unwrap();
     database.migrate().await.unwrap();
     let unique = Uuid::now_v7();
@@ -764,6 +771,9 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         materialized,
         (REQUESTS as i64 + 1, REQUESTS as i64, REQUESTS as i64 + 1, 0)
     );
+    inspection.close().await;
+    drop(database);
+    isolated.cleanup().await;
 }
 
 #[tokio::test]
@@ -905,9 +915,9 @@ async fn postgres_prepaid_boundary_remains_fail_closed_under_parallel_admission(
                 alias: "prepaid-boundary".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    requests_per_minute: 100,
-                    tokens_per_minute: 100,
-                    max_concurrency: 8,
+                    requests_per_minute: Some(100),
+                    tokens_per_minute: Some(100),
+                    max_concurrency: Some(8),
                     enforcement_mode: EnforcementMode::Prepaid,
                     ..KeyPolicy::default()
                 },
@@ -1033,6 +1043,8 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
         return;
     };
     let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
+    let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
+    let database_url = isolated.url().to_owned();
     let database = Database::connect_with_max(&database_url, 16).await.unwrap();
     database.migrate().await.unwrap();
     let inspection = PgPool::connect(&database_url).await.unwrap();
@@ -1262,6 +1274,9 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
     .await
     .unwrap();
     assert_eq!(recovered, (1, 1, 1));
+    inspection.close().await;
+    drop(database);
+    isolated.cleanup().await;
 }
 
 #[tokio::test]
@@ -1284,9 +1299,9 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                 alias: "proxy-admission-lock".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    requests_per_minute: 100_000,
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 8,
+                    requests_per_minute: Some(100_000),
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
@@ -1680,8 +1695,8 @@ async fn postgres_proxy_terminal_owner_is_exactly_once() {
                 alias: "proxy-atomic".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 16,
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(16),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(10),
@@ -1971,8 +1986,8 @@ async fn postgres_synchronous_image_terminal_ack_recovery_is_exactly_once_withou
                 alias: "image-atomic".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 16,
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(16),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(10),

@@ -24,6 +24,7 @@ const recordedFailureCopy: Record<string, [string, string]> = {
   upstream_connection: ['上游连接失败', 'The upstream connection failed'],
   upstream_read_timeout: ['读取上游响应超时', 'Reading the upstream response timed out'],
   upstream_request_timeout: ['等待上游请求响应超时', 'The upstream request timed out'],
+  gateway_owner_lost: ['网关副本已结束，这条连接不再处理', 'The gateway replica ended and is no longer handling this connection'],
 };
 
 const supplierFailureCopy: Record<string, [string, string]> = {
@@ -70,6 +71,9 @@ function diagnosticCause(request: RequestView, locale: 'zh-CN' | 'en'): string |
     || (diagnostic?.source === 'gateway' && diagnostic.stage === 'pre_admission' && diagnostic.reason === 'gateway_pre_admission')) {
     return zh ? '请求在网关准入前失败，尚未转发；具体原因未记录' : 'The request failed before gateway admission and was not forwarded; the specific cause was not recorded';
   }
+  if (request.terminal_cause_code === 'client_disconnected' && diagnostic?.stage !== 'response_delivery') {
+    return zh ? '客户端断开了连接' : 'The client disconnected';
+  }
   if (!diagnostic) return null;
   if (diagnostic.source === 'downstream_connection' && diagnostic.reason === 'client_disconnected') {
     return zh ? '客户端在响应交付完成前断开了连接' : 'The client disconnected before response delivery completed';
@@ -88,11 +92,13 @@ export function requestFailureCause(request: RequestView, locale: 'zh-CN' | 'en'
   const terminal = request.terminal_cause_code ? recordedCause(request.terminal_cause_code, locale) : null;
   const transport = terminal ?? (request.error_code ? recordedCause(request.error_code, locale) : null);
   if (transport) return transport;
-  if (!['failed', 'interrupted'].includes(requestOutcome(request))) return null;
+  if (!['failed', 'interrupted', 'cancelled'].includes(requestOutcome(request))) return null;
   const supplier = request.supplier_error?.code;
   const copy = supplier && Object.hasOwn(supplierFailureCopy, supplier) ? supplierFailureCopy[supplier] : null;
   if (copy) return copy[locale === 'zh-CN' ? 0 : 1];
-  return diagnosticCause(request, locale);
+  return diagnosticCause(request, locale)
+    ?? (['client_cancelled', 'downstream_disconnected'].includes(request.error_code ?? '')
+      ? (locale === 'zh-CN' ? '客户端断开了连接' : 'The client disconnected') : null);
 }
 
 export function requestErrorCopy(errorCode: string, locale: 'zh-CN' | 'en') {
@@ -105,14 +111,19 @@ export function requestErrorCopy(errorCode: string, locale: 'zh-CN' | 'en') {
 }
 
 /** Recorded terminal evidence, never an inference from initial HTTP headers. */
+export function requestCompletedAt(request: RequestView): number | null {
+  const completedAt = request.operational_terminal?.completed_at ?? request.completed_at;
+  return typeof completedAt === 'number' && Number.isFinite(completedAt) && completedAt >= request.created_at ? completedAt : null;
+}
+
 export function requestOutcome(request: RequestView): RequestOutcome {
   if (request.status_code === null) return request.error_code === 'delivery_started' ? 'delivering' : 'running';
-  if (request.error_code === 'client_cancelled' || request.error_code === 'downstream_disconnected') return 'cancelled';
+  if (request.error_code === 'client_cancelled' || request.error_code === 'downstream_disconnected'
+    || request.terminal_cause_code === 'client_disconnected') return 'cancelled';
   if (['upstream_incomplete_response', 'upstream_stream', 'downstream_backpressure'].includes(request.error_code ?? '')) return 'interrupted';
   if (request.error_code || request.status_code >= 400) return 'failed';
   if (request.status_code < 200) return 'unknown';
-  return typeof request.completed_at === 'number' && Number.isFinite(request.completed_at) && request.completed_at >= request.created_at
-    ? 'completed' : 'unknown';
+  return requestCompletedAt(request) !== null ? 'completed' : 'unknown';
 }
 
 export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') {
@@ -136,13 +147,14 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
   };
   const [label, explanation] = copy[outcome];
   const code = request.status_code === null ? '' : `${locale === 'zh-CN' ? '记录状态码' : 'Recorded status'}: ${request.status_code}`;
-  const cause = ['failed', 'interrupted'].includes(outcome) ? requestFailureCause(request, locale) : null;
-  const failureDetail = ['failed', 'interrupted'].includes(outcome)
+  const hasFailure = ['failed', 'interrupted', 'cancelled'].includes(outcome);
+  const cause = hasFailure ? requestFailureCause(request, locale) : null;
+  const failureDetail = hasFailure
     ? `${locale === 'zh-CN' ? '已记录原因' : 'Recorded cause'}: ${cause ?? (locale === 'zh-CN' ? '当时未采集具体原因' : 'No specific cause was captured at the time')}` : '';
   return { outcome, label, tone: outcome === 'completed' ? 'ok' : ['cancelled', 'interrupted', 'failed'].includes(outcome) ? 'bad' : outcome === 'unknown' ? 'unknown' : 'pending',
     cause: failureDetail,
     supplierDetail: requestSupplierDetail(request, locale),
-    hint: ['failed', 'interrupted'].includes(outcome) ? [failureDetail, requestSupplierDetail(request, locale)].filter(Boolean).join(' · ') : [explanation, code].filter(Boolean).join(' · ') };
+    hint: hasFailure ? [failureDetail, requestSupplierDetail(request, locale)].filter(Boolean).join(' · ') : [explanation, code].filter(Boolean).join(' · ') };
 }
 
 export type RequestEgressLineKind = 'proxy' | 'direct';

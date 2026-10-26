@@ -1,6 +1,6 @@
 use std::{
-    io::{self, SeekFrom},
-    path::{Path, PathBuf},
+    io,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -10,7 +10,6 @@ use std::{
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub(crate) const REQUEST_SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -54,15 +53,15 @@ impl RequestSpoolAdmission {
         memory: Option<&Arc<super::memory::ProxyMemoryReservation>>,
         request_metadata_bytes: usize,
     ) -> Result<RequestSpool, RequestSpoolCaptureError> {
+        // The configured directory is for terminal journals, not request bodies.
+        let _journal_directory = self.directory.as_path();
         let metadata = memory
             .map(|memory| {
                 memory
                     .try_reserve_ingress_bytes(
                         request_metadata_bytes
-                            .saturating_add(std::mem::size_of::<RequestSpoolCapture>())
                             .saturating_add(std::mem::size_of::<RequestSpool>())
                             .saturating_add(std::mem::size_of::<Mutex<RequestSpoolLease>>())
-                            .saturating_add(std::mem::size_of::<std::fs::File>() * 3)
                             .saturating_add(REQUEST_SPOOL_CHUNK_BYTES),
                     )
                     .map(Arc::new)
@@ -73,46 +72,38 @@ impl RequestSpoolAdmission {
         if declared_content_length.is_some_and(|length| length > maximum) {
             return Err(RequestSpoolCaptureError::TooLarge);
         }
-        prepare_directory(self.directory.as_ref()).await?;
-        let directory = self.directory.clone();
         let opening_metadata = metadata.clone();
         let opening_lease = lease.clone();
         #[cfg(test)]
         let blocking_open = self.usage.blocking_open.clone();
         let opening = tokio::task::spawn_blocking(move || {
             let _opening_metadata = opening_metadata;
-            let owner = tempfile::tempfile_in(directory.as_ref())?;
             opening_lease
                 .lock()
                 .map_err(|_| io::Error::other("request spool ownership unavailable"))?
                 .opened();
-            let writer = owner.try_clone()?;
             #[cfg(test)]
             if let Some(pause) = blocking_open {
                 pause.block();
             }
-            Ok::<_, io::Error>((owner, writer))
+            Ok::<_, io::Error>(())
         });
         #[cfg(test)]
         if let Some(pause) = &self.usage.blocking_open {
             pause.record(&opening);
         }
-        let (owner, writer) = opening
+        opening
             .await
             .map_err(|_| RequestSpoolCaptureError::Unavailable)?
             .map_err(spool_io_error)?;
-        let mut capture = RequestSpoolCapture {
-            owner: Some(Arc::new(owner)),
-            writer,
-            lease,
-            length: 0,
-            hasher: blake3::Hasher::new(),
-        };
+        let mut retained = Vec::new();
+        let mut length = 0_usize;
+        let mut hasher = blake3::Hasher::new();
 
         let mut stream = body.into_data_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|_| RequestSpoolCaptureError::BodyReadRejected)?;
-            if chunk.len() > maximum.saturating_sub(capture.length) {
+            if chunk.len() > maximum.saturating_sub(length) {
                 return Err(RequestSpoolCaptureError::TooLarge);
             }
             let frame_memory = memory
@@ -123,19 +114,18 @@ impl RequestSpoolAdmission {
                         .ok_or(RequestSpoolCaptureError::MemoryExhausted)
                 })
                 .transpose()?;
-            for piece in chunk.chunks(REQUEST_SPOOL_CHUNK_BYTES) {
-                let next = capture
-                    .length
-                    .checked_add(piece.len())
+            for offset in (0..chunk.len()).step_by(REQUEST_SPOOL_CHUNK_BYTES) {
+                let end = (offset + REQUEST_SPOOL_CHUNK_BYTES).min(chunk.len());
+                let next = length
+                    .checked_add(end - offset)
                     .ok_or(RequestSpoolCaptureError::TooLarge)?;
                 if next > maximum {
                     return Err(RequestSpoolCaptureError::TooLarge);
                 }
-                let mut writer = capture.writer.try_clone().map_err(spool_io_error)?;
                 let write_metadata = metadata.clone();
                 let write_frame = frame_memory.clone();
-                let write_lease = capture.lease.clone();
-                let write_bytes = piece.to_vec();
+                let write_lease = lease.clone();
+                let write_bytes = chunk.slice(offset..end);
                 #[cfg(test)]
                 let blocking_write = self.usage.blocking_write.clone();
                 let writing = tokio::task::spawn_blocking(move || {
@@ -145,45 +135,32 @@ impl RequestSpoolAdmission {
                     if let Some(pause) = blocking_write {
                         pause.block();
                     }
-                    let mut remaining = write_bytes.as_slice();
-                    while !remaining.is_empty() {
-                        let written = match std::io::Write::write(&mut writer, remaining) {
-                            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-                            Ok(written) => written,
-                            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                            Err(error) => return Err(error),
-                        };
-                        write_lease
-                            .lock()
-                            .map_err(|_| io::Error::other("request spool ownership unavailable"))?
-                            .record_written(written);
-                        remaining = &remaining[written..];
-                    }
-                    Ok(())
+                    write_lease
+                        .lock()
+                        .map_err(|_| io::Error::other("request spool ownership unavailable"))?
+                        .record_written(write_bytes.len());
+                    Ok::<_, io::Error>(write_bytes)
                 });
                 #[cfg(test)]
                 if let Some(pause) = &self.usage.blocking_write {
                     pause.record(&writing);
                 }
-                writing
+                let piece = writing
                     .await
                     .map_err(|_| RequestSpoolCaptureError::Unavailable)?
                     .map_err(spool_io_error)?;
-                capture.hasher.update(piece);
-                capture.length = next;
+                hasher.update(&piece);
+                retained.extend_from_slice(&piece);
+                length = next;
             }
         }
-        let owner = capture
-            .owner
-            .take()
-            .ok_or(RequestSpoolCaptureError::Unavailable)?;
-        let digest = *capture.hasher.finalize().as_bytes();
+        let digest = *hasher.finalize().as_bytes();
         Ok(RequestSpool {
-            owner,
-            length: capture.length,
+            body: Mutex::new(Some(Bytes::from(retained))),
+            length,
             digest,
             _metadata: metadata,
-            _lease: capture.lease.clone(),
+            lease,
             #[cfg(test)]
             read_count: self.read_count.clone(),
         })
@@ -248,6 +225,13 @@ impl RequestSpoolLease {
         self.usage.used_bytes.fetch_add(bytes, Ordering::AcqRel);
         self.bytes += bytes;
     }
+
+    fn release_all(&mut self) {
+        self.usage
+            .used_bytes
+            .fetch_sub(self.bytes, Ordering::AcqRel);
+        self.bytes = 0;
+    }
 }
 
 impl Drop for RequestSpoolLease {
@@ -261,20 +245,12 @@ impl Drop for RequestSpoolLease {
     }
 }
 
-struct RequestSpoolCapture {
-    owner: Option<Arc<std::fs::File>>,
-    writer: std::fs::File,
-    lease: Arc<Mutex<RequestSpoolLease>>,
-    length: usize,
-    hasher: blake3::Hasher,
-}
-
 pub(crate) struct RequestSpool {
-    owner: Arc<std::fs::File>,
+    body: Mutex<Option<Bytes>>,
     length: usize,
     digest: [u8; 32],
     _metadata: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
-    _lease: Arc<Mutex<RequestSpoolLease>>,
+    lease: Arc<Mutex<RequestSpoolLease>>,
     #[cfg(test)]
     read_count: Arc<AtomicUsize>,
 }
@@ -289,50 +265,32 @@ impl RequestSpool {
         self.digest
     }
 
+    /// Drop the retained upload once it has been handed to the upstream and the
+    /// first response byte has arrived. Later conversation projection uses the
+    /// semantic JSON already parsed from this buffer, not a second copy.
+    pub(crate) fn release_retained(&self) {
+        let mut stored = self.body.lock().unwrap_or_else(|error| error.into_inner());
+        if stored.take().is_some()
+            && let Ok(mut lease) = self.lease.lock()
+        {
+            lease.release_all();
+        }
+    }
+
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {
         #[cfg(test)]
         self.read_count.fetch_add(1, Ordering::AcqRel);
-        let owner = self.owner.clone();
-        let file = tokio::task::spawn_blocking(move || owner.try_clone())
-            .await
-            .map_err(|_| RequestSpoolReadError)?
-            .map_err(|_| RequestSpoolReadError)?;
-        let mut file = tokio::fs::File::from_std(file);
-        file.seek(SeekFrom::Start(0))
-            .await
-            .map_err(|_| RequestSpoolReadError)?;
-        let mut body = Vec::with_capacity(self.length);
-        file.read_to_end(&mut body)
-            .await
-            .map_err(|_| RequestSpoolReadError)?;
+        let body = self
+            .body
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or(RequestSpoolReadError)?;
         if body.len() != self.length || *blake3::hash(&body).as_bytes() != self.digest {
             return Err(RequestSpoolReadError);
         }
-        Ok(Bytes::from(body))
+        Ok(body)
     }
-}
-
-async fn prepare_directory(directory: &Path) -> Result<(), RequestSpoolCaptureError> {
-    tokio::fs::create_dir_all(directory)
-        .await
-        .map_err(spool_io_error)?;
-    let mut current = PathBuf::new();
-    for component in directory.components() {
-        current.push(component.as_os_str());
-        let metadata = tokio::fs::symlink_metadata(&current)
-            .await
-            .map_err(spool_io_error)?;
-        if metadata.file_type().is_symlink() {
-            return Err(RequestSpoolCaptureError::Unavailable);
-        }
-    }
-    let metadata = tokio::fs::metadata(directory)
-        .await
-        .map_err(spool_io_error)?;
-    if !metadata.is_dir() {
-        return Err(RequestSpoolCaptureError::Unavailable);
-    }
-    Ok(())
 }
 
 fn spool_io_error(error: io::Error) -> RequestSpoolCaptureError {
@@ -366,16 +324,14 @@ pub(crate) struct RequestSpoolReadError;
 
 #[cfg(test)]
 mod tests {
-    use std::{convert::Infallible, sync::Arc};
+    use std::{convert::Infallible, path::Path, sync::Arc};
 
     use futures_util::stream;
 
     use super::*;
 
     fn file_count(directory: &Path) -> usize {
-        std::fs::read_dir(directory)
-            .expect("request spool directory")
-            .count()
+        std::fs::read_dir(directory).map_or(0, |entries| entries.count())
     }
 
     #[tokio::test]
@@ -392,7 +348,10 @@ mod tests {
         assert_eq!(spool.digest(), digest);
         assert_eq!(spool.read_all().await.unwrap(), body);
         assert_eq!(file_count(directory.path()), 0);
-        assert_eq!(admission.snapshot().used_bytes, body.len());
+        spool.release_retained();
+        assert_eq!(admission.snapshot().used_bytes, 0);
+        assert!(spool.read_all().await.is_err());
+        assert_eq!(spool.len(), body.len());
         drop(spool);
         assert_eq!(file_count(directory.path()), 0);
         assert_eq!(admission.snapshot().used_bytes, 0);
@@ -482,17 +441,18 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn symlinked_spool_directory_is_rejected() {
+    async fn memory_capture_does_not_follow_a_spool_directory_symlink() {
         let parent = tempfile::tempdir().unwrap();
         let target = parent.path().join("target");
         std::fs::create_dir(&target).unwrap();
         let link = parent.path().join("request-spool");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let admission = RequestSpoolAdmission::new(link);
-        assert!(matches!(
-            admission.capture(Body::from("secret"), 1024, None).await,
-            Err(RequestSpoolCaptureError::Unavailable)
-        ));
+        let spool = admission
+            .capture(Body::from("secret"), 1024, None)
+            .await
+            .unwrap();
+        assert_eq!(spool.read_all().await.unwrap(), Bytes::from("secret"));
         assert_eq!(file_count(&target), 0);
     }
 }

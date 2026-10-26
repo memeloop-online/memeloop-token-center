@@ -18,8 +18,7 @@ mod route_types;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
 pub(super) use admission::{
-    AdmittedProxyRouteInput, DeferredSharedProbe, NextSendableProxyRouteInput,
-    prepare_admitted_proxy_route,
+    AdmittedProxyRouteInput, NextSendableProxyRouteInput, prepare_admitted_proxy_route,
 };
 pub(super) use candidates::{
     CandidatePreparationSummary, candidate_reservation_bounds, exhausted_candidate_error,
@@ -44,7 +43,6 @@ pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,
 };
-pub(crate) use recovery_wait::wait as wait_media_recovery;
 pub(super) use route_types::{
     PlannedProxyRoute, PreparedProxyRoute, ProxyRequestContext, ProxyRoutePlanInput,
     ProxyRouteResponse, ProxySendError, TransportFailureKind,

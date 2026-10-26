@@ -83,8 +83,8 @@ async fn sqlite_proxy_locators_and_staging_bindings_are_one_atomic_commit() {
                 alias: "proxy-staging".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 8,
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(10),

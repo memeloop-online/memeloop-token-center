@@ -110,6 +110,8 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   const [message, setMessage] = useState('');
   const [editing, setEditing] = useState<TransportProxyGroup | null>();
   const [name, setName] = useState('');
+  const [probeUrl, setProbeUrl] = useState('');
+  const [probeAttempts, setProbeAttempts] = useState('2');
   const [members, setMembers] = useState<MemberDraft[]>([]);
   const [replacement, setReplacement] = useState('');
   const [accountId, setAccountId] = useState(() => eligibleAccounts.find(account => account.id === initialAccountId)?.id ?? '');
@@ -132,6 +134,9 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   }));
   const validMembers = members.length >= 1 && members.length <= 4 && members.every(member => member.label.trim()
     && (member.id && !member.proxyUrl.trim() || member.proxyUrl.trim().startsWith('socks5h://')));
+  const probeAttemptCount = Number(probeAttempts);
+  const validProbe = Number.isInteger(probeAttemptCount) && probeAttemptCount >= 1 && probeAttemptCount <= 8
+    && (probeUrl.trim() === '' || /^https?:\/\//.test(probeUrl.trim()));
   const bindingPath = (id: string) => `/internal/v1/upstreams/${encodeURIComponent(id)}/transport-proxy-group`;
   const request = <Result,>(path: string, init: RequestInit = {}) => transportProxyRequest<Result>(path, token, {
     ...init, signal: pendingWrite.current?.signal,
@@ -175,7 +180,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
     locked.current = true;
     bindingRead.current += 1;
     setBusy(true); setReady(false); setError(''); setBinding(undefined); setEditing(undefined);
-    setMembers([]); setName(''); setReplacement(''); setGroupId(''); setInitialMember(''); setSingleMember('');
+    setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); setReplacement(''); setGroupId(''); setInitialMember(''); setSingleMember('');
     try {
       const result = await request<{ items: TransportProxyGroup[] }>(`${transportProxyGroupsPath}${query}`);
       const current = accountId ? await request<TransportProxyBinding>(`${bindingPath(accountId)}${query}`) : undefined;
@@ -224,12 +229,12 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   }
 
   function clearRestrictedState() {
-    setGroups([]); setBinding(undefined); setEditing(undefined); setMembers([]); setName(''); setReplacement('');
+    setGroups([]); setBinding(undefined); setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); setReplacement('');
     setGroupId(''); setInitialMember(''); setSingleMember(''); setAccountId('');
   }
 
   function editGroup(group: TransportProxyGroup | null) {
-    setEditing(group); setName(group?.name ?? ''); setReplacement(''); setError(''); setMessage('');
+    setEditing(group); setName(group?.name ?? ''); setProbeUrl(group?.probe_url ?? ''); setProbeAttempts(String(group?.probe_attempts ?? 2)); setReplacement(''); setError(''); setMessage('');
     setMembers(group ? group.members.map(member => ({ key: member.id, id: member.id, label: member.label, proxyUrl: '' })) : [newMember()]);
   }
 
@@ -238,11 +243,13 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   }
 
   async function saveGroup() {
-    if (editing === undefined || !name.trim() || !validMembers || requiresReplacement && !members.some(member => member.id === replacement)) return;
+    if (editing === undefined || !name.trim() || !validMembers || !validProbe || requiresReplacement && !members.some(member => member.id === replacement)) return;
     const body = {
       tenant_external_id: tenant, name: name.trim(),
       ...(editing ? { expected_version: editing.version } : {}),
       ...(requiresReplacement ? { replacement_member_id: replacement } : {}),
+      probe_url: probeUrl.trim() || null,
+      probe_attempts: Number(probeAttempts),
       members: members.map(member => ({ ...(member.id ? { id: member.id } : {}), label: member.label.trim(), ...(member.proxyUrl.trim() ? { proxy_url: member.proxyUrl.trim() } : {}) })),
     };
     await mutate(async () => {
@@ -251,7 +258,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
       });
       if (!alive.current) return;
       setGroups(current => [...current.filter(group => group.id !== saved.id), saved]);
-      setEditing(undefined); setMembers([]); setName(''); setBinding(undefined);
+      setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); setBinding(undefined);
       if (accountId) {
         try {
           const latest = await request<TransportProxyBinding>(`${bindingPath(accountId)}${query}`);
@@ -333,6 +340,10 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
           </FormSection>)}
           <p>{copy.addressHint}</p>
           <Button type="button" disabled={members.length >= 4} onClick={() => setMembers(current => [...current, newMember()])}>{copy.addMember}</Button>
+          <Field label={copy.probeUrl}><Input maxLength={200} value={probeUrl} onChange={(_, data) => setProbeUrl(data.value)} placeholder="https://example.com/" /></Field>
+          <Field label={copy.probeAttempts}><Input type="number" required min={1} max={8} value={probeAttempts} onChange={(_, data) => setProbeAttempts(data.value)} /></Field>
+          <p>{copy.probeHint}</p>
+          {editing && editing.last_probe_checked_at ? <p>{copy.lastProbe(editing.last_probe_status ?? '', new Date(editing.last_probe_checked_at).toLocaleString(locale))}</p> : null}
           {requiresReplacement && <Field label={copy.replacement} required>
             <Select value={replacement} onChange={event => setReplacement(event.target.value)} required>
               <option value="">{copy.selectSavedMember}</option>
@@ -341,8 +352,9 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
             <p>{copy.replacementHint}</p>
           </Field>}
           <div className="button-row">
-            <Button type="submit" appearance="primary" disabled={!name.trim() || !validMembers || requiresReplacement && !replacement}>{copy.save}</Button>
-            <Button type="button" onClick={async () => { if (await confirm(copy.discardEdit)) { setEditing(undefined); setMembers([]); setName(''); } }}>{copy.cancelEdit}</Button>
+            <Button type="submit" appearance="primary" disabled={!name.trim() || !validMembers || !validProbe || requiresReplacement && !replacement}>{copy.save}</Button>
+            {editing?.id ? <Button type="button" disabled={busy || !editing?.probe_url} onClick={() => { const groupId = editing?.id; if (!groupId) return; void mutate(async () => { await request(`${transportProxyGroupsPath}/${encodeURIComponent(groupId)}/probe${query}`, { method: 'POST' }); }, copy.probeQueued); }}>{copy.probeNow}</Button> : null}
+            <Button type="button" onClick={async () => { if (await confirm(copy.discardEdit)) { setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); } }}>{copy.cancelEdit}</Button>
           </div>
         </FormSection>
       </form>}

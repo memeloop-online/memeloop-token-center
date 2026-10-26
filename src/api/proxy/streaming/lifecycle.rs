@@ -26,9 +26,7 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) delivered_billable: bool,
     pub(super) sse_summary: Option<ResponsesSseSummary>,
     pub(super) usage_capture: Vec<u8>,
-    pub(super) response_archive_attempt: Option<crate::proxy_lifecycle::ProxyArchiveAttempt>,
     pub(super) stored_response: String,
-    pub(super) gap_response: String,
     pub(super) routing_terminal_observed_at: Option<i64>,
     pub(super) routing_terminal_pre_published: bool,
 }
@@ -161,6 +159,43 @@ fn streaming_upstream_evidence(
     }
 }
 
+pub(super) fn apply_chat_translation_usage_evidence(
+    summary: &mut ResponsesSseSummary,
+    translation_error: Option<&str>,
+) {
+    if matches!(
+        translation_error,
+        Some(
+            "upstream_invalid_response"
+                | "upstream_invalid_usage"
+                | "upstream_response_terminal_conflict"
+        )
+    ) {
+        summary.usage_invalid = true;
+    }
+}
+
+fn trusted_streaming_terminal_usage(
+    summary: Option<&ResponsesSseSummary>,
+    transport_error: Option<&str>,
+) -> Option<TokenUsage> {
+    summary
+        .filter(|summary| {
+            matches!(
+                summary.outcome,
+                ResponsesSseOutcome::Completed { .. } | ResponsesSseOutcome::TerminatedIncomplete
+            ) && !summary.usage_invalid
+                && !summary.protocol_invalid
+                && !summary.observed_protocol_invalid
+                && (!matches!(summary.outcome, ResponsesSseOutcome::TerminatedIncomplete)
+                    || matches!(
+                        transport_error,
+                        None | Some("downstream_disconnected" | "downstream_backpressure")
+                    ))
+        })
+        .and_then(|summary| summary.usage.clone())
+}
+
 pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInput<'_>) {
     let StreamingFinalizationInput {
         output_timing,
@@ -185,9 +220,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         delivered_billable,
         sse_summary,
         usage_capture,
-        response_archive_attempt,
         stored_response,
-        gap_response,
         routing_terminal_observed_at,
         routing_terminal_pre_published,
     } = input;
@@ -206,30 +239,11 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     // erase trustworthy provider usage. A validated provider-declared incomplete
     // terminal also carries final counters; an unknown EOF or error never does.
     // Keep the cancellation status and validate reservation bounds below.
-    let terminal_usage = sse_summary
-        .as_ref()
-        .filter(|summary| {
-            matches!(
-                summary.outcome,
-                ResponsesSseOutcome::Completed { .. } | ResponsesSseOutcome::TerminatedIncomplete
-            ) && !summary.usage_invalid
-                && !summary.protocol_invalid
-                && !summary.observed_protocol_invalid
-                && (!matches!(summary.outcome, ResponsesSseOutcome::TerminatedIncomplete)
-                    || matches!(
-                        transport_error,
-                        None | Some("downstream_disconnected" | "downstream_backpressure")
-                    ))
-        })
-        .and_then(|summary| summary.usage.clone());
+    let terminal_usage = trusted_streaming_terminal_usage(sse_summary.as_ref(), transport_error);
     let mut usage = if error_code.is_some() {
-        if delivered_billable {
-            if let Some(usage) = terminal_usage {
-                usage_basis = crate::model::RequestUsageBasis::ProviderReported;
-                usage
-            } else {
-                TokenUsage::default()
-            }
+        if let Some(usage) = terminal_usage {
+            usage_basis = crate::model::RequestUsageBasis::ProviderReported;
+            usage
         } else {
             TokenUsage::default()
         }
@@ -321,17 +335,6 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     let routing_session_id = conversation
         .as_ref()
         .and_then(|conversation| conversation.hints.session_id.clone());
-    let conversation = if let Some(conversation) = conversation.as_ref() {
-        match conversation.project(&memory, lifecycle_deadline).await {
-            Ok(projection) => Some(projection),
-            Err(error) => {
-                ProxyConversation::log_projection_error(request_id, &error);
-                None
-            }
-        }
-    } else {
-        None
-    };
     let (duration_ms, first_output_ms, generation_duration_ms) = output_timing
         .finish_with_duration(
             error_code.is_none()
@@ -342,8 +345,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
             diagnostic_context,
             Instant::now(),
         );
-    let terminal_result = finish_proxy_request_with_archive_fallback(
-        &state.db,
+    let snapshot = crate::proxy_lifecycle::pending_terminal::Snapshot::capture(
         FinishProxyRequest {
             terminal_cause: if transport_error == Some("downstream_disconnected") {
                 Some(crate::model::RequestTerminalCause::ClientDisconnected)
@@ -370,37 +372,80 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
                 routing_session_id.as_deref()
             },
             routing_terminal_observed_at,
-            conversation: conversation
-                .as_ref()
-                .map(|projection| projection.input(response_id.as_deref())),
+            conversation: None,
         },
-        response_archive_attempt.as_ref(),
-        &gap_response,
-    )
-    .await;
-    let terminal_result_failed = terminal_result.is_err();
-    if terminal_result_failed {
-        // The commit can be durable even when its acknowledgement is lost.
-        // Preserve this request-scoped archive until its database owner is
-        // known; deleting it here could leave a committed row dangling.
-        tracing::error!(%request_id, stage = "terminal_transaction", "proxy request finalization failed");
+        ProxyRequestUpstreamAttribution::KeepSelected,
+        response_id.clone(),
+        delivered_billable,
+        if matches!(
+            transport_error,
+            Some("downstream_disconnected" | "downstream_backpressure")
+        ) {
+            "response_delivery"
+        } else {
+            "upstream_response_body"
+        },
+    );
+    if let Some(conversation) = conversation.as_ref() {
+        conversation.release_retained_upload();
     }
-    let attempt_terminal = match streaming_upstream_evidence(
-        terminal_result_failed,
-        transport_error,
-        sse_summary.as_ref(),
-        error_code,
-    ) {
-        StreamingUpstreamEvidence::Succeeded => UpstreamAttemptTerminal::Succeeded,
-        StreamingUpstreamEvidence::Inconclusive => UpstreamAttemptTerminal::Inconclusive,
-        StreamingUpstreamEvidence::InvalidResponse => UpstreamAttemptTerminal::invalid_response(),
-    };
+    state.pending_terminals.submit_with_preparation(
+        snapshot,
+        memory.clone(),
+        prepare_terminal_conversation(
+            conversation,
+            memory,
+            response_id,
+            request_id,
+            lifecycle_deadline,
+        ),
+    );
+    // The response body is already delivered. A contended writer must not keep
+    // the proxy lifecycle slot; the same observation continues in the background.
+    let observation = state
+        .pending_terminals
+        .record_operational_observation(&state.db, request_id);
+    match tokio::time::timeout(std::time::Duration::from_millis(250), observation).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!(
+                %request_id,
+                error_category = error.diagnostic_category(),
+                "runtime terminal was not durable before the stream handler returned"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                %request_id,
+                "operational observation exceeded the response lifecycle budget"
+            );
+            let pending = state.pending_terminals.clone();
+            let database = state.db.clone();
+            tokio::spawn(async move {
+                if let Err(error) = pending
+                    .record_operational_observation(&database, request_id)
+                    .await
+                {
+                    tracing::error!(
+                        %request_id,
+                        error_category = error.diagnostic_category(),
+                        "background operational observation failed"
+                    );
+                }
+            });
+        }
+    }
+    let attempt_terminal =
+        match streaming_upstream_evidence(false, transport_error, sse_summary.as_ref(), error_code)
+        {
+            StreamingUpstreamEvidence::Succeeded => UpstreamAttemptTerminal::Succeeded,
+            StreamingUpstreamEvidence::Inconclusive => UpstreamAttemptTerminal::Inconclusive,
+            StreamingUpstreamEvidence::InvalidResponse => {
+                UpstreamAttemptTerminal::invalid_response()
+            }
+        };
     upstream_attempt.complete(attempt_terminal).await;
-    codex_retry.complete(if terminal_result_failed {
-        CodexRetryTerminal::Failed
-    } else {
-        retry_terminal
-    });
+    codex_retry.complete(retry_terminal);
 }
 
 #[cfg(test)]
@@ -420,6 +465,216 @@ mod tests {
             observed_protocol_invalid,
             independently_observed_protocol_invalid: observed_protocol_invalid,
             protocol_invalid,
+        }
+    }
+
+    #[test]
+    fn native_chat_terminal_conflict_invalidates_captured_usage() {
+        for conflicting in [false, true] {
+            let item = serde_json::json!({
+                "type": "message", "id": "msg-workbuddy", "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": "OK", "annotations": []}]
+            });
+            let mut terminal_item = item.clone();
+            if conflicting {
+                terminal_item["content"][0]["text"] = serde_json::json!("different");
+            }
+            let mut capture = ResponsesSseCapture::for_codex_responses();
+            let mut translator =
+                codex_transport::CodexChatStreamTranslator::new(Uuid::nil(), "public".into(), true);
+            let mut transport_error = None;
+            for event in [
+                serde_json::json!({"type": "response.output_item.done", "output_index": 0,
+                    "item": item}),
+                serde_json::json!({"type": "response.completed", "response": {
+                    "id": "resp-workbuddy", "object": "response", "status": "completed",
+                    "output": [terminal_item],
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+                }}),
+            ] {
+                let frame = format!("data: {event}\n\n");
+                capture.push(frame.as_bytes());
+                if let Err(error) = translator.translate_frame(frame.as_bytes()) {
+                    transport_error = Some(error);
+                }
+            }
+            let mut captured = capture.finish_summary();
+            assert!(matches!(
+                captured.outcome,
+                ResponsesSseOutcome::Completed { .. }
+            ));
+            assert!(captured.usage.is_some());
+            assert!(!captured.protocol_invalid);
+            apply_chat_translation_usage_evidence(&mut captured, transport_error);
+            let trusted = trusted_streaming_terminal_usage(Some(&captured), transport_error);
+            let terminal = classify_streaming_terminal(
+                200,
+                Protocol::OpenAiChat,
+                true,
+                transport_error,
+                Some(&captured),
+            );
+            if conflicting {
+                assert_eq!(transport_error, Some("upstream_invalid_response"));
+                assert_eq!(trusted, None);
+                assert_eq!(
+                    trusted_streaming_terminal_usage(
+                        Some(&captured),
+                        Some("downstream_disconnected")
+                    ),
+                    None
+                );
+                assert_eq!(
+                    (terminal.status_code, terminal.error_code),
+                    (502, Some("upstream_invalid_response"))
+                );
+                assert_eq!(
+                    streaming_upstream_evidence(
+                        false,
+                        transport_error,
+                        Some(&captured),
+                        terminal.error_code
+                    ),
+                    StreamingUpstreamEvidence::InvalidResponse
+                );
+            } else {
+                assert_eq!(transport_error, None);
+                assert_eq!(trusted, captured.usage);
+                let usage = trusted.unwrap();
+                assert_eq!((usage.input_tokens, usage.output_tokens), (3, 2));
+                assert_eq!((terminal.status_code, terminal.error_code), (200, None));
+            }
+        }
+    }
+
+    #[test]
+    fn native_chat_delta_and_terminal_output_kinds_must_agree_for_trusted_usage() {
+        for refusal_delta in [false, true] {
+            for conflicting in [false, true] {
+                let mut capture = ResponsesSseCapture::for_codex_responses();
+                let mut translator = codex_transport::CodexChatStreamTranslator::new(
+                    Uuid::nil(),
+                    "public".into(),
+                    true,
+                );
+                let refusal_terminal = refusal_delta != conflicting;
+                let content = if refusal_terminal {
+                    serde_json::json!({"type": "refusal", "refusal": "no"})
+                } else {
+                    serde_json::json!({"type": "output_text", "text": "yes", "annotations": []})
+                };
+                for event in [
+                    serde_json::json!({"type": "response.created",
+                        "response": {"id": "resp-kind", "status": "in_progress"}}),
+                    serde_json::json!({
+                        "type": if refusal_delta { "response.refusal.delta" } else { "response.output_text.delta" },
+                        "delta": if refusal_delta { "no" } else { "yes" }
+                    }),
+                ] {
+                    let frame = format!("data: {event}\n\n");
+                    capture.push(frame.as_bytes());
+                    translator.translate_frame(frame.as_bytes()).unwrap();
+                }
+                let event = serde_json::json!({"type": "response.completed", "response": {
+                    "id": "resp-kind", "object": "response", "status": "completed",
+                    "output": [{"type": "message", "id": "msg-kind", "role": "assistant",
+                        "status": "completed", "content": [content]}],
+                    "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+                }});
+                let frame = format!("data: {event}\n\n");
+                capture.push(frame.as_bytes());
+                let translation_error = translator.translate_frame(frame.as_bytes()).err();
+                assert_eq!(
+                    translation_error,
+                    conflicting.then_some("upstream_invalid_response")
+                );
+                let mut captured = capture.finish_summary();
+                assert!(matches!(
+                    captured.outcome,
+                    ResponsesSseOutcome::Completed { .. }
+                ));
+                assert!(!captured.usage_invalid);
+                let usage = captured.usage.clone().unwrap();
+                assert_eq!((usage.input_tokens, usage.output_tokens), (3, 2));
+                apply_chat_translation_usage_evidence(&mut captured, translation_error);
+                for transport_error in [
+                    translation_error,
+                    Some("downstream_disconnected"),
+                    Some("downstream_backpressure"),
+                ] {
+                    assert_eq!(
+                        trusted_streaming_terminal_usage(Some(&captured), transport_error),
+                        if conflicting {
+                            None
+                        } else {
+                            Some(usage.clone())
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_native_chat_output_preserves_valid_terminal_usage() {
+        let event = serde_json::json!({"type": "response.completed", "response": {
+            "id": "resp-search", "object": "response", "status": "completed",
+            "output": [{"type": "web_search_call", "id": "search-call", "status": "completed",
+                "action": {"type": "search", "query": "synthetic"}}],
+            "usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+        }});
+        let frame = format!("data: {event}\n\n");
+        let mut capture = ResponsesSseCapture::for_codex_responses();
+        capture.push(frame.as_bytes());
+        let mut translator =
+            codex_transport::CodexChatStreamTranslator::new(Uuid::nil(), "public".into(), true);
+        let translation_error = translator.translate_frame(frame.as_bytes()).err();
+        assert_eq!(translation_error, Some("upstream_unsupported_chat_output"));
+        let mut captured = capture.finish_summary();
+        apply_chat_translation_usage_evidence(&mut captured, translation_error);
+        let usage = trusted_streaming_terminal_usage(Some(&captured), translation_error).unwrap();
+        assert_eq!((usage.input_tokens, usage.output_tokens), (3, 2));
+    }
+
+    #[test]
+    fn semantic_terminal_failures_reject_usage_but_delivery_loss_preserves_it() {
+        for completed in [false, true] {
+            for translation_error in [
+                None,
+                Some("upstream_invalid_response"),
+                Some("upstream_invalid_usage"),
+                Some("upstream_response_terminal_conflict"),
+            ] {
+                let outcome = if completed {
+                    ResponsesSseOutcome::Completed {
+                        response_id: Some("resp-valid".into()),
+                    }
+                } else {
+                    ResponsesSseOutcome::TerminatedIncomplete
+                };
+                let mut captured = summary(outcome, false, false);
+                captured.usage = Some(TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    ..TokenUsage::default()
+                });
+                apply_chat_translation_usage_evidence(&mut captured, translation_error);
+                for transport_error in [
+                    translation_error,
+                    Some("downstream_disconnected"),
+                    Some("downstream_backpressure"),
+                ] {
+                    assert_eq!(
+                        trusted_streaming_terminal_usage(Some(&captured), transport_error),
+                        if translation_error.is_some() {
+                            None
+                        } else {
+                            captured.usage.clone()
+                        }
+                    );
+                }
+            }
         }
     }
 

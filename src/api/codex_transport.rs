@@ -1585,14 +1585,13 @@ impl CodexChatStreamTranslator {
     }
 
     fn observe_output_kind(&mut self, kind: ChatOutputKind) -> Result<(), &'static str> {
+        if self.output_kind.is_some_and(|current| current != kind) {
+            return Err("upstream_invalid_response");
+        }
         if kind == ChatOutputKind::Refusal && !self.tools.is_empty() {
             return Err("upstream_unsupported_chat_output");
         }
-        match self.output_kind {
-            None => self.output_kind = Some(kind),
-            Some(current) if current == kind => {}
-            Some(_) => return Err("upstream_unsupported_chat_output"),
-        }
+        self.output_kind = Some(kind);
         Ok(())
     }
 
@@ -3502,7 +3501,7 @@ mod tests {
             mixed.translate_frame(
                 b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"yes\"}\n\n"
             ),
-            Err("upstream_unsupported_chat_output")
+            Err("upstream_invalid_response")
         );
 
         let mut repeated =

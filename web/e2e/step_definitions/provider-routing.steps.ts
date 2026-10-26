@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page, Request } from 'playwright';
+import type { RequestListResponse } from '../../src/types.js';
 import { baseURL, eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
@@ -84,6 +85,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   assert.deepEqual(requestMetricLabels, ['总词元', '本地结算 ⓘ', '缓存率', '平均延迟']);
   assert.ok(!requestMetricLabels.includes('失败') && !requestMetricLabels.includes('请求数'), 'request metrics must not retain obsolete failure or request-count cards');
   const builder = requestPanel.locator('.typed-filter-builder');
+  await assertCount(requestPanel.locator('tbody tr'), 51);
   const dialog = await openTypedFilterDialog(builder);
 
   const protocol = await addTypedFilterCondition(dialog, 'protocol');
@@ -132,9 +134,20 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
     ['principal', 'contains', 'browser-e2e'], ['route_id', 'equals', seed.routeId], ['upstream_account_id', 'equals', seed.upstreamId],
     ['cost_micros', 'greater_than_or_equal', 0], ['cost_micros', 'less_than_or_equal', 1_000_000_000],
   ]);
-  await assertCount(requestPanel.locator('tbody tr'), 51);
+  const priced = await firstFilter.json() as RequestListResponse;
+  assert.equal(priced.requests.length, 50);
+  assert.equal(priced.next_cursor, null);
+  assert.ok(priced.requests.every((request) => request.status_code === 200 && request.cost !== null),
+    'numeric cost bounds must include only the fifty financially known requests');
+  await assertCount(requestPanel.locator('tbody tr'), 50);
 
   const errorDialog = await openTypedFilterDialog(builder);
+  const costConditions = errorDialog.locator('.typed-filter-row').filter({
+    has: page.locator('[data-filter-field="cost_micros"]'),
+  });
+  assert.equal(await costConditions.count(), 2);
+  await costConditions.first().getByRole('button', { name: '删除', exact: true }).click();
+  await costConditions.first().getByRole('button', { name: '删除', exact: true }).click();
   const status = await addTypedFilterCondition(errorDialog, 'status');
   await status.getByLabel('值').selectOption('error');
   const errorCode = await addTypedFilterCondition(errorDialog, 'error_code');
@@ -144,10 +157,21 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const errorFilter = await errorFilterResponse;
   assert.equal(errorFilter.status(), 200, await errorFilter.text());
   const errorAst = (errorFilter.request().postDataJSON() as { ast: { conditions: Array<{ field: string; value: { value: string } }> } }).ast;
+  assert.deepEqual(errorAst.conditions.slice(0, -2), firstAst.conditions.slice(0, -2),
+    'error drilldown removes only the numeric cost bounds, retaining all identity filters');
   assert.deepEqual(errorAst.conditions.slice(-2).map((condition) => [condition.field, condition.value.value]), [['status', 'error'], ['error_code', 'http_429']]);
+  const rejected = await errorFilter.json() as RequestListResponse;
+  assert.equal(rejected.requests.length, 1);
+  assert.equal(rejected.next_cursor, null);
+  assert.equal(rejected.requests[0].status_code, 429);
+  assert.equal(rejected.requests[0].completed_at, null);
+  assert.equal(rejected.requests[0].cost, null);
+  assert.equal(rejected.requests[0].operational_terminal?.financial_state, 'unknown');
+  assert.ok(!priced.requests.some((request) => request.request_id === rejected.requests[0].request_id),
+    'unknown cost must not have matched a minimum cost of zero');
   await assertCount(requestPanel.locator('tbody tr'), 1);
   await assertContains(requestPanel.locator('tbody'), '429');
-  await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务在响应开始时返回了错误状态');
+  await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务返回了错误状态');
   assert.doesNotMatch(await requestPanel.locator('tbody').innerText(), /http_429/);
   await requestPanel.getByRole('button', { name: /请求详情$/ }).click();
   const requestDrawer = page.getByRole('dialog');
@@ -225,11 +249,10 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   assert.equal(await page.locator('.provider-list').isVisible(), false);
   await providerWorkspace.getByRole('button', { name: '近期可用性', exact: true }).click();
   await providerWorkspace.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
-  // The shared seed includes a routed 429. Do not make this UI assertion
-  // depend on whether its real-time breaker cooldown has already elapsed.
   const healthPath = `/internal/v1/upstreams/${seed.upstreamId}/health`;
+  let manualHealthPosts = 0;
   await page.route((url) => url.pathname === healthPath, async (route) => {
-    assert.equal(route.request().method(), 'POST');
+    if (route.request().method() === 'POST') manualHealthPosts += 1;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -237,17 +260,17 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
         account_id: seed.upstreamId,
         status: 'unhealthy',
         error_code: 'rate_limited',
-        source: 'routing_state',
+        source: 'connection_probe',
         checked_at: Date.UTC(2026, 0, 1),
-        retry_at: Date.UTC(2026, 0, 1, 0, 1),
+        latency_ms: 12,
       }),
     });
   });
-  await providerWorkspace.getByRole('button', { name: '主动健康检查' }).click();
+  await providerWorkspace.getByRole('button', { name: '运行主动健康检查', exact: true }).click();
+  assert.equal(manualHealthPosts, 1);
   const manualHealth = providerWorkspace.locator('.provider-manual-health');
   await assertContains(manualHealth, '上游限流中');
-  await assertContains(manualHealth, '最早重试时间');
-  await assertContains(manualHealth, '未发送额外探测请求');
+  await assertContains(manualHealth, 'rate_limited');
   await assertNoCount(manualHealth.locator('.status.ok'));
   const disabledProvider = page.waitForResponse((response) => {
     const url = new URL(response.url());

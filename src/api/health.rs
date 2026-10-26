@@ -148,6 +148,21 @@ pub(super) async fn readiness_snapshot(state: AppState) -> (StatusCode, Value) {
         })
         .await;
     let (status, mut body) = readiness_contract(database_ready, archive_ready);
+    #[cfg(feature = "experimental-plugin-revisions")]
+    let status = if let Some(authority) = &state.application_plugins {
+        let snapshot = authority.refresh_status();
+        let ready = snapshot["ready"] == true;
+        body["application_plugins"] = snapshot;
+        if ready {
+            status
+        } else {
+            body["status"] = json!("not_ready");
+            body["error"] = json!({"code": "application_plugin_snapshot_unavailable"});
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    } else {
+        status
+    };
     if !database_ready.is_ready() {
         let code = match database_ready {
             crate::metrics::DatabaseReadiness::SchemaOutdated { .. } => "database_schema_outdated",

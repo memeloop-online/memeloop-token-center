@@ -51,13 +51,27 @@ pub(super) async fn gated_sse_upstream(
             .unwrap();
         stream.flush().await.unwrap();
         body_released.await.unwrap();
-        stream
-            .write_all(format!("{:X}\r\n", body.len()).as_bytes())
-            .await
-            .unwrap();
-        stream.write_all(&body).await.unwrap();
-        stream.write_all(b"\r\n0\r\n\r\n").await.unwrap();
-        stream.shutdown().await.unwrap();
+        let sent = async {
+            stream
+                .write_all(format!("{:X}\r\n", body.len()).as_bytes())
+                .await?;
+            stream.write_all(&body).await?;
+            stream.write_all(b"\r\n0\r\n\r\n").await?;
+            stream.shutdown().await
+        }
+        .await;
+        if let Err(error) = sent {
+            assert!(
+                matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                ),
+                "unexpected provider socket failure: {error}"
+            );
+        }
         assert!(
             tokio::time::timeout(Duration::from_millis(100), listener.accept())
                 .await
@@ -73,13 +87,19 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     const RETAINED_BYTES: usize = 8 * 1024 * 1024;
 
     let fixture = codex_route_fixture("large-conversation-stream").await;
+    let retirement = fixture
+        .state
+        .pending_terminals
+        .hold_retirement_for_test()
+        .await;
+    let spool_reads = fixture.state.responses_request_spool.read_count_for_test();
     fixture
         .state
         .db
         .update_key_policy(
             fixture.key_id,
             KeyPolicy {
-                tokens_per_minute: 32 * 1024 * 1024,
+                tokens_per_minute: Some(32 * 1024 * 1024),
                 ..KeyPolicy::default()
             },
         )
@@ -114,6 +134,11 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     let request_id = Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap())
         .expect("gateway request id");
     let finalization_gate = streaming::finalization_test_gate::install(request_id);
+    assert_eq!(
+        fixture.state.responses_request_spool.read_count_for_test(),
+        spool_reads + 1,
+        "routing reads the source-backed request once"
+    );
 
     let (held, _, _, _) = fixture.state.proxy_memory_budget.snapshot();
     assert!(
@@ -141,6 +166,63 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     upstream.await.unwrap();
     wait_for_request_settlement(&fixture, 1).await;
 
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let settled: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pending_proxy_settlements WHERE request_id = $1 AND state = 'applied'",
+            )
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if settled == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("large source-backed request must financially settle");
+    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+    assert_eq!(
+        fixture.state.responses_request_spool.read_count_for_test(),
+        spool_reads + 1,
+        "terminal journal preparation must reuse the semantic projection without rereading raw input"
+    );
+    let mut receipts = tokio::fs::read_dir(fixture.state.pending_terminals.directory_for_test())
+        .await
+        .unwrap();
+    let mut found_receipt = false;
+    while let Some(entry) = receipts.next_entry().await.unwrap() {
+        if entry
+            .path()
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let bytes = tokio::fs::read(entry.path()).await.unwrap();
+        let receipt: Value = serde_json::from_slice(&bytes).unwrap();
+        if receipt["request_id"] != request_id.to_string() {
+            continue;
+        }
+        assert!(
+            bytes.len() < RETAINED_BYTES,
+            "journal must not copy raw padding"
+        );
+        assert_eq!(
+            receipt["conversation"]["request_json"],
+            json!({"input": "small semantic input"})
+        );
+        found_receipt = true;
+    }
+    assert!(
+        found_receipt,
+        "settled receipt is retained at the retirement gate"
+    );
+
     let rows = fixture
         .state
         .db
@@ -148,23 +230,38 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
         .await
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let cluster: Option<String> =
         sqlx::query_scalar("SELECT conversation_cluster_id FROM request_records WHERE id = $1")
             .bind(rows[0].request_id.to_string())
             .fetch_one(&pool)
             .await
             .unwrap();
-    pool.close().await;
     assert!(
         cluster.is_some(),
-        "terminal projection reparsed the raw request"
+        "terminal projection must preserve source-backed conversation membership"
     );
+    let expected_atoms =
+        crate::conversation::extract_atoms(&json!({"input": "small semantic input"}));
+    let expected_prefix = crate::conversation::build_prefix(&expected_atoms);
+    let leaf: Option<String> = sqlx::query_scalar(
+        "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        leaf.as_deref(),
+        Some(expected_prefix.last().unwrap().node_hash.as_str())
+    );
+    pool.close().await;
+    drop(retirement);
 }
 
 #[tokio::test]
 async fn dropping_downstream_body_records_client_cancelled_without_poisoning_upstream() {
     let fixture = codex_route_fixture("downstream-client-cancelled").await;
+    let active_owners = fixture.state.proxy_lifecycles.active();
     codex_output_limits::enable_provider_default_limits(&fixture).await;
     let (endpoint, release_body, upstream) =
         gated_sse_upstream(completed_codex_sse("never consumed").into_bytes()).await;
@@ -177,22 +274,22 @@ async fn dropping_downstream_body_records_client_cancelled_without_poisoning_ups
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
 
     drop(response);
+    let receipt = cancellation::assert_unknown_receipt(
+        &fixture,
+        request_id,
+        499,
+        "client_cancelled",
+        active_owners,
+    )
+    .await;
+    assert_eq!(receipt["terminal_cause"], "client_disconnected");
     release_body.send(()).unwrap();
     upstream.await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
-
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(499));
-    assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
-    assert_eq!(rows[0].cost, "0");
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    cancellation::assert_unknown_request(&fixture, request_id, active_owners).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_health
@@ -207,7 +304,6 @@ async fn dropping_downstream_body_records_client_cancelled_without_poisoning_ups
         health_rows, 0,
         "a downstream cancellation is not upstream health evidence"
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
 async fn assert_delivery_database_fault(stage: &str, target_state: &str) {
@@ -249,8 +345,10 @@ async fn assert_delivery_database_fault(stage: &str, target_state: &str) {
     assert_eq!(response.status(), StatusCode::OK);
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
-        .expect("delivery state failure must close with a safe SSE terminal");
-    assert!(String::from_utf8_lossy(&delivered).contains("upstream request failed"));
+        .expect("local delivery observations must not block valid output");
+    assert!(String::from_utf8_lossy(&delivered).contains("response.completed"));
+    assert!(String::from_utf8_lossy(&delivered).contains("delivery state fault"));
+    assert!(!String::from_utf8_lossy(&delivered).contains("upstream request failed"));
 
     wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
@@ -259,10 +357,9 @@ async fn assert_delivery_database_fault(stage: &str, target_state: &str) {
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(500));
-    assert_eq!(rows[0].error_code.as_deref(), Some("delivery_state"));
-    assert_eq!(rows[0].cost, "0");
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].error_code, None);
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_health
@@ -277,17 +374,17 @@ async fn assert_delivery_database_fault(stage: &str, target_state: &str) {
         health_rows, 0,
         "a local delivery database fault is not upstream health evidence"
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     upstream.verify().await;
 }
 
 #[tokio::test]
-async fn delivery_prepare_database_fault_is_local_and_unbilled() {
+async fn delivery_prepare_database_fault_does_not_block_output_or_erase_usage() {
     assert_delivery_database_fault("prepare", "delivery_prepared").await;
 }
 
 #[tokio::test]
-async fn delivery_confirm_database_fault_is_local_and_unbilled() {
+async fn delivery_confirm_database_fault_does_not_block_output_or_erase_usage() {
     assert_delivery_database_fault("confirm", "delivery_started").await;
 }
 
@@ -298,6 +395,7 @@ async fn assert_codex_terminal_rejection(
     expected_prefix: Option<&str>,
 ) {
     let fixture = codex_route_fixture(label).await;
+    let active_owners = fixture.state.proxy_lifecycles.active();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -314,6 +412,8 @@ async fn assert_codex_terminal_rejection(
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .expect("a rejected Responses stream must end with a safe SSE error");
@@ -326,25 +426,17 @@ async fn assert_codex_terminal_rejection(
         assert!(delivered.contains(prefix));
     }
 
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
+    let receipt = cancellation::assert_unknown_receipt(
+        &fixture,
+        request_id,
+        502,
+        expected_error,
+        active_owners,
+    )
+    .await;
     assert_eq!(
-        refs.response_object.as_deref(),
-        Some(format!("gap://{}/response", rows[0].request_id).as_str())
+        receipt["response_object"],
+        format!("gap://{request_id}/response")
     );
     upstream.verify().await;
 }
@@ -352,6 +444,7 @@ async fn assert_codex_terminal_rejection(
 #[tokio::test]
 async fn codex_clean_eof_without_terminal_is_durable_and_explicit_downstream() {
     let fixture = codex_route_fixture("clean-eof-without-terminal").await;
+    let active_owners = fixture.state.proxy_lifecycles.active();
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -374,6 +467,8 @@ async fn codex_clean_eof_without_terminal_is_durable_and_explicit_downstream() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .expect("a clean EOF without a terminal must stay valid SSE");
@@ -382,24 +477,26 @@ async fn codex_clean_eof_without_terminal_is_durable_and_explicit_downstream() {
     assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert!(!delivered.contains("response.completed"));
 
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_unknown_receipt(
+        &fixture,
+        request_id,
+        502,
+        "upstream_eof_without_terminal",
+        active_owners,
+    )
+    .await;
     let rows = fixture
         .state
         .db
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_eof_without_terminal")
-    );
+    assert_eq!(rows[0].request_id, request_id);
     assert_eq!(
         rows[0].upstream_account_id,
         Some(fixture.upstream_account_id)
     );
     assert_eq!(rows[0].route_id, Some(fixture.route_id));
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     upstream.verify().await;
 }
 
@@ -531,9 +628,119 @@ async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
     upstream.verify().await;
 }
 
+pub(super) async fn pending_response_archive(
+    fixture: &CodexRouteFixture,
+    receipt: &Value,
+) -> String {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+
+    drain_archive_capture(fixture).await;
+    let request_id = receipt["request_id"].as_str().unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let spool = sqlx::query(
+        "SELECT tenant_id, reservation_id, state, chunk_count, byte_count \
+         FROM response_archive_spools WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        spool.get::<String, _>("tenant_id"),
+        receipt["tenant_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        spool.get::<String, _>("reservation_id"),
+        receipt["reservation"]["id"].as_str().unwrap()
+    );
+    assert_eq!(spool.get::<String, _>("state"), "pending");
+    let chunks = sqlx::query(
+        "SELECT seq, ciphertext, byte_count FROM response_archive_spool_chunks \
+         WHERE request_id = $1 ORDER BY seq",
+    )
+    .bind(request_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(chunks.len() as i64, spool.get::<i64, _>("chunk_count"));
+    assert!(!chunks.is_empty());
+    let mut archived = Vec::new();
+    for (index, chunk) in chunks.iter().enumerate() {
+        let sequence = chunk.get::<i64, _>("seq");
+        assert_eq!(sequence, index as i64);
+        let ciphertext = chunk.get::<String, _>("ciphertext");
+        let (sealed, compressed, version) = match ciphertext.strip_prefix("zstd1.") {
+            Some(sealed) => (sealed, true, 2),
+            None => (ciphertext.as_str(), false, 1),
+        };
+        let aad = format!(
+            "memeloop-token-center/response-archive-spool/v{version}/{}/{request_id}/{}/{sequence}",
+            spool.get::<String, _>("tenant_id"),
+            spool.get::<String, _>("reservation_id"),
+        );
+        let envelope: Value = crate::provider::open_private_json(
+            sealed,
+            fixture.state.config.key_pepper.as_bytes(),
+            aad.as_bytes(),
+        )
+        .unwrap();
+        let payload = URL_SAFE_NO_PAD
+            .decode(envelope["bytes"].as_str().unwrap())
+            .unwrap();
+        let expected_bytes = usize::try_from(chunk.get::<i64, _>("byte_count")).unwrap();
+        let payload = if compressed {
+            zstd::bulk::decompress(&payload, expected_bytes).unwrap()
+        } else {
+            payload
+        };
+        assert_eq!(payload.len(), expected_bytes);
+        archived.extend_from_slice(&payload);
+    }
+    assert_eq!(archived.len() as i64, spool.get::<i64, _>("byte_count"));
+    pool.close().await;
+    String::from_utf8(archived).unwrap()
+}
+
+pub(super) async fn assert_unknown_response_archives_omit(
+    fixture: &CodexRouteFixture,
+    sensitive: &str,
+) {
+    let receipt = cancellation::single_unknown_receipt(fixture).await;
+    drain_archive_capture(fixture).await;
+    let locator = receipt["response_object"].as_str().unwrap();
+    if let Some(inline) = locator.strip_prefix("inline-json:") {
+        assert!(!inline.contains(sensitive));
+    } else {
+        assert!(locator.starts_with("gap://"));
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM response_archive_spools WHERE request_id = $1")
+            .bind(receipt["request_id"].as_str().unwrap())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+    if state.as_deref() == Some("pending") {
+        let archived = pending_response_archive(fixture, &receipt).await;
+        assert!(!archived.contains(sensitive));
+    } else {
+        assert!(state.is_none() || state.as_deref() == Some("gap"));
+        let chunks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1",
+        )
+        .bind(receipt["request_id"].as_str().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(chunks, 0);
+    }
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive() {
     let fixture = codex_route_fixture("failed-bare-secret-event").await;
+    let active_owners = fixture.state.proxy_lifecycles.active();
     let upstream = MockServer::start().await;
     let sse = concat!(
         "event: response.failed\n",
@@ -556,6 +763,8 @@ async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive()
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
@@ -565,32 +774,15 @@ async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive()
     assert!(!delivered.contains("provider-payload-secret"));
     assert!(!delivered.contains("bare-event-secret"));
 
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_failed_response")
-    );
-    drain_completed_response_archive(&fixture).await;
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
-    let archived = fixture
-        .state
-        .archive
-        .get(refs.response_object.as_deref().expect("response archive"))
-        .await
-        .unwrap();
-    let archived = String::from_utf8(archived.to_vec()).unwrap();
+    let receipt = cancellation::assert_unknown_receipt(
+        &fixture,
+        request_id,
+        502,
+        "upstream_failed_response",
+        active_owners,
+    )
+    .await;
+    let archived = pending_response_archive(&fixture, &receipt).await;
     assert!(archived.contains("upstream request failed"));
     assert!(!archived.contains("provider-payload-secret"));
     assert!(!archived.contains("bare-event-secret"));

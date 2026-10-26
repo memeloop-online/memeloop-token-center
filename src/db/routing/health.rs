@@ -7,7 +7,9 @@ use crate::config::UpstreamHealthConfig;
 mod delivery;
 mod strategy;
 
+#[cfg(test)]
 const CONNECTION_FAILURE_DOMAIN_WINDOW_MILLIS: i64 = 60_000;
+#[cfg(test)]
 const CONNECTION_FAILURE_GLOBAL_DOMAIN_THRESHOLD: i64 = 2;
 
 pub(crate) struct UpstreamTransportDiagnostic<'a> {
@@ -23,6 +25,7 @@ pub(crate) struct UpstreamTransportDiagnostic<'a> {
     pub failure_domain: &'a str,
 }
 
+#[cfg(test)]
 pub(crate) struct AdmittedConnectionFailure<'a> {
     pub request_id: Uuid,
     pub upstream_account_id: Uuid,
@@ -35,6 +38,7 @@ pub(crate) struct AdmittedConnectionFailure<'a> {
     pub failure_domain: &'a str,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConnectionFailureDomainResult {
     pub distinct_failure_domains: i64,
@@ -64,6 +68,9 @@ pub(crate) enum UpstreamFailureKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamAttemptAdmission {
+    /// Customer forwarding does not participate in circuit-breaker leases.
+    /// Its outcome is published by the existing background observer.
+    Observed,
     Healthy {
         /// Database-backed health epoch shared by every request admitted in
         /// the same healthy cohort. Success rotates it; only the first
@@ -122,6 +129,7 @@ impl UpstreamFailureKind {
         }
     }
 
+    #[cfg(test)]
     fn base_cooldown_millis(self, health: UpstreamHealthConfig) -> i64 {
         match self {
             Self::RateLimited | Self::RateLimitedUntil { .. } => {
@@ -133,6 +141,7 @@ impl UpstreamFailureKind {
         }
     }
 
+    #[cfg(test)]
     fn explicit_deadline(self, now: i64, health: UpstreamHealthConfig) -> i64 {
         match self {
             Self::RateLimitedUntil { until, .. } => until
@@ -221,6 +230,7 @@ impl Database {
     /// a bounded window. The existing healthy-admission epoch remains the
     /// global cohort fence, so concurrent failures can open the breaker only
     /// once after the cross-domain threshold is met.
+    #[cfg(test)]
     pub(crate) async fn record_admitted_connection_failure_by_domain(
         &self,
         failure: AdmittedConnectionFailure<'_>,
@@ -537,6 +547,7 @@ impl Database {
     /// Observe current-generation routing suppression without claiming a probe
     /// lease or changing circuit-breaker state. A catalog GET cannot prove that
     /// generation requests have recovered their quota.
+    #[cfg(test)]
     pub(crate) async fn upstream_manual_health_suppression(
         &self,
         upstream_account_id: Uuid,
@@ -667,6 +678,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn claim_upstream_account_attempt_at_revision_with_health_config(
         &self,
         upstream_account_id: Uuid,
@@ -1000,6 +1012,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_failure_at_revision_with_health_config(
         &self,
         upstream_account_id: Uuid,
@@ -1048,6 +1061,7 @@ impl Database {
     /// times: after the first writer establishes health, its siblings are
     /// stale and become no-ops. A later half-open probe remains responsible
     /// for escalating a genuinely sustained failure.
+    #[cfg(test)]
     pub(crate) async fn record_admitted_upstream_account_failure_at_revision(
         &self,
         upstream_account_id: Uuid,
@@ -1117,6 +1131,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     async fn record_upstream_account_failure_inner(
         &self,
         upstream_account_id: Uuid,
@@ -1223,6 +1238,7 @@ impl Database {
     /// newer cohort's epoch and suppressing that cohort's genuine failure.
     /// Hard quota/authentication isolation and half-open probe leases remain
     /// separate authorities and are intentionally not touched.
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_success_at_revision(
         &self,
         upstream_account_id: Uuid,
@@ -1311,6 +1327,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_probe_failure_at_revision_with_health_config(
         &self,
         upstream_account_id: Uuid,
@@ -2315,7 +2332,8 @@ mod tests {
             .iter()
             .find_map(|admission| match admission {
                 UpstreamAttemptAdmission::Probe { lease_token } => Some(*lease_token),
-                UpstreamAttemptAdmission::Healthy { .. }
+                UpstreamAttemptAdmission::Observed
+                | UpstreamAttemptAdmission::Healthy { .. }
                 | UpstreamAttemptAdmission::SharedProbe { .. }
                 | UpstreamAttemptAdmission::Unavailable { .. } => None,
             })

@@ -6,6 +6,26 @@ import type { RequestView } from '../src/types.js';
 
 let requestNumber = 0;
 
+test('operational outcomes count before finance, while unknown amounts do not create zero totals', () => {
+  const rows: RequestView[] = [200, 499, 502].map(status_code => ({
+    ...request(status_code, 300), completed_at: null, currency: 'USD', cost: null,
+    operational_terminal: { completed_at: 400, stage: null, financial_state: 'pending' },
+  }));
+  rows.push({ ...rows[0], currency: 'CNY', cost: '9',
+    operational_terminal: { completed_at: 400, stage: null, financial_state: 'unknown' } });
+  const summary = summarizeVisibleRequests(rows);
+  assert.equal(summary.successful, 2);
+  assert.equal(summary.failed, 2);
+  assert.equal(summary.running, 0);
+  assert.equal(summary.unknown, 0);
+  assert.deepEqual(summary.localCosts, []);
+  assert.equal(summary.totalTokens, 0);
+  rows.push({ ...rows[1], cost: '0', completed_at: 500,
+    operational_terminal: { completed_at: 400, stage: null, financial_state: 'applied' } });
+  assert.deepEqual(summarizeVisibleRequests(rows).localCosts, [{ currency: 'USD', cost: 0 }]);
+  assert.deepEqual(summarizeVisibleRequests([{ ...request(502, 300), currency: 'USD', cost: null }]).localCosts, []);
+});
+
 test('metric backgrounds retain loaded-record scope and leave unknown latency gaps', () => {
   const points = visibleRequestMetricSeries([
     { ...request(200, 100), created_at: 1_000, completed_at: 1_100 },
@@ -116,10 +136,8 @@ test('cache rate uses only actual requests with complete cache telemetry', () =>
   assert.equal(summary.cacheRate, 20 / 150);
 });
 
-test('local cost totals follow the shared displayed-cost policy per currency', () => {
-  // Every failed request without provider-reported usage uses the policy zero,
-  // including historic estimated, ceiling and unknown provenance rows.
-  const zeroCostFailures: RequestView[] = ([
+test('local cost totals retain recorded amounts independently of failure and usage provenance', () => {
+  const recordedFailures: RequestView[] = ([
     ['not_observed', 499, 'client_cancelled'],
     ['provider_estimated', 502, null],
     ['contract_ceiling', 503, null],
@@ -128,8 +146,8 @@ test('local cost totals follow the shared displayed-cost policy per currency', (
     ...request(status_code, 100), usage_basis, error_code,
     cost: String(index + 1), currency: 'USD',
   }));
-  assert.deepEqual(summarizeVisibleRequests(zeroCostFailures).localCosts, [
-    { currency: 'USD', cost: 0 },
+  assert.deepEqual(summarizeVisibleRequests(recordedFailures).localCosts, [
+    { currency: 'USD', cost: 10 },
   ]);
 
   // A failed provider-reported request keeps its nonzero local settlement.
@@ -143,13 +161,13 @@ test('local cost totals follow the shared displayed-cost policy per currency', (
   // Totals stay grouped per recorded currency; amounts without a recorded
   // currency never contribute and currencies are never combined.
   const summary = summarizeVisibleRequests([
-    ...zeroCostFailures,
+    ...recordedFailures,
     failedProviderReported,
     { ...request(200, 100), usage_basis: 'provider_reported', cost: '2', currency: 'CNY' },
     { ...request(200, 100), usage_basis: 'provider_reported', cost: '9.99' },
   ]);
   assert.deepEqual(summary.localCosts, [
     { currency: 'CNY', cost: 2 },
-    { currency: 'USD', cost: 1.5 },
+    { currency: 'USD', cost: 11.5 },
   ]);
 });

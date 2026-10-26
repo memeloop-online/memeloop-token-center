@@ -5,13 +5,14 @@ on:
     branches: [master]
     tags: ['v*']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
   # Pull requests share a group by PR number so a new head cancels only its
-  # obsolete run. Every push receives its own group: master validation can
+  # obsolete run. Every push or dispatch receives its own group: validation can
   # therefore overlap, while the publisher still emits only immutable SHA tags.
   group: ci-${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('push-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -257,43 +258,6 @@ jobs:
         run: node --test tests/load/test-benchmark-memory.ts
       - name: Verify durable archive RSS harness contract
         run: node --test tests/load/test-durable-archive-memory.ts
-      - name: Start MinIO and create integration-test bucket
-        run: |
-          # Rust/Wasmtime debug artifacts can leave a hosted runner below
-          # MinIO's filesystem free-space safety threshold by test time. Keep
-          # the tiny integration bucket on an isolated sparse tmpfs so the
-          # storage test measures S3 behavior instead of runner disk pressure.
-          docker run --detach --name mtc-test-minio --publish 9000:9000 \
-            --tmpfs /data:rw,size=2g \
-            --env MINIO_ROOT_USER=token-center-test \
-            --env MINIO_ROOT_PASSWORD=token-center-test-secret \
-            ghcr.io/weftsh/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
-              break
-            fi
-            if [ "$attempt" -eq 30 ]; then
-              docker logs mtc-test-minio
-              exit 1
-            fi
-            sleep 1
-          done
-          # The unrelated public ECR Alpine helper can exhaust its transfer
-          # quota before Rust tests start. Use the official fixed mc release
-          # directly, with a reviewed checksum verified before execution.
-          mc_dir="$(mktemp -d "$RUNNER_TEMP/mtc-minio-client.XXXXXX")"
-          mc_binary="$mc_dir/mc"
-          curl --fail --location --retry 3 --max-time 120 \
-            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z \
-            --output "$mc_binary"
-          echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  $mc_binary" | sha256sum --check --strict
-          chmod 0500 "$mc_binary"
-          export MC_CONFIG_DIR="$mc_dir/config"
-          "$mc_binary" alias set test http://127.0.0.1:9000 token-center-test token-center-test-secret
-          "$mc_binary" mb --ignore-existing test/memeloop-token-center-test
-          "$mc_binary" admin user add test mtc-list-only mtc-list-only-secret
-          "$mc_binary" admin policy create test mtc-list-only "$PWD/tests/fixtures/minio-list-only-policy.json"
-          "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
       - run: cargo fmt --all -- --check
       - name: Verify pinned Claude privacy component through the host ABI
         id: claude_component
@@ -381,17 +345,10 @@ jobs:
             -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
-      - name: Verify installer SOCKS authentication, anonymous compatibility and redaction
-        run: |
-          cargo test --locked --all-features --lib plugin_distribution::
-          cargo test --locked --all-features --lib installation_proxy_
-          cargo test --locked --all-features --bin install-plugin-oci proxy_argument_tests::
-      - name: Verify H2 binding build and runtime gates without secrets or replay
-        run: |
-          cargo test --locked --no-default-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
-          cargo test --locked --all-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
-      - name: Optional routing SQL cannot delay forwarding or retain lifecycle capacity
-        run: cargo test --locked --all-features --lib api::proxy::tests::routing_persistence
+      - name: Verify the H2 binding build without the default features
+        run: cargo test --locked --no-default-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
+      - name: Run documentation tests
+        run: cargo test --locked --all-features --doc
       - name: Buffered delivery must precede PostgreSQL semantic materialization
         env:
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
@@ -402,15 +359,6 @@ jobs:
         run: |
           cargo test --locked --all-features --lib -- --ignored --exact db::tests::terminal_projection::semantic_isolation::postgres_semantic_payload_recovers_without_source_or_duplicate_finance
           cargo test --locked --all-features --lib -- --ignored --exact db::tests::terminal_projection::semantic_retry::postgres_semantic_projection_retries_only_confirmed_statement_rollback
-      - run: cargo test --locked --all-targets --all-features --no-fail-fast
-        env:
-          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
-          MTC_TEST_S3_ENDPOINT: http://127.0.0.1:9000
-          MTC_TEST_S3_BUCKET: memeloop-token-center-test
-          MTC_TEST_S3_ACCESS_KEY: token-center-test
-          MTC_TEST_S3_SECRET_KEY: token-center-test-secret
-          MTC_TEST_S3_LIST_ONLY_ACCESS_KEY: mtc-list-only
-          MTC_TEST_S3_LIST_ONLY_SECRET_KEY: mtc-list-only-secret
       - name: Verify preferred-account guest through the real host and gateway
         env:
           MTC_PREFERRED_ACCOUNT_PACKAGE: ${{ runner.temp }}/preferred-package
@@ -438,6 +386,115 @@ jobs:
           path: ${{ runner.temp }}/soonest-reset-package/
           if-no-files-found: error
           retention-days: 14
+
+  rust-suite:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: suite-1
+            args: --partition hash:1/4 -E 'not binary(cucumber)'
+          - name: suite-2
+            args: --partition hash:2/4 -E 'not binary(cucumber)'
+          - name: suite-3
+            args: --partition hash:3/4 -E 'not binary(cucumber)'
+          - name: suite-4
+            args: --partition hash:4/4 -E 'not binary(cucumber)'
+          - name: cucumber
+            args: -E 'binary(cucumber)'
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+      MTC_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      MTC_TEST_S3_BUCKET: memeloop-token-center-test
+      MTC_TEST_S3_ACCESS_KEY: token-center-test
+      MTC_TEST_S3_SECRET_KEY: token-center-test-secret
+      MTC_TEST_S3_LIST_ONLY_ACCESS_KEY: mtc-list-only
+      MTC_TEST_S3_LIST_ONLY_SECRET_KEY: mtc-list-only-secret
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: memeloop_token_center_test
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U token_center -d memeloop_token_center_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/checkout-plugin-examples
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.95.0
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install PostgreSQL and SQLite migration clients
+        timeout-minutes: 15
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          test -s /etc/apt/sources.list.d/ubuntu.sources
+          apt_sources=(-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/ubuntu.sources -o Dir::Etc::sourceparts=-)
+          sudo apt-get "${apt_sources[@]}" \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=60 \
+            update
+          sudo apt-get "${apt_sources[@]}" \
+            -o Acquire::Retries=3 \
+            -o DPkg::Lock::Timeout=60 \
+            install --yes --no-install-recommends postgresql-client sqlite3
+      - name: Start MinIO and create integration-test bucket
+        run: |
+          docker run --detach --name mtc-test-minio --publish 9000:9000 \
+            --tmpfs /data:rw,size=2g \
+            --env MINIO_ROOT_USER=token-center-test \
+            --env MINIO_ROOT_PASSWORD=token-center-test-secret \
+            ghcr.io/weftsh/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e server /data
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:9000/minio/health/live >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              docker logs mtc-test-minio
+              exit 1
+            fi
+            sleep 1
+          done
+          mc_dir="$(mktemp -d "$RUNNER_TEMP/mtc-minio-client.XXXXXX")"
+          mc_binary="$mc_dir/mc"
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/minio/mc/releases/download/RELEASE.2025-08-13T08-35-41Z/mc.linux-amd64.RELEASE.2025-08-13T08-35-41Z \
+            --output "$mc_binary"
+          echo "01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891  $mc_binary" | sha256sum --check --strict
+          chmod 0500 "$mc_binary"
+          export MC_CONFIG_DIR="$mc_dir/config"
+          "$mc_binary" alias set test http://127.0.0.1:9000 token-center-test token-center-test-secret
+          "$mc_binary" mb --ignore-existing test/memeloop-token-center-test
+          "$mc_binary" admin user add test mtc-list-only mtc-list-only-secret
+          "$mc_binary" admin policy create test mtc-list-only "$PWD/tests/fixtures/minio-list-only-policy.json"
+          "$mc_binary" admin policy attach test mtc-list-only --user mtc-list-only
+      - name: Install pinned cargo-nextest
+        run: |
+          curl --fail --location --retry 3 --max-time 120 \
+            --output "$RUNNER_TEMP/cargo-nextest.tar.gz" \
+            https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-0.9.87/cargo-nextest-0.9.87-x86_64-unknown-linux-gnu.tar.gz
+          echo "bde8d231e435099b068e654c591224defe686c784b4920682ee12784b6bfcf9e  $RUNNER_TEMP/cargo-nextest.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/nextest"
+          tar -xzf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C "$RUNNER_TEMP/nextest"
+          echo "$RUNNER_TEMP/nextest" >> "$GITHUB_PATH"
+      - name: Run ${{ matrix.name }} of the locked test suite
+        run: cargo nextest run --locked --all-targets --all-features --test-threads=4 ${{ matrix.args }}
 
   migration-smoke:
     needs: changes
@@ -654,7 +711,7 @@ jobs:
       binary_artifact: memory-binary-${{ github.sha }}
 
   release-input-assembly:
-    if: github.event_name == 'pull_request' && needs.changes.outputs.memory == 'true'
+    if: (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.memory == 'true'
     needs: [changes, memory-binary]
     runs-on: ubuntu-latest
     timeout-minutes: 35
@@ -697,13 +754,17 @@ jobs:
 
   publish-ghcr:
     if: >-
-      always() && github.event_name == 'push' &&
-      (github.ref == 'refs/heads/master' || needs.changes.outputs.is_version_tag == 'true') &&
+      always() &&
+      ((github.event_name == 'push' && (github.ref == 'refs/heads/master' || needs.changes.outputs.is_version_tag == 'true')) ||
+       (github.event_name == 'workflow_dispatch' && github.repository == 'memeloop-online/memeloop-token-center' &&
+        github.ref == 'refs/heads/master' && github.ref_protected == true)) &&
       needs.changes.result == 'success' && needs.repository-security.result == 'success' &&
       needs.dependency-security.result == 'success' && needs.api-contract.result == 'success' &&
       needs.packaging.result == 'success' && needs.memory-binary.result == 'success' &&
+      (github.event_name != 'workflow_dispatch' || needs.release-input-assembly.result == 'success') &&
       (needs.web.result == 'success' || (needs.changes.outputs.web == 'false' && needs.web.result == 'skipped')) &&
       (needs.rust.result == 'success' || (needs.changes.outputs.rust == 'false' && needs.rust.result == 'skipped')) &&
+      (needs.rust-suite.result == 'success' || (needs.changes.outputs.rust == 'false' && needs.rust-suite.result == 'skipped')) &&
       (needs.migration-smoke.result == 'success' || (needs.changes.outputs.migration == 'false' && needs.migration-smoke.result == 'skipped')) &&
       (needs.memory-acceptance.result == 'success' || (needs.changes.outputs.memory_acceptance == 'false' && needs.memory-acceptance.result == 'skipped'))
     needs:
@@ -712,11 +773,13 @@ jobs:
       - dependency-security
       - web
       - rust
+      - rust-suite
       - migration-smoke
       - api-contract
       - packaging
       - memory-acceptance
       - memory-binary
+      - release-input-assembly
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
@@ -844,8 +907,10 @@ jobs:
 
   verify-ghcr-release:
     if: >-
-      always() && github.event_name == 'push' &&
-      (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) &&
+      always() &&
+      ((github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))) ||
+       (github.event_name == 'workflow_dispatch' && github.repository == 'memeloop-online/memeloop-token-center' &&
+        github.ref == 'refs/heads/master' && github.ref_protected == true)) &&
       needs.publish-ghcr.result == 'success'
     needs: [publish-ghcr]
     runs-on: ubuntu-latest
@@ -883,7 +948,7 @@ jobs:
 
   publish-github-release:
     if: >-
-      always() && needs.changes.outputs.is_version_tag == 'true' &&
+      always() && github.event_name == 'push' && needs.changes.outputs.is_version_tag == 'true' &&
       needs.verify-ghcr-release.result == 'success' && needs.memory-binary.result == 'success'
     needs: [changes, memory-binary, verify-ghcr-release]
     runs-on: ubuntu-latest
@@ -1041,9 +1106,9 @@ jobs:
       - name: Validate fail-closed expensive CI scope detection
         run: node --test tests/ops/ci-scope-contract.test.ts
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
+        if: needs.changes.outputs.plugin_installer == 'true' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
       - name: Build the cached hardened plugin installer contract image
-        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
+        if: needs.changes.outputs.plugin_installer == 'true' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
@@ -1054,12 +1119,12 @@ jobs:
           cache-from: type=gha,scope=plugin-installer
           cache-to: type=gha,mode=max,scope=plugin-installer
       - name: Build and exercise the hardened plugin installer image
-        if: needs.changes.outputs.plugin_installer == 'true' && github.event_name == 'pull_request'
+        if: needs.changes.outputs.plugin_installer == 'true' && (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch')
         env:
           MTC_PLUGIN_INSTALLER_IMAGE: mtc-plugin-installer-contract:${{ github.run_id }}
         run: node --test tests/ops/plugin-installer-image-contract.test.ts
       - name: Validate the unchanged plugin installer contract statically
-        if: needs.changes.outputs.plugin_installer != 'true' || github.event_name != 'pull_request'
+        if: needs.changes.outputs.plugin_installer != 'true' || (github.event_name != 'pull_request' && github.event_name != 'workflow_dispatch')
         env:
           MTC_SKIP_DOCKER_BUILD: "1"
         run: node --test tests/ops/plugin-installer-image-contract.test.ts
