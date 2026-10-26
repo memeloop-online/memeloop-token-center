@@ -513,6 +513,40 @@ impl Database {
         Self::connect_with_max(database_url, 8).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn sqlite_database_url(database_url: &str) -> String {
+        Self::normalized_sqlite_url(database_url).into_owned()
+    }
+
+    fn normalized_sqlite_url(database_url: &str) -> std::borrow::Cow<'_, str> {
+        // `sqlite://C:/...` is a URL with host `C` and loses the drive. Keep the
+        // drive in the path (`sqlite:///C:/...`) and accept Windows separators.
+        let Some(rest) = database_url.strip_prefix("sqlite://") else {
+            return std::borrow::Cow::Borrowed(database_url);
+        };
+        if !rest.contains('\\') && !Self::is_windows_drive_path(rest) {
+            return std::borrow::Cow::Borrowed(database_url);
+        }
+        let rest = rest.replace('\\', "/");
+        let (path, query) = rest.split_once('?').unwrap_or((rest.as_str(), ""));
+        let path = if Self::is_windows_drive_path(path) {
+            format!("/{path}")
+        } else {
+            path.to_owned()
+        };
+        let mut url = format!("sqlite://{path}");
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(query);
+        }
+        std::borrow::Cow::Owned(url)
+    }
+
+    fn is_windows_drive_path(path: &str) -> bool {
+        let bytes = path.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+    }
+
     pub async fn connect_with_max(
         database_url: &str,
         maximum_connections: u32,
@@ -601,7 +635,10 @@ impl Database {
                 })
             });
         }
-        let pool = pool_options.connect(database_url).await?;
+        // Windows test paths use `\`. SQLite's URL parser treats that as an
+        // invalid URL, so the same `sqlite://...` fixtures never open a file.
+        let database_url = Self::normalized_sqlite_url(database_url);
+        let pool = pool_options.connect(database_url.as_ref()).await?;
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
             // over the same lightweight/test database. WAL keeps readers on a
@@ -615,7 +652,7 @@ impl Database {
         }
         Ok(Self {
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
-                database_url,
+                database_url.as_ref(),
                 backend,
             )?),
             pool,

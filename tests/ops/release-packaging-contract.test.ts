@@ -60,7 +60,7 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.doesNotMatch(manualMatrix, /"Dockerfile"|"Dockerfile\.plugin-installer"/);
   assert.equal(occurrences(workflow, ciMinioImage), 1);
   assert.equal(occurrences(workflow, ciMinioClientAsset), 1);
-  const minioSetup = (parse(workflow) as Workflow).jobs?.rust?.steps
+  const minioSetup = (parse(workflow) as Workflow).jobs?.['rust-suite']?.steps
     ?.find(step => step.name === 'Start MinIO and create integration-test bucket')?.run ?? '';
   assert.ok(!minioSetup.includes('public.ecr.aws'));
   assert.ok(!minioSetup.includes('apk add'));
@@ -225,7 +225,7 @@ test('normal CI dispatch runs all validation and publishes only protected offici
   assert.equal(workflow.on?.workflow_dispatch, null, 'dispatch must offer no gate-bypass inputs');
   const jobs = workflow.jobs ?? {};
   const outputs = { rust: 'true', web: 'true', migration: 'true', memory: 'true', memory_acceptance: 'true', plugin_installer: 'true', is_version_tag: 'false' };
-  const prerequisites = ['changes', 'repository-security', 'dependency-security', 'api-contract', 'packaging', 'memory-binary', 'web', 'rust', 'migration-smoke', 'memory-acceptance', 'release-input-assembly'];
+  const prerequisites = ['changes', 'repository-security', 'dependency-security', 'api-contract', 'packaging', 'memory-binary', 'web', 'rust', 'rust-suite', 'migration-smoke', 'memory-acceptance', 'release-input-assembly'];
   const needs = Object.fromEntries([...prerequisites, 'publish-ghcr', 'verify-ghcr-release'].map(name => [name, { result: 'success', outputs: { ...outputs } }]));
   const github = { event_name: 'workflow_dispatch', repository: 'memeloop-online/memeloop-token-center', ref: 'refs/heads/master', ref_protected: true };
   const admits = (condition: string | undefined): boolean => {
@@ -259,7 +259,7 @@ test('normal CI dispatch runs all validation and publishes only protected offici
   needs['publish-ghcr']!.result = 'skipped';
   assert.equal(admits(jobs['verify-ghcr-release']?.if), false);
   needs['publish-ghcr']!.result = 'success';
-  for (const name of ['web', 'rust', 'migration-smoke', 'memory-binary', 'memory-acceptance', 'release-input-assembly']) {
+  for (const name of ['web', 'rust', 'rust-suite', 'migration-smoke', 'memory-binary', 'memory-acceptance', 'release-input-assembly']) {
     assert.equal(admits(jobs[name]?.if), true, `${name} must execute on dispatch`);
   }
   for (const name of ['Build the cached hardened plugin installer contract image', 'Build and exercise the hardened plugin installer image']) {

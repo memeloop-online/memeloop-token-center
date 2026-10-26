@@ -1032,8 +1032,9 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             .cloned()
     });
     let _ = transient_health_scope;
-    // Customer requests do not write account or routing-group health.
-    // Each upstream and each proxy exit is judged only by its own probe.
+    // A successful send refreshes service availability. It does not rewrite
+    // the circuit-breaker cohort: cooldown and probe leases stay with their
+    // own compare-and-swap. A failure here is not an availability sample.
     let signal: Option<crate::plugin::routing::GroupRoutingTransientSignal> = None;
     let directive: Option<crate::plugin::routing::GroupRoutingExecutionDirective> = None;
     let mandatory_failure = matches!(
@@ -1041,9 +1042,12 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         GroupRoutingOutcome::HardQuota | GroupRoutingOutcome::Authentication
     );
     let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
+    if matches!(terminal, UpstreamAttemptTerminal::Succeeded) {
+        state.db.note_service_available(upstream_account_id).await;
+    }
     if observe_only {
         // The customer already has its result. Keep the transport diagnostic.
-        // Account health is written only by the independent service probe.
+        // Service availability was refreshed above when this attempt succeeded.
         if let UpstreamAttemptTerminal::Failed {
             kind,
             failure_stage,
@@ -1091,7 +1095,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             tracing::info!(
                 %request_id,
                 %upstream_account_id,
-                "customer request success is not an account health sample"
+                "upstream success refreshed service availability"
             );
         }
         UpstreamAttemptTerminal::Inconclusive => {

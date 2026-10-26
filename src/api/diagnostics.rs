@@ -1,7 +1,11 @@
-use std::{io, time::Duration};
+#[cfg(target_os = "linux")]
+use std::io;
+use std::time::Duration;
 
 use super::*;
-use crate::metrics::{ProfileKind, allocator_runtime_metrics};
+#[cfg(target_os = "linux")]
+use crate::metrics::ProfileKind;
+use crate::metrics::allocator_runtime_metrics;
 #[cfg(target_os = "linux")]
 use pprof::protos::Message;
 
