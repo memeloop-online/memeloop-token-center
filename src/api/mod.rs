@@ -64,11 +64,8 @@ pub(crate) mod plugin_execution;
 mod plugin_installer_network;
 mod plugins;
 pub(crate) mod proxy;
-pub(crate) use proxy::{MediaAttemptBudget, wait_media_recovery};
-pub(crate) use proxy::{
-    MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit,
-    current_gateway_failure_domain,
-};
+pub(crate) use proxy::MediaAttemptBudget;
+pub(crate) use proxy::{MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit};
 mod proxy_diagnostics;
 mod request_detail;
 mod request_normalization;
@@ -89,6 +86,7 @@ mod traffic;
 mod transport_proxy_groups;
 mod upstreams;
 use transport_proxy_groups::*;
+pub(crate) use upstreams::run_upstream_service_probes;
 mod usage_analysis;
 mod web;
 

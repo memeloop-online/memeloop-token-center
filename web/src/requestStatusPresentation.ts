@@ -22,8 +22,13 @@ const recordedFailureCopy: Record<string, [string, string]> = {
   upstream_transport_request: ['发送上游请求失败', 'Sending the upstream request failed'],
   upstream_transport_other: ['上游网络请求失败', 'The upstream network request failed'],
   upstream_connection: ['上游连接失败', 'The upstream connection failed'],
+  proxy_connect_failed: ['出网代理连接失败', 'The egress proxy connection failed'],
+  dns_resolution_failed: ['上游域名解析失败', 'Upstream DNS resolution failed'],
+  tls_handshake_failed: ['上游 TLS 握手失败', 'The upstream TLS handshake failed'],
+  upstream_connect_failed: ['上游 TCP 连接失败', 'The upstream TCP connection failed'],
   upstream_read_timeout: ['读取上游响应超时', 'Reading the upstream response timed out'],
   upstream_request_timeout: ['等待上游请求响应超时', 'The upstream request timed out'],
+  gateway_owner_lost: ['网关副本已结束，这条连接不再处理', 'The gateway replica ended and is no longer handling this connection'],
 };
 
 const supplierFailureCopy: Record<string, [string, string]> = {

@@ -846,14 +846,6 @@ mod tests {
         assert_eq!(diagnostic.transport_revision, 42);
         assert_eq!(diagnostic.failure_kind, "preparation");
         assert_eq!(diagnostic.failure_stage, "preparation_timeout");
-        let health_stage: String = sqlx::query_scalar(
-            "SELECT failure_stage FROM upstream_connection_failure_domains WHERE last_request_id = $1",
-        )
-        .bind(request_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(health_stage, "dns");
         assert!(
             state.routing_persistence.render_routing().contains(
                 "memeloop_token_center_routing_persistence_total{outcome=\"accepted\"} 1\n"

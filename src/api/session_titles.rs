@@ -169,6 +169,7 @@ async fn execute(state: &AppState, task: &SessionTitleTask) -> Result<Option<Str
         key,
         Some(settings.model_route_id),
         memory,
+        None,
     )
     .await?;
     if !response.status().is_success() {

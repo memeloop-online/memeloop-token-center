@@ -190,24 +190,12 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
         spool_reads + 1,
         "terminal journal preparation must reuse the semantic projection without rereading raw input"
     );
-    let mut receipts = tokio::fs::read_dir(fixture.state.pending_terminals.directory_for_test())
-        .await
-        .unwrap();
     let mut found_receipt = false;
-    while let Some(entry) = receipts.next_entry().await.unwrap() {
-        if entry
-            .path()
-            .extension()
-            .and_then(|extension| extension.to_str())
-            != Some("json")
-        {
-            continue;
-        }
-        let bytes = tokio::fs::read(entry.path()).await.unwrap();
-        let receipt: Value = serde_json::from_slice(&bytes).unwrap();
+    for receipt in fixture.state.pending_terminals.receipt_jsons_for_test() {
         if receipt["request_id"] != request_id.to_string() {
             continue;
         }
+        let bytes = serde_json::to_vec(&receipt).unwrap();
         assert!(
             bytes.len() < RETAINED_BYTES,
             "journal must not copy raw padding"

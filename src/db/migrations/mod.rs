@@ -708,6 +708,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "independent transport proxy reachability probe",
         sql: include_str!("../../../migrations/common/0135_transport_proxy_probe.sql"),
     },
+    Migration {
+        version: 136,
+        name: "independent upstream service and proxy probe results",
+        sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1398,6 +1403,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 135,
         name: "independent transport proxy reachability probe",
         sql: include_str!("../../../migrations/common/0135_transport_proxy_probe.sql"),
+    },
+    Migration {
+        version: 136,
+        name: "independent upstream service and proxy probe results",
+        sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
     },
 ];
 
