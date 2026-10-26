@@ -70,9 +70,17 @@ async fn execute(
         "x-mtc-client-name",
         HeaderValue::from_static("operator-inference"),
     );
-    let mut response =
-        proxy::proxy_with_identity(state, inference_headers, bytes, protocol, key, None, memory)
-            .await?;
+    let mut response = proxy::proxy_with_identity(
+        state,
+        inference_headers,
+        bytes,
+        protocol,
+        key,
+        None,
+        memory,
+        None,
+    )
+    .await?;
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

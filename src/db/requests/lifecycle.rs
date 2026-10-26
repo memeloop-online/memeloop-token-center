@@ -1582,6 +1582,38 @@ impl Database {
                     input.request_id,
                 )
                 .await?;
+                // The response path records the request before conversation
+                // preparation finishes. The later receipt still owns that body,
+                // and a returned status must not stay without its observation.
+                if let Some(conversation) = input.conversation.as_ref() {
+                    if conversation.key.tenant_id != input.tenant_id
+                        || conversation.key.key_id != input.reservation.key_id
+                    {
+                        return Err(AppError::NotFound);
+                    }
+                    let observation_count: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1",
+                    )
+                    .bind(input.request_id.to_string())
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                    if observation_count == 0 {
+                        enqueue_conversation_projection_in_transaction(
+                            &mut transaction,
+                            ConversationProjectionEnqueueInput {
+                                request_id: input.request_id,
+                                key: conversation.key,
+                                request_json: conversation.request_json,
+                                hints: conversation.hints,
+                                client_name: conversation.client_name,
+                                upstream_response_id: conversation.upstream_response_id,
+                                observed_at: now,
+                                content_materialized: false,
+                            },
+                        )
+                        .await?;
+                    }
+                }
                 BudgetHold::commit_optional(transaction, hold).await?;
                 if let Some(reservation) = budget_reservation.as_ref() {
                     reservation.release().await;

@@ -617,10 +617,10 @@ async fn codex_route_fixture_with_archive_directory(
 ) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join(archive_directory);
-    let database_url = format!(
+    let database_url = crate::db::Database::sqlite_database_url(&format!(
         "sqlite://{}?mode=rwc",
         directory.path().join(format!("codex-{label}.db")).display()
-    );
+    ));
     let mut config = Config::for_test(database_url.clone());
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(archive_path.display().to_string());
@@ -885,13 +885,13 @@ async fn response_usage_fixture_with_uri_contract_driver_model_config_and_creden
 ) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("archive");
-    let database_url = format!(
+    let database_url = crate::db::Database::sqlite_database_url(&format!(
         "sqlite://{}?mode=rwc",
         directory
             .path()
             .join(format!("compatibility-{label}.db"))
             .display()
-    );
+    ));
     let mut config = Config::for_test(database_url.clone());
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(archive_path.display().to_string());
@@ -1323,13 +1323,13 @@ async fn resilient_route_fixture(
     upstreams: &[(String, i64)],
 ) -> ResilientRouteFixture {
     let directory = tempfile::tempdir().unwrap();
-    let database_url = format!(
+    let database_url = crate::db::Database::sqlite_database_url(&format!(
         "sqlite://{}?mode=rwc",
         directory
             .path()
             .join(format!("resilient-{label}.db"))
             .display()
-    );
+    ));
     let mut config = Config::for_test(database_url.clone());
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(directory.path().join("archive").display().to_string());

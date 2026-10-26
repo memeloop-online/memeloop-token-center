@@ -759,7 +759,7 @@ async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
             .respond_with(
                 ResponseTemplate::new(status).set_body_raw("invalid JSON", "application/json"),
             )
-            .expect(2)
+            .expect(1)
             .mount(&upstream)
             .await;
         let fixture = fixture(&upstream).await;
@@ -798,7 +798,7 @@ async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
         )
         .await;
         assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     }
 }
 

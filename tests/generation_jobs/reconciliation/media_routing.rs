@@ -1,9 +1,5 @@
 use super::*;
 use memeloop_token_center::generation;
-use wiremock::{
-    Mock, MockServer, ResponseTemplate,
-    matchers::{method, path},
-};
 
 async fn configure(f: &ReconcileFixture, base_url: &str, submitted: bool, cooldown: i64) {
     let locator = f
