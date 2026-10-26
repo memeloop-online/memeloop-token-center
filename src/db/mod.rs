@@ -109,6 +109,7 @@ pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
 mod upstream_quota_reset;
+mod upstream_service_probes;
 mod usage_analysis;
 mod validation;
 
@@ -227,15 +228,15 @@ pub(crate) use requests::{
 pub(crate) use requests::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
 };
-pub(crate) use routing::{
-    AdmittedConnectionFailure, GrantedModelCapabilitySource, UpstreamAttemptAdmission,
-    UpstreamFailureKind, UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
-};
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
     ManagedModelRouteSyncResult, ReplaceCredentialRoutingInput, ReplaceRouteRoutingInput,
     RouteCreateDisposition, RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
     UpdateRoutedModelRouteInput,
+};
+pub(crate) use routing::{
+    GrantedModelCapabilitySource, UpstreamAttemptAdmission, UpstreamFailureKind,
+    UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
 };
 pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,

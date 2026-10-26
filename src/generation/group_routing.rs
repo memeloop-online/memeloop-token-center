@@ -1,7 +1,7 @@
 //! Media adapter for the shared group-routing-v1 runtime and core health gate.
 use crate::{
     AppState,
-    api::{MediaAttemptBudget, MediaAttemptGuard, wait_media_recovery},
+    api::{MediaAttemptBudget, MediaAttemptGuard},
     db::{RouteSelectionOptions, UpstreamAttemptAdmission},
     error::AppError,
     model::{AuthenticatedKey, GenerationJobWork},
@@ -113,86 +113,21 @@ pub(crate) async fn admit(
     request_id: Uuid,
     route: &ResolvedUpstream,
 ) -> Result<MediaAttemptGuard, AppError> {
-    let policy = state.group_routing.as_ref().and_then(|snapshot| {
-        (snapshot.tenant_id == tenant_id)
-            .then(|| {
-                snapshot.policy(
-                    route.route_id,
-                    route.account_id,
-                    route.credential_generation,
-                )
-            })
-            .flatten()
-    });
     if let Some(snapshot) = state.group_routing.as_ref()
         && snapshot.tenant_id != tenant_id
     {
         return Err(AppError::Forbidden);
     }
-    let admission = if let Some((allow_probe, cooldown_ms)) =
-        policy.and_then(|policy| policy.transient_probe_controls())
-    {
-        state
-            .db
-            .claim_upstream_account_attempt_at_revision_with_strategy(
-                tenant_id,
-                route.account_id,
-                route.credential_generation,
-                route.transport_revision,
-                state.config.upstream_health,
-                allow_probe,
-                Some(cooldown_ms),
-                false,
-                Some(crate::api::current_gateway_failure_domain()),
-            )
-            .await?
-    } else {
-        state
-            .db
-            .claim_upstream_account_attempt_at_revision_with_health_config(
-                route.account_id,
-                route.credential_generation,
-                route.transport_revision,
-                state.config.upstream_health,
-                Some(crate::api::current_gateway_failure_domain()),
-            )
-            .await?
-    };
-    match admission {
-        UpstreamAttemptAdmission::Unavailable {
-            transient_wait_eligible: true,
-            ..
-        } => {
-            let deadline = crate::group_routing::durable::deadline(state)
-                .unwrap_or(tokio::time::Instant::now());
-            if let Some((refreshed, _, mut guard)) =
-                wait_media_recovery(state, request_id, route.clone(), deadline).await?
-            {
-                // The caller already prepared a request with this exact route.
-                // Never send its old credential after a recovery refresh rotates it.
-                if refreshed.credential_generation == route.credential_generation
-                    && refreshed.transport_revision == route.transport_revision
-                {
-                    return Ok(guard);
-                }
-                guard.abandon_without_observe().await;
-            }
-            Err(AppError::Upstream(
-                "generation upstream is cooling down".into(),
-            ))
-        }
-        UpstreamAttemptAdmission::Unavailable { .. } => {
-            Err(AppError::Upstream("generation upstream is isolated".into()))
-        }
-        admission => Ok(MediaAttemptGuard::new(
-            state,
-            request_id,
-            route.route_id,
-            route.account_id,
-            route.credential_generation,
-            route.transport_revision,
-            admission,
-            None,
-        )),
-    }
+    // A customer generation uses the selected account. Account health comes
+    // only from the independent service probe, never from this request.
+    Ok(MediaAttemptGuard::new(
+        state,
+        request_id,
+        route.route_id,
+        route.account_id,
+        route.credential_generation,
+        route.transport_revision,
+        UpstreamAttemptAdmission::Observed,
+        None,
+    ))
 }

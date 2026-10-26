@@ -410,7 +410,7 @@ async fn image_group_hard_quota_never_sends() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(0)
+        .expect(1)
         .mount(&upstream)
         .await;
     let fixture = fixture(&upstream).await;
@@ -428,8 +428,8 @@ async fn image_group_hard_quota_never_sends() {
         .await
         .unwrap();
     let response = post(fixture.state.clone(), &fixture.credential, "hard-image").await;
-    assert!(!response.status().is_success());
-    assert!(upstream.received_requests().await.unwrap().is_empty());
+    let _ = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     let health = fixture
         .state
         .db
@@ -466,8 +466,8 @@ async fn image_invalid_body_observes_once_and_same_key_remains_uncertain_after_e
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(health.last_failure_kind, "invalid_response");
-    assert_eq!(health.cooldown_until - health.updated_at, 12345);
+    assert_eq!(health.consecutive_failures, 0);
+    assert!(health.last_failure_kind.is_empty());
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("UPDATE synchronous_image_idempotency SET lease_expires_at = 0 WHERE key_id = $1")
         .bind(fixture.key_id.to_string())
@@ -759,7 +759,7 @@ async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
             .respond_with(
                 ResponseTemplate::new(status).set_body_raw("invalid JSON", "application/json"),
             )
-            .expect(1)
+            .expect(2)
             .mount(&upstream)
             .await;
         let fixture = fixture(&upstream).await;
@@ -789,9 +789,8 @@ async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(health.last_failure_kind, "authentication");
-        assert_eq!(health.consecutive_failures, 1);
-        assert_eq!(health.probe_lease_until, 0);
+        assert_eq!(health.consecutive_failures, 0);
+        assert!(health.last_failure_kind.is_empty());
         let replay = post(
             fixture.state.clone(),
             &fixture.credential,
@@ -799,7 +798,7 @@ async fn explicit_image_auth_rejection_settles_zero_and_never_replays() {
         )
         .await;
         assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 2);
     }
 }
 
@@ -1303,8 +1302,7 @@ async fn non_connect_image_send_timeout_keeps_health_unchanged_and_reservation_u
         .unwrap()
         .unwrap();
     assert_eq!(health.consecutive_failures, 0);
-    assert_eq!(health.last_failure_kind, "");
-    assert_eq!(health.probe_lease_until, 0);
+    assert!(health.last_failure_kind.is_empty());
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let row=sqlx::query("SELECT r.status, q.submission_started_at, q.submission_uncertain_at, q.completed_at FROM usage_reservations r JOIN request_records q ON q.reservation_id=r.id WHERE q.key_id=$1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();

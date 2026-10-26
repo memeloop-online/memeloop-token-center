@@ -530,6 +530,76 @@ impl Journal {
         self.wake.notify_one();
     }
 
+    /// Persist the runtime outcome before the caller returns it to the client.
+    /// Financial settlement and the local journal stay asynchronous. A missing
+    /// claim still writes the request row, so a returned 502 cannot remain blank.
+    pub(crate) async fn record_operational_observation(
+        &self,
+        database: &Database,
+        request_id: Uuid,
+    ) -> Result<(), crate::error::AppError> {
+        let snapshot = {
+            let pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(entry) = pending
+                .values()
+                .find(|entry| entry.snapshot.request_id == request_id)
+            else {
+                return Ok(());
+            };
+            if entry.operational_acknowledged {
+                return Ok(());
+            }
+            entry.snapshot.clone()
+        };
+        if snapshot.claim.is_none() {
+            let attribution = snapshot.attribution();
+            let input = snapshot.terminal()?;
+            finish_proxy_request_with_retry(database, input, None, attribution).await?;
+            return Ok(());
+        }
+        let receipt_id = snapshot.receipt_id;
+        let claim = snapshot
+            .claim
+            .as_ref()
+            .ok_or(crate::error::AppError::Internal)?;
+        let terminal = snapshot
+            .operational_terminal
+            .as_ref()
+            .ok_or(crate::error::AppError::Internal)?;
+        let expected_digest = snapshot.operational_digest()?;
+        let ack = database
+            .record_pending_proxy_operational_terminal(
+                claim,
+                receipt_id,
+                terminal,
+                snapshot.attribution(),
+            )
+            .await?;
+        if ack.request_id != request_id
+            || ack.reservation_id != claim.reservation_id
+            || ack.fence != claim.fence
+            || ack.receipt_id != receipt_id
+            || ack.operational_digest != expected_digest
+        {
+            return Err(crate::error::AppError::Conflict(
+                "operational acknowledgement mismatch".into(),
+            ));
+        }
+        if let Some(entry) = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(&receipt_id)
+        {
+            entry.operational_acknowledged = true;
+        }
+        tracing::info!(%request_id, %receipt_id, operational_state = "acknowledged", "runtime terminal recorded before the client response returned");
+        Ok(())
+    }
+
     pub(crate) fn register_claim(&self, claim: crate::db::PendingProxySettlementClaim) {
         self.claims
             .lock()

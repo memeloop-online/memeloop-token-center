@@ -6,10 +6,9 @@ pub(super) fn parse_cache_usage_contract(value: &Value) -> TokenUsage {
         .unwrap()
         .unwrap()
 }
-pub(crate) use routing::{RequestAttemptBudget as MediaAttemptBudget, wait_media_recovery};
+pub(crate) use routing::RequestAttemptBudget as MediaAttemptBudget;
 pub(crate) use routing::{
     UpstreamAttemptGuard as MediaAttemptGuard, UpstreamAttemptTerminal as MediaAttemptTerminal,
-    current_gateway_failure_domain,
 };
 
 pub(crate) async fn classify_media_rate_limit(
@@ -61,9 +60,9 @@ use conversation_hints::{client_name, conversation_hints};
 use lifecycle::{finish_unavailable, run_bounded_proxy_lifecycle};
 use routing::{
     AdmittedProxyRouteInput, CandidatePreparationSummary, CodexRetryTerminal,
-    CodexRetryTerminalGuard, DeferredSharedProbe, NextSendableProxyRouteInput, PlannedProxyRoute,
-    PreparedProxyRoute, PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput,
-    ProxySendError, UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
+    CodexRetryTerminalGuard, NextSendableProxyRouteInput, PlannedProxyRoute, PreparedProxyRoute,
+    PreparedRouteReadiness, ProxyRequestContext, ProxyRoutePlanInput, ProxySendError,
+    UpstreamAttemptGuard, UpstreamAttemptTerminal, candidate_reservation_bounds,
     exhausted_candidate_error, materialize_proxy_route, next_planned_proxy_candidate,
     plan_proxy_route, prepare_admitted_proxy_route, prepared_input_reservation_bound,
     refresh_route_snapshot, retain_pinned_text_candidates, send_proxy_route,
@@ -254,7 +253,7 @@ async fn next_sendable_proxy_route(
     let strict_choice_count_is_incompatible = matches!(request.protocol, Protocol::OpenAiChat)
         && openai_chat_choice_count(request.request_json)? != 1;
     let mut summary = CandidatePreparationSummary::default();
-    let mut transient_candidate = None;
+    let transient_candidate = None;
     while let Some(mut planned) = match planned_candidate.take() {
         Some(planned) => Some(planned),
         None => {
@@ -326,94 +325,9 @@ async fn next_sendable_proxy_route(
         }
         let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
-        // Account health describes completed requests. It must not turn the
-        // next Codex POST into a half-open probe or wait for a recovery lease.
-        let admission = if codex_transport::is_driver(&planned.route.driver) {
-            UpstreamAttemptAdmission::Observed
-        } else if let Some(snapshot) = state.group_routing.as_ref()
-            && let Some((allow_probe, cooldown_ms)) = snapshot
-                .policy(
-                    planned.route.route_id,
-                    planned.route.account_id,
-                    planned.route.credential_generation,
-                )
-                .and_then(|policy| policy.transient_probe_controls())
-        {
-            state
-                .db
-                .claim_upstream_account_attempt_at_revision_with_strategy(
-                    snapshot.tenant_id,
-                    planned.route.account_id,
-                    planned.route.credential_generation,
-                    planned.route.transport_revision,
-                    state.config.upstream_health,
-                    allow_probe,
-                    Some(cooldown_ms),
-                    false,
-                    Some(routing::current_gateway_failure_domain()),
-                )
-                .await?
-        } else {
-            state
-                .db
-                .claim_upstream_account_attempt_at_revision_with_health_config(
-                    planned.route.account_id,
-                    planned.route.credential_generation,
-                    planned.route.transport_revision,
-                    state.config.upstream_health,
-                    Some(routing::current_gateway_failure_domain()),
-                )
-                .await?
-        };
-        if let UpstreamAttemptAdmission::Unavailable {
-            cooldown_until,
-            probe_lease_until,
-            shared_probe_eligible,
-            transient_wait_eligible,
-        } = admission
-        {
-            let now = unix_millis();
-            let admission_reason = if cooldown_until > now {
-                "cooldown"
-            } else if probe_lease_until > now {
-                "probe_lease"
-            } else {
-                "claim_contention"
-            };
-            tracing::warn!(
-                %request_id,
-                upstream_account_id = %planned.route.account_id,
-                candidate_rank = rank,
-                outbound_attempt,
-                admission_reason,
-                cooldown_until,
-                probe_lease_until,
-                failure_domain = routing::current_gateway_failure_domain(),
-                stage = "upstream_admission_skip",
-                "proxy skipped an authorized upstream before sending"
-            );
-            if shared_probe_eligible {
-                deferred_shared_probes.push_back(DeferredSharedProbe {
-                    route: planned.route.clone(),
-                    candidate_rank: rank,
-                    probe_lease_until,
-                });
-            }
-            // Retain at most one small route snapshot, never another request body.
-            if outbound_attempts == 0
-                && transient_wait_eligible
-                && !shared_probe_eligible
-                && transient_candidate.is_none()
-            {
-                transient_candidate = Some((planned.route.clone(), rank));
-            }
-            state.metrics.observe_upstream_health(
-                UpstreamHealthEvent::Skipped,
-                UpstreamHealthReason::Cooldown,
-            );
-            failover_reason = Some(UpstreamHealthReason::Cooldown);
-            continue;
-        }
+        // A customer request is not a health sample and does not consult one.
+        // Account and proxy health come from their own periodic probes.
+        let admission = UpstreamAttemptAdmission::Observed;
         return prepare_admitted_proxy_route(AdmittedProxyRouteInput {
             request,
             price,
@@ -802,78 +716,18 @@ async fn execute_component_primary(
     if readiness != PreparedRouteReadiness::Ready {
         return finish_unavailable(&request, readiness.error_code(), None).await;
     }
-    // Every component request passes core health admission, including failed
-    // strategy execution/native fallback. A missing policy never disables the
-    // generation fence or revives hard quota. This path never replays a send.
-    let admission = if let Some(snapshot) = request.state.group_routing.as_ref()
-        && let Some((allow_probe, cooldown_ms)) = snapshot
-            .policy(
-                primary.route.route_id,
-                primary.route.account_id,
-                primary.route.credential_generation,
-            )
-            .and_then(|policy| policy.transient_probe_controls())
-    {
-        request
-            .state
-            .db
-            .claim_upstream_account_attempt_at_revision_with_strategy(
-                snapshot.tenant_id,
-                primary.route.account_id,
-                primary.route.credential_generation,
-                primary.route.transport_revision,
-                request.state.config.upstream_health,
-                allow_probe,
-                Some(cooldown_ms),
-                false,
-                Some(routing::current_gateway_failure_domain()),
-            )
-            .await?
-    } else {
-        request
-            .state
-            .db
-            .claim_upstream_account_attempt_at_revision_with_health_config(
-                primary.route.account_id,
-                primary.route.credential_generation,
-                primary.route.transport_revision,
-                request.state.config.upstream_health,
-                Some(routing::current_gateway_failure_domain()),
-            )
-            .await?
-    };
-    let upstream_attempt = match admission {
-        UpstreamAttemptAdmission::Unavailable {
-            transient_wait_eligible: true,
-            ..
-        } => {
-            let Some((route, _, guard)) = routing::recovery_wait::wait(
-                request.state,
-                request.request_id,
-                primary.route.clone(),
-                recovery_wait_deadline,
-            )
-            .await?
-            else {
-                return finish_unavailable(&request, "upstream_unavailable", None).await;
-            };
-            primary.route = route;
-            Some(guard)
-        }
-        UpstreamAttemptAdmission::Unavailable { .. } => {
-            return finish_unavailable(&request, "upstream_unavailable", None).await;
-        }
-        admission => Some(UpstreamAttemptGuard::new(
-            request.state,
-            request.request_id,
-            primary.route.route_id,
-            primary.route.account_id,
-            primary.route.credential_generation,
-            primary.route.transport_revision,
-            admission,
-            None,
-        )),
-    };
+    // A customer request does not wait on, or become, an account health probe.
+    let _ = recovery_wait_deadline;
+    let upstream_attempt = Some(UpstreamAttemptGuard::new(
+        request.state,
+        request.request_id,
+        primary.route.route_id,
+        primary.route.account_id,
+        primary.route.credential_generation,
+        primary.route.transport_revision,
+        UpstreamAttemptAdmission::Observed,
+        None,
+    ));
     let mut active_route = match materialize_proxy_route(request.state, primary).await {
         Ok(prepared) => prepared,
         Err(_) => return finish_proxy_failure(&request, "provider_candidate_invalid").await,
@@ -2384,15 +2238,19 @@ impl ConversationBody {
             Self::InMemory(body) => memory.release_conversation_working_copies(body.len()),
             #[cfg(test)]
             Self::Spool(spool) => {
+                spool.release_retained();
                 memory.release_source_backed_conversation_working_copies(spool.len())
             }
             Self::ProjectedSpool {
                 spool,
                 retained_bytes,
                 ..
-            } => memory.release_source_backed_conversation_working_copies(
-                spool.len().saturating_sub(*retained_bytes),
-            ),
+            } => {
+                spool.release_retained();
+                memory.release_source_backed_conversation_working_copies(
+                    spool.len().saturating_sub(*retained_bytes),
+                )
+            }
         }
     }
 }
@@ -2435,6 +2293,15 @@ impl ProxyConversation {
 
     fn release_working_copies(&self, memory: &crate::gateway_body::memory::ProxyMemoryReservation) {
         self.request_body.release_working_copies(memory);
+    }
+
+    fn release_retained_upload(&self) {
+        match &self.request_body {
+            ConversationBody::InMemory(_) => {}
+            #[cfg(test)]
+            ConversationBody::Spool(spool) => spool.release_retained(),
+            ConversationBody::ProjectedSpool { spool, .. } => spool.release_retained(),
+        }
     }
 
     fn reject_projection(&self) {
@@ -3173,6 +3040,9 @@ async fn finish_buffered_request_before_deadline(
         BufferedResponseStorage::InlineLocalJson(stored_response) => (Some(stored_response), false),
         BufferedResponseStorage::Omit => (None, false),
     };
+    if let Some(conversation) = request.conversation.as_ref() {
+        conversation.release_retained_upload();
+    }
     let request_id = request.request_id;
     let (usage, mut usage_basis) = usage;
     let usage = match crate::db::normalize_proxy_usage_with_output_limit(
@@ -3251,6 +3121,18 @@ async fn finish_buffered_request_before_deadline(
             projection_deadline,
         ),
     );
+    if let Err(error) = request
+        .state
+        .pending_terminals
+        .record_operational_observation(&request.state.db, request_id)
+        .await
+    {
+        tracing::error!(
+            %request_id,
+            error_category = error.diagnostic_category(),
+            "runtime terminal was not durable before the client response returned"
+        );
+    }
     if archive_response {
         persistence::capture(
             request.state,

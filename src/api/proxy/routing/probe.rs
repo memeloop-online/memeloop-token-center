@@ -12,6 +12,7 @@ use std::{
 
 type ProbeKey = (Uuid, i64);
 
+#[cfg(test)]
 fn transient_sample_for_outcome(
     outcome: crate::plugin::routing::GroupRoutingOutcome,
 ) -> Option<bool> {
@@ -32,6 +33,7 @@ fn active_transient_keeps_breaker_closed(
     !signal.should_open(policy.min_samples, policy.open_micros)
 }
 
+#[cfg(test)]
 fn active_transient_defers_probe_recovery(
     policy: crate::plugin::routing::GroupRoutingTransientPolicy,
     signal: crate::plugin::routing::GroupRoutingTransientSignal,
@@ -1029,218 +1031,68 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             .transient_health_scope(route_id, upstream_account_id, credential_generation)
             .cloned()
     });
-    let signal = if let Some(transient_failure) = transient_sample_for_outcome(outcome)
-        && let Some(scope) = transient_health_scope
-    {
-        match state
-            .db
-            .record_transient_health_sample(
-                upstream_account_id,
-                credential_generation,
-                &scope.id,
-                transient_failure,
-                scope.window_ms,
-            )
-            .await
-        {
-            Ok(signal) => signal.map(|signal| {
-                signal.for_group_routing_window(crate::db::unix_millis(), scope.window_ms)
-            }),
-            Err(error) => {
-                state.routing_persistence.record_failure_gap();
-                tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), stage="transient_health_sample", "transient health signal unavailable; native health policy retained");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let _ = transient_health_scope;
+    // Customer requests do not write account or routing-group health.
+    // Each upstream and each proxy exit is judged only by its own probe.
+    let signal: Option<crate::plugin::routing::GroupRoutingTransientSignal> = None;
+    let directive: Option<crate::plugin::routing::GroupRoutingExecutionDirective> = None;
     let mandatory_failure = matches!(
         outcome,
         GroupRoutingOutcome::HardQuota | GroupRoutingOutcome::Authentication
     );
-    let directive = if mandatory_failure {
-        let background = state.clone();
-        state.routing_persistence.submit(4096, async move {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                crate::group_routing::observe_with_signal(
-                    &background,
+    let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
+    if observe_only {
+        // The customer already has its result. Keep the transport diagnostic.
+        // Account health is written only by the independent service probe.
+        if let UpstreamAttemptTerminal::Failed {
+            kind,
+            failure_stage,
+            ..
+        } = terminal
+            && let Err(error) = state
+                .db
+                .record_upstream_transport_diagnostic(crate::db::UpstreamTransportDiagnostic {
                     request_id,
                     route_id,
                     upstream_account_id,
                     credential_generation,
-                    outcome,
-                    signal,
-                ),
-            )
-            .await
-            .map_err(|_| AppError::Internal)?;
-            Ok(())
-        });
-        None
-    } else {
-        crate::group_routing::observe_with_signal(
-            &state,
-            request_id,
-            route_id,
-            upstream_account_id,
-            credential_generation,
-            outcome,
-            signal,
-        )
-        .await
-    };
-    let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
-    if observe_only {
-        // The customer has already received its result. Health persistence and
-        // transport diagnostics share the existing bounded background queue.
-        let result = match terminal {
-            UpstreamAttemptTerminal::Succeeded => {
-                state
-                    .db
-                    .record_observed_upstream_account_success_at_revision(
-                        upstream_account_id,
-                        credential_generation,
-                        transport_revision,
-                    )
-                    .await
-            }
-            UpstreamAttemptTerminal::Failed {
-                kind,
-                reason,
-                failure_stage,
-            } => {
-                state
-                    .metrics
-                    .observe_upstream_health(UpstreamHealthEvent::Failure, reason);
-                if let Err(error) = state
-                    .db
-                    .record_upstream_transport_diagnostic(crate::db::UpstreamTransportDiagnostic {
-                        request_id,
-                        route_id,
-                        upstream_account_id,
-                        credential_generation,
-                        transport_revision,
-                        failure_kind: kind.as_str(),
-                        failure_stage,
-                        gateway_pod: &gateway_identity.pod,
-                        gateway_node: gateway_identity.node.as_deref(),
-                        failure_domain: &gateway_identity.failure_domain,
-                    })
-                    .await
-                {
-                    state.routing_persistence.record_failure_gap();
-                    tracing::warn!(%request_id, error_category = error.diagnostic_category(), "upstream transport observation could not be persisted");
-                }
-                state
-                    .db
-                    .record_upstream_account_failure_at_revision_with_health_config(
-                        upstream_account_id,
-                        credential_generation,
-                        transport_revision,
-                        kind,
-                        health,
-                    )
-                    .await
-            }
-            UpstreamAttemptTerminal::Inconclusive => return,
-        };
-        if let Err(error) = result {
+                    transport_revision,
+                    failure_kind: kind.as_str(),
+                    failure_stage,
+                    gateway_pod: &gateway_identity.pod,
+                    gateway_node: gateway_identity.node.as_deref(),
+                    failure_domain: &gateway_identity.failure_domain,
+                })
+                .await
+        {
             state.routing_persistence.record_failure_gap();
-            tracing::warn!(%request_id, error_category = error.diagnostic_category(), "upstream health observation could not be persisted");
+            tracing::warn!(%request_id, error_category = error.diagnostic_category(), "upstream transport observation could not be persisted");
         }
+        let _ = (
+            health,
+            lease_token,
+            owns_probe_lease,
+            failure_epoch,
+            signal,
+            directive,
+        );
         return;
     }
     match terminal {
         UpstreamAttemptTerminal::Succeeded => {
-            if let (Some(policy), Some(signal), Some(lease_token)) = (
-                directive
-                    .as_ref()
-                    .and_then(|entry| entry.transient_policy)
-                    .filter(|policy| {
-                        policy.is_active()
-                            && state.group_routing.as_ref().is_some_and(|snapshot| {
-                                snapshot.active_transient_policy(
-                                    route_id,
-                                    upstream_account_id,
-                                    credential_generation,
-                                ) == Some(*policy)
-                            })
-                    }),
-                signal,
+            let _ = (
                 lease_token,
-            ) && active_transient_defers_probe_recovery(policy, signal)
-            {
-                if owns_probe_lease && !recovered_on_delivery {
-                    let cooldown = directive.as_ref().map_or(
-                        state.config.upstream_health.connection_cooldown_millis,
-                        |entry| entry.directive.cooldown_ms.min(60_000) as i64,
-                    );
-                    if let Err(error) = state
-                        .db
-                        .defer_upstream_account_probe_recovery_at_revision(
-                            upstream_account_id,
-                            credential_generation,
-                            transport_revision,
-                            lease_token,
-                            cooldown.max(0) as u64,
-                        )
-                        .await
-                    {
-                        state.routing_persistence.record_failure_gap();
-                        tracing::warn!(%request_id, %upstream_account_id, error_category=error.diagnostic_category(), "failed to defer transient probe recovery");
-                    }
-                }
-                return;
-            }
-            let recovery = async {
-                match lease_token {
-                    Some(lease_token) => {
-                        state
-                            .db
-                            .record_upstream_account_probe_success_at_revision(
-                                upstream_account_id,
-                                credential_generation,
-                                transport_revision,
-                                lease_token,
-                            )
-                            .await
-                    }
-                    _ => {
-                        let Some(failure_epoch) = failure_epoch else {
-                            return Ok(false);
-                        };
-                        state
-                            .db
-                            .record_upstream_account_success_at_revision(
-                                upstream_account_id,
-                                credential_generation,
-                                transport_revision,
-                                failure_epoch,
-                            )
-                            .await
-                    }
-                }
-            };
-            match recovery.await {
-                Ok(true) if lease_token.is_some() && !recovered_on_delivery => {
-                    state.metrics.observe_upstream_health(
-                        UpstreamHealthEvent::Recovered,
-                        UpstreamHealthReason::Success,
-                    )
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    state.routing_persistence.record_failure_gap();
-                    tracing::warn!(
-                        %request_id,
-                        %upstream_account_id,
-                        error_category = error.diagnostic_category(),
-                        "failed to clear upstream account cooldown after a valid probe"
-                    );
-                }
-            }
+                failure_epoch,
+                signal,
+                directive,
+                owns_probe_lease,
+                recovered_on_delivery,
+            );
+            tracing::info!(
+                %request_id,
+                %upstream_account_id,
+                "customer request success is not an account health sample"
+            );
         }
         UpstreamAttemptTerminal::Inconclusive => {
             if owns_probe_lease
@@ -1348,121 +1200,14 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 // next frozen policy snapshot.
                 return;
             }
-            let persisted = match lease_token {
-                Some(failure_epoch)
-                    if owns_probe_lease && kind == UpstreamFailureKind::Connection =>
-                {
-                    state
-                        .db
-                        .record_admitted_connection_failure_by_domain(
-                            crate::db::AdmittedConnectionFailure {
-                                request_id,
-                                upstream_account_id,
-                                credential_generation,
-                                transport_revision,
-                                failure_epoch,
-                                failure_stage,
-                                gateway_pod: &gateway_identity.pod,
-                                gateway_node: gateway_identity.node.as_deref(),
-                                failure_domain: &gateway_identity.failure_domain,
-                            },
-                            health,
-                        )
-                        .await
-                        .map(|result| result.global_breaker_opened)
-                }
-                Some(lease_token) => {
-                    state
-                        .db
-                        .record_upstream_account_probe_failure_at_revision_with_health_config(
-                            upstream_account_id,
-                            credential_generation,
-                            transport_revision,
-                            lease_token,
-                            kind,
-                            health,
-                        )
-                        .await
-                }
-                None => match failure_epoch {
-                    Some(failure_epoch) if kind == UpstreamFailureKind::Connection => state
-                        .db
-                        .record_admitted_connection_failure_by_domain(
-                            crate::db::AdmittedConnectionFailure {
-                                request_id,
-                                upstream_account_id,
-                                credential_generation,
-                                transport_revision,
-                                failure_epoch,
-                                failure_stage,
-                                gateway_pod: &gateway_identity.pod,
-                                gateway_node: gateway_identity.node.as_deref(),
-                                failure_domain: &gateway_identity.failure_domain,
-                            },
-                            health,
-                        )
-                        .await
-                        .map(|result| {
-                            tracing::warn!(
-                                %request_id,
-                                %upstream_account_id,
-                                failure_domain = %gateway_identity.failure_domain,
-                                distinct_failure_domains = result.distinct_failure_domains,
-                                global_breaker_opened = result.global_breaker_opened,
-                                stage = "connection_failure_domain_health",
-                                "recorded failure-domain connection evidence"
-                            );
-                            result.global_breaker_opened
-                        }),
-                    Some(failure_epoch)
-                        if matches!(
-                            kind,
-                            UpstreamFailureKind::Connection
-                                | UpstreamFailureKind::Unavailable
-                                | UpstreamFailureKind::InvalidResponse
-                        ) =>
-                    {
-                        state
-                            .db
-                            .record_admitted_upstream_account_failure_at_revision(
-                                upstream_account_id,
-                                credential_generation,
-                                transport_revision,
-                                kind,
-                                health,
-                                failure_epoch,
-                            )
-                            .await
-                    }
-                    _ => {
-                        state
-                            .db
-                            .record_upstream_account_failure_at_revision_with_health_config(
-                                upstream_account_id,
-                                credential_generation,
-                                transport_revision,
-                                kind,
-                                health,
-                            )
-                            .await
-                    }
-                },
-            };
-            match persisted {
-                Ok(true) => state
-                    .metrics
-                    .observe_upstream_health(UpstreamHealthEvent::Failure, reason),
-                Ok(false) => {}
-                Err(error) => {
-                    state.routing_persistence.record_failure_gap();
-                    tracing::warn!(
-                        %request_id,
-                        %upstream_account_id,
-                        error_category = error.diagnostic_category(),
-                        "failed to persist unsuccessful upstream attempt"
-                    );
-                }
-            }
+            let _ = (lease_token, owns_probe_lease, failure_epoch, health, reason);
+            tracing::info!(
+                %request_id,
+                %upstream_account_id,
+                failure_kind = kind.as_str(),
+                failure_stage,
+                "customer request outcome is not an account health sample"
+            );
         }
     }
 }

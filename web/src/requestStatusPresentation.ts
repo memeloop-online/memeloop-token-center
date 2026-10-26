@@ -24,6 +24,7 @@ const recordedFailureCopy: Record<string, [string, string]> = {
   upstream_connection: ['上游连接失败', 'The upstream connection failed'],
   upstream_read_timeout: ['读取上游响应超时', 'Reading the upstream response timed out'],
   upstream_request_timeout: ['等待上游请求响应超时', 'The upstream request timed out'],
+  gateway_owner_lost: ['网关副本已结束，这条连接不再处理', 'The gateway replica ended and is no longer handling this connection'],
 };
 
 const supplierFailureCopy: Record<string, [string, string]> = {
