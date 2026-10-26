@@ -142,7 +142,7 @@ async fn exact_identity_name_cas_and_manual_priority() {
             .is_none()
     );
     assert_eq!(
-        db.enqueue_unnamed_session_titles(key.tenant_id, &[identity.clone()])
+        db.enqueue_unnamed_session_titles(key.tenant_id, std::slice::from_ref(&identity))
             .await
             .unwrap()["queued"],
         0
@@ -206,7 +206,7 @@ async fn subtree_union_days_and_related_changes_do_not_copy_facts() {
     let subtree = db
         .analyze_session_tasks(
             key.tenant_id,
-            &[parent.clone()],
+            std::slice::from_ref(&parent),
             "subtree",
             None,
             &SessionTaskOptions::default(),
@@ -220,7 +220,7 @@ async fn subtree_union_days_and_related_changes_do_not_copy_facts() {
     assert_eq!(
         db.analyze_session_tasks(
             key.tenant_id,
-            &[child.clone()],
+            std::slice::from_ref(&child),
             "session",
             None,
             &SessionTaskOptions::default()
@@ -247,7 +247,7 @@ async fn subtree_union_days_and_related_changes_do_not_copy_facts() {
     assert_eq!(
         db.analyze_session_tasks(
             key.tenant_id,
-            &[parent.clone()],
+            std::slice::from_ref(&parent),
             "subtree",
             None,
             &SessionTaskOptions::default()
@@ -363,7 +363,7 @@ async fn metadata_batches_exceed_one_hundred_and_retain_unresolved_parents() {
     assert_eq!(
         db.analyze_session_tasks(
             owner.tenant_id,
-            &[parent.clone()],
+            std::slice::from_ref(&parent),
             "subtree",
             None,
             &SessionTaskOptions::default()
@@ -404,7 +404,7 @@ async fn fixed_offset_days_and_idempotent_names_preserve_exact_identity() {
     let analysis = db
         .analyze_session_tasks(
             owner.tenant_id,
-            &[identity.clone()],
+            std::slice::from_ref(&identity),
             "session",
             None,
             &SessionTaskOptions {
@@ -471,7 +471,39 @@ async fn postgres_task_days_honor_iana_dst_and_unknown_costs() {
     let db = Database::connect(&url).await.unwrap();
     db.migrate().await.unwrap();
     let owner = key(&db, &format!("task-dst-{}", Uuid::now_v7())).await;
-    let identity = session(&db, &owner, Uuid::now_v7()).await;
+    let thread = Uuid::now_v7();
+    let identity = session(&db, &owner, thread).await;
+    let child_thread = Uuid::now_v7();
+    let child = session(&db, &owner, child_thread).await;
+    db.import_session_parents(
+        owner.tenant_id,
+        &[ThreadParent {
+            child_thread_id: child_thread,
+            parent_thread_id: thread,
+            evidence: "thread_spawn_edges".into(),
+        }],
+    )
+    .await
+    .unwrap();
+    let revision = db
+        .session_title(owner.tenant_id, owner.key_id, identity.session_id)
+        .await
+        .unwrap()
+        .revision;
+    db.update_session_name(
+        owner.tenant_id,
+        &identity,
+        SessionNameUpdate {
+            title: "DST task".into(),
+            source: "codex".into(),
+            explicit_session_id: Some(thread.to_string()),
+            expected_revision: revision,
+            expected_unnamed: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     for timestamp in [
         1_772_944_200_000,
         1_772_947_800_000,
@@ -485,11 +517,12 @@ async fn postgres_task_days_honor_iana_dst_and_unknown_costs() {
     let analysis = db
         .analyze_session_tasks(
             owner.tenant_id,
-            &[identity],
-            "session",
+            &[identity.clone(), child],
+            "related",
             None,
             &SessionTaskOptions {
                 timezone: "America/New_York".into(),
+                include_subtrees: true,
                 ..Default::default()
             },
         )
@@ -505,4 +538,60 @@ async fn postgres_task_days_honor_iana_dst_and_unknown_costs() {
     assert_eq!(analysis["totals"]["requests"], 4);
     assert_eq!(analysis["totals"]["unknown_cost_requests"], 1);
     assert_eq!(analysis["totals"]["costs"]["USD"], 21);
+    let fixed = db
+        .analyze_session_tasks(
+            owner.tenant_id,
+            &[identity],
+            "session",
+            None,
+            &SessionTaskOptions {
+                timezone_offset_minutes: Some(-300),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(fixed["active_days"], 2);
+    assert_eq!(fixed["calendar_span_days"], 2);
+}
+
+#[tokio::test]
+async fn archive_identity_union_deduplicates_native_facts_and_keeps_unknown_cost() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("archive-union.db").display()
+    ))
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    let owner = key(&db, "archive-union").await;
+    let native = session(&db, &owner, Uuid::now_v7()).await;
+    let archive = session(&db, &owner, Uuid::now_v7()).await;
+    fact(&db, owner.tenant_id, &native, 1).await;
+    let native_id: String =
+        sqlx::query_scalar("SELECT request_id FROM request_stats_facts WHERE tenant_id=$1")
+            .bind(owner.tenant_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    for request in [native_id, Uuid::now_v7().to_string()] {
+        sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,protocol,model,input_tokens,output_tokens,imported_at) VALUES ($1,'fixture',$2,$2,$3,$4,$5,1,'openai','model',3,4,1)")
+            .bind(owner.tenant_id.to_string()).bind(request).bind(owner.key_id.to_string()).bind(owner.principal_id.to_string()).bind(archive.session_id.to_string())
+            .execute(&db.pool).await.unwrap();
+    }
+    let analysis = db
+        .analyze_session_tasks(
+            owner.tenant_id,
+            &[native, archive],
+            "related",
+            None,
+            &SessionTaskOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(analysis["totals"]["requests"], 2);
+    assert_eq!(analysis["totals"]["input_tokens"], 13);
+    assert_eq!(analysis["totals"]["unknown_cost_requests"], 1);
+    assert_eq!(analysis["totals"]["costs"]["USD"], 7);
 }

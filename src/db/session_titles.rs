@@ -257,15 +257,13 @@ impl Database {
         for session in sessions {
             if let Some((title, source)) =
                 titles.get(&(session.key_id.to_string(), session.session_id.clone()))
-            {
-                if source != "generated"
+                && (source != "generated"
                     || session
                         .session_name
                         .as_ref()
-                        .is_none_or(|name| name.trim().is_empty())
-                {
-                    session.session_name = Some(title.clone());
-                }
+                        .is_none_or(|name| name.trim().is_empty()))
+            {
+                session.session_name = Some(title.clone());
             }
         }
         Ok(())

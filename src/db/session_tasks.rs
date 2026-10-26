@@ -83,7 +83,7 @@ impl Database {
             sqlx::query("INSERT INTO session_thread_parents (tenant_id,child_thread_id,parent_thread_id,evidence) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING")
                 .bind(tenant.to_string()).bind(parent.child_thread_id.to_string()).bind(parent.parent_thread_id.to_string()).bind(&parent.evidence).execute(&mut *tx).await?;
         }
-        let linked=sqlx::query("INSERT INTO session_relationships (tenant_id,key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at) SELECT DISTINCT p.tenant_id,child.key_id,child.cluster_id,parent.key_id,parent.cluster_id,'parent',p.evidence,$2 FROM session_thread_parents p JOIN conversation_observations child ON child.explicit_session_id=p.child_thread_id JOIN conversation_clusters cc ON cc.id=child.cluster_id AND cc.tenant_id=p.tenant_id JOIN conversation_observations parent ON parent.explicit_session_id=p.parent_thread_id JOIN conversation_clusters pc ON pc.id=parent.cluster_id AND pc.tenant_id=p.tenant_id WHERE p.tenant_id=$1 AND (child.key_id<>parent.key_id OR child.cluster_id<>parent.cluster_id) ON CONFLICT DO NOTHING")
+        let linked=sqlx::query("WITH endpoints AS (SELECT DISTINCT o.explicit_session_id,o.key_id,o.cluster_id FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE c.tenant_id=$1 AND o.explicit_session_id IN (SELECT child_thread_id FROM session_thread_parents WHERE tenant_id=$1 UNION SELECT parent_thread_id FROM session_thread_parents WHERE tenant_id=$1)) INSERT INTO session_relationships (tenant_id,key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at) SELECT DISTINCT p.tenant_id,child.key_id,child.cluster_id,parent.key_id,parent.cluster_id,'parent',p.evidence,$2 FROM session_thread_parents p JOIN endpoints child ON child.explicit_session_id=p.child_thread_id JOIN endpoints parent ON parent.explicit_session_id=p.parent_thread_id WHERE p.tenant_id=$1 AND (child.key_id<>parent.key_id OR child.cluster_id<>parent.cluster_id) ON CONFLICT DO NOTHING")
             .bind(tenant.to_string()).bind(unix_millis()).execute(&mut *tx).await?.rows_affected();
         tx.commit().await?;
         Ok(json!({"accepted":parents.len(),"linked":linked}))
@@ -320,13 +320,12 @@ impl Database {
                 }
                 let existing = sqlx::query("SELECT target_key_id,target_session_id FROM session_relationships WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3 AND kind='parent'")
                     .bind(tenant.to_string()).bind(source.key_id.to_string()).bind(source.session_id.to_string()).fetch_optional(&mut *tx).await?;
-                if let Some(row) = existing {
-                    if row.try_get::<String, _>("target_key_id")? != target.key_id.to_string()
+                if let Some(row) = existing
+                    && (row.try_get::<String, _>("target_key_id")? != target.key_id.to_string()
                         || row.try_get::<String, _>("target_session_id")?
-                            != target.session_id.to_string()
-                    {
-                        return Err(AppError::Conflict("contradictory parent evidence".into()));
-                    }
+                            != target.session_id.to_string())
+                {
+                    return Err(AppError::Conflict("contradictory parent evidence".into()));
                 }
             }
             sqlx::query("INSERT INTO session_relationships (tenant_id,key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING")
@@ -483,7 +482,7 @@ impl Database {
             .zip(daily.last_key_value())
             .map_or(0, |((start, _), (end, _))| end - start + 1);
         Ok(json!({
-            "scope":scope,"include_subtrees":scope=="subtree" || options.include_subtrees,"identities":selected,
+            "scope":scope,"include_subtrees":scope=="subtree" || (scope=="related" && options.include_subtrees),"identities":selected,
             "timezone":options.timezone,"timezone_offset_minutes":options.timezone_offset_minutes,
             "first_request_at":first,"last_request_at":last,"calendar_span_days":span,"active_days":daily.len(),
             "totals":total,"daily":daily.into_iter().map(|(day,usage)|json!({"day_bucket":day,"day_start_at":day_starts[&day],"usage":usage})).collect::<Vec<_>>(),
