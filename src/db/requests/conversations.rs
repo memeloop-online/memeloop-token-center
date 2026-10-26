@@ -274,6 +274,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn materialize_conversation_content(
         &self,
         request_id: Uuid,

@@ -730,9 +730,9 @@ async fn archive_staging_reference(
         let response: Option<String> = sqlx::query_scalar(
             "SELECT response_object FROM synchronous_image_idempotency WHERE request_id = $1 AND response_object IS NOT NULL AND (response_object = $2 OR SUBSTR(response_object, 1, LENGTH($2) + 1) = $3) LIMIT 1",
         )
-        .bind(owner_id)
+        .bind(&owner_id)
         .bind(prefix)
-        .bind(segment_prefix)
+        .bind(&segment_prefix)
         .fetch_optional(&mut **transaction)
         .await?;
         if let Some(response) = response {

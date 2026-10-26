@@ -1710,7 +1710,7 @@ fn validated_upstream_job_id(value: &str) -> Result<&str, AppError> {
 }
 
 fn unknown_generation_status(driver: &str) -> AppError {
-    let provider = match driver {
+    let _provider = match driver {
         "volcengine-seedance" => "Seedance",
         "comfyui" => "ComfyUI",
         "siliconflow-video" => "SiliconFlow video",

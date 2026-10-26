@@ -899,7 +899,7 @@ fn normalize_audio_response(
     Ok(Value::Object(verbose))
 }
 
-fn finite_non_negative(value: Option<&Value>, field: &str) -> Result<f64, AppError> {
+fn finite_non_negative(value: Option<&Value>, _field: &str) -> Result<f64, AppError> {
     value
         .and_then(Value::as_f64)
         .filter(|value| value.is_finite() && *value >= 0.0)

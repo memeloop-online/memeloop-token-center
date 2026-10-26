@@ -47,7 +47,7 @@ impl LimitReason {
 /// Server-generated facts that are safe to show: stage names, phases, byte
 /// counts, limits, HTTP status digits, lock names, and `sqlx_error_kind`.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ErrorFacts {
+pub struct ErrorFacts {
     pub stage: Option<&'static str>,
     pub phase: Option<&'static str>,
     pub kind: Option<&'static str>,
@@ -100,6 +100,7 @@ impl ErrorFacts {
         self
     }
 
+    #[allow(dead_code)]
     pub const fn lock(mut self, lock: &'static str) -> Self {
         self.lock = Some(lock);
         self
