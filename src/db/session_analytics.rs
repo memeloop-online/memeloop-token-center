@@ -182,10 +182,8 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
            SELECT recent.key_id, recent.session_id,
                   (SELECT latest.id FROM request_records latest
                     WHERE latest.conversation_cluster_id IS NOT NULL
-                      AND (latest.key_id, latest.conversation_cluster_id) >=
-                          (recent.key_id, recent.session_id)
-                      AND (latest.key_id, latest.conversation_cluster_id) <=
-                          (recent.key_id, recent.session_id)
+                      AND latest.key_id = recent.key_id
+                      AND latest.conversation_cluster_id = recent.session_id
                     ORDER BY latest.key_id ASC,
                              latest.conversation_cluster_id ASC,
                              latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -198,8 +196,7 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
            UNION ALL
            SELECT recent.key_id, recent.session_id,
                   (SELECT latest.id FROM request_records latest
-                    WHERE latest.key_id >= recent.key_id
-                      AND latest.key_id <= recent.key_id
+                    WHERE latest.key_id = recent.key_id
                       AND latest.conversation_cluster_id IS NULL
                     ORDER BY latest.key_id ASC,
                              latest.created_at DESC, latest.id DESC LIMIT 1),
@@ -629,10 +626,8 @@ impl Database {
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
                             WHERE latest.conversation_cluster_id IS NOT NULL
-                              AND (latest.key_id, latest.conversation_cluster_id) >=
-                                  (recent.key_id, recent.session_id)
-                              AND (latest.key_id, latest.conversation_cluster_id) <=
-                                  (recent.key_id, recent.session_id)
+                              AND latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id = recent.session_id
                             ORDER BY latest.key_id ASC,
                                      latest.conversation_cluster_id ASC,
                                      latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -645,8 +640,7 @@ impl Database {
                    UNION ALL
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
-                            WHERE latest.key_id >= recent.key_id
-                              AND latest.key_id <= recent.key_id
+                            WHERE latest.key_id = recent.key_id
                               AND latest.conversation_cluster_id IS NULL
                             ORDER BY latest.key_id ASC,
                                      latest.created_at DESC, latest.id DESC LIMIT 1),
@@ -936,10 +930,8 @@ impl Database {
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
                             WHERE latest.conversation_cluster_id IS NOT NULL
-                              AND (latest.key_id, latest.conversation_cluster_id) >=
-                                  (recent.key_id, recent.session_id)
-                              AND (latest.key_id, latest.conversation_cluster_id) <=
-                                  (recent.key_id, recent.session_id)
+                              AND latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id = recent.session_id
                             ORDER BY latest.key_id ASC,
                                      latest.conversation_cluster_id ASC,
                                      latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -952,8 +944,7 @@ impl Database {
                    UNION ALL
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
-                            WHERE latest.key_id >= recent.key_id
-                              AND latest.key_id <= recent.key_id
+                            WHERE latest.key_id = recent.key_id
                               AND latest.conversation_cluster_id IS NULL
                             ORDER BY latest.key_id ASC,
                                      latest.created_at DESC, latest.id DESC LIMIT 1),
