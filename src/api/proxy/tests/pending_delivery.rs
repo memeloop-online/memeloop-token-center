@@ -830,13 +830,20 @@ async fn already_finished_without_matching_receipt_ack_keeps_durable_evidence() 
         .expect(1)
         .mount(&upstream)
         .await;
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({"model": fixture.model, "input": "unmatched ACK", "stream": false}),
+    // The journal must not settle in the gap after the fault trigger is gone
+    // and before this test records the unmatched terminal.
+    let held = fixture.state.pending_terminals.hold_writer_for_test().await;
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model": fixture.model, "input": "unmatched ACK", "stream": false}),
+        ),
     )
-    .await;
+    .await
+    .expect("delivery must not wait for the held journal");
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
@@ -851,6 +858,7 @@ async fn already_finished_without_matching_receipt_ack_keeps_durable_evidence() 
         .bind(crate::db::unix_millis()).bind(receipt["request_id"].as_str().unwrap())
         .execute(&pool).await.unwrap();
     pool.close().await;
+    drop(held);
     tokio::time::timeout(Duration::from_secs(5), async {
         while !fixture
             .state
