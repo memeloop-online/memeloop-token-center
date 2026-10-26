@@ -194,12 +194,7 @@ async fn verify_interleaving(url: &str) {
             )
             .await
             .unwrap();
-        assert_eq!(
-            unauthorized.len(),
-            1,
-            "a key without a grant still dispatches to the route account"
-        );
-        assert_eq!(unauthorized[0].account_id, account.id);
+        assert!(unauthorized.is_empty());
         let revision: i64 =
             sqlx::query_scalar("SELECT updated_at FROM upstream_accounts WHERE id = $1")
                 .bind(account.id.to_string())

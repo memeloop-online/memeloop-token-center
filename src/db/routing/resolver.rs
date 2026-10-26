@@ -201,16 +201,16 @@ impl Database {
             avoid_route_account,
             selection_seed,
         } = selection;
-        // A non-healthy service probe stays eligible and sorts last. Excluding
-        // it made the probe unable to reach the same account after a failure.
+        // Only an unhealthy probe sorts last. A healthy result and a missing
+        // probe share a rank so configured priority still chooses; excluding
+        // a non-healthy account made the probe unable to reach it again.
         let rows = sqlx::query(
              "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight,
                      a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                      a.credential_generation,
                      CAST(CASE
-                       WHEN service_probe.status = 'healthy' THEN 0
-                       WHEN service_probe.status IS NULL THEN 1
-                       ELSE 2
+                       WHEN service_probe.status = 'unhealthy' THEN 1
+                       ELSE 0
                      END AS BIGINT) AS probe_rank
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidates
@@ -250,7 +250,7 @@ impl Database {
                 %key_id,
                 "authorized candidate set was empty; selecting a configured upstream"
             );
-            self.fallback_dispatch_candidates(tenant_id, public_model, protocol)
+            self.fallback_dispatch_candidates(tenant_id, key_id, public_model, protocol)
                 .await?
         } else {
             rows
@@ -311,6 +311,7 @@ impl Database {
     async fn fallback_dispatch_candidates(
         &self,
         tenant_id: Uuid,
+        key_id: Uuid,
         public_model: &str,
         protocol: &str,
     ) -> Result<Vec<AnyRow>, AppError> {
@@ -320,9 +321,8 @@ impl Database {
                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                     a.credential_generation,
                     CAST(CASE
-                      WHEN service_probe.status = 'healthy' THEN 0
-                      WHEN service_probe.status IS NULL THEN 1
-                      ELSE 2
+                      WHEN service_probe.status = 'unhealthy' THEN 1
+                      ELSE 0
                     END AS BIGINT) AS probe_rank
              FROM model_routes r
              JOIN (
@@ -345,6 +345,16 @@ impl Database {
                ON service_probe.upstream_account_id = a.id
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND r.archived_at IS NULL
+               AND (
+                 EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $5 AND g.model_route_id = r.id)
+                 OR EXISTS (
+                   SELECT 1 FROM routing_grants g
+                   JOIN model_route_group_memberships membership
+                     ON membership.tenant_id = g.tenant_id AND membership.route_group_id = g.route_group_id
+                   WHERE g.tenant_id = r.tenant_id AND g.key_id = $5
+                     AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
+                 )
+               )
              ORDER BY probe_rank ASC, r.priority ASC, r.id ASC, a.id ASC
              LIMIT $4",
         )
@@ -352,6 +362,7 @@ impl Database {
         .bind(public_model)
         .bind(protocol)
         .bind(limit)
+        .bind(key_id.to_string())
         .fetch_all(&self.pool)
         .await?;
         if !configured.is_empty() {
@@ -367,9 +378,8 @@ impl Database {
                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                     a.credential_generation,
                     CAST(CASE
-                      WHEN service_probe.status = 'healthy' THEN 0
-                      WHEN service_probe.status IS NULL THEN 1
-                      ELSE 2
+                      WHEN service_probe.status = 'unhealthy' THEN 1
+                      ELSE 0
                     END AS BIGINT) AS probe_rank
              FROM model_routes r
              JOIN upstream_accounts a
@@ -380,6 +390,16 @@ impl Database {
                ON service_probe.upstream_account_id = a.id
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND r.archived_at IS NULL
+               AND (
+                 EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $5 AND g.model_route_id = r.id)
+                 OR EXISTS (
+                   SELECT 1 FROM routing_grants g
+                   JOIN model_route_group_memberships membership
+                     ON membership.tenant_id = g.tenant_id AND membership.route_group_id = g.route_group_id
+                   WHERE g.tenant_id = r.tenant_id AND g.key_id = $5
+                     AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
+                 )
+               )
              ORDER BY probe_rank ASC, a.id ASC
              LIMIT $4",
         )
@@ -387,6 +407,7 @@ impl Database {
         .bind(public_model)
         .bind(protocol)
         .bind(limit)
+        .bind(key_id.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(AppError::from)
@@ -1022,13 +1043,39 @@ mod tests {
         .execute(&database.pool)
         .await
         .unwrap();
+        let tenant_external: String =
+            sqlx::query_scalar("SELECT external_id FROM tenants WHERE id = $1")
+                .bind(&tenant_id)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        let issued = database
+            .create_key_with_routing(
+                crate::db::CreateKeyInput {
+                    tenant_external_id: tenant_external,
+                    principal_external_id: "member".into(),
+                    alias: "fallback".into(),
+                    currency: "USD".into(),
+                    policy: crate::model::KeyPolicy {
+                        allowed_models: vec!["gpt-fallback".into()],
+                        ..crate::model::KeyPolicy::default()
+                    },
+                    initial_balance: rust_decimal::Decimal::ONE,
+                    idempotency_key: None,
+                },
+                &[route_id],
+                &[],
+                b"fallback-dispatch-test",
+            )
+            .await
+            .unwrap();
         let selection = RouteSelectionOptions {
             upstream_account_hint: None,
             avoid_route_account: None,
             selection_seed: Uuid::now_v7(),
         };
         let tenant_uuid = Uuid::parse_str(&tenant_id).unwrap();
-        let found = database
+        let ungranted = database
             .list_authorized_upstream_candidates_with_hint(
                 Uuid::now_v7(),
                 tenant_uuid,
@@ -1038,7 +1085,25 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(found.len(), 1, "a route with no grant still has an account");
+        assert!(
+            ungranted.is_empty(),
+            "a key without a grant is not a candidate"
+        );
+        let found = database
+            .list_authorized_upstream_candidates_with_hint(
+                issued.key_id,
+                tenant_uuid,
+                "gpt-fallback",
+                "openai",
+                selection,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "a granted route still dispatches when catalog eligibility is empty"
+        );
         assert_eq!(found[0].account_id, account.id);
         database.note_service_available(account.id).await;
         let status: String = sqlx::query_scalar(
@@ -1056,7 +1121,7 @@ mod tests {
             .unwrap();
         let found = database
             .list_authorized_upstream_candidates_with_hint(
-                Uuid::now_v7(),
+                issued.key_id,
                 tenant_uuid,
                 "gpt-fallback",
                 "openai",
