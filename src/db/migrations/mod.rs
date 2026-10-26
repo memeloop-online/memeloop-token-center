@@ -723,6 +723,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "会话正文归档 media purpose",
         sql: include_str!("../../../migrations/sqlite/0138_conversation_media_archive.sql"),
     },
+    Migration {
+        version: 139,
+        name: "archive spool plain byte count follows the chunk ceiling",
+        sql: include_str!("../../../migrations/sqlite/0139_archive_spool_plain_byte_count.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1428,6 +1433,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 138,
         name: "会话正文归档 media purpose",
         sql: include_str!("../../../migrations/postgres/0138_conversation_media_archive.sql"),
+    },
+    Migration {
+        version: 139,
+        name: "archive spool plain byte count follows the chunk ceiling",
+        sql: include_str!("../../../migrations/postgres/0139_archive_spool_plain_byte_count.sql"),
     },
 ];
 

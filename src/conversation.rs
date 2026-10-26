@@ -578,6 +578,10 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
             completed = Some(value);
             continue;
         }
+        if let Some(fragment) = value.get("delta").and_then(Value::as_str) {
+            text.push_str(fragment);
+            continue;
+        }
         if let Some(fragment) = value
             .pointer("/delta/content")
             .and_then(Value::as_str)
@@ -1084,10 +1088,16 @@ impl SessionBodyPart {
 }
 
 fn atom_from_turn(turn: &SessionBodyTurn) -> SemanticAtom {
-    let mut content = turn_value(turn);
-    let instance_hash = digest_value(&content);
-    strip_instance_ids(&mut content);
-    let content_hash = digest_value(&content);
+    let content = turn_value(turn);
+    // 前缀身份只看角色和片段。客户端回放的助手回合来源是 request，
+    // 上一轮归档时来源是 return。文本相同就应接上，origin 仍留在入库 JSON 里。
+    let mut identity = content.clone();
+    if let Some(object) = identity.as_object_mut() {
+        object.remove("origin");
+    }
+    let instance_hash = digest_value(&identity);
+    strip_instance_ids(&mut identity);
+    let content_hash = digest_value(&identity);
     SemanticAtom {
         role: turn.role.clone(),
         kind: "turn".into(),
@@ -1235,6 +1245,46 @@ mod tests {
             infer_relation(&first, &second),
             (RelationKind::Continues, 0.95)
         );
+    }
+
+    #[test]
+    fn echoed_assistant_text_continues_the_return_turn() {
+        let first = session_body_from_documents(
+            &json!({"messages": [{"role": "user", "content": "one"}]}),
+            &json!({"choices": [{"message": {"role": "assistant", "content": "hello"}}]}),
+        );
+        let second = session_body_from_documents(
+            &json!({
+                "messages": [
+                    {"role": "user", "content": "one"},
+                    {"role": "assistant", "content": "hello"},
+                    {"role": "user", "content": "three"}
+                ]
+            }),
+            &json!({"choices": [{"message": {"role": "assistant", "content": "next"}}]}),
+        );
+        let (first_atoms, first_nodes) = first.into_prefix();
+        let (second_atoms, second_nodes) = second.into_prefix();
+        assert_eq!(first_atoms[1].content["origin"], "return");
+        assert_eq!(second_atoms[1].content["origin"], "request");
+        assert_eq!(first_atoms[1].content_hash, second_atoms[1].content_hash);
+        assert_eq!(first_nodes[0].node_hash, second_nodes[0].node_hash);
+        assert_eq!(first_nodes[1].node_hash, second_nodes[1].node_hash);
+    }
+
+    #[test]
+    fn responses_output_text_delta_is_the_return_document() {
+        let bytes = concat!(
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\",\"usage\":{\"output_tokens\":1}}}\n\n"
+        );
+        let document = raw_return_document(bytes.as_bytes()).expect("delta text");
+        let body = session_body_from_documents(&json!({"input": "parent"}), &document);
+        assert_eq!(body.turns.len(), 2);
+        assert_eq!(body.turns[1].role, "assistant");
+        assert_eq!(body.turns[1].parts[0].text.as_deref(), Some("hello"));
     }
 
     #[test]

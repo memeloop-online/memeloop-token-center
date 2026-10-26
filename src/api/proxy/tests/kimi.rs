@@ -1376,7 +1376,7 @@ async fn compaction_candidates_all_disabled_return_precise_400_without_dispatch(
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(body["error"]["code"], "compaction_producer_unavailable");
     assert_eq!(
         body["error"]["message_en"],
         "invalid request: no available authorized upstream supports Responses compaction production"

@@ -1015,15 +1015,10 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
-    let Some(return_document) = crate::conversation::raw_return_document(&return_bytes) else {
-        return skip_session_body(
-            state,
-            lease_owner,
-            request_id,
-            "session_body_skipped_archive_unreadable",
-        )
-        .await;
-    };
+    // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
+    // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
+    let return_document = crate::conversation::raw_return_document(&return_bytes)
+        .unwrap_or_else(|| serde_json::json!({}));
     let mut body =
         crate::conversation::session_body_from_documents(&request_document, &return_document);
     let pending_media = body.take_media_bytes();

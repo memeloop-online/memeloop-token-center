@@ -7142,7 +7142,7 @@ async fn send_full_context_session(world: &mut TokenCenterWorld, model: String) 
             "model": model,
             "messages": [
                 {"role": "user", "content": "one"},
-                {"role": "assistant", "content": "two"},
+                {"role": "assistant", "content": "hello"},
                 {"role": "user", "content": "three"}
             ]
         }))
