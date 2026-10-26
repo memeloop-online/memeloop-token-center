@@ -1060,13 +1060,31 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
         .pending_terminals
         .directory_for_test()
         .to_path_buf();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !directory.join(format!("{receipt_id}.json")).is_file() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unprojected financial ACK must retain a compact recovery receipt");
+    let compact: Value = serde_json::from_slice(
+        &tokio::fs::read(directory.join(format!("{receipt_id}.json")))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(compact["conversation"].is_null());
+    assert_eq!(compact["usage"], receipt["usage"]);
+    assert_eq!(compact["financial_ack"]["receipt_id"], receipt["receipt_id"]);
+    assert_eq!(compact["financial_ack"]["request_id"], receipt["request_id"]);
+    assert!(compact["financial_ack"]["receipt_digest"].as_str().is_some());
     fixture.state.pending_terminals.stop_for_test().await;
     sqlx::query("DROP TRIGGER fail_operational_terminal")
         .execute(&pool)
         .await
         .unwrap();
     fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        directory,
+        directory.clone(),
         fixture.state.db.independent_persistence_pool(),
     );
     let record = wait_for_operational(&fixture).await;
@@ -1095,6 +1113,7 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
     })
     .await
     .unwrap();
+    assert!(!directory.join(format!("{receipt_id}.json")).exists());
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     pool.close().await;
     upstream.verify().await;
@@ -1102,15 +1121,10 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
 
 #[tokio::test]
 async fn unknown_failure_retries_operational_sql_after_financial_arbitration_without_replay() {
-    unknown_failure_retries_operational_projection(false).await;
+    unknown_failure_retries_operational_projection().await;
 }
 
-#[tokio::test]
-async fn recovered_unknown_receipt_retries_operational_projection_without_replay() {
-    unknown_failure_retries_operational_projection(true).await;
-}
-
-async fn unknown_failure_retries_operational_projection(restart: bool) {
+async fn unknown_failure_retries_operational_projection() {
     let fixture = codex_route_fixture("pending-unknown-operational-retry").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query(
@@ -1162,7 +1176,17 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert!(!delivered.contains("response.completed"));
     assert!(!delivered.contains("PRIVATE_CANARY"));
-    let (_receipt_id, original) = wait_for_receipt(&fixture).await;
+    let original = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (_, receipt) = wait_for_receipt(&fixture).await;
+            if receipt["conversation"].is_object() {
+                break receipt;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("asynchronous preparation must retain the original conversation");
     let receipt_id = Uuid::parse_str(original["receipt_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while !fixture
@@ -1215,7 +1239,6 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     .await
     .unwrap();
     assert_eq!(count, 0);
-    let _ = restart;
     sqlx::query("DROP TRIGGER fail_unknown_operational")
         .execute(&pool)
         .await
@@ -1254,9 +1277,7 @@ async fn unknown_failure_retries_operational_projection(restart: bool) {
     .await
     .unwrap();
     assert_eq!(enqueued, 0);
-    if !restart {
-        assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
-    }
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
     sqlx::query("DROP TRIGGER fail_unknown_projection")
         .execute(&pool)
         .await

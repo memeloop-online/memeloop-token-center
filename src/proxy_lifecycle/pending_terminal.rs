@@ -170,6 +170,8 @@ pub(crate) struct Snapshot {
     claim: Option<crate::db::PendingProxySettlementClaim>,
     #[serde(default)]
     operational_terminal: Option<crate::db::PendingProxyOperationalTerminal>,
+    #[serde(default)]
+    financial_ack: Option<crate::db::PendingProxySettlementAck>,
 }
 
 impl Snapshot {
@@ -222,6 +224,7 @@ impl Snapshot {
             queued_billable,
             claim: None,
             operational_terminal: Some(operational_terminal),
+            financial_ack: None,
         }
     }
 
@@ -910,6 +913,15 @@ impl Journal {
                 pending.entry(snapshot.receipt_id)
             {
                 tracing::info!(request_id = %snapshot.request_id, %receipt_id, financial_state = "pending_durable", "pending terminal receipt recovered");
+                let applied = snapshot.financial_ack.as_ref().is_some_and(|ack| {
+                    snapshot.claim.as_ref().is_some_and(|claim| {
+                        ack.request_id == snapshot.request_id
+                            && ack.receipt_id == snapshot.receipt_id
+                            && ack.reservation_id == claim.reservation_id
+                            && ack.fence == claim.fence
+                            && !ack.receipt_digest.is_empty()
+                    })
+                });
                 entry.insert(Pending {
                     snapshot: Arc::new(snapshot),
                     activity: None,
@@ -917,7 +929,7 @@ impl Journal {
                     running: false,
                     retry_after: tokio::time::Instant::now(),
                     durable: true,
-                    applied: false,
+                    applied,
                     reconcile: false,
                     operational_running: false,
                     operational_acknowledged: false,
@@ -1099,6 +1111,7 @@ impl Journal {
     ) {
         let request_id = snapshot.request_id;
         let receipt_id = snapshot.receipt_id;
+        let mut financial_ack = snapshot.financial_ack.clone();
         if !durable {
             // The receipt already lives in the process. A local file of the
             // conversation was the request-spool emptyDir, and kubelet evicts
@@ -1133,6 +1146,7 @@ impl Journal {
                                         && ack.fence == claim.fence
                                         && !ack.receipt_digest.is_empty()
                                     {
+                                        financial_ack = Some(ack.clone());
                                         Ok(Some(FinishProxyRequestResult::Finished {
                                             cost_micros: ack.cost_micros,
                                             usage_invalid: false,
@@ -1221,6 +1235,14 @@ impl Journal {
             let _retirement = self.retirement_gate.acquire().await.unwrap();
         }
         let removed = applied && operational_acknowledged;
+        if durable && !removed && (reconcile || applied) {
+            let mut compact = (*snapshot).clone();
+            compact.financial_ack = financial_ack.clone();
+            write_compact_receipt(&self.directory, &compact).await;
+        }
+        if removed {
+            let _ = tokio::fs::remove_file(self.directory.join(format!("{receipt_id}.json"))).await;
+        }
         let mut pending = self
             .pending
             .lock()
@@ -1229,6 +1251,9 @@ impl Journal {
             pending.remove(&receipt_id);
             tracing::info!(%request_id, %receipt_id, financial_state = "settled", "terminal settlement acknowledged and receipt retired");
         } else if let Some(entry) = pending.get_mut(&receipt_id) {
+            if financial_ack.is_some() {
+                Arc::make_mut(&mut entry.snapshot).financial_ack = financial_ack;
+            }
             entry.running = false;
             entry.retry_after = tokio::time::Instant::now() + RETRY_INTERVAL;
             entry.durable = durable;
@@ -1236,13 +1261,6 @@ impl Journal {
             entry.reconcile = reconcile;
             if durable {
                 entry.retained = None;
-            }
-            if durable && reconcile {
-                let compact = entry.snapshot.clone();
-                let directory = self.directory.clone();
-                tokio::spawn(async move {
-                    write_compact_receipt(&directory, &compact).await;
-                });
             }
             if reconcile || applied {
                 entry.activity = None;
