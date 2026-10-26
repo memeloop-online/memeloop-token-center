@@ -580,9 +580,9 @@ async fn openai_catalog_sync_is_authenticated_bounded_and_failure_preserves_snap
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{health}");
-        assert_eq!(health["status"], "unhealthy");
-        assert_eq!(health["error_code"], expected);
-        assert_eq!(health["upstream_status"], upstream_status);
+        assert_eq!(health["status"], "skipped");
+        assert_eq!(health["error_code"], "probe_billing_unavailable");
+        assert!(health.get("upstream_status").is_none());
         for result in [failed, health] {
             let serialized = result.to_string();
             assert!(!serialized.contains("private-provider-message"));

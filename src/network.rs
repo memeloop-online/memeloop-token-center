@@ -405,28 +405,6 @@ pub(crate) async fn validate_codex_transport(
     Ok(())
 }
 
-/// Build a one-operation client for a fixed Codex control-plane URL.
-///
-/// A configured account proxy owns target DNS. Accounts without one connect
-/// directly to the fixed public target with an explicit no-proxy client.
-pub(crate) async fn client_for_codex_url(
-    shared_test_client: &reqwest::Client,
-    value: &str,
-    config: &Value,
-    proxy: Option<(&str, OutboundScope)>,
-    allow_test_loopback: bool,
-) -> Result<reqwest::Client, AppError> {
-    codex_client_for_url(
-        shared_test_client,
-        value,
-        config,
-        proxy,
-        allow_test_loopback,
-        false,
-    )
-    .await
-}
-
 /// Mutation-only Codex control transport with no implicit HTTP retry.
 pub(crate) async fn client_for_codex_url_without_retries(
     shared_test_client: &reqwest::Client,

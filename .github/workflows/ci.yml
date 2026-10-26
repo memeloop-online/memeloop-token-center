@@ -494,7 +494,14 @@ jobs:
           tar -xzf "$RUNNER_TEMP/cargo-nextest.tar.gz" -C "$RUNNER_TEMP/nextest"
           echo "$RUNNER_TEMP/nextest" >> "$GITHUB_PATH"
       - name: Run ${{ matrix.name }} of the locked test suite
-        run: cargo nextest run --locked --all-targets --all-features --test-threads=4 ${{ matrix.args }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.name }}" = "cucumber" ]; then
+            # cucumber's harness rejects nextest's --list probe.
+            cargo test --locked --all-features --test cucumber
+          else
+            cargo nextest run --locked --all-targets --all-features --test-threads=4 ${{ matrix.args }}
+          fi
 
   migration-smoke:
     needs: changes

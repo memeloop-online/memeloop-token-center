@@ -161,22 +161,15 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
-    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: "\/var\/lib\/memeloop-token-center\/request-spool"/, 3);
+    assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_PATH'));
+    assert.ok(!output.default!.includes('responses-request-spool'));
     const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
     for (const deployment of deployments) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
       assert.equal(deployment.metadata.annotations['argocd.argoproj.io/sync-wave'], role === 'gateway' || role === 'control' ? '1' : '0');
       const pod = deployment.spec.template.spec;
-      const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'responses-request-spool');
-      const spoolVolume = pod.volumes?.find(item => item.name === 'responses-request-spool');
-      if (role === 'gateway' || role === 'all') {
-        assert.equal(spoolMount?.readOnly, false, `${role}: request spool mount must be writable`);
-        assert.equal(spoolVolume?.emptyDir?.sizeLimit, '160Mi', `${role}: request spool must use bounded emptyDir`);
-        assert.equal(spoolVolume?.emptyDir?.medium, undefined, `${role}: request spool must use node disk`);
-      } else {
-        assert.equal(spoolMount, undefined, `${role}: does not accept Responses bodies`);
-        assert.equal(spoolVolume, undefined, `${role}: does not accept Responses bodies`);
-      }
+      assert.equal(pod.containers[0]!.volumeMounts?.find(item => item.name === 'responses-request-spool'), undefined, `${role}: request bodies do not get a temp directory`);
+      assert.equal(pod.volumes?.find(item => item.name === 'responses-request-spool'), undefined, `${role}: request bodies do not get a temp directory`);
     }
     for (const deployment of output.default!.split(/^---$/m).filter((document) => document.includes('kind: Deployment'))) {
       for (const [name, value] of [['CONNECT_TIMEOUT', '5000'], ['REQUEST_TIMEOUT', '30000'], ['READINESS_DEADLINE', '5000']]) {
@@ -278,7 +271,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       ['config.archiveSpoolCompression.enabled=not-a-boolean'], ['config.archiveSpoolCompression.unknown=true'],
       ['config.archiveObjectCompression.enabled=not-a-boolean'], ['config.archiveObjectCompression.unknown=true'],
       ['config.proxyMemoryBudgetBytes=268435455'], ['config.proxyMemoryBudgetBytes=2147483649'],
-      ['config.responsesRequestSpoolBytes=134217728'], ['requestSpool.mountPath=relative/path'], ['requestSpool.mountPath=/'],
+      ['config.responsesRequestSpoolBytes=134217728'], ['requestSpool.mountPath=/var/lib/memeloop-token-center/request-spool'],
     ];
     for (const [index, values] of invalid.entries()) {
       const args = ['template', `invalid-${index}`, chart, ...values!.flatMap((value) => ['--set-string', value])];
@@ -304,17 +297,6 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.notEqual(result.status, 0, `memory cross-field gate accepted ${values.join(',')}`);
       assert.match(result.stderr, /memory must cover config.proxyMemoryBudgetBytes plus 256Mi/);
     }
-    for (const values of [
-      ['requestSpool.mountPath=/var/lib/../request-spool'],
-      ['roles.gateway.resources.limits.ephemeral-storage=223Mi'],
-      ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.ephemeral-storage=223Mi'],
-    ]) {
-      const result = spawnSync(helm, ['template', 'invalid-spool-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
-      assert.notEqual(result.status, 0, `request spool cross-field gate accepted ${values.join(',')}`);
-      assert.match(result.stderr, /requestSpool.mountPath must be|ephemeral-storage must cover/);
-    }
-    const smallerSpool = spawnSync(helm, ['template', 'smaller-spool', chart, '--set', 'requestSpool.sizeLimit=64Mi'], { cwd: repository, encoding: 'utf8', shell: false });
-    assert.equal(smallerSpool.status, 0, smallerSpool.stderr);
     assert.notEqual(oldSchema.status, 0, 'release values schema accepted migration.schemaVersion=58');
     for (const budget of ['268435456', '805306368']) {
       const result = spawnSync(helm, ['template', 'body-memory-budget', chart,
