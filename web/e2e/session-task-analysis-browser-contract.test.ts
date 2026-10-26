@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
+import type {} from './fixtures/session-tasks-state.js';
 
 test('session tasks: CAS rename protects concurrent names, relations manage, rollup scopes switch', { timeout: 60_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
@@ -53,17 +54,19 @@ test('session tasks: CAS rename protects concurrent names, relations manage, rol
     await page.getByLabel('Copy credential ID').fill('00000000-0000-4000-8000-000000000003');
     await page.getByRole('button', { name: 'Add related session', exact: true }).click();
     await page.waitForFunction(() => window.relationshipWrites.some((write) => write.method === 'PUT' && write.kind === 'related'));
-    await page.getByText('Related Beta', { exact: true }).waitFor();
+    await page.getByText(/Related Beta · 00000003\/00000004/).waitFor();
     await page.getByRole('button', { name: 'Remove relation', exact: true }).click();
     await page.waitForFunction(() => window.relationshipWrites.some((write) => write.method === 'DELETE' && write.kind === 'related'));
     await page.getByText('No related sessions yet.', { exact: true }).waitFor();
 
-    // Name search selects a stable identity and the rollup renders real metrics.
     await page.getByRole('combobox', { name: 'Search by name or session ID, then select a session' }).click();
     await page.keyboard.type('Alpha');
     await page.getByRole('option', { name: /Parent task Alpha/ }).click();
     await page.waitForFunction(() => window.analyzeCalls.length === 1);
     assert.equal((await page.evaluate(() => window.analyzeCalls[0])).scope, 'session');
+    assert.deepEqual((await page.evaluate(() => window.analyzeCalls[0])).identities, [
+      { key_id: '00000000-0000-4000-8000-000000000001', session_id: '00000000-0000-4000-8000-000000000002' },
+    ]);
     await page.getByText('First activity', { exact: true }).waitFor();
     await page.getByText('Active days', { exact: true }).waitFor();
     await page.getByText('$12.34', { exact: true }).first().waitFor();
@@ -82,6 +85,62 @@ test('session tasks: CAS rename protects concurrent names, relations manage, rol
     await page.getByRole('button', { name: 'Related sessions', exact: true }).click();
     await page.getByText('No related sessions yet. Add relations from the session details first.', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.analyzeCalls.length), 2, 'an empty relation set runs no rollup');
+
+    await page.getByRole('button', { name: 'View separately', exact: true }).click();
+    await page.waitForFunction(() => window.analyzeCalls.length === 5);
+    await page.locator('.usage-task-separate').nth(1).getByText('First activity', { exact: true }).waitFor();
+    assert.equal(await page.locator('.usage-task-separate').count(), 2, 'expanded subtree members each get a session rollup');
+    const separateCalls = await page.evaluate(() => window.analyzeCalls.slice(3, 5));
+    assert.deepEqual(separateCalls.map(call => call.scope), ['session', 'session']);
+    assert.equal(new Set(separateCalls.map(call => call.identities[0].session_id)).size, 2);
+
+    await page.evaluate(() => { window.relatedActive = true; });
+    await page.getByRole('button', { name: 'Related sessions', exact: true }).click();
+    await page.waitForFunction(() => window.analyzeCalls.length === 6);
+    const union = await page.evaluate(() => window.analyzeCalls[5]);
+    assert.equal(union.scope, 'related');
+    assert.equal(union.identities.length, 2);
+    assert.equal(union.include_subtrees, false);
+    await page.getByRole('checkbox', { name: 'Include sub-sessions', exact: true }).check();
+    await page.waitForFunction(() => window.analyzeCalls.length === 7);
+    assert.equal((await page.evaluate(() => window.analyzeCalls[6])).include_subtrees, true);
+    await page.getByRole('checkbox', { name: /Related Beta/ }).uncheck();
+    assert.equal(await page.locator('.usage-task-metrics').count(), 0, 'deselection removes the previous union total');
+
+    await page.evaluate(() => { window.holdAnalysis = true; });
+    await page.getByRole('button', { name: 'Include sub-sessions', exact: true }).click();
+    await page.waitForFunction(() => window.analyzeCalls.length === 8);
+    await page.getByRole('button', { name: 'This session', exact: true }).click();
+    await page.waitForFunction(() => window.analyzeCalls.length === 9);
+    await page.locator('.usage-task-metrics b').first().getByText('3', { exact: true }).waitFor();
+    await page.evaluate(async () => {
+      window.releaseAnalysis();
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    assert.equal(await page.locator('.usage-task-metrics b').first().innerText(), '3', 'late subtree result cannot replace this-session totals');
+
+    await page.evaluate(() => { window.holdAnalysis = true; });
+    await page.getByRole('button', { name: 'Include sub-sessions', exact: true }).click();
+    await page.waitForFunction(() => window.analyzeCalls.length === 10);
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.getByText('Loading cancelled. Retry or select another scope.', { exact: false }).waitFor();
+    await page.evaluate(async () => {
+      window.releaseAnalysis();
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    assert.equal(await page.locator('.usage-task-metrics').count(), 0, 'cancelled result stays hidden even if transport delivers it');
+
+    const zonedPage = await browser.newPage({ timezoneId: 'America/New_York' });
+    await zonedPage.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await zonedPage.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-tasks.html`);
+    await zonedPage.getByRole('combobox').fill('Alpha');
+    await zonedPage.getByRole('option', { name: /Parent task Alpha/ }).click();
+    await zonedPage.getByText('11/1/2026', { exact: true }).waitFor();
+    await zonedPage.getByText('11/2/2026', { exact: true }).waitFor();
+    const zonedCall = await zonedPage.evaluate(() => window.analyzeCalls[0]);
+    assert.equal(zonedCall.timezone, 'America/New_York');
+    assert.equal('timezone_offset_minutes' in zonedCall, false, 'IANA calls never send a competing fixed offset');
+    await zonedPage.screenshot({ path: `${evidence}/new-york-dst.png`, fullPage: true });
   } finally {
     await browser.close();
     await server.close();

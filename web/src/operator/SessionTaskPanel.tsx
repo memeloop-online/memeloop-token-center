@@ -79,6 +79,7 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<LogicalSessionSummary[]>([]);
   const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState(false);
   const [selected, setSelected] = useState<LogicalSessionSummary>();
   const [scope, setScope] = useState<SessionTaskScope | 'separate'>('session');
   const [includeSubtrees, setIncludeSubtrees] = useState(false);
@@ -88,10 +89,16 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
   const [relatedOptions, setRelatedOptions] = useState<SessionIdentity[]>();
   const [relatedChecked, setRelatedChecked] = useState<Set<string>>(new Set());
   const analysisSequence = useRef(0);
+  const analysisRequest = useRef<AbortController | undefined>(undefined);
+  const relationRequest = useRef<AbortController | undefined>(undefined);
+  const [cancelled, setCancelled] = useState(false);
+  const [relationError, setRelationError] = useState(false);
   const [labels, setLabels] = useState<Map<string, string>>(new Map());
 
   const search = query.trim();
   useEffect(() => {
+    setResults([]);
+    setSearchError(false);
     if (!token.trim() || !search) { setResults([]); setSearching(false); return; }
     const controller = new AbortController();
     const timer = setTimeout(() => {
@@ -109,7 +116,7 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
             return next;
           });
         })
-        .catch(() => { if (!controller.signal.aborted) setResults([]); })
+        .catch(() => { if (!controller.signal.aborted) setSearchError(true); })
         .finally(() => { if (!controller.signal.aborted) setSearching(false); });
     }, 300);
     return () => { clearTimeout(timer); controller.abort(); };
@@ -121,8 +128,9 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
 
   // Related scope needs the persisted relation set before it can aggregate.
   useEffect(() => {
-    if (scope !== 'related' || !selectedIdentity) return;
+    if (scope !== 'related' || !selectedIdentity || cancelled) return;
     const controller = new AbortController();
+    relationRequest.current = controller;
     void sessionRelationships(tenant, token, selectedIdentity, controller.signal)
       .then((response) => {
         if (controller.signal.aborted) return;
@@ -148,14 +156,15 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
           }).catch(() => { /* Labels degrade to stable IDs; the rollup still works. */ });
         }
       })
-      .catch(() => { if (!controller.signal.aborted) setRelatedOptions([]); });
+      .catch(() => { if (!controller.signal.aborted) setRelationError(true); });
     return () => controller.abort();
-  }, [scope, selectedIdentity, tenant, token, t, locale]);
+  }, [scope, selectedIdentity, tenant, token, t, locale, cancelled]);
 
   useEffect(() => {
-    if (!selectedIdentity) { setAnalysis(undefined); setSeparate(new Map()); return; }
+    if (!selectedIdentity || cancelled) { setAnalysis(undefined); setSeparate(new Map()); return; }
     const sequence = ++analysisSequence.current;
     const controller = new AbortController();
+    analysisRequest.current = controller;
     const run = async () => {
       if (scope === 'separate') {
         setAnalysis({ key: 'separate', phase: 'loading' });
@@ -199,7 +208,7 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
         return;
       }
       if (scope === 'related') {
-        if (relatedOptions === undefined) return;
+        if (relatedOptions === undefined) { setAnalysis(undefined); return; }
         const identities = [selectedIdentity, ...relatedOptions.filter((option) => relatedChecked.has(identityKey(option)))];
         if (identities.length === 1) { setAnalysis(undefined); return; }
         const key = `related:${identities.map(identityKey).sort().join('|')}`;
@@ -227,9 +236,21 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
     };
     void run();
     return () => controller.abort();
-  }, [selectedIdentity, scope, relatedOptions, relatedChecked, includeSubtrees, tenant, token, t]);
+  }, [selectedIdentity, scope, relatedOptions, relatedChecked, includeSubtrees, tenant, token, t, cancelled, locale]);
+
+  const clearAnalysis = () => {
+    analysisRequest.current?.abort();
+    relationRequest.current?.abort();
+    analysisSequence.current += 1;
+    setAnalysis(undefined);
+    setSeparate(new Map());
+    setSeparateProgress(undefined);
+    setCancelled(false);
+    setRelationError(false);
+  };
 
   const selectSession = (session: LogicalSessionSummary) => {
+    clearAnalysis();
     setSelected(session);
     setScope('session');
     setQuery('');
@@ -238,9 +259,15 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
   };
 
   const analysisLoading = analysis?.phase === 'loading';
+  const relationsLoading = scope === 'related' && relatedOptions === undefined && !relationError && !cancelled;
   const scopeButton = (value: SessionTaskScope | 'separate', label: string) => (
-    <ToggleButton appearance="secondary" checked={scope === value} disabled={!selected || analysisLoading}
-      onClick={() => setScope(value)}>{label}</ToggleButton>
+    <ToggleButton appearance="secondary" checked={scope === value} disabled={!selected}
+      onClick={() => {
+        if (value === scope && !cancelled) return;
+        clearAnalysis();
+        setRelatedOptions(undefined);
+        setScope(value);
+      }}>{label}</ToggleButton>
   );
   return <article className="panel usage-task-panel" aria-label={t('tasks.title')}>
     <div className="panel-title"><h2>{t('tasks.title')}</h2></div>
@@ -254,12 +281,13 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
         }}>
         {results.map((session) => {
           const value = `${session.key_id}:${session.session_id}`;
-          const label = `${sessionLabel(session, t, locale)} · ${credentialDisplayName(session.key_alias, t)} · ${session.session_id.slice(-8)}`;
+          const label = `${sessionLabel(session, t, locale)} · ${credentialDisplayName(session.key_alias, t)} · ${session.key_id.slice(-8)}/${session.session_id.slice(-8)}`;
           return <Option key={value} value={value} text={label}>{label}</Option>;
         })}
       </Combobox>
     </label>
     {searching && <LoadingProgress active label={t('common.loading')} level="section" />}
+    {searchError && <p role="alert">{t('sessions.loadFailed')}</p>}
     {selected && <>
       <p><b>{sessionLabel(selected, t, locale)}</b> <span className="muted">{credentialDisplayName(selected.key_alias, t)}</span></p>
       <div className="segmented" role="group" aria-label={t('tasks.title')}>
@@ -268,15 +296,15 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
         {scopeButton('separate', t('tasks.scope.separate'))}
         {scopeButton('related', t('sessions.rel.related'))}
       </div>
-      {scope === 'related' && <Checkbox checked={includeSubtrees} label={t('tasks.scope.subtree')}
+      {scope === 'related' && !cancelled && <Checkbox checked={includeSubtrees} label={t('tasks.scope.subtree')}
         onChange={(_, data) => setIncludeSubtrees(data.checked === true)} />}
-      {scope === 'related' && relatedOptions !== undefined && (
+      {scope === 'related' && !cancelled && relatedOptions !== undefined && (
         relatedOptions.length === 0
           ? <p className="muted">{t('tasks.relatedEmpty')}</p>
           : <div>{relatedOptions.map((option) => {
               const key = identityKey(option);
-              return <Checkbox key={key} checked={relatedChecked.has(key)} disabled={analysisLoading}
-                label={labels.get(key) ?? option.session_id}
+              return <Checkbox key={key} checked={relatedChecked.has(key)}
+                label={`${labels.get(key) ?? t('sessions.logicalSession')} · ${option.key_id.slice(-8)}/${option.session_id.slice(-8)}`}
                 onChange={(_, data) => {
                   const next = new Set(relatedChecked);
                   if (data.checked === true) next.add(key); else next.delete(key);
@@ -284,12 +312,17 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
                 }} />;
             })}</div>
       )}
-      {analysisLoading && scope !== 'separate' && <LoadingState label={t('common.loading')} variant="detail" />}
+      {(analysisLoading || relationsLoading) && <>
+        <LoadingState label={t('common.loading')} variant="detail" />
+        <Button appearance="secondary" onClick={() => { clearAnalysis(); setCancelled(true); }}>{t('common.cancel')}</Button>
+      </>}
+      {(relationError || cancelled) && <p role="status">{t(cancelled ? 'tasks.cancelled' : 'sessions.rel.failed')} <Button appearance="secondary"
+        onClick={() => { clearAnalysis(); setRelatedOptions(undefined); setSelected((current) => current && { ...current }); }}>{t('sessions.retryLoad')}</Button></p>}
       {analysis?.phase === 'failed' && <div className="notice error" role="alert"><span>{analysis.error}</span>
         <Button appearance="secondary" onClick={() => { setSelected((current) => current && { ...current }); }}>{t('sessions.retryLoad')}</Button></div>}
       {analysis?.phase === 'ready' && scope !== 'separate' && <AnalysisSummary analysis={analysis.value} />}
       {scope === 'separate' && <>
-        {separateProgress && separateProgress.done < separateProgress.total && <p className="muted" role="status">{t('sessions.name.batchProgress', { done: separateProgress.done, total: separateProgress.total })}</p>}
+        {separateProgress && separateProgress.done < separateProgress.total && <p className="muted" role="status">{t('tasks.separateProgress', { done: separateProgress.done, total: separateProgress.total })}</p>}
         {separate.size > 0 && <h3>{t('tasks.perSession')}</h3>}
         {[...separate.values()].map((entry) => <section key={entry.key} className="usage-task-separate">
           <h4>{labels.get(entry.key) ?? entry.key.replace('\0', ' · ')}</h4>

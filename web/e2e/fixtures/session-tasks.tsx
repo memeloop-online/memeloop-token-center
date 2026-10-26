@@ -6,34 +6,27 @@ import { SessionTitleAction } from '../../src/operator/SessionTitleAction';
 import { SessionRelationships } from '../../src/operator/SessionRelationships';
 import { SessionTaskPanel } from '../../src/operator/SessionTaskPanel';
 import type { LogicalSessionSummary } from '../../src/types';
+import type { TaskFixtureCall } from './session-tasks-state.js';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/sessionViews.css';
 import '../../src/operator/operator.css';
 
-declare global {
-  interface Window {
-    analyzeCalls: Array<{ scope: string; identities: number; timezone: string; include_subtrees: boolean }>;
-    namePuts: Array<{ title: string; source: string; expected_revision: number }>;
-    relationshipWrites: Array<{ method: string; kind: string }>;
-    forceNameConflict: boolean;
-    lastTitle: string;
-    relatedActive: boolean;
-  }
-}
 window.analyzeCalls = [];
 window.namePuts = [];
 window.relationshipWrites = [];
 window.forceNameConflict = false;
 window.lastTitle = '';
 window.relatedActive = false;
+window.holdAnalysis = false;
+window.releaseAnalysis = () => {};
 
 const KEY = '00000000-0000-4000-8000-000000000001';
 const SESSION = '00000000-0000-4000-8000-000000000002';
 const PEER_KEY = '00000000-0000-4000-8000-000000000003';
 const PEER_SESSION = '00000000-0000-4000-8000-000000000004';
 const DAY = 86_400_000;
-const FIRST = 1_792_800_000_000; // 2026-10-24T00:00:00Z
+const FIRST = Date.parse('2026-10-24T00:00:00Z');
 
 const alpha: LogicalSessionSummary = {
   session_id: SESSION, session_name: 'Parent task Alpha', task_kind: null,
@@ -51,19 +44,27 @@ const usage = (requests: number, input: number, output: number, micros: number) 
   costs: micros ? { USD: micros } : {},
 });
 
-function analysisFor(scope: string, identities: number) {
+function analysisFor(call: TaskFixtureCall) {
+  const identities = call.scope === 'subtree' || (call.scope === 'related' && call.include_subtrees)
+    ? [{ key_id: KEY, session_id: SESSION }, { key_id: PEER_KEY, session_id: PEER_SESSION }]
+    : call.identities;
+  const starts = call.timezone === 'America/New_York'
+    ? [Date.parse('2026-11-01T04:00:00Z'), Date.parse('2026-11-02T05:00:00Z')]
+    : [FIRST, FIRST + DAY];
   return {
-    scope,
-    identities: Array.from({ length: identities }, () => ({ key_id: KEY, session_id: SESSION })),
-    timezone: 'UTC',
-    first_request_at: FIRST,
-    last_request_at: FIRST + DAY + 3_600_000,
+    scope: call.scope,
+    identities,
+    timezone: call.timezone,
+    timezone_offset_minutes: null,
+    include_subtrees: call.scope === 'subtree' || call.include_subtrees,
+    first_request_at: starts[0],
+    last_request_at: starts[1] + 3_600_000,
     calendar_span_days: 2,
     active_days: 2,
-    totals: usage(3, 100, 50, 12_340_000),
+    totals: usage(call.scope === 'subtree' ? 30 : call.scope === 'related' ? 6 : 3, 100, 50, 12_340_000),
     daily: [
-      { day_bucket: FIRST / DAY, day_start_at: FIRST, usage: usage(1, 40, 20, 4_000_000) },
-      { day_bucket: FIRST / DAY + 1, day_start_at: FIRST + DAY, usage: usage(2, 60, 30, 8_340_000) },
+      { day_bucket: 20758, day_start_at: starts[0], usage: usage(1, 40, 20, 4_000_000) },
+      { day_bucket: 20759, day_start_at: starts[1], usage: usage(2, 60, 30, 8_340_000) },
     ],
     coverage: 'completed_request_facts_and_archive_only',
   };
@@ -79,9 +80,13 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.includes('/sessions/parents')) return json({ accepted: 0, linked: 0 });
   if (url.includes('/sessions/resolve')) return json({ sessions: [] });
   if (url.includes('/sessions/analyze')) {
-    const body = JSON.parse(String(init?.body ?? '{}'));
-    window.analyzeCalls.push({ scope: body.scope, identities: body.identities.length, timezone: body.timezone, include_subtrees: body.include_subtrees });
-    return json(analysisFor(body.scope, body.identities.length));
+    const body: TaskFixtureCall = JSON.parse(String(init?.body ?? '{}'));
+    window.analyzeCalls.push(body);
+    if (window.holdAnalysis) {
+      window.holdAnalysis = false;
+      await new Promise<void>((resolve) => { window.releaseAnalysis = resolve; });
+    }
+    return json(analysisFor(body));
   }
   if (url.includes(`/sessions/${SESSION}/name`)) {
     const body = JSON.parse(String(init?.body ?? '{}'));
@@ -113,7 +118,7 @@ window.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.includes('/sessions/summaries')) {
     return json({
       generated_at: FIRST,
-      sessions: [{ ...alpha, session_id: PEER_SESSION, key_id: PEER_KEY, session_name: 'Related Beta' }],
+      sessions: [alpha, { ...alpha, session_id: PEER_SESSION, key_id: PEER_KEY, session_name: 'Related Beta' }],
     });
   }
   if (url.includes('/internal/v1/sessions?')) {

@@ -84,7 +84,7 @@ export function SessionRelationships({ token, tenant, identity, onOpenSession }:
   const children = useMemo(() => relationships.filter((row) => row.kind === 'parent'
     && row.target.key_id === identity.key_id && row.target.session_id === identity.session_id), [relationships, identity]);
   const related = useMemo(() => relationships.filter((row) => row.kind === 'related'), [relationships, identity]);
-  const labelFor = (peer: SessionIdentity) => names.get(peer.key_id + '' + peer.session_id) ?? peer.session_id;
+  const labelFor = (peer: SessionIdentity) => `${names.get(peer.key_id + '' + peer.session_id) ?? t('sessions.logicalSession')} · ${peer.key_id.slice(-8)}/${peer.session_id.slice(-8)}`;
 
   const mutate = async (target: SessionIdentity, kind: 'parent' | 'related', remove: boolean) => {
     if (pending) return;

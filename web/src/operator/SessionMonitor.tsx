@@ -672,10 +672,15 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     }
   }
 
-  const namingBatchInFlight = useRef(false);
+  const namingBatchRequest = useRef<AbortController | undefined>(undefined);
+  useEffect(() => () => {
+    namingBatchRequest.current?.abort();
+    namingBatchRequest.current = undefined;
+  }, [scopeKey]);
   async function nameUnnamedSessions() {
-    if (namingBatchInFlight.current) return;
-    namingBatchInFlight.current = true;
+    if (namingBatchRequest.current) return;
+    const controller = new AbortController();
+    namingBatchRequest.current = controller;
     const batchScope = scopeKey;
     const generation = scopeGeneration.current;
     const batchFilters = emptySessionFilters;
@@ -684,18 +689,16 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     let failed = false;
     let cursor: LogicalSessionCursor | undefined;
     try {
-      // Walk every page of the current list scope, not only the loaded page.
-      // Enqueueing is idempotent server-side, so a retry after a page failure
-      // simply resubmits still-unnamed sessions.
       do {
-        const page = await api<LogicalSessionListResponse>(sessionsPath(tenant, batchFilters, cursor), token.trim(), { signal: AbortSignal.timeout(30_000) });
-        if (generation !== scopeGeneration.current) return;
+        const page = await api<LogicalSessionListResponse>(sessionsPath(tenant, batchFilters, cursor), token.trim(), { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]) });
+        if (controller.signal.aborted || generation !== scopeGeneration.current) return;
         const candidates = page.sessions
           .filter((session) => !session.unlinked && !session.session_name?.trim() && sessionIdentityUuid.test(session.session_id))
           .map((session): SessionIdentity => ({ key_id: session.key_id, session_id: session.session_id }));
         for (let start = 0; start < candidates.length; start += titleEnqueueChunk) {
-          if (generation !== scopeGeneration.current) return;
-          const receipt = await enqueueSessionTitles(tenant, token, candidates.slice(start, start + titleEnqueueChunk), new AbortController().signal);
+          if (controller.signal.aborted || generation !== scopeGeneration.current) return;
+          const receipt = await enqueueSessionTitles(tenant, token, candidates.slice(start, start + titleEnqueueChunk), controller.signal);
+          if (controller.signal.aborted || generation !== scopeGeneration.current) return;
           submitted += receipt.results.filter((result) => result.status !== 'named').length;
           setNamingBatch({ scope: batchScope, submitted, failed: false, done: false });
         }
@@ -705,9 +708,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     } catch {
       failed = true;
     } finally {
-      namingBatchInFlight.current = false;
+      if (namingBatchRequest.current === controller) namingBatchRequest.current = undefined;
     }
-    if (generation !== scopeGeneration.current) return;
+    if (controller.signal.aborted || generation !== scopeGeneration.current) return;
     setNamingBatch({ scope: batchScope, submitted, failed, done: !failed });
   }
 

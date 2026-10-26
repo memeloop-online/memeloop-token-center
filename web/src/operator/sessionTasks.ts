@@ -82,10 +82,6 @@ export function updateSessionName(
   );
 }
 
-/**
- * Enqueue assistant naming for unnamed sessions. The receipt body is
- * backend-defined; callers rely on HTTP success and per-session title reads.
- */
 export function enqueueSessionTitles(
   tenant: string, token: string, identities: SessionIdentity[], signal: AbortSignal,
 ) {
@@ -131,7 +127,7 @@ export function useSessionParentLabel(
         });
         if (controller.signal.aborted) return;
         const summary = summaries.sessions[0];
-        setParent({ scope, label: summary ? labelRef.current(summary) : row.target.session_id, identity: row.target });
+        setParent({ scope, label: `${summary ? labelRef.current(summary) : row.target.session_id} · ${row.target.key_id.slice(-8)}/${row.target.session_id.slice(-8)}`, identity: row.target });
       } catch {
         if (!controller.signal.aborted) setParent({ scope, label: '' });
       }

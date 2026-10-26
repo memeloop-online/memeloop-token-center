@@ -855,6 +855,8 @@ export interface SessionNameUpdate {
   source: 'manual' | 'codex';
   explicit_session_id?: string;
   expected_revision: number;
+  expected_unnamed?: boolean;
+  idempotency_key?: string;
 }
 
 export type SessionTaskScope = 'session' | 'subtree' | 'related';
@@ -879,9 +881,11 @@ export interface SessionTaskDailyBucket {
 
 export interface SessionTaskAnalysis {
   scope: SessionTaskScope;
+  include_subtrees: boolean;
   identities: SessionIdentity[];
   /** Day-bucket boundary zone reported by the backend, e.g. UTC. */
   timezone: string;
+  timezone_offset_minutes: number | null;
   first_request_at: number | null;
   last_request_at: number | null;
   calendar_span_days: number;
