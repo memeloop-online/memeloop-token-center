@@ -310,6 +310,7 @@ async fn enqueue_conversation_task(
         ConversationProjectionEnqueueInput {
             request_id,
             key: conversation.key,
+            request_json: conversation.request_json,
             hints: conversation.hints,
             client_name: conversation.client_name,
             upstream_response_id: conversation.upstream_response_id,

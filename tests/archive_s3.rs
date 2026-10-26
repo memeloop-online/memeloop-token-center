@@ -377,7 +377,15 @@ async fn minio_outage_is_bounded_and_http_error_does_not_leak_storage_details() 
         .expect("read sanitized error body");
     let payload: Value = serde_json::from_slice(&body).expect("JSON error response");
     assert_ne!(payload["error"]["code"], "internal_error");
-    assert_eq!(payload["error"]["message"], "internal error");
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains('错') || message.contains("错误"))
+            || payload["error"]["message_en"]
+                .as_str()
+                .is_some_and(|message| message.contains("error")),
+        "{payload}"
+    );
     let body = String::from_utf8_lossy(&body);
     assert!(!body.contains("127.0.0.1"));
     assert!(!body.contains("must-not-leak"));

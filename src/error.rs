@@ -399,16 +399,26 @@ impl IntoResponse for AppError {
             Self::Internal { code, facts } => (StatusCode::INTERNAL_SERVER_ERROR, *code, *facts),
         };
         let (mut message, mut message_en) = render_bilingual(code, facts);
-        if let Self::BadRequest(detail) = &self
-            && let Some(field) = request_field_fact(detail)
-        {
-            message.push_str("字段 ");
-            message.push_str(field);
-            message.push('。');
-            message_en.push(' ');
-            message_en.push_str("field ");
-            message_en.push_str(field);
-            message_en.push('.');
+        match &self {
+            Self::BadRequest(detail) => {
+                if let Some(field) = request_field_fact(detail) {
+                    message.push_str("字段 ");
+                    message.push_str(field);
+                    message.push('。');
+                }
+                if let Some(english) = specific_public_sentence("invalid request", detail) {
+                    message_en = english;
+                }
+            }
+            Self::Conflict(detail) => {
+                if let Some(english) = specific_public_sentence("conflict", detail) {
+                    message_en = english;
+                }
+            }
+            Self::CompactionProducerUnavailable => {
+                message_en = "invalid request: no available authorized upstream supports Responses compaction production".to_owned();
+            }
+            _ => {}
         }
         let mut response = match &self {
             Self::LimitExceeded { reason, .. } => (
@@ -472,6 +482,17 @@ pub(crate) fn is_public_error_code(code: &str) -> bool {
     !code
         .strip_prefix("http_")
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// 服务端自己写的短句可以原样放进 `message_en`。用户输入、地址和超长内容不放。
+fn specific_public_sentence(prefix: &str, detail: &str) -> Option<String> {
+    if detail.is_empty() || detail.len() > 240 {
+        return None;
+    }
+    if !detail.is_ascii() || detail.chars().any(char::is_control) || detail.contains("://") {
+        return None;
+    }
+    Some(format!("{prefix}: {detail}"))
 }
 
 fn request_field_fact(detail: &str) -> Option<&'static str> {

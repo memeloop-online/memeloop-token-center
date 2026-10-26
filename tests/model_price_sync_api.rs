@@ -203,9 +203,11 @@ async fn management_sync_http_endpoint_writes_nothing_when_every_source_fails() 
     let (status, body) = sync_request(&state, &["openai/gpt-priority"]).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_ne!(body["error"]["code"], "internal_error");
-    assert_eq!(
-        body["error"]["message"],
-        "configured upstream is unavailable"
+    assert!(
+        body["error"]["message_en"]
+            .as_str()
+            .is_some_and(|message| message.contains("configured upstream is unavailable")),
+        "{body}"
     );
 
     let after = serde_json::to_value(

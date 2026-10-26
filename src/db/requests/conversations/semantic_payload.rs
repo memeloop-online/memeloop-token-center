@@ -293,6 +293,7 @@ mod receipt_tests {
                 ConversationProjectionEnqueueInput {
                     request_id: Uuid::from_u128(index),
                     key: &key,
+                    request_json: &body,
                     hints: &hints,
                     client_name: Some("Codex"),
                     upstream_response_id: None,
@@ -414,9 +415,11 @@ mod receipt_tests {
         let key = key(&db, "receipt").await;
         let request = Uuid::now_v7();
         let hints = ConversationHints::default();
+        let empty = serde_json::json!({});
         let enqueue = |client_name| ConversationProjectionEnqueueInput {
             request_id: request,
             key: &key,
+            request_json: &empty,
             hints: &hints,
             client_name,
             upstream_response_id: None,

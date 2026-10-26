@@ -4579,7 +4579,7 @@ async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWo
     assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
     let rendered = world.response.to_string();
     assert!(!rendered.contains("must-not-leak"));
-    assert_eq!(world.response["error"]["code"], "upstream_error");
+    assert_eq!(world.response["error"]["code"], "upstream_http_400");
     let request_id = world
         .synchronous_request_id
         .expect("rejected synchronous image request id");

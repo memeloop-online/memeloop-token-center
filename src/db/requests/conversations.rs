@@ -89,6 +89,8 @@ pub struct ConversationProjectionTask {
 pub(crate) struct ConversationProjectionEnqueueInput<'a> {
     pub(crate) request_id: Uuid,
     pub(crate) key: &'a AuthenticatedKey,
+    /// 结算时已经收好的对话字段。不是带填充的原始请求 JSON。
+    pub(crate) request_json: &'a serde_json::Value,
     pub(crate) hints: &'a ConversationHints,
     pub(crate) client_name: Option<&'a str>,
     pub(crate) upstream_response_id: Option<&'a str>,
@@ -107,6 +109,18 @@ const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
 const SESSION_BODY_REBUILD_OUTCOME: &str = "session_body";
+const SESSION_BODY_INLINE_REQUEST_LIMIT: usize = 1024 * 1024;
+
+fn inline_session_request(value: &serde_json::Value) -> String {
+    let Ok(encoded) = serde_json::to_string(value) else {
+        return "{}".to_owned();
+    };
+    if encoded.len() > SESSION_BODY_INLINE_REQUEST_LIMIT {
+        "{}".to_owned()
+    } else {
+        encoded
+    }
+}
 
 /// 网关结算只把请求身份放进队列。
 /// 不在这里解析原始请求 JSON 或原始返回 JSON。
@@ -118,14 +132,16 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let ConversationProjectionEnqueueInput {
         request_id,
         key,
+        request_json,
         hints,
         client_name,
         upstream_response_id,
         observed_at,
     } = input;
-    // 结算不解析原始请求 JSON。worker 稍后按 locator 读取两份原始文档并写会话正文。
+    // 这里不解析对象存储里的原始请求 JSON。只留下结算时已经收好的对话字段，
+    // 供 locator 仍是 gap:// 时归档。超过上限的内容仍留给对象存储。
     let payload: Option<(String, String)> = None;
-    let request_json = "{}".to_owned();
+    let request_json = inline_session_request(request_json);
     let semantic_snapshot = {
         let snapshot = ConversationSemanticSnapshot {
             leaf: None,
@@ -326,6 +342,7 @@ impl Database {
             ConversationProjectionEnqueueInput {
                 request_id: claim.request_id,
                 key: conversation.key,
+                request_json: conversation.request_json,
                 hints: conversation.hints,
                 client_name: conversation.client_name,
                 upstream_response_id: conversation.upstream_response_id,
@@ -507,6 +524,24 @@ impl Database {
         )))
     }
 
+    /// locator 是 gap:// 时，用结算时已经收好的对话字段。不读对象存储。
+    pub async fn session_body_inline_request(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+    ) -> Result<Option<String>, AppError> {
+        let now = unix_millis();
+        let row = sqlx::query(
+            "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+        )
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|row| row.try_get("request_json").ok()))
+    }
+
     /// 把已经整理好的会话正文写入 CNPG。媒体 locator 记在 `conversation_media_parts`。
     /// 不读取对象存储，也不碰 `generation_assets`。
     pub async fn prepare_session_body_archive(
@@ -678,6 +713,16 @@ impl Database {
                     })
                 })
                 .transpose()?;
+            if snapshot.as_ref().is_some_and(|item| {
+                item.leaf.is_none() && item.atom_hashes.is_empty() && item.payload_digest.is_none()
+            }) {
+                sqlx::query("UPDATE conversation_projection_outbox SET lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2")
+                    .bind(request_id.to_string())
+                    .bind(lease_owner.to_string())
+                    .execute(&self.pool)
+                    .await?;
+                return Ok(false);
+            }
             let payload_required = prepare.try_get::<i64, _>("payload_required")? != 0;
             if payload_required
                 != snapshot
@@ -739,6 +784,12 @@ impl Database {
                 .try_get::<Option<i64>, _>("projected_at")?
                 .is_none()
         {
+            // 终端还没写完时不能占着五分钟租约，否则下一轮会话正文归档赶不上。
+            sqlx::query("UPDATE conversation_projection_outbox SET lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2")
+                .bind(request_id.to_string())
+                .bind(lease_owner.to_string())
+                .execute(&mut *transaction)
+                .await?;
             return Ok(false);
         }
         if let Some(terminal) = terminal.as_ref()

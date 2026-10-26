@@ -2987,15 +2987,14 @@ async fn assert_exactly_once_side_effects_for(
                 .unwrap()
             {
                 assert!(
-                    fixture
-                        .state
-                        .db
-                        .project_claimed_conversation_projection_task(
-                            projection_owner,
-                            task.request_id
-                        )
-                        .await
-                        .unwrap()
+                    crate::worker::archive_session_body(
+                        &fixture.state,
+                        projection_owner,
+                        task.request_id
+                    )
+                    .await
+                    .unwrap(),
+                    "会话正文归档要读到原始返回 JSON"
                 );
                 assert!(
                     !fixture

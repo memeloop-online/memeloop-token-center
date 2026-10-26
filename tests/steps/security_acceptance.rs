@@ -78,7 +78,7 @@ async fn assert_normalized_control_rejection(response: reqwest::Response, label:
         .unwrap_or_else(|error| panic!("{label} rejection JSON: {error}"));
     assert_eq!(body["error"]["code"], "invalid_request", "{label}");
     assert_eq!(
-        body["error"]["message"],
+        body["error"]["message_en"],
         "invalid request: request parameters or body do not match the API schema",
         "{label}"
     );

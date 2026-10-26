@@ -513,7 +513,7 @@ async fn traffic_input_error_has_fixed_413_public_response() {
         serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "plugin_input_too_large");
     assert!(
-        body["error"]["message"]
+        body["error"]["message_en"]
             .as_str()
             .unwrap()
             .contains("traffic plugin input limit")

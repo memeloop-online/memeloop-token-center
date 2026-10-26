@@ -568,6 +568,12 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
         let Ok(value) = serde_json::from_slice::<Value>(payload) else {
             continue;
         };
+        if let Some(response) = value.get("response").filter(|response| {
+            response.get("output").is_some() || response.get("choices").is_some()
+        }) {
+            completed = Some(response.clone());
+            continue;
+        }
         if value.get("output").is_some() || value.get("choices").is_some() {
             completed = Some(value);
             continue;

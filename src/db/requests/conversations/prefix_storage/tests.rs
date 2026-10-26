@@ -430,9 +430,11 @@ async fn contract(url: &str) {
         .await
         .unwrap();
     let mut transaction = database.begin_write_transaction().await.unwrap();
+    let empty = serde_json::json!({});
     let input = ConversationProjectionEnqueueInput {
         request_id: projected,
         key: &first,
+        request_json: &empty,
         hints: &default_hints,
         client_name: Some("Codex"),
         upstream_response_id: None,

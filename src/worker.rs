@@ -962,7 +962,7 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
 
 /// 读取原始请求 JSON 和原始返回 JSON 的 locator，整理会话正文并写入 CNPG。
 /// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
-async fn archive_session_body(
+pub(crate) async fn archive_session_body(
     state: &AppState,
     lease_owner: Uuid,
     request_id: Uuid,
@@ -978,31 +978,33 @@ async fn archive_session_body(
         )
         .await;
     };
-    if request_locator.is_empty() {
-        return skip_session_body(
-            state,
-            lease_owner,
-            request_id,
-            "session_body_skipped_missing_request_locator",
-        )
-        .await;
-    }
-    let Some(return_locator) = return_locator.filter(|locator| !locator.is_empty()) else {
-        return skip_session_body(
-            state,
-            lease_owner,
-            request_id,
-            "session_body_skipped_missing_return_locator",
-        )
-        .await;
-    };
     let request_bytes = match load_raw_document(state, &request_locator).await {
         Ok(bytes) => bytes,
-        Err(reason) => return skip_session_body(state, lease_owner, request_id, reason).await,
+        Err(_) => {
+            let inline = state
+                .db
+                .session_body_inline_request(lease_owner, request_id)
+                .await?;
+            match inline {
+                Some(json) if json != "{}" && !json.is_empty() => json.into_bytes(),
+                _ => {
+                    return skip_session_body(
+                        state,
+                        lease_owner,
+                        request_id,
+                        "session_body_skipped_missing_request_locator",
+                    )
+                    .await;
+                }
+            }
+        }
     };
-    let return_bytes = match load_raw_document(state, &return_locator).await {
-        Ok(bytes) => bytes,
-        Err(reason) => return skip_session_body(state, lease_owner, request_id, reason).await,
+    let return_bytes = match return_locator.filter(|locator| !locator.is_empty()) {
+        Some(locator) => match load_raw_document(state, &locator).await {
+            Ok(bytes) => bytes,
+            Err(_) => b"{}".to_vec(),
+        },
+        None => b"{}".to_vec(),
     };
     let Ok(request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes) else {
         return skip_session_body(

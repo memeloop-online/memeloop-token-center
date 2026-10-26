@@ -2573,7 +2573,7 @@ mod tests {
             serde_json::from_slice(&to_bytes(second.into_body(), 1024 * 1024).await.unwrap())
                 .unwrap();
         assert!(
-            second_body["error"]["message"]
+            second_body["error"]["message_en"]
                 .as_str()
                 .is_some_and(|message| message.contains("outcome is unknown"))
         );

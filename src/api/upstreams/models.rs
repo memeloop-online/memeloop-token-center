@@ -2068,6 +2068,18 @@ mod tests {
     const CATALOG_PRIMARY_PROXY: &str = "socks5h://10.20.30.40:1080";
     const CATALOG_BACKUP_PROXY: &str = "socks5h://10.20.30.41:1080";
 
+    fn direct_catalog_client(
+        account: &crate::provider::UpstreamAccountView,
+    ) -> Result<reqwest::Client, &'static str> {
+        // 成员地址在这些测试里只用来区分选择结果，并不是真的 SOCKS 监听。
+        // 请求打到夹具 URL。生产客户端仍然会走账号代理。
+        let policy =
+            crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))
+                .map_err(|_| "transport_client_unavailable")?;
+        crate::build_codex_http_client_with_policy(policy)
+            .map_err(|_| "transport_client_unavailable")
+    }
+
     async fn catalog_proxy_fixture(
         policy: Value,
     ) -> (
@@ -2171,9 +2183,10 @@ mod tests {
                 |selected, generation| {
                     let proxy = selected.proxy().unwrap().0;
                     attempts.push((proxy.to_owned(), generation));
-                    let client = state
+                    let _proxied = state
                         .codex_clients
                         .account_transport_snapshot(&account, selected, generation)?;
+                    let client = direct_catalog_client(&account)?;
                     Ok(client.get(if proxy == CATALOG_PRIMARY_PROXY {
                         primary.clone()
                     } else {
@@ -2283,9 +2296,10 @@ mod tests {
                 true,
                 |selected, generation| {
                     attempts += 1;
-                    let client = state
+                    let _proxied = state
                         .codex_clients
                         .account_transport_snapshot(&account, selected, generation)?;
+                    let client = direct_catalog_client(&account)?;
                     Ok(client.get(format!("{}/models", server.uri())))
                 },
             )
@@ -2399,9 +2413,10 @@ mod tests {
                     }
                     let proxy = selected.proxy().unwrap().0;
                     attempts.push(proxy.to_owned());
-                    let client = state
+                    let _proxied = state
                         .codex_clients
                         .account_transport_snapshot(&account, selected, generation)?;
+                    let client = direct_catalog_client(&account)?;
                     Ok(client.get(if proxy == CATALOG_PRIMARY_PROXY {
                         &primary
                     } else {
