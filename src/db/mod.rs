@@ -512,6 +512,7 @@ impl Database {
         Self::connect_with_max(database_url, 8).await
     }
 
+    #[cfg(test)]
     pub(crate) fn sqlite_database_url(database_url: &str) -> String {
         Self::normalized_sqlite_url(database_url).into_owned()
     }
