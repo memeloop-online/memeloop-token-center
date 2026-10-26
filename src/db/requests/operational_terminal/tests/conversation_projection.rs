@@ -113,9 +113,6 @@ async fn contract(fixture: Fixture) {
         .unwrap();
     assert_eq!(active.len(), 1, "a running request must remain active");
     assert_eq!(active[0].active_requests, 1);
-    let body = serde_json::json!({
-        "messages": [{"role": "user", "content": "retain history despite unknown usage"}]
-    });
     let hints = ConversationHints::default();
     let mut transaction = fixture.database.begin_write_transaction().await.unwrap();
     enqueue_conversation_projection_in_transaction(
@@ -123,12 +120,10 @@ async fn contract(fixture: Fixture) {
         ConversationProjectionEnqueueInput {
             request_id,
             key: &fixture.key,
-            request_json: &body,
             hints: &hints,
             client_name: Some("Codex"),
             upstream_response_id: None,
             observed_at: unix_millis(),
-            content_materialized: false,
         },
     )
     .await

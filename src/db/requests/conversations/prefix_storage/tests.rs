@@ -433,12 +433,10 @@ async fn contract(url: &str) {
     let input = ConversationProjectionEnqueueInput {
         request_id: projected,
         key: &first,
-        request_json: &base_body,
         hints: &default_hints,
         client_name: Some("Codex"),
         upstream_response_id: None,
         observed_at: now + 205,
-        content_materialized: false,
     };
     enqueue_conversation_projection_in_transaction(&mut transaction, input)
         .await

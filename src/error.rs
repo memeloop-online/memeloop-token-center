@@ -262,7 +262,7 @@ impl AppError {
         Self::upstream_with(code, ErrorFacts::new().status(status))
     }
 
-    pub(crate) fn storage(code: &'static str) -> Self {
+    pub fn storage(code: &'static str) -> Self {
         Self::storage_with(code, ErrorFacts::new())
     }
 
@@ -1480,8 +1480,8 @@ pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'stat
             "the request record could not be persisted",
         ),
         "response_archive_too_large" => (
-            "响应归档超过大小上限",
-            "the response archive exceeded the size limit",
+            "已保存的原始返回 JSON 超过读取上限，无法读回",
+            "the stored raw return document could not be read back because it is larger than the reader limit",
         ),
         "plugin_runtime_failed" => ("插件运行时失败", "the plugin runtime failed"),
         "plugin_invalid_result" => (

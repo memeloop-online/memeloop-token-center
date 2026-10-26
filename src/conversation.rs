@@ -543,13 +543,16 @@ pub fn session_body_from_documents(request: &Value, return_document: &Value) -> 
 }
 
 /// 原始返回 JSON 的字节。JSON 直接解析；SSE 收成一份 JSON，供 [`session_body_from_documents`] 使用。
-pub fn raw_return_document(bytes: &[u8]) -> Result<Value, ()> {
+pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
     let trimmed = trim_ascii_start(bytes);
-    if trimmed.first().is_some_and(|byte| matches!(byte, b'{' | b'[')) {
-        return serde_json::from_slice(trimmed).map_err(|_| ());
+    if trimmed
+        .first()
+        .is_some_and(|byte| matches!(byte, b'{' | b'['))
+    {
+        return serde_json::from_slice(trimmed).ok();
     }
     if !bytes.windows(5).any(|window| window == b"data:") {
-        return Err(());
+        return None;
     }
     let mut completed = None;
     let mut text = String::new();
@@ -572,18 +575,22 @@ pub fn raw_return_document(bytes: &[u8]) -> Result<Value, ()> {
         if let Some(fragment) = value
             .pointer("/delta/content")
             .and_then(Value::as_str)
-            .or_else(|| value.pointer("/choices/0/delta/content").and_then(Value::as_str))
+            .or_else(|| {
+                value
+                    .pointer("/choices/0/delta/content")
+                    .and_then(Value::as_str)
+            })
         {
             text.push_str(fragment);
         }
     }
     if let Some(value) = completed {
-        return Ok(value);
+        return Some(value);
     }
     if text.is_empty() {
-        return Err(());
+        return None;
     }
-    Ok(serde_json::json!({
+    Some(serde_json::json!({
         "output": [{
             "type": "message",
             "role": "assistant",
@@ -631,7 +638,10 @@ impl SessionBody {
                 turn.parts.iter().filter_map(|part| {
                     let content_blake3 = part.content_blake3.as_deref()?;
                     let object_locator = part.object_locator.as_deref()?;
-                    let media_type = part.media_type.as_deref().unwrap_or("application/octet-stream");
+                    let media_type = part
+                        .media_type
+                        .as_deref()
+                        .unwrap_or("application/octet-stream");
                     let byte_length = i64::try_from(part.byte_length.unwrap_or(0)).ok()?;
                     Some(SessionMediaLocator {
                         turn_id: atom.content_hash.clone(),
@@ -685,11 +695,11 @@ fn append_request_turns(turns: &mut Vec<SessionBodyTurn>, request: &Value) {
 }
 
 fn append_return_turns(turns: &mut Vec<SessionBodyTurn>, document: &Value) {
-    if let Some(output) = document.get("output").and_then(Value::as_array) {
-        if !output.is_empty() {
-            append_entry_turns(turns, output, "return");
-            return;
-        }
+    if let Some(output) = document.get("output").and_then(Value::as_array)
+        && !output.is_empty()
+    {
+        append_entry_turns(turns, output, "return");
+        return;
     }
     if let Some(message) = document.pointer("/choices/0/message") {
         turns.push(turn_from_entry(message, "return"));
@@ -748,16 +758,15 @@ fn is_bare_content_part(value: &Value) -> bool {
 
 fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
     let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
-    let role = entry
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or(if matches!(kind, "function_call" | "function_call_output") {
+    let role = entry.get("role").and_then(Value::as_str).unwrap_or(
+        if matches!(kind, "function_call" | "function_call_output") {
             "tool"
         } else if origin == "return" {
             "assistant"
         } else {
             "user"
-        });
+        },
+    );
     let call_id = entry
         .get("call_id")
         .and_then(Value::as_str)
@@ -971,10 +980,10 @@ fn media_bytes_from_part(value: &Value) -> Option<(String, Vec<u8>)> {
             return Some(decoded);
         }
     }
-    if declared.is_some() {
-        if let Some(nested) = value.get("content").and_then(Value::as_str) {
-            return decode_media_payload(nested, declared);
-        }
+    if declared.is_some()
+        && let Some(nested) = value.get("content").and_then(Value::as_str)
+    {
+        return decode_media_payload(nested, declared);
     }
     None
 }
@@ -1123,7 +1132,12 @@ fn part_value(part: &SessionBodyPart) -> Value {
 
 fn strip_private_provider_fields(value: Value) -> Value {
     match value {
-        Value::Array(items) => Value::Array(items.into_iter().map(strip_private_provider_fields).collect()),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(strip_private_provider_fields)
+                .collect(),
+        ),
         Value::Object(map) => {
             let mut cleaned = Map::new();
             for (key, child) in map {

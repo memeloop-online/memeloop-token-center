@@ -916,6 +916,16 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
 const SESSION_BODY_ARCHIVE_READ_LIMIT: usize = 128 * 1024 * 1024;
 
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
+    if let Err(error) = state
+        .db
+        .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT)
+        .await
+    {
+        state
+            .metrics
+            .observe_background_projection(BackgroundProjectionKind::Conversation, false);
+        tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
+    }
     let tasks = match state
         .db
         .claim_conversation_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
@@ -1003,7 +1013,7 @@ async fn archive_session_body(
         )
         .await;
     };
-    let Ok(return_document) = crate::conversation::raw_return_document(&return_bytes) else {
+    let Some(return_document) = crate::conversation::raw_return_document(&return_bytes) else {
         return skip_session_body(
             state,
             lease_owner,

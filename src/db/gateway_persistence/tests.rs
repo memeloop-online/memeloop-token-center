@@ -621,10 +621,7 @@ async fn saturated_memory_permits_queue_the_raw_request_without_blocking_admissi
         })
         .await
         .expect("memory permits must still archive the raw request JSON");
-        fixture
-            .database
-            .drain_gateway_persistence_for_test()
-            .await;
+        fixture.database.drain_gateway_persistence_for_test().await;
     }
     assert_eq!(
         fixture

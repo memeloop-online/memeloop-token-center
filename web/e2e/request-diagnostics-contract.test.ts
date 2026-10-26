@@ -201,7 +201,7 @@ test('recorded pre-admission evidence explains non-forwarding without guessing t
     assert.equal(requestFailureCause(base, locale), locale === 'zh-CN' ? '网关当时接不住新的请求' : 'The gateway could not take another request');
     const overload = locale === 'zh-CN' ? '网关当时接不住新的请求' : 'The gateway could not take another request';
     const fact = (token: string) => locale === 'zh-CN' ? `失败阶段 ${token}` : `failure stage ${token}`;
-    const joined = (tokens: string[]) => locale === 'zh-CN'
+    const joined = (tokens: readonly string[]) => locale === 'zh-CN'
       ? [overload, ...tokens.map(fact)].join('。')
       : [overload, ...tokens.map(fact)].join('. ');
     for (const [diagnostic, tokens] of [

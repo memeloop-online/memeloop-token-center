@@ -488,8 +488,8 @@ function RequestDrawer({ detail, upstreamName, accountNames, onOpenSession, onCl
     </div>
     <Button appearance="subtle" aria-expanded={technicalOpen} aria-controls={technicalId} onClick={() => setTechnicalOpen(!technicalOpen)}>{t('request.technicalDetails')}</Button>
     {technicalOpen && <section id={technicalId} className="request-technical-details" aria-label={t('request.technicalDetails')}>
-      <h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
-      <h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
+      <h3>{t('request.rawRequestJson')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
+      <h3>{t('request.rawReturnJson')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
       {detail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(detail.provenance, null, 2)}</pre></>}
       {detail.transport_diagnostics?.length ? <><h3>{locale === 'zh-CN' ? '上游传输诊断' : 'Upstream transport diagnostics'}</h3><pre>{JSON.stringify(detail.transport_diagnostics, null, 2)}</pre></> : null}
     </section>}

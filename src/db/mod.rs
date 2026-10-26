@@ -203,16 +203,21 @@ pub use providers::{
     UpdateModelRouteInput, UpdateUpstreamAccountInput, UpstreamModelCatalogView, UpstreamModelView,
 };
 pub(crate) use requests::RequestArchiveAdmission;
-#[cfg_attr(not(test), allow(unused_imports))]
-pub(crate) use requests::{
-    ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
-};
 pub use requests::{
     AttachProxyArchiveResult, ConversationDetailFilter, ConversationListFilter,
     ConversationProjectionTask, FinishMeteredSynchronousRequest, FinishProxyRequest,
     FinishProxyRequestResult, FinishRequest, MeteredUsageProjectionTask, NewRequest,
     ProxyConversationInput, RequestListFilter, StartMeteredSynchronousRequest, StartProxyRequest,
     StatsFilter, normalize_proxy_usage,
+};
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use requests::{
+    ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
+};
+#[cfg(test)]
+pub(crate) use requests::{
+    FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
+    FILTERED_ACTIVITY_SOURCE_ROLLUPS,
 };
 pub(crate) use requests::{
     MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, SessionRoutingTerminalInput,
@@ -221,11 +226,6 @@ pub(crate) use requests::{
     record_request_finished_in_transaction, record_request_started_in_transaction,
     reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
     validate_numeric_range,
-};
-#[cfg(test)]
-pub(crate) use requests::{
-    FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
-    FILTERED_ACTIVITY_SOURCE_ROLLUPS,
 };
 #[cfg(test)]
 pub(crate) use requests::{

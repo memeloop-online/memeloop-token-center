@@ -22,9 +22,6 @@ use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingWriteLease};
 /// are archived in full; object-storage cipher budget is independent of it.
 #[cfg_attr(not(test), allow(dead_code))]
 const PLAIN_LIMIT: i64 = 64 * 1024 * 1024;
-/// Legacy name for the former 16MiB request ceiling. Raw request JSON is
-/// archived at any size; this value is not a capture cutoff.
-pub(crate) const REQUEST_ARCHIVE_PLAIN_LIMIT: usize = 16 * 1024 * 1024;
 const CIPHER_CHUNK_LIMIT: usize = 512 * 1024;
 const CIPHER_LIMIT: i64 = 256 * 1024 * 1024;
 pub(super) const REQUEST_CIPHER_LIMIT: i64 = CIPHER_LIMIT / 2;

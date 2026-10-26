@@ -277,8 +277,6 @@ pub struct StartProxyRequest<'a> {
 pub(crate) enum RequestArchiveAdmission {
     Captured,
     Queued,
-    GapCapacity,
-    GapRetentionLimit,
 }
 
 /// `session_dialogue_unavailable` means this settlement could not build 会话正文.
@@ -312,12 +310,10 @@ async fn enqueue_conversation_task(
         ConversationProjectionEnqueueInput {
             request_id,
             key: conversation.key,
-            request_json: conversation.request_json,
             hints: conversation.hints,
             client_name: conversation.client_name,
             upstream_response_id: conversation.upstream_response_id,
             observed_at,
-            content_materialized: false,
         },
     )
     .await

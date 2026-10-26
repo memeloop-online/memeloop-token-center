@@ -127,64 +127,6 @@ fn digest(
     digest.finalize().to_hex().to_string()
 }
 
-pub(super) fn encode(
-    request_id: Uuid,
-    key: &AuthenticatedKey,
-    request: &serde_json::Value,
-) -> Result<(String, String), AppError> {
-    let length = crate::gateway_body::memory::json_encoded_length(request)?;
-    if length > MAX_SEMANTIC_PAYLOAD_BYTES {
-        return Err(AppError::Conflict(
-            "conversation semantic payload exceeds its bound".into(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(length);
-    serde_json::to_writer(&mut bytes, request)
-        .map_err(|_| AppError::internal("semantic_payload_encode_1"))?;
-    let body =
-        String::from_utf8(bytes).map_err(|_| AppError::internal("semantic_payload_encode_2"))?;
-    let digest = digest(
-        &request_id.to_string(),
-        &key.tenant_id.to_string(),
-        &key.key_id.to_string(),
-        &key.principal_id.to_string(),
-        &body,
-    );
-    Ok((body, digest))
-}
-
-pub(super) async fn persist(
-    transaction: &mut Transaction<'_, Any>,
-    request_id: Uuid,
-    key: &AuthenticatedKey,
-    body: &str,
-    digest: &str,
-) -> Result<(), AppError> {
-    let inserted = sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7) ON CONFLICT(request_id) DO NOTHING")
-        .bind(request_id.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(key.principal_id.to_string()).bind(body.len() as i64).bind(digest).bind(body).execute(&mut **transaction).await?;
-    if inserted.rows_affected() != 1 {
-        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1")
-            .bind(request_id.to_string()).fetch_one(&mut **transaction).await?;
-        let decoded = validate(
-            &existing,
-            request_id,
-            &key.tenant_id.to_string(),
-            &key.key_id.to_string(),
-            &key.principal_id.to_string(),
-            digest,
-        )?;
-        if serde_json::to_string(&decoded)
-            .map_err(|_| AppError::internal("semantic_payload_persist_1"))?
-            != body
-        {
-            return Err(AppError::Conflict(
-                "conversation semantic payload changed".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validated_body(
     row: &sqlx::any::AnyRow,
     request_id: Uuid,
@@ -224,21 +166,6 @@ fn validated_body(
 fn json_document(body: &str) -> bool {
     let mut deserializer = serde_json::Deserializer::from_str(body);
     serde::de::IgnoredAny::deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
-}
-
-fn validate(
-    row: &sqlx::any::AnyRow,
-    request_id: Uuid,
-    tenant_id: &str,
-    key_id: &str,
-    principal_id: &str,
-    expected: &str,
-) -> Result<serde_json::Value, AppError> {
-    // Conflict replay still compares canonical JSON. The worker rebuild path
-    // uses `validated_body` and never builds this document.
-    let body = validated_body(row, request_id, tenant_id, key_id, principal_id, expected)?;
-    serde_json::from_str(&body)
-        .map_err(|_| AppError::Conflict("invalid conversation semantic payload".into()))
 }
 
 pub(super) async fn load(
@@ -366,12 +293,10 @@ mod receipt_tests {
                 ConversationProjectionEnqueueInput {
                     request_id: Uuid::from_u128(index),
                     key: &key,
-                    request_json: &body,
                     hints: &hints,
                     client_name: Some("Codex"),
                     upstream_response_id: None,
                     observed_at: index as i64,
-                    content_materialized: false,
                 },
             )
             .await
@@ -390,8 +315,23 @@ mod receipt_tests {
             true,
         )
         .await;
+        let atoms = crate::conversation::extract_atoms(&body);
+        let nodes = crate::conversation::build_prefix(&atoms);
+        let planted = serde_json::to_string(&ConversationSemanticSnapshot {
+            leaf: nodes.last().map(|node| node.node_hash.clone()),
+            atom_hashes: atoms.iter().map(|atom| atom.content_hash.clone()).collect(),
+            payload_digest: None,
+        })
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversation_projection_outbox SET semantic_snapshot_json = $1, semantic_payload_snapshot_json = NULL",
+        )
+        .bind(&planted)
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let encoded: String = sqlx::query_scalar(
-            "SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+            "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
         )
         .bind(Uuid::from_u128(1).to_string())
         .fetch_one(&db.pool)
@@ -415,7 +355,7 @@ mod receipt_tests {
         assert_eq!(next, Some(Uuid::from_u128(32).to_string()));
         assert_eq!(compacted, 1);
         let receipt: String = sqlx::query_scalar(
-            "SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+            "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
         )
         .bind(Uuid::from_u128(1).to_string())
         .fetch_one(&db.pool)
@@ -428,9 +368,9 @@ mod receipt_tests {
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-        assert_eq!(payloads, 34);
+        assert_eq!(payloads, 0);
         let unchanged: String = sqlx::query_scalar(
-            "SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+            "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
         )
         .bind(Uuid::from_u128(3).to_string())
         .fetch_one(&db.pool)
@@ -473,26 +413,23 @@ mod receipt_tests {
         db.migrate().await.unwrap();
         let key = key(&db, "receipt").await;
         let request = Uuid::now_v7();
-        let body = serde_json::json!({"input":[{"role":"user","content":"retained question"}]});
         let hints = ConversationHints::default();
-        let enqueue = |request_json| ConversationProjectionEnqueueInput {
+        let enqueue = |client_name| ConversationProjectionEnqueueInput {
             request_id: request,
             key: &key,
-            request_json,
             hints: &hints,
-            client_name: Some("Codex"),
+            client_name,
             upstream_response_id: None,
             observed_at: 1,
-            content_materialized: false,
         };
         let mut tx = db.begin_write_transaction().await.unwrap();
-        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&body))
+        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(Some("Codex")))
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        let snapshot: String = sqlx::query_scalar("SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+        let snapshot: String = sqlx::query_scalar("SELECT COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) FROM conversation_projection_outbox WHERE request_id = $1")
             .bind(request.to_string()).fetch_one(&db.pool).await.unwrap();
-        sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 2, semantic_payload_snapshot_json = $1 WHERE request_id = $2")
+        sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 2, semantic_snapshot_json = $1, semantic_payload_snapshot_json = NULL WHERE request_id = $2")
             .bind(completed_receipt(&snapshot)).bind(request.to_string()).execute(&db.pool).await.unwrap();
         sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
             .bind(request.to_string())
@@ -500,7 +437,7 @@ mod receipt_tests {
             .await
             .unwrap();
         let mut tx = db.begin_write_transaction().await.unwrap();
-        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&body))
+        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(Some("Codex")))
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -509,10 +446,9 @@ mod receipt_tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
-        let changed = serde_json::json!({"input":"different evidence"});
         let mut tx = db.begin_write_transaction().await.unwrap();
         assert!(
-            enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&changed))
+            enqueue_conversation_projection_in_transaction(&mut tx, enqueue(Some("other")))
                 .await
                 .is_err()
         );

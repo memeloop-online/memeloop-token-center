@@ -1235,12 +1235,6 @@ async fn proxy_with_cancellation_guard(
     match started_request.archive_admission {
         crate::db::RequestArchiveAdmission::Captured
         | crate::db::RequestArchiveAdmission::Queued => {}
-        crate::db::RequestArchiveAdmission::GapCapacity => state
-            .metrics
-            .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity),
-        crate::db::RequestArchiveAdmission::GapRetentionLimit => state
-            .metrics
-            .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::RetentionLimit),
     }
     let reservation = started_request.reservation;
     admission.finish("completed", None, Some(body.len()));

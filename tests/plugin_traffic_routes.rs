@@ -958,19 +958,21 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
     let gateway_dispatch = capture.dispatch();
 
     let decision = tracing::dispatcher::with_default(&direct_dispatch, || {
-        state.plugins.apply_traffic(
-            memeloop_token_center::plugin::memeloop::token_center::types::RequestContext {
-                tenant_id: "tenant".into(),
-                principal_id: "principal".into(),
-                key_id: "key".into(),
-                protocol: "openai".into(),
-                model: "requested-model".into(),
-                config_json: "{}".into(),
-            },
-            &json!({"model": "requested-model", "messages": []}),
-        )
-    })
-    .expect("execute policy with Log capability");
+        state
+            .plugins
+            .apply_traffic(
+                memeloop_token_center::plugin::memeloop::token_center::types::RequestContext {
+                    tenant_id: "tenant".into(),
+                    principal_id: "principal".into(),
+                    key_id: "key".into(),
+                    protocol: "openai".into(),
+                    model: "requested-model".into(),
+                    config_json: "{}".into(),
+                },
+                &json!({"model": "requested-model", "messages": []}),
+            )
+            .unwrap_or_else(|error| panic!("execute policy with Log capability: {error}"))
+    });
     assert!(!decision.allow);
 
     let response = call(

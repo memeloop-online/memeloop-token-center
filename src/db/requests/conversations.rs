@@ -89,12 +89,10 @@ pub struct ConversationProjectionTask {
 pub(crate) struct ConversationProjectionEnqueueInput<'a> {
     pub(crate) request_id: Uuid,
     pub(crate) key: &'a AuthenticatedKey,
-    pub(crate) request_json: &'a serde_json::Value,
     pub(crate) hints: &'a ConversationHints,
     pub(crate) client_name: Option<&'a str>,
     pub(crate) upstream_response_id: Option<&'a str>,
     pub(crate) observed_at: i64,
-    pub(crate) content_materialized: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -107,6 +105,8 @@ struct ConversationSemanticSnapshot {
 
 const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
+const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
+const SESSION_BODY_REBUILD_OUTCOME: &str = "session_body";
 
 /// 网关结算只把请求身份放进队列。
 /// 不在这里解析原始请求 JSON 或原始返回 JSON。
@@ -118,12 +118,10 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let ConversationProjectionEnqueueInput {
         request_id,
         key,
-        request_json: _,
         hints,
         client_name,
         upstream_response_id,
         observed_at,
-        content_materialized: _,
     } = input;
     // 结算不解析原始请求 JSON。worker 稍后按 locator 读取两份原始文档并写会话正文。
     let payload: Option<(String, String)> = None;
@@ -210,6 +208,79 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     Ok(())
 }
 
+/// 已有观测的历史行换成会话正文的叶子。没有观测时返回 false，调用方再插入。
+async fn rewrite_session_body_observation_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    request_id: &str,
+    snapshot: &ConversationSemanticSnapshot,
+) -> Result<bool, ConversationContentError> {
+    if let Some(leaf) = snapshot.leaf.as_deref() {
+        let mut roots = std::collections::BTreeSet::new();
+        roots.insert(leaf.to_owned());
+        let graph = prefix_storage::load_paths(transaction, tenant_id, roots).await?;
+        let full = graph.hashes(Some(leaf), None)?;
+        if full
+            .iter()
+            .take(MAX_CONVERSATION_FINGERPRINT_ATOMS)
+            .ne(snapshot.atom_hashes.iter())
+        {
+            return Err(AppError::Conflict("conversation prefix content mismatch".into()).into());
+        }
+    } else if !snapshot.atom_hashes.is_empty() {
+        return Err(AppError::Conflict("conversation prefix content mismatch".into()).into());
+    }
+    let fingerprint = prefix_storage::Fingerprint::from_hashes(&snapshot.atom_hashes);
+    let encoded = serde_json::to_string(&fingerprint)
+        .map_err(|_| AppError::internal("conversations_rewrite_session_body_observation_1"))?;
+    let updated = sqlx::query(
+        "UPDATE conversation_observations SET leaf_node_hash = $1, atom_hashes_json = $2 WHERE request_id = $3",
+    )
+    .bind(snapshot.leaf.as_deref())
+    .bind(&encoded)
+    .bind(request_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(updated.rows_affected() == 1)
+}
+
+async fn rewrite_reopened_session_body_if_present(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+) -> Result<(), ConversationContentError> {
+    let row = sqlx::query(
+        "SELECT tenant_id, statistics_outcome, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_optional(&mut **transaction)
+    .await?;
+    let Some(row) = row else {
+        return Ok(());
+    };
+    if row
+        .try_get::<Option<String>, _>("statistics_outcome")?
+        .as_deref()
+        != Some(SESSION_BODY_REBUILD_OUTCOME)
+    {
+        return Ok(());
+    }
+    let Some(encoded) = row.try_get::<Option<String>, _>("semantic_snapshot_json")? else {
+        return Ok(());
+    };
+    let snapshot: ConversationSemanticSnapshot = serde_json::from_str(&encoded)
+        .map_err(|_| AppError::internal("conversations_rewrite_reopened_session_body_1"))?;
+    let tenant_id: String = row.try_get("tenant_id")?;
+    let request_id = request_id.to_string();
+    rewrite_session_body_observation_in_transaction(
+        transaction,
+        &tenant_id,
+        &request_id,
+        &snapshot,
+    )
+    .await?;
+    Ok(())
+}
+
 impl Database {
     /// Retain conversation evidence without acknowledging financial settlement.
     /// The operational receipt supplies a stable timestamp for exact replay.
@@ -255,12 +326,10 @@ impl Database {
             ConversationProjectionEnqueueInput {
                 request_id: claim.request_id,
                 key: conversation.key,
-                request_json: conversation.request_json,
                 hints: conversation.hints,
                 client_name: conversation.client_name,
                 upstream_response_id: conversation.upstream_response_id,
                 observed_at,
-                content_materialized: false,
             },
         )
         .await?;
@@ -307,6 +376,34 @@ impl Database {
         Ok(())
     }
 
+    /// 把已经写过 `projected_at`、并且原始请求 JSON 与原始返回 JSON 的 locator 都还在的行
+    /// 收成小批，交给新 worker 重写会话正文。
+    ///
+    /// 不能只把 `projected_at` 清掉：旧 worker 的第二条领取会忽略主租约，只要快照还在就签收。
+    /// 这里同时清掉两份快照，并把主租约钉在 `session-body-rebuild` 上，直到新 worker 换成自己的领取。
+    /// `statistics_outcome = session_body` 留在完成之后，避免同一行被反复重开。
+    /// locator 缺一就不重开。不改 `request_object` / `response_object`。
+    pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
+        let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
+        let mut transaction = self.begin_write_transaction().await?;
+        let (outcome_predicate, lock) = match self.backend {
+            DatabaseBackend::PostgreSql => (
+                "o.statistics_outcome IS DISTINCT FROM 'session_body'",
+                " FOR UPDATE OF o SKIP LOCKED",
+            ),
+            DatabaseBackend::Sqlite => ("o.statistics_outcome IS NOT 'session_body'", ""),
+        };
+        let statement = format!(
+            "UPDATE conversation_projection_outbox SET projected_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL, lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}', lease_expires_at = 9223372036854775807, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, statistics_outcome = '{SESSION_BODY_REBUILD_OUTCOME}' WHERE request_id IN (SELECT o.request_id FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id WHERE o.projected_at IS NOT NULL AND {outcome_predicate} AND r.request_object <> '' AND r.response_object IS NOT NULL AND r.response_object <> '' ORDER BY o.observed_at ASC, o.request_id ASC LIMIT $1{lock})"
+        );
+        let updated = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(limit)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(updated.rows_affected())
+    }
+
     /// Claims a bounded batch of terminal conversation observations for one
     /// projector. A crashed worker's lease expires and another worker can
     /// safely retry the same durable payload.
@@ -332,15 +429,35 @@ impl Database {
         let statement = format!(
             "UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN ({claimable}) RETURNING request_id, observed_at"
         );
-        let mut rows = sqlx::query(sqlx::AssertSqlSafe(statement))
+        let sentinel_lock = match self.backend {
+            DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
+            DatabaseBackend::Sqlite => "",
+        };
+        // 只领取租约主人仍是 session-body-rebuild 的行。主租约未过期，两份快照又是空的，
+        // 所以旧 worker 的两条领取都匹配不到。
+        let sentinel_statement = format!(
+            "UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}' ORDER BY observed_at ASC, request_id ASC LIMIT $3{sentinel_lock}) RETURNING request_id, observed_at"
+        );
+        let mut rows = sqlx::query(sqlx::AssertSqlSafe(sentinel_statement))
             .bind(lease_owner.to_string())
             .bind(expires_at)
-            .bind(now)
             .bind(limit)
             .fetch_all(&mut *transaction)
             .await?;
-        let remaining = limit.saturating_sub(rows.len() as i64);
-        if remaining > 0 {
+        let mut budget = limit.saturating_sub(rows.len() as i64);
+        if budget > 0 {
+            let primary = sqlx::query(sqlx::AssertSqlSafe(statement))
+                .bind(lease_owner.to_string())
+                .bind(expires_at)
+                .bind(now)
+                .bind(budget)
+                .fetch_all(&mut *transaction)
+                .await?;
+            budget = budget.saturating_sub(primary.len() as i64);
+            rows.extend(primary);
+        }
+        if budget > 0 {
+            let remaining = budget;
             let suffix = match self.backend {
                 DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
                 DatabaseBackend::Sqlite => "",
@@ -483,7 +600,7 @@ impl Database {
         let now = unix_millis();
         let note = serde_json::json!({ "session_body_skip": reason }).to_string();
         let updated = sqlx::query(
-            "UPDATE conversation_projection_outbox SET projected_at = $1, semantic_snapshot_json = $2, semantic_payload_snapshot_json = NULL, lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $4",
+            "UPDATE conversation_projection_outbox SET projected_at = $1, semantic_snapshot_json = $2, semantic_payload_snapshot_json = NULL, statistics_outcome = 'session_body', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $3 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $4",
         )
         .bind(now)
         .bind(note)
@@ -541,7 +658,7 @@ impl Database {
         let prepared_snapshot = {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
-                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
             )
             .bind(request_id.to_string())
             .bind(lease_owner.to_string())
@@ -631,7 +748,8 @@ impl Database {
             )
             .await?
         {
-            let skipped = sqlx::query("UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'pruned', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3 AND COALESCE(terminal_lease_expires_at, lease_expires_at) > $1")
+            rewrite_reopened_session_body_if_present(&mut transaction, request_id).await?;
+            let skipped = sqlx::query("UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = CASE WHEN statistics_outcome = 'session_body' THEN 'session_body' ELSE 'pruned' END, lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3 AND COALESCE(terminal_lease_expires_at, lease_expires_at) > $1")
                 .bind(now).bind(request_id.to_string()).bind(lease_owner.to_string()).execute(&mut *transaction).await?;
             if skipped.rows_affected() == 1 {
                 sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
@@ -643,10 +761,10 @@ impl Database {
         }
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3 FOR UPDATE"
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3 FOR UPDATE"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3"
+                "SELECT tenant_id, key_id, principal_id, request_json, hints_json, client_name, upstream_response_id, observed_at, key_snapshot_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3"
             }
         };
         let task = sqlx::query(select)
@@ -733,35 +851,54 @@ impl Database {
                 "conversation semantic snapshot changed during projection".into(),
             ).into());
         }
-        if let Some(expected) = snapshot
-            .as_ref()
-            .and_then(|snapshot| snapshot.payload_digest.as_deref())
-        {
-            semantic_payload::verify_in_transaction(
+        let rebuilding = task
+            .try_get::<Option<String>, _>("statistics_outcome")?
+            .as_deref()
+            == Some(SESSION_BODY_REBUILD_OUTCOME);
+        let rewrote_existing = if rebuilding && let Some(snapshot) = snapshot.as_ref() {
+            let tenant = tenant_id.to_string();
+            let request = request_id.to_string();
+            rewrite_session_body_observation_in_transaction(
                 &mut transaction,
-                self.backend,
-                request_id,
-                &projection_key,
-                expected,
+                &tenant,
+                &request,
+                snapshot,
+            )
+            .await?
+        } else {
+            false
+        };
+        if !rewrote_existing {
+            if let Some(expected) = snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.payload_digest.as_deref())
+            {
+                semantic_payload::verify_in_transaction(
+                    &mut transaction,
+                    self.backend,
+                    request_id,
+                    &projection_key,
+                    expected,
+                )
+                .await?;
+            }
+            self.record_conversation_observation_with_snapshot_in_transaction(
+                &mut transaction,
+                ConversationObservationInput {
+                    key: &projection_key,
+                    request_id,
+                    request_json: &request_json,
+                    hints: &hints,
+                    client_name: client_name.as_deref(),
+                    upstream_response_id: upstream_response_id.as_deref(),
+                    observed_at,
+                    attach_request_record: true,
+                    content_materialized: true,
+                },
+                snapshot.as_ref(),
             )
             .await?;
         }
-        self.record_conversation_observation_with_snapshot_in_transaction(
-            &mut transaction,
-            ConversationObservationInput {
-                key: &projection_key,
-                request_id,
-                request_json: &request_json,
-                hints: &hints,
-                client_name: client_name.as_deref(),
-                upstream_response_id: upstream_response_id.as_deref(),
-                observed_at,
-                attach_request_record: true,
-                content_materialized: true,
-            },
-            snapshot.as_ref(),
-        )
-        .await?;
         if let Some(upstream_response_id) = upstream_response_id.as_deref() {
             attach_conversation_upstream_response_in_transaction(
                 &mut transaction,
@@ -773,7 +910,7 @@ impl Database {
         }
         let receipt = task.try_get::<Option<String>, _>("semantic_snapshot_json")?.as_deref().map(semantic_payload::completed_receipt);
         let acknowledged = sqlx::query(
-            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'applied', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NULL THEN $4 ELSE NULL END, semantic_payload_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN $4 ELSE NULL END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+            "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'session_body', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NULL THEN $4 ELSE NULL END, semantic_payload_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN $4 ELSE NULL END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
         )
         .bind(now)
         .bind(request_id.to_string())

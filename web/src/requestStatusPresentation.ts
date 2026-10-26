@@ -85,7 +85,7 @@ const recordedFailureCopy: Record<string, [string, string]> = {
   request_archive_capture_failed: ['请求归档在写入阶段失败', 'Capturing the request archive failed'],
   request_archive_commit_failed: ['请求归档在提交阶段失败', 'Committing the request archive failed'],
   request_record_persist_failed: ['请求记录没有写入数据库', 'The request record could not be persisted'],
-  response_archive_too_large: ['响应归档超过大小上限', 'The response archive exceeded the size limit'],
+  response_archive_too_large: ['已保存的原始返回 JSON 超过读取上限，无法读回', 'The stored raw return document could not be read back because it is larger than the reader limit'],
   database_operation_failed: ['数据库操作失败', 'The database operation failed'],
   object_storage_failed: ['对象存储操作失败', 'Object storage operation failed'],
   local_storage_failed: ['本地存储操作失败', 'Local storage operation failed'],

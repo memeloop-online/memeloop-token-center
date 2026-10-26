@@ -684,7 +684,7 @@ async fn request_above_legacy_plain_limit_archives_the_raw_bytes() {
         .unwrap();
     let request_id = Uuid::new_v4();
     let locator = format!("gap://{request_id}/request");
-    let body = bytes::Bytes::from(vec![b'x'; REQUEST_ARCHIVE_PLAIN_LIMIT.saturating_add(1)]);
+    let body = bytes::Bytes::from(vec![b'x'; 16 * 1024 * 1024 + 1]);
     let admitted = db
         .start_proxy_request_with_archive(
             StartProxyRequest {
