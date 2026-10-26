@@ -157,7 +157,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
-    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 2Gi/);
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 8Gi/);
     assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
