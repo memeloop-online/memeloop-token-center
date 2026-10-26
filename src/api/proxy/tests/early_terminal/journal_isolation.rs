@@ -192,19 +192,24 @@ async fn unavailable_journal_filesystem_keeps_original_error_and_no_memory_owner
     );
     let rejected = rejected_chat(&fixture).await.unwrap();
     assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(rejected.headers()["x-mtc-request-recording"], "unavailable");
+    assert!(
+        !rejected.headers().contains_key("x-mtc-request-recording"),
+        "a blocked journal path must not drop the database record"
+    );
     assert_no_request_memory(&fixture);
     let body: Value =
         serde_json::from_slice(&to_bytes(rejected.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "no_authorized_upstream_candidate");
-    assert!(
+    fixture.state.early_requests.drain_for_test().await;
+    assert_eq!(
         fixture
             .state
             .db
             .list_requests(fixture.key_id, 10)
             .await
             .unwrap()
-            .is_empty()
+            .len(),
+        1
     );
     tokio::fs::remove_file(&path).await.unwrap();
     let recovered = rejected_chat(&fixture).await.unwrap();
@@ -218,7 +223,7 @@ async fn unavailable_journal_filesystem_keeps_original_error_and_no_memory_owner
             .await
             .unwrap()
             .len(),
-        1
+        2
     );
     assert!(upstream.received_requests().await.unwrap().is_empty());
 }

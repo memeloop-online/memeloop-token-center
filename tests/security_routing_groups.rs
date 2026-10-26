@@ -32,6 +32,29 @@ mod group_custom;
 #[path = "security_routing_groups/group_custom_finance.rs"]
 mod group_custom_finance;
 
+fn sqlite_inspection_url(database_url: &str) -> String {
+    // Match Database::connect: `sqlite://C:\...` is a host, not a drive path.
+    let Some(rest) = database_url.strip_prefix("sqlite://") else {
+        return database_url.to_owned();
+    };
+    let windows = rest.contains('\\') || rest.as_bytes().get(1).copied() == Some(b':');
+    if !windows {
+        return database_url.to_owned();
+    }
+    let rest = rest.replace('\\', "/");
+    let (path, query) = rest.split_once('?').unwrap_or((rest.as_str(), ""));
+    let path = if path.as_bytes().get(1).copied() == Some(b':') {
+        format!("/{path}")
+    } else {
+        path.to_owned()
+    };
+    if query.is_empty() {
+        format!("sqlite://{path}")
+    } else {
+        format!("sqlite://{path}?{query}")
+    }
+}
+
 async fn api_json(state: &AppState, method: &str, path: String, body: Value) -> StatusCode {
     api::router(state.clone())
         .oneshot(
@@ -1352,7 +1375,7 @@ async fn exercise_group_routing_security(database_url: String, backend: &str) {
     sqlx::any::install_default_drivers();
     let inspection = AnyPoolOptions::new()
         .max_connections(1)
-        .connect(&database_url)
+        .connect(&sqlite_inspection_url(&database_url))
         .await
         .expect("routing security inspection pool");
     if backend == "sqlite" {

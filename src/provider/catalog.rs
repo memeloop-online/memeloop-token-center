@@ -397,6 +397,13 @@ impl ProviderCatalog {
             "required": ["base_url"],
             "properties": {
                 "base_url": {"type": "string", "format": "uri", "title": "Base URL"},
+                "probe_model": {
+                    "title": "Probe model",
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Exact upstream model for the short health probe. Leave unset to use the cheapest catalog model, then the lowest numeric version, then the first listed model. The probe is billed to the filter-assistant credential and does not use that assistant's model."
+                },
                 "network_scope": {
                     "title": "Network scope",
                     "type": "string",
@@ -1220,6 +1227,13 @@ fn builtin_managed_oauth_provider(
             "properties": {
                 "base_url": {"const": base_url, "readOnly": true},
                 "network_scope": {"const": "public", "readOnly": true},
+                "probe_model": {
+                    "title": "Probe model",
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Exact upstream model for the short health probe. Leave unset to use the cheapest catalog model, then the lowest numeric version, then the first listed model. The probe is billed to the filter-assistant credential and does not use that assistant's model."
+                },
                 "reservation_token_bounds": {
                     "type": "object",
                     "default": {},
@@ -1285,7 +1299,14 @@ fn builtin_interactive_oauth_provider(
             "required": ["base_url", "network_scope"],
             "properties": {
                 "base_url": {"const": base_url, "readOnly": true},
-                "network_scope": {"const": "public", "readOnly": true}
+                "network_scope": {"const": "public", "readOnly": true},
+                "probe_model": {
+                    "title": "Probe model",
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Exact upstream model for the short health probe. Leave unset to use the cheapest catalog model, then the lowest numeric version, then the first listed model. The probe is billed to the filter-assistant credential and does not use that assistant's model."
+                }
             }
         }),
         credential_schema: json!({

@@ -11,7 +11,6 @@
     "migration",
     "serviceAccount",
     "roles",
-    "requestSpool",
     "config",
     "plugins",
     "ingress",
@@ -71,7 +70,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "schemaVersion": { "type": "integer", "const": 135 },
+        "schemaVersion": { "type": "integer", "const": 136 },
         "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
         "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
         "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
@@ -119,15 +118,6 @@
           }
         }
       ]
-    },
-    "requestSpool": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["mountPath", "sizeLimit"],
-      "properties": {
-        "mountPath": { "type": "string", "pattern": "^/.+$" },
-        "sizeLimit": { "$ref": "#/definitions/resourceQuantity" }
-      }
     },
     "config": {
       "type": "object",
