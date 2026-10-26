@@ -285,11 +285,27 @@ mod tests {
                 let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
                 let mut observed = None;
                 while let Some(current) = source {
-                    if let Some(http2) = current.downcast_ref::<http2::Error>() {
-                        observed = Some((http2.is_reset(), http2.is_remote(), http2.reason()));
+                    if let Some(frame) = current.downcast_ref::<http2::Error>() {
+                        observed = Some((frame.is_reset(), frame.is_remote(), frame.reason()));
                         break;
                     }
-                    source = current.source();
+                    if let Some(frame) = current.downcast_ref::<h2::Error>() {
+                        observed = Some((
+                            frame.is_reset(),
+                            frame.is_remote(),
+                            frame
+                                .reason()
+                                .map(|reason| http2::Reason::from(u32::from(reason))),
+                        ));
+                        break;
+                    }
+                    source = match current
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                    {
+                        Some(inner) => Some(inner),
+                        None => current.source(),
+                    };
                 }
                 assert_eq!(observed, Some((true, true, Some(reason))));
                 assert_eq!(connections.load(Ordering::SeqCst), 1);

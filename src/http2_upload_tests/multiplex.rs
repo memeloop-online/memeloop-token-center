@@ -405,11 +405,27 @@ async fn mixed_upload_case(reset: bool, tls: bool) {
                 let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
                 let mut evidence = None;
                 while let Some(current) = source {
-                    if let Some(http2) = current.downcast_ref::<http2::Error>() {
-                        evidence = Some((http2.is_reset(), http2.is_remote(), http2.is_library(), http2.is_go_away(), http2.reason()));
+                    if let Some(frame) = current.downcast_ref::<http2::Error>() {
+                        evidence = Some((frame.is_reset(), frame.is_remote(), frame.is_library(), frame.is_go_away(), frame.reason()));
                         break;
                     }
-                    source = current.source();
+                    if let Some(frame) = current.downcast_ref::<h2::Error>() {
+                        evidence = Some((
+                            frame.is_reset(),
+                            frame.is_remote(),
+                            frame.is_library(),
+                            frame.is_go_away(),
+                            frame.reason().map(|reason| http2::Reason::from(u32::from(reason))),
+                        ));
+                        break;
+                    }
+                    source = match current
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                    {
+                        Some(inner) => Some(inner),
+                        None => current.source(),
+                    };
                 }
                 assert_eq!(evidence, Some((true, true, false, false, Some(http2::Reason::PROTOCOL_ERROR))));
                 emit_evidence(serde_json::json!({"phase": "injected_peer_reset_before_response_headers", "reason": 1, "remote": true, "library": false, "goaway": false, "delivery": "fixture_confirmed_partial_upload_not_production_inference"}));

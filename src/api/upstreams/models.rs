@@ -112,8 +112,13 @@ impl CatalogFailure {
     fn send(error: reqwest::Error) -> Self {
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         while let Some(current) = source {
-            if let Some(http2) = current.downcast_ref::<http2::Error>()
-                && (http2.is_reset() || http2.is_go_away())
+            if let Some(frame) = current.downcast_ref::<http2::Error>()
+                && (frame.is_reset() || frame.is_go_away())
+            {
+                return Self::transport("send", error.is_timeout(), false);
+            }
+            if let Some(frame) = current.downcast_ref::<h2::Error>()
+                && (frame.is_reset() || frame.is_go_away())
             {
                 return Self::transport("send", error.is_timeout(), false);
             }
@@ -2338,11 +2343,13 @@ mod tests {
                     &account,
                     &credential,
                     true,
-                    |selected, generation| {
+                    |_selected, _generation| {
                         attempts += 1;
-                        let client = state
-                            .codex_clients
-                            .account_transport_snapshot(&account, selected, generation)?;
+                        let client = crate::build_codex_http2_test_client(
+                            crate::provider::CodexTransportPolicy::default(),
+                            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+                        )
+                        .map_err(|_| "transport_client_unavailable")?;
                         Ok(client.get(&endpoint).version(http::Version::HTTP_2))
                     },
                 ),

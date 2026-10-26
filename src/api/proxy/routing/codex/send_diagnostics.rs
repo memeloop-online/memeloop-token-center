@@ -152,7 +152,7 @@ impl Http2AttemptEvidence {
                 http2_goaway = http2.is_go_away(),
                 http2_remote = http2.is_remote(),
                 http2_library = http2.is_library(),
-                http2_reason = ?http2.reason().map(u32::from),
+                http2_reason = ?http2.reason(),
                 request_body_polls = self.body_consumption.polls(),
                 request_body_consumed_bytes = self.body_consumption.bytes(),
                 body_consumption_scope = "transport_body_poll_not_wire_commit",

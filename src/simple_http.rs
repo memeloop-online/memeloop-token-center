@@ -41,7 +41,9 @@ pub(crate) fn codex_http_client_builder_with_proxy(
         .tcp_keepalive_retries(None::<u32>)
         .http2_keep_alive_interval(keep_alive_interval)
         .http2_keep_alive_timeout(Duration::from_millis(policy.request_timeout_millis))
-        .http2_keep_alive_while_idle(false);
+        .http2_keep_alive_while_idle(false)
+        .http2_initial_stream_window_size(6_291_456)
+        .http2_max_header_list_size(262_144);
     if let Some(proxy_url) = proxy_url {
         builder = builder.proxy(reqwest::Proxy::all(proxy_url)?);
     }

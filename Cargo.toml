@@ -49,6 +49,7 @@ hkdf = "0.12"
 hmac = "0.12"
 http = "1"
 http-body-util = "0.1"
+h2 = "=0.4.16"
 http2 = "=0.5.20"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server", "service", "tokio"] }

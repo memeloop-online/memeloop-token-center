@@ -394,7 +394,10 @@ async fn strict_h2_peer_reproduces_remote_protocol_error_for_untrimmed_field_val
         assert!(http2.is_remote());
         assert!(!http2.is_library());
         assert!(!http2.is_go_away());
-        assert_eq!(http2.reason(), Some(http2::Reason::PROTOCOL_ERROR));
+        assert_eq!(
+            http2.reason(),
+            Some(u32::from(http2::Reason::PROTOCOL_ERROR))
+        );
         assert_eq!(connections.load(Ordering::SeqCst), 1);
         assert_eq!(resets.load(Ordering::SeqCst), 1);
         server.abort();

@@ -132,7 +132,11 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
             .with_max_level(tracing::Level::INFO)
             .with_writer(move || sink.clone())
             .finish();
-        let client = crate::build_codex_http_client().unwrap();
+        let client = crate::build_codex_http2_test_client(
+            crate::provider::CodexTransportPolicy::default(),
+            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+        )
+        .unwrap();
         let operation = async {
             let mut request = client
                 .post(format!("http://{address}/responses"))

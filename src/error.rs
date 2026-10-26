@@ -398,7 +398,18 @@ impl IntoResponse for AppError {
             Self::Storage { code, facts } => (StatusCode::INTERNAL_SERVER_ERROR, *code, *facts),
             Self::Internal { code, facts } => (StatusCode::INTERNAL_SERVER_ERROR, *code, *facts),
         };
-        let (message, message_en) = render_bilingual(code, facts);
+        let (mut message, mut message_en) = render_bilingual(code, facts);
+        if let Self::BadRequest(detail) = &self
+            && let Some(field) = request_field_fact(detail)
+        {
+            message.push_str("字段 ");
+            message.push_str(field);
+            message.push('。');
+            message_en.push(' ');
+            message_en.push_str("field ");
+            message_en.push_str(field);
+            message_en.push('.');
+        }
         let mut response = match &self {
             Self::LimitExceeded { reason, .. } => (
                 status,
@@ -461,6 +472,22 @@ pub(crate) fn is_public_error_code(code: &str) -> bool {
     !code
         .strip_prefix("http_")
         .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn request_field_fact(detail: &str) -> Option<&'static str> {
+    const FIELDS: &[&str] = &[
+        "frequency_penalty",
+        "presence_penalty",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "stream_options",
+        "service_tier",
+        "input_audio",
+        "max_tokens",
+        "temperature",
+        "top_p",
+    ];
+    FIELDS.iter().copied().find(|field| detail.contains(field))
 }
 
 pub(crate) fn render_bilingual(code: &str, facts: ErrorFacts) -> (String, String) {

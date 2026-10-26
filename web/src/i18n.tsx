@@ -468,7 +468,7 @@ const zh = {
   'managedSync.reviewModels': '查看模型与路由', 'managedSync.reviewPricing': '检查模型价格',
   'managedSync.pending': '同步中…',
   'managedSync.retry': '重新同步模型', 'managedSync.previous': '以下为上一次收到的结果，本次尚未取得新结果。',
-  'managedSync.price.reviewHelp': '未匹配表示这次没找到新价格。请检查现有价格，补齐缺失价格并确认待定价格。',
+  'managedSync.price.reviewHelp': '未匹配表示本次没找到新价格。请检查现有价格，补齐缺失价格并确认待定价格。',
   'managedSync.price.preservedHelp': '原有价格已保留，未被覆盖。',
   'managedSync.price.deferredHelp': '请检查现有价格，缺失时手动补齐。',
   'managedSync.warning.unknown': '部分路由未完成核对，请查看模型与路由，核对配置并处理未完成的项目。',

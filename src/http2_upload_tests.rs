@@ -174,7 +174,11 @@ pub(crate) async fn accept_socks_at_port(socket: &mut TcpStream, port: u16) {
     accept_socks_for_host(socket, port, HOST).await;
 }
 
-pub(crate) async fn accept_socks_for_host(socket: &mut TcpStream, port: u16, host: &str) {
+pub(crate) async fn accept_socks_for_host(
+    socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
+    port: u16,
+    host: &str,
+) {
     let mut greeting = [0; 2];
     socket.read_exact(&mut greeting).await.unwrap();
     assert_eq!(greeting[0], 5);
@@ -190,8 +194,13 @@ pub(crate) async fn accept_socks_for_host(socket: &mut TcpStream, port: u16, hos
     socket.read_exact(&mut destination).await.unwrap();
     assert_eq!(destination, host.as_bytes());
     assert_eq!(socket.read_u16().await.unwrap(), port);
-    socket.write_all(&[5, 0, 0, 1, 127, 0, 0, 1]).await.unwrap();
-    socket.write_all(&port.to_be_bytes()).await.unwrap();
+    // One write. hyper-util 0.1.20 drops a SOCKS5 CONNECT reply that arrives in
+    // more than one read: its parser consumes the header before it knows the
+    // address is complete, then the retry no longer starts at version 5.
+    let mut reply = Vec::with_capacity(10);
+    reply.extend_from_slice(&[5, 0, 0, 1, 127, 0, 0, 1]);
+    reply.extend_from_slice(&port.to_be_bytes());
+    socket.write_all(&reply).await.unwrap();
 }
 
 struct Receipt {
@@ -411,7 +420,9 @@ fn assert_wire(wire: &Wire, length: usize, reused: bool) -> serde_json::Value {
     assert_eq!(continuation, [None, None]);
     assert_eq!(settings_sent, [1, 1]);
     assert_eq!(settings_acked, settings_sent);
-    assert_eq!(profile_settings.get(&1), Some(&65_536));
+    // reqwest's h2 client has no header-table setting. The peer keeps the
+    // protocol default of 4096. The upload window is setting 4.
+    assert_eq!(profile_settings.get(&1), None);
     assert_eq!(profile_settings.get(&2), Some(&0));
     assert_eq!(profile_settings.get(&4), Some(&6_291_456));
     assert_eq!(profile_settings.get(&6), Some(&262_144));
@@ -663,4 +674,37 @@ async fn pinned_http2_recv_drop_930_characterization_not_upload_root_fix() {
     })
     .await
     .expect("bounded isolated receive-capacity characterization");
+}
+
+struct ReadySocksConnector(Option<hyper_util::rt::TokioIo<tokio::io::DuplexStream>>);
+
+impl tower::Service<http::Uri> for ReadySocksConnector {
+    type Response = hyper_util::rt::TokioIo<tokio::io::DuplexStream>;
+    type Error = std::io::Error;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(&mut self, _context: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _destination: http::Uri) -> Self::Future {
+        std::future::ready(Ok(self.0.take().expect("one socks connection")))
+    }
+}
+
+#[tokio::test]
+async fn hyper_util_accepts_the_socks5_success_reply() {
+    let (client, mut server) = tokio::io::duplex(1024);
+    let server = tokio::spawn(async move {
+        accept_socks_for_host(&mut server, 443, "localhost").await;
+        server
+    });
+    let mut socks = hyper_util::client::legacy::connect::proxy::SocksV5::new(
+        "socks5h://127.0.0.1:1".parse().unwrap(),
+        ReadySocksConnector(Some(hyper_util::rt::TokioIo::new(client))),
+    );
+    let result =
+        tower::Service::call(&mut socks, "https://localhost/responses".parse().unwrap()).await;
+    let _server = server.await.unwrap();
+    assert!(result.is_ok(), "{result:?}");
 }
