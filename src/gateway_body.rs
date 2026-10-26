@@ -151,7 +151,6 @@ impl GatewayBodyRejectionMetrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GatewayBodyAdmissionError {
     CapacityExhausted,
-    RequestSpoolStorageFull,
     RequestSpoolUnavailable,
     UnsupportedEncoding,
     Timeout,
@@ -307,6 +306,10 @@ async fn admit_request_body_for_route(
             .min(maximum);
         let declared_content_length_usize =
             declared_content_length.and_then(|length| usize::try_from(length).ok());
+        let body_key = parts
+            .extensions
+            .get::<request_spool::RequestBodyObjectKey>()
+            .map(|key| key.0.clone());
         let spool = read_with_deadline(
             deadline,
             request_spool
@@ -330,13 +333,11 @@ async fn admit_request_body_for_route(
                                     .saturating_add(value.as_bytes().len())
                             },
                         )),
+                    body_key.as_deref(),
                 ),
         )
         .await?
         .map_err(|error| match error {
-            request_spool::RequestSpoolCaptureError::StorageFull => {
-                GatewayBodyAdmissionError::RequestSpoolStorageFull
-            }
             request_spool::RequestSpoolCaptureError::MemoryExhausted => {
                 GatewayBodyAdmissionError::CapacityExhausted
             }

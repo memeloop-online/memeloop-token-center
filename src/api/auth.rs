@@ -81,10 +81,9 @@ pub(super) async fn authenticate_control_before_body(
             Err(crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted) => {
                 return Err(AppError::Overloaded);
             }
-            Err(
-                crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolStorageFull
-                | crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable,
-            ) => return Err(AppError::Overloaded),
+            Err(crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable) => {
+                return Err(AppError::Overloaded);
+            }
             Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
                 return Ok(control_body_rejection(
                     StatusCode::REQUEST_TIMEOUT,
@@ -225,6 +224,11 @@ async fn admit_authenticated_gateway_body(
         let request_id = diagnostic_context
             .map(|context| context.request_id.to_string())
             .unwrap_or_else(|| safe_gateway_request_id(request.headers()));
+        if uuid::Uuid::parse_str(&request_id).is_ok() {
+            request.extensions_mut().insert(
+                crate::gateway_body::request_spool::RequestBodyObjectKey(request_id.clone()),
+            );
+        }
         let body_read = diagnostic_context
             .map(|context| proxy_diagnostics::Phase::new(context, "gateway_request_body"));
         let _body_read_activity =
@@ -295,18 +299,6 @@ fn gateway_body_admission_rejection(
                 .metrics
                 .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
             gateway_body_capacity_rejection()
-        }
-        crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolStorageFull => {
-            tracing::warn!(
-                request_id = %request_id,
-                route_class = "responses",
-                reason = "request_spool_storage_full",
-                "gateway request spool storage full"
-            );
-            gateway_request_spool_rejection(
-                "request_spool_storage_full",
-                "request spool storage is full or its filesystem quota is exhausted",
-            )
         }
         crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable => {
             tracing::error!(
@@ -430,10 +422,9 @@ pub(super) async fn admit_cloud_webhook_before_body(
         Err(crate::gateway_body::GatewayBodyAdmissionError::CapacityExhausted) => {
             return Err(AppError::Overloaded);
         }
-        Err(
-            crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolStorageFull
-            | crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable,
-        ) => return Err(AppError::Overloaded),
+        Err(crate::gateway_body::GatewayBodyAdmissionError::RequestSpoolUnavailable) => {
+            return Err(AppError::Overloaded);
+        }
         Err(crate::gateway_body::GatewayBodyAdmissionError::Timeout) => {
             return Ok(control_body_rejection(
                 StatusCode::REQUEST_TIMEOUT,
@@ -520,10 +511,10 @@ mod response_body_guard_tests {
     }
 
     #[tokio::test]
-    async fn request_spool_storage_full_is_retryable_and_explainable() {
+    async fn request_spool_unavailable_is_retryable_and_explainable() {
         let response = gateway_request_spool_rejection(
-            "request_spool_storage_full",
-            "request spool storage is full or its filesystem quota is exhausted",
+            "request_spool_unavailable",
+            "request spool is temporarily unavailable",
         );
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -534,8 +525,8 @@ mod response_body_guard_tests {
             .await
             .expect("error body");
         let body = std::str::from_utf8(&body).expect("UTF-8 error");
-        assert!(body.contains("request_spool_storage_full"));
-        assert!(body.contains("filesystem quota is exhausted"));
+        assert!(body.contains("request_spool_unavailable"));
+        assert!(body.contains("temporarily unavailable"));
     }
 
     #[test]

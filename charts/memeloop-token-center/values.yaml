@@ -47,7 +47,7 @@ roles:
       # Request is what the scheduler reserves. The limit is higher so a burst
       # of in-memory request bodies can allocate without pinning that RAM up front.
       requests: { cpu: 100m, memory: 512Mi, ephemeral-storage: 64Mi }
-      limits: { cpu: "1", memory: 2Gi, ephemeral-storage: 256Mi }
+      limits: { cpu: "1", memory: 8Gi, ephemeral-storage: 256Mi }
     autoscaling:
       # Size this together with config.databaseMaxConnections and the database
       # connection budget before enabling.

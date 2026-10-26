@@ -151,7 +151,7 @@ impl AppState {
         ));
         let gateway_body_read_concurrency = config.gateway_body_read_concurrency as usize;
         let responses_body_read_concurrency = config.responses_body_read_concurrency as usize;
-        let responses_request_spool = gateway_body::request_spool::RequestSpoolAdmission::new(
+        let mut responses_request_spool = gateway_body::request_spool::RequestSpoolAdmission::new(
             config.responses_request_spool_path.clone().into(),
         );
         if config.run_migrations_on_start {
@@ -174,6 +174,7 @@ impl AppState {
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
+        responses_request_spool = responses_request_spool.with_archive(archive.clone());
         let persistence_db = db.independent_persistence_pool();
         let routing_persistence_db = db.independent_persistence_pool();
         let early_requests = early_request::Journal::new(
