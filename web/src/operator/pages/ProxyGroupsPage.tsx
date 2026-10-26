@@ -40,8 +40,8 @@ export function ProxyGroupsPage({ token, tenant, initialAccountId, onBack }: {
     && (!account.tenant_external_id || account.tenant_external_id === tenant));
   const accessError = access.state.kind === 'failed' ? copy.unavailable
     : access.state.kind === 'ready' ? access.state.refreshError ? copy.unavailable : !allowed ? copy.denied : '' : '';
-  return <section className="panel proxy-groups-page" aria-label={copy.title}>
-    <div className="panel-title"><h2>{copy.title}</h2><Button appearance="secondary" type="button" onClick={onBack}>{copy.backToAccounts}</Button></div>
+  return <section className="proxy-groups-page" aria-label={copy.pageTitle}>
+    <header className="panel-title proxy-groups-title"><Button appearance="secondary" type="button" onClick={onBack}>{copy.backToAccounts}</Button><div><h2>{copy.pageTitle}</h2></div></header>
     <LoadingProgress active={Boolean(tenant) && (access.state.kind === 'idle' || access.state.kind === 'loading')} label={copy.checking} level="page" />
     {!tenant ? <p role="status">{copy.selectTenant}</p> : accessError ? <div>
       <p className="notice error" role="alert">{accessError}</p>
