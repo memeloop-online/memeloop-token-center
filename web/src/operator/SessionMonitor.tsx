@@ -6,7 +6,11 @@ import { useI18n } from '../i18n.js';
 import { Button, Checkbox } from '../design-system';
 import { SessionDetailSurface, SessionList } from '../SessionViews.js';
 import { SessionCredentialFilter } from './SessionCredentialFilter.js';
+import { SessionRelationships } from './SessionRelationships.js';
 import { SessionTitleAction } from './SessionTitleAction.js';
+import { enqueueSessionTitles, useSessionParentLabel } from './sessionTasks.js';
+import { credentialDisplayName } from '../identityPresentation.js';
+import { unnamedSessionName } from '../sessionTitles.js';
 import { RequestRefreshControl } from './traffic/RequestRefreshControl.js';
 import { defaultRequestRefreshInterval } from './traffic/requestRefresh.js';
 import {
@@ -17,7 +21,7 @@ import {
 import { LatestRequestGate } from './latestRequestGate.js';
 import type {
   LogicalSessionCursor, LogicalSessionDetail, LogicalSessionListResponse, LogicalSessionSummary,
-  LogicalSessionSummaryBatchResponse, RequestDetail, RequestView,
+  LogicalSessionSummaryBatchResponse, RequestDetail, RequestView, SessionIdentity,
 } from '../types.js';
 
 interface SessionFilters {
@@ -39,6 +43,8 @@ export { LatestRequestGate, type LatestRequest } from './latestRequestGate.js';
 
 const emptySessionFilters: SessionFilters = { q: '', keyId: '', model: '', state: '' };
 const sessionPageLimit = 50;
+const sessionIdentityUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const titleEnqueueChunk = 100;
 
 function sessionsPath(tenant: string, filters: SessionFilters, before?: LogicalSessionCursor) {
   const params = new URLSearchParams({ limit: String(sessionPageLimit) });
@@ -118,6 +124,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const [filters, setFilters] = useState<SessionFilters>(emptySessionFilters);
   const [refreshing, setRefreshing] = useState(false);
   const [localRefreshInterval, setLocalRefreshInterval] = useState(defaultRequestRefreshInterval);
+  const [namingBatch, setNamingBatch] = useState<{ scope: string; submitted: number; failed: boolean; done: boolean }>();
   const [manualPaused, setManualPaused] = useState(false);
   const refreshInterval = refreshCadence?.intervalMs ?? localRefreshInterval;
   const backgroundPaused = refreshCadence?.paused ?? false;
@@ -525,6 +532,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     handledFocus.current = 0;
     setSessions([]); setListScope(''); setDetail(undefined); setDetailScope(''); setSelected(undefined); setNextCursor(null); setGeneratedAt(0);
     setLoading(false); setDetailLoading(false); setRefreshing(false); setError(''); setErrorScope('');
+    setNamingBatch(undefined);
     if (!token.trim()) {
       setDraft(emptySessionFilters);
       setFilters(emptySessionFilters);
@@ -664,11 +672,60 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     }
   }
 
+  const namingBatchInFlight = useRef(false);
+  async function nameUnnamedSessions() {
+    if (namingBatchInFlight.current) return;
+    namingBatchInFlight.current = true;
+    const batchScope = scopeKey;
+    const generation = scopeGeneration.current;
+    const batchFilters = emptySessionFilters;
+    setNamingBatch({ scope: batchScope, submitted: 0, failed: false, done: false });
+    let submitted = 0;
+    let failed = false;
+    let cursor: LogicalSessionCursor | undefined;
+    try {
+      // Walk every page of the current list scope, not only the loaded page.
+      // Enqueueing is idempotent server-side, so a retry after a page failure
+      // simply resubmits still-unnamed sessions.
+      do {
+        const page = await api<LogicalSessionListResponse>(sessionsPath(tenant, batchFilters, cursor), token.trim(), { signal: AbortSignal.timeout(30_000) });
+        if (generation !== scopeGeneration.current) return;
+        const candidates = page.sessions
+          .filter((session) => !session.unlinked && !session.session_name?.trim() && sessionIdentityUuid.test(session.session_id))
+          .map((session): SessionIdentity => ({ key_id: session.key_id, session_id: session.session_id }));
+        for (let start = 0; start < candidates.length; start += titleEnqueueChunk) {
+          if (generation !== scopeGeneration.current) return;
+          const receipt = await enqueueSessionTitles(tenant, token, candidates.slice(start, start + titleEnqueueChunk), new AbortController().signal);
+          submitted += receipt.results.filter((result) => result.status !== 'named').length;
+          setNamingBatch({ scope: batchScope, submitted, failed: false, done: false });
+        }
+        cursor = page.next_cursor ?? undefined;
+        if (generation !== scopeGeneration.current) return;
+      } while (cursor);
+    } catch {
+      failed = true;
+    } finally {
+      namingBatchInFlight.current = false;
+    }
+    if (generation !== scopeGeneration.current) return;
+    setNamingBatch({ scope: batchScope, submitted, failed, done: !failed });
+  }
+
   const hasScope = Boolean(token.trim());
   const status = !hasScope ? 'idle' : refreshing ? 'refreshing' : streamState;
   const visibleSessions = listScope === scopeKey ? sessions : [];
   const visibleDetail = detailScope === scopeKey ? detail : undefined;
   const visibleError = errorScope === scopeKey ? error : '';
+  const visibleNamingBatch = namingBatch?.scope === scopeKey ? namingBatch : undefined;
+  const openSessionIdentity = (target: SessionIdentity) => {
+    const next: SessionFilters = { q: target.session_id, keyId: target.key_id, model: '', state: '' };
+    setDraft(next);
+    setFilters(next);
+  };
+  const selectedParent = useSessionParentLabel(tenant, token,
+    selected && visibleDetail && !visibleDetail.unlinked ? selected.key_id : undefined,
+    selected && visibleDetail && !visibleDetail.unlinked && sessionIdentityUuid.test(visibleDetail.session_id) ? visibleDetail.session_id : null,
+    (session) => session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credentialDisplayName(session.key_alias, t), true));
   return <>
     {visibleError && <div className="notice error" role="alert">{visibleError} <Button appearance="secondary" disabled={loading || detailLoading} onClick={() => errorTarget === 'detail' && selected ? void selectSession(selected) : void loadSessions(false, filters, visibleSessions.length > 0)}>{t('sessions.retryLoad')}</Button></div>}
     <RequestRefreshControl
@@ -682,7 +739,16 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       <span className={`session-live-state ${status}`} role="status">{autoRefresh ? t(`sessions.live.${status}`) : t('sessions.paused')}</span>
       <Button appearance="secondary" disabled={loading || refreshing || detailLoading} onClick={() => { void refreshNow(); }}>{t('sessions.refreshNow')}</Button>
       {(loading || refreshing) && <Button appearance="secondary" onClick={cancelListLoad}>{t('common.cancel')}</Button>}
+      <Button appearance="secondary" disabled={!hasScope || (visibleNamingBatch !== undefined && !visibleNamingBatch.done && !visibleNamingBatch.failed)}
+        onClick={() => { void nameUnnamedSessions(); }}>{t('sessions.name.batch')}</Button>
     </div>
+    {visibleNamingBatch && <p className="muted" role="status">{visibleNamingBatch.failed
+      ? t('sessions.name.batchFailed')
+      : visibleNamingBatch.done && visibleNamingBatch.submitted === 0
+        ? t('sessions.name.batchEmpty')
+        : visibleNamingBatch.done
+          ? t('sessions.name.batchDone', { count: visibleNamingBatch.submitted })
+          : t('sessions.name.batchProgress', { done: visibleNamingBatch.submitted })}</p>}
     <form className="session-controls" onSubmit={(event) => { event.preventDefault(); setFilters({ ...draft }); }}>
       <label>{t('sessions.search')}<input value={draft.q} onChange={(event) => setDraft({ ...draft, q: event.target.value })} placeholder={t('sessions.searchPlaceholder')} /></label>
       <SessionCredentialFilter value={draft.keyId} sessions={visibleSessions} token={token} tenant={tenant} onChange={(keyId) => setDraft({ ...draft, keyId })} />
@@ -700,6 +766,13 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
         {!visibleDetail && detailLoading && <div className="session-detail-skeleton" role="status" aria-label={t('common.loading')}><i /><i /><i /><i /></div>}
         {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
         {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} contextLoader={contextLoader}
+          parentNav={selectedParent ? <p className="session-parent-nav"><Button appearance="transparent" className="table-link"
+            onClick={() => openSessionIdentity(selectedParent.identity)}>{t('sessions.rel.backToParent', { name: selectedParent.label })}</Button></p> : undefined}
+          taskRelations={selected && !visibleDetail.unlinked && sessionIdentityUuid.test(visibleDetail.session_id)
+            ? <SessionRelationships key={`${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`} token={token} tenant={tenant}
+                identity={{ key_id: selected.key_id, session_id: visibleDetail.session_id }}
+                onOpenSession={openSessionIdentity} />
+            : undefined}
           titleAction={selected && !visibleDetail.unlinked ? <SessionTitleAction key={`${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`}
             token={token} tenant={tenant} keyId={selected.key_id} sessionId={visibleDetail.session_id}
             onTitle={(title) => {

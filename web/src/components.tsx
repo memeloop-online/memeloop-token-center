@@ -229,11 +229,14 @@ export function RequestDiagnostics({
   currency,
   onOpenSession,
   upstreamName,
+  sessionParent,
 }: {
   request: RequestView;
   currency?: string;
   onOpenSession?: (sessionId: string) => void;
   upstreamName?: string;
+  /** Resolved parent session of a confirmed sub-session, loaded on demand by the owner layer. */
+  sessionParent?: { label: string; sessionId: string };
 }) {
   const { locale, t } = useI18n();
   const pending = requestIsPending(request);
@@ -255,6 +258,11 @@ export function RequestDiagnostics({
   const supplierDetail = requestStatusCopy(request, locale).supplierDetail;
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
+    {sessionParent && <p className="request-session-parent"><b>{t('request.parentSession')}</b>
+      {onOpenSession
+        ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(sessionParent.sessionId)}>{sessionParent.label}</button>
+        : <span>{sessionParent.label}</span>}
+    </p>}
     <section className="request-detail-group request-detail-primary" aria-label={zh ? '模型与用量' : 'Model and usage'}>
       <div className="request-detail-wide"><b>{t('request.model')}</b><RequestMetadata label={request.model} fields={[[t('request.routeId'), request.route_id], [t('request.protocol'), request.protocol]]} /><RequestCompaction request={request} /></div>
       <div className="request-detail-wide"><b>{zh ? '凭据' : 'Credential'}</b><RequestMetadata label={credentialLabel} fields={[[zh ? '凭据 ID' : 'Credential ID', request.credential_identity?.key_id], [zh ? '主体' : 'Principal', principalDisplayName(request.credential_identity?.principal_external_id, t)], [zh ? '租户' : 'Tenant', request.credential_identity?.tenant_external_id]]} /></div>
@@ -270,7 +278,7 @@ export function RequestDiagnostics({
       <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
       <div><RequestOutputRate request={request} /></div>
     </section>
-    {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
+      {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
       {context.association === 'confirmed'
         ? context.session_id && onOpenSession
           ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(context.session_id!)}>{sessionLabel}</button>

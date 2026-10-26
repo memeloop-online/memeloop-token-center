@@ -12,6 +12,7 @@ import { formatCurrencyDisplay, formatMetricDisplay, formatNumber, formatPercent
 import { LocalSettlementNotice, localSettlementLabel, localSettlementTrendLabel } from '../LocalSettlementNotice';
 import { analyticsDuration, finiteP95Points, histogramP95 } from './analyticsPresentation';
 import { UsageSummaryMetrics } from './UsageSummaryMetrics';
+import { SessionTaskPanel } from './SessionTaskPanel';
 import { useI18n } from '../i18n';
 import type { KeyListCursor, KeyView, OperatorUsageAnalysis, TypedFilterAst, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
 import './usage.css';
@@ -183,7 +184,10 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
     if (!stats) return null;
     if (dimension === 'models') return <DimensionTable title={t('usage.models')} values={stats.by_model} onSelect={(bucket) => applyDimension('model', bucket)} />;
     if (dimension === 'keys') return <DimensionTable title={t('usage.keys')} values={stats.by_key} onSelect={(bucket) => applyDimension('keyId', bucket)} />;
-    if (dimension === 'sessions') return <DimensionTable title={t('usage.sessions')} values={stats.by_session} labelForValue={(bucket) => bucket.unlinked || bucket.id.startsWith('unlinked:') ? t('sessions.unlinkedRequests') : bucket.label} onSelect={onOpenSession} />;
+    if (dimension === 'sessions') return <>
+      <SessionTaskPanel key={`${tenant}\0${token}`} token={token} tenant={tenant} />
+      <DimensionTable title={t('usage.sessions')} values={stats.by_session} labelForValue={(bucket) => bucket.unlinked || bucket.id.startsWith('unlinked:') ? t('sessions.unlinkedRequests') : bucket.label} onSelect={onOpenSession} />
+    </>;
     if (dimension === 'upstreams') return <DimensionTable title={t('usage.upstreams')} values={stats.by_upstream} labelForValue={(bucket) => bucket.id === 'unassigned' ? t('usage.unassigned') : bucket.label} onSelect={(bucket) => applyDimension('upstreamId', bucket)} />;
     if (dimension === 'protocols') return <DimensionTable title={t('usage.protocols')} values={stats.by_protocol} labelForValue={(bucket) => t(`usage.protocol.${bucket.id}`)} onSelect={(bucket) => applyDimension('protocol', bucket)} />;
     if (dimension === 'statuses') return <DimensionTable title={t('usage.statuses')} values={stats.by_status} labelForValue={(bucket) => bucket.id === 'success' ? t('traffic.success') : bucket.id === 'error' ? t('traffic.failure') : bucket.label} onSelect={(bucket) => applyDimension('status', bucket)} />;

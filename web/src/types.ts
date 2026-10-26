@@ -833,6 +833,76 @@ export interface LogicalSessionSummaryBatchResponse {
   sessions: LogicalSessionSummary[];
 }
 
+/** Stable session identity is always the credential/session pair, never a title. */
+export interface SessionIdentity {
+  key_id: string;
+  session_id: string;
+}
+
+export interface SessionTitleState {
+  title: string | null;
+  state: 'unavailable' | 'pending' | 'running' | 'ready' | 'failed' | 'waiting_config';
+  error_code: string | null;
+  updated_at?: number | null;
+  /** Absent on deployments before title provenance: treat as generated. */
+  source?: string;
+  /** Absent on deployments before title provenance: treat as 0. */
+  revision?: number;
+}
+
+export interface SessionNameUpdate {
+  title: string;
+  source: 'manual' | 'codex';
+  explicit_session_id?: string;
+  expected_revision: number;
+}
+
+export type SessionTaskScope = 'session' | 'subtree' | 'related';
+
+export interface SessionTaskUsage {
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_input_tokens: number;
+  cache_write_tokens: number;
+  request_duration_sum_ms: number;
+  unknown_cost_requests: number;
+  /** Currency → cost in millionths of the currency unit. */
+  costs: Record<string, number>;
+}
+
+export interface SessionTaskDailyBucket {
+  day_bucket: number;
+  day_start_at: number;
+  usage: SessionTaskUsage;
+}
+
+export interface SessionTaskAnalysis {
+  scope: SessionTaskScope;
+  identities: SessionIdentity[];
+  /** Day-bucket boundary zone reported by the backend, e.g. UTC. */
+  timezone: string;
+  first_request_at: number | null;
+  last_request_at: number | null;
+  calendar_span_days: number;
+  active_days: number;
+  totals: SessionTaskUsage;
+  daily: SessionTaskDailyBucket[];
+  coverage: string;
+}
+
+export interface SessionRelationship {
+  key_id: string;
+  session_id: string;
+  target: SessionIdentity;
+  kind: 'parent' | 'related';
+  evidence: string | null;
+}
+
+export interface SessionRelationshipsResponse {
+  relationships: SessionRelationship[];
+}
+
 export interface LogicalSessionDetail {
   session_id: string;
   cluster_id: string | null;
