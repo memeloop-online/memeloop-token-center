@@ -13,10 +13,10 @@ ignore = [
   # line depends on zstd >=0.14.3, so the advisory cannot be cleared by a
   # lockfile update. Archive compression uses zstd::bulk, which the legacy
   # streaming advisory does not cover. Revisit when the client crate moves.
-  { id = "RUSTSEC-2026-0391", reason = "wreq-util certificate compression uses Encoder::new, not a reused with_context", expires = "2026-11-26" },
-  { id = "RUSTSEC-2026-0398", reason = "seekable decompression is not used", expires = "2026-11-26" },
-  { id = "RUSTSEC-2026-0403", reason = "bulk decode is outside the legacy streaming path", expires = "2026-11-26" },
-  { id = "RUSTSEC-2026-0410", reason = "the wasm allocator shim is not linked into the linux gateway", expires = "2026-11-26" },
+  { id = "RUSTSEC-2026-0391", reason = "until 2026-11-26: wreq-util certificate compression uses Encoder::new, not a reused with_context" },
+  { id = "RUSTSEC-2026-0398", reason = "until 2026-11-26: seekable decompression is not used" },
+  { id = "RUSTSEC-2026-0403", reason = "until 2026-11-26: bulk decode is outside the legacy streaming path" },
+  { id = "RUSTSEC-2026-0410", reason = "until 2026-11-26: the wasm allocator shim is not linked into the linux gateway" },
 ]
 
 [licenses]
