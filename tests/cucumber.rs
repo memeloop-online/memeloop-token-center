@@ -8783,7 +8783,7 @@ async fn workbuddy_sends_openai_turns(world: &mut TokenCenterWorld, model: Strin
             {"role": "user", "content": "apply the fix"}
         ]),
     ];
-    for messages in messages {
+    for (messages_index, messages) in messages.into_iter().enumerate() {
         let response = world
             .client
             .post(format!("{}/v1/chat/completions", world.service_url))
@@ -8801,6 +8801,9 @@ async fn workbuddy_sends_openai_turns(world: &mut TokenCenterWorld, model: Strin
         world.status = Some(response.status());
         let _ = response.bytes().await.expect("WorkBuddy OpenAI response");
         assert_eq!(world.status, Some(StatusCode::OK));
+        // The next turn must observe this turn's prefix. Projecting both at
+        // once can cluster them by session id without writing the edge.
+        wait_for_projected_conversation_requests(world, messages_index + 1).await;
     }
 }
 

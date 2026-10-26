@@ -761,8 +761,24 @@ async fn assert_committed_receipt_replay_preserves_owned_key(changed_field: Opti
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
-    assert!(receipt["conversation"]["key"].is_object());
+    let (receipt_id, receipt) = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(receipt) = fixture
+                .state
+                .pending_terminals
+                .receipt_jsons_for_test()
+                .into_iter()
+                .next()
+                && receipt["conversation"]["key"].is_object()
+            {
+                let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
+                return (receipt_id, receipt);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned key receipt must include the conversation key");
     wait_for_request_settlement(&fixture, 1).await;
     let operational = wait_for_operational(&fixture)
         .await
