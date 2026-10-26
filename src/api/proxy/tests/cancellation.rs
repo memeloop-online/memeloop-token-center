@@ -119,19 +119,13 @@ async fn read_unknown_receipt(
     tokio::time::timeout(Duration::from_secs(3), async {
       assert_unknown_request(fixture, request_id, active_owners).await;
       loop {
-        let Ok(mut entries) = tokio::fs::read_dir(fixture.state.pending_terminals.directory_for_test()).await else {
-            tokio::task::yield_now().await;
-            continue;
-        };
-        while let Some(entry) = entries.next_entry().await.unwrap() {
-        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
-            continue;
-        }
-        let receipt: Value =
-            serde_json::from_slice(&tokio::fs::read(entry.path()).await.unwrap()).unwrap();
-        if receipt["request_id"] != request_id.to_string() {
-            continue;
-        }
+        if let Some(receipt) = fixture
+            .state
+            .pending_terminals
+            .receipt_jsons_for_test()
+            .into_iter()
+            .find(|receipt| receipt["request_id"] == request_id.to_string())
+        {
         assert_eq!(receipt["usage_basis"], "not_observed");
         assert_eq!(receipt["claim"]["request_id"], receipt["request_id"]);
         assert_eq!(receipt["claim"]["tenant_id"], receipt["tenant_id"]);

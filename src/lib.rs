@@ -456,12 +456,14 @@ fn codex_http_client_builder(
         policy,
         keep_alive_interval,
     );
-    // No connect timeout and no kernel TCP user timeout. A stored
-    // connect_timeout_millis is not a socket deadline. The forward ends when
-    // the upstream answers, the client cancels, or the socket itself fails.
-    // wreq would otherwise force-close a Linux socket after 30s without an ACK
-    // and probe TCP keepalive every 15s. HTTP/2 keepalive remains.
+    // The stored connect timeout bounds only TCP, proxy CONNECT, and TLS.
+    // It does not limit time spent waiting for response headers after the
+    // connection is up, and it is not a kernel TCP user timeout. Leaving the
+    // handshake unbounded made a stuck proxy or route look like a two-minute
+    // upstream wait. wreq would otherwise force-close a Linux socket after 30s
+    // without an ACK and probe TCP keepalive every 15s. HTTP/2 keepalive remains.
     let builder = wreq::Client::builder()
+        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
         .redirect(wreq::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.

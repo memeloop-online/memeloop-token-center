@@ -239,27 +239,21 @@ async fn journal_recovery_projects_terminal_after_writer_replacement() {
         error_code: "no_authorized_upstream_candidate".into(),
     };
     let directory = tempfile::tempdir().unwrap();
-    let unavailable = crate::db::Database::connect(&fixture.database_url)
-        .await
-        .unwrap();
-    unavailable.close().await;
-    let previous = crate::early_request::Journal::new(directory.path().to_owned(), unavailable);
-    assert!(previous.append(terminal.clone()).await);
-    let encoded = tokio::fs::read(
-        directory
-            .path()
-            .join(format!("{}.json", terminal.request_id)),
-    )
-    .await
-    .unwrap();
-    assert!(encoded.len() <= 4096);
-    assert!(!String::from_utf8_lossy(&encoded).contains(&fixture.key));
-    drop(previous);
-    let recovered = crate::early_request::Journal::new(
+    let journal = crate::early_request::Journal::new(
         directory.path().to_owned(),
         fixture.state.db.independent_persistence_pool(),
     );
-    recovered.drain_for_test().await;
+    assert!(journal.append(terminal.clone()).await);
+    assert!(
+        tokio::fs::read_dir(directory.path())
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none(),
+        "early terminals are recorded in the database, not a local spool"
+    );
     let rows = fixture
         .state
         .db

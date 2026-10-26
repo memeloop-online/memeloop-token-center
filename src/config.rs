@@ -528,7 +528,9 @@ impl Config {
             && spool_path.components().all(|component| {
                 matches!(
                     component,
-                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::Normal(_)
                 )
             });
         if !valid_spool_path {

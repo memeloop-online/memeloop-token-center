@@ -36,12 +36,13 @@ The existing RAM checks can still reject requests; fair RAM waiting, oversized
 transport-frame allocation, and whole-process memory accounting are separate
 work. This change introduces no new upload deadline or concurrency cutoff.
 
-`requestSpool.mountPath` is only the writable directory for terminal journals.
-Request bodies are not written there. The chart still caps that directory so a
-journal cannot fill the node, and that cap is what kubelet enforces. It is not
-an application admission budget for uploads. Memory admission remains the limit
-on how much upload data a process may retain. The retained bytes stay until that
-response finishes, so a long generation keeps the raw upload for the whole reply.
+The chart does not mount a request-spool emptyDir. Request bodies stay in
+process memory, and terminal responsibility stays in that same process until
+the database accepts it. A local directory of those receipts is what kubelet
+evicts when the emptyDir reaches its size limit. Memory admission remains the
+limit on how much upload data a process may retain. The retained bytes stay
+until that response finishes, so a long generation keeps the raw upload for the
+whole reply.
 
 The optional `gateway_archive` database pool is independent of ingress spooling.
 Its bounded background capture can retain an archive gap on failure; this change

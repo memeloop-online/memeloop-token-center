@@ -14,6 +14,7 @@ mod oauth_copilot;
 #[cfg(test)]
 mod oauth_device_worker_tests;
 mod oauth_kimi;
+mod probe_model;
 mod proxy_settings;
 mod quota;
 mod rejections;
