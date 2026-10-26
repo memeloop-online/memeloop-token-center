@@ -77,6 +77,7 @@ mod routing;
 mod self_service;
 mod session_reading;
 mod session_titles;
+mod session_tasks;
 pub(crate) use session_titles::process_one as process_session_title;
 mod sessions;
 mod sse;

@@ -713,6 +713,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "independent upstream service and proxy probe results",
         sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
     },
+    Migration {
+        version: 139,
+        name: "session task relationships and explicit names",
+        sql: include_str!("../../../migrations/common/0139_session_task_relationships.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1408,6 +1413,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 136,
         name: "independent upstream service and proxy probe results",
         sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
+    },
+    Migration {
+        version: 139,
+        name: "session task relationships and explicit names",
+        sql: include_str!("../../../migrations/common/0139_session_task_relationships.sql"),
     },
 ];
 

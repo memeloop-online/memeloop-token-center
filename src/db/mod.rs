@@ -99,6 +99,7 @@ pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
 pub(crate) use session_responses::SessionResponseTask;
 mod session_projection;
 mod session_titles;
+pub(crate) mod session_tasks;
 pub(crate) use session_titles::{
     SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
 };

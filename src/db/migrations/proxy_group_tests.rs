@@ -84,6 +84,10 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&125));
     assert!(versions.contains(&126));
     for statement in [
+        "DROP TABLE session_relationships",
+        "DROP TABLE session_thread_parents",
+        "DROP INDEX conversation_observations_explicit_session_idx",
+        "DROP INDEX request_stats_facts_session_idx",
         "DROP TABLE session_generated_titles",
         "DROP TABLE session_response_summaries",
         "DROP VIEW model_route_eligible_upstream_accounts",
@@ -167,7 +171,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136)",
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 139)",
     )
     .execute(&database.pool)
     .await
@@ -228,7 +232,7 @@ async fn upgrade_contract(database: &Database) {
         tail,
         vec![
             117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133,
-            134, 135, 136
+            134, 135, 136, 139
         ]
     );
     let policy: String = sqlx::query_scalar(
@@ -270,7 +274,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136
+                133, 134, 135, 136, 139
             ]
         );
     }

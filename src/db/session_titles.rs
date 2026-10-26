@@ -9,6 +9,8 @@ pub(crate) struct SessionTitleView {
     pub state: String,
     pub error_code: Option<String>,
     pub updated_at: Option<i64>,
+    pub source: String,
+    pub revision: i64,
 }
 
 pub(crate) struct SessionTitleTask {
@@ -52,7 +54,7 @@ impl Database {
         key_id: Uuid,
         session_id: Uuid,
     ) -> Result<SessionTitleView, AppError> {
-        let row = sqlx::query("SELECT title, state, error_code, updated_at FROM session_generated_titles WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3")
+        let row = sqlx::query("SELECT title, state, error_code, updated_at, title_source, revision FROM session_generated_titles WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3")
             .bind(tenant_id.to_string()).bind(key_id.to_string()).bind(session_id.to_string())
             .fetch_optional(&self.pool).await?;
         match row {
@@ -61,12 +63,16 @@ impl Database {
                 state: row.try_get("state")?,
                 error_code: row.try_get("error_code")?,
                 updated_at: Some(row.try_get("updated_at")?),
+                source: row.try_get("title_source")?,
+                revision: row.try_get("revision")?,
             }),
             None => Ok(SessionTitleView {
                 title: None,
                 state: "unavailable".into(),
                 error_code: None,
                 updated_at: None,
+                source: "unknown".into(),
+                revision: 0,
             }),
         }
     }
@@ -80,7 +86,7 @@ impl Database {
         session_id: Uuid,
     ) -> Result<SessionTitleView, AppError> {
         let now = unix_millis();
-        sqlx::query("INSERT INTO session_generated_titles (tenant_id, key_id, session_id, next_attempt_at, updated_at) VALUES ($1, $2, $3, $4, $4) ON CONFLICT(tenant_id, key_id, session_id) DO UPDATE SET state = 'pending', revision = session_generated_titles.revision + 1, attempts = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at, lease_owner = NULL, lease_until = NULL, error_code = NULL WHERE session_generated_titles.state NOT IN ('pending', 'running') OR (session_generated_titles.state = 'running' AND session_generated_titles.lease_until <= excluded.updated_at)")
+        sqlx::query("INSERT INTO session_generated_titles (tenant_id, key_id, session_id, next_attempt_at, updated_at) VALUES ($1, $2, $3, $4, $4) ON CONFLICT(tenant_id, key_id, session_id) DO UPDATE SET state = 'pending', revision = session_generated_titles.revision + 1, attempts = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at, lease_owner = NULL, lease_until = NULL, error_code = NULL WHERE session_generated_titles.title_source = 'generated' AND (session_generated_titles.state NOT IN ('pending', 'running') OR (session_generated_titles.state = 'running' AND session_generated_titles.lease_until <= excluded.updated_at))")
             .bind(tenant_id.to_string()).bind(key_id.to_string()).bind(session_id.to_string())
             .bind(now).execute(&self.pool).await?;
         self.session_title(tenant_id, key_id, session_id).await
@@ -223,7 +229,7 @@ impl Database {
             .collect::<Vec<_>>()
             .join(" OR ");
         let statement = format!(
-            "SELECT key_id, session_id, title FROM session_generated_titles WHERE tenant_id = $1 AND title IS NOT NULL AND ({predicates})"
+            "SELECT key_id, session_id, title, title_source FROM session_generated_titles WHERE tenant_id = $1 AND title IS NOT NULL AND ({predicates})"
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(statement)).bind(tenant_id);
         for session in sessions.iter() {
@@ -241,15 +247,25 @@ impl Database {
                         row.try_get::<String, _>("key_id")?,
                         row.try_get::<String, _>("session_id")?,
                     ),
-                    row.try_get::<String, _>("title")?,
+                    (
+                        row.try_get::<String, _>("title")?,
+                        row.try_get::<String, _>("title_source")?,
+                    ),
                 ))
             })
             .collect::<Result<std::collections::HashMap<_, _>, AppError>>()?;
         for session in sessions {
-            if let Some(title) =
+            if let Some((title, source)) =
                 titles.get(&(session.key_id.to_string(), session.session_id.clone()))
             {
-                session.session_name = Some(title.clone());
+                if source != "generated"
+                    || session
+                        .session_name
+                        .as_ref()
+                        .is_none_or(|name| name.trim().is_empty())
+                {
+                    session.session_name = Some(title.clone());
+                }
             }
         }
         Ok(())
