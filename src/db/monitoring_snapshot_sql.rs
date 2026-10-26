@@ -142,17 +142,16 @@ pub(super) fn monitoring_upstream_health_batch_sql(account_count: usize) -> Opti
 SELECT target.upstream_account_id,
        COALESCE(account.name, deleted.name,
                 '__retired_upstream__') AS name,
-       account.status, account.credential_generation,
-       health.credential_generation AS health_generation,
-       health.consecutive_failures, health.cooldown_until, health.updated_at
+       account.status,
+       probe.status AS probe_status,
+       probe.checked_at AS probe_checked_at
   FROM selected target
   LEFT JOIN upstream_accounts account
          ON account.id = target.upstream_account_id
   LEFT JOIN deleted_upstream_account_snapshots deleted
          ON deleted.upstream_account_id = target.upstream_account_id
-  LEFT JOIN upstream_account_health health
-         ON health.upstream_account_id = account.id
-        AND health.transport_revision = account.updated_at
+  LEFT JOIN upstream_service_probes probe
+         ON probe.upstream_account_id = account.id
  ORDER BY target.upstream_account_id ASC"#,
     ))
 }

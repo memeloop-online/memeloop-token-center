@@ -116,12 +116,6 @@ roles:
       behavior: {}
     podDisruptionBudget: { enabled: false, minAvailable: 1 }
 
-# Writable node-local directory for terminal journals. Request bodies are not
-# stored here; they stay in process memory until the upstream response finishes.
-requestSpool:
-  mountPath: /var/lib/memeloop-token-center/request-spool
-  sizeLimit: 160Mi
-
 config:
   terminalProjectionEnabled: false
   # Keep the sum across replicas below the PostgreSQL/PgBouncer connection budget.

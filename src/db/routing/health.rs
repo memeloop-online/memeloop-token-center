@@ -761,6 +761,31 @@ impl Database {
         .await
     }
 
+    /// Provider quota exhaustion is not a transport probe. Customer forwarding
+    /// still has to leave that account alone until its deadline.
+    pub(crate) async fn customer_attempt_blocked_by_quota(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+    ) -> Result<bool, AppError> {
+        let blocked: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM upstream_account_health
+             WHERE upstream_account_id = $1
+               AND credential_generation = $2
+               AND transport_revision = $3
+               AND cooldown_until > $4
+               AND last_failure_kind IN ('quota_exhausted', 'rate_limited')",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(transport_revision)
+        .bind(unix_millis())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(blocked.is_some())
+    }
+
     async fn claim_upstream_attempt_inner(
         &self,
         upstream_account_id: Uuid,
@@ -1279,7 +1304,11 @@ impl Database {
         .bind(success_epoch.to_string())
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let recovered = result.rows_affected() == 1;
+        if recovered {
+            self.note_service_available(upstream_account_id).await;
+        }
+        Ok(recovered)
     }
 
     #[cfg(test)]
@@ -1413,7 +1442,11 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let recovered = result.rows_affected() == 1;
+        if recovered {
+            self.note_service_available(upstream_account_id).await;
+        }
+        Ok(recovered)
     }
 
     #[cfg(test)]
@@ -2345,12 +2378,28 @@ mod tests {
                 .count(),
             1
         );
+        sqlx::query(
+            "INSERT INTO upstream_service_probes (upstream_account_id, status, checked_at)
+             VALUES ($1, 'unhealthy', 1)",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
         assert!(
             database
                 .record_upstream_account_probe_success(account_id, 1, lease_token)
                 .await
                 .unwrap()
         );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM upstream_service_probes WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "healthy");
         assert!(
             database
                 .claim_upstream_account_attempt(account_id, 1)
