@@ -243,11 +243,10 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   assert.equal(await page.locator('.provider-list').isVisible(), false);
   await providerWorkspace.getByRole('button', { name: '近期可用性', exact: true }).click();
   await providerWorkspace.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
-  // The shared seed includes a routed 429. Do not make this UI assertion
-  // depend on whether its real-time breaker cooldown has already elapsed.
   const healthPath = `/internal/v1/upstreams/${seed.upstreamId}/health`;
+  let manualHealthPosts = 0;
   await page.route((url) => url.pathname === healthPath, async (route) => {
-    assert.equal(route.request().method(), 'POST');
+    if (route.request().method() === 'POST') manualHealthPosts += 1;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -255,17 +254,17 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
         account_id: seed.upstreamId,
         status: 'unhealthy',
         error_code: 'rate_limited',
-        source: 'routing_state',
+        source: 'connection_probe',
         checked_at: Date.UTC(2026, 0, 1),
-        retry_at: Date.UTC(2026, 0, 1, 0, 1),
+        latency_ms: 12,
       }),
     });
   });
-  await providerWorkspace.getByRole('button', { name: '主动健康检查' }).click();
+  await providerWorkspace.getByRole('button', { name: '运行主动健康检查', exact: true }).click();
+  assert.equal(manualHealthPosts, 1);
   const manualHealth = providerWorkspace.locator('.provider-manual-health');
   await assertContains(manualHealth, '上游限流中');
-  await assertContains(manualHealth, '最早重试时间');
-  await assertContains(manualHealth, '未发送额外探测请求');
+  await assertContains(manualHealth, 'rate_limited');
   await assertNoCount(manualHealth.locator('.status.ok'));
   const disabledProvider = page.waitForResponse((response) => {
     const url = new URL(response.url());

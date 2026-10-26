@@ -193,7 +193,7 @@ function RequestOutputRate({ request }: { request: RequestView }) {
   const average = averageRequestOutputTps(request);
   const first = request.first_output_ms;
   const wait = typeof first === 'number' && Number.isFinite(first) && first >= 0
-    ? `${t('request.firstOutputWait')}: ${formatMilliseconds(first, locale)}` : t('request.firstOutputMissing');
+    ? `${t('request.firstOutputWait')}: ${formatMilliseconds(first, locale)}. ${t('request.firstOutputWaitHint')}` : t('request.firstOutputMissing');
   return <span className="request-output-rates">{([
     ['generation', generation, t('request.generationTps'), t('request.generationTpsHint')],
     ['average', average, t('request.averageTps'), t('request.averageTpsHint')],

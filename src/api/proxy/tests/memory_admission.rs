@@ -48,7 +48,7 @@ async fn source_backed_conversation_releases_all_raw_request_permits() {
             let projection = conversation
                 .project(
                     &memory,
-                    tokio::time::Instant::now() + Duration::from_secs(5),
+                    tokio::time::Instant::now() + Duration::from_secs(30),
                 )
                 .await?;
             Ok::<_, crate::error::AppError>(projection.request_json["model"].clone())

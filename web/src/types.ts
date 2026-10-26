@@ -1139,13 +1139,13 @@ export interface UpstreamDeletionReadiness {
 
 export interface UpstreamHealth {
   account_id: string;
-  status: 'healthy' | 'unhealthy';
+  status: 'healthy' | 'unhealthy' | 'skipped';
   error_code?: string | null;
   upstream_status?: number;
   latency_ms?: number;
   checked_at: number;
   retry_at?: number;
-  source?: 'routing_state' | 'connection_probe' | 'local_state';
+  source?: 'routing_state' | 'connection_probe' | 'model_probe' | 'local_state';
 }
 
 export interface ConfigurationSchemas {
