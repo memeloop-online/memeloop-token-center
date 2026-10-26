@@ -54,25 +54,21 @@ impl ArchiveStore {
     ) -> Result<(), AppError> {
         let download = self.open_stream(locator, None).await?;
         if download.object_size != expected_size {
-            return Err(AppError::Storage(
-                "archive CAS object integrity failure".into(),
-            ));
+            return Err(AppError::storage("local_storage_failed"));
         }
         let mut stream = download.stream;
         let mut size = 0_u64;
         let mut digest = blake3::Hasher::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk
-                .map_err(|_| AppError::Storage("archive CAS object integrity failure".into()))?;
+                .map_err(|_| AppError::storage("archive_cas_object_integrity_failure"))?;
             size = size
-                .checked_add(u64::try_from(chunk.len()).map_err(|_| AppError::Internal)?)
-                .ok_or_else(|| AppError::Storage("archive CAS object integrity failure".into()))?;
+                .checked_add(u64::try_from(chunk.len()).map_err(|_| AppError::internal("cas_verify_exact_object_1"))?)
+                .ok_or_else(|| AppError::storage("archive_cas_object_integrity_failure"))?;
             digest.update(&chunk);
         }
         if size != expected_size || digest.finalize().to_hex().as_str() != expected_digest {
-            return Err(AppError::Storage(
-                "archive CAS object integrity failure".into(),
-            ));
+            return Err(AppError::storage("local_storage_failed"));
         }
         Ok(())
     }

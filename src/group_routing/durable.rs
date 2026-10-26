@@ -64,9 +64,9 @@ pub(crate) fn capture(state: &AppState) -> Result<Option<serde_json::Value>, App
         fingerprints,
         policies,
     })
-    .map_err(|_| AppError::Internal)?;
+    .map_err(|_| AppError::internal("durable_capture_1"))?;
     if serde_json::to_vec(&value)
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("durable_capture_2"))?
         .len()
         > MAX_SNAPSHOT_BYTES
     {
@@ -106,25 +106,25 @@ pub(crate) async fn restore_selected(
         return Ok(restored);
     };
     if serde_json::to_vec(value)
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("durable_restore_selected_1"))?
         .len()
         > MAX_SNAPSHOT_BYTES
     {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("durable_restore_selected_1"));
     }
     let stored: DurablePlan =
-        serde_json::from_value(value.clone()).map_err(|_| AppError::Internal)?;
+        serde_json::from_value(value.clone()).map_err(|_| AppError::internal("durable_restore_selected_2"))?;
     if stored.version != 1
         || stored.tenant_id != tenant_id
         || stored.policies.len() > 1024
         || stored.deadline_at < stored.started_at
     {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("durable_restore_selected_2"));
     }
     let total_budget = stored.deadline_at.saturating_sub(stored.started_at) as u64;
     // A stored deadline is a bound, never a new budget on each worker claim.
     if total_budget > 24 * 60 * 60 * 1000 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("durable_restore_selected_3"));
     }
     let mut runtime_available = true;
     #[cfg(feature = "experimental-plugin-revisions")]
@@ -153,7 +153,7 @@ pub(crate) async fn restore_selected(
             continue;
         }
         if !policy.has_valid_transient_snapshot() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("durable_restore_selected_4"));
         }
         let input = GroupRoutingInput {
             tenant_id: tenant_id.to_string(),
@@ -169,9 +169,9 @@ pub(crate) async fn restore_selected(
                 candidates: vec![policy.directive.clone()],
             },
         )?;
-        let route = Uuid::parse_str(&policy.candidate.route_id).map_err(|_| AppError::Internal)?;
+        let route = Uuid::parse_str(&policy.candidate.route_id).map_err(|_| AppError::internal("durable_restore_selected_3"))?;
         let account =
-            Uuid::parse_str(&policy.candidate.account_id).map_err(|_| AppError::Internal)?;
+            Uuid::parse_str(&policy.candidate.account_id).map_err(|_| AppError::internal("durable_restore_selected_4"))?;
         if model_route_id != Some(route) || account != upstream_account_id {
             continue;
         }
@@ -184,12 +184,12 @@ pub(crate) async fn restore_selected(
             continue;
         }
         let generation =
-            i64::try_from(policy.candidate.generation).map_err(|_| AppError::Internal)?;
+            i64::try_from(policy.candidate.generation).map_err(|_| AppError::internal("durable_restore_selected_5"))?;
         if policies
             .insert((route, account, generation), policy)
             .is_some()
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("durable_restore_selected_5"));
         }
     }
     let now = crate::db::unix_millis();

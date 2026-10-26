@@ -2210,7 +2210,7 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
     assert_eq!(
         refs.response_object.as_deref(),
         Some(
-            "inline-json:{\"error\":{\"message\":\"upstream request failed\",\"type\":\"upstream_error\"}}"
+            "inline-json:{\"error\":{\"code\":\"upstream_transport_request\",\"message\":\"上游请求失败。发送上游请求失败。\",\"message_en\":\"upstream request failed. sending the upstream request failed.\",\"type\":\"upstream_error\"}}"
         )
     );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -5937,10 +5937,12 @@ async fn buffered_chat_usage_diagnostics_preserve_failure_accounting_and_error_p
         let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        assert_eq!(
-            body.as_ref(),
-            br#"{"error":{"message":"upstream request failed","type":"upstream_error"}}"#
-        );
+        let rendered = String::from_utf8(body.to_vec()).unwrap();
+        assert!(rendered.contains("upstream request failed"));
+        assert!(rendered.contains(&format!(r#""code":"{expected_error}""#)));
+        assert!(rendered.contains(
+            crate::error::public_error_meaning(expected_error).unwrap_or(expected_error)
+        ));
         cancellation::assert_single_unknown_receipt(&fixture, 502, Some(expected_error)).await;
         let rows = fixture
             .state
@@ -6349,7 +6351,7 @@ fn upstream_usage_rejects_negative_and_extreme_token_counts() {
 fn response_archive_cleanup_requires_conclusive_database_ownership() {
     let stored = "staging/proxy/00000000-0000-0000-0000-000000000000/response/00000000-0000-0000-0000-000000000001/body";
     assert!(!response_archive_requires_cleanup(
-        &Err(AppError::Internal),
+        &Err(AppError::internal("proxy_tests_response_archive_cleanup_requires_conclusive_databas")),
         stored
     ));
     assert!(response_archive_requires_cleanup(

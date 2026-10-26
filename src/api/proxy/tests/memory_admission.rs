@@ -41,24 +41,38 @@ async fn source_backed_conversation_releases_all_raw_request_permits() {
     let blocker = budget.reservation();
     assert!(blocker.try_grow(1024 * 1024, 1));
     let memory = budget.reservation();
-    let projected = {
-        let conversation = conversation.clone();
-        let memory = memory.clone();
-        tokio::spawn(async move {
-            let projection = conversation
-                .project(
-                    &memory,
-                    tokio::time::Instant::now() + Duration::from_secs(30),
-                )
-                .await?;
-            Ok::<_, crate::error::AppError>(projection.request_json["model"].clone())
+    let blocked = conversation
+        .project(
+            &memory,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await;
+    assert!(matches!(
+        blocked,
+        Err(crate::error::AppError::Capacity {
+            code: "proxy_memory_projection",
+            ..
         })
-    };
-    budget.wait_for_projection_reservation_for_test().await;
+    ));
     assert_eq!(admission.read_count_for_test(), 0);
     drop(blocker);
-    assert_eq!(projected.await.unwrap().unwrap(), json!("gpt-5.6-sol"));
+    let recovered = ProxyConversation {
+        key: conversation.key.clone(),
+        request_body: conversation.request_body.clone(),
+        hints: crate::conversation::ConversationHints::default(),
+        client_name: None,
+        projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
+    };
+    let projection = recovered
+        .project(
+            &memory,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(projection.request_json["model"], json!("gpt-5.6-sol"));
     assert_eq!(admission.read_count_for_test(), 1);
+    drop(projection);
     assert_eq!(budget.snapshot().0, 0);
 
     // With 64 KiB units, a 64 KiB source plus a 64 KiB response fits exactly
@@ -90,7 +104,6 @@ async fn source_backed_conversation_releases_all_raw_request_permits() {
                 64 * 1024,
                 tokio::time::Instant::now(),
             )
-            .await
     );
     assert_eq!(combined_budget.snapshot().0, 0);
 
@@ -188,7 +201,6 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
     assert!(held.try_grow(retained_partition, 1));
     assert!(
         held.finalize_request(tokio::time::Instant::now() + Duration::from_secs(1))
-            .await
     );
     let dispatched = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
     let signal = dispatched.clone();
@@ -267,36 +279,41 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
 }
 
 #[tokio::test]
-async fn executed_response_waits_for_memory_without_replaying_upstream() {
-    let fixture = std::sync::Arc::new(codex_route_fixture("response-memory-wait").await);
+async fn executed_response_rejects_memory_without_waiting_or_replaying_upstream() {
+    let fixture = std::sync::Arc::new(codex_route_fixture("response-memory-reject").await);
     let held = fixture.state.proxy_memory_budget.reservation();
     let ingress_allowance = fixture.state.config.responses_body_max_bytes as usize * 3;
     assert!(held.try_grow(
         fixture.state.config.proxy_memory_budget_bytes as usize - ingress_allowance,
         1,
     ));
+    // The request releases its ingress charge before response admission. The
+    // declared upstream body therefore has to need more than that allowance,
+    // or a one-unit reservation would succeed in the freed capacity.
+    let output_len = ingress_allowance / 3 / 2 + 64 * 1024;
+    let upstream_body = completed_codex_sse(&"x".repeat(output_len));
+    assert!(
+        upstream_body.len().saturating_mul(crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT)
+            > ingress_allowance,
+        "declared response must not fit in the memory left after ingress"
+    );
     let upstream = MockServer::start().await;
-    let response_blocker = fixture.state.proxy_memory_budget.reservation();
-    let upstream_blocker = response_blocker.clone();
-    let upstream_fixture = fixture.clone();
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
-        .respond_with(move |_: &wiremock::Request| {
-            let (used, limit, _, _) = upstream_fixture.state.proxy_memory_budget.snapshot();
-            assert!(upstream_blocker.try_grow(limit - used, 1));
-            ResponseTemplate::new(200).set_body_raw(
-                completed_codex_sse("delivered after memory release"),
-                "text/event-stream",
-            )
-        })
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(upstream_body, "text/event-stream"),
+        )
         .expect(1)
         .mount(&upstream)
         .await;
     let endpoint = upstream.uri();
     let owned_fixture = fixture.clone();
     let request = tokio::spawn(async move {
-        let payload = serde_json::to_vec(&json!({"model": owned_fixture.model,
-            "input": "wait without retry", "stream": false}))
+        let payload = serde_json::to_vec(&json!({
+            "model": owned_fixture.model,
+            "input": "fail without retry",
+            "stream": false
+        }))
         .unwrap();
         let request = Request::post("/v1/responses")
             .header(
@@ -314,37 +331,42 @@ async fn executed_response_waits_for_memory_without_replaying_upstream() {
         .await
         .unwrap()
     });
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        fixture
-            .state
-            .proxy_memory_budget
-            .wait_for_response_reservation_for_test(),
-    )
-    .await
-    .expect("executed response reaches memory admission");
-    assert!(!request.is_finished());
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-    drop(held);
-    let response = request.await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+    let response = tokio::time::timeout(Duration::from_secs(5), request)
         .await
-        .unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&bytes).unwrap()["output"][0]["content"][0]["text"],
-        "delivered after memory release"
+        .expect("executed response memory rejection returns without queueing")
+        .expect("request task");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        body.contains("upstream_response_memory_capacity"),
+        "{body}"
     );
-    drain_completed_response_archive(&fixture).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    let rows = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            if rows.len() == 1 && rows[0].error_code.is_some() {
+                break rows;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("memory rejection is recorded");
     assert_eq!(rows.len(), 1);
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_eq!(rows[0].status_code, Some(502));
+    assert_eq!(
+        rows[0].error_code.as_deref(),
+        Some("upstream_response_memory_capacity")
+    );
     upstream.verify().await;
+    drop(held);
 }
 
 #[tokio::test]

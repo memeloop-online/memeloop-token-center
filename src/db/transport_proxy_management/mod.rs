@@ -108,7 +108,7 @@ async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppErro
             "version":i64::MAX,
             "proxies":proxies,
         }]))
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("transport_proxy_management_mod_budget_1"))?
         .len()
             + 512;
     }

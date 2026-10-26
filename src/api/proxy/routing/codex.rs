@@ -434,7 +434,7 @@ async fn send_codex_attempt_once(
     route: &PreparedProxyRoute,
     session_id: &str,
     transport: (
-        &wreq::Client,
+        &reqwest::Client,
         &UpstreamCredential,
         send_diagnostics::TransportIdentity,
         Option<crate::db::egress::SelectedEgress>,
@@ -475,18 +475,20 @@ async fn send_codex_attempt_once(
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
     let (client, credential, transport_identity, selected_egress) = transport;
+    // Plugins do not replace this send unless one registers. None do: a package
+    // that needs its own HTTP calls host `http-request`, executed by this client.
+    if state.plugins.codex_outbound_registered() {
+        return Err(ProxySendError::CandidateUnavailable);
+    }
     loop {
-        let mut request = client.post(target_url).body(route.forwarded_body.clone());
-        let egress_path = if let Some((proxy_url, _)) = credential.proxy() {
-            let proxy =
-                wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
-            request = request.proxy(proxy);
+        let request = client.post(target_url).body(route.forwarded_body.clone());
+        let egress_path = if credential.proxy().is_some() {
             CodexEgressPath::AccountProxy
         } else {
             CodexEgressPath::Direct
         };
         let credential_now = credential_application_now();
-        let request = codex_transport::apply_wreq_wire_headers(
+        let request = codex_transport::apply_codex_wire_headers(
             request,
             headers,
             &route.route.credential,
@@ -507,7 +509,6 @@ async fn send_codex_attempt_once(
             context,
             matches!(egress_path, CodexEgressPath::AccountProxy),
             body_consumption.clone(),
-            state.config.h2_attempt_binding_enabled,
         );
         let mut egress = None;
         let mut remote_reset = false;
@@ -515,8 +516,6 @@ async fn send_codex_attempt_once(
         async {
             let mut request = request?;
             body_consumption.attach(&mut request);
-            #[cfg(feature = "h2-attempt-binding")]
-            http2_evidence.attach_binding(&mut request);
             egress = egress::AttemptRecorder::begin(
                 state,
                 &route.route,
@@ -549,7 +548,7 @@ async fn send_codex_attempt_once(
                 selection_epoch = transport_identity.selection_epoch,
                 group_selection_version = ?transport_identity.group_selection_version,
                 request_local_selection = transport_identity.request_local_selection,
-                transport_cause = wreq_transport_cause(&error),
+                transport_cause = codex_transport_cause(&error),
                 request_body_polls = body_consumption.polls(),
                 request_body_consumed_bytes = body_consumption.bytes(),
                 body_consumption_scope = "transport_body_poll_not_wire_commit",
@@ -558,7 +557,7 @@ async fn send_codex_attempt_once(
                 stage = "codex_transport_send_failure",
                 "Codex outbound transport send failed"
             );
-            classify_wreq_send_error(error)
+            classify_codex_send_error(error)
         })
     })
     .await;
@@ -566,7 +565,7 @@ async fn send_codex_attempt_once(
         state.metrics.observe_upstream(
             &route.route.driver,
             "proxy",
-            upstream_result.as_ref().ok().map(wreq::Response::status),
+            upstream_result.as_ref().ok().map(reqwest::Response::status),
             upstream_started.elapsed(),
         );
         match upstream_result {
@@ -608,30 +607,23 @@ async fn send_codex_attempt_once(
     }
 }
 
-fn classify_wreq_send_error(error: wreq::Error) -> ProxySendError {
+fn classify_codex_send_error(error: reqwest::Error) -> ProxySendError {
     if let Some(http2_failure) = upstream_response::codex_http2_failure(&error) {
         let kind = match http2_failure {
             upstream_response::CodexHttp2Failure::Reset => TransportFailureKind::Http2Reset,
             upstream_response::CodexHttp2Failure::GoAway => TransportFailureKind::Http2GoAway,
         };
         ProxySendError::NonRetryableTransport(kind)
-    } else if error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls() {
-        let stage = if error.is_proxy_connect() {
-            "proxy_connect"
-        } else if error.is_dns() {
-            "dns"
-        } else if error.is_tls() {
-            "tls"
-        } else {
-            "connect"
-        };
-        ProxySendError::RetryableConnection(stage)
     } else {
+        let class = crate::simple_http::classify_transport(&error);
+        if class.pre_delivery() {
+            return ProxySendError::RetryableConnection(class.stage());
+        }
         // A send error after the request leaves the client is ambiguous and is
         // never replayed by this state machine.
-        let kind = if error.is_timeout() {
+        let kind = if class.timeout || error.is_timeout() {
             TransportFailureKind::Timeout
-        } else if error.is_connection_reset() {
+        } else if class.connection_reset {
             TransportFailureKind::ConnectionReset
         } else if error.is_body() {
             TransportFailureKind::Body
@@ -646,19 +638,22 @@ fn classify_wreq_send_error(error: wreq::Error) -> ProxySendError {
     }
 }
 
-fn wreq_transport_cause(error: &wreq::Error) -> &'static str {
+fn codex_transport_cause(error: &reqwest::Error) -> &'static str {
     if let Some(cause) = sanitized_error_source_cause(error) {
         cause
-    } else if error.is_timeout() {
-        "transport_timeout"
-    } else if error.is_connection_reset() {
-        "connection_reset"
-    } else if error.is_dns() {
-        "dns_resolution"
-    } else if error.is_tls() {
-        "tls_failure"
     } else {
-        "unclassified"
+        let class = crate::simple_http::classify_transport(error);
+        if class.timeout {
+            "transport_timeout"
+        } else if class.connection_reset {
+            "connection_reset"
+        } else if class.dns {
+            "dns_resolution"
+        } else if class.tls {
+            "tls_failure"
+        } else {
+            "unclassified"
+        }
     }
 }
 

@@ -85,7 +85,7 @@ async fn archived_generation_asset_response(
     view: crate::model::GenerationAssetView,
     object_locator: &str,
 ) -> Result<Response, AppError> {
-    let declared_size = u64::try_from(view.size_bytes).map_err(|_| AppError::Internal)?;
+    let declared_size = u64::try_from(view.size_bytes).map_err(|_| AppError::internal("assets_archived_generation_asset_response_1"))?;
     let range_header = match single_byte_range_header(headers) {
         Ok(value) => value,
         Err(()) => return Ok(range_not_satisfiable(declared_size)),
@@ -102,24 +102,18 @@ async fn archived_generation_asset_response(
             actual_size,
             "generation asset archive size mismatch"
         );
-        return Err(AppError::Storage(
-            "generation asset archive size mismatch".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     let download = state
         .archive
         .open_stream(object_locator, requested_range.clone())
         .await?;
     if download.object_size != actual_size {
-        return Err(AppError::Storage(
-            "generation asset archive changed during download".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     let expected_range = requested_range.clone().unwrap_or(0..declared_size);
     if download.range != expected_range {
-        return Err(AppError::Storage(
-            "generation asset archive returned an unexpected range".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     let content_length = download.range.end.saturating_sub(download.range.start);
     let mut response = Response::builder()
@@ -152,7 +146,7 @@ async fn archived_generation_asset_response(
     }
     response
         .body(Body::from_stream(download.stream))
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("assets_archived_generation_asset_response_2"))
 }
 
 async fn provider_generation_asset_response(
@@ -180,7 +174,7 @@ async fn provider_generation_asset_response(
                 .await?
         }
     }
-    .ok_or_else(|| AppError::Upstream("generation asset upstream is unavailable".into()))?;
+    .ok_or_else(|| AppError::upstream("generation_asset_upstream_is_unavailable"))?;
     let mut request = crate::generation::provider_asset_get(state, &route, url).await?;
     let range = match single_provider_range_header(headers) {
         Ok(range) => range,
@@ -201,14 +195,15 @@ async fn provider_generation_asset_response(
         started.elapsed(),
     );
     let upstream =
-        response_result.map_err(|_| AppError::Upstream("generation asset fetch failed".into()))?;
+        response_result.map_err(|_| AppError::upstream("generation_asset_fetch_failed"))?;
     if matches!(upstream.status(), StatusCode::NOT_FOUND | StatusCode::GONE) {
         return Ok(provider_asset_unavailable());
     }
     if upstream.status() == StatusCode::RANGE_NOT_SATISFIABLE {
         let Some(requested_range) = range else {
-            return Err(AppError::Upstream(
-                "generation asset provider returned 416 without a range request".into(),
+            return Err(AppError::upstream_status(
+                "generation_asset_range_mismatch",
+                upstream.status().as_u16(),
             ));
         };
         let content_range = upstream
@@ -218,13 +213,15 @@ async fn provider_generation_asset_response(
             .and_then(crate::generation::parse_unsatisfied_content_range)
             .filter(|total| requested_range.spec.is_unsatisfied(*total))
             .ok_or_else(|| {
-                AppError::Upstream(
-                    "generation asset provider returned an invalid unsatisfied range".into(),
+                AppError::upstream_status(
+                    "generation_asset_range_mismatch",
+                    upstream.status().as_u16(),
                 )
             })?;
         if upstream.content_length() != Some(0) {
-            return Err(AppError::Upstream(
-                "generation asset provider returned a non-empty 416 response".into(),
+            return Err(AppError::upstream_status(
+                "generation_asset_range_mismatch",
+                upstream.status().as_u16(),
             ));
         }
         return Response::builder()
@@ -234,30 +231,32 @@ async fn provider_generation_asset_response(
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CACHE_CONTROL, "private, no-store")
             .body(Body::empty())
-            .map_err(|_| AppError::Internal);
+            .map_err(|_| AppError::internal("assets_provider_generation_asset_response_1"));
     }
     if !matches!(
         upstream.status(),
         StatusCode::OK | StatusCode::PARTIAL_CONTENT
     ) {
-        return Err(AppError::Upstream(format!(
-            "generation asset fetch returned HTTP {}",
-            upstream.status().as_u16()
-        )));
+        return Err(AppError::upstream_status(
+            "generation_asset_fetch_returned_http",
+            upstream.status().as_u16(),
+        ));
     }
     let status = upstream.status();
     if range.is_some() && status != StatusCode::PARTIAL_CONTENT {
-        return Err(AppError::Upstream(
-            "generation asset provider ignored the requested byte range".into(),
+        return Err(AppError::upstream_status(
+            "generation_asset_range_mismatch",
+            status.as_u16(),
         ));
     }
     if range.is_none() && status == StatusCode::PARTIAL_CONTENT {
-        return Err(AppError::Upstream(
-            "generation asset provider returned a partial response without a range request".into(),
+        return Err(AppError::upstream_status(
+            "generation_asset_range_mismatch",
+            status.as_u16(),
         ));
     }
     let validated_partial = if status == StatusCode::PARTIAL_CONTENT {
-        let requested = range.ok_or(AppError::Internal)?;
+        let requested = range.ok_or(AppError::internal("assets_provider_generation_asset_response_2"))?;
         let content_range = upstream
             .headers()
             .get(header::CONTENT_RANGE)
@@ -265,18 +264,23 @@ async fn provider_generation_asset_response(
             .and_then(crate::generation::parse_satisfied_content_range)
             .filter(|content_range| requested.spec.matches(*content_range))
             .ok_or_else(|| {
-                AppError::Upstream(
-                    "generation asset provider returned an invalid content range".into(),
+                AppError::upstream_status(
+                    "generation_asset_range_mismatch",
+                    status.as_u16(),
                 )
             })?;
         let expected_length = content_range
             .end
             .checked_sub(content_range.start)
             .and_then(|length| length.checked_add(1))
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("assets_provider_generation_asset_response_1"))?;
         if upstream.content_length() != Some(expected_length) {
-            return Err(AppError::Upstream(
-                "generation asset provider returned an invalid range content length".into(),
+            return Err(AppError::upstream_with(
+                "generation_asset_range_mismatch",
+                crate::error::ErrorFacts::new()
+                    .status(status.as_u16())
+                    .bytes(upstream.content_length().unwrap_or(0))
+                    .limit(expected_length),
             ));
         }
         Some((content_range, expected_length))
@@ -318,14 +322,10 @@ async fn provider_generation_asset_response(
             Some(Ok(chunk)) if !chunk.is_empty() => break chunk,
             Some(Ok(_)) => {}
             Some(Err(_)) => {
-                return Err(AppError::Upstream(
-                    "generation asset response stream failed".into(),
-                ));
+                return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("assets_provider_generation_asset_response")));
             }
             None if validated_partial.is_some() => {
-                return Err(AppError::Upstream(
-                    "generation asset provider returned a short range body".into(),
-                ));
+                return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("assets_provider_generation_asset_response")));
             }
             None => return Ok(provider_asset_unavailable()),
         }
@@ -354,11 +354,9 @@ async fn provider_generation_asset_response(
         .map(|(_, expected_length)| expected_length)
         .or(declared_content_length);
     let body = if let Some(expected_length) = expected_body_length {
-        let first_length = u64::try_from(first.len()).map_err(|_| AppError::Internal)?;
+        let first_length = u64::try_from(first.len()).map_err(|_| AppError::internal("assets_site_1"))?;
         if first_length > expected_length {
-            return Err(AppError::Upstream(
-                "generation asset provider returned a body larger than its content length".into(),
-            ));
+            return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("assets_upstream")));
         }
         Body::from_stream(futures_util::stream::try_unfold(
             (Some(first), body, expected_length),
@@ -402,7 +400,7 @@ async fn provider_generation_asset_response(
     } else {
         Body::from_stream(futures_util::stream::iter([Ok::<_, reqwest::Error>(first)]).chain(body))
     };
-    response.body(body).map_err(|_| AppError::Internal)
+    response.body(body).map_err(|_| AppError::internal("assets_site_2"))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

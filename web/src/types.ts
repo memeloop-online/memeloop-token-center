@@ -46,6 +46,11 @@ export interface RequestView {
   credential_identity?: RequestCredentialIdentity | null;
   error_code: string | null;
   terminal_cause_code?: string | null;
+  /**
+   * Stage stored on the open request row. Absence means no stage was recorded.
+   * It is not a terminal cause and is not inferred.
+   */
+  in_flight_stage?: 'upstream_response_headers' | 'upstream_response_body' | 'response_delivery' | null;
   failure_diagnostic?: RequestFailureDiagnostic | null;
   supplier_error?: SupplierError | null;
   /**
@@ -240,6 +245,7 @@ export interface RequestEvent {
   cost: string | null;
   error_code: string | null;
   terminal_cause_code?: string | null;
+  in_flight_stage?: RequestView['in_flight_stage'];
   failure_diagnostic?: RequestFailureDiagnostic | null;
   supplier_error?: SupplierError | null;
   archive_state: RequestArchiveState;

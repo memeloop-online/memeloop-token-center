@@ -138,8 +138,8 @@ test('typed failure diagnostics explain stage and source without guessing from t
   const downstream = { ...base, failure_diagnostic: { stage: 'response_delivery', source: 'downstream_connection', reason: 'client_disconnected' } };
   const supplierStatus = { ...base, failure_diagnostic: { stage: 'upstream_response_headers', source: 'upstream_http_response', reason: 'upstream_http_status' } };
   for (const [locale, prefix, downstreamCopy, supplierCopy] of [
-    ['zh-CN', '已记录原因', '客户端在响应交付完成前断开了连接', '上游服务在响应开始时返回了错误状态'],
-    ['en', 'Recorded cause', 'The client disconnected before response delivery completed', 'The upstream service returned an error status at the start of its response'],
+    ['zh-CN', '已记录原因', '上游已经开始返回，客户端在收完之前断开', '上游服务在响应开始时返回了错误状态'],
+    ['en', 'Recorded cause', 'The upstream had started returning, and the client disconnected before the response finished', 'The upstream service returned an error status at the start of its response'],
   ] as const) {
     // The same recorded 499 carries opposite typed evidence; only the evidence speaks.
     for (const [request, reason] of [[downstream, downstreamCopy], [supplierStatus, supplierCopy]] as const) {
@@ -151,7 +151,7 @@ test('typed failure diagnostics explain stage and source without guessing from t
     }
     // A supplier HTTP 499 never becomes a client disconnect, and the reverse, without typed evidence.
     assert.equal(requestFailureCause(base, locale), null);
-    assert.equal(requestStatusCopy(base, locale).hint, `${prefix}: ${locale === 'zh-CN' ? '当时未采集具体原因' : 'No specific cause was captured at the time'}`);
+    assert.equal(requestStatusCopy(base, locale).hint, `${prefix}: ${locale === 'zh-CN' ? '只记下了 HTTP 状态，没有记下失败发生在哪一段' : 'Only the HTTP status was stored, not the phase where it failed'}`);
     // An unrecorded observation phase adds no phase claim.
     const unknownPhase = { ...base, failure_diagnostic: { stage: null, source: 'upstream', reason: 'upstream_http2_reset' } };
     const phaseCopy = requestStatusCopy(unknownPhase, locale);
@@ -187,8 +187,8 @@ test('recorded pre-admission evidence explains non-forwarding without guessing t
     input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'service_overloaded' };
   for (const locale of ['zh-CN', 'en'] as const) {
     const expected = locale === 'zh-CN'
-      ? '请求在网关准入前失败，尚未转发；具体原因未记录'
-      : 'The request failed before gateway admission and was not forwarded; the specific cause was not recorded';
+      ? '请求没有发到上游。网关当时接不住新的请求。'
+      : 'The request was not sent upstream. The gateway could not take another request.';
     for (const evidence of [
       { terminal_cause_code: 'gateway_pre_admission' },
       { failure_diagnostic: { stage: 'pre_admission', source: 'gateway', reason: 'gateway_pre_admission' } },
@@ -198,14 +198,30 @@ test('recorded pre-admission evidence explains non-forwarding without guessing t
       assert.ok(requestStatusCopy(request, locale).hint.includes(expected));
       assert.doesNotMatch(requestStatusCopy(request, locale).hint, /pool|database|连接池|数据库|重试|retry/i);
     }
-    // Status and the public overload code alone establish neither phase nor cause.
-    assert.equal(requestFailureCause(base, locale), null);
-    for (const diagnostic of [
-      { stage: null, source: 'gateway', reason: 'gateway_pre_admission' },
-      { stage: 'pre_admission', source: 'upstream', reason: 'gateway_pre_admission' },
-      { stage: 'pre_admission', source: 'gateway', reason: 'private-canary' },
-    ]) assert.equal(requestFailureCause({ ...base, failure_diagnostic: diagnostic }, locale), null);
+    assert.equal(requestFailureCause(base, locale), locale === 'zh-CN' ? '网关当时接不住新的请求' : 'The gateway could not take another request');
+    const overload = locale === 'zh-CN' ? '网关当时接不住新的请求' : 'The gateway could not take another request';
+    const fact = (token: string) => locale === 'zh-CN' ? `失败阶段 ${token}` : `failure stage ${token}`;
+    const joined = (tokens: string[]) => locale === 'zh-CN'
+      ? [overload, ...tokens.map(fact)].join('。')
+      : [overload, ...tokens.map(fact)].join('. ');
+    for (const [diagnostic, tokens] of [
+      [{ stage: null, source: 'gateway', reason: 'gateway_pre_admission' }, ['gateway_pre_admission']],
+      [{ stage: 'pre_admission', source: 'upstream', reason: 'gateway_pre_admission' }, ['pre_admission', 'gateway_pre_admission']],
+      [{ stage: 'pre_admission', source: 'gateway', reason: 'private-canary' }, ['pre_admission']],
+    ] as const) {
+      const cause = requestFailureCause({ ...base, failure_diagnostic: diagnostic }, locale);
+      assert.equal(cause, joined(tokens));
+      assert.doesNotMatch(cause ?? '', /private-canary/);
+    }
     const specific = { ...base, terminal_cause_code: 'gateway_pre_admission', error_code: 'upstream_read_timeout' };
-    assert.equal(requestFailureCause(specific, locale), locale === 'zh-CN' ? '读取上游响应超时' : 'Reading the upstream response timed out');
+    assert.equal(requestFailureCause(specific, locale), locale === 'zh-CN' ? '请求没有发到上游。读取上游响应超时。' : 'The request was not sent upstream. Reading the upstream response timed out.');
+    const pool = { ...base, terminal_cause_code: 'gateway_pre_admission', error_code: 'database_pool_exhausted' };
+    assert.equal(requestFailureCause(pool, locale), locale === 'zh-CN'
+      ? '请求没有发到上游。数据库连接池等待超时。'
+      : 'The request was not sent upstream. The database connection pool timed out.');
+    const ingress = { ...base, error_code: 'proxy_memory_ingress' };
+    assert.equal(requestFailureCause(ingress, locale), locale === 'zh-CN'
+      ? '网关内存装不下这次请求体，也没有写入对象存储'
+      : 'The gateway memory budget could not hold the request body, and the body was not written to object storage');
   }
 });

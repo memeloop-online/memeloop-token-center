@@ -27,11 +27,11 @@ fn output_validity_price_snapshot(
     output_token_limit: Option<i64>,
 ) -> Result<String, AppError> {
     if output_token_limit.is_some_and(|limit| !(0..=1_000_000_000).contains(&limit)) {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("lifecycle_output_validity_price_snapshot_1"));
     }
-    let mut snapshot = serde_json::to_value(price).map_err(|_| AppError::Internal)?;
+    let mut snapshot = serde_json::to_value(price).map_err(|_| AppError::internal("lifecycle_output_validity_price_snapshot_1"))?;
     snapshot["output_token_limit"] = serde_json::json!(output_token_limit);
-    serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)
+    serde_json::to_string(&snapshot).map_err(|_| AppError::internal("lifecycle_output_validity_price_snapshot_2"))
 }
 
 async fn persist_output_token_limit(
@@ -62,7 +62,7 @@ fn output_token_limit_from_snapshot(
         return Ok(Some(legacy_ceiling));
     };
     let snapshot: serde_json::Value =
-        serde_json::from_str(snapshot).map_err(|_| AppError::Internal)?;
+        serde_json::from_str(snapshot).map_err(|_| AppError::internal("lifecycle_output_token_limit_from_snapshot_1"))?;
     match snapshot.get("output_token_limit") {
         None => Ok(Some(legacy_ceiling)),
         Some(serde_json::Value::Null) => Ok(None),
@@ -70,7 +70,7 @@ fn output_token_limit_from_snapshot(
             .as_i64()
             .filter(|limit| (0..=1_000_000_000).contains(limit))
             .map(Some)
-            .ok_or(AppError::Internal),
+            .ok_or(AppError::internal("lifecycle_output_token_limit_from_snapshot_1")),
     }
 }
 
@@ -440,7 +440,11 @@ impl Database {
             .await
             .map(|started| started.reservation)
             .map_err(|error| match error {
-                AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
+                error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
+                    .retarget_capacity(
+                        "request_record_persist_failed",
+                        crate::error::ErrorFacts::new().phase("request_record"),
+                    ),
                 other => other,
             })
     }
@@ -545,7 +549,11 @@ impl Database {
             )
             .await
             .map_err(|error| match error {
-                AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
+                error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
+                    .retarget_capacity(
+                        "request_record_persist_failed",
+                        crate::error::ErrorFacts::new().phase("request_admission"),
+                    ),
                 other => other,
             });
         if let Err(error) = &result {
@@ -590,7 +598,13 @@ impl Database {
                     pepper,
                     compression_enabled,
                 )
-                .map_err(|_| AppError::Overloaded)
+                .map_err(|error| match error {
+                    error @ AppError::Capacity { .. } => error,
+                    other => other.retarget_capacity(
+                        "request_archive_prepare_failed",
+                        crate::error::ErrorFacts::new().phase("request_admission"),
+                    ),
+                })
             })
             .transpose()?;
         // Prepare only the existing bounded first insert batch before taking
@@ -621,7 +635,13 @@ impl Database {
                 let (tx, now, hold) = self
                     .reserved_spool_transaction(reservation, "request_admission")
                     .await
-                    .map_err(|_| AppError::Overloaded)?;
+                    .map_err(|error| match error {
+                    error @ AppError::Capacity { .. } => error,
+                    other => other.retarget_capacity(
+                        "request_archive_reservation_failed",
+                        crate::error::ErrorFacts::new().phase("request_admission"),
+                    ),
+                })?;
                 (tx, now, Some(hold))
             } else {
                 (self.begin_write_transaction().await?, unix_millis(), None)
@@ -659,12 +679,12 @@ impl Database {
                 .await?;
             if updated.rows_affected() != 1 {
                 BudgetHold::rollback_optional(transaction, hold).await?;
-                return Err(AppError::Internal);
+                return Err(AppError::internal("lifecycle_start_proxy_request_inner_1"));
             }
         }
         if let (Some(archive), Some(_)) = (buffered_archive, budget_reservation.as_ref()) {
             BudgetHold::set_phase(&mut hold, "archive_capture");
-            let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
+            let prepared_request_batch = prepared_request_batch.ok_or(AppError::internal("lifecycle_start_proxy_request_inner_2"))?;
             let capture_started = std::time::Instant::now();
             let captured = self
                 .capture_reserved_buffered_archive_body_in_transaction(
@@ -690,15 +710,35 @@ impl Database {
                 if let Some(reservation) = budget_reservation.as_ref() {
                     reservation.release().await;
                 }
-                return Err(AppError::Overloaded);
+                return Err({
+                    let stage = if captured.is_err() {
+                        "capture_failed"
+                    } else {
+                        "capacity"
+                    };
+                    let mut facts = crate::error::ErrorFacts::new()
+                        .phase("archive_capture")
+                        .stage(stage);
+                    let sql_kind = match &captured {
+                        Err(AppError::Internal { facts, .. })
+                        | Err(AppError::Capacity { facts, .. })
+                        | Err(AppError::Storage { facts, .. })
+                        | Err(AppError::Upstream { facts, .. }) => facts.kind,
+                        _ => None,
+                    };
+                    if let Some(kind) = sql_kind {
+                        facts = facts.kind(kind);
+                    }
+                    AppError::capacity("request_archive_capture_failed", facts)
+                });
             }
         } else if archive.is_some() {
-            let (body, _, _) = archive.ok_or(AppError::Internal)?;
+            let (body, _, _) = archive.ok_or(AppError::internal("lifecycle_site_1"))?;
             let reason = match archive_admission {
                 RequestArchiveAdmission::GapCapacity => "capacity",
                 RequestArchiveAdmission::GapRetentionLimit => "retention_limit",
                 RequestArchiveAdmission::Captured | RequestArchiveAdmission::Queued => {
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("lifecycle_site_2"));
                 }
             };
             super::super::archive_spool::insert_request_archive_gap_in_transaction(
@@ -710,7 +750,7 @@ impl Database {
             )
             .await?;
         } else if prepared_request_batch.is_some() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("lifecycle_site_3"));
         }
         // Finish private archive writes before taking any financial hold.
         // Admission remains one atomic commit, but a slow archive batch cannot
@@ -744,10 +784,17 @@ impl Database {
         BudgetHold::commit_optional(transaction, hold)
             .await
             .map_err(|error| {
+                let kind = crate::error::sqlx_error_kind(&error);
+                let app = AppError::from(error);
                 if archive.is_some() {
-                    AppError::Overloaded
+                    app.retarget_capacity(
+                        "request_archive_commit_failed",
+                        crate::error::ErrorFacts::new()
+                            .phase("request_admission")
+                            .kind(kind),
+                    )
                 } else {
-                    error.into()
+                    app
                 }
             })?;
         if let Some(reservation) = budget_reservation.as_ref() {
@@ -858,7 +905,7 @@ impl Database {
                 .bind(input.reservation.id.to_string())
                 .fetch_one(&mut *transaction)
                 .await?;
-            retained_price = serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+            retained_price = serde_json::from_str(&snapshot).map_err(|_| AppError::internal("lifecycle_switch_pending_proxy_candidate_1"))?;
             &retained_price
         } else {
             input.price
@@ -1098,6 +1145,34 @@ impl Database {
         Ok(())
     }
 
+    /// Stores the stage a still-open proxy request has actually reached.
+    /// This is operator evidence for the request list. It is not delivery
+    /// preparation, not a settlement claim, and not a terminal cause.
+    /// A missing row or an already finished request is left unchanged.
+    pub(crate) async fn record_proxy_in_flight_stage(
+        &self,
+        request_id: Uuid,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        reservation_id: Uuid,
+        stage: &'static str,
+    ) -> Result<(), AppError> {
+        if crate::model::recorded_in_flight_stage(Some(stage.to_owned())).is_none() {
+            return Err(AppError::internal("lifecycle_record_proxy_in_flight_stage_1"));
+        }
+        sqlx::query(
+            "UPDATE request_records SET in_flight_stage = $1 WHERE id = $2 AND tenant_id = $3 AND key_id = $4 AND reservation_id = $5 AND completed_at IS NULL AND (in_flight_stage IS NULL OR in_flight_stage <> $1)",
+        )
+        .bind(stage)
+        .bind(request_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(key_id.to_string())
+        .bind(reservation_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Converges an admitted stream after its in-process lifecycle deadline.
     ///
     /// The durable delivery marker, rather than the cancelled task's local
@@ -1180,7 +1255,7 @@ impl Database {
         let input_token_ceiling = if delivery_started {
             pending
                 .as_ref()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal("lifecycle_finish_unobserved_proxy_request_1"))?
                 .try_get::<i64, _>("input_tokens")?
         } else {
             reservation.reserved_tokens
@@ -1188,7 +1263,7 @@ impl Database {
         let output_token_ceiling = if delivery_started {
             pending
                 .as_ref()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal("lifecycle_finish_unobserved_proxy_request_2"))?
                 .try_get::<i64, _>("output_tokens")?
         } else {
             0
@@ -1203,7 +1278,7 @@ impl Database {
         let requested_service_tier = if delivery_started {
             pending
                 .as_ref()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal("lifecycle_finish_unobserved_proxy_request_3"))?
                 .try_get::<Option<String>, _>("service_tier")?
         } else {
             None
@@ -1568,12 +1643,12 @@ impl Database {
                 let result = FinishProxyRequestResult::AlreadyFinished {
                     status_code: existing
                         .try_get::<Option<i64>, _>("status_code")?
-                        .ok_or(AppError::Internal)?,
+                        .ok_or(AppError::internal("lifecycle_site_4"))?,
                     cost_micros: existing.try_get("cost_micros")?,
                     error_code: existing.try_get("error_code")?,
                     response_object: existing
                         .try_get::<Option<String>, _>("response_object")?
-                        .ok_or(AppError::Internal)?,
+                        .ok_or(AppError::internal("lifecycle_site_5"))?,
                 };
                 // Repair feeds for terminal requests written before settlement
                 // publication existed. The publisher is idempotent for replays.
@@ -1654,7 +1729,7 @@ impl Database {
                     (0, 0, Vec::new())
                 } else if let Some(snapshot) = price_snapshot_json {
                     let price: ModelPrice =
-                        serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+                        serde_json::from_str(&snapshot).map_err(|_| AppError::internal("lifecycle_site_1"))?;
                     (
                         price.input_micros_per_million,
                         price.output_micros_per_million,
@@ -1676,7 +1751,7 @@ impl Database {
                         .try_get::<String, _>("enforcement_mode")?
                         .as_str(),
                 )
-                .ok_or(AppError::Internal)?,
+                .ok_or(AppError::internal("lifecycle_site_6"))?,
                 reserved_micros: reservation_row.try_get("reserved_micros")?,
                 input_micros_per_million,
                 output_micros_per_million,
@@ -1894,7 +1969,7 @@ impl Database {
                     input.response_object.to_owned(),
                     false,
                 ),
-                Err(AppError::Upstream(_)) => (
+                Err(AppError::Upstream { .. }) => (
                     TokenUsage::default(),
                     502,
                     Some("upstream_invalid_usage".to_owned()),
@@ -2022,7 +2097,7 @@ impl Database {
             // transaction publishes the complete terminal snapshot.
             "settled" => reservation_row
                 .try_get::<Option<i64>, _>("actual_micros")?
-                .ok_or(AppError::Internal)?,
+                .ok_or(AppError::internal("lifecycle_site_7"))?,
             _ => {
                 return Err(AppError::Conflict(
                     "request reservation is not finishable".into(),
@@ -2290,7 +2365,7 @@ pub(crate) async fn allocate_request_event_cursor(
                     event_at: last_at,
                 }
             } else {
-                let event_at = last_at.checked_add(1).ok_or(AppError::Internal)?;
+                let event_at = last_at.checked_add(1).ok_or(AppError::internal("lifecycle_allocate_request_event_cursor_1"))?;
                 RequestEventCursor {
                     event_id: fresh_v7_at(event_at)?,
                     event_at,
@@ -2310,15 +2385,15 @@ pub(crate) async fn allocate_request_event_cursor(
     .execute(&mut **transaction)
     .await?;
     if claimed.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("lifecycle_allocate_request_event_cursor_2"));
     }
     Ok(cursor)
 }
 
 fn fresh_v7_at(event_at: i64) -> Result<String, AppError> {
-    let millis = u64::try_from(event_at).map_err(|_| AppError::Internal)?;
+    let millis = u64::try_from(event_at).map_err(|_| AppError::internal("lifecycle_fresh_v7_at_1"))?;
     if millis > 0x0000_ffff_ffff_ffff {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("lifecycle_fresh_v7_at_1"));
     }
     let timestamp = millis.to_be_bytes();
     let mut bytes = *Uuid::now_v7().as_bytes();
@@ -2791,7 +2866,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("lifecycle_site_8"));
     }
     Ok(true)
 }

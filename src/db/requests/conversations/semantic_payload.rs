@@ -139,8 +139,8 @@ pub(super) fn encode(
         ));
     }
     let mut bytes = Vec::with_capacity(length);
-    serde_json::to_writer(&mut bytes, request).map_err(|_| AppError::Internal)?;
-    let body = String::from_utf8(bytes).map_err(|_| AppError::Internal)?;
+    serde_json::to_writer(&mut bytes, request).map_err(|_| AppError::internal("semantic_payload_encode_1"))?;
+    let body = String::from_utf8(bytes).map_err(|_| AppError::internal("semantic_payload_encode_2"))?;
     let digest = digest(
         &request_id.to_string(),
         &key.tenant_id.to_string(),
@@ -171,7 +171,7 @@ pub(super) async fn persist(
             &key.principal_id.to_string(),
             digest,
         )?;
-        if serde_json::to_string(&decoded).map_err(|_| AppError::Internal)? != body {
+        if serde_json::to_string(&decoded).map_err(|_| AppError::internal("semantic_payload_persist_1"))? != body {
             return Err(AppError::Conflict(
                 "conversation semantic payload changed".into(),
             ));
@@ -180,14 +180,14 @@ pub(super) async fn persist(
     Ok(())
 }
 
-fn validate(
+fn validated_body(
     row: &sqlx::any::AnyRow,
     request_id: Uuid,
     tenant_id: &str,
     key_id: &str,
     principal_id: &str,
     expected: &str,
-) -> Result<serde_json::Value, AppError> {
+) -> Result<String, AppError> {
     let body: String = row.try_get("request_json")?;
     if row.try_get::<String, _>("tenant_id")? != tenant_id
         || row.try_get::<String, _>("key_id")? != key_id
@@ -208,6 +208,30 @@ fn validate(
             "conversation semantic payload integrity mismatch".into(),
         ));
     }
+    if !json_document(&body) {
+        return Err(AppError::Conflict(
+            "invalid conversation semantic payload".into(),
+        ));
+    }
+    Ok(body)
+}
+
+fn json_document(body: &str) -> bool {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    serde::de::IgnoredAny::deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
+}
+
+fn validate(
+    row: &sqlx::any::AnyRow,
+    request_id: Uuid,
+    tenant_id: &str,
+    key_id: &str,
+    principal_id: &str,
+    expected: &str,
+) -> Result<serde_json::Value, AppError> {
+    // Conflict replay still compares canonical JSON. The worker rebuild path
+    // uses `validated_body` and never builds this document.
+    let body = validated_body(row, request_id, tenant_id, key_id, principal_id, expected)?;
     serde_json::from_str(&body)
         .map_err(|_| AppError::Conflict("invalid conversation semantic payload".into()))
 }
@@ -219,7 +243,7 @@ pub(super) async fn load(
     key_id: &str,
     principal_id: &str,
     expected: &str,
-) -> Result<serde_json::Value, AppError> {
+) -> Result<String, AppError> {
     let length = match database.backend {
         DatabaseBackend::PostgreSql => "octet_length(request_json)",
         DatabaseBackend::Sqlite => "length(CAST(request_json AS BLOB))",
@@ -232,7 +256,7 @@ pub(super) async fn load(
         .fetch_optional(&database.pool)
         .await?
         .ok_or_else(|| AppError::Conflict("conversation semantic payload is missing".into()))?;
-    validate(&row, request_id, tenant_id, key_id, principal_id, expected)
+    validated_body(&row, request_id, tenant_id, key_id, principal_id, expected)
 }
 
 pub(super) async fn verify_in_transaction(
@@ -254,7 +278,7 @@ pub(super) async fn verify_in_transaction(
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or_else(|| AppError::Conflict("conversation semantic payload is missing".into()))?;
-    validate(
+    validated_body(
         &row,
         request_id,
         &key.tenant_id.to_string(),

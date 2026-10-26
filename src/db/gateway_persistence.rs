@@ -165,7 +165,7 @@ impl Database {
         let request_id = input.request_id;
         let tenant_id = input.key.tenant_id;
         if input.request_object != format!("gap://{request_id}/request") {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("gateway_persistence_start_proxy_request_with_deferred_archive_1"));
         }
         let reservation = self
             .start_proxy_forwarding_request_with_output_limit(
@@ -175,7 +175,12 @@ impl Database {
             )
             .await
             .map_err(|error| match error {
-                AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
+                error @ AppError::Capacity { .. } => error,
+                error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
+                    .retarget_capacity(
+                        "request_record_persist_failed",
+                        crate::error::ErrorFacts::new().phase("request_admission"),
+                    ),
                 other => other,
             })?;
         let identity = ArchiveSpoolIdentity {
@@ -213,7 +218,7 @@ impl Database {
                         .writer
                         .acquire()
                         .await
-                        .map_err(|_| AppError::Internal)?;
+                        .map_err(|_| AppError::internal("gateway_persistence_start_proxy_request_with_deferred_archive_1"))?;
                     if let Err(error) = database.publish_proxy_started_event(identity).await {
                         tracing::warn!(%request_id, reason = error.diagnostic_category(), "request started event omitted");
                     }
@@ -329,7 +334,12 @@ impl Database {
             )
             .await?
         {
-            return Err(AppError::Overloaded);
+            return Err(AppError::capacity(
+            "request_archive_capture_failed",
+            crate::error::ErrorFacts::new()
+                .phase("deferred_request_archive")
+                .stage("capacity"),
+        ));
         }
         hold.commit(transaction).await?;
         capacity.release().await;

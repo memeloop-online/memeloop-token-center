@@ -157,7 +157,7 @@ pub(super) async fn list_model_picker_options(
     for item in &mut data {
         for source in &mut item.sources {
             let canonical_id = canonicalize_provider_driver(&source.provider.id).to_owned();
-            let provider = providers.get(&canonical_id).ok_or(AppError::Internal)?;
+            let provider = providers.get(&canonical_id).ok_or(AppError::internal("model_picker_list_model_picker_options_1"))?;
             source.provider.id = canonical_id;
             source.provider.label = provider.display_name.clone();
             source.provider.protocols = provider.protocols.clone();
@@ -170,7 +170,7 @@ pub(super) async fn list_model_picker_options(
         data.truncate(query.limit as usize);
     }
     let next_cursor = if has_more {
-        let last = data.last().ok_or(AppError::Internal)?;
+        let last = data.last().ok_or(AppError::internal("model_picker_list_model_picker_options_2"))?;
         Some(encode_cursor(ModelPickerCursor {
             version: 1,
             selection_kind: query.selection_kind,
@@ -222,12 +222,12 @@ fn parse_uuid_filter(value: Option<&str>) -> Result<Vec<Uuid>, AppError> {
 }
 
 fn cursor_scope_sha256(scope: &ModelPickerCursorScope<'_>) -> Result<String, AppError> {
-    let encoded = serde_json::to_vec(scope).map_err(|_| AppError::Internal)?;
+    let encoded = serde_json::to_vec(scope).map_err(|_| AppError::internal("model_picker_cursor_scope_sha256_1"))?;
     Ok(URL_SAFE_NO_PAD.encode(Sha256::digest(encoded)))
 }
 
 fn encode_cursor(cursor: ModelPickerCursor) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(&cursor).map_err(|_| AppError::Internal)?;
+    let bytes = serde_json::to_vec(&cursor).map_err(|_| AppError::internal("model_picker_encode_cursor_1"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 

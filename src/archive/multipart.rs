@@ -80,15 +80,13 @@ impl ArchiveWriter {
     pub async fn write(&mut self, mut bytes: Bytes) -> Result<(), AppError> {
         let next_size = self
             .size_bytes
-            .checked_add(u64::try_from(bytes.len()).map_err(|_| AppError::Internal)?)
-            .ok_or_else(|| AppError::Storage("archive object size overflow".into()))?;
+            .checked_add(u64::try_from(bytes.len()).map_err(|_| AppError::internal("multipart_write_1"))?)
+            .ok_or_else(|| AppError::storage("archive_object_size_overflow"))?;
         if self.inner.is_none() {
-            return Err(AppError::Storage("archive writer is already closed".into()));
+            return Err(AppError::storage("archive_writer_is_already_closed"));
         }
         if self.compressed && next_size > super::compressed::MAX_PLAIN {
-            return Err(AppError::Storage(
-                "archive text object exceeds format limit".into(),
-            ));
+            return Err(AppError::storage("local_storage_failed"));
         }
         self.hasher.update(&bytes);
         self.size_bytes = next_size;
@@ -156,9 +154,7 @@ impl ArchiveWriter {
         // objects currently bind only request-owned staged locators; do not
         // publish a suffix-bearing CAS locator that other readers reject.
         if self.compressed {
-            return Err(AppError::Storage(
-                "compressed archive writers require staged finish".into(),
-            ));
+            return Err(AppError::storage("local_storage_failed"));
         }
         self.finish_multipart().await?;
         let location = content_location(
@@ -199,7 +195,7 @@ impl ArchiveWriter {
 
     async fn finish_multipart(&mut self) -> Result<(), AppError> {
         if self.inner.is_none() {
-            return Err(AppError::Storage("archive writer is already closed".into()));
+            return Err(AppError::storage("archive_writer_is_already_closed"));
         }
         if self.compressed {
             if !self.compressed_pending.is_empty() {
@@ -211,7 +207,7 @@ impl ArchiveWriter {
                 .await?;
         }
         let Some(mut inner) = self.inner.take() else {
-            return Err(AppError::Storage("archive writer is already closed".into()));
+            return Err(AppError::storage("archive_writer_is_already_closed"));
         };
 
         // object_store::WriteMultipart aborts when `complete` fails, but a

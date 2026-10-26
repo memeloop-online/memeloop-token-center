@@ -520,7 +520,7 @@ async fn poll_codex_device_login_at(
     let token = if let Some(token) = state.issued_token.clone() {
         token
     } else {
-        let device_token = state.device_token.as_ref().ok_or(AppError::Internal)?;
+        let device_token = state.device_token.as_ref().ok_or(AppError::internal("codex_device_poll_codex_device_login_at_1"))?;
         state.exchange_dispatched = true;
         db.replace_oauth_login_poll_state(
             state.session_id,
@@ -619,7 +619,7 @@ async fn poll_codex_device_login_at(
         } => Ok(CodexDevicePollResult::Pending {
             retry_after_seconds,
         }),
-        OAuthLoginClaim::Claimed { .. } => Err(AppError::Internal),
+        OAuthLoginClaim::Claimed { .. } => Err(AppError::internal("codex_device_site_1")),
     }
 }
 
@@ -816,7 +816,7 @@ fn validate_user_code(value: &str) -> Result<(), AppError> {
 }
 
 fn device_error() -> AppError {
-    AppError::Upstream("OpenAI Codex authorization failed".into())
+    AppError::upstream("openai_codex_authorization_failed")
 }
 
 #[cfg(test)]

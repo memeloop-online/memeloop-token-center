@@ -189,7 +189,7 @@ pub(in crate::api) async fn request_detail_response_with_transport_diagnostics(
     let mut detail = request_detail(state, refs).await;
     detail.transport_diagnostics = transport_diagnostics;
     detail.egress_attempts = egress_attempts;
-    let mut body = serde_json::to_vec(&detail).map_err(|_| AppError::Internal)?;
+    let mut body = serde_json::to_vec(&detail).map_err(|_| AppError::internal("requests_request_detail_response_with_transport_diagnostics_1"))?;
     if body.len() > MAX_ARCHIVE_DETAIL_RESPONSE {
         detail.request_body = Value::Null;
         detail.response_body = Value::Null;
@@ -198,7 +198,7 @@ pub(in crate::api) async fn request_detail_response_with_transport_diagnostics(
             side.complete = false;
             side.reason = Some("archive_detail_response_too_large".to_owned());
         }
-        body = serde_json::to_vec(&detail).map_err(|_| AppError::Internal)?;
+        body = serde_json::to_vec(&detail).map_err(|_| AppError::internal("requests_request_detail_response_with_transport_diagnostics_2"))?;
     }
     let body_len = body.len();
     Response::builder()
@@ -207,7 +207,7 @@ pub(in crate::api) async fn request_detail_response_with_transport_diagnostics(
         .header(header::CONTENT_LENGTH, body_len)
         .header(header::CACHE_CONTROL, "private, no-store")
         .body(Body::from(body))
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("requests_request_detail_response_with_transport_diagnostics_3"))
 }
 
 pub(in crate::api) async fn self_stats(

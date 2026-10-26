@@ -103,7 +103,7 @@ struct DeviceResponse {
 }
 
 fn failed() -> AppError {
-    AppError::Upstream("Kimi OAuth request failed".into())
+    AppError::upstream("kimi_oauth_request_failed")
 }
 
 fn encode_form(form: &[(&str, &str)]) -> String {
@@ -479,7 +479,7 @@ fn claim_result(
             lease_owner,
             login: Box::new(open_private_json(&ready_ciphertext, key, READY_AAD)?),
         },
-        OAuthLoginClaim::Claimed { .. } => return Err(AppError::Internal),
+        OAuthLoginClaim::Claimed { .. } => return Err(AppError::internal("kimi_device_claim_result_1")),
     })
 }
 
@@ -585,7 +585,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, AppError::Upstream(_)));
+        assert!(matches!(error, AppError::Upstream { .. }));
         shutdown.send(()).unwrap();
         server.await.unwrap();
         assert_eq!(

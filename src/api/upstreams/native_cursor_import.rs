@@ -62,7 +62,7 @@ pub(in crate::api) async fn import_native_cursor_oauth(
         }
     }
     let document =
-        serde_json::to_vec(&canonical_json(&body.document)).map_err(|_| AppError::Internal)?;
+        serde_json::to_vec(&canonical_json(&body.document)).map_err(|_| AppError::internal("native_cursor_import_import_native_cursor_oauth_1"))?;
     if document.len() > 1024 * 1024
         || format!("{:x}", Sha256::digest(&document)) != body.source_document_sha256
     {
@@ -130,8 +130,8 @@ pub(in crate::api) async fn import_native_cursor_oauth(
 }
 
 fn keyed_digest(pepper: &[u8], domain: &[u8], value: &Value) -> Result<String, AppError> {
-    let mut mac = Hmac::<Sha256>::new_from_slice(pepper).map_err(|_| AppError::Internal)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(pepper).map_err(|_| AppError::internal("native_cursor_import_keyed_digest_1"))?;
     mac.update(domain);
-    mac.update(&serde_json::to_vec(&canonical_json(value)).map_err(|_| AppError::Internal)?);
+    mac.update(&serde_json::to_vec(&canonical_json(value)).map_err(|_| AppError::internal("native_cursor_import_keyed_digest_2"))?);
     Ok(format!("{:x}", mac.finalize().into_bytes()))
 }

@@ -169,7 +169,7 @@ impl Database {
         let now = unix_millis();
         let service_id = Uuid::now_v7();
         let issued = crypto::issue_service_credential(service_id, pepper);
-        let scopes_json = serde_json::to_string(&input.scopes).map_err(|_| AppError::Internal)?;
+        let scopes_json = serde_json::to_string(&input.scopes).map_err(|_| AppError::internal("service_tokens_create_service_token_1"))?;
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO service_principals (id, name, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'active', 1, $3, $4)",
@@ -261,7 +261,7 @@ impl Database {
         let generation = row.try_get::<i64, _>("credential_generation")? + 1;
         let scopes_json: String = row.try_get("scopes_json")?;
         let scopes: Vec<String> =
-            serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?;
+            serde_json::from_str(&scopes_json).map_err(|_| AppError::internal("service_tokens_rotate_service_token_1"))?;
         validate_service_scopes(&scopes)?;
         let tenant_external_id: Option<String> = row.try_get("tenant_external_id")?;
         let name: String = row.try_get("name")?;
@@ -341,7 +341,7 @@ impl Database {
         let token = token.ok_or(AppError::NotFound)?;
         let expected: Vec<u8> = row.try_get("secret_hash")?;
         if !crypto::verify_credential(&token, pepper, &expected) {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("service_tokens_copy_service_token_1"));
         }
         Ok(CopiedServiceCredential {
             service_id,
@@ -396,7 +396,7 @@ fn service_token_view(row: AnyRow) -> Result<ServiceTokenView, AppError> {
         fingerprint: row.try_get("fingerprint")?,
         credential_copy_available: row.try_get::<i64, _>("credential_copy_available")? != 0
             && row.try_get::<String, _>("status")? == "active",
-        scopes: serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?,
+        scopes: serde_json::from_str(&scopes_json).map_err(|_| AppError::internal("service_tokens_service_token_view_1"))?,
         tenant_external_id: row.try_get("tenant_external_id")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -476,13 +476,13 @@ mod tests {
             database
                 .copy_service_token(issued.service_id, b"wrong pepper")
                 .await,
-            Err(AppError::Internal)
+            Err(AppError::Internal { .. })
         ));
         sqlx::query("UPDATE service_credentials SET secret_plaintext = 'incorrect-original-value' WHERE service_principal_id = $1")
             .bind(issued.service_id.to_string()).execute(&database.pool).await.unwrap();
         assert!(matches!(
             database.copy_service_token(issued.service_id, pepper).await,
-            Err(AppError::Internal)
+            Err(AppError::Internal { .. })
         ));
         sqlx::query("UPDATE service_credentials SET secret_plaintext = NULL WHERE service_principal_id = $1")
             .bind(issued.service_id.to_string()).execute(&database.pool).await.unwrap();

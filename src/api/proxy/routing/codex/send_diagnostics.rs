@@ -18,9 +18,9 @@ pub(super) struct BodyConsumption {
 }
 
 impl BodyConsumption {
-    pub(super) fn attach(&self, request: &mut wreq::Request) {
+    pub(super) fn attach(&self, request: &mut reqwest::Request) {
         if let Some(body) = request.body_mut().take() {
-            *request.body_mut() = Some(wreq::Body::wrap(ObservedRequestBody {
+            *request.body_mut() = Some(reqwest::Body::wrap(ObservedRequestBody {
                 inner: body,
                 consumption: self.clone(),
             }));
@@ -37,13 +37,13 @@ impl BodyConsumption {
 }
 
 struct ObservedRequestBody {
-    inner: wreq::Body,
+    inner: reqwest::Body,
     consumption: BodyConsumption,
 }
 
 impl Body for ObservedRequestBody {
     type Data = bytes::Bytes;
-    type Error = wreq::Error;
+    type Error = reqwest::Error;
 
     fn poll_frame(
         mut self: Pin<&mut Self>,
@@ -84,8 +84,6 @@ pub(super) struct TransportIdentity {
 }
 
 pub(super) struct Http2AttemptEvidence {
-    #[cfg(any(test, feature = "h2-attempt-binding"))]
-    binding: Option<wreq_proto::ext::H2AttemptObserver>,
     request_id: Uuid,
     upstream_account_id: Uuid,
     credential_generation: i64,
@@ -99,25 +97,14 @@ pub(super) struct Http2AttemptEvidence {
 }
 
 impl Http2AttemptEvidence {
-    #[cfg(feature = "h2-attempt-binding")]
-    pub(super) fn binding_observer(&self) -> Option<wreq_proto::ext::H2AttemptObserver> {
-        self.binding.clone()
-    }
-
     pub(super) fn capture(
         route: &ResolvedUpstream,
         identity: TransportIdentity,
         context: CodexAttemptContext,
         account_proxy: bool,
         body_consumption: BodyConsumption,
-        binding_enabled: bool,
     ) -> Self {
-        #[cfg(not(any(test, feature = "h2-attempt-binding")))]
-        let _ = binding_enabled;
         Self {
-            #[cfg(any(test, feature = "h2-attempt-binding"))]
-            binding: (cfg!(feature = "h2-attempt-binding") && binding_enabled)
-                .then(wreq_proto::ext::H2AttemptObserver::default),
             request_id: context.request_id,
             upstream_account_id: route.account_id,
             credential_generation: route.credential_generation,
@@ -136,57 +123,12 @@ impl Http2AttemptEvidence {
         }
     }
 
-    #[cfg(any(test, feature = "h2-attempt-binding"))]
-    pub(super) fn attach_binding(&self, request: &mut wreq::Request) {
-        if let Some(binding) = &self.binding {
-            request.extensions_mut().insert(binding.clone());
-        }
-    }
-
-    #[cfg(feature = "h2-attempt-binding")]
-    fn observe_binding(&self, stage: &'static str, status: Option<u16>) {
-        if let Some(binding) = self
-            .binding
-            .as_ref()
-            .and_then(|observer| observer.snapshot())
-        {
-            tracing::info!(
-                request_id = %self.request_id,
-                upstream_account_id = %self.upstream_account_id,
-                credential_generation = self.credential_generation,
-                transport_revision = self.transport_revision,
-                candidate_rank = self.candidate_rank,
-                outbound_attempt = self.outbound_attempt,
-                connect_attempt = self.identity.connect_attempt,
-                stage, status,
-                h2_connection_id = binding.connection_id,
-                h2_stream_id = binding.stream_id,
-                h2_stream_ordinal = binding.stream_ordinal,
-                h2_connection_age_ms = binding.connection_age_ms,
-                h2_lifecycle = binding.lifecycle,
-                h2_terminal_age_ms = binding.terminal_age_ms,
-                lifecycle_scope = "local_connection_task_not_peer_close",
-                peer_delivery_state = "unknown",
-                "Optional H2 attempt binding"
-            );
-        }
-    }
-
     pub(super) fn observe_error(
         &self,
         error: &(dyn std::error::Error + 'static),
         before_response_headers: bool,
     ) {
         if let Some(http2) = upstream_response::codex_http2_error(error) {
-            #[cfg(feature = "h2-attempt-binding")]
-            self.observe_binding(
-                if before_response_headers {
-                    "codex_h2_binding_before_response_headers"
-                } else {
-                    "codex_h2_binding_response_body"
-                },
-                None,
-            );
             tracing::warn!(
                 request_id = %self.request_id,
                 upstream_account_id = %self.upstream_account_id,
@@ -221,13 +163,8 @@ impl Http2AttemptEvidence {
         }
     }
 
-    pub(super) fn observe_response(self, response: wreq::Response) -> UpstreamResponse {
+    pub(super) fn observe_response(self, response: reqwest::Response) -> UpstreamResponse {
         use futures_util::StreamExt;
-        #[cfg(feature = "h2-attempt-binding")]
-        self.observe_binding(
-            "codex_h2_binding_response_admitted_not_full_success",
-            Some(response.status().as_u16()),
-        );
         UpstreamResponse::Prefetched {
             status: response.status(),
             headers: response.headers().clone(),
@@ -261,7 +198,7 @@ struct PreparedRequestEvidence {
 }
 
 impl PreparedRequestEvidence {
-    fn capture(request: &wreq::Request, known_payload_bytes: usize) -> Self {
+    fn capture(request: &reqwest::Request, known_payload_bytes: usize) -> Self {
         let headers = request.headers();
         let content_lengths = headers.get_all(header::CONTENT_LENGTH);
         let prepared_content_length_count = content_lengths.iter().count();
@@ -300,11 +237,12 @@ impl PreparedRequestEvidence {
             prepared_content_length,
             content_length_state,
             request_protocol_policy: match request.version() {
-                None => "client_default_negotiation",
-                Some(Version::HTTP_10) => "explicit_http_10",
-                Some(Version::HTTP_11) => "explicit_http_11",
-                Some(Version::HTTP_2) => "explicit_http_2",
-                Some(_) => "explicit_other",
+                // reqwest stores HTTP/1.1 when the caller does not pin a version.
+                // ALPN can still negotiate HTTP/2 unless the client is http1_only.
+                Version::HTTP_11 => "client_default_negotiation",
+                Version::HTTP_10 => "explicit_http_10",
+                Version::HTTP_2 => "explicit_http_2",
+                _ => "explicit_other",
             },
             forbidden_connection_header_count: forbidden_connection_header_mask.count_ones()
                 as usize,
@@ -322,7 +260,7 @@ impl PreparedRequestEvidence {
 }
 
 pub(super) fn observe(
-    request: &wreq::Request,
+    request: &reqwest::Request,
     route: &PreparedProxyRoute,
     selected_credential: &UpstreamCredential,
     identity: &TransportIdentity,

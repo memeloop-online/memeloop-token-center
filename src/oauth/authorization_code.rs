@@ -282,10 +282,10 @@ pub(crate) async fn bind_google_identity(
         ..
     } = credential
     else {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("authorization_code_bind_google_identity_1"));
     };
     state["authorization_code"]["identity"] =
-        serde_json::to_value(identity).map_err(|_| AppError::Internal)?;
+        serde_json::to_value(identity).map_err(|_| AppError::internal("authorization_code_bind_google_identity_1"))?;
     Ok(())
 }
 
@@ -311,22 +311,22 @@ async fn read_google_identity(
         )?
         .send()
         .await
-        .map_err(|_| AppError::Upstream("Google account identity request failed".into()))?;
+        .map_err(|_| AppError::upstream("google_account_identity_request_failed"))?;
     let status = response.status();
     let bytes = super::bounded_body(response).await?;
     if !status.is_success() {
-        return Err(AppError::Upstream(format!(
-            "Google account identity returned HTTP {}",
-            status.as_u16()
-        )));
+        return Err(AppError::upstream_status(
+            "google_account_identity_returned_http",
+            status.as_u16(),
+        ));
     }
     let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::Upstream("Google account identity response is invalid".into()))?;
+        .map_err(|_| AppError::upstream("google_account_identity_response_is_invalid"))?;
     let subject = value
         .get("id")
         .and_then(Value::as_str)
         .filter(|subject| valid_google_subject(subject))
-        .ok_or_else(|| AppError::Upstream("Google account identity is missing".into()))?;
+        .ok_or_else(|| AppError::upstream("google_account_identity_is_missing"))?;
     Ok(GoogleIdentity {
         issuer: GOOGLE_ISSUER.into(),
         subject: subject.into(),
@@ -373,22 +373,22 @@ async fn bind_declared_identity_with_transport(
         )?
         .send()
         .await
-        .map_err(|_| AppError::Upstream("account identity request failed".into()))?;
+        .map_err(|_| AppError::upstream("account_identity_request_failed"))?;
     let status = response.status();
     let bytes = super::bounded_body(response).await?;
     if !status.is_success() {
-        return Err(AppError::Upstream(format!(
-            "account identity returned HTTP {}",
-            status.as_u16()
-        )));
+        return Err(AppError::upstream_status(
+            "account_identity_returned_http",
+            status.as_u16(),
+        ));
     }
     let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::Upstream("account identity response is invalid".into()))?;
+        .map_err(|_| AppError::upstream("account_identity_response_is_invalid"))?;
     let id = value
         .pointer(&contribution.id_pointer)
         .and_then(Value::as_str)
         .filter(|id| valid_provider_identity_id(id))
-        .ok_or_else(|| AppError::Upstream("account identity is missing".into()))?;
+        .ok_or_else(|| AppError::upstream("account_identity_is_missing"))?;
     let identity = ProviderIdentity {
         url: contribution.url.clone(),
         id: id.to_owned(),
@@ -398,10 +398,10 @@ async fn bind_declared_identity_with_transport(
         ..
     } = credential
     else {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("authorization_code_bind_declared_identity_with_transport_1"));
     };
     state["authorization_code"]["provider_identity"] =
-        serde_json::to_value(identity).map_err(|_| AppError::Internal)?;
+        serde_json::to_value(identity).map_err(|_| AppError::internal("authorization_code_bind_declared_identity_with_transport_1"))?;
     Ok(())
 }
 
@@ -468,8 +468,8 @@ pub(crate) fn reauthorization_client(
     let client = match (state.login_client, requested) {
         (Some(installed), None) => installed,
         (Some(installed), Some(requested)) => {
-            if serde_json::to_value(&installed).map_err(|_| AppError::Internal)?
-                != serde_json::to_value(&requested).map_err(|_| AppError::Internal)?
+            if serde_json::to_value(&installed).map_err(|_| AppError::internal("authorization_code_reauthorization_client_1"))?
+                != serde_json::to_value(&requested).map_err(|_| AppError::internal("authorization_code_reauthorization_client_2"))?
             {
                 return Err(AppError::BadRequest(
                     "reauthorization cannot change the installed OAuth client or scopes".into(),
@@ -693,10 +693,10 @@ pub async fn start(
         return Err(AppError::BadRequest("account name is required".into()));
     }
     let mut random = [0u8; 64];
-    getrandom::fill(&mut random).map_err(|_| AppError::Internal)?;
+    getrandom::fill(&mut random).map_err(|_| AppError::internal("authorization_code_start_1"))?;
     let verifier = URL_SAFE_NO_PAD.encode(&random[..32]);
     let state = URL_SAFE_NO_PAD.encode(&random[32..]);
-    let mut url = Url::parse(&input.adapter.login_url).map_err(|_| AppError::Internal)?;
+    let mut url = Url::parse(&input.adapter.login_url).map_err(|_| AppError::internal("authorization_code_start_2"))?;
     url.query_pairs_mut()
         .append_pair("response_type", "code")
         .append_pair("client_id", &input.client.client_id)
@@ -972,7 +972,7 @@ pub async fn complete(
         } => Ok(CompleteResult::Pending {
             retry_after_seconds,
         }),
-        OAuthLoginClaim::Claimed { .. } => Err(AppError::Internal),
+        OAuthLoginClaim::Claimed { .. } => Err(AppError::internal("authorization_code_site_1")),
     }
 }
 
@@ -999,7 +999,7 @@ pub async fn refresh(
         state
             .get("authorization_code")
             .cloned()
-            .ok_or(AppError::Internal)?,
+            .ok_or(AppError::internal("authorization_code_refresh_1"))?,
     )
     .map_err(|_| AppError::BadRequest("invalid OAuth refresh state".into()))?;
     if active_adapter.flow_kind != OAuthFlowKind::AuthorizationCodePkce
@@ -1069,7 +1069,7 @@ fn credential_with_state(
             .as_deref()
             .is_some_and(|kind| !kind.eq_ignore_ascii_case("bearer"))
     {
-        return Err(AppError::Upstream("invalid OAuth token response".into()));
+        return Err(AppError::upstream("invalid_oauth_token_response"));
     }
     Ok(UpstreamCredential::OAuth {
         access_token: tokens.access_token,
@@ -1079,7 +1079,7 @@ fn credential_with_state(
             .or_else(|| old_refresh.cloned()),
         expires_at: Some(
             now.checked_add(tokens.expires_in * 1000)
-                .ok_or(AppError::Internal)?,
+                .ok_or(AppError::internal("authorization_code_credential_with_state_1"))?,
         ),
         header: "authorization".into(),
         prefix: "Bearer ".into(),
@@ -1159,17 +1159,17 @@ async fn dispatch_token_request(
     let response = http
         .execute(request)
         .await
-        .map_err(|_| AppError::Upstream("OAuth token request failed".into()))?;
+        .map_err(|_| AppError::upstream("oauth_token_request_failed"))?;
     let status = response.status();
     let body = super::bounded_body(response).await?;
     if !status.is_success() {
-        return Err(AppError::Upstream(format!(
-            "OAuth token endpoint returned HTTP {}",
-            status.as_u16()
-        )));
+        return Err(AppError::upstream_status(
+            "oauth_token_endpoint_returned_http",
+            status.as_u16(),
+        ));
     }
     serde_json::from_slice(&body)
-        .map_err(|_| AppError::Upstream("invalid OAuth token response".into()))
+        .map_err(|_| AppError::upstream("invalid_oauth_token_response"))
 }
 
 fn encode_token_form(form: &[(&str, String)]) -> String {

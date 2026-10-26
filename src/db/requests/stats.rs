@@ -448,7 +448,7 @@ impl StatsProjectionAccumulator {
             .saturating_add(row.try_get("cache_reported_requests")?);
         let currency: String = row.try_get("currency")?;
         if currency.is_empty() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("stats_accumulate_1"));
         }
         if let Some(micros) = row.try_get::<Option<i64>, _>("cost_micros")? {
             let cost = self.costs.entry(currency).or_default();
@@ -813,7 +813,7 @@ SELECT bucket_kind, name, day_bucket, requests, successful_requests,
                 "model" => by_model.push(bucket),
                 "day" => by_day.push(bucket),
                 "error" => errors.push(bucket),
-                _ => return Err(AppError::Internal),
+                _ => return Err(AppError::internal("stats_site_1")),
             }
         }
         by_model.sort_by(stats_bucket_order);

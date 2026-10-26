@@ -250,7 +250,7 @@ pub(super) fn outbound_base_url(configured: &str) -> String {
 
 /// Prepare the native Codex request used by the synchronous Images adapter.
 ///
-/// This shares the account-scoped fingerprinted client, OAuth credential and
+/// This shares the account-scoped client, OAuth credential and
 /// SOCKS5H binding with text traffic. The Responses body remains non-streaming
 /// so the image result is bounded as one JSON response instead of entering the
 /// text SSE event admission path.
@@ -259,7 +259,7 @@ pub(in crate::api) async fn prepare_image_request(
     route: &crate::provider::ResolvedUpstream,
     body: &Value,
     request_id: Uuid,
-) -> Result<wreq::RequestBuilder, AppError> {
+) -> Result<reqwest::RequestBuilder, AppError> {
     if route.driver != DRIVER || route.base_url != BASE_URL {
         return Err(AppError::BadRequest(
             "OpenAI Codex image route has an invalid fixed transport".into(),
@@ -287,7 +287,7 @@ pub(in crate::api) async fn prepare_image_request(
                 .into(),
         ));
     }
-    let body = serde_json::to_vec(body).map_err(|_| AppError::Internal)?;
+    let body = serde_json::to_vec(body).map_err(|_| AppError::internal("codex_transport_prepare_image_request_1"))?;
 
     let selection = state.transport_proxy_groups.select_config(
         route.account_id,
@@ -308,16 +308,10 @@ pub(in crate::api) async fn prepare_image_request(
     let client = state
         .codex_clients
         .transport_snapshot(&transport_route, selection.generation)
-        .map_err(|_| AppError::Upstream("OpenAI Codex transport is unavailable".into()))?;
+        .map_err(|_| AppError::upstream("openai_codex_transport_is_unavailable"))?;
     let target_url = crate::network::upstream_api_url(&outbound_base_url, RESPONSES_PATH);
-    let mut request = client.post(target_url).body(body);
-    if let Some((proxy_url, _)) = selection.credential.proxy() {
-        request = request.proxy(
-            wreq::Proxy::all(proxy_url)
-                .map_err(|_| AppError::BadRequest("OpenAI Codex proxy is invalid".into()))?,
-        );
-    }
-    apply_wreq_image_wire_headers(
+    let request = client.post(target_url).body(body);
+    apply_codex_image_wire_headers(
         request,
         &route.credential,
         &request_id.to_string(),
@@ -1084,13 +1078,13 @@ pub(super) fn apply_reqwest_wire_headers(
         .header("chatgpt-account-id", account_id))
 }
 
-pub(super) fn apply_wreq_wire_headers(
-    request: wreq::RequestBuilder,
+pub(super) fn apply_codex_wire_headers(
+    request: reqwest::RequestBuilder,
     downstream_headers: &http::HeaderMap,
     credential: &UpstreamCredential,
     session_id: &str,
     now: i64,
-) -> Result<wreq::RequestBuilder, AppError> {
+) -> Result<reqwest::RequestBuilder, AppError> {
     validate_credential_contract(credential)?;
     let account_id = account_header_value(credential)?;
     let Some((credential_header, credential_value)) = credential.request_header(now)? else {
@@ -1099,7 +1093,7 @@ pub(super) fn apply_wreq_wire_headers(
         ));
     };
     let client_identity = codex_client_identity(downstream_headers);
-    let mut request = request.default_headers(false);
+    let mut request = request;
     for name in PASSTHROUGH_HEADERS {
         if let Some(value) = downstream_headers.get(*name) {
             if value.as_bytes().len() > MAX_PASSTHROUGH_HEADER_BYTES {
@@ -1130,12 +1124,12 @@ pub(super) fn apply_wreq_wire_headers(
         .header("chatgpt-account-id", account_id))
 }
 
-fn apply_wreq_image_wire_headers(
-    request: wreq::RequestBuilder,
+fn apply_codex_image_wire_headers(
+    request: reqwest::RequestBuilder,
     credential: &UpstreamCredential,
     session_id: &str,
     now: i64,
-) -> Result<wreq::RequestBuilder, AppError> {
+) -> Result<reqwest::RequestBuilder, AppError> {
     validate_credential_contract(credential)?;
     let account_id = account_header_value(credential)?;
     let Some((credential_header, credential_value)) = credential.request_header(now)? else {
@@ -1144,7 +1138,6 @@ fn apply_wreq_image_wire_headers(
         ));
     };
     Ok(request
-        .default_headers(false)
         .header(credential_header, credential_value)
         .header(header::ACCEPT, "application/json")
         .header(header::ACCEPT_ENCODING, "identity")
@@ -1917,9 +1910,8 @@ pub(super) async fn buffer_response(
     let reserved = if let Some(conversation) = conversation {
         conversation
             .reserve_for_buffered_response(memory, maximum, deadline)
-            .await
     } else {
-        memory.reserve_buffered_response(maximum, deadline).await
+        memory.reserve_buffered_response(maximum, deadline)
     };
     if !reserved {
         capacity.finish("rejected", None, None);
@@ -2881,14 +2873,13 @@ mod tests {
         assert_eq!(result.usage.output_tokens, 2);
     }
 
-    #[tokio::test]
-    async fn buffered_parser_accounts_live_events_and_retains_completed_output_until_release() {
+    #[test]
+    fn buffered_parser_accounts_live_events_and_retains_completed_output_until_release() {
         let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(512 * 1024);
         let memory = budget.reservation();
         assert!(
             memory
                 .reserve_buffered_response(64 * 1024, tokio::time::Instant::now())
-                .await
         );
         let baseline = budget.snapshot().0;
         let mut parser = BufferedResponsesParser::default();
@@ -2909,14 +2900,13 @@ mod tests {
         assert_eq!(budget.snapshot().0, 0);
     }
 
-    #[tokio::test]
-    async fn buffered_parser_releases_parse_memory_on_error_and_honors_actual_budget_exhaustion() {
+    #[test]
+    fn buffered_parser_releases_parse_memory_on_error_and_honors_actual_budget_exhaustion() {
         let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(128 * 1024);
         let memory = budget.reservation();
         assert!(
             memory
                 .reserve_buffered_response(1024, tokio::time::Instant::now())
-                .await
         );
         let baseline = budget.snapshot().0;
         let mut parser = BufferedResponsesParser::default();

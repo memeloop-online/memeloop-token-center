@@ -130,7 +130,7 @@ impl Database {
             return Ok(Vec::new());
         }
         if routes.len() > MAX_ROUTE_PAGE {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("list_list_enriched_model_routes_page_1"));
         }
 
         let mut associations = routes
@@ -184,7 +184,7 @@ impl Database {
                 "grant_revision" => {
                     route.grant_revision = row.try_get("numeric_value")?;
                 }
-                _ => return Err(AppError::Internal),
+                _ => return Err(AppError::internal("list_list_enriched_model_routes_page_2")),
             }
         }
 
@@ -192,7 +192,7 @@ impl Database {
             .into_iter()
             .map(|route| {
                 let route_id = route.id;
-                let association = associations.remove(&route_id).ok_or(AppError::Internal)?;
+                let association = associations.remove(&route_id).ok_or(AppError::internal("list_list_enriched_model_routes_page_3"))?;
                 Ok(EnrichedModelRouteView {
                     route,
                     route_id,

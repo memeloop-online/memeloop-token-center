@@ -97,7 +97,7 @@ fn sanitize_parameter_schema(
     placeholders: &BTreeSet<String>,
 ) -> Result<Value, AppError> {
     if serde_json::to_vec(schema)
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("comfyui_schema_sanitize_parameter_schema_1"))?
         .len()
         > MAX_SCHEMA_BYTES
     {
@@ -252,7 +252,7 @@ fn sanitize_scalar_schema(schema: &Value) -> Result<Value, AppError> {
             sanitized.insert((*key).to_owned(), value);
         }
     }
-    let sanitized = serde_json::to_value(sanitized).map_err(|_| AppError::Internal)?;
+    let sanitized = serde_json::to_value(sanitized).map_err(|_| AppError::internal("comfyui_schema_sanitize_scalar_schema_1"))?;
     if let Some(default) = sanitized.get("default") {
         crate::schema::validate_instance(&sanitized, default).map_err(|_| {
             AppError::BadRequest("ComfyUI parameter default does not match its type".into())

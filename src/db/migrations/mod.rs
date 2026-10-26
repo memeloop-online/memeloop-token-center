@@ -713,6 +713,16 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "independent upstream service and proxy probe results",
         sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
     },
+    Migration {
+        version: 137,
+        name: "recorded in-flight proxy request stage",
+        sql: include_str!("../../../migrations/common/0137_request_in_flight_stage.sql"),
+    },
+    Migration {
+        version: 138,
+        name: "会话正文归档 media purpose",
+        sql: include_str!("../../../migrations/sqlite/0138_conversation_media_archive.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1408,6 +1418,16 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 136,
         name: "independent upstream service and proxy probe results",
         sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
+    },
+    Migration {
+        version: 137,
+        name: "recorded in-flight proxy request stage",
+        sql: include_str!("../../../migrations/common/0137_request_in_flight_stage.sql"),
+    },
+    Migration {
+        version: 138,
+        name: "会话正文归档 media purpose",
+        sql: include_str!("../../../migrations/postgres/0138_conversation_media_archive.sql"),
     },
 ];
 

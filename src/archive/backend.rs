@@ -26,14 +26,12 @@ impl ArchiveStore {
                         AppError::BadRequest("MTC_ARCHIVE_PATH is required".into())
                     })?;
                     std::fs::create_dir_all(root).map_err(|_| {
-                        AppError::Storage("archive filesystem initialization failed".into())
+                        AppError::storage("archive_filesystem_initialization_failed")
                     })?;
                     Arc::new(
                         object_store::local::LocalFileSystem::new_with_prefix(PathBuf::from(root))
                             .map_err(|_| {
-                                AppError::Storage(
-                                    "archive filesystem configuration is invalid".into(),
-                                )
+                                AppError::storage("local_storage_failed")
                             })?,
                     )
                 }
@@ -70,7 +68,7 @@ impl ArchiveStore {
                         builder = builder.with_secret_access_key(secret_key);
                     }
                     Arc::new(builder.build().map_err(|_| {
-                        AppError::Storage("archive S3 configuration is invalid".into())
+                        AppError::storage("archive_s3_configuration_is_invalid")
                     })?)
                 }
             };

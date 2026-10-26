@@ -91,7 +91,7 @@ impl Database {
             "version": 1, "claim": claim, "receipt_id": receipt_id,
             "terminal": terminal, "attribution": attribution,
         }))
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("operational_terminal_record_pending_proxy_operational_terminal_1"))?;
         let operational_digest = blake3::hash(&bytes).to_hex().to_string();
         let mut tx = self.begin_write_transaction().await?;
         let locator = sqlx::query(
@@ -144,8 +144,8 @@ impl Database {
         }
         let contract: Value =
             serde_json::from_str(&authority.try_get::<String, _>("contract_json")?)
-                .map_err(|_| AppError::Internal)?;
-        let contract_bytes = serde_json::to_vec(&contract).map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("operational_terminal_record_pending_proxy_operational_terminal_2"))?;
+        let contract_bytes = serde_json::to_vec(&contract).map_err(|_| AppError::internal("operational_terminal_record_pending_proxy_operational_terminal_3"))?;
         if blake3::hash(&contract_bytes).to_hex().as_str() != claim.contract_digest {
             return Err(conflict());
         }
@@ -242,7 +242,7 @@ impl Database {
             let request_id = parse_uuid(row.try_get("request_id")?)?;
             let contract: serde_json::Value =
                 serde_json::from_str(&row.try_get::<String, _>("contract_json")?)
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("operational_terminal_close_expired_proxy_owners_1"))?;
             let claim = PendingProxySettlementClaim {
                 request_id,
                 tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
@@ -255,11 +255,11 @@ impl Database {
                 input_token_ceiling: contract
                     .get("input_ceiling")
                     .and_then(serde_json::Value::as_i64)
-                    .ok_or(AppError::Internal)?,
+                    .ok_or(AppError::internal("operational_terminal_close_expired_proxy_owners_1"))?,
                 output_token_ceiling: contract
                     .get("output_ceiling")
                     .and_then(serde_json::Value::as_i64)
-                    .ok_or(AppError::Internal)?,
+                    .ok_or(AppError::internal("operational_terminal_close_expired_proxy_owners_2"))?,
                 requested_service_tier: contract
                     .get("tier")
                     .and_then(serde_json::Value::as_str)

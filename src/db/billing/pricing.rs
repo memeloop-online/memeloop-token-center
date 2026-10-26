@@ -158,7 +158,7 @@ impl Database {
         .await?
         .into_iter()
         .next()
-        .ok_or(AppError::Internal)
+        .ok_or(AppError::internal("pricing_upsert_synced_model_price_tier_1"))
     }
 
     /// One bounded write transaction and one joined read per batch. Conditional
@@ -217,7 +217,7 @@ impl Database {
                 "cache_price_estimated": i64::from(price.cache_price_estimated),
             }));
         }
-        let input_json = serde_json::to_string(&rows).map_err(|_| AppError::Internal)?;
+        let input_json = serde_json::to_string(&rows).map_err(|_| AppError::internal("pricing_upsert_synced_model_price_tiers_1"))?;
         let input_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "WITH incoming AS (SELECT * FROM jsonb_to_recordset(CAST($1 AS jsonb)) AS price(id TEXT, tier_id TEXT, model TEXT, service_tier TEXT, input_micros BIGINT, cached_micros BIGINT, cache_write_micros BIGINT, output_micros BIGINT, source TEXT, cache_price_estimated BIGINT))"
@@ -270,7 +270,7 @@ impl Database {
                 Self::MAX_LISTED_MODEL_PRICES
             )));
         }
-        let limit = i64::try_from(limit).map_err(|_| AppError::Internal)?;
+        let limit = i64::try_from(limit).map_err(|_| AppError::internal("pricing_list_model_prices_page_1"))?;
         let offset = i64::try_from(offset)
             .map_err(|_| AppError::BadRequest("model price offset is too large".into()))?;
         let rows = sqlx::query(
@@ -297,7 +297,7 @@ impl Database {
                 Self::MAX_LISTED_MODEL_PRICES
             )));
         }
-        let limit = i64::try_from(limit).map_err(|_| AppError::Internal)?;
+        let limit = i64::try_from(limit).map_err(|_| AppError::internal("pricing_list_model_prices_after_1"))?;
         let rows = sqlx::query(
             "WITH limited_prices AS (SELECT model, currency, input_micros_per_million, output_micros_per_million, source, updated_at FROM model_prices WHERE currency = $1 AND model > $2 ORDER BY model ASC LIMIT $3) SELECT p.model, p.currency, p.input_micros_per_million, p.output_micros_per_million, p.source, p.updated_at, t.service_tier AS tier_service_tier, t.input_micros_per_million AS tier_input_micros_per_million, t.cached_input_micros_per_million AS tier_cached_input_micros_per_million, t.cache_write_micros_per_million AS tier_cache_write_micros_per_million, t.output_micros_per_million AS tier_output_micros_per_million, t.source AS tier_source, t.updated_at AS tier_updated_at, t.cache_price_estimated AS tier_cache_price_estimated FROM limited_prices p LEFT JOIN model_price_tiers t ON t.model = p.model AND t.currency = p.currency ORDER BY p.model ASC, CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier",
         )
@@ -331,7 +331,7 @@ impl Database {
             if index > 0 {
                 statement.push_str(", ");
             }
-            write!(statement, "${}", index + 2).map_err(|_| AppError::Internal)?;
+            write!(statement, "${}", index + 2).map_err(|_| AppError::internal("pricing_model_price_views_for_models_1"))?;
         }
         statement.push_str(") ORDER BY p.model ASC, CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier");
         // SQL safety boundary: only monotonically generated `$N` placeholders are appended to
@@ -549,7 +549,7 @@ fn model_price_views_from_joined_rows(rows: Vec<AnyRow>) -> Result<Vec<ModelPric
         };
         prices
             .last_mut()
-            .ok_or(AppError::Internal)?
+            .ok_or(AppError::internal("pricing_model_price_views_from_joined_rows_1"))?
             .tiers
             .push(ModelPriceTierView {
                 service_tier,

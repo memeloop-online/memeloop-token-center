@@ -653,7 +653,7 @@ async fn poll_at(
             header: "authorization".into(),
             prefix: "Bearer ".into(),
             adapter_state: Some(
-                serde_json::to_value(adapter_state).map_err(|_| AppError::Internal)?,
+                serde_json::to_value(adapter_state).map_err(|_| AppError::internal("copilot_site_1"))?,
             ),
             proxy_network_scope: state.proxy_url.as_ref().map(|_| OutboundScope::Private),
             proxy_url: state.proxy_url,
@@ -695,7 +695,7 @@ async fn poll_at(
         } => Ok(CopilotDevicePollResult::Pending {
             retry_after_seconds,
         }),
-        OAuthLoginClaim::Claimed { .. } => Err(AppError::Internal),
+        OAuthLoginClaim::Claimed { .. } => Err(AppError::internal("copilot_site_1")),
     }
 }
 
@@ -1050,7 +1050,7 @@ async fn refresh_at(
         expires_at: Some(copilot.expires_at),
         header: "authorization".into(),
         prefix: "Bearer ".into(),
-        adapter_state: Some(serde_json::to_value(state).map_err(|_| AppError::Internal)?),
+        adapter_state: Some(serde_json::to_value(state).map_err(|_| AppError::internal("copilot_refresh_at_1"))?),
         proxy_url: credential.proxy().map(|(url, _)| url.to_owned()),
         proxy_network_scope: credential.proxy().map(|(_, scope)| scope),
     })
@@ -1299,7 +1299,7 @@ fn invalid_state() -> AppError {
 }
 
 fn upstream_error() -> AppError {
-    AppError::Upstream("GitHub Copilot authorization failed".into())
+    AppError::upstream("github_copilot_authorization_failed")
 }
 
 #[cfg(test)]

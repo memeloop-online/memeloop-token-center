@@ -137,8 +137,8 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(&delivered).unwrap();
-    assert_eq!(body["error"]["code"], "internal_error");
-    assert_eq!(body["error"]["message"], "internal error");
+    assert_eq!(body["error"]["code"], "database_operation_failed");
+    assert!(body["error"]["message"].as_str().unwrap().contains("数据库") || body["error"]["message"].as_str().unwrap().contains("内部错误"));
     assert!(!String::from_utf8_lossy(&delivered).contains("PRIVATE_CANARY"));
     let authority = sqlx::query(
         "SELECT p.fence, p.contract_digest, p.contract_json, q.upstream_account_id, q.completed_at, \
@@ -169,7 +169,7 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
     cancellation::assert_unknown_request(&fixture, request_id, 0).await;
     let record = wait_for_operational(&fixture).await;
     assert_eq!(record.status_code, Some(500));
-    assert_eq!(record.error_code.as_deref(), Some("internal_error"));
+    assert_eq!(record.error_code.as_deref(), Some("database_operation_failed"));
     assert_eq!(record.terminal_cause_code, None);
     assert_eq!(
         record.upstream_account_id,
@@ -201,7 +201,7 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
     );
     drop(held);
     let receipt =
-        cancellation::assert_unknown_receipt(&fixture, request_id, 500, "internal_error", 0).await;
+        cancellation::assert_unknown_receipt(&fixture, request_id, 500, "database_operation_failed", 0).await;
     assert_eq!(receipt["receipt_id"], operational_receipt);
     assert_eq!(
         receipt["claim"]["fence"],

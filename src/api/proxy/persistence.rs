@@ -236,7 +236,7 @@ mod tests {
     async fn deferred_persistence_releases_capacity_after_failure_and_rejects_oversize() {
         let persistence = Arc::new(Persistence::default());
         assert!(!persistence.submit(BYTES + 1, async { Ok(()) }));
-        assert!(persistence.submit(BYTES, async { Err(AppError::Internal) }));
+        assert!(persistence.submit(BYTES, async { Err(AppError::internal("persistence_deferred_persistence_releases_capacity_after_failure")) }));
         tokio::time::timeout(Duration::from_secs(1), async {
             while persistence.jobs.available_permits() != JOBS {
                 tokio::task::yield_now().await;

@@ -221,15 +221,15 @@ async fn start_claude_login_at(
     let _ = validate_oauth_login_config(&input.provider_config)?;
     let mut verifier_bytes = [0_u8; 32];
     let mut state_bytes = [0_u8; 32];
-    fill(&mut verifier_bytes).map_err(|_| AppError::Internal)?;
-    fill(&mut state_bytes).map_err(|_| AppError::Internal)?;
+    fill(&mut verifier_bytes).map_err(|_| AppError::internal("claude_start_claude_login_at_1"))?;
+    fill(&mut state_bytes).map_err(|_| AppError::internal("claude_start_claude_login_at_2"))?;
     let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
     let state_value = URL_SAFE_NO_PAD.encode(state_bytes);
     if verifier == state_value {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("claude_start_claude_login_at_1"));
     }
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    let mut login_url = Url::parse(&endpoints.authorize).map_err(|_| AppError::Internal)?;
+    let mut login_url = Url::parse(&endpoints.authorize).map_err(|_| AppError::internal("claude_start_claude_login_at_3"))?;
     login_url
         .query_pairs_mut()
         .append_pair("code", "true")
@@ -428,7 +428,7 @@ async fn complete_claude_login_at(
         } => Ok(ClaudeCompleteResult::Pending {
             retry_after_seconds,
         }),
-        OAuthLoginClaim::Claimed { .. } => Err(AppError::Internal),
+        OAuthLoginClaim::Claimed { .. } => Err(AppError::internal("claude_complete_claude_login_at_1")),
     }
 }
 
@@ -816,7 +816,7 @@ fn expiry_millis(now: i64, expires_in: i64) -> Result<i64, AppError> {
 }
 
 fn claude_error() -> AppError {
-    AppError::Upstream("Claude OAuth authorization failed".into())
+    AppError::upstream("claude_oauth_authorization_failed")
 }
 
 #[cfg(test)]
@@ -1170,7 +1170,7 @@ mod tests {
         let rendered = error.to_string();
         assert_eq!(
             rendered,
-            "configured upstream is unavailable: Claude OAuth authorization failed"
+            "configured upstream is unavailable: claude_oauth_authorization_failed"
         );
         assert!(!rendered.contains("manual-code"));
         assert!(!rendered.contains("response-secret"));
@@ -1196,7 +1196,7 @@ mod tests {
         .to_string();
         assert_eq!(
             timeout,
-            "configured upstream is unavailable: Claude OAuth authorization failed"
+            "configured upstream is unavailable: claude_oauth_authorization_failed"
         );
         assert!(!timeout.contains("refresh-timeout"));
     }

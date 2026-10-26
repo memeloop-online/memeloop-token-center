@@ -642,6 +642,17 @@ pub struct EntitlementReconcileResult {
     pub replaced_entitlement_id: Option<Uuid>,
 }
 
+/// Stages a live proxy request can have recorded. Anything else, including a
+/// delivery-contract marker, is not an in-flight stage.
+pub(crate) fn recorded_in_flight_stage(value: Option<String>) -> Option<String> {
+    match value.as_deref() {
+        Some("upstream_response_headers" | "upstream_response_body" | "response_delivery") => {
+            value
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RequestView {
     /// Independently acknowledged execution outcome; accounting may remain unknown.
@@ -697,6 +708,10 @@ pub struct RequestView {
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub terminal_cause_code: Option<String>,
+    /// Stage recorded while the request was still open. Absence means no stage
+    /// was stored. A finished row may still carry the last stage; the operator
+    /// label uses it only while `status_code` is absent.
+    pub in_flight_stage: Option<String>,
     /// Fixed supplier reason reconstructed from a bounded native inline envelope.
     pub supplier_error: Option<crate::supplier_error::SupplierError>,
     /// Current durable archive workflow state. Terminal spool transitions are
@@ -735,7 +750,7 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 33)?;
+        let mut state = serializer.serialize_struct("RequestView", 34)?;
         state.serialize_field("operational_terminal", &self.operational_terminal)?;
         state.serialize_field("egress", &self.egress)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
@@ -773,6 +788,7 @@ impl Serialize for RequestView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field("in_flight_stage", &self.in_flight_stage)?;
         let diagnostic = failure_diagnostic(self.terminal_cause_code.as_deref());
         let diagnostic = diagnostic.map(|value| {
             let stage = match self.operational_terminal.as_ref() {
@@ -991,6 +1007,8 @@ pub struct RequestEventView {
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub terminal_cause_code: Option<String>,
+    /// Current open-request stage joined from the request row when the event is read.
+    pub in_flight_stage: Option<String>,
     /// Fixed supplier reason reconstructed from a bounded native inline envelope.
     pub supplier_error: Option<crate::supplier_error::SupplierError>,
     pub archive_state: RequestArchiveState,
@@ -1005,7 +1023,7 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 35)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 36)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
@@ -1046,6 +1064,7 @@ impl Serialize for RequestEventView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field("in_flight_stage", &self.in_flight_stage)?;
         state.serialize_field(
             "failure_diagnostic",
             &failure_diagnostic(self.terminal_cause_code.as_deref()),
@@ -1911,6 +1930,7 @@ mod tests {
                 .into(),
             ),
             terminal_cause_code: Some(cause.into()),
+            in_flight_stage: None,
             supplier_error: None,
             archive_state: RequestArchiveState::Gap,
             credential_identity: None,

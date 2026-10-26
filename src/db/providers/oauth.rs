@@ -45,7 +45,7 @@ fn oauth_refresh_lifecycle_from_row(row: &sqlx::any::AnyRow) -> Result<(String, 
         return Ok((driver, refresh_url));
     }
     let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("oauth_oauth_refresh_lifecycle_from_row_1"))?;
     let driver = config
         .pointer("/oauth/driver")
         .and_then(Value::as_str)
@@ -327,7 +327,7 @@ impl Database {
                 preserve_refresh_fence = dispatched;
             }
             let replacement_ciphertext = seal_credential(&replacement, key_material)?;
-            let next_generation = generation.checked_add(1).ok_or(AppError::Internal)?;
+            let next_generation = generation.checked_add(1).ok_or(AppError::internal("oauth_site_1"))?;
             let next_updated_at = now.max(updated_at.saturating_add(1));
             if preserve_refresh_fence {
                 let fenced = sqlx::query(
@@ -582,14 +582,14 @@ impl Database {
         let current_session = row.try_get::<Option<String>, _>("oauth_session_id")?;
         if let Some(encoded) = &provider_config_json {
             let current: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("oauth_reauthorize_upstream_account_with_transport_1"))?;
             let mut replacement: Value =
-                serde_json::from_str(encoded).map_err(|_| AppError::Internal)?;
+                serde_json::from_str(encoded).map_err(|_| AppError::internal("oauth_reauthorize_upstream_account_with_transport_2"))?;
             let stamp_key = super::super::transport_proxy_management::CONFIG_KEY;
             if let Some(stamp) = current.get(stamp_key) {
                 replacement
                     .as_object_mut()
-                    .ok_or(AppError::Internal)?
+                    .ok_or(AppError::internal("oauth_reauthorize_upstream_account_with_transport_1"))?
                     .insert(stamp_key.into(), stamp.clone());
             } else if replacement.get(stamp_key).is_some() {
                 return Err(AppError::BadRequest(
@@ -698,7 +698,7 @@ impl Database {
         }
         let generation = current_generation
             .checked_add(1)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("oauth_site_2"))?;
         let updated_at = now.max(input.expected_updated_at.saturating_add(1));
         sqlx::query(
             "UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND revoked_at IS NULL",
@@ -1163,7 +1163,7 @@ impl Database {
                 Ok(view) => return Ok(view),
                 Err(error)
                     if attempt < retry_delays.len()
-                        && matches!(error, AppError::Internal | AppError::Storage(_)) =>
+                        && matches!(error, AppError::Internal { .. } | AppError::Storage { .. }) =>
                 {
                     if retry_delays[attempt].is_zero() {
                         tokio::task::yield_now().await;
@@ -1545,7 +1545,7 @@ impl Database {
             ),
             credential_generation: generation,
             status,
-            config: serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?,
+            config: serde_json::from_str(&config_json).map_err(|_| AppError::internal("oauth_site_1"))?,
             credential_expires_at: credential.expires_at(),
             has_proxy: false,
             proxy_scheme: None,
@@ -1598,7 +1598,7 @@ fn upstream_credential_rotation_request_hash(
     account_id: Uuid,
     credential: &UpstreamCredential,
 ) -> Result<String, AppError> {
-    let encoded = serde_json::to_vec(credential).map_err(|_| AppError::Internal)?;
+    let encoded = serde_json::to_vec(credential).map_err(|_| AppError::internal("oauth_upstream_credential_rotation_request_hash_1"))?;
     let mut hash = Sha256::new();
     hash.update(b"memeloop-token-center/upstream-credential-rotation-request/v1\0");
     hash.update(account_id.as_bytes());
@@ -2111,7 +2111,7 @@ mod tests {
                     state.config.key_pepper.as_bytes(),
                 )
                 .await,
-            Err(AppError::Internal)
+            Err(AppError::Internal { .. })
         ));
         let after_rollback = state
             .db

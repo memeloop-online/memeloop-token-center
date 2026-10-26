@@ -48,13 +48,18 @@ impl<'a> BufferedArchive<'a> {
         compression_enabled: bool,
     ) -> Result<Self, AppError> {
         if body.len() > 64 * 1024 * 1024 {
-            return Err(AppError::Overloaded);
+            return Err(AppError::capacity(
+                "response_archive_too_large",
+                crate::error::ErrorFacts::new()
+                    .bytes(body.len() as u64)
+                    .limit(64 * 1024 * 1024),
+            ));
         }
         let chunk_count = body.len().div_ceil(super::CHUNK_BYTES);
         let mut nonces = Vec::with_capacity(chunk_count);
         for _ in 0..chunk_count {
             let mut nonce = [0_u8; 12];
-            fill(&mut nonce).map_err(|_| AppError::Internal)?;
+            fill(&mut nonce).map_err(|_| AppError::internal("producer_new_1"))?;
             nonces.push(nonce);
         }
         Ok(Self {
@@ -84,15 +89,15 @@ impl<'a> BufferedArchive<'a> {
     }
 
     pub(crate) fn seal(&self, seq: usize) -> Result<String, AppError> {
-        let nonce = self.nonces.get(seq).copied().ok_or(AppError::Internal)?;
+        let nonce = self.nonces.get(seq).copied().ok_or(AppError::internal("producer_seal_1"))?;
         let start = seq
             .checked_mul(super::CHUNK_BYTES)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("producer_seal_2"))?;
         let end = (start + super::CHUNK_BYTES).min(self.body.len());
-        let bytes = self.body.get(start..end).ok_or(AppError::Internal)?;
+        let bytes = self.body.get(start..end).ok_or(AppError::internal("producer_seal_3"))?;
         let sealed = super::cipher::seal_for_purpose_with_nonce_and_compression(
             self.identity,
-            i64::try_from(seq).map_err(|_| AppError::Internal)?,
+            i64::try_from(seq).map_err(|_| AppError::internal("producer_seal_1"))?,
             bytes,
             self.pepper,
             self.purpose,
@@ -115,12 +120,12 @@ impl<'a> BufferedArchive<'a> {
             .map(|seq| {
                 let start = seq
                     .checked_mul(super::CHUNK_BYTES)
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("producer_prepare_first_batch_1"))?;
                 let end = (start + super::CHUNK_BYTES).min(self.body.len());
                 Ok(crate::db::ArchiveSpoolChunk {
-                    seq: i64::try_from(seq).map_err(|_| AppError::Internal)?,
+                    seq: i64::try_from(seq).map_err(|_| AppError::internal("producer_prepare_first_batch_1"))?,
                     ciphertext: self.seal(seq)?,
-                    byte_count: i64::try_from(end - start).map_err(|_| AppError::Internal)?,
+                    byte_count: i64::try_from(end - start).map_err(|_| AppError::internal("producer_prepare_first_batch_2"))?,
                 })
             })
             .collect::<Result<Vec<_>, AppError>>()?;
@@ -237,7 +242,12 @@ pub(crate) fn encrypt_buffered(
     pepper: &[u8],
 ) -> Result<Vec<crate::db::ArchiveSpoolChunk>, AppError> {
     if body.len() > 64 * 1024 * 1024 {
-        return Err(AppError::Overloaded);
+        return Err(AppError::capacity(
+            "response_archive_too_large",
+            crate::error::ErrorFacts::new()
+                .bytes(body.len() as u64)
+                .limit(64 * 1024 * 1024),
+        ));
     }
     body.chunks(super::CHUNK_BYTES)
         .enumerate()
@@ -440,7 +450,7 @@ impl ResponseArchiveSettlement {
         Self {
             _writer: super::OwnedTask::spawn(
                 async move {
-                    released.await.map_err(|_| AppError::Internal)?;
+                    released.await.map_err(|_| AppError::internal("producer_pending_for_test_1"))?;
                     Ok(())
                 },
                 "response_spool_writer_test",
@@ -709,7 +719,7 @@ impl ResponseArchiveWriter {
         )
         .await?
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_begin_inner_1"));
         }
         Ok(Self {
             state,
@@ -725,13 +735,13 @@ impl ResponseArchiveWriter {
 
     async fn append_chunks(&mut self, chunks: Vec<QueuedArchiveChunk>) -> Result<(), AppError> {
         if chunks.is_empty() || chunks.len() > super::CAPTURE_DATABASE_BATCH_CHUNKS {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_append_chunks_1"));
         }
         let chunk_count = chunks.len();
         let batch_bytes = chunks.iter().try_fold(0_i64, |total, chunk| {
             total
-                .checked_add(i64::try_from(chunk.bytes.len()).map_err(|_| AppError::Internal)?)
-                .ok_or(AppError::Internal)
+                .checked_add(i64::try_from(chunk.bytes.len()).map_err(|_| AppError::internal("producer_append_chunks_1"))?)
+                .ok_or(AppError::internal("producer_append_chunks_2"))
         })?;
         let mut chunks = chunks.into_iter();
         let identity = self.identity;
@@ -758,9 +768,9 @@ impl ResponseArchiveWriter {
                             bytes,
                             _memory: memory,
                         } =
-                            chunks.next().ok_or(AppError::Internal)?;
+                            chunks.next().ok_or(AppError::internal("producer_append_chunks_3"))?;
                         let byte_count =
-                            i64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
+                            i64::try_from(bytes.len()).map_err(|_| AppError::internal("producer_append_chunks_2"))?;
                         let ciphertext = super::cipher::seal_for_purpose_with_compression(
                             identity,
                             seq,
@@ -790,16 +800,16 @@ impl ResponseArchiveWriter {
         };
         self.append_attempts += 1;
         if !appended? {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_append_chunks_4"));
         }
         self.seq = self
             .seq
-            .checked_add(i64::try_from(chunk_count).map_err(|_| AppError::Internal)?)
-            .ok_or(AppError::Internal)?;
+            .checked_add(i64::try_from(chunk_count).map_err(|_| AppError::internal("producer_append_chunks_3"))?)
+            .ok_or(AppError::internal("producer_append_chunks_5"))?;
         self.bytes = self
             .bytes
             .checked_add(batch_bytes)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("producer_append_chunks_6"))?;
         Ok(())
     }
 
@@ -861,7 +871,7 @@ impl ResponseArchiveWriter {
         )
         .await?
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_seal_inner_1"));
         }
         Ok(())
     }
@@ -958,7 +968,7 @@ async fn observe_writer_database(
     }
     // The existing SQLx conversion emits only a safe fixed error_kind (for
     // example pool_timeout/query_cancelled). Keep that event correlated before
-    // conversion erases its type into AppError::Internal.
+    // conversion erases its type into AppError::internal("producer_observe_writer_database_1").
     let result = operation.instrument(tracing::info_span!("response_archive_database", request_id = %identity.request_id, phase)).await;
     let outcome = match &result {
         Ok(true) => "acknowledged",
@@ -1117,13 +1127,19 @@ mod tests {
             })
             .now_or_never()
             .unwrap();
-            assert!(matches!(result, Err(AppError::Overloaded)));
+            assert!(matches!(
+                result,
+                Err(AppError::Capacity {
+                    code: "database_pool_exhausted",
+                    ..
+                })
+            ));
             let result = observe_writer_database(identity(), "response_spool_seal", 8, async {
-                Err(AppError::Storage("SECRET_CANARY".to_owned()))
+                Err(AppError::storage("object_storage_failed"))
             })
             .now_or_never()
             .unwrap();
-            assert!(matches!(result, Err(AppError::Storage(_))));
+            assert!(matches!(result, Err(AppError::Storage { .. })));
         });
         let bytes = writer.0.lock().unwrap();
         let logs = std::str::from_utf8(&bytes).unwrap();

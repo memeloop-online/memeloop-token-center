@@ -1697,7 +1697,7 @@ async fn sqlite_request_lifecycle_uses_locators_for_finish_detail_and_events() {
         .unwrap();
     assert!(matches!(
         database.request_archive_refs(key_id, request_id).await,
-        Err(AppError::Internal)
+        Err(AppError::Internal { .. })
     ));
 }
 

@@ -1,7 +1,6 @@
 use super::*;
 use std::path::Path;
 use tokio_rustls::{TlsAcceptor, rustls};
-use wreq::tls::trust::CertStore;
 
 pub(super) trait FixtureStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
@@ -9,7 +8,13 @@ impl<Socket: AsyncRead + AsyncWrite + Unpin + Send> FixtureStream for Socket {}
 
 pub(crate) struct TlsFixture {
     pub(crate) acceptor: TlsAcceptor,
-    pub(crate) roots: CertStore,
+    root_pem: Vec<u8>,
+}
+
+impl TlsFixture {
+    pub(crate) fn root_certificate(&self) -> reqwest::Certificate {
+        reqwest::Certificate::from_pem(&self.root_pem).expect("synthetic root")
+    }
 }
 
 async fn openssl(directory: &Path, arguments: &[&str]) {
@@ -122,12 +127,7 @@ impl TlsFixture {
             ],
         )
         .await;
-        let roots = CertStore::from_pem_stack(
-            tokio::fs::read(directory.path().join("ca.pem"))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let root_pem = tokio::fs::read(directory.path().join("ca.pem")).await.unwrap();
         let certificate = rustls::pki_types::CertificateDer::from(
             tokio::fs::read(directory.path().join("server.der"))
                 .await
@@ -140,7 +140,7 @@ impl TlsFixture {
                     .unwrap(),
             ));
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
+            rustls::crypto::ring::default_provider(),
         ))
         .with_safe_default_protocol_versions()
         .unwrap()
@@ -150,7 +150,7 @@ impl TlsFixture {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
-            roots,
+            root_pem,
         }
     }
 }
@@ -160,8 +160,7 @@ async fn socks_tls_rejects_untrusted_fixture_certificate_before_http() {
     let fixture = TlsFixture::new().await;
     timeout(Duration::from_secs(15), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy =
-            wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
+        let proxy_url = format!("socks5h://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             accept_socks_at_port(&mut socket, 443).await;
@@ -180,13 +179,15 @@ async fn socks_tls_rejects_untrusted_fixture_certificate_before_http() {
                 "peer must reject the untrusted certificate before HTTP"
             );
         });
-        let result = build_codex_http_client_with_policy(CodexTransportPolicy::default())
-            .unwrap()
-            .post(format!("https://{HOST}/v1/responses"))
-            .proxy(proxy)
-            .body(Bytes::from_static(PRIME))
-            .send()
-            .await;
+        let result = crate::build_codex_http_client_with_proxy(
+            CodexTransportPolicy::default(),
+            Some(&proxy_url),
+        )
+        .unwrap()
+        .post(format!("https://{HOST}/v1/responses"))
+        .body(Bytes::from_static(PRIME))
+        .send()
+        .await;
         assert!(
             result.unwrap_err().is_connect(),
             "production builder must retain certificate verification"

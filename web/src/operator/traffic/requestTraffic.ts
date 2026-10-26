@@ -81,7 +81,7 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
       if (Number.isFinite(cost)) localCosts.set(currency, (localCosts.get(currency) ?? 0) + cost);
     }
     const outcome = requestOutcome(request);
-    if (outcome === 'running' || outcome === 'delivering') {
+    if (outcome === 'running' || outcome === 'waiting_upstream' || outcome === 'reading_body' || outcome === 'delivering') {
       running += 1;
       continue;
     }
@@ -271,6 +271,8 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     cost: event.cost,
     error_code: event.error_code,
     terminal_cause_code: event.terminal_cause_code ?? previous?.terminal_cause_code ?? null,
+    in_flight_stage: event.in_flight_stage === 'upstream_response_headers' || event.in_flight_stage === 'upstream_response_body' || event.in_flight_stage === 'response_delivery'
+      ? event.in_flight_stage : previous?.in_flight_stage,
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };

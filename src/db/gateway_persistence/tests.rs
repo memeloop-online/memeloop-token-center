@@ -720,7 +720,7 @@ async fn safety_database_failure_never_enqueues_archive_work() {
         .execute(&fixture.database.pool).await.unwrap();
     assert!(matches!(
         fixture.admit(Uuid::new_v4()).await,
-        Err(AppError::Overloaded)
+        Err(AppError::Capacity { code: "request_record_persist_failed", .. })
     ));
     assert_eq!(
         fixture

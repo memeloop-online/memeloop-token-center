@@ -1,5 +1,5 @@
-# cargo audit 0.22 reads this file, not deny.toml. wreq-util 3.0.0-rc.14
-# requires zstd 0.13.3, and that line has no published build on zstd >=0.14.3.
+# cargo audit 0.22 reads this file, not deny.toml. Archive compression uses
+# zstd 0.13.3, and that line has no published build on zstd >=0.14.3.
 # Review and drop these on 2026-11-26.
 
 [advisories]

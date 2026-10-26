@@ -370,7 +370,7 @@ impl Database {
             .transpose()?;
         let route_id = Uuid::now_v7();
         if let Some(idempotency_key) = idempotency_key.as_ref() {
-            let fingerprint = request_fingerprint.as_deref().ok_or(AppError::Internal)?;
+            let fingerprint = request_fingerprint.as_deref().ok_or(AppError::internal("routes_create_routed_model_route_with_idempotency_1"))?;
             if let Some(existing_route_id) =
                 find_owned_route_create(&mut tx, &tenant_id, idempotency_key, fingerprint, now)
                     .await?
@@ -434,7 +434,7 @@ impl Database {
             RouteCreateDisposition::Created
         };
         if let Some(idempotency_key) = idempotency_key.as_ref() {
-            let fingerprint = request_fingerprint.as_deref().ok_or(AppError::Internal)?;
+            let fingerprint = request_fingerprint.as_deref().ok_or(AppError::internal("routes_create_routed_model_route_with_idempotency_2"))?;
             match claim_route_create(
                 &mut tx,
                 &tenant_id,

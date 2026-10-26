@@ -115,7 +115,7 @@ impl Database {
         } else {
             requested
         };
-        let version = version.checked_add(1).ok_or(AppError::Internal)?;
+        let version = version.checked_add(1).ok_or(AppError::internal("bindings_change_transport_binding_1"))?;
         let stamp = BindingStamp {
             selection_version: revision(&mut tx).await?,
             binding_version: version,
@@ -205,7 +205,7 @@ impl Database {
         let next_generation = generation
             .checked_add(1)
             .filter(|generation| *generation <= i64::from(u32::MAX))
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("bindings_write_transport_account_1"))?;
         let now = unix_millis().max(updated_at.saturating_add(1));
         let refresh_query = match self.backend {
             DatabaseBackend::PostgreSql => {
@@ -239,10 +239,10 @@ impl Database {
         let credential = current_credential.with_transport_proxy(proxy.to_owned())?;
         let ciphertext = seal_credential(&credential, key)?;
         let mut config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
-            .map_err(|_| AppError::Internal)?;
-        config.as_object_mut().ok_or(AppError::Internal)?.insert(
+            .map_err(|_| AppError::internal("bindings_write_transport_account_1"))?;
+        config.as_object_mut().ok_or(AppError::internal("bindings_write_transport_account_2"))?.insert(
             CONFIG_KEY.into(),
-            serde_json::to_value(stamp).map_err(|_| AppError::Internal)?,
+            serde_json::to_value(stamp).map_err(|_| AppError::internal("bindings_write_transport_account_2"))?,
         );
         sqlx::query("UPDATE upstream_credentials SET revoked_at = $1 WHERE upstream_account_id = $2 AND generation = $3 AND revoked_at IS NULL")
             .bind(now).bind(id.to_string()).bind(generation).execute(&mut **tx).await?;

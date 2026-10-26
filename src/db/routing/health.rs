@@ -429,13 +429,13 @@ impl Database {
             .map(|row| {
                 Ok(crate::model::RequestTransportDiagnosticView {
                     route_id: Uuid::parse_str(&row.try_get::<String, _>("route_id")?).map_err(
-                        |_| AppError::Storage("transport diagnostic route is malformed".into()),
+                        |_| AppError::storage("transport_diagnostic_route_is_malformed"),
                     )?,
                     upstream_account_id: Uuid::parse_str(
                         &row.try_get::<String, _>("upstream_account_id")?,
                     )
                     .map_err(|_| {
-                        AppError::Storage("transport diagnostic account is malformed".into())
+                        AppError::storage("transport_diagnostic_account_is_malformed")
                     })?,
                     credential_generation: row.try_get("credential_generation")?,
                     transport_revision: row.try_get("transport_revision")?,
@@ -539,7 +539,7 @@ impl Database {
         token
             .map(|token| {
                 Uuid::parse_str(&token)
-                    .map_err(|_| AppError::Storage("healthy admission epoch is malformed".into()))
+                    .map_err(|_| AppError::storage("healthy_admission_epoch_is_malformed"))
             })
             .transpose()
     }
@@ -989,7 +989,7 @@ impl Database {
             .map(|token| {
                 Uuid::parse_str(&token)
                     .map_err(|_| {
-                        AppError::Storage("upstream probe lease token is malformed".into())
+                        AppError::storage("upstream_probe_lease_token_is_malformed")
                     })
                     .map(|lease_token| UpstreamAttemptAdmission::SharedProbe { lease_token })
             })

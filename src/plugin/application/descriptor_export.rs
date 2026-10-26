@@ -122,8 +122,8 @@ impl ApplicationPlugins {
         };
         let descriptor_digest = descriptor.digest()?;
         let current_inventory = self.read_export_inventory().await?;
-        if serde_json::to_value(&inventory).map_err(|_| AppError::Internal)?
-            != serde_json::to_value(&current_inventory).map_err(|_| AppError::Internal)?
+        if serde_json::to_value(&inventory).map_err(|_| AppError::internal("descriptor_export_export_descriptor_1"))?
+            != serde_json::to_value(&current_inventory).map_err(|_| AppError::internal("descriptor_export_export_descriptor_2"))?
             || self.db.plugin_descriptor_authority_snapshot().await? != before
         {
             return Err(AppError::Conflict("plugin export authority changed".into()));
@@ -146,8 +146,8 @@ impl ApplicationPlugins {
         };
         let file = tokio::fs::File::open(path)
             .await
-            .map_err(|_| AppError::Internal)?;
-        let metadata = file.metadata().await.map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("descriptor_export_read_export_inventory_1"))?;
+        let metadata = file.metadata().await.map_err(|_| AppError::internal("descriptor_export_read_export_inventory_2"))?;
         let limit = PluginInventoryDescriptor::MAX_PARSE_BYTES;
         if !metadata.is_file() || metadata.len() > limit as u64 {
             return Err(AppError::Forbidden);
@@ -156,7 +156,7 @@ impl ApplicationPlugins {
         file.take((limit + 1) as u64)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("descriptor_export_read_export_inventory_3"))?;
         if bytes.len() > limit {
             return Err(AppError::Forbidden);
         }
@@ -164,8 +164,8 @@ impl ApplicationPlugins {
             serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
         for (inventory_id, previous) in retained {
             let entry = incoming.get(&inventory_id).ok_or(AppError::Forbidden)?;
-            if serde_json::to_value(previous).map_err(|_| AppError::Internal)?
-                != serde_json::to_value(entry).map_err(|_| AppError::Internal)?
+            if serde_json::to_value(previous).map_err(|_| AppError::internal("descriptor_export_read_export_inventory_4"))?
+                != serde_json::to_value(entry).map_err(|_| AppError::internal("descriptor_export_read_export_inventory_5"))?
             {
                 return Err(AppError::Forbidden);
             }
@@ -184,8 +184,8 @@ impl ApplicationPlugins {
         let db = self.db.clone();
         let permit = tokio::time::timeout(ADMISSION_WAIT, EXPORT_PERMITS.clone().acquire_owned())
             .await
-            .map_err(|_| AppError::Overloaded)?
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::capacity_error("plugin_export_capacity"))?
+            .map_err(|_| AppError::internal("descriptor_export_load_export_inventory_1"))?;
         #[cfg(test)]
         let gate = self.compile_gate.lock().unwrap().take();
         let task = tokio::task::spawn_blocking(move || {
@@ -193,10 +193,10 @@ impl ApplicationPlugins {
             #[cfg(test)]
             if let Some((entered, release)) = gate {
                 let _ = entered.send(());
-                release.recv().map_err(|_| AppError::Internal)?;
+                release.recv().map_err(|_| AppError::internal("descriptor_export_load_export_inventory_2"))?;
             }
             let metadata =
-                std::fs::symlink_metadata(&entry.root).map_err(|_| AppError::Internal)?;
+                std::fs::symlink_metadata(&entry.root).map_err(|_| AppError::internal("descriptor_export_load_export_inventory_3"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -207,8 +207,8 @@ impl ApplicationPlugins {
         });
         tokio::time::timeout(COMPILATION_DEADLINE, task)
             .await
-            .map_err(|_| AppError::Overloaded)?
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::capacity_error("plugin_export_capacity"))?
+            .map_err(|_| AppError::internal("descriptor_export_load_export_inventory_4"))?
     }
 }
 

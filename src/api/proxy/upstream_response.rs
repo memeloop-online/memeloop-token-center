@@ -110,11 +110,10 @@ pub(super) struct UpstreamResponseParts {
     pub(super) stream: UpstreamByteStream,
 }
 
-/// A small client-neutral response surface. Native Codex uses wreq for its
-/// TLS/HTTP2 fingerprint; all other upstreams remain on reqwest.
+/// A small response surface. Native Codex and every other upstream use reqwest.
 pub(super) enum UpstreamResponse {
     Reqwest(reqwest::Response),
-    Codex(wreq::Response),
+    Codex(reqwest::Response),
     Prefetched {
         status: StatusCode,
         headers: HeaderMap,

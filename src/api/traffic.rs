@@ -68,7 +68,7 @@ pub(super) async fn proxy_openai_responses(
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
-        return Err(AppError::Overloaded);
+        return Err(AppError::capacity_error("proxy_memory_ingress"));
     }
     let body = spool.read_all().await.map_err(|_| {
         tracing::error!(
@@ -76,7 +76,7 @@ pub(super) async fn proxy_openai_responses(
             bytes = spool.len(),
             "authenticated Responses request spool could not be replayed"
         );
-        AppError::Overloaded
+        AppError::capacity_error("request_spool_read_failed")
     })?;
     super::proxy::proxy_spooled_responses(
         state,
@@ -106,7 +106,7 @@ pub(super) async fn proxy_openai_responses_compact(
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
-        return Err(AppError::Overloaded);
+        return Err(AppError::capacity_error("proxy_memory_ingress"));
     }
     let body = spool.read_all().await.map_err(|_| {
         tracing::error!(
@@ -114,7 +114,7 @@ pub(super) async fn proxy_openai_responses_compact(
             bytes = spool.len(),
             "authenticated Responses compact request spool could not be replayed"
         );
-        AppError::Overloaded
+        AppError::capacity_error("request_spool_read_failed")
     })?;
     super::proxy::proxy_spooled_responses(
         state,
@@ -449,9 +449,12 @@ async fn apply_traffic_plugin(
                 .proxy_memory_budget
                 .temporary(64 * 1024 * 1024 + input_length.max(16 * 1024 * 1024).saturating_mul(5))
                 .map_err(|error| {
-                    state.metrics.observe_proxy_memory_error(
-                        crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                        error,
+                    named_memory_rejection(
+                        "proxy_memory_plugin",
+                        state.metrics.observe_proxy_memory_error(
+                            crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                            error,
+                        ),
                     )
                 })?,
         )
@@ -494,9 +497,12 @@ async fn apply_traffic_plugin(
                 )
             })();
             result.map_err(|error| {
-                metrics.observe_proxy_memory_error(
-                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                    error,
+                named_memory_rejection(
+                    "proxy_memory_plugin",
+                    metrics.observe_proxy_memory_error(
+                        crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                        error,
+                    ),
                 )
             })
         })
@@ -511,9 +517,7 @@ async fn apply_traffic_plugin(
         .request_json
         .unwrap_or(original_request_json);
     if !request_json.is_object() {
-        return Err(AppError::Upstream(
-            "plugin returned a request that is not a JSON object".into(),
-        ));
+        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin")));
     }
     let rewritten_model = request_json
         .get("model")
@@ -525,21 +529,17 @@ async fn apply_traffic_plugin(
         .or(rewritten_model)
         .unwrap_or_else(|| requested_model.clone());
     if model.trim().is_empty() || model.len() > 200 {
-        return Err(AppError::Upstream(
-            "plugin returned an invalid model".into(),
-        ));
+        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin")));
     }
     request_json["model"] = Value::String(model.clone());
     if crate::gateway_body::memory::json_encoded_length(&request_json)? > MAX_IMAGE_REQUEST_BODY {
-        return Err(AppError::Upstream(
-            "plugin-rewritten request exceeds 16 MiB".into(),
-        ));
+        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin")));
     }
     let upstream_account_hint = plugin_decision
         .upstream_account_id
         .map(|value| {
             Uuid::parse_str(&value).map_err(|_| {
-                AppError::Upstream("plugin returned an invalid upstream account id".into())
+                AppError::upstream("plugin_returned_an_invalid_upstream_account_id")
             })
         })
         .transpose()?;
@@ -572,7 +572,7 @@ pub(super) async fn prepare_component_provider(
     })
     .await?
     .ok_or_else(|| {
-        AppError::Upstream("component provider adapter is declared but unavailable".into())
+        AppError::upstream("component_provider_adapter_is_declared_but_unavailable")
     })
 }
 
@@ -588,9 +588,12 @@ pub(super) async fn normalize_component_provider(
         .proxy_memory_budget
         .temporary(64 * 1024 * 1024 + body.len().saturating_mul(6))
         .map_err(|error| {
-            state.metrics.observe_proxy_memory_error(
-                crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                error,
+            named_memory_rejection(
+                "proxy_memory_plugin",
+                state.metrics.observe_proxy_memory_error(
+                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                    error,
+                ),
             )
         })?;
     let plugins = state.plugins.clone();
@@ -601,7 +604,7 @@ pub(super) async fn normalize_component_provider(
     })
     .await?
     .ok_or_else(|| {
-        AppError::Upstream("component provider adapter is declared but unavailable".into())
+        AppError::upstream("component_provider_adapter_is_declared_but_unavailable")
     })
 }
 
@@ -609,11 +612,13 @@ pub(super) fn component_provider_url(base_url: &str, path: &str) -> Result<Strin
     let base = network::checked_http_url(base_url)?;
     let target = network::checked_http_url(&format!("{}{}", base_url.trim_end_matches('/'), path))?;
     if target.origin() != base.origin() {
-        return Err(AppError::Upstream(
-            "component provider path changed the configured upstream origin".into(),
-        ));
+        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("traffic_component_provider_url")));
     }
     Ok(target.into())
+}
+
+fn named_memory_rejection(stage: &'static str, error: AppError) -> AppError {
+    error.name_if_overloaded(stage)
 }
 
 pub(super) fn component_provider_timeout(config: &Value) -> Duration {

@@ -23,6 +23,9 @@ const MAX_CONVERSATION_FINGERPRINT_JSON_BYTES: usize = 70_000;
 // PostgreSQL's much larger protocol limit.
 const CONVERSATION_INSERT_BATCH_BIND_LIMIT: usize = 900;
 const SEMANTIC_ATOM_INSERT_BIND_COUNT: usize = 7;
+// The worker cgroup limit is 384Mi. A full session's raw JSON is at most
+// 128MiB; keep each insert batch far below the rest of that budget.
+const CONVERSATION_INSERT_BATCH_BYTES: usize = 256 * 1024;
 const CONTEXT_NODE_INSERT_BIND_COUNT: usize = 6;
 const EXPLICIT_SESSION_LOCK_SEED: i64 = 734_627_102_948_338;
 const CONVERSATION_REFERENCE_LOCK_SEED: i64 = 734_627_102_948_339;
@@ -136,10 +139,10 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
         };
         (
             "{}".to_owned(),
-            Some(serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)?),
+            Some(serde_json::to_string(&snapshot).map_err(|_| AppError::internal("conversations_enqueue_conversation_projection_in_transaction_1"))?),
         )
     };
-    let hints_json = serde_json::to_string(hints).map_err(|_| AppError::Internal)?;
+    let hints_json = serde_json::to_string(hints).map_err(|_| AppError::internal("conversations_enqueue_conversation_projection_in_transaction_2"))?;
     let key_snapshot = serde_json::json!({
         "account_id": key.account_id,
         "alias": key.alias,
@@ -398,7 +401,7 @@ impl Database {
             };
             let snapshot: Option<ConversationSemanticSnapshot> = prepare
                 .try_get::<Option<String>, _>("semantic_snapshot_json")?
-                .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::Internal))
+                .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::internal("conversations_project_claimed_conversation_projection_task_1")))
                 .transpose()?;
             let payload_required = prepare.try_get::<i64, _>("payload_required")? != 0;
             if payload_required
@@ -429,26 +432,17 @@ impl Database {
                     )
                     .await?
                 } else {
-                    serde_json::from_str(&prepare.try_get::<String, _>("request_json")?)
-                        .map_err(|_| AppError::Internal)?
+                    prepare.try_get::<String, _>("request_json")?
                 };
-                if let Some(snapshot) = snapshot.as_ref() {
-                    let atoms = extract_atoms(&prepare_request_json);
-                    let nodes = build_prefix(&atoms);
-                    if snapshot.leaf != nodes.last().map(|node| node.node_hash.clone())
-                        || snapshot.atom_hashes != bounded_atom_hashes(&atoms)
-                    {
-                        return Err(AppError::Conflict(
-                            "conversation semantic snapshot integrity mismatch".into(),
-                        ));
-                    }
-                }
-                self.materialize_conversation_content(
+                // Drop the raw session before the observation transaction. The
+                // streamed insert below already released each message.
+                self.materialize_streamed_conversation_content(
                     request_id,
                     lease_owner,
                     &prepare_tenant_id,
-                    &prepare_request_json,
+                    prepare_request_json,
                     prepare.try_get("observed_at")?,
+                    snapshot.as_ref(),
                 )
                 .await?;
             }
@@ -514,23 +508,23 @@ impl Database {
             task.try_get::<Option<String>, _>("key_snapshot_json")?
         {
             let snapshot: serde_json::Value =
-                serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+                serde_json::from_str(&snapshot).map_err(|_| AppError::internal("conversations_site_1"))?;
             AuthenticatedKey {
                 key_id,
                 tenant_id,
                 principal_id,
                 account_id: serde_json::from_value(snapshot["account_id"].clone())
-                    .map_err(|_| AppError::Internal)?,
+                    .map_err(|_| AppError::internal("conversations_site_2"))?,
                 alias: serde_json::from_value(snapshot["alias"].clone())
-                    .map_err(|_| AppError::Internal)?,
+                    .map_err(|_| AppError::internal("conversations_site_3"))?,
                 currency: serde_json::from_value(snapshot["currency"].clone())
-                    .map_err(|_| AppError::Internal)?,
+                    .map_err(|_| AppError::internal("conversations_site_4"))?,
                 credential_generation: serde_json::from_value(
                     snapshot["credential_generation"].clone(),
                 )
-                .map_err(|_| AppError::Internal)?,
+                .map_err(|_| AppError::internal("conversations_site_5"))?,
                 policy: serde_json::from_value(snapshot["policy"].clone())
-                    .map_err(|_| AppError::Internal)?,
+                    .map_err(|_| AppError::internal("conversations_site_6"))?,
             }
         } else {
             let key_row = sqlx::query(
@@ -551,20 +545,20 @@ impl Database {
                 currency: key_row.try_get("currency")?,
                 credential_generation: key_row.try_get("credential_generation")?,
                 policy: serde_json::from_str(&key_row.try_get::<String, _>("policy_json")?)
-                    .map_err(|_| AppError::Internal)?,
+                    .map_err(|_| AppError::internal("conversations_site_7"))?,
             }
         };
         let request_json = serde_json::from_str(&task.try_get::<String, _>("request_json")?)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("conversations_site_8"))?;
         let hints = serde_json::from_str(&task.try_get::<String, _>("hints_json")?)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("conversations_site_9"))?;
         let client_name: Option<String> = task.try_get("client_name")?;
         let upstream_response_id: Option<String> = task.try_get("upstream_response_id")?;
         let observed_at: i64 = task.try_get("observed_at")?;
 
         let snapshot: Option<ConversationSemanticSnapshot> = task
             .try_get::<Option<String>, _>("semantic_snapshot_json")?
-            .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::Internal))
+            .map(|encoded| serde_json::from_str(&encoded).map_err(|_| AppError::internal("conversations_site_10")))
             .transpose()?;
         let payload_required = task.try_get::<i64, _>("payload_required")? != 0;
         if payload_required
@@ -887,7 +881,7 @@ impl Database {
             }
         }
         let atom_hashes_json =
-            serde_json::to_string(&fingerprint).map_err(|_| AppError::Internal)?;
+            serde_json::to_string(&fingerprint).map_err(|_| AppError::internal("conversations_site_11"))?;
         let has_semantic_atoms = !atom_hashes.is_empty();
         debug_assert!(atom_hashes_json.len() <= MAX_CONVERSATION_FINGERPRINT_JSON_BYTES);
         let current_node_hashes: HashSet<&str> =
@@ -1069,7 +1063,7 @@ impl Database {
         };
 
         let execution_metadata = hints.execution_metadata();
-        let labels_json = serde_json::to_string(&hints.labels).map_err(|_| AppError::Internal)?;
+        let labels_json = serde_json::to_string(&hints.labels).map_err(|_| AppError::internal("conversations_site_12"))?;
 
         sqlx::query(
             "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version, turn_id, parent_turn_id, branch_id, compaction, session_name, trace_id, span_id, parent_span_id, agent_id, parent_agent_id, task_kind, labels_json, metadata_source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 2, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
@@ -1190,7 +1184,7 @@ impl Database {
             let snapshot = sqlx::query("UPDATE terminal_projection_outbox SET session_id = $1 WHERE request_id = $2 AND created_at = $3")
                 .bind(cluster_id.to_string()).bind(&request_id).bind(request_created_at).execute(&mut **transaction).await?;
             if attached.rows_affected() != 1 && snapshot.rows_affected() != 1 {
-                return Err(AppError::Internal.into());
+                return Err(AppError::internal("conversations_site_1").into());
             }
             if request_fact_exists {
                 reclassify_request_session_in_transaction(
@@ -1302,7 +1296,7 @@ impl Database {
             (filter.before_created_at, filter.before_request_id)
         {
             sqlx::query(
-                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms, r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit, r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM (SELECT * FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 AND (created_at < $3 OR (created_at = $3 AND id < $4)) ORDER BY created_at DESC, id DESC LIMIT $5) r LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM (SELECT * FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2 AND (source_started_at < $3 OR (source_started_at = $3 AND archive_request_id < $4)) ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $5) archive_page) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms, r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit, r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, r.in_flight_stage, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM (SELECT * FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 AND (created_at < $3 OR (created_at = $3 AND id < $4)) ORDER BY created_at DESC, id DESC LIMIT $5) r LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM (SELECT * FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2 AND (source_started_at < $3 OR (source_started_at = $3 AND archive_request_id < $4)) ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $5) archive_page) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id WHERE requests.created_at < $3 OR (requests.created_at = $3 AND requests.id < $4) ORDER BY requests.created_at DESC, requests.id DESC LIMIT $5",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -1313,7 +1307,7 @@ impl Database {
             .await?
         } else {
             sqlx::query(
-                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms, r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit, r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM (SELECT * FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3) r LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM (SELECT * FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2 ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $3) archive_page) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
+                "SELECT requests.*, observation.session_name, observation.trace_id, observation.span_id, observation.parent_span_id, observation.agent_id, observation.parent_agent_id, observation.task_kind, observation.labels_json, observation.metadata_source, observation.explicit_session_id, observation.turn_id, observation.parent_turn_id, observation.upstream_response_id, observation.branch_id, observation.compaction, observation.client_name FROM (SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms, r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit, r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, r.in_flight_stage, CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'live' AS source_kind, 'native' AS provenance_kind, CAST(0 AS BIGINT) AS unlinked, NULL AS archive_source, NULL AS external_request_id, r.conversation_cluster_id AS session_id, 'confirmed' AS session_association FROM (SELECT * FROM request_records WHERE key_id = $1 AND conversation_cluster_id = $2 ORDER BY created_at DESC, id DESC LIMIT $3) r LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id WHERE r.key_id = $1 AND r.conversation_cluster_id = $2 UNION ALL SELECT archive_request_id AS id, source_started_at AS created_at, CAST(NULL AS BIGINT) AS completed_at, source_completed_at, protocol, model, CAST(NULL AS TEXT) AS upstream_model, CAST(NULL AS TEXT) AS upstream_account_id, CAST(NULL AS TEXT) AS route_id, status_code, duration_ms, CAST(NULL AS BIGINT) AS first_output_ms, CAST(NULL AS BIGINT) AS generation_duration_ms, CAST(NULL AS TEXT) AS usage_basis, input_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens, CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit, CAST(0 AS BIGINT) AS cost_micros, NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%' OR response_object IS NULL OR response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state, 'session_archive' AS source_kind, 'archive_unlinked' AS provenance_kind, CAST(1 AS BIGINT) AS unlinked, source AS archive_source, external_request_id, conversation_cluster_id AS session_id, 'unlinked' AS session_association FROM (SELECT * FROM session_archive_unlinked_requests WHERE key_id = $1 AND conversation_cluster_id = $2 ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $3) archive_page) requests LEFT JOIN conversation_observations observation ON observation.request_id = requests.id AND observation.key_id = $1 AND observation.cluster_id = requests.session_id ORDER BY requests.created_at DESC, requests.id DESC LIMIT $3",
             )
             .bind(&key_id)
             .bind(&cluster_id)
@@ -1346,7 +1340,7 @@ impl Database {
             Vec::new()
         } else {
             let request_ids_json =
-                serde_json::to_string(&page_request_ids).map_err(|_| AppError::Internal)?;
+                serde_json::to_string(&page_request_ids).map_err(|_| AppError::internal("conversations_site_13"))?;
             let query = match self.backend {
                 DatabaseBackend::PostgreSql => {
                     "SELECT source_o.request_id AS from_request_id, target_o.request_id AS to_request_id, e.relation_kind, e.confidence_millis, e.evidence_json FROM conversation_edges e JOIN conversation_observations target_o ON target_o.id = e.to_observation_id LEFT JOIN conversation_observations source_o ON source_o.id = e.from_observation_id WHERE e.cluster_id = $1 AND target_o.key_id = $2 AND (source_o.key_id = $3 OR source_o.id IS NULL) AND target_o.request_id IN (SELECT jsonb_array_elements_text(CAST($4 AS JSONB))) ORDER BY target_o.created_at ASC, target_o.id ASC, e.id ASC LIMIT $5"
@@ -1546,7 +1540,7 @@ async fn emit_conversation_projected_event_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if inserted.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("conversations_emit_conversation_projected_event_in_transaction_1"));
     }
     Ok(())
 }
@@ -1682,7 +1676,7 @@ async fn merge_conversation_clusters_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if target_projection.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("conversations_merge_conversation_clusters_in_transaction_1"));
     }
 
     // Migration 0031 intentionally retained inert historical cross-key edges.
@@ -1705,7 +1699,7 @@ async fn merge_conversation_clusters_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if moved_observations.rows_affected() == 0 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("conversations_merge_conversation_clusters_in_transaction_2"));
     }
     sqlx::query(
         "UPDATE request_records SET conversation_cluster_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND conversation_cluster_id = $4",
@@ -1763,7 +1757,7 @@ async fn merge_conversation_clusters_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if target_cluster.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("conversations_site_2"));
     }
     merge_session_reading_in_transaction(
         transaction,
@@ -1792,7 +1786,7 @@ async fn merge_conversation_clusters_in_transaction(
         .execute(&mut **transaction)
         .await?;
         if retained_source.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("conversations_site_3"));
         }
     }
     Ok(target_cluster_id)
@@ -1922,7 +1916,7 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     .bind(request_id.to_string())
     .fetch_optional(&mut **transaction)
     .await?
-    .ok_or(AppError::Internal)?;
+    .ok_or(AppError::internal("conversations_attach_conversation_upstream_response_in_transacti"))?;
     let parent_observation_id: String = parent.try_get("id")?;
     let key_id: String = parent.try_get("key_id")?;
     let tenant_id: String = parent.try_get("tenant_id")?;
@@ -1944,7 +1938,7 @@ pub(crate) async fn attach_conversation_upstream_response_in_transaction(
     .execute(&mut **transaction)
     .await?;
     if updated.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("conversations_attach_conversation_upstream_response_in_transacti"));
     }
     reconcile_unresolved_explicit_parents_in_transaction(
         transaction,
@@ -2057,11 +2051,14 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     billing,
                     error_code,
                     terminal_cause_code: row.try_get("terminal_cause_code")?,
+                    in_flight_stage: crate::model::recorded_in_flight_stage(
+                        row.try_get("in_flight_stage")?,
+                    ),
                     supplier_error: None,
                     archive_state: crate::model::RequestArchiveState::from_storage(
                         row.try_get::<String, _>("archive_state")?.as_str(),
                     )
-                    .ok_or(AppError::Internal)?,
+                    .ok_or(AppError::internal("conversations_conversation_request_views_1"))?,
                     credential_identity: None,
                     session_context: Some(RequestSessionContext {
                         session_id: row.try_get("session_id")?,
@@ -2207,6 +2204,226 @@ fn conversation_batch_insert_statement(
     statement
 }
 
+struct PendingAtom {
+    role: String,
+    kind: String,
+    content_json: String,
+    content_hash: String,
+    instance_hash: String,
+}
+
+struct PendingNode {
+    node_hash: String,
+    parent_hash: Option<String>,
+    atom_hash: String,
+    depth: i64,
+}
+
+fn conversation_prefix_from_request_json(
+    request_json: &[u8],
+) -> Result<(Option<String>, Vec<String>), serde_json::Error> {
+    let mut parent = None;
+    let mut leaf = None;
+    let mut fingerprint = Vec::new();
+    crate::conversation::try_for_each_request_atom(request_json, |atom| {
+        if fingerprint.len() < MAX_CONVERSATION_FINGERPRINT_ATOMS {
+            fingerprint.push(atom.content_hash.clone());
+        }
+        let node_hash = crate::conversation::digest_parts(parent.as_deref(), &atom.content_hash);
+        parent = Some(node_hash.clone());
+        leaf = Some(node_hash);
+        Ok::<(), serde_json::Error>(())
+    })
+    .map_err(|error| match error {
+        crate::conversation::RequestAtomError::Json(error)
+        | crate::conversation::RequestAtomError::Visitor(error) => error,
+    })?;
+    Ok((leaf, fingerprint))
+}
+
+impl Database {
+    /// Rebuild one session from its stored request without holding every message.
+    ///
+    /// The worker is limited to 384Mi. Parsing the whole session into one JSON
+    /// value, then cloning every message into atoms, exceeds that while the raw
+    /// body is still live. Atoms and prefix nodes written here match
+    /// `extract_atoms` and `build_prefix`.
+    async fn materialize_streamed_conversation_content(
+        &self,
+        request_id: Uuid,
+        lease_owner: Uuid,
+        tenant_id: &str,
+        request_json: String,
+        observed_at: i64,
+        snapshot: Option<&ConversationSemanticSnapshot>,
+    ) -> Result<(), AppError> {
+        let (leaf, fingerprint) = conversation_prefix_from_request_json(request_json.as_bytes())
+            .map_err(|_| AppError::internal("conversations_materialize_streamed_conversation_content_1"))?;
+        if let Some(snapshot) = snapshot
+            && (snapshot.leaf != leaf || snapshot.atom_hashes != fingerprint)
+        {
+            return Err(AppError::Conflict(
+                "conversation semantic snapshot integrity mismatch".into(),
+            ));
+        }
+        let mut transaction = self.begin_write_transaction().await?;
+        let result = insert_streamed_conversation_content(
+            &mut transaction,
+            tenant_id,
+            request_json,
+            observed_at,
+        )
+        .await;
+        if let Err(error) = result {
+            let retryable_sqlstate = error.retryable_sqlstate();
+            let rollback_confirmed = transaction.rollback().await.is_ok();
+            tracing::warn!(
+                %request_id,
+                rollback_confirmed,
+                sqlstate = retryable_sqlstate.unwrap_or("unclassified"),
+                "conversation content transaction failed"
+            );
+            if rollback_confirmed && retryable_sqlstate.is_some() {
+                self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                    .await;
+            }
+            return Err(error.into());
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+}
+
+async fn insert_streamed_conversation_content(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    request_json: String,
+    observed_at: i64,
+) -> Result<(), ConversationContentError> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    let walk = tokio::task::spawn_blocking(move || {
+        crate::conversation::try_for_each_request_atom(request_json.as_bytes(), |atom| {
+            tx.blocking_send(atom).map_err(|_| ())
+        })
+    });
+    let mut parent = None;
+    let mut depth = 0_i64;
+    let mut atoms = Vec::new();
+    let mut nodes = Vec::new();
+    let mut batch_bytes = 0_usize;
+    let max_rows = CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT;
+    let mut failed: Option<ConversationContentError> = None;
+    while let Some(atom) = rx.recv().await {
+        let crate::conversation::SemanticAtom {
+            role,
+            kind,
+            content,
+            content_hash,
+            instance_hash,
+        } = atom;
+        let Ok(content_json) = serde_json::to_string(&content) else {
+            failed = Some(AppError::internal("conversations_insert_streamed_conversation_content_1").into());
+            break;
+        };
+        drop(content);
+        depth += 1;
+        let node_hash = crate::conversation::digest_parts(parent.as_deref(), &content_hash);
+        nodes.push(PendingNode {
+            node_hash: node_hash.clone(),
+            parent_hash: parent.clone(),
+            atom_hash: content_hash.clone(),
+            depth,
+        });
+        parent = Some(node_hash);
+        batch_bytes = batch_bytes.saturating_add(content_json.len());
+        atoms.push(PendingAtom {
+            role,
+            kind,
+            content_json,
+            content_hash,
+            instance_hash,
+        });
+        if atoms.len() >= max_rows || batch_bytes >= CONVERSATION_INSERT_BATCH_BYTES {
+            if let Err(error) =
+                flush_conversation_batches(transaction, tenant_id, observed_at, &atoms, &nodes)
+                    .await
+            {
+                failed = Some(error);
+                break;
+            }
+            atoms.clear();
+            nodes.clear();
+            batch_bytes = 0;
+        }
+    }
+    drop(rx);
+    let walk_result = match walk.await {
+        Ok(result) => result,
+        Err(_) => return Err(AppError::internal("conversations_insert_streamed_conversation_content_2").into()),
+    };
+    if let Some(error) = failed {
+        return Err(error);
+    }
+    if !atoms.is_empty() {
+        flush_conversation_batches(transaction, tenant_id, observed_at, &atoms, &nodes).await?;
+    }
+    match walk_result {
+        Ok(()) => Ok(()),
+        Err(crate::conversation::RequestAtomError::Json(_)) => Err(AppError::internal("conversations_insert_streamed_conversation_content_3").into()),
+        // The sender only fails when this task drops the receiver after its own error.
+        Err(crate::conversation::RequestAtomError::Visitor(())) => Err(AppError::internal("conversations_insert_streamed_conversation_content_4").into()),
+    }
+}
+
+async fn flush_conversation_batches(
+    transaction: &mut Transaction<'_, Any>,
+    tenant_id: &str,
+    observed_at: i64,
+    atoms: &[PendingAtom],
+    nodes: &[PendingNode],
+) -> Result<(), ConversationContentError> {
+    if !atoms.is_empty() {
+        let statement = conversation_batch_insert_statement(
+            "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ",
+            atoms.len(),
+            SEMANTIC_ATOM_INSERT_BIND_COUNT,
+            " ON CONFLICT(tenant_id, content_hash) DO NOTHING",
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+        for atom in atoms {
+            query = query
+                .bind(tenant_id)
+                .bind(&atom.content_hash)
+                .bind(&atom.instance_hash)
+                .bind(&atom.role)
+                .bind(&atom.kind)
+                .bind(&atom.content_json)
+                .bind(observed_at);
+        }
+        query.execute(&mut **transaction).await?;
+    }
+    if !nodes.is_empty() {
+        let statement = conversation_batch_insert_statement(
+            "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) VALUES ",
+            nodes.len(),
+            CONTEXT_NODE_INSERT_BIND_COUNT,
+            " ON CONFLICT(tenant_id, node_hash) DO NOTHING",
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
+        for node in nodes {
+            query = query
+                .bind(tenant_id)
+                .bind(&node.node_hash)
+                .bind(&node.parent_hash)
+                .bind(&node.atom_hash)
+                .bind(node.depth)
+                .bind(observed_at);
+        }
+        query.execute(&mut **transaction).await?;
+    }
+    Ok(())
+}
+
 pub(crate) async fn materialize_conversation_content_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
@@ -2249,7 +2466,7 @@ async fn materialize_conversation_content_with_statement_error(
                 .bind(&atom.instance_hash)
                 .bind(&atom.role)
                 .bind(&atom.kind)
-                .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::Internal)?)
+                .bind(serde_json::to_string(&atom.content).map_err(|_| AppError::internal("conversations_materialize_conversation_content_with_statement_er"))?)
                 .bind(observed_at);
         }
         query.execute(&mut **transaction).await?;
@@ -2348,6 +2565,111 @@ mod tests {
             conversation_batch_insert_statement("VALUES ", 2, 3, " ON CONFLICT DO NOTHING"),
             "VALUES ($1,$2,$3),($4,$5,$6) ON CONFLICT DO NOTHING"
         );
+    }
+
+    #[tokio::test]
+    async fn streamed_session_rebuild_matches_extracted_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("session-rebuild.db").display()
+        ))
+        .await
+        .unwrap();
+        db.migrate().await.unwrap();
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "rules", "id": "s"}),
+            serde_json::json!({"role": "user", "content": "keep [}{] \"quotes\"", "created_at": 3}),
+            serde_json::json!({"role": "assistant", "content": [{"type": "text", "text": "answer", "call_id": "c"}], "tool_call_id": "t"}),
+        ];
+        messages.extend((0..200).map(|index| {
+            serde_json::json!({"role": "user", "content": format!("turn-{index}"), "id": format!("id-{index}")})
+        }));
+        messages.push(serde_json::json!({"role": "user", "content": "tail"}));
+        let body = serde_json::json!({
+            "model": "session-rebuild",
+            "tools": [{"name": "unused", "description": "x".repeat(2048)}],
+            "messages": messages
+        });
+        let text = serde_json::to_string(&body).unwrap();
+        let tenant = Uuid::now_v7().to_string();
+        let (leaf, fingerprint) =
+            conversation_prefix_from_request_json(text.as_bytes()).unwrap();
+        let mismatch = db
+            .materialize_streamed_conversation_content(
+                Uuid::now_v7(),
+                Uuid::now_v7(),
+                &tenant,
+                text.clone(),
+                7,
+                Some(&ConversationSemanticSnapshot {
+                    leaf: Some("not-the-leaf".into()),
+                    atom_hashes: fingerprint.clone(),
+                    payload_digest: None,
+                }),
+            )
+            .await;
+        assert!(mismatch.is_err());
+        let untouched: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1")
+                .bind(&tenant)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(untouched, 0);
+        db.materialize_streamed_conversation_content(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            &tenant,
+            text.clone(),
+            7,
+            Some(&ConversationSemanticSnapshot {
+                leaf: leaf.clone(),
+                atom_hashes: fingerprint.clone(),
+                payload_digest: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let atoms = extract_atoms(&body);
+        let nodes = build_prefix(&atoms);
+        let rows = sqlx::query(
+            "SELECT n.depth, n.node_hash, n.parent_hash, n.atom_hash, a.role, a.kind, a.instance_hash, a.content_json FROM context_nodes n JOIN semantic_atoms a ON a.tenant_id = n.tenant_id AND a.content_hash = n.atom_hash WHERE n.tenant_id = $1 ORDER BY n.depth",
+        )
+        .bind(&tenant)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), atoms.len());
+        assert!(atoms.len() > CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT);
+        for (row, (atom, node)) in rows.iter().zip(atoms.iter().zip(&nodes)) {
+            let depth: i64 = row.try_get("depth").unwrap();
+            let node_hash: String = row.try_get("node_hash").unwrap();
+            let parent_hash: Option<String> = row.try_get("parent_hash").unwrap();
+            let atom_hash: String = row.try_get("atom_hash").unwrap();
+            let role: String = row.try_get("role").unwrap();
+            let kind: String = row.try_get("kind").unwrap();
+            let instance_hash: String = row.try_get("instance_hash").unwrap();
+            let content_json: String = row.try_get("content_json").unwrap();
+            assert_eq!(depth, node.depth as i64);
+            assert_eq!(node_hash, node.node_hash);
+            assert_eq!(parent_hash, node.parent_hash);
+            assert_eq!(atom_hash, atom.content_hash);
+            assert_eq!(role, atom.role);
+            assert_eq!(kind, atom.kind);
+            assert_eq!(instance_hash, atom.instance_hash);
+            assert_eq!(content_json, serde_json::to_string(&atom.content).unwrap());
+        }
+        assert_eq!(leaf.as_deref(), nodes.last().map(|node| node.node_hash.as_str()));
+        assert_eq!(
+            fingerprint,
+            atoms
+                .iter()
+                .take(MAX_CONVERSATION_FINGERPRINT_ATOMS)
+                .map(|atom| atom.content_hash.clone())
+                .collect::<Vec<_>>()
+        );
+        db.pool.close().await;
     }
 
     #[test]

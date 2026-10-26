@@ -13,13 +13,40 @@ use crate::{api::proxy::safe_response_id, provider::SseFramingLimits};
 // response.completed" and loses the explicit upstream failure. Keep this
 // envelope fixed and redacted, and do not mint a response id or a successful
 // terminal for a lifecycle we could not validate.
-const SAFE_FAILURE_EVENT: &[u8] = b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"upstream request failed\",\"type\":\"server_error\",\"code\":\"server_error\"}}}\n\n";
-
-/// A fixed terminal error frame for a downstream Responses SSE stream.  It
-/// deliberately contains no provider detail and lets a stream that has
-/// already started end with a valid body instead of a transport decode error.
-pub(in crate::api) fn safe_failure_event() -> Bytes {
-    Bytes::from_static(SAFE_FAILURE_EVENT)
+/// A Codex `response.failed` frame. It carries the sanitizer's code and stage
+/// in both languages and never a provider body or a minted response id.
+pub(in crate::api) fn safe_failure_event(code: &'static str, stage: &'static str) -> Bytes {
+    let public_code = if crate::error::is_public_error_code(code) && !code.starts_with("http_") {
+        code
+    } else {
+        "upstream_rejected"
+    };
+    let public_stage = if crate::error::is_public_error_code(stage) {
+        stage
+    } else {
+        "response_failed"
+    };
+    let (message, message_en) = crate::error::render_bilingual(
+        public_code,
+        crate::error::ErrorFacts::new().stage(public_stage),
+    );
+    let data = serde_json::to_vec(&json!({
+        "type": "response.failed",
+        "response": {
+            "status": "failed",
+            "error": {
+                "code": public_code,
+                "message": message,
+                "message_en": format!("upstream request failed. {message_en}"),
+                "type": "server_error"
+            }
+        }
+    }))
+    .expect("safe failure frame is static JSON");
+    let mut frame = b"event: response.failed\ndata: ".to_vec();
+    frame.extend_from_slice(&data);
+    frame.extend_from_slice(b"\n\n");
+    Bytes::from(frame)
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -178,6 +205,7 @@ pub(in crate::api) struct ResponsesStreamingSanitizer {
     // A fixed, low-cardinality operator diagnosis. It is deliberately never
     // derived from an upstream event, identifier, or payload.
     last_rejection_stage: Option<&'static str>,
+    last_rejection_code: Option<&'static str>,
 }
 
 impl Default for ResponsesStreamingSanitizer {
@@ -197,6 +225,7 @@ impl ResponsesStreamingSanitizer {
             terminal_hold: ResponseTerminalHold::with_limit(limits.terminal_hold_bytes),
             progress_heartbeat: None,
             last_rejection_stage: None,
+            last_rejection_code: None,
         }
     }
 
@@ -205,11 +234,13 @@ impl ResponsesStreamingSanitizer {
         let batch = self.framer.push(chunk);
         if let Some(rejection) = batch.rejection {
             self.last_rejection_stage = Some("framing");
+            self.last_rejection_code = Some(rejection.error_code());
             return Err(rejection.error_code());
         }
         for event in batch.events {
             if let Err(rejection) = self.sanitize_event(event, &mut output) {
                 self.last_rejection_stage = Some(rejection.stage);
+                self.last_rejection_code = Some(rejection.code);
                 return Err(rejection.code);
             }
         }
@@ -232,10 +263,12 @@ impl ResponsesStreamingSanitizer {
     pub(in crate::api) fn finish(&mut self) -> Result<Bytes, &'static str> {
         if !self.framer.is_complete() {
             self.last_rejection_stage = Some("eof_incomplete");
+            self.last_rejection_code = Some("upstream_incomplete_response");
             return Err("upstream_incomplete_response");
         }
         if self.terminal.is_none() {
             self.last_rejection_stage = Some("eof_without_terminal");
+            self.last_rejection_code = Some("upstream_eof_without_terminal");
             return Err("upstream_eof_without_terminal");
         }
         let terminal = self.terminal_hold.release();
@@ -265,6 +298,10 @@ impl ResponsesStreamingSanitizer {
     /// It never includes any upstream bytes, headers, identifiers, or errors.
     pub(in crate::api) fn last_rejection_stage(&self) -> &'static str {
         self.last_rejection_stage.unwrap_or("unknown")
+    }
+
+    pub(in crate::api) fn last_rejection_code(&self) -> &'static str {
+        self.last_rejection_code.unwrap_or("upstream_rejected")
     }
 
     fn sanitize_event(
@@ -434,7 +471,7 @@ impl ResponsesStreamingSanitizer {
             self.terminal_hold.begin();
         }
         if failure {
-            self.append_output(output, SAFE_FAILURE_EVENT)
+            self.append_output(output, &safe_failure_event("upstream_rejected", "response_failed"))
                 .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
         } else {
             self.append_safe_sse_fields(&event, output)?;

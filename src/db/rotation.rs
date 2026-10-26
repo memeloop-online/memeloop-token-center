@@ -144,7 +144,7 @@ pub(super) async fn store_credential_rotation_response<T: Serialize>(
     .execute(&mut **transaction)
     .await?;
     if stored.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("rotation_store_credential_rotation_response_1"));
     }
     Ok(())
 }

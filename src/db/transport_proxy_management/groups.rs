@@ -103,7 +103,7 @@ impl Database {
         {
             return Err(invalid());
         }
-        let version = version.checked_add(1).ok_or(AppError::Internal)?;
+        let version = version.checked_add(1).ok_or(AppError::internal("groups_update_transport_group_1"))?;
         let ciphertext = seal_private_json(&next, key, MEMBERS_AAD)?;
         let (probe_url, probe_attempts) = probe_settings(body.probe_url, body.probe_attempts)?;
         sqlx::query("UPDATE transport_proxy_groups SET name = $1, version = $2, members_ciphertext = $3, probe_url = $4, probe_attempts = $5, updated_at = $6 WHERE id = $7")

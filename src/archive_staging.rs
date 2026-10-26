@@ -57,7 +57,7 @@ impl ArchiveStagingOwner {
             "proxy_request" => Ok(Self::ProxyRequest(id)),
             "synchronous_request" => Ok(Self::SynchronousRequest(id)),
             "generation_job" => Ok(Self::GenerationJob(id)),
-            _ => Err(AppError::Internal),
+            _ => Err(AppError::internal("archive_staging_parse_1")),
         }
     }
 }
@@ -68,6 +68,9 @@ pub enum ArchiveStagingPurpose {
     Response,
     Result,
     Assets,
+    /// 从原始请求 JSON 或响应里抽出的媒体字节。用途是对象键上的这一段，不写进密文。
+    /// 会话正文归档的 CNPG part 保存 blake3 和 locator。
+    Media,
 }
 
 impl ArchiveStagingPurpose {
@@ -77,6 +80,7 @@ impl ArchiveStagingPurpose {
             Self::Response => "response",
             Self::Result => "result",
             Self::Assets => "assets",
+            Self::Media => "media",
         }
     }
 
@@ -86,7 +90,8 @@ impl ArchiveStagingPurpose {
             "response" => Ok(Self::Response),
             "result" => Ok(Self::Result),
             "assets" => Ok(Self::Assets),
-            _ => Err(AppError::Internal),
+            "media" => Ok(Self::Media),
+            _ => Err(AppError::internal("archive_staging_parse_2")),
         }
     }
 }
@@ -203,7 +208,7 @@ impl ArchiveStagingState {
             "bound" => Ok(Self::Bound),
             "cleanup_pending" => Ok(Self::CleanupPending),
             "cleaned" => Ok(Self::Cleaned),
-            _ => Err(AppError::Internal),
+            _ => Err(AppError::internal("archive_staging_parse_3")),
         }
     }
 }
@@ -344,15 +349,42 @@ pub(crate) fn validate_bound_locator(
     Ok(())
 }
 
+/// 会话正文归档里单个媒体对象的键。闭合用途是路径中的 `media` 段，blake3 是最后一段。
+/// 对象字节保持密文，种类不写进字节里。
+pub fn conversation_media_locator(
+    key: ArchiveStagingKey,
+    content_blake3: &str,
+) -> Result<String, AppError> {
+    if key.purpose != ArchiveStagingPurpose::Media || !valid_blake3_hex(content_blake3) {
+        return Err(AppError::BadRequest(
+            "会话正文归档的媒体对象键必须是 media 用途和 blake3".into(),
+        ));
+    }
+    let locator = format!("{}/{content_blake3}", key.canonical_prefix());
+    validate_bound_locator(key, &locator)?;
+    Ok(locator)
+}
+
+fn valid_blake3_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn valid_owner_purpose(owner: ArchiveStagingOwner, purpose: ArchiveStagingPurpose) -> bool {
     matches!(
         (owner, purpose),
         (
             ArchiveStagingOwner::ProxyRequest(_),
-            ArchiveStagingPurpose::Request | ArchiveStagingPurpose::Response
+            ArchiveStagingPurpose::Request
+                | ArchiveStagingPurpose::Response
+                | ArchiveStagingPurpose::Media
         ) | (
             ArchiveStagingOwner::SynchronousRequest(_),
-            ArchiveStagingPurpose::Request | ArchiveStagingPurpose::Result
+            ArchiveStagingPurpose::Request
+                | ArchiveStagingPurpose::Result
+                | ArchiveStagingPurpose::Media
         ) | (
             ArchiveStagingOwner::GenerationJob(_),
             ArchiveStagingPurpose::Request | ArchiveStagingPurpose::Assets
@@ -361,10 +393,10 @@ fn valid_owner_purpose(owner: ArchiveStagingOwner, purpose: ArchiveStagingPurpos
 }
 
 fn parse_canonical_uuid(value: &str) -> Result<Uuid, AppError> {
-    let parsed = Uuid::parse_str(value).map_err(|_| AppError::Internal)?;
+    let parsed = Uuid::parse_str(value).map_err(|_| AppError::internal("archive_staging_parse_canonical_uuid_1"))?;
     (parsed.to_string() == value)
         .then_some(parsed)
-        .ok_or(AppError::Internal)
+        .ok_or(AppError::internal("archive_staging_parse_canonical_uuid_2"))
 }
 
 fn valid_object_locator(value: &str) -> bool {
@@ -388,6 +420,36 @@ fn valid_object_locator(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn media_purpose_is_on_the_key_and_generation_assets_stay_separate() {
+        let owner_id = Uuid::parse_str("019fffff-ffff-7fff-bfff-fffffffffff0").unwrap();
+        let attempt_id = Uuid::parse_str("019fffff-ffff-7fff-bfff-fffffffffff1").unwrap();
+        let hash = "ab".repeat(32);
+        let key = ArchiveStagingKey::new(
+            ArchiveStagingOwner::ProxyRequest(owner_id),
+            ArchiveStagingPurpose::Media,
+            attempt_id,
+        )
+        .unwrap();
+        let locator = conversation_media_locator(key, &hash).unwrap();
+        assert_eq!(
+            locator,
+            format!(
+                "staging/proxy/{owner_id}/media/{attempt_id}/{hash}"
+            )
+        );
+        assert_eq!(ArchiveStagingPurpose::parse("media").unwrap(), ArchiveStagingPurpose::Media);
+        assert!(
+            ArchiveStagingKey::new(
+                ArchiveStagingOwner::GenerationJob(owner_id),
+                ArchiveStagingPurpose::Media,
+                attempt_id,
+            )
+            .is_err()
+        );
+        assert!(conversation_media_locator(key, "not-a-blake3").is_err());
+    }
 
     #[test]
     fn canonical_prefix_contains_only_typed_segments() {

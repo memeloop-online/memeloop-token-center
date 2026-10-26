@@ -17,7 +17,7 @@ impl std::io::Write for Http2EvidenceWriter {
     }
 }
 
-fn http2_attempt_evidence(binding_enabled: bool) -> Http2AttemptEvidence {
+fn http2_attempt_evidence() -> Http2AttemptEvidence {
     let route = ResolvedUpstream {
         route_id: Uuid::new_v4(),
         account_id: Uuid::new_v4(),
@@ -68,7 +68,6 @@ fn http2_attempt_evidence(binding_enabled: bool) -> Http2AttemptEvidence {
         },
         true,
         BodyConsumption::default(),
-        binding_enabled,
     )
 }
 
@@ -77,14 +76,7 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
     use futures_util::StreamExt;
     use tracing::instrument::WithSubscriber;
 
-    for (before_headers, binding_enabled) in
-        [(true, false), (false, false), (true, true), (false, true)]
-    {
-        let binding_active = cfg!(feature = "h2-attempt-binding") && binding_enabled;
-        assert!(
-            !crate::config::Config::for_test("sqlite::memory:".to_owned())
-                .h2_attempt_binding_enabled
-        );
+    for before_headers in [true, false] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (release, released) = tokio::sync::oneshot::channel();
@@ -127,7 +119,7 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
             );
             response_task.await.unwrap();
         });
-        let evidence = http2_attempt_evidence(binding_enabled);
+        let evidence = http2_attempt_evidence();
         let expected_request = evidence.request_id;
         let expected_account = evidence.upstream_account_id;
         let expected_client = evidence.identity.client_instance_id;
@@ -150,39 +142,12 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
                 .build()
                 .unwrap();
             evidence.body_consumption.attach(&mut request);
-            assert_eq!(evidence.binding.is_some(), binding_active);
-            assert!(
-                evidence
-                    .binding
-                    .as_ref()
-                    .and_then(|observer| observer.snapshot())
-                    .is_none()
-            );
-            if cfg!(feature = "h2-attempt-binding") {
-                evidence.attach_binding(&mut request);
-            }
-            assert_eq!(
-                request
-                    .extensions()
-                    .get::<wreq_proto::ext::H2AttemptObserver>()
-                    .is_some(),
-                binding_active
-            );
             let result = client.execute(request).await;
-            if binding_active {
-                let binding = evidence.binding.as_ref().unwrap().snapshot().unwrap();
-                assert_ne!(binding.connection_id, 0);
-                assert_eq!(binding.stream_id, 1);
-                assert_eq!(binding.stream_ordinal, 1);
-                assert!(!format!("{binding:?}").contains("CANARY"));
-            } else {
-                assert!(evidence.binding.is_none());
-            }
             if before_headers {
                 let error = result.expect_err("peer reset must precede headers");
                 evidence.observe_error(&error, true);
                 assert!(matches!(
-                    classify_wreq_send_error(error),
+                    classify_codex_send_error(error),
                     ProxySendError::NonRetryableTransport(TransportFailureKind::Http2Reset)
                 ));
                 drop(release);
@@ -236,53 +201,11 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        let bindings: Vec<_> = events
-            .iter()
-            .map(|event| &event["fields"])
-            .filter(|fields| fields["message"] == "Optional H2 attempt binding")
-            .collect();
-        assert_eq!(
-            bindings.len(),
-            if binding_active {
-                if before_headers { 1 } else { 2 }
-            } else {
-                0
-            }
+        assert!(
+            events
+                .iter()
+                .all(|event| event["fields"]["message"] != "Optional H2 attempt binding")
         );
-        for binding in &bindings {
-            assert_eq!(binding["request_id"], expected_request.to_string());
-            assert_eq!(binding["upstream_account_id"], expected_account.to_string());
-            assert_eq!(binding["credential_generation"], 13);
-            assert_eq!(binding["transport_revision"], 42);
-            assert_eq!(binding["candidate_rank"], 2);
-            assert_eq!(binding["outbound_attempt"], 1);
-            assert_eq!(binding["connect_attempt"], 2);
-            assert!(binding["h2_connection_id"].as_u64().unwrap() > 0);
-            assert_eq!(binding["h2_connection_id"], bindings[0]["h2_connection_id"]);
-            assert_eq!(binding["h2_stream_id"], 1);
-            assert_eq!(binding["h2_stream_ordinal"], 1);
-            assert_eq!(binding["peer_delivery_state"], "unknown");
-            assert!(binding["h2_lifecycle"].as_u64().unwrap() <= 3);
-            assert!(binding["h2_connection_age_ms"].as_u64().is_some());
-            assert_eq!(
-                binding["lifecycle_scope"],
-                "local_connection_task_not_peer_close"
-            );
-        }
-        if binding_active {
-            assert_eq!(
-                bindings[0]["stage"],
-                if before_headers {
-                    "codex_h2_binding_before_response_headers"
-                } else {
-                    "codex_h2_binding_response_admitted_not_full_success"
-                }
-            );
-            if !before_headers {
-                assert_eq!(bindings[0]["status"], 200);
-                assert_eq!(bindings[1]["stage"], "codex_h2_binding_response_body");
-            }
-        }
         let fields: Vec<_> = events
             .iter()
             .map(|event| &event["fields"])
@@ -326,20 +249,12 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
             fields["client_identity_scope"],
             "cached_client_not_connection_or_stream"
         );
-        println!(
-            "h2_binding_gate feature={} runtime={} preheaders={} attached={} receipts={} posts=1 canaries_absent=true peer_delivery=unknown",
-            cfg!(feature = "h2-attempt-binding"),
-            binding_enabled,
-            before_headers,
-            binding_active,
-            bindings.len()
-        );
     }
 }
 
 #[tokio::test]
 async fn generic_errors_do_not_create_h2_origin_or_log_raw_error() {
-    let evidence = http2_attempt_evidence(true);
+    let evidence = http2_attempt_evidence();
     let writer = Http2EvidenceWriter::default();
     let sink = writer.clone();
     let subscriber = tracing_subscriber::fmt()
@@ -394,9 +309,9 @@ async fn native_request_991089_tls_encoded_contract() {
     let observed = consumption.clone();
     let sent = payload.clone();
     let mut evidence =
-        crate::http2_upload_tests::native_encoded::verify(payload, move |client, url, proxy| {
-            let builder = codex_transport::apply_wreq_wire_headers(
-                client.post(url).proxy(proxy).body(sent),
+        crate::http2_upload_tests::native_encoded::verify(payload, move |client, url| {
+            let builder = codex_transport::apply_codex_wire_headers(
+                client.post(url).body(sent),
                 &downstream,
                 &credential,
                 "synthetic-session",
@@ -515,7 +430,7 @@ fn native_request_discards_stale_length_and_forbidden_downstream_headers() {
     ] {
         downstream.insert(name, HeaderValue::from_static(value));
     }
-    let request = codex_transport::apply_wreq_wire_headers(
+    let request = codex_transport::apply_codex_wire_headers(
         client
             .post("https://chatgpt.com/backend-api/codex/responses")
             .body(serialized.clone()),

@@ -59,7 +59,7 @@ pub(super) async fn aggregate_terminal_generation_job(
     .execute(&mut **transaction)
     .await?;
     if fact.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("aggregation_aggregate_terminal_generation_job_1"));
     }
 
     sqlx::query(
@@ -126,7 +126,7 @@ pub(super) async fn aggregate_terminal_generation_job(
     .execute(&mut **transaction)
     .await?;
     if aggregated.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("aggregation_site_1"));
     }
     sqlx::query(
         r#"INSERT INTO usage_analysis_hourly (

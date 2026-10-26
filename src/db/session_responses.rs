@@ -105,7 +105,7 @@ impl Database {
             let encoded = serde_json::to_string(&serde_json::json!({
                 "role": "assistant", "type": "response_summary", "content": answer
             }))
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("session_responses_finish_session_response_1"))?;
             let digest = blake3::hash(encoded.as_bytes()).to_hex().to_string();
             sqlx::query("INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $2, 'assistant', 'response_summary', $3, $4) ON CONFLICT(tenant_id, content_hash) DO NOTHING")
                 .bind(task.tenant_id.to_string()).bind(&digest).bind(encoded).bind(now).execute(&mut *tx).await?;

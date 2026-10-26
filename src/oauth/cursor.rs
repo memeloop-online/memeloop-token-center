@@ -242,7 +242,7 @@ pub async fn start_cursor_login(
         )
     };
     let mut verifier_bytes = [0_u8; 32];
-    fill(&mut verifier_bytes).map_err(|_| AppError::Internal)?;
+    fill(&mut verifier_bytes).map_err(|_| AppError::internal("cursor_start_cursor_login_1"))?;
     let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let uuid = Uuid::now_v7().to_string();
@@ -496,10 +496,10 @@ pub async fn poll_cursor_login(
         let _ = db
             .release_oauth_login_poll(state.session_id, lease_owner, now)
             .await;
-        return Err(AppError::Upstream(format!(
-            "Cursor OAuth poll returned {}",
-            status
-        )));
+        return Err(AppError::upstream_status(
+            "cursor_oauth_poll_returned",
+            status.as_u16(),
+        ));
     }
     let body = match bounded_body(response).await {
         Ok(body) => body,
@@ -511,11 +511,9 @@ pub async fn poll_cursor_login(
         }
     };
     let tokens: CursorTokens = serde_json::from_slice(&body)
-        .map_err(|_| AppError::Upstream("Cursor OAuth returned invalid JSON".into()))?;
+        .map_err(|_| AppError::upstream("cursor_oauth_returned_invalid_json"))?;
     if tokens.access_token.is_empty() {
-        return Err(AppError::Upstream(
-            "Cursor OAuth returned an empty access token".into(),
-        ));
+        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("cursor_poll_cursor_login")));
     }
     let expires_at = token_expiry_millis(&tokens.access_token)
         .unwrap_or_else(|| now.saturating_add(60 * 60 * 1000));
@@ -534,7 +532,7 @@ pub async fn poll_cursor_login(
                 schema: CURSOR_ADAPTER_SCHEMA.to_owned(),
                 account_id,
             })
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("cursor_site_1"))?,
         )
     } else {
         None
@@ -588,7 +586,7 @@ pub async fn poll_cursor_login(
         } => Ok(CursorPollResult::Pending {
             retry_after_seconds,
         }),
-        OAuthLoginClaim::Claimed { .. } => Err(AppError::Internal),
+        OAuthLoginClaim::Claimed { .. } => Err(AppError::internal("cursor_site_1")),
     }
 }
 
@@ -617,25 +615,23 @@ pub async fn refresh_cursor_credential(
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body("{}")
         .build()
-        .map_err(|_| AppError::Upstream("Cursor OAuth refresh failed".into()))?;
+        .map_err(|_| AppError::upstream("cursor_oauth_refresh_failed"))?;
     request_guard.mark_request_started().await?;
     let response = http
         .execute(request)
         .await
-        .map_err(|_| AppError::Upstream("Cursor OAuth refresh failed".into()))?;
+        .map_err(|_| AppError::upstream("cursor_oauth_refresh_failed"))?;
     if !response.status().is_success() {
-        return Err(AppError::Upstream(format!(
-            "Cursor OAuth refresh returned {}",
-            response.status()
-        )));
+        return Err(AppError::upstream_status(
+            "cursor_oauth_refresh_returned",
+            response.status().as_u16(),
+        ));
     }
     let body = bounded_body(response).await?;
     let tokens: CursorTokens = serde_json::from_slice(&body)
-        .map_err(|_| AppError::Upstream("Cursor OAuth refresh returned invalid JSON".into()))?;
+        .map_err(|_| AppError::upstream("cursor_oauth_refresh_returned_invalid_json"))?;
     if tokens.access_token.is_empty() {
-        return Err(AppError::Upstream(
-            "Cursor OAuth refresh returned an empty access token".into(),
-        ));
+        return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("cursor_refresh_cursor_credential")));
     }
     let expires_at = token_expiry_millis(&tokens.access_token)
         .unwrap_or_else(|| now.saturating_add(60 * 60 * 1000));
@@ -669,7 +665,7 @@ pub async fn refresh_cursor_credential(
                 schema: CURSOR_ADAPTER_SCHEMA.to_owned(),
                 account_id,
             })
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("cursor_refresh_cursor_credential_1"))?,
         ),
         None => credential.adapter_state().cloned(),
     };
@@ -833,7 +829,7 @@ fn cursor_identity_error() -> AppError {
 }
 
 fn cursor_identity_upstream_error() -> AppError {
-    AppError::Upstream("Cursor OAuth did not return a stable account identity".into())
+    AppError::upstream("cursor_oauth_did_not_return_a_stable_account_identity")
 }
 
 #[cfg(test)]
@@ -968,7 +964,7 @@ mod tests {
         let rendered = error.to_string();
         assert_eq!(
             rendered,
-            "configured upstream is unavailable: Cursor OAuth did not return a stable account identity"
+            "configured upstream is unavailable: cursor_oauth_did_not_return_a_stable_account_identity"
         );
         for secret in [
             opaque_secret,

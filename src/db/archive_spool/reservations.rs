@@ -29,7 +29,7 @@ impl ArchiveBudgetReservation {
         amount: i64,
     ) -> Result<bool, AppError> {
         if self.identity != identity || self.purpose != purpose || amount < 0 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("reservations_consume_1"));
         }
         let updated = sqlx::query("UPDATE archive_budget_reservations SET cipher_bytes = cipher_bytes - $1 WHERE id = $2 AND cipher_bytes >= $1")
             .bind(amount).bind(self.id.to_string()).execute(&mut **tx).await?;
@@ -49,7 +49,7 @@ impl ArchiveBudgetReservation {
         .execute(&mut **tx)
         .await?;
         if updated.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("reservations_refund_in_transaction_1"));
         }
         Ok(())
     }
@@ -124,7 +124,7 @@ impl Database {
             .try_fold(SPOOL_OVERHEAD, |total, bytes| {
                 total.checked_add(archive.sealed_len(bytes.len())? as i64 + CHUNK_OVERHEAD)
             })
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("reservations_reserve_buffered_archive_capacity_inner_1"))?;
         if amount > CIPHER_LIMIT {
             return Ok(None);
         }
@@ -232,7 +232,12 @@ impl Database {
             .transpose()?;
         if expires_at.is_none_or(|expires_at| expires_at <= now) {
             tx.rollback().await?;
-            return Err(AppError::Overloaded);
+            return Err(AppError::capacity(
+                "request_archive_reservation_failed",
+                crate::error::ErrorFacts::new()
+                    .phase(operation)
+                    .stage("reservation_expired"),
+            ));
         }
         let mut hold = BudgetHold::late(operation, Some(reservation.identity.request_id));
         hold.phase("reserved_capacity_work");
@@ -280,7 +285,7 @@ impl Database {
         let found = row.is_some();
         if let Some(row) = row {
             let id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("reservations_cleanup_expired_archive_budget_reservation_1"))?;
             let reclaimed_bytes: i64 = row.try_get("cipher_bytes")?;
             refund_reserved_capacity(&mut tx, id, row).await?;
             tracing::info!(
@@ -303,14 +308,14 @@ async fn refund_reserved_capacity(
     let purpose = match row.try_get::<String, _>("purpose")?.as_str() {
         "request" => BufferedArchivePurpose::Request,
         "response" => BufferedArchivePurpose::Response,
-        _ => return Err(AppError::Internal),
+        _ => return Err(AppError::internal("reservations_refund_reserved_capacity_1")),
     };
     if amount > 0 {
         let updated = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose,
             "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes - $1 WHERE singleton = 1 AND cipher_bytes >= $1")))
             .bind(amount).execute(&mut **tx).await?;
         if updated.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("reservations_refund_reserved_capacity_2"));
         }
     }
     sqlx::query("DELETE FROM archive_budget_reservations WHERE id = $1")

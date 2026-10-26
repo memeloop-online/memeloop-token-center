@@ -170,9 +170,9 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     let standby =
         add_codex_standby_route(&fixture, &format!("codex-route-{label}"), "account-456").await;
     fixture.state.codex_clients.install_test_client(
-        wreq::Client::builder()
-            .http2_only()
-            .retry(wreq::retry::Policy::never())
+        reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .retry(reqwest::retry::never())
             .no_proxy()
             .build()
             .unwrap(),
@@ -338,9 +338,9 @@ async fn pre_header_reset_then_success_settles_one_logical_request() {
         .await;
         set_short_http2_deadline(&fixture).await;
         fixture.state.codex_clients.install_test_client(
-            wreq::Client::builder()
-                .http2_only()
-                .retry(wreq::retry::Policy::never())
+            reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .retry(reqwest::retry::never())
                 .no_proxy()
                 .build()
                 .unwrap(),

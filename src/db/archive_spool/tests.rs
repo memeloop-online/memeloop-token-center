@@ -597,7 +597,7 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
     assert!(matches!(
         db.start_proxy_request_with_archive(input(), &body, pepper)
             .await,
-        Err(AppError::Overloaded)
+        Err(AppError::Capacity { code: "request_archive_capture_failed", .. })
     ));
     let reservations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")

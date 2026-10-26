@@ -222,7 +222,7 @@ impl MetricsAccumulator {
         }
         let currency: String = row.try_get("currency")?;
         if currency.is_empty() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("monitoring_snapshot_accumulate_1"));
         }
         let cost = self.costs.entry(currency).or_default();
         *cost = cost.saturating_add(row.try_get("cost_micros")?);
@@ -374,7 +374,7 @@ impl Database {
                     .entry((upstream_account_id, model))
                     .or_default()
                     .accumulate(&row)?,
-                _ => return Err(AppError::Internal),
+                _ => return Err(AppError::internal("monitoring_snapshot_operator_monitoring_snapshot_inner_1")),
             }
         }
         let summary = summary.finish();
@@ -541,7 +541,7 @@ async fn terminal_outcomes_batch(
         DatabaseBackend::Sqlite => MonitoringTerminalBatchDialect::Sqlite,
     };
     let sql = monitoring_terminal_outcomes_batch_sql(context.scope, pairs.len(), dialect)
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("monitoring_snapshot_terminal_outcomes_batch_1"))?;
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for (upstream_account_id, model) in pairs {
         query = query.bind(upstream_account_id).bind(model);
@@ -560,14 +560,14 @@ async fn terminal_outcomes_batch(
         let model: String = row.try_get("model")?;
         let pair = (upstream_account_id, model);
         let Some(pair_outcomes) = outcomes.get_mut(&pair) else {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("monitoring_snapshot_terminal_outcomes_batch_1"));
         };
         let source: String = row.try_get("source")?;
         let status: String = row.try_get("status_class")?;
         if !matches!(source.as_str(), "request" | "generation")
             || !matches!(status.as_str(), "success" | "failure")
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("monitoring_snapshot_terminal_outcomes_batch_2"));
         }
         let error_code: String = row.try_get("error_code")?;
         pair_outcomes.push(MonitoringTerminalOutcome {
@@ -591,7 +591,7 @@ async fn upstream_health_batch(
         return Ok(BTreeMap::new());
     }
     let sql = monitoring_upstream_health_batch_sql(upstream_account_ids.len())
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("monitoring_snapshot_upstream_health_batch_1"))?;
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for upstream_account_id in upstream_account_ids {
         query = query.bind(upstream_account_id);
@@ -603,7 +603,7 @@ async fn upstream_health_batch(
         let upstream_account_id: String = row.try_get("upstream_account_id")?;
         let value = upstream_health_from_row(&row)?;
         if health.insert(upstream_account_id, value).is_some() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("monitoring_snapshot_upstream_health_batch_2"));
         }
     }
     Ok(health)

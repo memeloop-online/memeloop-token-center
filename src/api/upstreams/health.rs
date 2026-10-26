@@ -22,11 +22,14 @@ enum ProbeDisposition {
 
 fn classify_probe_error(error: &AppError) -> ProbeDisposition {
     match error {
-        AppError::Upstream(_) => ProbeDisposition::Store("upstream_unavailable"),
+        AppError::Upstream { .. } => ProbeDisposition::Store("upstream_unavailable"),
         AppError::OAuthRefresh(_) => ProbeDisposition::Store("authentication_failed"),
+        AppError::Capacity { code, .. } => ProbeDisposition::Skip(code),
+        AppError::Overloaded => ProbeDisposition::Skip("service_overloaded"),
+        AppError::Internal { code, .. } => ProbeDisposition::Skip(code),
+        AppError::Storage { code, .. } => ProbeDisposition::Skip(code),
         AppError::Forbidden
         | AppError::NoAuthorizedUpstreamCandidate
-        | AppError::Overloaded
         | AppError::Unauthorized
         | AppError::BadRequest(_)
         | AppError::QuotaExceeded
@@ -38,8 +41,6 @@ fn classify_probe_error(error: &AppError) -> ProbeDisposition {
         | AppError::ProxyGroupConflict(_)
         | AppError::CompactionProducerUnavailable
         | AppError::PluginInputTooLarge
-        | AppError::Internal
-        | AppError::Storage(_)
         | AppError::DatabaseUnavailable(_)
         | AppError::SchemaSecretAnalysisTooComplex
         | AppError::PluginReleaseDownload(_) => ProbeDisposition::Skip("probe_admission_skipped"),
@@ -471,7 +472,7 @@ mod tests {
             super::ProbeDisposition::Skip(_)
         ));
         assert!(matches!(
-            classify_probe_error(&AppError::Upstream("down".into())),
+            classify_probe_error(&AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("health_admission_gaps_are_not_stored_as_upstream_failures"))),
             super::ProbeDisposition::Store("upstream_unavailable")
         ));
     }

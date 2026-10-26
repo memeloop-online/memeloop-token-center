@@ -101,7 +101,7 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
 #[test]
 fn safe_failure_is_an_explicit_failed_terminal_without_a_fabricated_identity() {
     let mut framer = BoundedSseFramer::default();
-    let batch = framer.push(&safe_failure_event());
+    let batch = framer.push(&safe_failure_event("upstream_rejected", "response_failed"));
     assert!(batch.rejection.is_none());
     assert_eq!(batch.events.len(), 1);
     let (event_name, data) = parse_sse_event(&batch.events[0]).unwrap();
@@ -109,11 +109,19 @@ fn safe_failure_is_an_explicit_failed_terminal_without_a_fabricated_identity() {
     let payload: Value = serde_json::from_slice(&data.unwrap()).unwrap();
     assert_eq!(payload["type"], "response.failed");
     assert_eq!(payload["response"]["status"], "failed");
-    assert_eq!(payload["response"]["error"]["code"], "server_error");
-    assert_eq!(
-        payload["response"]["error"]["message"],
-        "upstream request failed"
-    );
+    assert_eq!(payload["response"]["error"]["code"], "upstream_rejected");
+    assert!(payload["response"]["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("上游"));
+    assert!(payload["response"]["error"]["message_en"]
+        .as_str()
+        .unwrap()
+        .contains("upstream request failed"));
+    assert!(payload["response"]["error"]["message_en"]
+        .as_str()
+        .unwrap()
+        .contains("response_failed"));
     assert!(payload.pointer("/response/id").is_none());
 }
 

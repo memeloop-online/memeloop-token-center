@@ -117,13 +117,11 @@ where
     let permit = match tokio::time::timeout(capacity_timeout, permits.acquire_owned()).await {
         Err(_) => {
             observation.outcome = Outcome::CapacityTimeout;
-            return Err(AppError::Upstream(
-                "plugin execution capacity is exhausted".into(),
-            ));
+            return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("plugin_execution_run_with_limits")));
         }
         Ok(Err(_)) => {
             observation.outcome = Outcome::CapacityClosed;
-            return Err(AppError::Internal);
+            return Err(AppError::internal("plugin_execution_run_with_limits_1"));
         }
         Ok(Ok(permit)) => permit,
     };
@@ -138,11 +136,11 @@ where
     match tokio::time::timeout(execution_timeout, task).await {
         Err(_) => {
             observation.outcome = Outcome::ExecutionTimeout;
-            Err(AppError::Upstream("plugin execution timed out".into()))
+            Err(AppError::upstream("plugin_execution_timed_out"))
         }
         Ok(Err(_)) => {
             observation.outcome = Outcome::TaskFailed;
-            Err(AppError::Upstream("plugin task failed".into()))
+            Err(AppError::upstream("plugin_task_failed"))
         }
         Ok(Ok(Err(error))) => {
             observation.outcome = Outcome::HookError;
@@ -165,7 +163,7 @@ mod tests {
         let (send, receive) = oneshot::channel();
         let result = run_with_limits::<(), _, _>(
             Phase::Prepare,
-            || Err(AppError::Upstream("private-fixture-payload".into())),
+            || Err(AppError::upstream("private_fixture_payload")),
             Arc::new(Semaphore::new(1)),
             Duration::from_secs(1),
             Duration::from_secs(35),
@@ -174,7 +172,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(result, Err(AppError::Upstream(_))));
+        assert!(matches!(result, Err(AppError::Upstream { .. })));
         let event = receive.await.unwrap();
         assert_eq!(event.phase, Phase::Prepare);
         assert_eq!(event.outcome, Outcome::HookError);
@@ -195,7 +193,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(result, Err(AppError::Upstream(_))));
+        assert!(matches!(result, Err(AppError::Upstream { .. })));
         assert_eq!(receive.await.unwrap().outcome, Outcome::CapacityTimeout);
     }
 
@@ -282,7 +280,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(result, Err(AppError::Upstream(_))));
+        assert!(matches!(result, Err(AppError::Upstream { .. })));
         assert_eq!(event_rx.await.unwrap().outcome, Outcome::ExecutionTimeout);
         // The worker may begin before or after the zero-duration timeout;
         // neither ordering is assumed. It cannot finish before this release.
@@ -316,7 +314,7 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(result, Err(AppError::Internal)));
+        assert!(matches!(result, Err(AppError::Internal { .. })));
         assert_eq!(receive.await.unwrap().outcome, Outcome::CapacityClosed);
     }
 }

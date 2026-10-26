@@ -223,7 +223,7 @@ impl Database {
             .await?;
         let (summary, time_series) = take_summary_time_series(&mut projections)?;
         if !projections.is_empty() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("usage_analysis_aggregate_usage_analysis_trends_for_tenant_id_1"));
         }
         snapshot.record_completion(UsageAnalysisMainProjectionSet::Trends);
         snapshot.commit().await?;
@@ -343,7 +343,7 @@ impl Database {
                         units,
                     },
                 ),
-                _ => return Err(AppError::Internal),
+                _ => return Err(AppError::internal("usage_analysis_aggregate_usage_analysis_for_tenant_id_1")),
             }
         }
         generation_units_by_modality.sort_by(|left, right| {
@@ -394,7 +394,7 @@ impl Database {
             let label = accumulator.label.clone();
             let metrics = accumulator.finish();
             match kind.as_str() {
-                "time" | "summary" => return Err(AppError::Internal),
+                "time" | "summary" => return Err(AppError::internal("usage_analysis_site_1")),
                 "model" => by_model.push(UsageAnalysisBucket { id, label, metrics }),
                 "key" => by_key.push(UsageAnalysisBucket { id, label, metrics }),
                 "upstream" => by_upstream.push(UsageAnalysisBucket { id, label, metrics }),
@@ -408,7 +408,7 @@ impl Database {
                     by_status.push(UsageAnalysisBucket { id, label, metrics });
                 }
                 "error" => errors.push(UsageAnalysisBucket { id, label, metrics }),
-                _ => return Err(AppError::Internal),
+                _ => return Err(AppError::internal("usage_analysis_site_2")),
             }
         }
         for buckets in [
@@ -440,7 +440,7 @@ impl Database {
             .into_iter()
             .map(|((_kind, id), accumulator)| {
                 Ok(UsageAnalysisHeatmapBucket {
-                    hour_of_week: id.parse().map_err(|_| AppError::Internal)?,
+                    hour_of_week: id.parse().map_err(|_| AppError::internal("usage_analysis_site_1"))?,
                     metrics: accumulator.finish(),
                 })
             })
@@ -1228,8 +1228,8 @@ fn take_summary_time_series(
         .collect::<Vec<_>>();
     let mut time_series = Vec::with_capacity(time_keys.len());
     for key in time_keys {
-        let bucket_start = key.1.parse().map_err(|_| AppError::Internal)?;
-        let metrics = projections.remove(&key).ok_or(AppError::Internal)?.finish();
+        let bucket_start = key.1.parse().map_err(|_| AppError::internal("usage_analysis_take_summary_time_series_1"))?;
+        let metrics = projections.remove(&key).ok_or(AppError::internal("usage_analysis_take_summary_time_series_1"))?.finish();
         time_series.push(UsageAnalysisTimeBucket {
             bucket_start,
             metrics,
@@ -1287,7 +1287,7 @@ fn accumulate_usage_row(
     let currency: String = row.try_get("currency")?;
     let cost_micros: i64 = row.try_get("cost_micros")?;
     if currency.is_empty() {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("usage_analysis_accumulate_usage_row_1"));
     }
     let cost = accumulator.costs.entry(currency).or_default();
     *cost = cost.saturating_add(cost_micros);

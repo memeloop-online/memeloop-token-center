@@ -215,9 +215,7 @@ impl UpstreamCredential {
                 }
                 validate_optional_private_proxy(proxy_url.as_deref(), *proxy_network_scope)?;
                 if expires_at.is_some_and(|expires_at| expires_at <= now) {
-                    return Err(AppError::Upstream(
-                        "upstream OAuth credential is expired and must be refreshed".into(),
-                    ));
+                    return Err(AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("credential_validate")));
                 }
                 (access_token, header, prefix)
             }
@@ -277,10 +275,10 @@ impl UpstreamCredential {
                     PROVIDER_ADAPTER_SECRET_PATCH_KEY.into(),
                     Value::String(encoded),
                 );
-                validate_adapter_state(adapter_state.as_ref().ok_or(AppError::Internal)?)?;
+                validate_adapter_state(adapter_state.as_ref().ok_or(AppError::internal("credential_with_provider_adapter_secret_patch_1"))?)?;
                 Ok(self)
             }
-            _ => Err(AppError::Internal),
+            _ => Err(AppError::internal("credential_with_provider_adapter_secret_patch_2")),
         }
     }
 
@@ -474,7 +472,7 @@ impl UpstreamCredential {
 }
 
 pub(crate) fn validate_provider_adapter_secret_patch(patch: &Value) -> Result<Vec<u8>, AppError> {
-    let patch = serde_json::to_vec(patch).map_err(|_| AppError::Internal)?;
+    let patch = serde_json::to_vec(patch).map_err(|_| AppError::internal("credential_validate_provider_adapter_secret_patch_1"))?;
     if patch.len() > MAX_PROVIDER_ADAPTER_SECRET_PATCH_BYTES {
         return Err(AppError::BadRequest(
             "OAuth provider secret configuration exceeds its storage limit".into(),
@@ -565,9 +563,9 @@ pub fn validate_adapter_state(state: &Value) -> Result<(), AppError> {
     if let Some(object) = provider_state.as_object_mut()
         && object.remove(PROVIDER_ADAPTER_SECRET_PATCH_KEY).is_some()
     {
-        decode_provider_adapter_secret_patch(state)?.ok_or(AppError::Internal)?;
+        decode_provider_adapter_secret_patch(state)?.ok_or(AppError::internal("credential_validate_adapter_state_1"))?;
     }
-    let encoded = serde_json::to_vec(&provider_state).map_err(|_| AppError::Internal)?;
+    let encoded = serde_json::to_vec(&provider_state).map_err(|_| AppError::internal("credential_validate_adapter_state_1"))?;
     if encoded.len() > MAX_ADAPTER_STATE_BYTES {
         return Err(AppError::BadRequest(
             "managed OAuth adapter state exceeds its size limit".into(),
@@ -607,7 +605,7 @@ fn decode_provider_adapter_secret_patch(state: &Value) -> Result<Option<Value>, 
     };
     let decoded = URL_SAFE_NO_PAD
         .decode(encoded)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("credential_decode_provider_adapter_secret_patch_1"))?;
     if decoded.len() > MAX_PROVIDER_ADAPTER_SECRET_PATCH_BYTES {
         return Err(AppError::BadRequest(
             "OAuth provider secret configuration exceeds its storage limit".into(),
@@ -615,32 +613,32 @@ fn decode_provider_adapter_secret_patch(state: &Value) -> Result<Option<Value>, 
     }
     serde_json::from_slice(&decoded)
         .map(Some)
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("credential_decode_provider_adapter_secret_patch_2"))
 }
 
 fn apply_provider_adapter_secret_patch(
     mut config: Value,
     patch: &Value,
 ) -> Result<Value, AppError> {
-    let entries = patch.as_array().ok_or(AppError::Internal)?;
+    let entries = patch.as_array().ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_1"))?;
     for entry in entries {
-        let entry = entry.as_object().ok_or(AppError::Internal)?;
+        let entry = entry.as_object().ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_2"))?;
         if entry.len() != 2 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("credential_apply_provider_adapter_secret_patch_3"));
         }
         let path = entry
             .get("path")
             .and_then(Value::as_array)
-            .ok_or(AppError::Internal)?
+            .ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_4"))?
             .iter()
             .map(|segment| {
                 segment
                     .as_str()
                     .map(str::to_owned)
-                    .ok_or(AppError::Internal)
+                    .ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_5"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let value = entry.get("value").cloned().ok_or(AppError::Internal)?;
+        let value = entry.get("value").cloned().ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_6"))?;
         if path.is_empty() {
             config = value;
             continue;
@@ -649,14 +647,14 @@ fn apply_provider_adapter_secret_patch(
         for segment in &path[..path.len() - 1] {
             target = target
                 .as_object_mut()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_7"))?
                 .entry(segment.clone())
                 .or_insert_with(|| Value::Object(serde_json::Map::new()));
         }
         target
             .as_object_mut()
-            .ok_or(AppError::Internal)?
-            .insert(path.last().cloned().ok_or(AppError::Internal)?, value);
+            .ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_8"))?
+            .insert(path.last().cloned().ok_or(AppError::internal("credential_apply_provider_adapter_secret_patch_9"))?, value);
     }
     Ok(config)
 }
@@ -713,7 +711,7 @@ pub(crate) fn seal_private_json<T: Serialize>(
     aad: &[u8],
 ) -> Result<String, AppError> {
     let mut nonce = [0_u8; 12];
-    fill(&mut nonce).map_err(|_| AppError::Internal)?;
+    fill(&mut nonce).map_err(|_| AppError::internal("credential_seal_private_json_1"))?;
     seal_private_json_with_nonce(value, key_material, aad, nonce)
 }
 
@@ -726,9 +724,9 @@ pub(crate) fn seal_private_json_with_nonce<T: Serialize>(
     aad: &[u8],
     nonce: [u8; 12],
 ) -> Result<String, AppError> {
-    let plaintext = serde_json::to_vec(value).map_err(|_| AppError::Internal)?;
+    let plaintext = serde_json::to_vec(value).map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_1"))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&current_encryption_key(key_material)?)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_2"))?;
     let ciphertext = cipher
         .encrypt(
             (&nonce).into(),
@@ -737,7 +735,7 @@ pub(crate) fn seal_private_json_with_nonce<T: Serialize>(
                 aad,
             },
         )
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_3"))?;
     Ok(format!(
         "{CURRENT_ENVELOPE_VERSION}.{}.{}",
         URL_SAFE_NO_PAD.encode(nonce),
@@ -775,19 +773,19 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
         // SHA-256 derivation. Keep that format read-only so an upgrade never
         // strands credentials; every new write uses RustCrypto HKDF below.
         Some(LEGACY_ENVELOPE_VERSION) => legacy_encryption_key(key_material),
-        _ => return Err(AppError::Internal),
+        _ => return Err(AppError::internal("credential_open_private_json_1")),
     };
     if parts.next().is_some() {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("credential_open_private_json_2"));
     }
     let nonce = URL_SAFE_NO_PAD
-        .decode(nonce.ok_or(AppError::Internal)?)
-        .map_err(|_| AppError::Internal)?;
-    let nonce: [u8; 12] = nonce.try_into().map_err(|_| AppError::Internal)?;
+        .decode(nonce.ok_or(AppError::internal("credential_open_private_json_3"))?)
+        .map_err(|_| AppError::internal("credential_open_private_json_1"))?;
+    let nonce: [u8; 12] = nonce.try_into().map_err(|_| AppError::internal("credential_open_private_json_2"))?;
     let ciphertext = URL_SAFE_NO_PAD
-        .decode(ciphertext.ok_or(AppError::Internal)?)
-        .map_err(|_| AppError::Internal)?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| AppError::Internal)?;
+        .decode(ciphertext.ok_or(AppError::internal("credential_open_private_json_4"))?)
+        .map_err(|_| AppError::internal("credential_open_private_json_3"))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).map_err(|_| AppError::internal("credential_open_private_json_4"))?;
     let plaintext = cipher
         .decrypt(
             (&nonce).into(),
@@ -796,8 +794,8 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
                 aad,
             },
         )
-        .map_err(|_| AppError::Internal)?;
-    serde_json::from_slice(&plaintext).map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("credential_open_private_json_5"))?;
+    serde_json::from_slice(&plaintext).map_err(|_| AppError::internal("credential_open_private_json_6"))
 }
 
 pub(super) fn current_encryption_key(key_material: &[u8]) -> Result<[u8; 32], AppError> {
@@ -807,7 +805,7 @@ pub(super) fn current_encryption_key(key_material: &[u8]) -> Result<[u8; 32], Ap
     );
     let mut key = [0_u8; 32];
     hkdf.expand(b"chacha20poly1305-key", &mut key)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("credential_current_encryption_key_1"))?;
     Ok(key)
 }
 

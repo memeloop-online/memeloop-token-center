@@ -46,7 +46,7 @@ impl ArchiveStagingObjectStore for CanaryWorkerStore {
         &self,
         _key: ArchiveStagingKey,
     ) -> Result<(), AppError> {
-        Err(AppError::Storage(WORKER_CANARY.to_owned()))
+        Err(AppError::storage("local_storage_failed"))
     }
 
     async fn archive_staging_segment_is_empty(

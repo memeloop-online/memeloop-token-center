@@ -2,10 +2,12 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{Read, Write},
-    os::{fd::AsRawFd, unix::ffi::OsStrExt},
     path::{Component, Path, PathBuf},
 };
 
+#[cfg(unix)]
+use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+#[cfg(unix)]
 use rustix::fs::{Mode, OFlags, mkdirat, openat};
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +22,11 @@ use crate::{
 const MAX_BYTES: usize = PluginInventoryDescriptor::MAX_PARSE_BYTES * 2;
 const INVENTORY_FILE: &str = "inventory.json";
 const RECEIPT_FILE: &str = "receipt.json";
+
+#[cfg(unix)]
+type DirHandle = rustix::fd::OwnedFd;
+#[cfg(windows)]
+type DirHandle = crate::windows_dir::Directory;
 
 pub struct DescriptorImportOptions {
     pub descriptor_file: PathBuf,
@@ -189,17 +196,10 @@ pub async fn import_plugin_descriptor_with_diagnostics(
         .map_err(|error| DescriptorImportFailure::validation(Phase::CredentialScope, error))?;
     validate_paths(&descriptor, &options.plugin_dir, &options.output_dir)
         .map_err(|error| DescriptorImportFailure::validation(Phase::PathValidate, error))?;
-    let directory = storage(crate::plugin_publication::directory_fd(&options.plugin_dir))
+    let directory = storage(import_directory(&options.plugin_dir))
         .map_err(|error| DescriptorImportFailure::at(Phase::RootLock, Cause::Storage, error))?;
-    let lock = File::from(
-        storage(openat(
-            &directory,
-            ".mtc-descriptor-import.lock",
-            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::from_bits_truncate(0o600),
-        ))
-        .map_err(|error| DescriptorImportFailure::at(Phase::RootLock, Cause::Storage, error))?,
-    );
+    let lock = open_lock_file(&directory)
+        .map_err(|error| DescriptorImportFailure::at(Phase::RootLock, Cause::Storage, error))?;
     if !storage(lock.metadata())
         .map_err(|error| DescriptorImportFailure::at(Phase::RootLock, Cause::Storage, error))?
         .is_file()
@@ -248,16 +248,13 @@ pub async fn import_plugin_descriptor_with_diagnostics(
     for (inventory_id, entry) in &descriptor.inventories {
         let name = direct_child(&options.plugin_dir, &entry.inventory.root)
             .map_err(|error| DescriptorImportFailure::validation(Phase::PackageWorkspace, error))?;
-        match mkdirat(&directory, name, Mode::from_bits_truncate(0o755)) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(_) => {
-                return Err(DescriptorImportFailure::at(
-                    Phase::PackageWorkspace,
-                    Cause::Storage,
-                    AppError::Internal,
-                ));
-            }
-        }
+        ensure_directory(&directory, name).map_err(|_| {
+            DescriptorImportFailure::at(
+                Phase::PackageWorkspace,
+                Cause::Storage,
+                AppError::internal("descriptor_import_import_plugin_descriptor_with_diagnostics_1"),
+            )
+        })?;
         let root = directory_at(&directory, name).map_err(|error| {
             DescriptorImportFailure::at(Phase::PackageWorkspace, Cause::Storage, error)
         })?;
@@ -274,20 +271,16 @@ pub async fn import_plugin_descriptor_with_diagnostics(
             let mut installation = options.installation.clone();
             installation.reference = reference;
             let workspace = format!(".mtc-plugin-staging-import-{}", uuid::Uuid::now_v7());
-            storage(mkdirat(
-                &root,
-                workspace.as_str(),
-                Mode::from_bits_truncate(0o700),
-            ))
-            .map_err(|error| {
+            ensure_directory(&root, std::ffi::OsStr::new(&workspace)).map_err(|error| {
                 DescriptorImportFailure::at(Phase::PackageWorkspace, Cause::Storage, error)
             })?;
             let staging =
                 directory_at(&root, std::ffi::OsStr::new(&workspace)).map_err(|error| {
                     DescriptorImportFailure::at(Phase::PackageWorkspace, Cause::Storage, error)
                 })?;
-            installation.plugin_root =
-                PathBuf::from(format!("/proc/self/fd/{}/.", staging.as_raw_fd()));
+            installation.plugin_root = pinned_directory_path(&staging).map_err(|error| {
+                DescriptorImportFailure::at(Phase::PackageWorkspace, Cause::Storage, error)
+            })?;
             installation.allow_portable_publication = false;
             let installed = install_plugin_oci(&installation)
                 .await
@@ -302,12 +295,7 @@ pub async fn import_plugin_descriptor_with_diagnostics(
             }
             promote_verified_package(&staging, &root, &plugin_id)
                 .map_err(|error| DescriptorImportFailure::unknown(Phase::PackagePromote, error))?;
-            storage(rustix::fs::unlinkat(
-                &root,
-                workspace.as_str(),
-                rustix::fs::AtFlags::REMOVEDIR,
-            ))
-            .map_err(|error| {
+            remove_child_directory(&root, std::ffi::OsStr::new(&workspace)).map_err(|error| {
                 DescriptorImportFailure::at(Phase::PackagePromote, Cause::Storage, error)
             })?;
             same_directory(&root, &entry.inventory.root)
@@ -317,15 +305,16 @@ pub async fn import_plugin_descriptor_with_diagnostics(
             .map_err(|error| DescriptorImportFailure::unknown(Phase::InventoryValidate, error))?;
         let expected = entry.clone();
         let digests = tokio::task::spawn_blocking(move || {
-            let path = format!("/proc/self/fd/{}/.", root.as_raw_fd());
-            validate_inventory(&expected, &path)
+            let path = pinned_directory_path(&root)?;
+            let path = path.to_str().ok_or(AppError::Forbidden)?;
+            validate_inventory(&expected, path)
         })
         .await
         .map_err(|_| {
             DescriptorImportFailure::at(
                 Phase::InventoryValidate,
                 Cause::Internal,
-                AppError::Internal,
+                AppError::internal("descriptor_import_site_1"),
             )
         })?
         .map_err(|error| DescriptorImportFailure::unknown(Phase::InventoryValidate, error))?;
@@ -395,7 +384,8 @@ fn validate_inventory(
     Ok(actual)
 }
 
-fn package_tree(directory: &rustix::fd::OwnedFd) -> Result<BTreeMap<PathBuf, Vec<u8>>, AppError> {
+#[cfg(unix)]
+fn package_tree(directory: &DirHandle) -> Result<BTreeMap<PathBuf, Vec<u8>>, AppError> {
     let mut pending = vec![(
         PathBuf::new(),
         File::from(directory_at(directory, std::ffi::OsStr::new("."))?),
@@ -436,9 +426,61 @@ fn package_tree(directory: &rustix::fd::OwnedFd) -> Result<BTreeMap<PathBuf, Vec
     Ok(result)
 }
 
+#[cfg(windows)]
+fn package_tree(directory: &DirHandle) -> Result<BTreeMap<PathBuf, Vec<u8>>, AppError> {
+    let mut pending = vec![(
+        PathBuf::new(),
+        directory
+            .try_clone()
+            .map_err(|_| AppError::internal("descriptor_import_package_tree_1"))?,
+    )];
+    let mut result = BTreeMap::new();
+    let mut total = 0usize;
+    let mut entries = 0usize;
+    while let Some((relative, file)) = pending.pop() {
+        if relative.as_os_str().as_encoded_bytes().len() > 240 || entries > 16384 {
+            return Err(AppError::Forbidden);
+        }
+        for name in storage(crate::windows_dir::read_names(&file))? {
+            entries += 1;
+            if crate::windows_dir::ensure_component(name.as_os_str()).is_err() {
+                return Err(AppError::Forbidden);
+            }
+            let child_path = relative.join(&name);
+            if !relative.as_os_str().is_empty() && child_path.parent() != Some(relative.as_path()) {
+                return Err(AppError::Forbidden);
+            }
+            if let Ok(child) = crate::windows_dir::open_subdir(&file, name.as_os_str()) {
+                pending.push((child_path, child));
+                continue;
+            }
+            let bytes = match crate::windows_dir::read_limited(
+                &file,
+                name.as_os_str(),
+                (81 * 1024 * 1024usize).saturating_sub(total) as u64,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                    return Err(AppError::Forbidden);
+                }
+                Err(error) if crate::windows_dir::is_reparse_refusal(&error) => {
+                    return Err(AppError::Forbidden);
+                }
+                Err(_) => return Err(AppError::internal("descriptor_import_package_tree_1")),
+            };
+            total += bytes.len();
+            let mut tagged = vec![1];
+            tagged.extend(bytes);
+            result.insert(child_path, tagged);
+        }
+        result.insert(relative, Vec::new());
+    }
+    Ok(result)
+}
+
 fn promote_verified_package(
-    staging: &rustix::fd::OwnedFd,
-    root: &rustix::fd::OwnedFd,
+    staging: &DirHandle,
+    root: &DirHandle,
     plugin_id: &str,
 ) -> Result<(), AppError> {
     #[cfg(target_os = "linux")]
@@ -477,12 +519,49 @@ fn promote_verified_package(
                 rustix::fs::AtFlags::REMOVEDIR,
             ))?;
         }
-        Err(_) => return Err(AppError::Internal),
+        Err(_) => return Err(AppError::internal("descriptor_import_promote_verified_package_1")),
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        use std::ffi::OsStr;
+        match crate::windows_dir::rename_noreplace(
+            staging,
+            OsStr::new(plugin_id),
+            root,
+            OsStr::new(plugin_id),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let verified = directory_at(staging, OsStr::new(plugin_id))?;
+                let existing = directory_at(root, OsStr::new(plugin_id))?;
+                let bytes = package_tree(&verified)?;
+                if bytes != package_tree(&existing)? {
+                    return Err(AppError::Forbidden);
+                }
+                storage(crate::windows_dir::remove_tree(&verified))?;
+                storage(crate::windows_dir::remove_dir(staging, OsStr::new(plugin_id)))?;
+            }
+            Err(_) => return Err(AppError::internal("descriptor_import_promote_verified_package_2")),
+        }
+        storage(root.sync())?;
+        return storage(staging.sync());
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
     return Err(AppError::Forbidden);
-    storage(rustix::fs::fsync(root))?;
-    storage(rustix::fs::fsync(staging))
+    #[cfg(unix)]
+    {
+        storage(rustix::fs::fsync(root))?;
+        storage(rustix::fs::fsync(staging))
+    }
+}
+
+fn path_component_allowed(part: Component<'_>) -> bool {
+    match part {
+        Component::RootDir | Component::Normal(_) => true,
+        #[cfg(windows)]
+        Component::Prefix(_) => true,
+        _ => false,
+    }
 }
 
 fn validate_paths(
@@ -490,10 +569,7 @@ fn validate_paths(
     plugin_dir: &Path,
     output: &Path,
 ) -> Result<(), AppError> {
-    if !plugin_dir.is_absolute()
-        || plugin_dir
-            .components()
-            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    if !plugin_dir.is_absolute() || plugin_dir.components().any(|part| !path_component_allowed(part))
     {
         return Err(AppError::Forbidden);
     }
@@ -511,10 +587,7 @@ fn direct_child<'path>(
     parent: &Path,
     child: &'path Path,
 ) -> Result<&'path std::ffi::OsStr, AppError> {
-    if child.parent() != Some(parent)
-        || child
-            .components()
-            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+    if child.parent() != Some(parent) || child.components().any(|part| !path_component_allowed(part))
     {
         return Err(AppError::Forbidden);
     }
@@ -525,26 +598,41 @@ fn direct_child<'path>(
     Ok(name)
 }
 
-fn same_directory(directory: &impl std::os::fd::AsFd, path: &Path) -> Result<(), AppError> {
+fn same_directory(directory: &DirHandle, path: &Path) -> Result<(), AppError> {
     let current = storage(crate::plugin_publication::directory_fd(path))?;
-    let expected = storage(rustix::fs::fstat(directory))?;
-    let actual = storage(rustix::fs::fstat(&current))?;
-    if expected.st_dev != actual.st_dev || expected.st_ino != actual.st_ino {
-        return Err(AppError::Forbidden);
+    #[cfg(unix)]
+    {
+        let expected = storage(rustix::fs::fstat(directory))?;
+        let actual = storage(rustix::fs::fstat(&current))?;
+        if expected.st_dev != actual.st_dev || expected.st_ino != actual.st_ino {
+            return Err(AppError::Forbidden);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let expected = storage(directory.file_id())?;
+        let actual = storage(current.file_id())?;
+        if expected != actual {
+            return Err(AppError::Forbidden);
+        }
     }
     Ok(())
 }
 
-fn directory_at(
-    parent: &impl std::os::fd::AsFd,
-    name: &std::ffi::OsStr,
-) -> Result<rustix::fd::OwnedFd, AppError> {
-    storage(openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ))
+fn directory_at(parent: &DirHandle, name: &std::ffi::OsStr) -> Result<DirHandle, AppError> {
+    #[cfg(unix)]
+    {
+        storage(openat(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ))
+    }
+    #[cfg(windows)]
+    {
+        storage(crate::windows_dir::open_writable_subdir(parent, name))
+    }
 }
 
 fn read_path(path: &Path, maximum: usize) -> Result<Vec<u8>, AppError> {
@@ -563,16 +651,33 @@ fn bounded_read(file: File, maximum: usize) -> Result<Vec<u8>, AppError> {
     Ok(bytes)
 }
 
-fn read_at(directory: &impl std::os::fd::AsFd, name: &str) -> Result<Vec<u8>, AppError> {
-    bounded_read(
-        File::from(storage(openat(
-            directory,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        ))?),
-        MAX_BYTES,
-    )
+fn read_at(directory: &DirHandle, name: &str) -> Result<Vec<u8>, AppError> {
+    #[cfg(unix)]
+    {
+        bounded_read(
+            File::from(storage(openat(
+                directory,
+                name,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                Mode::empty(),
+            ))?),
+            MAX_BYTES,
+        )
+    }
+    #[cfg(windows)]
+    {
+        match crate::windows_dir::read_limited(directory, std::ffi::OsStr::new(name), MAX_BYTES as u64)
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::InvalidData
+                    || crate::windows_dir::is_reparse_refusal(&error) =>
+            {
+                Err(AppError::Forbidden)
+            }
+            Err(_) => Err(AppError::internal("descriptor_import_read_at_1")),
+        }
+    }
 }
 
 fn inventory_map(
@@ -586,7 +691,7 @@ fn inventory_map(
 }
 
 fn read_bundle(
-    directory: &impl std::os::fd::AsFd,
+    directory: &DirHandle,
 ) -> Result<
     (
         DescriptorImportReceipt,
@@ -617,26 +722,32 @@ fn read_bundle(
 }
 
 fn encoded(value: &impl Serialize) -> Result<Vec<u8>, AppError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| AppError::Internal)?;
+    let bytes = serde_json::to_vec(value).map_err(|_| AppError::internal("descriptor_import_encoded_1"))?;
     if bytes.len() > MAX_BYTES {
         return Err(AppError::Forbidden);
     }
     Ok(bytes)
 }
 
-fn write_at(directory: &impl std::os::fd::AsFd, name: &str, bytes: &[u8]) -> Result<(), AppError> {
+fn write_at(directory: &DirHandle, name: &str, bytes: &[u8]) -> Result<(), AppError> {
+    #[cfg(unix)]
     let mut file = File::from(storage(openat(
         directory,
         name,
         OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::from_bits_truncate(0o644),
     ))?);
+    #[cfg(windows)]
+    let mut file = storage(crate::windows_dir::create_file(
+        directory,
+        std::ffi::OsStr::new(name),
+    ))?;
     storage(file.write_all(bytes))?;
     storage(file.sync_all())
 }
 
 fn publish_bundle(
-    directory: &impl std::os::fd::AsFd,
+    directory: &DirHandle,
     plugin_dir: &Path,
     output: &Path,
     receipt: &DescriptorImportReceipt,
@@ -644,32 +755,22 @@ fn publish_bundle(
     let name = direct_child(plugin_dir, output)?;
     let inventory = encoded(&inventory_map(&receipt.descriptor))?;
     let receipt_bytes = encoded(receipt)?;
-    match openat(
-        directory,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(existing) => {
-            let (prior, _) = read_bundle(&existing)?;
-            if encoded(&prior)? != receipt_bytes {
-                return Err(AppError::Forbidden);
-            }
-            return Ok(());
+    if let Some(existing) = existing_directory(directory, name)? {
+        let (prior, _) = read_bundle(&existing)?;
+        if encoded(&prior)? != receipt_bytes {
+            return Err(AppError::Forbidden);
         }
-        Err(rustix::io::Errno::NOENT) => {}
-        Err(_) => return Err(AppError::Forbidden),
+        return Ok(());
     }
     let staging_name = format!(".mtc-descriptor-partial-{}", uuid::Uuid::now_v7());
-    storage(mkdirat(
-        directory,
-        staging_name.as_str(),
-        Mode::from_bits_truncate(0o755),
-    ))?;
+    ensure_directory(directory, std::ffi::OsStr::new(&staging_name))?;
     let staging = directory_at(directory, std::ffi::OsStr::new(&staging_name))?;
     write_at(&staging, INVENTORY_FILE, &inventory)?;
     write_at(&staging, RECEIPT_FILE, &receipt_bytes)?;
+    #[cfg(unix)]
     storage(rustix::fs::fsync(&staging))?;
+    #[cfg(windows)]
+    storage(staging.sync())?;
     #[cfg(target_os = "linux")]
     storage(rustix::fs::renameat_with(
         directory,
@@ -678,13 +779,138 @@ fn publish_bundle(
         name,
         rustix::fs::RenameFlags::NOREPLACE,
     ))?;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    storage(crate::windows_dir::rename_noreplace(
+        directory,
+        std::ffi::OsStr::new(&staging_name),
+        directory,
+        name,
+    ))?;
+    #[cfg(not(any(target_os = "linux", windows)))]
     return Err(AppError::Forbidden);
-    storage(rustix::fs::fsync(directory))
+    #[cfg(unix)]
+    storage(rustix::fs::fsync(directory))?;
+    #[cfg(windows)]
+    storage(directory.sync())?;
+    Ok(())
+}
+
+fn open_lock_file(directory: &DirHandle) -> Result<File, AppError> {
+    #[cfg(unix)]
+    {
+        Ok(File::from(storage(openat(
+            directory,
+            ".mtc-descriptor-import.lock",
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
+            Mode::from_bits_truncate(0o600),
+        ))?))
+    }
+    #[cfg(windows)]
+    {
+        let name = std::ffi::OsStr::new(".mtc-descriptor-import.lock");
+        match crate::windows_dir::open_file(directory, name) {
+            Ok(file) => Ok(file),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match crate::windows_dir::create_file(directory, name) {
+                    Ok(file) => Ok(file),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        storage(crate::windows_dir::open_file(directory, name))
+                    }
+                    Err(_) => Err(AppError::internal("descriptor_import_open_lock_file_1")),
+                }
+            }
+            Err(_) => Err(AppError::internal("descriptor_import_open_lock_file_2")),
+        }
+    }
+}
+
+fn ensure_directory(directory: &DirHandle, name: &std::ffi::OsStr) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        match mkdirat(directory, name, Mode::from_bits_truncate(0o755)) {
+            Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),
+            Err(_) => Err(AppError::internal("descriptor_import_ensure_directory_1")),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match crate::windows_dir::create_dir(directory, name) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(_) => Err(AppError::internal("descriptor_import_ensure_directory_2")),
+        }
+    }
+}
+
+fn pinned_directory_path(directory: &DirHandle) -> Result<PathBuf, AppError> {
+    #[cfg(unix)]
+    {
+        Ok(PathBuf::from(format!(
+            "/proc/self/fd/{}/.",
+            directory.as_raw_fd()
+        )))
+    }
+    #[cfg(windows)]
+    {
+        storage(directory.final_path())
+    }
+}
+
+fn remove_child_directory(directory: &DirHandle, name: &std::ffi::OsStr) -> Result<(), AppError> {
+    #[cfg(unix)]
+    {
+        storage(rustix::fs::unlinkat(
+            directory,
+            name,
+            rustix::fs::AtFlags::REMOVEDIR,
+        ))
+    }
+    #[cfg(windows)]
+    {
+        storage(crate::windows_dir::remove_dir(directory, name))
+    }
+}
+
+fn existing_directory(
+    directory: &DirHandle,
+    name: &std::ffi::OsStr,
+) -> Result<Option<DirHandle>, AppError> {
+    #[cfg(unix)]
+    {
+        match openat(
+            directory,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(existing) => Ok(Some(existing)),
+            Err(rustix::io::Errno::NOENT) => Ok(None),
+            Err(_) => Err(AppError::Forbidden),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match crate::windows_dir::open_subdir(directory, name) {
+            Ok(existing) => Ok(Some(existing)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(AppError::Forbidden),
+        }
+    }
+}
+
+fn import_directory(path: &Path) -> std::io::Result<DirHandle> {
+    #[cfg(unix)]
+    {
+        crate::plugin_publication::directory_fd(path)
+    }
+    #[cfg(windows)]
+    {
+        crate::windows_dir::open_writable_directory(path)
+    }
 }
 
 fn storage<T, Error>(result: Result<T, Error>) -> Result<T, AppError> {
-    result.map_err(|_| AppError::Internal)
+    result.map_err(|_| AppError::internal("descriptor_import_storage_1"))
 }
 
 #[cfg(test)]
@@ -811,9 +1037,9 @@ mod tests {
         assert_eq!(Cause::distribution("untrusted-marker"), Cause::Unknown);
         for error in [
             AppError::Forbidden,
-            AppError::Internal,
+            AppError::internal("descriptor_import_unknown_diagnostics_do_not_infer_cause_or_disc"),
             AppError::BadRequest("https://fixture.invalid/untrusted-marker".into()),
-            AppError::Storage("/private/untrusted-marker".into()),
+            AppError::storage("private_untrusted_marker"),
             AppError::ProxyGroupConflict("untrusted-marker"),
         ] {
             let expected = error.to_string();
@@ -830,9 +1056,9 @@ mod tests {
             assert_eq!(failure.into_app_error().to_string(), expected);
         }
         let failure =
-            DescriptorImportFailure::validation(Phase::DescriptorValidate, AppError::Internal);
+            DescriptorImportFailure::validation(Phase::DescriptorValidate, AppError::internal("descriptor_import_unknown_diagnostics_do_not_infer_cause_or_disc"));
         assert_eq!(failure.diagnostic().cause, Cause::Unknown);
-        assert!(matches!(failure.into_app_error(), AppError::Internal));
+        assert!(matches!(failure.into_app_error(), AppError::Internal { .. }));
     }
 
     #[tokio::test]
@@ -880,10 +1106,10 @@ mod tests {
                 cause: Cause::Unknown
             }
         );
-        assert!(matches!(failure.into_app_error(), AppError::Internal));
+        assert!(matches!(failure.into_app_error(), AppError::Internal { .. }));
         assert!(matches!(
             import_plugin_descriptor(&options).await,
-            Err(AppError::Internal)
+            Err(AppError::Internal { .. })
         ));
         std::fs::write(&options.descriptor_file, input).unwrap();
         let lock = directory.path().join(".mtc-descriptor-import.lock");
@@ -899,10 +1125,10 @@ mod tests {
                 cause: Cause::Storage
             }
         );
-        assert!(matches!(failure.into_app_error(), AppError::Internal));
+        assert!(matches!(failure.into_app_error(), AppError::Internal { .. }));
         assert!(matches!(
             import_plugin_descriptor(&options).await,
-            Err(AppError::Internal)
+            Err(AppError::Internal { .. })
         ));
         assert!(!options.output_dir.exists());
     }
@@ -1231,10 +1457,21 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let options = options(directory.path());
-        std::os::unix::fs::symlink(external.path(), directory.path().join("empty")).unwrap();
-        assert!(import_plugin_descriptor(&options).await.is_err());
-        assert!(!options.output_dir.exists());
-        std::fs::remove_file(directory.path().join("empty")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(external.path(), directory.path().join("empty")).unwrap();
+            assert!(import_plugin_descriptor(&options).await.is_err());
+            assert!(!options.output_dir.exists());
+            std::fs::remove_file(directory.path().join("empty")).unwrap();
+        }
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(external.path(), directory.path().join("empty")).is_ok()
+        {
+            assert!(import_plugin_descriptor(&options).await.is_err());
+            assert!(!options.output_dir.exists());
+            let _ = std::fs::remove_dir(directory.path().join("empty"));
+            let _ = std::fs::remove_file(directory.path().join("empty"));
+        }
         std::fs::create_dir(&options.output_dir).unwrap();
         std::fs::write(options.output_dir.join(INVENTORY_FILE), b"{}").unwrap();
         assert!(import_plugin_descriptor(&options).await.is_err());

@@ -199,9 +199,7 @@ impl ArchiveStagingObjectStore for FlakyStore {
             })
             .is_ok()
         {
-            return Err(AppError::Storage(
-                "injected endpoint and credential detail".into(),
-            ));
+            return Err(AppError::storage("local_storage_failed"));
         }
         Ok(())
     }
@@ -217,9 +215,7 @@ impl ArchiveStagingObjectStore for FlakyStore {
             })
             .is_ok()
         {
-            return Err(AppError::Storage(
-                "injected object path and owner detail".into(),
-            ));
+            return Err(AppError::storage("local_storage_failed"));
         }
         Ok(true)
     }

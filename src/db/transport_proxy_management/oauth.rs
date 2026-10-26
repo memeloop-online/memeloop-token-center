@@ -126,7 +126,7 @@ impl Database {
                 .bind(account_id.to_string()).bind(&snapshot.tenant_external_id)
                 .fetch_optional(&mut **tx).await?.ok_or(AppError::NotFound)?;
             let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("oauth_validate_oauth_transport_group_tx_1"))?;
             let installed_session = snapshot.session_id.is_some_and(|session| {
                 row.try_get::<Option<String>, _>("oauth_session_id")
                     .ok()
@@ -135,7 +135,7 @@ impl Database {
                     == Some(session.to_string().as_str())
             });
             if config.get(CONFIG_KEY)
-                != Some(&serde_json::to_value(stamp).map_err(|_| AppError::Internal)?)
+                != Some(&serde_json::to_value(stamp).map_err(|_| AppError::internal("oauth_validate_oauth_transport_group_tx_2"))?)
                 || stamp.group_id != Some(snapshot.reference.group_id)
                 || stamp.group_version != Some(snapshot.reference.expected_group_version)
                 || (!installed_session

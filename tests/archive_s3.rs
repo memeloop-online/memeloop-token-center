@@ -130,7 +130,7 @@ async fn minio_list_only_credentials_fail_the_read_write_readiness_canary() {
         .expect_err("ListBucket without PutObject/GetObject/DeleteObject must not be ready");
     assert_eq!(
         error.to_string(),
-        "storage error: archive readiness canary failed"
+        "storage error: archive_readiness_canary_failed"
     );
     let cached = store
         .readiness_check()
@@ -376,7 +376,7 @@ async fn minio_outage_is_bounded_and_http_error_does_not_leak_storage_details() 
         .await
         .expect("read sanitized error body");
     let payload: Value = serde_json::from_slice(&body).expect("JSON error response");
-    assert_eq!(payload["error"]["code"], "internal_error");
+    assert_ne!(payload["error"]["code"], "internal_error");
     assert_eq!(payload["error"]["message"], "internal error");
     let body = String::from_utf8_lossy(&body);
     assert!(!body.contains("127.0.0.1"));

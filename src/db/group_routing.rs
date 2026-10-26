@@ -114,9 +114,9 @@ impl Database {
             .map(|row| {
                 Ok((
                     Uuid::parse_str(&row.try_get::<String, _>("route_id")?)
-                        .map_err(|_| AppError::Internal)?,
+                        .map_err(|_| AppError::internal("group_routing_candidate_group_strategies_1"))?,
                     Uuid::parse_str(&row.try_get::<String, _>("account_id")?)
-                        .map_err(|_| AppError::Internal)?,
+                        .map_err(|_| AppError::internal("group_routing_candidate_group_strategies_2"))?,
                     CandidateGroupStrategy {
                         id: format!(
                             "{}:{}",
@@ -130,7 +130,7 @@ impl Database {
                         strategy: serde_json::from_str(
                             &row.try_get::<String, _>("routing_strategy")?,
                         )
-                        .map_err(|_| AppError::Internal)?,
+                        .map_err(|_| AppError::internal("group_routing_candidate_group_strategies_3"))?,
                     },
                 ))
             })
@@ -148,7 +148,7 @@ impl Database {
             return Ok(Vec::new());
         }
         if scopes.len() > 1024 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("group_routing_group_routing_v2_transient_signals_1"));
         }
         let values = (0..scopes.len())
             .map(|index| {
@@ -190,7 +190,7 @@ impl Database {
             .map(|row| {
                 Ok(ScopedTransientHealthSignal {
                     account_id: Uuid::parse_str(&row.try_get::<String, _>("account_id")?)
-                        .map_err(|_| AppError::Internal)?,
+                        .map_err(|_| AppError::internal("group_routing_group_routing_v2_transient_signals_1"))?,
                     generation: row.try_get("generation")?,
                     policy_scope: row.try_get("policy_scope")?,
                     signal: TransientHealthSignal {

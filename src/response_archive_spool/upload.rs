@@ -407,7 +407,7 @@ async fn upload(
         "response_spool_staging_begin",
     )
     .await
-    .ok_or(AppError::Internal)??;
+    .ok_or(AppError::internal("upload_upload_1"))??;
     let (lost_sender, mut lost_receiver) = tokio::sync::mpsc::channel(1);
     let (heartbeat_stop, stop_receiver) = tokio::sync::oneshot::channel();
     let heartbeat_state = state.clone();
@@ -441,12 +441,12 @@ async fn upload(
                 .await?;
             if chunks.is_empty() {
                 *phase = "lease";
-                return Err(AppError::Internal);
+                return Err(AppError::internal("upload_upload_2"));
             }
             for chunk in chunks {
                 *phase = "chunk_validation";
                 if chunk.seq != seq || seq >= task.chunk_count {
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("upload_upload_3"));
                 }
                 *phase = "decrypt";
                 let bytes = super::cipher::open_for_purpose(
@@ -459,7 +459,7 @@ async fn upload(
                 )?;
                 total = total
                     .checked_add(chunk.byte_count)
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("upload_upload_4"))?;
                 digest.update(&bytes);
                 *phase = "object_write";
                 writer.write(bytes).await?;
@@ -468,7 +468,7 @@ async fn upload(
         }
         *phase = "chunk_validation";
         if total != task.byte_count {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("upload_upload_5"));
         }
         *phase = "object_finish";
         let stored = writer.finish_staged().await?;
@@ -478,10 +478,10 @@ async fn upload(
             attempt.object_locator.clone()
         };
         if stored.object_locator != expected_locator
-            || stored.size_bytes != u64::try_from(total).map_err(|_| AppError::Internal)?
+            || stored.size_bytes != u64::try_from(total).map_err(|_| AppError::internal("upload_upload_1"))?
             || stored.blake3_digest != digest.finalize().to_hex().as_str()
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("upload_upload_6"));
         }
         let bind_locator = if task.successful_terminal {
             *phase = "cas_promote";
@@ -514,9 +514,9 @@ async fn upload(
             "response_spool_terminal_bind",
         )
         .await
-        .ok_or(AppError::Internal)??;
+        .ok_or(AppError::internal("upload_upload_7"))??;
         if !bound {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("upload_upload_8"));
         }
         Ok(())
     };
@@ -538,7 +538,7 @@ async fn upload(
         Some(result) => result,
         None => {
             *phase = "lease";
-            Err(AppError::Internal)
+            Err(AppError::internal("upload_upload_9"))
         }
     }
 }
@@ -676,8 +676,8 @@ mod tests {
             None
         );
         assert!(matches!(
-            observe_claim(async { Err::<Option<()>, _>(AppError::Internal) }).await,
-            Err(AppError::Internal)
+            observe_claim(async { Err::<Option<()>, _>(AppError::internal("upload_empty_claim_and_database_error_remain_distinct_1")) }).await,
+            Err(AppError::Internal { .. })
         ));
     }
 

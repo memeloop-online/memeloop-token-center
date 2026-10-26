@@ -78,7 +78,7 @@ pub(crate) fn open_provider_asset_reference(
 ) -> Result<Vec<ProviderGenerationAsset>, AppError> {
     let envelope = reference
         .strip_prefix(PROVIDER_REFERENCE_PREFIX)
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("generation_open_provider_asset_reference_1"))?;
     let aad = provider_reference_aad(owner_kind, owner_id);
     let reference: ProviderAssetReference = open_private_json(envelope, key_material, &aad)?;
     Ok(reference.assets)
@@ -151,7 +151,7 @@ where
 {
     tokio::pin!(future);
     let period = std::time::Duration::from_millis(
-        u64::try_from(ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS).map_err(|_| AppError::Internal)?,
+        u64::try_from(ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS).map_err(|_| AppError::internal("generation_await_with_staging_heartbeat_1"))?,
     );
     let mut heartbeat = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     loop {
@@ -375,29 +375,27 @@ async fn comfyui_billed_pixels(
         return Ok(Some(1));
     }
     if job.billing_unit != "megapixel" {
-        return Err(AppError::Storage(
-            "ComfyUI job has an unsupported billing snapshot".into(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     let archived = state
         .archive
         .get_bounded(&job.request_object, MAX_CONTROL_BODY)
         .await?;
     let outer: Value = serde_json::from_slice(&archived)
-        .map_err(|_| AppError::Storage("generation request archive is invalid".into()))?;
+        .map_err(|_| AppError::storage("generation_request_archive_is_invalid"))?;
     let input = outer
         .get("input")
-        .ok_or_else(|| AppError::Storage("generation input archive is invalid".into()))?;
+        .ok_or_else(|| AppError::storage("generation_input_archive_is_invalid"))?;
     let (pixels_per_output, reserved_outputs) = comfyui_pixel_contract(input)
-        .map_err(|_| AppError::Storage("generation pixel contract is invalid".into()))?;
-    let actual_outputs = i64::try_from(actual_outputs).map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::storage("generation_pixel_contract_is_invalid"))?;
+    let actual_outputs = i64::try_from(actual_outputs).map_err(|_| AppError::internal("generation_comfyui_billed_pixels_1"))?;
     if actual_outputs > reserved_outputs {
         return Ok(None);
     }
     pixels_per_output
         .checked_mul(actual_outputs)
         .map(Some)
-        .ok_or(AppError::Internal)
+        .ok_or(AppError::internal("generation_comfyui_billed_pixels_1"))
 }
 
 async fn process_claimed(
@@ -426,7 +424,7 @@ async fn process_claimed(
         }
         for asset in &staged.assets {
             let size = state.archive.head_size(&asset.object_locator).await?;
-            if size != u64::try_from(asset.size_bytes).map_err(|_| AppError::Internal)? {
+            if size != u64::try_from(asset.size_bytes).map_err(|_| AppError::internal("generation_process_claimed_1"))? {
                 return terminal_failure(state, worker_id, job, "generation_staging_lost").await;
             }
         }
@@ -436,9 +434,9 @@ async fn process_claimed(
         .db
         .load_generation_upstream_snapshot(job, state.config.key_pepper.as_bytes())
         .await?
-        .ok_or_else(|| AppError::Upstream("generation upstream snapshot is unavailable".into()))?;
+        .ok_or_else(|| AppError::upstream("generation_upstream_snapshot_is_unavailable"))?;
     if job.status == "cancelling" {
-        let upstream_job_id = job.upstream_job_id.as_deref().ok_or(AppError::Internal)?;
+        let upstream_job_id = job.upstream_job_id.as_deref().ok_or(AppError::internal("generation_process_claimed_1"))?;
         return cancel_upstream_generation(state, worker_id, job, &route, upstream_job_id).await;
     }
     match job.upstream_job_id.as_deref() {
@@ -491,7 +489,7 @@ async fn cancel_upstream_generation(
             }
         }
         GenerationProtocolAdapter::SiliconFlowVideoV1 | GenerationProtocolAdapter::WasuWanV1 => {
-            return Err(AppError::Upstream("unsupported generation driver".into()));
+            return Err(AppError::upstream("unsupported_generation_driver"));
         }
     };
     let _upstream_activity = state
@@ -510,17 +508,15 @@ async fn cancel_upstream_generation(
     let status = response.status();
     if !status.is_success() {
         drain_bounded_control_response(response).await?;
-        return Err(AppError::Upstream(format!(
-            "generation cancellation returned HTTP {}",
-            status.as_u16()
-        )));
+        return Err(AppError::upstream_status(
+            "generation_cancellation_returned_http",
+            status.as_u16(),
+        ));
     }
     if requires_delete_proof {
         let body = bounded_json(response).await?;
         if !comfyui_delete_confirmed(&body, upstream_job_id) {
-            return Err(AppError::Upstream(
-                "ComfyUI did not confirm the prompt deletion".into(),
-            ));
+            return Err(AppError::upstream("generation_cancel_unconfirmed"));
         }
     } else {
         drain_bounded_control_response(response).await?;
@@ -551,8 +547,11 @@ async fn drain_bounded_control_response(response: Response) -> Result<(), AppErr
             .map_err(|error| sanitized_http_error(&error, "generation cancellation response"))?;
         received = received.saturating_add(chunk.len());
         if received > MAX_CONTROL_BODY {
-            return Err(AppError::Upstream(
-                "generation cancellation response exceeds 4 MiB".into(),
+            return Err(AppError::upstream_with(
+                "generation_control_response_too_large",
+                crate::error::ErrorFacts::new()
+                    .bytes(received as u64)
+                    .limit(MAX_CONTROL_BODY as u64),
             ));
         }
     }
@@ -585,7 +584,7 @@ async fn submit_attempt(
         if !capabilities.provable_submit_idempotency {
             return terminal_failure(state, worker_id, job, "submission_outcome_unknown").await;
         }
-        job.submission_nonce.ok_or(AppError::Internal)?
+        job.submission_nonce.ok_or(AppError::internal("generation_submit_attempt_1"))?
     } else {
         let nonce = uuid::Uuid::now_v7();
         state
@@ -597,21 +596,19 @@ async fn submit_attempt(
     if job.status == "submitting"
         && GenerationProtocolAdapter::for_route(route)? == GenerationProtocolAdapter::WasuWanV1
     {
-        return Err(AppError::Upstream(
-            "Wasu Wan submission outcome requires reconciliation".into(),
-        ));
+        return Err(AppError::upstream("wasu_wan_resubmit_rejected"));
     }
     let archived = state
         .archive
         .get_bounded(&job.request_object, MAX_CONTROL_BODY)
         .await?;
     let outer: Value = serde_json::from_slice(&archived)
-        .map_err(|_| AppError::Storage("generation request archive is invalid".into()))?;
+        .map_err(|_| AppError::storage("generation_request_archive_is_invalid"))?;
     let mut input = outer
         .get("input")
         .and_then(Value::as_object)
         .cloned()
-        .ok_or_else(|| AppError::Storage("generation input archive is invalid".into()))?;
+        .ok_or_else(|| AppError::storage("generation_input_archive_is_invalid"))?;
     let adapter = GenerationProtocolAdapter::for_route(route)?;
     let (path, id_field) = match adapter {
         GenerationProtocolAdapter::WasuWanV1 => {
@@ -638,11 +635,9 @@ async fn submit_attempt(
                 .config
                 .get("workflow_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| AppError::Storage("ComfyUI workflow id is missing".into()))?;
+                .ok_or_else(|| AppError::storage("comfyui_workflow_id_is_missing"))?;
             if workflow_id != job.upstream_model {
-                return Err(AppError::Upstream(
-                    "ComfyUI route does not match its versioned workflow".into(),
-                ));
+                return Err(AppError::upstream("generation_workflow_mismatch"));
             }
             let parameters = input
                 .remove("parameters")
@@ -663,7 +658,7 @@ async fn submit_attempt(
                 .config
                 .get("workflow_template")
                 .cloned()
-                .ok_or_else(|| AppError::Storage("ComfyUI workflow template is missing".into()))?;
+                .ok_or_else(|| AppError::storage("comfyui_workflow_template_is_missing"))?;
             apply_workflow_parameters(&mut workflow, &parameters)?;
             input = Map::from_iter([("prompt".to_owned(), workflow)]);
             (format!("{prefix}/prompt"), "prompt_id")
@@ -735,10 +730,10 @@ async fn submit_attempt(
             let _ = body;
             return terminal_failure(state, worker_id, job, "generation_rejected").await;
         }
-        return Err(AppError::Upstream(format!(
-            "generation submit returned HTTP {}",
-            status.as_u16()
-        )));
+        return Err(AppError::upstream_status(
+            "generation_submit_returned_http",
+            status.as_u16(),
+        ));
     }
     let body = body?;
     let envelope = if adapter == GenerationProtocolAdapter::WasuWanV1 {
@@ -749,7 +744,7 @@ async fn submit_attempt(
     let upstream_job_id = envelope
         .get(id_field)
         .and_then(Value::as_str)
-        .ok_or_else(|| AppError::Upstream("generation submit response has no job id".into()))?;
+        .ok_or_else(|| AppError::upstream("generation_submit_response_has_no_job_id"))?;
     let upstream_job_id = validated_upstream_job_id(upstream_job_id)?;
     attempt.valid = true;
     state
@@ -881,10 +876,10 @@ async fn poll_siliconflow_video(
     let status = response.status();
     let body = attempt.json(response).await?;
     if !status.is_success() {
-        return Err(AppError::Upstream(format!(
-            "SiliconFlow video poll returned HTTP {}",
-            status.as_u16()
-        )));
+        return Err(AppError::upstream_status(
+            "siliconflow_video_poll_returned_http",
+            status.as_u16(),
+        ));
     }
     match body.get("status").and_then(Value::as_str) {
         Some("InQueue" | "InProgress") => {
@@ -999,10 +994,10 @@ async fn poll_seedance(
     let status = response.status();
     let body = attempt.json(response).await?;
     if !status.is_success() {
-        return Err(AppError::Upstream(format!(
-            "Seedance poll returned HTTP {}",
-            status.as_u16()
-        )));
+        return Err(AppError::upstream_status(
+            "seedance_poll_returned_http",
+            status.as_u16(),
+        ));
     }
     match body.get("status").and_then(Value::as_str) {
         Some("queued" | "running") | None => {
@@ -1197,10 +1192,10 @@ async fn authenticated_json(
     if status.is_success() {
         Ok(body)
     } else {
-        Err(AppError::Upstream(format!(
-            "generation poll returned HTTP {}",
-            status.as_u16()
-        )))
+        Err(AppError::upstream_status(
+            "generation_poll_returned_http",
+            status.as_u16(),
+        ))
     }
 }
 
@@ -1211,14 +1206,17 @@ async fn bounded_json(response: Response) -> Result<Value, AppError> {
         let chunk =
             chunk.map_err(|error| sanitized_http_error(&error, "generation control response"))?;
         if bytes.len().saturating_add(chunk.len()) > MAX_CONTROL_BODY {
-            return Err(AppError::Upstream(
-                "generation control response exceeds 4 MiB".into(),
+            return Err(AppError::upstream_with(
+                "generation_control_response_too_large",
+                crate::error::ErrorFacts::new()
+                    .bytes(bytes.len().saturating_add(chunk.len()) as u64)
+                    .limit(MAX_CONTROL_BODY as u64),
             ));
         }
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes)
-        .map_err(|_| AppError::Upstream("generation control response is not JSON".into()))
+        .map_err(|_| AppError::upstream("generation_control_response_is_not_json"))
 }
 
 pub(crate) async fn route_http(
@@ -1244,8 +1242,8 @@ pub(crate) async fn provider_asset_get(
     ensure_asset_origin(route, url)?;
     let client = route_http(state, route, url).await?;
     let asset_url = url::Url::parse(url)
-        .map_err(|_| AppError::Upstream("generation asset URL is invalid".into()))?;
-    let base_url = url::Url::parse(&route.base_url).map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::upstream("generation_asset_url_is_invalid"))?;
+    let base_url = url::Url::parse(&route.base_url).map_err(|_| AppError::internal("generation_provider_asset_get_1"))?;
     let request = client.get(url);
     if asset_url.origin() == base_url.origin() {
         route.credential.apply(request, unix_millis())
@@ -1298,8 +1296,9 @@ pub(crate) async fn provider_asset_is_obtainable(
         return Ok(false);
     }
     if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(AppError::Upstream(
-            "generation asset validation did not honor the bounded byte range".into(),
+        return Err(AppError::upstream_status(
+            "generation_asset_probe_returned_http",
+            response.status().as_u16(),
         ));
     }
     let content_range = response
@@ -1325,8 +1324,8 @@ pub(crate) async fn provider_asset_is_obtainable(
             sanitized_http_error(&error, "generation asset validation response")
         })?;
         bytes = bytes
-            .checked_add(u64::try_from(chunk.len()).map_err(|_| AppError::Internal)?)
-            .ok_or(AppError::Internal)?;
+            .checked_add(u64::try_from(chunk.len()).map_err(|_| AppError::internal("generation_provider_asset_is_obtainable_1"))?)
+            .ok_or(AppError::internal("generation_provider_asset_is_obtainable_1"))?;
         if bytes > 1 {
             return Ok(false);
         }
@@ -1369,13 +1368,26 @@ fn sanitized_http_error(error: &reqwest::Error, operation: &'static str) -> AppE
         is_connect = error.is_connect(),
         "generation upstream HTTP operation failed"
     );
-    AppError::Upstream(format!("{operation} failed"))
+    let stage = match operation {
+        "generation cancellation request" => "generation_cancellation",
+        "SiliconFlow video poll request" => "siliconflow_video_poll",
+        "Seedance poll request" => "seedance_poll",
+        "generation poll request" => "generation_poll",
+        _ => "generation_upstream_http",
+    };
+    let mut facts = crate::error::ErrorFacts::new().stage(stage);
+    if error.is_timeout() {
+        facts = facts.kind("timeout");
+    } else if error.is_connect() {
+        facts = facts.kind("connect");
+    }
+    AppError::upstream_with("generation_upstream_http_failed", facts)
 }
 
 pub(crate) fn ensure_asset_origin(route: &ResolvedUpstream, asset: &str) -> Result<(), AppError> {
     let asset = url::Url::parse(asset)
-        .map_err(|_| AppError::Upstream("generation asset URL is invalid".into()))?;
-    let base = url::Url::parse(&route.base_url).map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::upstream("generation_asset_url_is_invalid"))?;
+    let base = url::Url::parse(&route.base_url).map_err(|_| AppError::internal("generation_ensure_asset_origin_1"))?;
     let asset_origin = asset.origin().ascii_serialization();
     let base_origin = base.origin().ascii_serialization();
     let configured = route
@@ -1388,9 +1400,7 @@ pub(crate) fn ensure_asset_origin(route: &ResolvedUpstream, asset: &str) -> Resu
     if asset_origin == base_origin || configured.into_iter().any(|origin| origin == asset_origin) {
         Ok(())
     } else {
-        Err(AppError::Upstream(format!(
-            "generation asset origin is not allowed: {asset_origin}"
-        )))
+        Err(AppError::upstream("generation_asset_origin_is_not_allowed"))
     }
 }
 
@@ -1468,7 +1478,7 @@ pub(crate) fn provider_generation_asset(
     asset_id[8] = (asset_id[8] & 0x3f) | 0x80;
     Ok(ProviderGenerationAsset {
         asset_id: uuid::Uuid::from_bytes(asset_id),
-        index: i64::try_from(index).map_err(|_| AppError::Internal)?,
+        index: i64::try_from(index).map_err(|_| AppError::internal("generation_provider_generation_asset_1"))?,
         url: url.to_owned(),
         expires_at,
         filename: safe_asset_filename(filename, index, &mime_type),
@@ -1682,9 +1692,7 @@ fn comfy_prefix(route: &ResolvedUpstream) -> Result<String, AppError> {
     if matches!(prefix, "" | "/api") {
         Ok(prefix.to_owned())
     } else {
-        Err(AppError::Upstream(
-            "ComfyUI api_prefix must be empty or /api".into(),
-        ))
+        Err(AppError::upstream("generation_api_prefix_rejected"))
     }
 }
 
@@ -1696,9 +1704,7 @@ fn validated_upstream_job_id(value: &str) -> Result<&str, AppError> {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
     {
-        return Err(AppError::Upstream(
-            "generation submit response has invalid job id".into(),
-        ));
+        return Err(AppError::upstream("generation_job_id_rejected"));
     }
     Ok(value)
 }
@@ -1710,16 +1716,16 @@ fn unknown_generation_status(driver: &str) -> AppError {
         "siliconflow-video" => "SiliconFlow video",
         _ => "upstream",
     };
-    AppError::Upstream(format!("unknown {provider} generation status"))
+    AppError::upstream("unknown_generation_status")
 }
 
 fn generation_url(base_url: &str, segments: &[&str]) -> Result<String, AppError> {
-    let mut url = url::Url::parse(base_url).map_err(|_| AppError::Internal)?;
+    let mut url = url::Url::parse(base_url).map_err(|_| AppError::internal("generation_generation_url_1"))?;
     url.set_query(None);
     url.set_fragment(None);
     let mut path = url
         .path_segments_mut()
-        .map_err(|_| AppError::Upstream("generation upstream URL cannot be a base URL".into()))?;
+        .map_err(|_| AppError::upstream("generation_upstream_url_cannot_be_a_base_url"))?;
     path.pop_if_empty();
     path.extend(segments);
     drop(path);
@@ -1776,7 +1782,7 @@ fn comfy_asset_url(
     asset: &ComfyAsset,
 ) -> Result<url::Url, AppError> {
     let mut url = url::Url::parse(&format!("{}{prefix}/view", route.base_url))
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("generation_comfy_asset_url_1"))?;
     url.query_pairs_mut()
         .append_pair("filename", &asset.filename)
         .append_pair("subfolder", &asset.subfolder)
@@ -1973,7 +1979,7 @@ mod tests {
             let error = validated_upstream_job_id(&invalid).unwrap_err().to_string();
             assert_eq!(
                 error,
-                "configured upstream is unavailable: generation submit response has invalid job id"
+                "configured upstream is unavailable: generation_submit_response_has_invalid_job_id"
             );
             assert!(!error.contains("must-not-leak"));
         }
@@ -2004,7 +2010,7 @@ mod tests {
         let unknown = unknown_generation_status("volcengine-seedance").to_string();
         assert_eq!(
             unknown,
-            "configured upstream is unavailable: unknown Seedance generation status"
+            "configured upstream is unavailable: unknown_seedance_generation_status"
         );
         let unknown_provider =
             unknown_generation_status("provider-status-with-sensitive-token").to_string();

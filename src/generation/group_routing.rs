@@ -69,7 +69,7 @@ pub(crate) async fn prepare_route_for_protocol(
         }
     }
     let native =
-        native.ok_or_else(|| AppError::Upstream(format!("{protocol} route is not configured")))?;
+        native.ok_or_else(|| AppError::upstream("route_is_not_configured"))?;
     if !state.plugins.has_group_routing_hooks() {
         return Ok(native);
     }
@@ -102,9 +102,7 @@ pub(crate) async fn prepare_route_for_protocol(
             return Ok(route);
         }
     }
-    Err(AppError::Upstream(format!(
-        "{protocol} candidates are unavailable"
-    )))
+    Err(AppError::upstream("candidates_are_unavailable"))
 }
 
 pub(crate) async fn admit(

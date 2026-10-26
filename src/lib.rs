@@ -12,6 +12,7 @@ mod early_request;
 pub mod error;
 pub mod filter_ast;
 mod gateway_body;
+mod simple_http;
 pub mod generation;
 mod group_routing;
 #[cfg(not(target_env = "msvc"))]
@@ -25,11 +26,25 @@ pub mod oauth;
 pub mod plugin;
 #[cfg(feature = "plugin-distribution")]
 pub mod plugin_distribution;
-#[cfg(any(
-    feature = "experimental-plugin-revisions",
-    feature = "plugin-distribution"
+#[cfg(all(
+    any(
+        feature = "experimental-plugin-revisions",
+        feature = "plugin-distribution"
+    ),
+    unix
 ))]
 mod plugin_publication;
+#[cfg(all(
+    any(
+        feature = "experimental-plugin-revisions",
+        feature = "plugin-distribution"
+    ),
+    windows
+))]
+#[path = "plugin_publication_windows.rs"]
+mod plugin_publication;
+#[cfg(windows)]
+mod windows_dir;
 pub mod plugin_release;
 #[cfg(any(
     feature = "experimental-plugin-revisions",
@@ -63,7 +78,15 @@ const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 // matching the read timeout to the overall deadline does not make it unbounded.
 const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
 const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
-const CODEX_HTTP2_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(30);
+pub(crate) use simple_http::{
+    build_codex_http_client_with_policy, build_codex_http_client_with_proxy,
+};
+#[cfg(test)]
+pub(crate) use simple_http::{
+    build_codex_http2_test_client, build_codex_http_client, codex_http_client_builder,
+    codex_http_client_builder_with_proxy, codex_http_protocol_test_builder,
+    CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+};
 // Each streaming response archive owns a 5 MiB multipart buffer. Keep the
 // upstream/request concurrency independent, but bound simultaneous archive
 // writers so one gateway cannot multiply that buffer by all active lifecycles.
@@ -129,9 +152,12 @@ pub enum InitializationError {
 
 fn plugin_initialization_error(error: crate::error::AppError) -> InitializationError {
     match error {
-        crate::error::AppError::DatabaseUnavailable(_) | crate::error::AppError::Overloaded => {
-            InitializationError::Database(error)
-        }
+        crate::error::AppError::DatabaseUnavailable(_)
+        | crate::error::AppError::Overloaded
+        | crate::error::AppError::Capacity {
+            code: "database_pool_exhausted",
+            ..
+        } => InitializationError::Database(error),
         _ => InitializationError::Plugin,
     }
 }
@@ -400,104 +426,8 @@ impl AppState {
     }
 }
 
-#[cfg(test)]
-fn build_codex_http_client() -> Result<wreq::Client, wreq::Error> {
-    build_codex_http_client_with_policy(provider::CodexTransportPolicy::default())
-}
-
-fn build_codex_http_client_with_policy(
-    policy: provider::CodexTransportPolicy,
-) -> Result<wreq::Client, wreq::Error> {
-    codex_http_client_builder(policy, CODEX_HTTP2_KEEP_ALIVE_INTERVAL).build()
-}
-
-#[cfg(test)]
-fn build_codex_http2_test_client(
-    policy: provider::CodexTransportPolicy,
-    keep_alive_interval: Duration,
-) -> Result<wreq::Client, wreq::Error> {
-    codex_http_protocol_test_builder(policy, keep_alive_interval, http::Version::HTTP_2).build()
-}
-
-#[cfg(test)]
-fn codex_http_protocol_test_builder(
-    policy: provider::CodexTransportPolicy,
-    keep_alive_interval: Duration,
-    version: http::Version,
-) -> wreq::ClientBuilder {
-    let builder = codex_http_client_builder(policy, keep_alive_interval);
-    match version {
-        http::Version::HTTP_11 => builder.http1_only(),
-        http::Version::HTTP_2 => builder.http2_only(),
-        _ => panic!("unsupported synthetic protocol arm"),
-    }
-}
-
-fn codex_http_client_builder(
-    policy: provider::CodexTransportPolicy,
-    keep_alive_interval: Duration,
-) -> wreq::ClientBuilder {
-    use wreq::IntoEmulation;
-    use wreq_util::{Emulation, Platform, Profile};
-
-    let emulation: wreq::Emulation = Emulation::builder()
-        .profile(Profile::Chrome133)
-        .platform(Platform::Linux)
-        .http2(true)
-        // The browser profile supplies only the TLS and HTTP/2 fingerprint.
-        // Product-controlled Codex headers remain the complete HTTP identity.
-        .headers(false)
-        .build()
-        .into_emulation();
-    let http2_options = codex_http2_options(
-        emulation
-            .http2_options
-            .clone()
-            .expect("Chrome133 HTTP/2 profile must include HTTP/2 options"),
-        policy,
-        keep_alive_interval,
-    );
-    // The stored connect timeout bounds only TCP, proxy CONNECT, and TLS.
-    // It does not limit time spent waiting for response headers after the
-    // connection is up, and it is not a kernel TCP user timeout. Leaving the
-    // handshake unbounded made a stuck proxy or route look like a two-minute
-    // upstream wait. wreq would otherwise force-close a Linux socket after 30s
-    // without an ACK and probe TCP keepalive every 15s. HTTP/2 keepalive remains.
-    let builder = wreq::Client::builder()
-        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
-        .redirect(wreq::redirect::Policy::none())
-        // Responses POSTs are not safe for an HTTP client's implicit retry.
-        // Candidate failover remains explicit and pre-delivery in the proxy.
-        .retry(wreq::retry::Policy::never())
-        .no_proxy()
-        // The cache owns at most 64 account clients; bound each idle pool too.
-        .pool_max_idle_per_host(8)
-        .pool_idle_timeout(Duration::from_secs(90))
-        .emulation(emulation)
-        .http2_options(http2_options)
-        .tcp_keepalive(None::<Duration>)
-        .tcp_keepalive_interval(None::<Duration>)
-        .tcp_keepalive_retries(None::<u32>);
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-    let builder = builder.tcp_user_timeout(None::<Duration>);
-    match policy.http_protocol {
-        provider::CodexHttpProtocol::ProviderDefault => builder,
-        provider::CodexHttpProtocol::Http1Only => builder.http1_only(),
-    }
-}
-
-fn codex_http2_options(
-    mut options: wreq::http2::Http2Options,
-    policy: provider::CodexTransportPolicy,
-    keep_alive_interval: Duration,
-) -> wreq::http2::Http2Options {
-    options.keep_alive_interval = Some(keep_alive_interval);
-    options.keep_alive_timeout = Duration::from_millis(policy.request_timeout_millis);
-    options.keep_alive_while_idle = false;
-    options
-}
-
 fn base_http_client_builder() -> reqwest::ClientBuilder {
+    simple_http::install_ring_provider();
     reqwest::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .read_timeout(HTTP_READ_TIMEOUT)
@@ -580,10 +510,7 @@ mod http2_upload_tests;
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        net::{IpAddr, SocketAddr},
-        time::Duration,
-    };
+    use std::net::{IpAddr, SocketAddr};
 
     use reqwest::StatusCode;
     use tokio::{
@@ -596,60 +523,9 @@ mod tests {
     };
 
     use super::{
-        CODEX_HTTP2_KEEP_ALIVE_INTERVAL, build_codex_http_client, build_explicit_proxy_http_client,
-        build_http_client, build_pinned_http_client, codex_http2_options,
+        build_codex_http_client_with_proxy, build_explicit_proxy_http_client, build_http_client,
+        build_pinned_http_client,
     };
-
-    #[test]
-    fn codex_http2_keep_alive_preserves_chrome_profile_without_provider_data() {
-        use wreq::IntoEmulation;
-        use wreq_util::{Emulation, Platform, Profile};
-
-        let profile: wreq::Emulation = Emulation::builder()
-            .profile(Profile::Chrome133)
-            .platform(Platform::Linux)
-            .http2(true)
-            .headers(false)
-            .build()
-            .into_emulation();
-        let original = profile.http2_options.unwrap();
-        let policy = crate::provider::CodexTransportPolicy::default();
-        let options =
-            codex_http2_options(original.clone(), policy, CODEX_HTTP2_KEEP_ALIVE_INTERVAL);
-        assert_eq!(
-            options.keep_alive_interval,
-            Some(CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
-        );
-        assert_eq!(
-            options.keep_alive_timeout,
-            Duration::from_millis(policy.request_timeout_millis)
-        );
-        assert!(!options.keep_alive_while_idle);
-        assert_eq!(options.initial_window_size, original.initial_window_size);
-        assert_eq!(
-            options.initial_conn_window_size,
-            original.initial_conn_window_size
-        );
-        assert_eq!(options.header_table_size, original.header_table_size);
-        assert_eq!(options.max_header_list_size, original.max_header_list_size);
-        assert_eq!(
-            options.max_concurrent_streams,
-            original.max_concurrent_streams
-        );
-        assert_eq!(options.enable_push, original.enable_push);
-        assert_eq!(
-            format!("{:?}", options.settings_order),
-            format!("{:?}", original.settings_order)
-        );
-        assert_eq!(
-            format!("{:?}", options.headers_pseudo_order),
-            format!("{:?}", original.headers_pseudo_order)
-        );
-        assert_eq!(
-            format!("{:?}", options.headers_stream_dependency),
-            format!("{:?}", original.headers_stream_dependency)
-        );
-    }
 
     #[tokio::test]
     async fn shared_http_client_does_not_follow_redirects() {
@@ -840,19 +716,22 @@ mod tests {
         drop(response);
         drop(client);
 
-        let wreq_client = build_codex_http_client().unwrap();
-        let response = wreq_client
+        let codex_client = build_codex_http_client_with_proxy(
+            crate::provider::CodexTransportPolicy::default(),
+            Some(&format!("socks5h://{proxy_address}")),
+        )
+        .unwrap();
+        let response = codex_client
             .get(format!(
                 "http://remote-target.invalid:{}/through-remote-dns-proxy",
                 target.address().port()
             ))
-            .proxy(wreq::Proxy::all(format!("socks5h://{proxy_address}")).unwrap())
             .send()
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         drop(response);
-        drop(wreq_client);
+        drop(codex_client);
         tokio::time::timeout(std::time::Duration::from_secs(2), proxy)
             .await
             .unwrap()

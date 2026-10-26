@@ -308,7 +308,7 @@ async fn mixed_upload_case(reset: bool, tls: bool) {
     };
     timeout(Duration::from_secs(15), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
+        let proxy_url = format!("socks5h://{}", listener.local_addr().unwrap());
         let bodies: BTreeMap<_, _> = LENGTHS.into_iter().map(|length| {
             let body = Bytes::from(format!("{{\"input\":\"{}\"}}", "x".repeat(length - 12)));
             assert_eq!(body.len(), length);
@@ -366,15 +366,29 @@ async fn mixed_upload_case(reset: bool, tls: bool) {
             receipts
         });
         let client = if let Some(fixture) = fixture {
-            crate::codex_http_client_builder(CodexTransportPolicy::default(), crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
-                .tls_cert_store(fixture.roots).build().unwrap()
+            crate::codex_http_client_builder_with_proxy(
+                CodexTransportPolicy::default(),
+                crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+                Some(&proxy_url),
+            )
+            .unwrap()
+            .add_root_certificate(fixture.root_certificate())
+            .build()
+            .unwrap()
         } else {
-            build_codex_http_client_with_policy(CodexTransportPolicy::default()).unwrap()
+            crate::codex_http_client_builder_with_proxy(
+                CodexTransportPolicy::default(),
+                crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+                Some(&proxy_url),
+            )
+            .unwrap()
+            .http2_prior_knowledge()
+            .build()
+            .unwrap()
         };
         let send = |payload: Bytes| {
             let scheme = if tls { "https" } else { "http" };
             let request = client.post(format!("{scheme}://{HOST}/v1/responses"))
-                .proxy(proxy.clone())
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(payload);
             let request = if tls { request } else { request.version(http::Version::HTTP_2) };

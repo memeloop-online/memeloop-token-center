@@ -27,10 +27,7 @@ pub(crate) enum GenerationProtocolAdapter {
 impl GenerationProtocolAdapter {
     pub(crate) fn for_route(route: &ResolvedUpstream) -> Result<Self, AppError> {
         Self::detect(&route.driver, &route.config, &route.upstream_model).ok_or_else(|| {
-            AppError::Upstream(format!(
-                "generation driver {} cannot execute asynchronous jobs",
-                route.driver
-            ))
+            AppError::upstream("generation_driver_cannot_execute_asynchronous_jobs")
         })
     }
 
@@ -114,9 +111,9 @@ impl GenerationProtocolAdapter {
                 let units = input
                     .get("duration")
                     .and_then(Value::as_i64)
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("protocol_estimated_units_1"))?;
                 if !(1..=60).contains(&units) {
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("protocol_estimated_units_2"));
                 }
                 Ok(units)
             }

@@ -49,7 +49,7 @@ impl Database {
         rows.iter()
             .map(|row| {
                 let id: String = row.try_get("id")?;
-                Uuid::parse_str(&id).map_err(|_| AppError::Internal)
+                Uuid::parse_str(&id).map_err(|_| AppError::internal("upstream_service_probes_upstream_service_probes_due_1"))
             })
             .collect()
     }
@@ -183,7 +183,7 @@ impl Database {
         .await?
         .ok_or(AppError::NotFound)?;
         let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("upstream_service_probes_probe_account_context_1"))?;
         Ok(ProbeAccountContext {
             tenant_external_id: row.try_get("external_id")?,
             driver: row.try_get("driver")?,
@@ -298,7 +298,7 @@ impl Database {
         rows.iter()
             .map(|row| {
                 let id: String = row.try_get("account_id")?;
-                Uuid::parse_str(&id).map_err(|_| AppError::Internal)
+                Uuid::parse_str(&id).map_err(|_| AppError::internal("upstream_service_probes_transport_group_bound_accounts_1"))
             })
             .collect()
     }

@@ -842,7 +842,7 @@ async fn read_codex(
     })?;
     let budget = codex_quota_budget(&account.config)?;
     let policy = codex_quota_transport_policy(&account.config, budget)?;
-    let http = crate::build_codex_http_client_with_policy(policy).map_err(|_| {
+    crate::build_codex_http_client_with_policy(policy).map_err(|_| {
         tracing::warn!(
             operation = "quota_supplier_read",
             upstream_account_id = %account.id,
@@ -867,7 +867,7 @@ async fn read_codex(
     };
     let (usage, reset) = tokio::join!(
         get_codex_json_with_routes(
-            &http,
+            policy,
             auth.clone(),
             USAGE_URL,
             QuotaRequestContext::for_account(account, "usage", trigger),
@@ -876,7 +876,7 @@ async fn read_codex(
             Some(&routes),
         ),
         get_codex_json_with_routes(
-            &http,
+            policy,
             auth,
             CREDITS_URL,
             QuotaRequestContext::for_account(account, "credits", trigger),
@@ -1018,18 +1018,18 @@ async fn decode_response(
 }
 
 async fn get_codex_json(
-    http: &wreq::Client,
+    policy: crate::provider::CodexTransportPolicy,
     auth: CodexQuotaAuth<'_>,
     url: &str,
     context: QuotaRequestContext,
     budget: QuotaBudget,
     session: &retry::ReadSession<'_>,
 ) -> Result<Value, &'static str> {
-    get_codex_json_with_routes(http, auth, url, context, budget, session, None).await
+    get_codex_json_with_routes(policy, auth, url, context, budget, session, None).await
 }
 
 async fn get_codex_json_with_routes(
-    http: &wreq::Client,
+    policy: crate::provider::CodexTransportPolicy,
     auth: CodexQuotaAuth<'_>,
     url: &str,
     context: QuotaRequestContext,
@@ -1048,13 +1048,16 @@ async fn get_codex_json_with_routes(
                 routes.log_attempt(context, route, attempt, budget);
             }
             let started = tokio::time::Instant::now();
+            // read is a post-header body-inactivity budget, never a
+            // connection/request deadline. The account's connection limit
+            // (including a 15s SOCKS handshake) runs inside session.deadline.
+            let proxy_url = routes.map_or(auth.proxy_url, |routes| routes.proxy_url(route));
+            let http = crate::build_codex_http_client_with_proxy(policy, proxy_url).map_err(|_| {
+                retry::Failure::terminal("quota_destination_invalid", "client")
+            })?;
             let mut request = http
                 .get(url)
-                // read is a post-header body-inactivity budget, never a
-                // connection/request deadline. The account's connection limit
-                // (including a 15s SOCKS handshake) runs inside session.deadline.
                 .timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
-                .default_headers(false)
                 .header(
                     auth.credential_header.clone(),
                     auth.credential_value.clone(),
@@ -1077,12 +1080,6 @@ async fn get_codex_json_with_routes(
             if context.endpoint_kind == "credits" {
                 request = request.header("openai-beta", "codex-1");
             }
-            if let Some(proxy_url) = routes.map_or(auth.proxy_url, |routes| routes.proxy_url(route))
-            {
-                request = request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| {
-                    retry::Failure::terminal("quota_destination_invalid", "client")
-                })?);
-            }
             let response = request.send().await.map_err(|error| {
                 if let Some(routes) = routes {
                     routes.advance_on_failure(&route_index, &error);
@@ -1090,7 +1087,7 @@ async fn get_codex_json_with_routes(
                 if tokio::time::Instant::now() >= deadline {
                     retry::Failure::terminal("quota_timeout", "deadline")
                 } else {
-                    retry::Failure::wreq(error)
+                    retry::Failure::transport(error)
                 }
             })?;
             if let Some(failure) =
@@ -1106,7 +1103,7 @@ async fn get_codex_json_with_routes(
 }
 
 async fn decode_codex_response(
-    response: wreq::Response,
+    response: reqwest::Response,
     context: QuotaRequestContext,
     started: tokio::time::Instant,
     deadline: tokio::time::Instant,
@@ -1392,14 +1389,10 @@ mod tests {
         let budget = codex_quota_budget(&config).unwrap();
         assert_eq!(budget.total, Duration::from_secs(20));
         assert_eq!(budget.read, Duration::from_secs(8));
-        let client = crate::build_codex_http_client_with_policy(
-            codex_quota_transport_policy(&config, budget).unwrap(),
-        )
-        .unwrap();
         let task = tokio::spawn(async move {
             let session = retry::ReadSession::testing(budget);
             get_codex_json(
-                &client,
+                codex_quota_transport_policy(&config, budget).unwrap(),
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,
                     credential_value: http::HeaderValue::from_static("Bearer fixture-token"),
@@ -1458,10 +1451,6 @@ mod tests {
     #[tokio::test]
     async fn explicit_quota_budget_is_not_cut_off_by_the_legacy_six_seconds() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = crate::build_codex_http_client_with_policy(
-            crate::provider::CodexTransportPolicy::default(),
-        )
-        .unwrap();
         let context = QuotaRequestContext {
             account_id: Uuid::from_u128(1),
             credential_generation: 2,
@@ -1471,7 +1460,7 @@ mod tests {
         let url = format!("http://{}/usage", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             get_codex_json(
-                &client,
+                crate::provider::CodexTransportPolicy::default(),
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,
                     credential_value: http::HeaderValue::from_static("Bearer fixture-token"),
@@ -1556,10 +1545,6 @@ mod tests {
             proxy_url: None,
             proxy_network_scope: None,
         };
-        let http = crate::build_codex_http_client_with_policy(
-            crate::provider::CodexTransportPolicy::default(),
-        )
-        .unwrap();
         let account = http::HeaderValue::from_static("fixture-account");
         let (credential_header, credential_value) =
             credential.request_header(unix_millis()).unwrap().unwrap();
@@ -1581,7 +1566,7 @@ mod tests {
         };
         assert_eq!(
             get_codex_json(
-                &http,
+                crate::provider::CodexTransportPolicy::default(),
                 CodexQuotaAuth {
                     credential_header: credential_header.clone(),
                     credential_value: credential_value.clone(),
@@ -1599,7 +1584,7 @@ mod tests {
         );
         assert_eq!(
             get_codex_json(
-                &http,
+                crate::provider::CodexTransportPolicy::default(),
                 CodexQuotaAuth {
                     credential_header,
                     credential_value,

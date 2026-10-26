@@ -90,10 +90,12 @@ pub(crate) async fn begin_proxy_archive_attempt(
 ) -> Result<ProxyArchiveAttempt, AppError> {
     if !matches!(
         purpose,
-        ArchiveStagingPurpose::Request | ArchiveStagingPurpose::Response
+        ArchiveStagingPurpose::Request
+            | ArchiveStagingPurpose::Response
+            | ArchiveStagingPurpose::Media
     ) {
         return Err(AppError::BadRequest(
-            "proxy archive purpose must be request or response".into(),
+            "proxy archive purpose must be request, response, or media".into(),
         ));
     }
     let attempt_id = Uuid::now_v7();
@@ -137,7 +139,11 @@ async fn begin_proxy_archive_attempt_with_retry(
     for delay in RETRY_DELAYS {
         match database.begin_archive_staging_attempt(input.clone()).await {
             Ok(result) => return Ok(result),
-            Err(AppError::Internal) => tokio::time::sleep(delay).await,
+            Err(AppError::Internal { code, .. })
+                if code == "proxy_lifecycle_begin_proxy_archive_attempt_with_retry_1" =>
+            {
+                tokio::time::sleep(delay).await;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -169,7 +175,11 @@ pub(crate) async fn finish_proxy_request_with_retry(
             .await
         {
             Ok(result) => return Ok(result),
-            Err(AppError::Internal) => tokio::time::sleep(delay).await,
+            Err(AppError::Internal { code, .. })
+                if code == "proxy_lifecycle_finish_proxy_request_with_retry_1" =>
+            {
+                tokio::time::sleep(delay).await;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -196,7 +206,7 @@ pub(crate) fn response_archive_requires_cleanup(
             response_object,
             ..
         }) if response_object != stored_response
-    ) || matches!(result, Err(error) if !matches!(error, AppError::Internal))
+    ) || matches!(result, Err(error) if !matches!(error, AppError::Internal { .. }))
 }
 
 #[cfg(test)]

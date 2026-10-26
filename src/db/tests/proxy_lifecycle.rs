@@ -198,7 +198,7 @@ async fn forwarding_admission_snapshot_commits_and_failures_roll_back_for_both_m
                 database
                     .start_proxy_forwarding_request(input(Uuid::now_v7()), Some(fault_model))
                     .await,
-                Err(AppError::Overloaded)
+                Err(AppError::Capacity { code: "request_record_persist_failed", .. })
             ));
             assert_eq!(forwarding_admission_state(&database, &key).await, admitted);
             assert_admission_snapshot_fault_schema(&database, mode, name, true).await;

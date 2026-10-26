@@ -584,7 +584,7 @@ async fn refresh_plugin_service_data(
                 .unwrap_or(Err(
                     crate::plugin::service_data::PluginServiceDataCollectionFailure {
                         code: crate::db::PluginServiceDataRefreshErrorCode::ComponentExecution,
-                        error: crate::error::AppError::Internal,
+                        error: crate::error::AppError::internal("worker_refresh_plugin_service_data_1"),
                     },
                 ))
         } else {

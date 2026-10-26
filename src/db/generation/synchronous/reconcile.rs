@@ -103,7 +103,7 @@ impl Database {
                 input.currency,
                 input.evidence_digest,
             ))
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("reconcile_resolve_image_generation_quarantine_1"))?,
         )
         .to_hex()
         .to_string();
@@ -130,7 +130,7 @@ impl Database {
             .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).fetch_optional(&mut *tx).await?.ok_or(AppError::Forbidden)?;
         let scopes: Vec<String> =
             serde_json::from_str(&credential.try_get::<String, _>("scopes_json")?)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("reconcile_resolve_image_generation_quarantine_2"))?;
         crate::db::credentials::validate_service_scopes(&scopes)
             .map_err(|_| AppError::Forbidden)?;
         if !scopes.iter().any(|s| s == "generations:reconcile")
@@ -160,7 +160,7 @@ impl Database {
         if let Some(replay) = sqlx::query("SELECT request_digest, result_json FROM image_generation_quarantine_resolutions WHERE tenant_id = $1 AND actor_service_id = $2 AND idempotency_hash = $3")
             .bind(&tenant_id).bind(input.actor_service_id.to_string()).bind(input.idempotency_hash).fetch_optional(&mut *tx).await? {
             if replay.try_get::<String, _>("request_digest")? != digest { return Err(AppError::Conflict("Idempotency-Key was used for a different resolution".into())); }
-            let result = serde_json::from_str(&replay.try_get::<String, _>("result_json")?).map_err(|_| AppError::Internal)?;
+            let result = serde_json::from_str(&replay.try_get::<String, _>("result_json")?).map_err(|_| AppError::internal("reconcile_site_1"))?;
             tx.commit().await?;
             return Ok(result);
         }
@@ -195,7 +195,7 @@ impl Database {
             enforcement_mode: EnforcementMode::from_storage(
                 &row.try_get::<String, _>("enforcement_mode")?,
             )
-            .ok_or(AppError::Internal)?,
+            .ok_or(AppError::internal("reconcile_site_1"))?,
             reserved_micros: row.try_get("reserved_micros")?,
             reserved_tokens: row.try_get("reserved_tokens")?,
             rate_window_start: row.try_get("rate_window_start")?,
@@ -224,7 +224,7 @@ impl Database {
             created_at: now,
         };
         let inserted = sqlx::query("INSERT INTO image_generation_quarantine_resolutions (id,tenant_id,request_id,actor_service_id,idempotency_hash,request_digest,expected_revision,action,confirmed_cost_micros,currency,evidence_digest,result_json,created_at,actor_credential_generation) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) ON CONFLICT DO NOTHING")
-            .bind(result.resolution_id.to_string()).bind(&tenant_id).bind(input.request_id.to_string()).bind(input.actor_service_id.to_string()).bind(input.idempotency_hash).bind(digest).bind(input.expected_revision).bind(input.action).bind(input.confirmed_cost_micros).bind(input.currency).bind(input.evidence_digest).bind(serde_json::to_string(&result).map_err(|_| AppError::Internal)?).bind(now).bind(input.actor_credential_generation).execute(&mut *tx).await?;
+            .bind(result.resolution_id.to_string()).bind(&tenant_id).bind(input.request_id.to_string()).bind(input.actor_service_id.to_string()).bind(input.idempotency_hash).bind(digest).bind(input.expected_revision).bind(input.action).bind(input.confirmed_cost_micros).bind(input.currency).bind(input.evidence_digest).bind(serde_json::to_string(&result).map_err(|_| AppError::internal("reconcile_site_2"))?).bind(now).bind(input.actor_credential_generation).execute(&mut *tx).await?;
         if inserted.rows_affected() != 1 {
             return Err(AppError::Conflict(
                 "request or Idempotency-Key already resolved".into(),
@@ -284,7 +284,7 @@ fn view(row: &AnyRow) -> Result<ImageGenerationQuarantineView, AppError> {
     let completed_at: Option<i64> = row.try_get("completed_at")?;
     let resolution: Option<ImageGenerationQuarantineResolution> = row
         .try_get::<Option<String>, _>("resolution_json")?
-        .map(|value| serde_json::from_str(&value).map_err(|_| AppError::Internal))
+        .map(|value| serde_json::from_str(&value).map_err(|_| AppError::internal("reconcile_view_1")))
         .transpose()?;
     let revision = blake3::hash(
         &serde_json::to_vec(&(
@@ -298,7 +298,7 @@ fn view(row: &AnyRow) -> Result<ImageGenerationQuarantineView, AppError> {
             completed_at,
             resolution.as_ref().map(|receipt| receipt.resolution_id),
         ))
-        .map_err(|_| AppError::Internal)?,
+        .map_err(|_| AppError::internal("reconcile_view_2"))?,
     )
     .to_hex()
     .to_string();

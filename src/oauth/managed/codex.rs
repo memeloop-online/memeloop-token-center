@@ -223,7 +223,7 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> 
 }
 
 fn refresh_failed() -> AppError {
-    AppError::Upstream("OpenAI Codex OAuth refresh failed".into())
+    AppError::upstream("openai_codex_oauth_refresh_failed")
 }
 
 #[cfg(test)]
@@ -461,7 +461,7 @@ mod tests {
             let rendered = format!("{error:?} {error}");
             assert_eq!(
                 error.to_string(),
-                "configured upstream is unavailable: OpenAI Codex OAuth refresh failed"
+                "configured upstream is unavailable: openai_codex_oauth_refresh_failed"
             );
             for secret in [
                 "response-body-secret",

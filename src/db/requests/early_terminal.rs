@@ -27,7 +27,7 @@ impl Database {
             || input.completed_at < input.created_at
             || input.duration_ms < 0
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("early_terminal_record_early_request_terminal_1"));
         }
         let request_id = input.request_id.to_string();
         let mut transaction = self.begin_write_transaction().await?;
@@ -77,7 +77,7 @@ impl Database {
         )
         .await?;
         if !finished {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("early_terminal_record_early_request_terminal_1"));
         }
         transaction.commit().await?;
         Ok(())

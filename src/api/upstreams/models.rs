@@ -109,7 +109,7 @@ impl CatalogFailure {
         }
     }
 
-    fn send(error: wreq::Error) -> Self {
+    fn send(error: reqwest::Error) -> Self {
         let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
         while let Some(current) = source {
             if let Some(http2) = current.downcast_ref::<http2::Error>()
@@ -128,7 +128,7 @@ impl CatalogFailure {
         Self::transport(
             "send",
             error.is_timeout(),
-            error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls(),
+            crate::simple_http::classify_transport(&error).pre_delivery(),
         )
     }
 
@@ -205,13 +205,13 @@ pub(in crate::api) async fn discover_upstream_model(
     )
     .await
     .unwrap_or(Err("connection_failed"))
-    .map_err(|code| AppError::Upstream(code.into()))?;
+    .map_err(|code| AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("models_discover_upstream_model")))?;
     let matches = values
         .iter()
         .filter(|value| value.get("slug").and_then(Value::as_str) == Some(query.model.as_str()))
         .collect::<Vec<_>>();
     if matches.len() > 1 {
-        return Err(AppError::Upstream("invalid_response".into()));
+        return Err(AppError::upstream("invalid_response"));
     }
     let metadata = matches.first().copied();
     let configured = state
@@ -668,7 +668,7 @@ async fn sync_account_models_selected(
                         "selected model is absent from authenticated upstream metadata".into(),
                     )
                 } else {
-                    AppError::Upstream(code.into())
+                    AppError::upstream_with("upstream_unavailable", crate::error::ErrorFacts::new().stage("models_sync_account_models_selected"))
                 });
             }
         }
@@ -1131,19 +1131,14 @@ async fn fetch_codex_models(
                 .request_header(unix_millis())
                 .map_err(|_| "credential_invalid")?
                 .ok_or("credential_invalid")?;
-            let mut request = client
+            let request = client
                 .get(&url)
-                .default_headers(false)
                 .header(credential_header, credential_value)
                 .header(header::ACCEPT, "application/json")
                 .header(header::ACCEPT_ENCODING, "identity")
                 .header(header::USER_AGENT, crate::oauth::managed::codex::USER_AGENT)
                 .header("originator", crate::oauth::managed::codex::ORIGINATOR)
                 .header("chatgpt-account-id", account_id);
-            if let Some((proxy_url, _)) = credential.proxy() {
-                request =
-                    request.proxy(wreq::Proxy::all(proxy_url).map_err(|_| "destination_invalid")?);
-            }
             Ok(request)
         },
     )
@@ -1169,7 +1164,7 @@ async fn codex_catalog_response(
     mut build_request: impl FnMut(
         &UpstreamCredential,
         i64,
-    ) -> Result<wreq::RequestBuilder, &'static str>,
+    ) -> Result<reqwest::RequestBuilder, &'static str>,
 ) -> Result<Value, &'static str> {
     let policy =
         crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))?;
@@ -1334,7 +1329,7 @@ fn codex_account_header(credential: &UpstreamCredential) -> Result<String, &'sta
 }
 
 async fn bounded_json_response(
-    request: wreq::RequestBuilder,
+    request: reqwest::RequestBuilder,
     budget: CatalogBudget,
     deadline: tokio::time::Instant,
     require_complete: bool,

@@ -1,5 +1,7 @@
-import type { RequestView } from './types.js';
+import { formatMilliseconds } from './format.js';
+import type { Locale } from './i18n.js';
 import { RETIRED_CREDENTIAL } from './identityPresentation.js';
+import type { RequestView } from './types.js';
 
 const tokenCount = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
@@ -65,7 +67,7 @@ export function requestUsageCopy(request: RequestView, locale: string) {
   const zh = locale === 'zh-CN';
   if (requestSettlementPending(request)) return {
     label: zh ? '用量待确认' : 'Usage awaiting confirmation',
-    hint: zh ? '实际用量尚未确认，不代表没有使用。' : 'Actual usage is awaiting confirmation; this does not mean no usage.',
+    hint: zh ? '实际用量尚未确认。' : 'Actual usage is awaiting confirmation.',
   };
   switch (request.usage_basis) {
     case 'provider_reported': return { label: zh ? '上游报告用量' : 'Provider-reported usage', hint: zh ? '词元数量由上游报告；速率使用网关记录的时间。' : 'Token counts reported by the provider; throughput uses gateway-recorded timing.' };
@@ -86,12 +88,12 @@ export function requestCostCopy(request: RequestView, locale: string) {
     label: zh ? '待结算' : 'Awaiting settlement',
     hint: requestIsPending(request)
       ? (zh ? '请求仍在进行中，费用尚未结算。' : 'The request is still in progress; cost has not been settled.')
-      : (zh ? '请求已结束，费用待确认；不代表费用为零。' : 'The request has ended; cost awaits confirmation. This does not mean zero cost.'),
+      : (zh ? '请求已结束，费用待确认。' : 'The request has ended. Cost awaits confirmation.'),
   };
   if (requestDisplayedCost(request) === '') return {
     unknown: true, ledgerLabel,
     label: zh ? '费用待确认' : 'Cost awaiting confirmation',
-    hint: zh ? '尚无已确认的费用，不代表费用为零。' : 'No confirmed cost is available; this does not mean zero cost.',
+    hint: zh ? '尚无已确认的费用。' : 'No confirmed cost is available yet.',
   };
   if (request.operational_terminal?.financial_state === 'applied') return {
     unknown: false, ledgerLabel, label: '',
@@ -113,6 +115,24 @@ export function requestCostCopy(request: RequestView, locale: string) {
       ? '本地已结算金额；供应商实际用量请以供应商记录为准。'
       : 'Locally settled amount; consult provider records for actual usage.',
   };
+}
+
+/** Total time, the wait until the upstream starts returning, and the output interval after that. */
+export function requestDurationTooltip(request: RequestView, locale: Locale): string {
+  const zh = locale === 'zh-CN';
+  const lines: string[] = [];
+  const push = (label: string, value: number | null | undefined) => {
+    if (!timingMs(value)) return;
+    lines.push(`${label}: ${formatMilliseconds(value, locale)}`);
+  };
+  push(zh ? '总耗时' : 'Total', request.duration_ms);
+  push(zh ? '等待上游开始返回' : 'Waiting for the upstream to start', request.first_output_ms);
+  push(zh ? '上游返回内容' : 'Upstream output', request.generation_duration_ms);
+  if (timingMs(request.duration_ms) && timingMs(request.first_output_ms) && timingMs(request.generation_duration_ms)) {
+    const local = request.duration_ms - request.first_output_ms - request.generation_duration_ms;
+    if (local > 0) push(zh ? '网关本地处理' : 'Gateway local work', local);
+  }
+  return lines.join(' · ');
 }
 
 export function requestDisplayedCost(request: RequestView): string {

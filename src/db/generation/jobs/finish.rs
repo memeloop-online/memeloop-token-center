@@ -152,7 +152,7 @@ impl Database {
             .try_get::<Option<String>, _>("staged_assets_json")?
             .map(|value| serde_json::from_str::<GenerationStagedAssets>(&value))
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("finish_site_1"))?;
         let driver: String = job.try_get("driver")?;
         let estimated_units: i64 = job.try_get("estimated_units")?;
         if input.billed_units > estimated_units {
@@ -193,7 +193,7 @@ impl Database {
             enforcement_mode: EnforcementMode::from_storage(
                 job.try_get::<String, _>("enforcement_mode")?.as_str(),
             )
-            .ok_or(AppError::Internal)?,
+            .ok_or(AppError::internal("finish_site_1"))?,
             reserved_micros: job.try_get("reserved_micros")?,
             input_micros_per_million: 0,
             output_micros_per_million: if billing_unit == "megapixel" {
@@ -201,7 +201,7 @@ impl Database {
             } else {
                 micros_per_unit
                     .checked_mul(1_000_000)
-                    .ok_or(AppError::Internal)?
+                    .ok_or(AppError::internal("finish_site_2"))?
             },
             price_tiers: Vec::new(),
             rate_window_start: job.try_get("rate_window_start")?,
@@ -228,7 +228,7 @@ impl Database {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("finish_site_2"))?;
 
         if matches!(
             current_status.as_str(),
@@ -241,7 +241,7 @@ impl Database {
                 .as_deref()
                 .map(serde_json::from_str)
                 .transpose()
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("finish_site_3"))?;
             let existing_error_code: Option<String> = job.try_get("error_code")?;
             let reservation_status: String = job.try_get("reservation_status")?;
             let actual_micros: Option<i64> = job.try_get("actual_micros")?;
@@ -256,7 +256,7 @@ impl Database {
                     result.as_ref(),
                     input.job_id,
                     provider_assets,
-                    provider_key_material.ok_or(AppError::Internal)?,
+                    provider_key_material.ok_or(AppError::internal("finish_site_3"))?,
                 )?,
                 None => existing_result == result,
             };
@@ -287,7 +287,7 @@ impl Database {
             current_status.as_str(),
             "queued" | "running" | "submitting" | "cancelling"
         ) {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("finish_site_4"));
         }
         let lease_owner: Option<String> = job.try_get("lease_owner")?;
         if lease_owner.as_deref() != Some(input.worker_id) {
@@ -309,7 +309,7 @@ impl Database {
             .staged_assets
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("finish_site_5"))?;
         let updated = sqlx::query("UPDATE generation_jobs SET status = $1, billed_units = $2, cost_micros = $3, result_json = $4, error_code = $5, completed_at = $6, updated_at = $7, lease_owner = NULL, lease_expires_at = NULL, staged_assets_json = CASE WHEN $1 = 'succeeded' THEN staged_assets_json ELSE NULL END WHERE id = $8 AND lease_owner = $9 AND status IN ('queued', 'running', 'submitting', 'cancelling') AND ((staged_assets_json IS NULL AND $10 IS NULL) OR staged_assets_json = $10)")
             .bind(input.status)
             .bind(input.billed_units)
@@ -335,7 +335,7 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         if metadata_only.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("finish_site_4"));
         }
         if input.status == "succeeded" {
             insert_generation_assets_in_transaction(
@@ -399,7 +399,7 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         if inserted.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("finish_site_5"));
         }
         transaction.commit().await?;
         Ok(cost_micros)
@@ -487,7 +487,7 @@ fn safe_generation_result(
                 "job",
                 job_id,
                 provider_assets,
-                provider_key_material.ok_or(AppError::Internal)?,
+                provider_key_material.ok_or(AppError::internal("finish_safe_generation_result_1"))?,
             )?;
             Ok(serde_json::json!({
                 "provider": provider,
@@ -515,11 +515,11 @@ fn provider_generation_result_matches(
         .as_object_mut()
         .and_then(|value| value.remove("provider_reference"))
         .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("finish_provider_generation_result_matches_1"))?;
     expected
         .as_object_mut()
         .and_then(|value| value.remove("provider_reference"))
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("finish_provider_generation_result_matches_2"))?;
     let existing_assets = crate::generation::open_provider_asset_reference(
         "job",
         job_id,

@@ -435,7 +435,7 @@ impl Database {
             .await
             .map_err(|error| match error {
                 DatabaseReadinessError::Dependency(error) => error,
-                DatabaseReadinessError::SchemaOutdated(_) => AppError::Internal,
+                DatabaseReadinessError::SchemaOutdated(_) => AppError::internal("db_mod_readiness_check_1"),
             })
     }
 

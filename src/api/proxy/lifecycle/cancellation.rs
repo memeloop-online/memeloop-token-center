@@ -28,7 +28,7 @@ struct CancelledRequest {
 
 impl CancellationGuard {
     pub(in crate::api::proxy) async fn acquire_owner(&mut self) -> Result<(), AppError> {
-        let owner = self.owner.as_mut().ok_or(AppError::Internal)?;
+        let owner = self.owner.as_mut().ok_or(AppError::internal("cancellation_acquire_owner_1"))?;
         owner
             .permit
             .acquire_owner(
@@ -71,7 +71,7 @@ impl CancellationGuard {
         &mut self,
         request: &BufferedRequest<'_>,
     ) -> Result<(), AppError> {
-        let owner = self.owner.as_mut().ok_or(AppError::Internal)?;
+        let owner = self.owner.as_mut().ok_or(AppError::internal("cancellation_prepare_dispatch_1"))?;
         let claim = owner
             .database
             .claim_pending_proxy_settlement(
@@ -84,6 +84,25 @@ impl CancellationGuard {
         owner.reservation = request.reservation.clone();
         owner.stage = "upstream_response_headers";
         owner.pending.register_claim(claim);
+        let request_id = owner.context.request_id;
+        if let Err(error) = owner
+            .database
+            .record_proxy_in_flight_stage(
+                request_id,
+                owner.tenant_id,
+                owner.reservation.key_id,
+                owner.reservation.id,
+                owner.stage,
+            )
+            .await
+        {
+            tracing::warn!(
+                %request_id,
+                stage = owner.stage,
+                error_category = error.diagnostic_category(),
+                "in-flight request stage was not stored"
+            );
+        }
         Ok(())
     }
 
@@ -127,7 +146,7 @@ impl CancellationGuard {
         self.owner
             .take()
             .map(|owner| owner.permit)
-            .ok_or(AppError::Internal)
+            .ok_or(AppError::internal("cancellation_handoff_1"))
     }
 }
 
@@ -192,7 +211,7 @@ impl Drop for CancellationGuard {
                         tracing::info!(%request_id, stage = "request_cancellation_settled", "proxy cancellation settlement completed");
                         return;
                     }
-                    Err(AppError::Internal) => {}
+                    Err(AppError::Internal { code, .. }) if code == "cancellation_drop_1" => {}
                     Err(error) => {
                         tracing::error!(%request_id, stage = "request_cancellation_reconcile_failed", error_category = error.diagnostic_category(), "proxy cancellation requires orphan reconciliation");
                         return;

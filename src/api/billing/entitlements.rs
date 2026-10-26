@@ -84,7 +84,7 @@ fn entitlement_reconcile_input(
         source: body.source,
         proration_json: body
             .proration
-            .map(|value| serde_json::to_string(&value).map_err(|_| AppError::Internal))
+            .map(|value| serde_json::to_string(&value).map_err(|_| AppError::internal("entitlements_entitlement_reconcile_input_1")))
             .transpose()?,
     })
 }

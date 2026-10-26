@@ -168,12 +168,12 @@ impl ApplicationPlugins {
             };
             let file = tokio::fs::File::open(path)
                 .await
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("installation_secret_1"))?;
             let mut bytes = Vec::new();
             file.take(258)
                 .read_to_end(&mut bytes)
                 .await
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("installation_secret_2"))?;
             if bytes.len() > 257 {
                 return Err(AppError::Forbidden);
             }
@@ -248,12 +248,12 @@ impl ApplicationPlugins {
             .ok_or(AppError::NotFound)?;
         let file = tokio::fs::File::open(path)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_install_policy_1"))?;
         let mut bytes = Vec::new();
         file.take(65537)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_install_policy_2"))?;
         if bytes.len() > 65536 {
             return Err(AppError::Forbidden);
         }
@@ -452,7 +452,7 @@ impl ApplicationPlugins {
         let permit = INSTALL_PERMITS
             .clone()
             .try_acquire_owned()
-            .map_err(|_| AppError::Overloaded)?;
+            .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?;
         let (record, run) = self
             .db
             .begin_plugin_installation(
@@ -515,10 +515,10 @@ impl ApplicationPlugins {
             let trust = trust_digest(policy).await?;
             tokio::fs::create_dir_all(&policy.plugin_root)
                 .await
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("installation_perform_install_1"))?;
             let parent = tokio::fs::symlink_metadata(&policy.plugin_root)
                 .await
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("installation_perform_install_2"))?;
             if !parent.is_dir() || parent.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -529,14 +529,14 @@ impl ApplicationPlugins {
                 INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
             )
             .await
-            .map_err(|_| AppError::Overloaded)?
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+            .map_err(|_| AppError::internal("installation_perform_install_3"))?;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 claim_inventory_root(&claim_root, &owner)
             })
             .await
-            .map_err(|_| AppError::Internal)??;
+            .map_err(|_| AppError::internal("installation_perform_install_4"))??;
             let checkpoints = self.db.plugin_installation(operation_id).await?.checkpoints;
             Ok((trust, checkpoints))
         })
@@ -552,7 +552,7 @@ impl ApplicationPlugins {
                     return Ok(());
                 }
                 let mut command = crate::plugin_runtime_companions::plugin_installer_command()
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("installation_perform_install_5"))?;
                 command
                     .arg(reference)
                     .arg("--plugin-dir")
@@ -577,21 +577,21 @@ impl ApplicationPlugins {
                 }
                 let mut child = command.spawn().map_err(|_| {
                     tracing::warn!(stage = "installer_spawn", "plugin installation failed");
-                    AppError::Internal
+                    AppError::internal("installation_perform_install_1")
                 })?;
                 if let Some((username, password)) = &policy.ephemeral_proxy_credentials {
                     use tokio::io::AsyncWriteExt;
-                    let mut stdin = child.stdin.take().ok_or(AppError::Internal)?;
+                    let mut stdin = child.stdin.take().ok_or(AppError::internal("installation_perform_install_2"))?;
                     let payload =
                         serde_json::to_vec(&json!({"username":username,"password":password}))
-                            .map_err(|_| AppError::Internal)?;
+                            .map_err(|_| AppError::internal("installation_perform_install_6"))?;
                     stdin
                         .write_all(&payload)
                         .await
-                        .map_err(|_| AppError::Internal)?;
-                    stdin.shutdown().await.map_err(|_| AppError::Internal)?;
+                        .map_err(|_| AppError::internal("installation_perform_install_7"))?;
+                    stdin.shutdown().await.map_err(|_| AppError::internal("installation_perform_install_8"))?;
                 }
-                let mut stderr = child.stderr.take().ok_or(AppError::Internal)?;
+                let mut stderr = child.stderr.take().ok_or(AppError::internal("installation_perform_install_3"))?;
                 let capture = async {
                     use tokio::io::AsyncReadExt;
                     let mut captured = Vec::new();
@@ -609,7 +609,7 @@ impl ApplicationPlugins {
                 // Drain concurrently (bounded retained bytes) without an orphan
                 // task. Existing phase timeout drops/kills this owned child.
                 let (status, captured) = tokio::join!(child.wait(), capture);
-                let status = status.map_err(|_| AppError::Internal)?;
+                let status = status.map_err(|_| AppError::internal("installation_site_1"))?;
                 if !status.success() {
                     log_installer_diagnostics(&captured.unwrap_or_default());
                     tracing::warn!(
@@ -617,7 +617,7 @@ impl ApplicationPlugins {
                         exit_code = status.code(),
                         "plugin installation failed"
                     );
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("installation_perform_install_4"));
                 }
                 let checkpoint = package_checkpoint(&inventory_root, reference, &trust).await?;
                 checkpoints.insert(reference.clone(), checkpoint);
@@ -659,7 +659,7 @@ impl ApplicationPlugins {
             let digest = review_digest(&runtime, &trust)?;
             let review = json!({"plugins":runtime.manifests()});
             if serde_json::to_vec(&review)
-                .map_err(|_| AppError::Internal)?
+                .map_err(|_| AppError::internal("installation_site_2"))?
                 .len()
                 > 4 * 1024 * 1024
             {
@@ -686,11 +686,11 @@ impl ApplicationPlugins {
             INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
         )
         .await
-        .map_err(|_| AppError::Overloaded)?
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+        .map_err(|_| AppError::internal("installation_review_runtime_1"))?;
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let metadata = std::fs::symlink_metadata(&root).map_err(|_| AppError::Internal)?;
+            let metadata = std::fs::symlink_metadata(&root).map_err(|_| AppError::internal("installation_review_runtime_2"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -698,8 +698,8 @@ impl ApplicationPlugins {
         });
         tokio::time::timeout(COMPILATION_DEADLINE, task)
             .await
-            .map_err(|_| AppError::Overloaded)?
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+            .map_err(|_| AppError::internal("installation_review_runtime_3"))?
     }
 
     pub async fn approve_installation(
@@ -777,7 +777,7 @@ impl ApplicationPlugins {
                 let identity = identities
                     .get(&manifest.id)
                     .cloned()
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("installation_approve_installation_1"))?;
                 Ok((
                     manifest.id.clone(),
                     vec![PluginGrant {
@@ -833,7 +833,7 @@ impl ApplicationPlugins {
             )
         })
         .await
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("installation_reclaim_unreferenced_installation_attempts_1"))?
     }
 }
 
@@ -865,7 +865,7 @@ fn reclaim_installation_attempt_roots(
         if reclaimed >= ATTEMPT_RECLAMATION_LIMIT {
             break;
         }
-        let entry = entry.map_err(|_| AppError::Internal)?;
+        let entry = entry.map_err(|_| AppError::internal("installation_reclaim_installation_attempt_roots_1"))?;
         let entry_name = entry.file_name();
         let (attempt_id, root, recovery_entry) =
             if let Some(attempt_id) = inventory_attempt_id(&entry_name) {
@@ -936,7 +936,7 @@ fn allow_missing_plugin_root<T>(result: std::io::Result<T>) -> Result<Option<T>,
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(AppError::Internal),
+        Err(_) => Err(AppError::internal("installation_allow_missing_plugin_root_1")),
     }
 }
 
@@ -946,7 +946,7 @@ async fn bounded_install_phase<T>(
 ) -> Result<T, AppError> {
     tokio::time::timeout(deadline, work)
         .await
-        .map_err(|_| AppError::Overloaded)?
+        .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
 }
 
 async fn run_with_lease<T, R: std::future::Future<Output = Result<(), AppError>>>(
@@ -961,7 +961,7 @@ async fn run_with_lease<T, R: std::future::Future<Output = Result<(), AppError>>
             result = &mut work => return result,
             _ = renewal.tick() => {
                 tokio::time::timeout(Duration::from_secs(10), renew())
-                    .await.map_err(|_| AppError::Overloaded)??;
+                    .await.map_err(|_| AppError::capacity_error("plugin_installation_capacity"))??;
             }
         }
     }
@@ -1246,27 +1246,27 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
     let parent = root.parent().ok_or(AppError::Forbidden)?;
     let name = root.file_name().ok_or(AppError::Forbidden)?;
     let temporary = parent.join(format!(".mtc-inventory-claim-{}", uuid::Uuid::now_v7()));
-    std::fs::create_dir(&temporary).map_err(|_| AppError::Internal)?;
+    std::fs::create_dir(&temporary).map_err(|_| AppError::internal("installation_claim_inventory_root_1"))?;
     let marker = temporary.join(".mtc-install-owner");
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&marker)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_2"))?;
         file.write_all(owner.as_bytes())
-            .map_err(|_| AppError::Internal)?;
-        file.sync_all().map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_3"))?;
+        file.sync_all().map_err(|_| AppError::internal("installation_claim_inventory_root_4"))?;
         std::fs::File::open(&temporary)
             .and_then(|file| file.sync_all())
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_5"))?;
         crate::plugin_publication::reserve_directory_name(root, owner.as_bytes()).map_err(
             |error| {
                 crate::plugin_publication::report_io("inventory_claim", &error);
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     AppError::Forbidden
                 } else {
-                    AppError::Internal
+                    AppError::internal("installation_claim_inventory_root_1")
                 }
             },
         )?;
@@ -1275,10 +1275,10 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("installation_claim_inventory_root_6"))?;
         match renameat_with(
             &directory,
-            temporary.file_name().ok_or(AppError::Internal)?,
+            temporary.file_name().ok_or(AppError::internal("installation_claim_inventory_root_2"))?,
             &directory,
             name,
             RenameFlags::NOREPLACE,
@@ -1300,7 +1300,7 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                     .map_err(|_| AppError::Forbidden)?
                     .take(65)
                     .read_to_end(&mut existing)
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("installation_claim_inventory_root_7"))?;
                 if existing != owner.as_bytes() {
                     return Err(AppError::Forbidden);
                 }
@@ -1323,13 +1323,13 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         AppError::Forbidden
                     } else {
-                        AppError::Internal
+                        AppError::internal("installation_claim_inventory_root_3")
                     }
                 })?;
             }
             Err(error) => {
                 crate::plugin_publication::report_io("inventory_rename", &error.into());
-                return Err(AppError::Internal);
+                return Err(AppError::internal("installation_claim_inventory_root_4"));
             }
         }
         crate::plugin_publication::bind_existing_directory(root, owner.as_bytes()).map_err(
@@ -1338,13 +1338,13 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     AppError::Forbidden
                 } else {
-                    AppError::Internal
+                    AppError::internal("installation_claim_inventory_root_5")
                 }
             },
         )?;
         std::fs::File::open(parent)
             .and_then(|file| file.sync_all())
-            .map_err(|_| AppError::Internal)
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_8"))
     })();
     // Only files created by this invocation, never an existing inventory.
     let _ = std::fs::remove_file(marker);
@@ -1353,9 +1353,9 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
 }
 
 fn inventory_attempt_storage_id(attempt_id: &str) -> Result<String, AppError> {
-    let attempt = uuid::Uuid::parse_str(attempt_id).map_err(|_| AppError::Internal)?;
+    let attempt = uuid::Uuid::parse_str(attempt_id).map_err(|_| AppError::internal("installation_inventory_attempt_storage_id_1"))?;
     if attempt.to_string() != attempt_id {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("installation_inventory_attempt_storage_id_1"));
     }
     Ok(format!("mtc-attempt-{attempt}"))
 }
@@ -1408,16 +1408,16 @@ async fn package_checkpoint(
         INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
     )
     .await
-    .map_err(|_| AppError::Overloaded)?
-    .map_err(|_| AppError::Internal)?;
+    .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+    .map_err(|_| AppError::internal("installation_package_checkpoint_1"))?;
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         use std::io::Read;
         let (source, digest) = reference.rsplit_once('@').ok_or(AppError::Forbidden)?;
         let mut found = None;
         let mut count = 0;
-        for entry in std::fs::read_dir(&root).map_err(|_| AppError::Internal)? {
-            let entry = entry.map_err(|_| AppError::Internal)?;
+        for entry in std::fs::read_dir(&root).map_err(|_| AppError::internal("installation_package_checkpoint_2"))? {
+            let entry = entry.map_err(|_| AppError::internal("installation_package_checkpoint_3"))?;
             if entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
@@ -1426,7 +1426,7 @@ async fn package_checkpoint(
                 return Err(AppError::Forbidden);
             }
             let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::Internal)?;
+            let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::internal("installation_package_checkpoint_4"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -1435,7 +1435,7 @@ async fn package_checkpoint(
                 .map_err(|_| AppError::Forbidden)?
                 .take(16385)
                 .read_to_end(&mut receipt)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("installation_package_checkpoint_5"))?;
             if receipt.len() > 16384 {
                 return Err(AppError::Forbidden);
             }
@@ -1464,8 +1464,8 @@ async fn package_checkpoint(
     });
     tokio::time::timeout(STORAGE_DEADLINE, task)
         .await
-        .map_err(|_| AppError::Overloaded)?
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+        .map_err(|_| AppError::internal("installation_package_checkpoint_6"))?
 }
 
 async fn checkpoint_matches(
@@ -1490,13 +1490,13 @@ fn package_tree_digest(root: &std::path::Path) -> Result<String, AppError> {
     let mut total = 0;
     while let Some(relative) = pending.pop() {
         let path = root.join(&relative);
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::Internal)?;
+        let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::internal("installation_package_tree_digest_1"))?;
         if metadata.file_type().is_symlink() || relative.as_os_str().len() > 240 {
             return Err(AppError::Forbidden);
         }
         if metadata.is_dir() {
-            for entry in std::fs::read_dir(path).map_err(|_| AppError::Internal)? {
-                let entry = entry.map_err(|_| AppError::Internal)?;
+            for entry in std::fs::read_dir(path).map_err(|_| AppError::internal("installation_package_tree_digest_2"))? {
+                let entry = entry.map_err(|_| AppError::internal("installation_package_tree_digest_3"))?;
                 entries += 1;
                 if entries > 64 * 240 {
                     return Err(AppError::Forbidden);
@@ -1508,12 +1508,12 @@ fn package_tree_digest(root: &std::path::Path) -> Result<String, AppError> {
                 return Err(AppError::Forbidden);
             }
             let mut file = std::fs::File::open(path)
-                .map_err(|_| AppError::Internal)?
+                .map_err(|_| AppError::internal("installation_package_tree_digest_4"))?
                 .take(64 * 1024 * 1024 + 1);
             let mut hash = Sha256::new();
             let mut buffer = [0u8; 65536];
             loop {
-                let count = file.read(&mut buffer).map_err(|_| AppError::Internal)?;
+                let count = file.read(&mut buffer).map_err(|_| AppError::internal("installation_package_tree_digest_5"))?;
                 if count == 0 {
                     break;
                 }
@@ -1542,12 +1542,12 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
     for path in &policy.cosign_public_keys {
         let file = tokio::fs::File::open(path)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_trust_digest_1"))?;
         let mut bytes = Vec::new();
         file.take(65537)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_trust_digest_2"))?;
         if bytes.is_empty() || bytes.len() > 65536 {
             return Err(AppError::Forbidden);
         }
@@ -1571,11 +1571,11 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
     // Preserve existing public-key review digests; keyless identities are part
     // of the reviewed authority and invalidate checkpoints when changed.
     if let Some(identity) = &policy.cosign_keyless {
-        trust["keyless"] = serde_json::to_value(identity).map_err(|_| AppError::Internal)?;
+        trust["keyless"] = serde_json::to_value(identity).map_err(|_| AppError::internal("installation_trust_digest_3"))?;
     }
     if !policy.source_keyless.is_empty() {
         trust["source_keyless"] =
-            serde_json::to_value(&policy.source_keyless).map_err(|_| AppError::Internal)?;
+            serde_json::to_value(&policy.source_keyless).map_err(|_| AppError::internal("installation_trust_digest_4"))?;
     }
     super::super::plugin_configuration_schema_digest(&trust)
 }
@@ -1628,29 +1628,30 @@ pub(super) async fn append_inventory_file(
             .read(true)
             .write(true)
             .open(path.with_extension("lock"))
-            .map_err(|_| AppError::Internal)?;
-        lock.try_lock().map_err(|_| AppError::Overloaded)?;
+            .map_err(|_| AppError::internal("installation_append_inventory_file_1"))?;
+        lock.try_lock()
+            .map_err(|_| AppError::capacity_error("plugin_installation_lock"))?;
         let mut bytes = Vec::new();
         std::fs::File::open(&path)
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::internal("installation_append_inventory_file_2"))?
             .take(4 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_append_inventory_file_3"))?;
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(AppError::Forbidden);
         }
         let mut inventory: BTreeMap<String, PreinstalledInventory> =
             serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
         if let Some(existing) = inventory.get(&id) {
-            if serde_json::to_value(existing).map_err(|_| AppError::Internal)?
-                == serde_json::to_value(&entry).map_err(|_| AppError::Internal)?
+            if serde_json::to_value(existing).map_err(|_| AppError::internal("installation_append_inventory_file_4"))?
+                == serde_json::to_value(&entry).map_err(|_| AppError::internal("installation_append_inventory_file_5"))?
             {
                 return Ok(());
             }
             return Err(AppError::Conflict("inventory ID is immutable".into()));
         }
         inventory.insert(id, entry);
-        let bytes = serde_json::to_vec(&inventory).map_err(|_| AppError::Internal)?;
+        let bytes = serde_json::to_vec(&inventory).map_err(|_| AppError::internal("installation_append_inventory_file_6"))?;
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(AppError::Forbidden);
         }
@@ -1660,20 +1661,20 @@ pub(super) async fn append_inventory_file(
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_append_inventory_file_7"))?;
         let result = (|| {
             file.set_permissions(
                 std::fs::metadata(&path)
-                    .map_err(|_| AppError::Internal)?
+                    .map_err(|_| AppError::internal("installation_append_inventory_file_8"))?
                     .permissions(),
             )
-            .map_err(|_| AppError::Internal)?;
-            file.write_all(&bytes).map_err(|_| AppError::Internal)?;
-            file.sync_all().map_err(|_| AppError::Internal)?;
-            std::fs::rename(&temporary, &path).map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_append_inventory_file_9"))?;
+            file.write_all(&bytes).map_err(|_| AppError::internal("installation_append_inventory_file_10"))?;
+            file.sync_all().map_err(|_| AppError::internal("installation_append_inventory_file_11"))?;
+            std::fs::rename(&temporary, &path).map_err(|_| AppError::internal("installation_append_inventory_file_12"))?;
             std::fs::File::open(parent)
                 .and_then(|file| file.sync_all())
-                .map_err(|_| AppError::Internal)
+                .map_err(|_| AppError::internal("installation_append_inventory_file_13"))
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temporary);
@@ -1681,7 +1682,7 @@ pub(super) async fn append_inventory_file(
         result
     })
     .await
-    .map_err(|_| AppError::Internal)?
+    .map_err(|_| AppError::internal("installation_append_inventory_file_14"))?
 }
 
 #[cfg(test)]
@@ -2891,7 +2892,7 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
                 std::io::ErrorKind::PermissionDenied,
                 "fixture",
             ))),
-            Err(AppError::Internal)
+            Err(AppError::Internal { .. })
         ));
     }
 

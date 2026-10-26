@@ -164,7 +164,7 @@ async fn fragmented_crlf_comment_frames_fail_without_starting_billable_delivery(
         body.as_ref(),
         [
             b": heartbeat\r\n\r\n: heartbeat\r\n\r\n".as_slice(),
-            b"data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream stream did not complete\"}}\n\n".as_slice(),
+            "data: {\"error\":{\"code\":\"upstream_incomplete_response\",\"message\":\"上游响应流没有完整结束。失败阶段 invalid_terminal。\",\"message_en\":\"upstream stream did not complete. failure stage invalid_terminal.\",\"type\":\"upstream_error\"}}\n\n".as_bytes(),
         ].concat(),
     );
     upstream.await.unwrap();

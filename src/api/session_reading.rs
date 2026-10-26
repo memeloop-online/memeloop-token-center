@@ -123,7 +123,7 @@ fn encode_cursor(
             scope: scope.clone(),
             position,
         })
-        .map_err(|_| AppError::Internal)?,
+        .map_err(|_| AppError::internal("session_reading_encode_cursor_1"))?,
     );
     let (tag, _) = crypto::hash_credential(&format!("{CURSOR_DOMAIN}{payload}"), pepper);
     Ok(format!("{payload}.{}", URL_SAFE_NO_PAD.encode(tag)))

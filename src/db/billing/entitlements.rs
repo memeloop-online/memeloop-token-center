@@ -229,7 +229,7 @@ impl Database {
                 &input.provider,
                 &input.external_subscription_id,
             ))
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("entitlements_apply_cloud_entitlement_1"))?;
             sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948316))")
                 .bind(subscription_lock)
                 .execute(&mut *tx)
@@ -298,7 +298,7 @@ impl Database {
             })?
             .try_get("policy_json")?;
             let effective_policy =
-                serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?;
+                serde_json::from_str(&policy_json).map_err(|_| AppError::internal("entitlements_site_1"))?;
             input.audit.key_id = credential.key_id;
             input.audit.entitlement_id = entitlement.entitlement.entitlement_id;
             super::cloud::record_cloud_subscription_event_in_transaction(&mut tx, input.audit, now)
@@ -329,7 +329,7 @@ impl Database {
         let key_status: String = key_row.try_get("status")?;
         let mut effective_policy: KeyPolicy =
             serde_json::from_str(&key_row.try_get::<String, _>("policy_json")?)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("entitlements_site_2"))?;
 
         // Subscription automation owns financial snapshots, but it does not own
         // the operator-controlled credential lifecycle. A disabled stable key
@@ -344,7 +344,7 @@ impl Database {
 
         if active_snapshot {
             let policy_json =
-                serde_json::to_string(&input.policy).map_err(|_| AppError::Internal)?;
+                serde_json::to_string(&input.policy).map_err(|_| AppError::internal("entitlements_site_3"))?;
             let updated = sqlx::query(
                 "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4",
             )
@@ -429,7 +429,7 @@ pub(super) async fn reconcile_entitlement_in_transaction(
     operation: EntitlementOperation,
     idempotency_key: &str,
 ) -> Result<(EntitlementReconcileResult, bool), AppError> {
-    let canonical = serde_json::to_vec(&operation).map_err(|_| AppError::Internal)?;
+    let canonical = serde_json::to_vec(&operation).map_err(|_| AppError::internal("entitlements_reconcile_entitlement_in_transaction_1"))?;
     let request_hash = format!("{:x}", Sha256::digest(&canonical));
     let now = unix_millis();
     let reconciliation_id = Uuid::now_v7();
@@ -463,7 +463,7 @@ pub(super) async fn reconcile_entitlement_in_transaction(
         let response_json: String = replay.try_get("response_json")?;
         return serde_json::from_str(&response_json)
             .map(|response| (response, true))
-            .map_err(|_| AppError::Internal);
+            .map_err(|_| AppError::internal("entitlements_reconcile_entitlement_in_transaction_2"));
     }
 
     let result = match operation {
@@ -477,7 +477,7 @@ pub(super) async fn reconcile_entitlement_in_transaction(
             replace_entitlement_snapshot(tx, tenant_id, &input, reconciliation_id, now).await?
         }
     };
-    let response_json = serde_json::to_string(&result).map_err(|_| AppError::Internal)?;
+    let response_json = serde_json::to_string(&result).map_err(|_| AppError::internal("entitlements_reconcile_entitlement_in_transaction_3"))?;
     sqlx::query(
         "INSERT INTO entitlement_reconciliations (id, tenant_id, idempotency_key, request_hash, response_json, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
     )
@@ -1125,7 +1125,7 @@ fn canonicalize_entitlement_operation(
             let value: serde_json::Value = serde_json::from_str(raw).map_err(|_| {
                 AppError::BadRequest("proration metadata must be valid JSON".into())
             })?;
-            *raw = serde_json::to_string(&value).map_err(|_| AppError::Internal)?;
+            *raw = serde_json::to_string(&value).map_err(|_| AppError::internal("entitlements_canonicalize_1"))?;
         }
         Ok(())
     }

@@ -46,7 +46,7 @@ pub(super) async fn execute(
         "x-mtc-client-name",
         HeaderValue::from_static("filter-assistant"),
     );
-    let body = Bytes::from(serde_json::to_vec(&request).map_err(|_| AppError::Internal)?);
+    let body = Bytes::from(serde_json::to_vec(&request).map_err(|_| AppError::internal("filter_assistant_execute_1"))?);
     let memory = state.proxy_memory_budget.reservation();
     let response = proxy_with_identity(
         state,
@@ -60,8 +60,9 @@ pub(super) async fn execute(
     )
     .await?;
     if !response.status().is_success() {
-        return Err(AppError::Upstream(
-            "filter assistant model execution failed; no filter was applied".into(),
+        return Err(AppError::upstream_status(
+            "filter_assistant_upstream_status",
+            response.status().as_u16(),
         ));
     }
     let bytes = to_bytes(response.into_body(), MAX_RESPONSE_BYTES)
@@ -71,9 +72,7 @@ pub(super) async fn execute(
 }
 
 fn invalid_output() -> AppError {
-    AppError::Upstream(
-        "filter assistant returned an invalid suggestion; no filter was applied".into(),
-    )
+    AppError::upstream("filter_assistant_response_unreadable")
 }
 
 fn parse_response(bytes: &[u8], protocol: &str) -> Result<TypedFilterAst, AppError> {

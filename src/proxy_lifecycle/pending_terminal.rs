@@ -246,7 +246,7 @@ impl Snapshot {
             "version": 1, "claim": self.claim, "receipt_id": self.receipt_id,
             "terminal": self.operational_terminal, "attribution": attribution,
         }))
-        .map_err(|_| crate::error::AppError::Internal)?;
+        .map_err(|_| crate::error::AppError::internal("pending_terminal_operational_digest_1"))?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
 
@@ -277,7 +277,7 @@ impl Snapshot {
                 ]
                 .into_iter()
                 .find(|cause| cause.as_str() == value.as_str())
-                .ok_or(crate::error::AppError::Internal)
+                .ok_or(crate::error::AppError::internal("pending_terminal_terminal_1"))
             })
             .transpose()?;
         if self.version != 1
@@ -286,7 +286,7 @@ impl Snapshot {
                 .checked_add(self.output_token_ceiling)
                 != Some(self.reservation.reserved_tokens)
         {
-            return Err(crate::error::AppError::Internal);
+            return Err(crate::error::AppError::internal("pending_terminal_terminal_2"));
         }
         Ok(FinishProxyRequest {
             terminal_cause,
@@ -571,11 +571,11 @@ impl Journal {
         let claim = snapshot
             .claim
             .as_ref()
-            .ok_or(crate::error::AppError::Internal)?;
+            .ok_or(crate::error::AppError::internal("pending_terminal_record_operational_observation_1"))?;
         let terminal = snapshot
             .operational_terminal
             .as_ref()
-            .ok_or(crate::error::AppError::Internal)?;
+            .ok_or(crate::error::AppError::internal("pending_terminal_record_operational_observation_2"))?;
         let expected_digest = snapshot.operational_digest()?;
         let ack = database
             .record_pending_proxy_operational_terminal(
@@ -969,7 +969,7 @@ impl Journal {
                     let claim = snapshot
                         .claim
                         .as_ref()
-                        .ok_or(crate::error::AppError::Internal)?;
+                        .ok_or(crate::error::AppError::internal("pending_terminal_start_operational_1"))?;
                     if !operational_acknowledged {
                         let terminal = snapshot.operational_terminal.as_ref().ok_or_else(|| {
                             crate::error::AppError::Conflict(
@@ -1152,7 +1152,7 @@ impl Journal {
                                             usage_invalid: false,
                                         }))
                                     } else {
-                                        Err(crate::error::AppError::Internal)
+                                        Err(crate::error::AppError::internal("pending_terminal_attempt_1"))
                                     }
                                 })
                         } else {
