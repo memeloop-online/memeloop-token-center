@@ -95,14 +95,14 @@ impl Database {
         });
         let accounts = sqlx::query("SELECT account_id, version, initial_member_id FROM transport_proxy_bindings WHERE group_id = $1 ORDER BY account_id")
             .bind(id.to_string()).fetch_all(&mut *tx).await?;
-        if destructive && !accounts.is_empty() && body.replacement_member_id.is_none() {
-            return Err(invalid());
-        }
         if let Some(replacement) = body.replacement_member_id
             && !next.iter().any(|member| member.id == replacement)
         {
             return Err(invalid());
         }
+        let replacement_member_id = body
+            .replacement_member_id
+            .or_else(|| destructive.then_some(next[0].id));
         let version = version.checked_add(1).ok_or(AppError::Internal)?;
         let ciphertext = seal_private_json(&next, key, MEMBERS_AAD)?;
         let (probe_url, probe_attempts) = probe_settings(body.probe_url, body.probe_attempts)?;
@@ -120,7 +120,7 @@ impl Database {
             let base = retained
                 .or_else(|| {
                     next.iter()
-                        .find(|member| Some(member.id) == body.replacement_member_id)
+                        .find(|member| Some(member.id) == replacement_member_id)
                 })
                 .ok_or_else(invalid)?;
             let binding_version: i64 = account.try_get("version")?;
@@ -146,12 +146,12 @@ impl Database {
                 &previous,
                 &next,
                 base.id,
-                body.replacement_member_id,
+                replacement_member_id,
                 key,
             )
             .await?;
             sqlx::query("UPDATE transport_proxy_bindings SET initial_member_id = $1, replacement_member_id = $2, updated_at = $3 WHERE account_id = $4")
-                .bind(base.id.to_string()).bind(body.replacement_member_id.map(|id| id.to_string())).bind(unix_millis()).bind(account_id.to_string()).execute(&mut *tx).await?;
+                .bind(base.id.to_string()).bind(replacement_member_id.map(|id| id.to_string())).bind(unix_millis()).bind(account_id.to_string()).execute(&mut *tx).await?;
         }
         budget(&mut tx, key).await?;
         audit(&mut tx, &tenant_id, id, "update", version, actor).await?;
