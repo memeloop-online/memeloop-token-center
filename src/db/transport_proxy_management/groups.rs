@@ -42,19 +42,26 @@ impl Database {
     ) -> Result<Value, AppError> {
         validate_name(&body.name)?;
         normalize_legacy_members(&self.pool, key).await?;
-        let members = members(body.members, &[])?;
-        validate_endpoints(&members).await?;
+        for member in &body.members {
+            if let Some(proxy) = &member.proxy_url {
+                crate::network::validate_managed_codex_proxy(proxy).await?;
+            }
+        }
         let (probe_url, probe_attempts) = probe_settings(body.probe_url, body.probe_attempts)?;
         let ciphertext = "";
         let mut tx = self.begin_write_transaction().await?;
         lock(&mut tx).await?;
         let tenant_id = tenant(&mut tx, &body.tenant_external_id).await?;
+        let members = self
+            .resolve_proxy_members(&mut tx, &tenant_id, body.members, &[], key)
+            .await?;
         let id = Uuid::now_v7();
         available_name(&mut tx, &tenant_id, &body.name, id).await?;
         let now = unix_millis();
         sqlx::query("INSERT INTO transport_proxy_groups (id, tenant_id, name, version, members_ciphertext, probe_url, probe_attempts, created_at, updated_at) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $7)")
             .bind(id.to_string()).bind(&tenant_id).bind(&body.name).bind(ciphertext).bind(&probe_url).bind(probe_attempts).bind(now).execute(&mut *tx).await?;
         store_group_members(
+            self,
             &mut tx,
             &id.to_string(),
             &tenant_id,
@@ -107,7 +114,9 @@ impl Database {
         }
         let previous = load_group_members(&mut *tx, &id.to_string(), key).await?;
         available_name(&mut tx, &tenant_id, &body.name, id).await?;
-        let next = members(body.members, &previous)?;
+        let next = self
+            .resolve_proxy_members(&mut tx, &tenant_id, body.members, &previous, key)
+            .await?;
         let destructive = previous.iter().any(|old| {
             !next
                 .iter()
@@ -131,6 +140,7 @@ impl Database {
         sqlx::query("UPDATE transport_proxy_groups SET name = $1, version = $2, members_ciphertext = $3, probe_url = $4, probe_attempts = $5, updated_at = $6 WHERE id = $7")
             .bind(&body.name).bind(version).bind(ciphertext).bind(&probe_url).bind(probe_attempts).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
         store_group_members(
+            self,
             &mut tx,
             &id.to_string(),
             &tenant_id,
@@ -230,11 +240,4 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
-}
-
-async fn validate_endpoints(members: &[Member]) -> Result<(), AppError> {
-    for member in members {
-        crate::network::validate_managed_codex_proxy(&member.proxy_url).await?;
-    }
-    Ok(())
 }

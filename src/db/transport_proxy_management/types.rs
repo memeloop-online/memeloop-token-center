@@ -26,6 +26,7 @@ pub(crate) struct MemberInput {
 pub(crate) struct CreateGroup {
     pub tenant_external_id: String,
     pub name: String,
+    #[serde(alias = "proxy_ids", deserialize_with = "deserialize_member_inputs")]
     pub members: Vec<MemberInput>,
     #[serde(default)]
     pub probe_url: Option<String>,
@@ -39,12 +40,43 @@ pub(crate) struct UpdateGroup {
     pub tenant_external_id: String,
     pub expected_version: i64,
     pub name: String,
+    #[serde(alias = "proxy_ids", deserialize_with = "deserialize_member_inputs")]
     pub members: Vec<MemberInput>,
     pub replacement_member_id: Option<Uuid>,
     #[serde(default)]
     pub probe_url: Option<String>,
     #[serde(default)]
     pub probe_attempts: Option<u8>,
+}
+
+fn deserialize_member_inputs<'input, Deserializer>(
+    deserializer: Deserializer,
+) -> Result<Vec<MemberInput>, Deserializer::Error>
+where
+    Deserializer: serde::Deserializer<'input>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    let references = values.first().is_some_and(Value::is_string);
+    values
+        .into_iter()
+        .map(|value| {
+            if value.is_string() != references {
+                return Err(serde::de::Error::custom(
+                    "members and proxy_ids must not be mixed",
+                ));
+            }
+            if references {
+                let id = serde_json::from_value::<Uuid>(value).map_err(serde::de::Error::custom)?;
+                Ok(MemberInput {
+                    id: Some(id),
+                    label: String::new(),
+                    proxy_url: None,
+                })
+            } else {
+                serde_json::from_value(value).map_err(serde::de::Error::custom)
+            }
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]

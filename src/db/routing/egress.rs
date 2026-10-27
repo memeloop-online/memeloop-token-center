@@ -167,6 +167,7 @@ impl Database {
         if result.rows_affected() != 1 {
             return Err(AppError::storage("egress_attempt_snapshot_conflict"));
         }
+        crate::db::network_proxies::signals::stage_attempt(&self.pool, attempt).await?;
         Ok(())
     }
 

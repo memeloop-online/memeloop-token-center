@@ -13,6 +13,23 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
                 .delete(network_proxies::delete_network_proxy),
         )
         .route(
+            "/internal/v1/transport-proxies/{proxy_id}/observations",
+            get(network_proxies::network_proxy_observations),
+        )
+        .route(
+            "/internal/v1/transport-proxies/{proxy_id}/probe",
+            post(network_proxies::probe_network_proxy),
+        )
+        .route(
+            "/internal/v1/transport-proxy-strategies",
+            get(network_proxies::network_proxy_strategies),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/transport-proxy-selection",
+            get(network_proxies::get_network_proxy_selection)
+                .put(network_proxies::update_network_proxy_selection),
+        )
+        .route(
             "/internal/v1/api-schema",
             get(super::super::api_schema::discover),
         )

@@ -37,14 +37,8 @@ impl TransportProxyGroups {
     }
 
     pub(crate) fn spawn_due_probes(&self, pool: &AnyPool) {
-        let Ok(managed) = self.managed.read() else {
-            return;
-        };
         let now = unix_millis().max(0) as u64;
-        for item in managed.values() {
-            let Some(entry) = item.entry.clone() else {
-                continue;
-            };
+        for entry in self.groups.values().cloned() {
             let url = entry.probe_url.lock().ok().and_then(|slot| slot.clone());
             let Some(url) = url else {
                 entry.probe_requested.store(false, Ordering::Release);
@@ -131,7 +125,7 @@ async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> Prob
 /// Any HTTP response means the proxy reached the configured address. Only a
 /// failed socket, tunnel, DNS, or TLS handshake counts as unreachable. This
 /// client carries no customer body and does not call the Responses API.
-async fn proxy_reaches(proxy_url: &str, target: &str) -> bool {
+pub(super) async fn proxy_reaches(proxy_url: &str, target: &str) -> bool {
     let Ok(proxy) = reqwest::Proxy::all(proxy_url) else {
         return false;
     };

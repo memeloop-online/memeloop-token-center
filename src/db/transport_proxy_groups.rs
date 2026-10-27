@@ -8,10 +8,12 @@ use std::{
 
 use super::*;
 
+mod entity_probe;
 mod managed;
 mod persistence;
 mod probe;
 pub(crate) mod strategy;
+mod strategy_runtime;
 #[cfg(test)]
 mod tests;
 
@@ -77,6 +79,9 @@ impl Snapshot {
 pub(crate) struct TransportProxyGroups {
     groups: BTreeMap<Uuid, Arc<Entry>>,
     managed: std::sync::RwLock<BTreeMap<Uuid, managed::ManagedEntry>>,
+    probe_permits: Arc<tokio::sync::Semaphore>,
+    entity_probe_inflight: std::sync::Mutex<std::collections::BTreeSet<(Uuid, i64)>>,
+    strategy_status: std::sync::RwLock<BTreeMap<Uuid, Value>>,
     key: Vec<u8>,
 }
 
@@ -136,6 +141,9 @@ impl TransportProxyGroups {
         Ok(Self {
             groups,
             managed: std::sync::RwLock::new(BTreeMap::new()),
+            probe_permits: Arc::new(tokio::sync::Semaphore::new(4)),
+            entity_probe_inflight: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            strategy_status: std::sync::RwLock::new(BTreeMap::new()),
             key: key.to_vec(),
         })
     }

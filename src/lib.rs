@@ -270,7 +270,7 @@ impl AppState {
 
         let transport_proxy_groups = Arc::new(transport_proxy_groups);
         transport_proxy_groups
-            .start(&config.database_url)
+            .start(&config.database_url, plugins.clone())
             .map_err(|_| InitializationError::TransportProxyGroups)?;
         Ok(Self {
             config: Arc::new(config),

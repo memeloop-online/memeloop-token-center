@@ -1,7 +1,11 @@
 use super::*;
 
 impl TransportProxyGroups {
-    pub(crate) fn start(self: &Arc<Self>, database_url: &str) -> Result<(), sqlx::Error> {
+    pub(crate) fn start(
+        self: &Arc<Self>,
+        database_url: &str,
+        plugins: crate::plugin::PluginRuntime,
+    ) -> Result<(), sqlx::Error> {
         let pool = AnyPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
@@ -12,6 +16,9 @@ impl TransportProxyGroups {
                 if current.refresh_managed(&pool).await.is_err() {
                     tracing::debug!("transport proxy configuration refresh deferred");
                 }
+                if current.evaluate_strategies(&pool, &plugins).await.is_err() {
+                    tracing::debug!("network proxy strategy refresh deferred");
+                }
                 for entry in current.persistence_entries().unwrap_or_default() {
                     if entry.synchronize(&pool).await.is_err() {
                         tracing::debug!(account_id = %entry.group.account_id, "optional proxy selection persistence deferred");
@@ -19,6 +26,36 @@ impl TransportProxyGroups {
                 }
                 current.spawn_due_probes(&pool);
                 drop(current);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let probe_pool = AnyPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_lazy(database_url)?;
+        let groups = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(current) = groups.upgrade() {
+                if current.spawn_entity_probes(&probe_pool).await.is_err() {
+                    tracing::debug!("network proxy probe scheduling deferred");
+                }
+                drop(current);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let signal_pool = AnyPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_lazy(database_url)?;
+        let groups = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while groups.upgrade().is_some() {
+                if crate::db::network_proxies::signals::merge_pending(&signal_pool)
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("network proxy signal merge deferred");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });

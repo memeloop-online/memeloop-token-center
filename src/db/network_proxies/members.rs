@@ -90,7 +90,9 @@ pub(crate) async fn normalize_legacy_members(pool: &AnyPool, key: &[u8]) -> Resu
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn store_group_members(
+    database: &Database,
     tx: &mut Transaction<'_, Any>,
     group: &str,
     tenant: &str,
@@ -121,6 +123,16 @@ pub(crate) async fn store_group_members(
                 sqlx::query("UPDATE network_proxies SET name = $1, proxy_ciphertext = $2, version = version + 1, updated_at = $3, last_probe_status = NULL, last_probe_checked_at = NULL WHERE id = $4")
                     .bind(&member.label).bind(seal_private_json(&member.proxy_url, key, PROXY_AAD)?)
                     .bind(unix_millis()).bind(member.id.to_string()).execute(&mut **tx).await?;
+                database
+                    .refresh_network_proxy_references(
+                        tx,
+                        member.id,
+                        &old,
+                        &previous.try_get::<String, _>("name")?,
+                        Some(group),
+                        key,
+                    )
+                    .await?;
             }
         } else {
             sqlx::query("INSERT INTO network_proxies (id, tenant_id, name, version, proxy_ciphertext, probe_enabled, probe_target, probe_attempts, created_at, updated_at) VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$8)")

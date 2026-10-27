@@ -4,8 +4,9 @@ use crate::db::transport_proxy_management::{BindingStamp, CONFIG_KEY, Member};
 pub(super) struct ManagedEntry {
     pub stamp: BindingStamp,
     pub credential_generation: i64,
+    pub(super) initial_member_id: Uuid,
     pub entry: Option<Arc<Entry>>,
-    members: Vec<Member>,
+    pub(super) members: Vec<Member>,
     group_name: Option<String>,
 }
 
@@ -206,6 +207,7 @@ impl TransportProxyGroups {
             next.insert(
                 account_id,
                 ManagedEntry {
+                    initial_member_id: parse_uuid(row.try_get("initial_member_id")?)?,
                     stamp,
                     credential_generation: generation,
                     entry,

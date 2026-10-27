@@ -1,5 +1,8 @@
 use super::*;
 mod members;
+pub(crate) mod signals;
+#[cfg(test)]
+mod tests;
 pub(crate) use members::{load_group_members, normalize_legacy_members, store_group_members};
 
 pub(crate) const PROXY_AAD: &[u8] = b"mtc/network-proxy/v1";
@@ -271,7 +274,7 @@ impl Database {
             ));
         }
         let references: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM network_proxy_group_members WHERE proxy_id = $1",
+            "SELECT (SELECT COUNT(*) FROM network_proxy_group_members WHERE proxy_id = $1) + (SELECT COUNT(*) FROM network_proxy_selection_policies WHERE proxy_id = $1)",
         )
         .bind(id.to_string())
         .fetch_one(&mut *tx)
