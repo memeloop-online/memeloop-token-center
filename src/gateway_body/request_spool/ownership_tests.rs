@@ -25,7 +25,7 @@ const BUDGET_BYTES: u32 = 1024 * 1024;
 fn pause_hooks_do_not_enlarge_cloned_admission_state() {
     assert_eq!(
         std::mem::size_of::<RequestSpoolAdmission>(),
-        std::mem::size_of::<[Arc<()>; 3]>()
+        std::mem::size_of::<[Arc<()>; 2]>()
     );
 }
 

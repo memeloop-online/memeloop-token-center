@@ -173,16 +173,14 @@ mod ownership_tests;
 
 #[derive(Clone)]
 pub(crate) struct RequestSpoolAdmission {
-    directory: Arc<PathBuf>,
     usage: Arc<RequestSpoolUsage>,
     #[cfg(test)]
     read_count: Arc<AtomicUsize>,
 }
 
 impl RequestSpoolAdmission {
-    pub(crate) fn new(directory: PathBuf) -> Self {
+    pub(crate) fn new(_directory: PathBuf) -> Self {
         Self {
-            directory: Arc::new(directory),
             usage: Arc::new(RequestSpoolUsage::default()),
             #[cfg(test)]
             read_count: Arc::new(AtomicUsize::new(0)),
@@ -226,8 +224,6 @@ impl RequestSpoolAdmission {
         request_metadata_bytes: usize,
         body_key: Option<&str>,
     ) -> Result<RequestSpool, RequestSpoolCaptureError> {
-        // The configured directory is for terminal journals, not request bodies.
-        let _journal_directory = self.directory.as_path();
         let durable = self.usage.durable.clone();
         let object_key = durable.as_ref().and_then(|_| {
             request_body_object_key(body_key.unwrap_or(""))
