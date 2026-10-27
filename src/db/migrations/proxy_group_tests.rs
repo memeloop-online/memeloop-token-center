@@ -174,6 +174,16 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
+    for statement in [
+        "DROP INDEX IF EXISTS session_archive_unlinked_recent_idx",
+        "DROP INDEX IF EXISTS request_egress_attempts_request_idx",
+        "DROP INDEX IF EXISTS conversation_observations_compacted_probe_idx",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
     sqlx::query("DELETE FROM schema_migrations WHERE version >= 115")
         .execute(&database.pool)
         .await

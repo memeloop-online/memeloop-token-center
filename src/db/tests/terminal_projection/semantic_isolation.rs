@@ -1,5 +1,33 @@
 use super::*;
 
+/// Drops this worker's terminal lease and claims the task again.
+///
+/// Every projection attempt that declines or fails leaves the task unclaimable,
+/// so a test that wants to observe a *second* attempt has to re-claim it.
+/// `lease_owner` carries the `terminal-v118` sentinel and must survive; clearing
+/// it would send the next pass down the "empty snapshot, not pinned" branch,
+/// which answers `Ok(false)` before the payload is validated at all.
+async fn reclaim(database: &Database, request_id: Uuid) -> Uuid {
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let owner = Uuid::now_v7();
+    assert!(
+        database
+            .claim_conversation_projection_tasks(owner, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id),
+        "the projection task must be claimable again"
+    );
+    owner
+}
+
 async fn recovery_contract(database_url: &str) {
     let database = Database::connect(database_url).await.unwrap();
     database.migrate().await.unwrap();
@@ -173,11 +201,13 @@ async fn recovery_contract(database_url: &str) {
             .execute(&database.pool)
             .await
             .unwrap();
+        let owner = reclaim(&database, request_id).await;
         assert!(
             database
-                .project_claimed_conversation_projection_task(stale, request_id)
+                .project_claimed_conversation_projection_task(owner, request_id)
                 .await
-                .is_err()
+                .is_err(),
+            "a payload whose {field} disagrees with the outbox row must not project"
         );
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(original.to_string())
@@ -188,11 +218,13 @@ async fn recovery_contract(database_url: &str) {
     }
     sqlx::query("UPDATE conversation_semantic_payloads SET request_json = '{}', encoded_bytes = 2 WHERE request_id = $1")
         .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+    let owner = reclaim(&database, request_id).await;
     assert!(
         database
-            .project_claimed_conversation_projection_task(stale, request_id)
+            .project_claimed_conversation_projection_task(owner, request_id)
             .await
-            .is_err()
+            .is_err(),
+        "a payload whose recorded length disagrees with its body must not project"
     );
     sqlx::query("UPDATE conversation_semantic_payloads SET request_json = $1, encoded_bytes = $2 WHERE request_id = $3")
         .bind(&encoded).bind(encoded.len() as i64).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
@@ -214,11 +246,13 @@ async fn recovery_contract(database_url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
+    let owner = reclaim(&database, request_id).await;
     assert!(
         database
-            .project_claimed_conversation_projection_task(stale, request_id)
+            .project_claimed_conversation_projection_task(owner, request_id)
             .await
-            .is_err()
+            .is_err(),
+        "a failed semantic ACK must surface as an error, not a silent skip"
     );
     let state = sqlx::query("SELECT (SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1) AS atoms, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $2) AS observations, (SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $2) AS payloads")
         .bind(key.tenant_id.to_string()).bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
