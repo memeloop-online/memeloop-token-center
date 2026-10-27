@@ -1,5 +1,44 @@
 use super::super::*;
 
+/// Materialization is deferred: `finish_proxy_request` only enqueues the
+/// terminal and conversation projections, so a test that asserts the resulting
+/// `conversation_observations` row has to drive both queues first, terminal
+/// before conversation.
+async fn drain_projections(database: &Database, request_id: Uuid) {
+    for _ in 0..4 {
+        let owner = Uuid::now_v7();
+        let mut progressed = false;
+        if database
+            .claim_terminal_projection_tasks(owner, 32)
+            .await
+            .unwrap()
+            .contains(&request_id)
+        {
+            database
+                .project_claimed_terminal_projection_task(owner, request_id)
+                .await
+                .unwrap();
+            progressed = true;
+        }
+        if database
+            .claim_conversation_projection_tasks(owner, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id)
+        {
+            database
+                .project_claimed_conversation_projection_task(owner, request_id)
+                .await
+                .unwrap();
+            progressed = true;
+        }
+        if !progressed {
+            return;
+        }
+    }
+}
+
 const ADMISSION_SNAPSHOT_FAULTS: [(&str, &str, &str); 2] = [
     (
         "admission_snapshot_abort",
@@ -2048,22 +2087,22 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
     .unwrap();
     preseal_budget.rollback().await.unwrap();
     release_response_preseal.send(()).unwrap();
-    let waiting = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO semantic_atoms%' AND $1 = ANY(pg_blocking_pids(pid))",
-            )
-            .bind(blocker_pid)
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
-            if waiting > 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
+    // Materialization moved to the projection worker, so a buffered finish no
+    // longer inserts semantic atoms on this path. What still has to hold is
+    // that it never waits on that content while holding the archive budget;
+    // with the atom lock held it must simply run to completion.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let blocked_on_atoms: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO semantic_atoms%' AND $1 = ANY(pg_blocking_pids(pid))",
+    )
+    .bind(blocker_pid)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        blocked_on_atoms, 0,
+        "a buffered finish must not materialize semantic atoms inline"
+    );
     // Keep the content blocker open while another archive operation takes the
     // global budget. Preparation must hold neither this row nor the session.
     let budget = tokio::time::timeout(
@@ -2084,7 +2123,6 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
         finish.abort();
         let _ = finish.await;
     }
-    waiting.expect("buffered finish must reach the immutable-content lock barrier");
     assert!(
         budget_available,
         "content preparation must release the archive budget"
@@ -2600,6 +2638,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             ..
         }
     ));
+    drain_projections(&database, request_id).await;
     let committed = sqlx::query(
             "SELECT r.status AS reservation_status, q.status_code, q.input_tokens, q.output_tokens, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.id) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, (SELECT COUNT(*) FROM request_daily_aggregates) AS aggregate_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS finished_events, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id AND o.upstream_response_id = 'resp-atomic') AS observation_count FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE r.id = $1",
         )
@@ -2969,6 +3008,7 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
     }
     assert_eq!(winners, 1);
     assert_eq!(replays, 5);
+    drain_projections(&database, request_id).await;
     let counts = sqlx::query(
             "SELECT (SELECT COUNT(*) FROM ledger_entries WHERE source = $1) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $2) AS fact_count, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $3) AS observation_count, (SELECT COUNT(*) FROM request_events WHERE request_id = $4 AND event_kind = 'finished') AS event_count",
         )

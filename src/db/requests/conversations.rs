@@ -192,36 +192,94 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
         let completed = existing
             .try_get::<Option<i64>, _>("projected_at")?
             .is_some();
-        if existing.try_get::<String, _>("tenant_id")? != key.tenant_id.to_string()
-            || existing.try_get::<String, _>("key_id")? != key.key_id.to_string()
-            || existing.try_get::<String, _>("principal_id")? != key.principal_id.to_string()
-            || existing.try_get::<String, _>("request_json")? != request_json
-            || existing.try_get::<String, _>("hints_json")? != hints_json
-            || existing
-                .try_get::<Option<String>, _>("client_name")?
-                .as_deref()
-                != client_name
-            || existing
-                .try_get::<Option<String>, _>("upstream_response_id")?
-                .as_deref()
-                != upstream_response_id
-            || existing.try_get::<i64, _>("observed_at")? != observed_at
-            || existing
-                .try_get::<Option<String>, _>("key_snapshot_json")?
-                .as_deref()
-                != Some(key_snapshot.as_str())
-            || !semantic_payload::snapshot_matches(
+        // `observed_at` is when the winning terminal completed, not part of this
+        // row's identity. Two owners that raced their own terminals legitimately
+        // disagree by a few milliseconds, and `ON CONFLICT DO NOTHING` already
+        // made the first value authoritative, so a later replay is not a content
+        // conflict. Everything below is content and stays fatal.
+        let observed_at_differs = existing.try_get::<i64, _>("observed_at")? != observed_at;
+        let mismatched: Vec<&'static str> = [
+            (
+                "tenant_id",
+                existing.try_get::<String, _>("tenant_id")? != key.tenant_id.to_string(),
+            ),
+            (
+                "key_id",
+                existing.try_get::<String, _>("key_id")? != key.key_id.to_string(),
+            ),
+            (
+                "principal_id",
+                existing.try_get::<String, _>("principal_id")? != key.principal_id.to_string(),
+            ),
+            (
+                "request_json",
+                existing.try_get::<String, _>("request_json")? != request_json,
+            ),
+            (
+                "hints_json",
+                existing.try_get::<String, _>("hints_json")? != hints_json,
+            ),
+            (
+                "client_name",
                 existing
-                    .try_get::<Option<String>, _>("semantic_snapshot_json")?
-                    .as_deref(),
-                semantic_snapshot.as_deref(),
-                completed,
-            )
-            || (existing.try_get::<i64, _>("payload_required")? != 0) != payload.is_some()
-        {
+                    .try_get::<Option<String>, _>("client_name")?
+                    .as_deref()
+                    != client_name,
+            ),
+            (
+                "upstream_response_id",
+                existing
+                    .try_get::<Option<String>, _>("upstream_response_id")?
+                    .as_deref()
+                    != upstream_response_id,
+            ),
+            // `observed_at` is when the winning terminal completed, not part of
+            // this row's identity. Two owners that raced their own terminals
+            // legitimately disagree by a few milliseconds, and `ON CONFLICT DO
+            // NOTHING` already made the first value authoritative. Treating it
+            // as a content conflict turned a correct exactly-once settlement
+            // into a 409 for the loser.
+            (
+                "key_snapshot_json",
+                existing
+                    .try_get::<Option<String>, _>("key_snapshot_json")?
+                    .as_deref()
+                    != Some(key_snapshot.as_str()),
+            ),
+            (
+                "semantic_snapshot_json",
+                !semantic_payload::snapshot_matches(
+                    existing
+                        .try_get::<Option<String>, _>("semantic_snapshot_json")?
+                        .as_deref(),
+                    semantic_snapshot.as_deref(),
+                    completed,
+                ),
+            ),
+            (
+                "payload_required",
+                (existing.try_get::<i64, _>("payload_required")? != 0) != payload.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, differs)| differs.then_some(field))
+        .collect();
+        if !mismatched.is_empty() {
+            tracing::warn!(
+                %request_id,
+                fields = %mismatched.join(","),
+                "conversation projection enqueue disagrees with the stored row"
+            );
             return Err(AppError::Conflict(
                 "会话正文归档的入队记录和已有记录不一致".into(),
             ));
+        }
+        if observed_at_differs {
+            // Expected when concurrent owners settle their own terminals.
+            tracing::debug!(
+                %request_id,
+                "conversation projection replay carries a different observation time"
+            );
         }
         if completed {
             return Ok(());
