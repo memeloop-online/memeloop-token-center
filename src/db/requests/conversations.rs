@@ -105,6 +105,10 @@ struct ConversationSemanticSnapshot {
     payload_digest: Option<String>,
 }
 
+fn empty_semantic_snapshot(item: &ConversationSemanticSnapshot) -> bool {
+    item.leaf.is_none() && item.atom_hashes.is_empty() && item.payload_digest.is_none()
+}
+
 const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
@@ -140,7 +144,9 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     } = input;
     // 这里不解析对象存储里的原始请求 JSON。只留下结算时已经收好的对话字段，
     // 供 locator 仍是 gap:// 时归档。超过上限的内容仍留给对象存储。
+    // 缩减后的对话另存一行，SQL 失败后还能重试。这不是原始请求 JSON，也不是会话正文。
     let payload: Option<(String, String)> = None;
+    let reduced = semantic_payload::encode(request_id, key, request_json)?;
     let request_json = inline_session_request(request_json);
     let semantic_snapshot = {
         let snapshot = ConversationSemanticSnapshot {
@@ -221,6 +227,7 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
             return Ok(());
         }
     }
+    semantic_payload::persist(transaction, request_id, key, &reduced.0, &reduced.1).await?;
     Ok(())
 }
 
@@ -693,7 +700,7 @@ impl Database {
         let prepared_snapshot = {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
-                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+                "SELECT tenant_id, key_id, principal_id, request_json, observed_at, lease_owner, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, CAST(CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN 1 ELSE 0 END AS BIGINT) AS payload_required, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
             )
             .bind(request_id.to_string())
             .bind(lease_owner.to_string())
@@ -713,15 +720,79 @@ impl Database {
                     })
                 })
                 .transpose()?;
-            if snapshot.as_ref().is_some_and(|item| {
-                item.leaf.is_none() && item.atom_hashes.is_empty() && item.payload_digest.is_none()
-            }) {
-                sqlx::query("UPDATE conversation_projection_outbox SET lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2")
+            let mut snapshot = snapshot;
+            if snapshot.as_ref().is_some_and(empty_semantic_snapshot) {
+                // 主租约仍钉在 terminal-v118 上时，这是新 worker 的领取。
+                // 不把空快照当成已经写完的观测，也不清租约，避免旧 worker 用主领取抢走。
+                let pinned = prepare
+                    .try_get::<Option<String>, _>("lease_owner")?
+                    .as_deref()
+                    == Some("terminal-v118");
+                if !pinned {
+                    return Ok(false);
+                }
+                let terminal_open: Option<Option<i64>> = sqlx::query_scalar(
+                    "SELECT projected_at FROM terminal_projection_outbox WHERE request_id = $1",
+                )
+                .bind(request_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+                if terminal_open.is_some_and(|projected_at| projected_at.is_none()) {
+                    return Ok(false);
+                }
+                let inline: String = prepare.try_get("request_json")?;
+                let body = if inline != "{}" && !inline.is_empty() {
+                    inline
+                } else {
+                    semantic_payload::load_reduced(
+                        self,
+                        request_id,
+                        &prepare.try_get::<String, _>("tenant_id")?,
+                        &prepare.try_get::<String, _>("key_id")?,
+                        &prepare.try_get::<String, _>("principal_id")?,
+                    )
+                    .await?
+                    .filter(|body| body != "{}" && !body.is_empty())
+                    .unwrap_or_default()
+                };
+                if body.is_empty() {
+                    return Ok(false);
+                }
+                let (leaf, atom_hashes) =
+                    conversation_prefix_from_request_json(body.as_bytes()).map_err(|_| {
+                        AppError::internal(
+                            "conversations_project_claimed_conversation_projection_task_2",
+                        )
+                    })?;
+                let rebuilt = ConversationSemanticSnapshot {
+                    leaf,
+                    atom_hashes,
+                    payload_digest: None,
+                };
+                if empty_semantic_snapshot(&rebuilt) {
+                    return Ok(false);
+                }
+                self.materialize_streamed_conversation_content(
+                    request_id,
+                    lease_owner,
+                    &prepare.try_get::<String, _>("tenant_id")?,
+                    body,
+                    prepare.try_get("observed_at")?,
+                    Some(&rebuilt),
+                )
+                .await?;
+                let encoded = serde_json::to_string(&rebuilt).map_err(|_| {
+                    AppError::internal(
+                        "conversations_project_claimed_conversation_projection_task_3",
+                    )
+                })?;
+                sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json = $1, semantic_payload_snapshot_json = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3")
+                    .bind(&encoded)
                     .bind(request_id.to_string())
                     .bind(lease_owner.to_string())
                     .execute(&self.pool)
                     .await?;
-                return Ok(false);
+                snapshot = Some(rebuilt);
             }
             let payload_required = prepare.try_get::<i64, _>("payload_required")? != 0;
             if payload_required

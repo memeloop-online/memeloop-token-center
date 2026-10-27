@@ -33,6 +33,12 @@ BEGIN
 END $$;
 
 ALTER TABLE response_archive_spools
+    DROP CONSTRAINT IF EXISTS response_archive_spools_byte_count_check;
+
+ALTER TABLE request_archive_spools
+    DROP CONSTRAINT IF EXISTS request_archive_spools_byte_count_check;
+
+ALTER TABLE response_archive_spools
     ADD CONSTRAINT response_archive_spools_byte_count_check
     CHECK (byte_count BETWEEN 0 AND 4294967296);
 

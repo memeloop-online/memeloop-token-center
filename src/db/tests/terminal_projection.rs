@@ -139,7 +139,12 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
     );
     let envelope = sqlx::query("SELECT request_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, lease_owner FROM conversation_projection_outbox WHERE request_id = $1")
         .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
-    assert_eq!(envelope.get::<String, _>("request_json"), "{}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&envelope.get::<String, _>("request_json"))
+            .unwrap(),
+        body,
+        "outbox keeps the reduced dialogue for a gap locator"
+    );
     assert!(envelope.get::<String, _>("semantic_snapshot_json").len() < 71_000);
     assert_eq!(envelope.get::<String, _>("lease_owner"), "terminal-v118");
     if account_first {

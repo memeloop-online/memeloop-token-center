@@ -339,6 +339,8 @@ struct Pending {
     operational_reconcile: bool,
     preparation: Option<Preparation>,
     projection_retained: Option<Box<dyn Send>>,
+    /// 对话还在异步整理时，收据还不能对外比较。整理完才会带上 request_json。
+    conversation_pending: bool,
 }
 
 type Preparation =
@@ -535,6 +537,7 @@ impl Journal {
                 operational_reconcile: false,
                 preparation: Some(Box::pin(preparation)),
                 projection_retained: None,
+                conversation_pending: true,
             },
         );
         tracing::info!(%request_id, %receipt_id, financial_state = "pending_unacknowledged", "terminal responsibility accepted in memory; journal durability not acknowledged");
@@ -790,6 +793,7 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .values()
+            .filter(|entry| !entry.conversation_pending)
             .filter_map(|entry| serde_json::to_value(entry.snapshot.as_ref()).ok())
             .collect()
     }
@@ -947,6 +951,7 @@ impl Journal {
                     operational_reconcile: false,
                     preparation: None,
                     projection_retained: None,
+                    conversation_pending: false,
                 });
             }
         }
@@ -1097,6 +1102,7 @@ impl Journal {
                     {
                         entry.snapshot = prepared.clone();
                         entry.projection_retained = projection_retained;
+                        entry.conversation_pending = false;
                     }
                     prepared
                 } else {

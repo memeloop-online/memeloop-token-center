@@ -600,7 +600,6 @@ fn build_request_list_query(
     query.push(" FROM (SELECT r.* FROM request_records r LEFT JOIN proxy_operational_terminals op ON op.request_id = r.id AND op.request_created_at = r.created_at AND op.tenant_id = r.tenant_id AND op.key_id = r.key_id AND op.reservation_id = r.reservation_id");
     push_identity_filter_joins(&mut query, "r", filter);
     query.push(" WHERE 1 = 1");
-    push_identity_eligibility(&mut query, scope, "r");
     push_request_record_filters(&mut query, scope, filter);
     query.push(" ORDER BY r.created_at DESC, r.id DESC LIMIT ");
     query.bind_i64(page_limit);
@@ -608,6 +607,10 @@ fn build_request_list_query(
     push_operator_identity_joins(&mut query, scope, "r", &RequestListFilter::default());
     query.push(" LEFT JOIN conversation_observations observation ON observation.request_id = r.id AND observation.key_id = r.key_id AND observation.cluster_id = r.conversation_cluster_id");
     query.push(" LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id AND request_spool.reservation_id = r.reservation_id LEFT JOIN response_archive_spools spool ON spool.request_id = r.id AND spool.tenant_id = r.tenant_id AND spool.reservation_id = r.reservation_id");
+    // 身份条件放在 OFFSET 0 分页之后。写进扫描里会让规划器丢掉
+    // tenant_id + created_at 索引，整段历史按时间过滤，30 秒就被取消。
+    query.push(" WHERE 1 = 1");
+    push_identity_eligibility(&mut query, scope, "r");
     query.push(") AS request_page");
 
     if generation_branch_can_match(filter) {
@@ -616,12 +619,13 @@ fn build_request_list_query(
         query.push(" FROM (SELECT g.* FROM generation_jobs g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
         push_identity_filter_joins(&mut query, "g", filter);
         query.push(" WHERE 1 = 1");
-        push_identity_eligibility(&mut query, scope, "g");
         push_generation_job_filters(&mut query, scope, filter);
         query.push(" ORDER BY g.created_at DESC, g.id DESC LIMIT ");
         query.bind_i64(page_limit);
         query.push(" OFFSET 0) g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
         push_operator_identity_joins(&mut query, scope, "g", &RequestListFilter::default());
+        query.push(" WHERE 1 = 1");
+        push_identity_eligibility(&mut query, scope, "g");
         query.push(") AS generation_page");
     }
 
@@ -631,12 +635,13 @@ fn build_request_list_query(
         query.push(" FROM (SELECT u.* FROM session_archive_unlinked_requests u");
         push_identity_filter_joins(&mut query, "u", filter);
         query.push(" WHERE 1 = 1");
-        push_identity_eligibility(&mut query, scope, "u");
         push_archive_request_filters(&mut query, scope, filter);
         query.push(" ORDER BY u.source_started_at DESC, u.archive_request_id DESC LIMIT ");
         query.bind_i64(page_limit);
         query.push(" OFFSET 0) u LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id");
         push_operator_identity_joins(&mut query, scope, "u", &RequestListFilter::default());
+        query.push(" WHERE 1 = 1");
+        push_identity_eligibility(&mut query, scope, "u");
         query.push(") AS archive_page");
     }
 

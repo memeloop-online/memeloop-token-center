@@ -1006,7 +1006,7 @@ pub(crate) async fn archive_session_body(
         },
         None => b"{}".to_vec(),
     };
-    let Ok(request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes) else {
+    let Ok(mut request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes) else {
         return skip_session_body(
             state,
             lease_owner,
@@ -1015,6 +1015,22 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
+    // locator 读出来的占位文档没有对话字段时，改用结算时留下的缩减请求 JSON。
+    if request_document.get("messages").is_none() && request_document.get("input").is_none() {
+        if let Some(json) = state
+            .db
+            .session_body_inline_request(lease_owner, request_id)
+            .await?
+        {
+            if json != "{}"
+                && !json.is_empty()
+                && let Ok(fallback) = serde_json::from_str::<serde_json::Value>(&json)
+                && (fallback.get("messages").is_some() || fallback.get("input").is_some())
+            {
+                request_document = fallback;
+            }
+        }
+    }
     // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
     // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
     let return_document = crate::conversation::raw_return_document(&return_bytes)
