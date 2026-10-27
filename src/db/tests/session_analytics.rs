@@ -68,7 +68,8 @@ async fn unlinked_bucket_keeps_identity_and_pages_mixed_sources_without_gaps() {
         }
         expected.push((created_at, request_id));
     }
-    expected.sort_by(|left, right| right.cmp(left));
+    expected.sort_unstable();
+    expected.reverse();
     let bucket = format!("unlinked:{}", owner.key_id);
     let mut filter = ConversationDetailFilter {
         limit: 3,
