@@ -64,11 +64,13 @@ struct UsageAnalysisSnapshot {
 /// scan that fetched ~164k rows by random heap access, while the equivalent sequential
 /// scan of the same table finished in 3.9 s.
 ///
-/// Raising `random_page_cost` to 20 makes the planner price that random access honestly
-/// and pick the sequential scan plus hash join instead.  The setting is transaction-local
-/// (and these transactions are read-only), so it cannot slow down or re-plan the OLTP
-/// paths that share the pool.
-const USAGE_ANALYSIS_RANDOM_PAGE_COST: &str = "SET LOCAL random_page_cost = 20";
+/// 15 is the value that flips that plan to a sequential scan plus hash join; the cluster
+/// also carries it in `postgresql.parameters`.  Pinning it here as well keeps the fix
+/// effective for this rule even before cluster parameters roll out, and states the
+/// assumption next to the statements that depend on it.  The setting is transaction-local
+/// and these transactions are read-only, so it cannot re-plan the OLTP paths that share
+/// the pool.
+const USAGE_ANALYSIS_RANDOM_PAGE_COST: &str = "SET LOCAL random_page_cost = 15";
 
 impl UsageAnalysisSnapshot {
     async fn begin(database: &Database) -> Result<Self, AppError> {

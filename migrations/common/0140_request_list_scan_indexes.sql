@@ -5,11 +5,18 @@
 --   * generation_jobs      -> generation_jobs_global_time_idx (created_at DESC, id DESC)
 -- The unlinked-archive source had no global newest-first key, so every global
 -- operator page load scanned and sorted the whole table to keep the newest 101
--- rows.  This key lets the planner walk the ordered rows directly and stop at the
--- page boundary.  (A tenant carries the same ordering through the existing
--- key/cluster page index when it is scoped to one credential.)
+-- rows.  A leading `source_started_at DESC` key lets the planner walk the ordered
+-- rows directly, stop at the page boundary, and settle the remaining
+-- `archive_request_id DESC` tie-break inside each small batch (incremental sort).
+-- (A tenant carries the same ordering through the existing key/cluster page index
+-- when it is scoped to one credential.)
+--
+-- The tie-break column is deliberately not part of the key: it is a random archive
+-- identifier, so it only ever breaks ties within one millisecond of
+-- `source_started_at`.  Adding it would grow the index from ~21 B to ~64 B per row
+-- (64 MB vs 193 MB at 3M rows) to save a sub-millisecond sort.
 CREATE INDEX IF NOT EXISTS session_archive_unlinked_recent_idx
-    ON session_archive_unlinked_requests (source_started_at DESC, archive_request_id DESC);
+    ON session_archive_unlinked_requests (source_started_at DESC);
 
 -- Every request-list page resolves the visible page's egress observations with
 -- `WHERE request_id IN (...)` and a window over the same rows.  The only prior
