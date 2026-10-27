@@ -557,7 +557,11 @@ async fn send_codex_attempt_once(
                 stage = "codex_transport_send_failure",
                 "Codex outbound transport send failed"
             );
-            classify_codex_send_error(error)
+            classify_codex_send_error(
+                error,
+                body_consumption.polls(),
+                body_consumption.bytes(),
+            )
         })
     })
     .await;
@@ -607,7 +611,11 @@ async fn send_codex_attempt_once(
     }
 }
 
-fn classify_codex_send_error(error: reqwest::Error) -> ProxySendError {
+fn classify_codex_send_error(
+    error: reqwest::Error,
+    body_polls: u64,
+    body_bytes: u64,
+) -> ProxySendError {
     if let Some(http2_failure) = upstream_response::codex_http2_failure(&error) {
         let kind = match http2_failure {
             upstream_response::CodexHttp2Failure::Reset => TransportFailureKind::Http2Reset,
@@ -618,6 +626,14 @@ fn classify_codex_send_error(error: reqwest::Error) -> ProxySendError {
         let class = crate::simple_http::classify_transport(&error);
         if class.pre_delivery() {
             return ProxySendError::RetryableConnection(class.stage());
+        }
+        // reqwest surfaces a `connect_timeout` expiry as a plain request timeout,
+        // not as a connect error, so `pre_delivery()` cannot see it. With zero
+        // body polls the request body never reached the wire, so the logical
+        // request was provably not delivered; replaying it on another candidate
+        // (or another sticky exit) cannot double-charge the upstream.
+        if class.timeout && body_polls == 0 && body_bytes == 0 {
+            return ProxySendError::RetryableConnection("connect_timeout");
         }
         // A send error after the request leaves the client is ambiguous and is
         // never replayed by this state machine.
@@ -721,6 +737,9 @@ fn codex_egress_failure_stage(error: &ProxySendError) -> CodexEgressFailureStage
         ProxySendError::RetryableConnection("dns") => CodexEgressFailureStage::Dns,
         ProxySendError::RetryableConnection("tls") => CodexEgressFailureStage::Tls,
         ProxySendError::RetryableConnection("connect") => CodexEgressFailureStage::Connect,
+        ProxySendError::RetryableConnection("connect_timeout") => {
+            CodexEgressFailureStage::Connect
+        }
         ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout) => {
             CodexEgressFailureStage::Timeout
         }

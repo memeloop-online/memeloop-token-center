@@ -19,6 +19,10 @@ use crate::response_archive_spool::{BufferedArchive, BufferedArchivePurpose};
 const TASK_LIMIT: usize = 16;
 const BYTE_LIMIT: usize = 32 * 1024 * 1024;
 const JOB_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on how long a queued archive job may hold its request body while
+/// waiting for memory permits. Without it the wait queue is unbounded and every
+/// queued job pins a full request body in the process.
+const ARCHIVE_PERMIT_WAIT: Duration = Duration::from_secs(5);
 
 tokio::task_local! {
     static ARCHIVE_DEADLINE: (Arc<GatewayPersistence>, tokio::time::Instant);
@@ -233,7 +237,10 @@ impl Database {
         let persistence = self.gateway_persistence.clone();
         let immediate = persistence.try_admit(charge);
         persistence.accepted.fetch_add(1, Ordering::Relaxed);
-        let body = Bytes::copy_from_slice(body);
+        // `Bytes` is refcounted, so this only bumps a reference on a buffer the
+        // request path already owns. Deep-copying it here made every queued
+        // archive job hold its own full copy of the request body.
+        let body: Bytes = body.clone();
         let pepper = pepper.to_vec();
         let mut database = self.clone();
         database.pool = persistence.pool.clone();
@@ -241,7 +248,32 @@ impl Database {
         tokio::spawn(async move {
             let _permits = match immediate {
                 Some((slot, bytes)) => (slot, Some(bytes)),
-                None => persistence.acquire_archive_permits(charge).await,
+                None => {
+                    // A bounded wait keeps the queue finite. Losing the archive
+                    // job leaves the durable `gap://` locator behind, which the
+                    // worker already handles; unbounded waiting traded that gap
+                    // for process-wide memory growth.
+                    match tokio::time::timeout(
+                        ARCHIVE_PERMIT_WAIT,
+                        persistence.acquire_archive_permits(charge),
+                    )
+                    .await
+                    {
+                        Ok(permits) => permits,
+                        Err(_) => {
+                            database
+                                .gateway_persistence
+                                .capacity
+                                .fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                %request_id,
+                                reason = "archive_permit_timeout",
+                                "request archive omitted; durable gap retained"
+                            );
+                            return;
+                        }
+                    }
+                }
             };
             // Permit wait is outside the capture deadline. A full memory
             // semaphore must not expire the job and drop the raw request JSON.

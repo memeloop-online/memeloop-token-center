@@ -475,17 +475,21 @@ impl Journal {
             .values_mut()
             .filter(|entry| entry.durable && entry.reconcile && !entry.running)
         {
+            // A receipt that already handed its conversation to the projection
+            // queue no longer needs the parsed request body to prove anything:
+            // the queue row is the record. Keeping it here is what made the
+            // process grow without bound, because these receipts are never
+            // removed (an unknown settlement keeps `reconcile` set forever).
             let keep_unknown_evidence = entry.unknown_annotated
                 && entry.snapshot.claim.is_some()
                 && entry.snapshot.usage_basis
-                    != Some(crate::model::RequestUsageBasis::ProviderReported);
+                    != Some(crate::model::RequestUsageBasis::ProviderReported)
+                && !entry.conversation_enqueued;
             if !keep_unknown_evidence && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
                 snapshot.conversation = None;
             }
             // The budgeted body can leave once its projection is durable.
             // Until then the permit stays with the unenqueued evidence.
-            // The conversation value itself stays: it is the receipt, not the
-            // budgeted buffer.
             if !keep_unknown_evidence || entry.conversation_enqueued {
                 entry.projection_retained = None;
             }
