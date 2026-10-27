@@ -8,6 +8,8 @@ pub struct SelectedEgress {
     pub group_name: Option<String>,
     pub member_id: Option<Uuid>,
     pub member_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_version: Option<i64>,
     scheme: Option<String>,
     host: Option<String>,
     port: Option<u16>,
@@ -44,6 +46,7 @@ impl SelectedEgress {
             group_name: None,
             member_id: None,
             member_name: None,
+            proxy_version: None,
             scheme: address.as_ref().map(|value| value.0.clone()),
             host: address.as_ref().map(|value| value.1.clone()),
             port: address.and_then(|value| value.2),

@@ -148,6 +148,10 @@ impl Database {
             .bind(id.to_string()).bind(target.map(|id| id.to_string())).bind(version)
             .bind(target.map(|_| selected.id.to_string())).bind(unix_millis()).execute(&mut *tx).await?;
         budget(&mut tx, key).await?;
+        sqlx::query("DELETE FROM network_proxy_selection_policies WHERE account_id = $1")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
         audit(
             &mut tx,
             &tenant_id,

@@ -11,6 +11,7 @@ use super::*;
 mod managed;
 mod persistence;
 mod probe;
+pub(crate) mod strategy;
 #[cfg(test)]
 mod tests;
 

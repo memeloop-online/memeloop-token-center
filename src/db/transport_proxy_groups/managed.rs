@@ -20,6 +20,7 @@ impl ManagedEntry {
                 selected.group_name = self.group_name.clone();
                 selected.member_id = Some(member.id);
                 selected.member_name = Some(member.label.clone());
+                selected.proxy_version = Some(member.version);
                 Ok(selected)
             })
             .collect::<Result<Vec<_>, AppError>>()
@@ -42,7 +43,7 @@ impl TransportProxyGroups {
 
     pub(crate) async fn refresh_managed(&self, pool: &AnyPool) -> Result<(), AppError> {
         crate::db::network_proxies::normalize_legacy_members(pool, &self.key).await?;
-        let rows = sqlx::query("SELECT b.account_id, b.version AS binding_version, b.group_id, b.initial_member_id, b.replacement_member_id, g.version AS group_version, g.name AS group_name, g.members_ciphertext, g.probe_url, g.probe_attempts, a.credential_generation, a.config_json, s.group_fingerprint AS saved_fingerprint, s.credential_generation AS saved_generation, s.selection_generation AS saved_epoch, s.base_index AS saved_base, s.selected_index AS saved_selected FROM transport_proxy_bindings b JOIN upstream_accounts a ON a.id = b.account_id LEFT JOIN transport_proxy_groups g ON g.id = b.group_id LEFT JOIN upstream_transport_proxy_selections s ON s.account_id = b.account_id WHERE b.group_id IS NOT NULL ORDER BY b.account_id LIMIT 257")
+        let rows = sqlx::query("SELECT b.account_id, b.version AS binding_version, b.group_id, b.initial_member_id, b.replacement_member_id, g.version AS group_version, g.name AS group_name, g.probe_url, g.probe_attempts, p.proxy_id AS manual_proxy_id, p.version AS policy_version, a.credential_generation, a.config_json, s.group_fingerprint AS saved_fingerprint, s.credential_generation AS saved_generation, s.selection_generation AS saved_epoch, s.base_index AS saved_base, s.selected_index AS saved_selected FROM transport_proxy_bindings b JOIN upstream_accounts a ON a.id = b.account_id LEFT JOIN transport_proxy_groups g ON g.id = b.group_id LEFT JOIN network_proxy_selection_policies p ON p.account_id = b.account_id LEFT JOIN upstream_transport_proxy_selections s ON s.account_id = b.account_id WHERE b.group_id IS NOT NULL OR p.mode = 'manual' ORDER BY b.account_id LIMIT 257")
             .fetch_all(pool).await?;
         let mut next = BTreeMap::new();
         let mut active = 0usize;
@@ -62,6 +63,7 @@ impl TransportProxyGroups {
                 return Err(unavailable());
             }
             let generation: i64 = row.try_get("credential_generation")?;
+            let manual: Option<String> = row.try_get("manual_proxy_id")?;
             let members: Vec<Member> = if group_id.is_some() {
                 active += 1;
                 crate::db::network_proxies::load_group_members(
@@ -70,10 +72,24 @@ impl TransportProxyGroups {
                     &self.key,
                 )
                 .await?
+            } else if let Some(proxy_id) = manual {
+                active += 1;
+                let proxy = sqlx::query("SELECT p.id, p.name, p.version, p.proxy_ciphertext FROM network_proxies p JOIN upstream_accounts a ON a.tenant_id = p.tenant_id WHERE p.id = $1 AND a.id = $2")
+                    .bind(proxy_id).bind(account_id.to_string()).fetch_one(pool).await?;
+                vec![Member {
+                    id: parse_uuid(proxy.try_get("id")?)?,
+                    label: proxy.try_get("name")?,
+                    version: proxy.try_get("version")?,
+                    proxy_url: open_private_json(
+                        &proxy.try_get::<String, _>("proxy_ciphertext")?,
+                        &self.key,
+                        crate::db::network_proxies::PROXY_AAD,
+                    )?,
+                }]
             } else {
                 Vec::new()
             };
-            let entry = if group_id.is_some() {
+            let entry = if !members.is_empty() {
                 let proxies = members
                     .iter()
                     .map(|member| member.proxy_url.clone())

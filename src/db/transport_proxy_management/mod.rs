@@ -6,7 +6,9 @@ use crate::db::network_proxies::{
 mod bindings;
 mod groups;
 mod oauth;
+mod policies;
 mod selection;
+pub(crate) use policies::UpdateProxySelection;
 #[cfg(test)]
 mod tests;
 mod types;

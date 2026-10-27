@@ -5,6 +5,12 @@ pub(crate) struct Member {
     pub id: Uuid,
     pub label: String,
     pub proxy_url: String,
+    #[serde(default = "initial_proxy_version")]
+    pub version: i64,
+}
+
+fn initial_proxy_version() -> i64 {
+    1
 }
 
 #[derive(Deserialize)]
@@ -151,6 +157,7 @@ pub(super) fn members(
             id,
             label: item.label,
             proxy_url,
+            version: old.map(|member| member.version).unwrap_or(1),
         });
     }
     Ok(output)

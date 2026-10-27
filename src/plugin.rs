@@ -29,6 +29,7 @@ mod configuration;
 /// host-opted-in through `application` and never enabled by the production binary.
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod lifecycle;
+pub mod network_proxy_strategy;
 pub mod routing;
 pub(crate) mod service_data;
 mod ui_projection;
@@ -146,6 +147,8 @@ pub struct PluginManifest {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginContributions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_proxy_strategy: Option<network_proxy_strategy::NetworkProxyStrategyContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_routing: Option<routing::GroupRoutingContribution>,
     #[serde(default)]
@@ -2249,6 +2252,7 @@ pub fn validate_plugin_package(directory: &Path) -> Result<PluginManifest, AppEr
 }
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
+    network_proxy_strategy::validate_contribution(manifest)?;
     routing::validate_contribution(manifest)?;
     if manifest.id.is_empty()
         || manifest.id.len() > MAX_PLUGIN_ID_BYTES

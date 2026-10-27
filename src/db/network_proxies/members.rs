@@ -9,11 +9,12 @@ pub(crate) async fn load_group_members<'connection, Executor>(
 where
     Executor: sqlx::Executor<'connection, Database = Any>,
 {
-    let rows = sqlx::query("SELECT p.id, p.name, p.proxy_ciphertext FROM network_proxy_group_members m JOIN network_proxies p ON p.id = m.proxy_id JOIN transport_proxy_groups g ON g.id = m.group_id AND g.tenant_id = p.tenant_id WHERE m.group_id = $1 ORDER BY m.position")
+    let rows = sqlx::query("SELECT p.id, p.name, p.version, p.proxy_ciphertext FROM network_proxy_group_members m JOIN network_proxies p ON p.id = m.proxy_id JOIN transport_proxy_groups g ON g.id = m.group_id AND g.tenant_id = p.tenant_id WHERE m.group_id = $1 ORDER BY m.position")
         .bind(group_id).fetch_all(executor).await?;
     rows.into_iter()
         .map(|row| {
             Ok(Member {
+                version: row.try_get("version")?,
                 id: parse_uuid(row.try_get("id")?)?,
                 label: row.try_get("name")?,
                 proxy_url: open_private_json(
