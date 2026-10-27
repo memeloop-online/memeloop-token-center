@@ -714,9 +714,9 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
     },
     Migration {
-        version: 139,
+        version: 142,
         name: "session task relationships and explicit names",
-        sql: include_str!("../../../migrations/common/0139_session_task_relationships.sql"),
+        sql: include_str!("../../../migrations/common/0142_session_task_relationships.sql"),
     },
 ];
 
@@ -1415,9 +1415,9 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
     },
     Migration {
-        version: 139,
+        version: 142,
         name: "session task relationships and explicit names",
-        sql: include_str!("../../../migrations/common/0139_session_task_relationships.sql"),
+        sql: include_str!("../../../migrations/common/0142_session_task_relationships.sql"),
     },
 ];
 
