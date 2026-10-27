@@ -6,6 +6,177 @@ mod cache_coverage;
 mod semantic_isolation;
 mod semantic_retry;
 
+#[tokio::test]
+async fn sqlite_session_body_rebuild_rewrites_only_two_locator_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = crate::AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("session-body-rebuild.db").display()
+    )))
+    .await
+    .unwrap();
+    let database = &state.db;
+    let request = serde_json::json!({
+        "model": "raw-provider-model",
+        "private_request_field": "exclude from training",
+        "messages": [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "question"}
+        ]
+    });
+    let response = serde_json::json!({
+        "id": "raw-provider-response-id",
+        "private_response_field": "exclude from training",
+        "choices": [{"message": {"role": "assistant", "content": "answer"}}]
+    });
+    let request_locator = format!("inline-json:{request}");
+    let response_locator = format!("inline-json:{response}");
+    let mut selected = None;
+    let mut excluded = Vec::new();
+    for (request_object, response_object) in [
+        ("", None),
+        (request_locator.as_str(), None),
+        (request_locator.as_str(), Some("")),
+        ("", Some(response_locator.as_str())),
+        (request_locator.as_str(), Some(response_locator.as_str())),
+    ] {
+        let (key, reservation, request_id) = admitted(database, false).await;
+        let hints = ConversationHints {
+            session_id: Some(request_id.to_string()),
+            ..ConversationHints::default()
+        };
+        let mut input = finish(&key, &reservation, request_id);
+        input.conversation = Some(ProxyConversationInput {
+            key: &key,
+            request_json: &request,
+            hints: &hints,
+            client_name: None,
+            upstream_response_id: None,
+        });
+        database.finish_proxy_request_deferred(input).await.unwrap();
+        let terminal_owner = Uuid::now_v7();
+        database
+            .claim_terminal_projection_tasks(terminal_owner, 32)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .project_claimed_terminal_projection_task(terminal_owner, request_id)
+                .await
+                .unwrap()
+        );
+        let cluster = database
+            .record_conversation_observation(&key, request_id, &request, &hints, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE request_records SET request_object = $1, response_object = $2 WHERE id = $3",
+        )
+        .bind(request_object)
+        .bind(response_object)
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        // Both old snapshot columns must be cleared before exposing a rebuild.
+        sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 1, statistics_outcome = 'applied', semantic_snapshot_json = '{}', semantic_payload_snapshot_json = '{}', lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $1")
+            .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        if !request_object.is_empty() && response_object.is_some_and(|value| !value.is_empty()) {
+            selected = Some((request_id, key.tenant_id, cluster));
+        } else {
+            excluded.push(request_id);
+        }
+    }
+    let (request_id, tenant_id, cluster) = selected.unwrap();
+    assert_eq!(database.reopen_session_body_rebuilds(32).await.unwrap(), 1);
+    let marker = sqlx::query("SELECT projected_at, semantic_snapshot_json, semantic_payload_snapshot_json, lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(marker.get::<Option<i64>, _>("projected_at"), None);
+    for field in [
+        "semantic_snapshot_json",
+        "semantic_payload_snapshot_json",
+        "terminal_lease_owner",
+    ] {
+        assert_eq!(marker.get::<Option<String>, _>(field), None);
+    }
+    assert_eq!(
+        marker.get::<Option<i64>, _>("terminal_lease_expires_at"),
+        None
+    );
+    assert_eq!(
+        marker.get::<String, _>("lease_owner"),
+        "session-body-rebuild"
+    );
+    assert_eq!(marker.get::<i64, _>("lease_expires_at"), i64::MAX);
+    let old_claimable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE projected_at IS NULL AND ((lease_expires_at IS NULL OR lease_expires_at <= $1) OR ((semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL) AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $1)))")
+        .bind(unix_millis()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(old_claimable, 0);
+    let owner = Uuid::now_v7();
+    let tasks = database
+        .claim_conversation_projection_tasks(owner, 32)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].request_id, request_id);
+    assert!(
+        crate::worker::archive_session_body(&state, owner, request_id)
+            .await
+            .unwrap()
+    );
+    let expected = crate::conversation::session_body_from_documents(&request, &response);
+    let (atoms, nodes) = expected.into_prefix();
+    assert_eq!(atoms.len(), 3);
+    let observation = sqlx::query(
+        "SELECT leaf_node_hash, cluster_id FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        observation.get::<String, _>("leaf_node_hash"),
+        nodes.last().unwrap().node_hash
+    );
+    assert_eq!(
+        observation.get::<String, _>("cluster_id"),
+        cluster.to_string()
+    );
+    let mut turns = Vec::new();
+    for atom in atoms {
+        let content: String = sqlx::query_scalar(
+            "SELECT content_json FROM semantic_atoms WHERE tenant_id = $1 AND content_hash = $2",
+        )
+        .bind(tenant_id.to_string())
+        .bind(&atom.content_hash)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(!content.contains("private_request_field"));
+        assert!(!content.contains("private_response_field"));
+        assert!(!content.contains("raw-provider"));
+        turns.push(serde_json::from_str(&content).unwrap());
+    }
+    let dialogue = crate::conversation::training_dialogue(&turns);
+    assert_eq!(
+        dialogue
+            .iter()
+            .map(|turn| turn.role.as_str())
+            .collect::<Vec<_>>(),
+        ["system", "user", "assistant"]
+    );
+    assert_eq!(dialogue[2].origin, "return");
+    assert_eq!(dialogue[2].parts[0]["text"], "answer");
+    assert_eq!(database.reopen_session_body_rebuilds(32).await.unwrap(), 0);
+    for excluded_id in excluded {
+        let row = sqlx::query("SELECT projected_at, statistics_outcome, semantic_snapshot_json, semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(excluded_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(row.get::<i64, _>("projected_at"), 1);
+        assert_eq!(row.get::<String, _>("statistics_outcome"), "applied");
+        assert_eq!(row.get::<String, _>("semantic_snapshot_json"), "{}");
+        assert_eq!(row.get::<String, _>("semantic_payload_snapshot_json"), "{}");
+    }
+}
+
 async fn admitted(
     database: &Database,
     metered: bool,
