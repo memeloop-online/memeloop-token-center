@@ -134,7 +134,8 @@ test('session tasks: CAS rename protects concurrent names, relations manage, rol
     const zonedPage = await browser.newPage({ timezoneId: 'America/New_York' });
     await zonedPage.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await zonedPage.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-tasks.html`);
-    await zonedPage.getByRole('combobox').fill('Alpha');
+    await zonedPage.getByRole('combobox').click();
+    await zonedPage.keyboard.type('Alpha');
     await zonedPage.getByRole('option', { name: /Parent task Alpha/ }).click();
     await zonedPage.getByText('11/1/2026', { exact: true }).waitFor();
     await zonedPage.getByText('11/2/2026', { exact: true }).waitFor();
