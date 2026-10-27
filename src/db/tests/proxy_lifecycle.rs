@@ -1910,7 +1910,7 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
 }
 
 #[tokio::test]
-async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
+async fn buffered_settlement_enqueues_while_conversation_content_is_locked() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
@@ -1963,10 +1963,6 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
     }]});
     let atom = extract_atoms(&request_json).remove(0);
     let mut blocker = database.begin_write_transaction().await.unwrap();
-    let blocker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *blocker)
-        .await
-        .unwrap();
     sqlx::query(
         "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
     )
@@ -2048,24 +2044,11 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
     .unwrap();
     preseal_budget.rollback().await.unwrap();
     release_response_preseal.send(()).unwrap();
-    let waiting = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE datname = current_database() AND state = 'active' AND wait_event_type = 'Lock' AND query LIKE 'INSERT INTO semantic_atoms%' AND $1 = ANY(pg_blocking_pids(pid))",
-            )
-            .bind(blocker_pid)
-            .fetch_one(&database.pool)
-            .await
-            .unwrap();
-            if waiting > 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-    // Keep the content blocker open while another archive operation takes the
-    // global budget. Preparation must hold neither this row nor the session.
+    let terminal = tokio::time::timeout(std::time::Duration::from_secs(15), &mut finish).await;
+    if terminal.is_err() {
+        finish.abort();
+        let _ = finish.await;
+    }
     let budget = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         database.spool_transaction(),
@@ -2079,20 +2062,22 @@ async fn buffered_conversation_content_wait_does_not_hold_archive_budget() {
         _ => false,
     };
     blocker.rollback().await.unwrap();
-    let terminal = tokio::time::timeout(std::time::Duration::from_secs(15), &mut finish).await;
-    if terminal.is_err() {
-        finish.abort();
-        let _ = finish.await;
-    }
-    waiting.expect("buffered finish must reach the immutable-content lock barrier");
     assert!(
         budget_available,
-        "content preparation must release the archive budget"
+        "settlement releases the archive budget while content remains locked"
     );
     assert!(matches!(
         terminal.unwrap().unwrap().unwrap(),
         FinishProxyRequestResult::Finished { .. }
     ));
+    let queued: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND lease_owner = 'terminal-v118'), (SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1), (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1)",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(queued, (1, 1, 0));
 }
 
 #[tokio::test]
@@ -2323,6 +2308,43 @@ async fn concurrent_proxy_starts_serialize_in_sqlite() {
             .await
             .unwrap(),
         16
+    );
+}
+
+async fn archive_queued_lifecycle_body(database: &Database, request_id: Uuid) {
+    let row = sqlx::query(
+        "SELECT o.observed_at, r.completed_at, p.request_json, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = o.request_id) AS observations FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id JOIN conversation_semantic_payloads p ON p.request_id = o.request_id WHERE o.request_id = $1 AND o.projected_at IS NULL",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.get::<i64, _>("observed_at"),
+        row.get::<i64, _>("completed_at")
+    );
+    assert_eq!(row.get::<i64, _>("observations"), 0);
+    let request: serde_json::Value =
+        serde_json::from_str(&row.get::<String, _>("request_json")).unwrap();
+    let owner = Uuid::now_v7();
+    let tasks = database
+        .claim_conversation_projection_tasks(owner, 32)
+        .await
+        .unwrap();
+    assert!(tasks.iter().any(|task| task.request_id == request_id));
+    let body = crate::conversation::session_body_from_documents(&request, &serde_json::json!({}));
+    let (atoms, nodes) = body.into_prefix();
+    assert!(
+        database
+            .prepare_session_body_archive(owner, request_id, &atoms, &nodes, &[])
+            .await
+            .unwrap()
+    );
+    assert!(
+        database
+            .project_claimed_conversation_projection_task(owner, request_id)
+            .await
+            .unwrap()
     );
 }
 
@@ -2600,6 +2622,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
             ..
         }
     ));
+    archive_queued_lifecycle_body(&database, request_id).await;
     let committed = sqlx::query(
             "SELECT r.status AS reservation_status, q.status_code, q.input_tokens, q.output_tokens, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.id) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, (SELECT COUNT(*) FROM request_daily_aggregates) AS aggregate_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS finished_events, (SELECT COUNT(*) FROM conversation_observations o WHERE o.request_id = q.id AND o.upstream_response_id = 'resp-atomic') AS observation_count FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE r.id = $1",
         )
@@ -2969,6 +2992,7 @@ async fn concurrent_proxy_terminal_owners_settle_and_link_once() {
     }
     assert_eq!(winners, 1);
     assert_eq!(replays, 5);
+    archive_queued_lifecycle_body(&database, request_id).await;
     let counts = sqlx::query(
             "SELECT (SELECT COUNT(*) FROM ledger_entries WHERE source = $1) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = $2) AS fact_count, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $3) AS observation_count, (SELECT COUNT(*) FROM request_events WHERE request_id = $4 AND event_kind = 'finished') AS event_count",
         )

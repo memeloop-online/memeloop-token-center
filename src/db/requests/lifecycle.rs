@@ -1683,14 +1683,11 @@ impl Database {
                         "request reservation ownership mismatch".into(),
                     ));
                 }
-                if existing
+                let completed_at = existing
                     .try_get::<Option<i64>, _>("completed_at")?
-                    .is_none()
-                {
-                    return Err(AppError::Conflict(
-                        "request terminal ownership changed".into(),
-                    ));
-                }
+                    .ok_or_else(|| {
+                        AppError::Conflict("request terminal ownership changed".into())
+                    })?;
                 let result = FinishProxyRequestResult::AlreadyFinished {
                     status_code: existing
                         .try_get::<Option<i64>, _>("status_code")?
@@ -1728,7 +1725,7 @@ impl Database {
                             &mut transaction,
                             input.request_id,
                             conversation,
-                            now,
+                            completed_at,
                         )
                         .await?;
                     }
