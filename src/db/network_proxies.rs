@@ -1,4 +1,6 @@
 use super::*;
+mod members;
+pub(crate) use members::{load_group_members, normalize_legacy_members, store_group_members};
 
 pub(crate) const PROXY_AAD: &[u8] = b"mtc/network-proxy/v1";
 
@@ -115,6 +117,7 @@ impl Database {
         external: &str,
         key: &[u8],
     ) -> Result<Value, AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         let rows = sqlx::query("SELECT p.* FROM network_proxies p JOIN tenants t ON t.id = p.tenant_id WHERE t.external_id = $1 ORDER BY p.name, p.id")
             .bind(external).fetch_all(&self.pool).await?;
         let items = rows
@@ -130,6 +133,7 @@ impl Database {
         external: &str,
         key: &[u8],
     ) -> Result<Value, AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         let row = sqlx::query("SELECT p.* FROM network_proxies p JOIN tenants t ON t.id = p.tenant_id WHERE p.id = $1 AND t.external_id = $2")
             .bind(id.to_string()).bind(external).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;
         let mut result = proxy_view(&row, external, key)?;
@@ -148,6 +152,7 @@ impl Database {
         actor: Option<Uuid>,
         key: &[u8],
     ) -> Result<Value, AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         validate_proxy_name(&body.name)?;
         validate_probe(&body.probe)?;
         crate::network::validate_managed_codex_proxy(&body.proxy_url).await?;
@@ -187,6 +192,7 @@ impl Database {
         actor: Option<Uuid>,
         key: &[u8],
     ) -> Result<Value, AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         validate_proxy_name(&body.name)?;
         if let Some(probe) = &body.probe {
             validate_probe(probe)?;
@@ -222,6 +228,12 @@ impl Database {
             interval_ms: row.try_get("probe_interval_ms")?,
             attempts: row.try_get("probe_attempts")?,
         });
+        let old_proxy: String = open_private_json(
+            &row.try_get::<String, _>("proxy_ciphertext")?,
+            key,
+            PROXY_AAD,
+        )?;
+        let old_name: String = row.try_get("name")?;
         let ciphertext = body
             .proxy_url
             .as_ref()
@@ -234,6 +246,8 @@ impl Database {
         sqlx::query("UPDATE network_proxies SET name = $1, version = $2, proxy_ciphertext = $3, probe_enabled = $4, probe_target = $5, probe_interval_ms = $6, probe_attempts = $7, updated_at = $8, last_probe_status = NULL, last_probe_checked_at = NULL, last_probe_latency_ms = NULL WHERE id = $9")
             .bind(&body.name).bind(version).bind(ciphertext).bind(i64::from(probe.enabled)).bind(probe.target_url)
             .bind(probe.interval_ms).bind(probe.attempts).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
+        self.refresh_network_proxy_references(&mut tx, id, &old_proxy, &old_name, None, key)
+            .await?;
         proxy_audit(&mut tx, &tenant, id, "proxy_update", version, actor).await?;
         tx.commit().await?;
         self.get_network_proxy(id, &body.tenant_external_id, key)

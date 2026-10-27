@@ -183,8 +183,12 @@ pub(crate) fn probe_settings(
     Ok((url, attempts))
 }
 
-pub(super) fn view(row: &AnyRow, tenant_external_id: &str, key: &[u8]) -> Result<Value, AppError> {
-    let members = open_members(row, key)?.into_iter().map(|member| {
+pub(super) fn view(
+    row: &AnyRow,
+    tenant_external_id: &str,
+    members: Vec<Member>,
+) -> Result<Value, AppError> {
+    let members = members.into_iter().map(|member| {
         let parsed = url::Url::parse(&member.proxy_url).map_err(|_| AppError::internal("types_view_1"))?;
         Ok(serde_json::json!({"id":member.id,"label":member.label,"scheme":parsed.scheme(),"host":parsed.host_str(),"port":parsed.port().unwrap_or(1080),"remote_dns":true,"has_auth":!parsed.username().is_empty() || parsed.password().is_some()}))
     }).collect::<Result<Vec<_>, AppError>>()?;

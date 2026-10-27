@@ -13,8 +13,7 @@ CREATE TABLE network_proxies (
     last_probe_latency_ms BIGINT,
     probe_requested BIGINT NOT NULL DEFAULT 0,
     created_at BIGINT NOT NULL,
-    updated_at BIGINT NOT NULL,
-    UNIQUE (tenant_id, name)
+    updated_at BIGINT NOT NULL
 );
 CREATE TABLE network_proxy_group_members (
     group_id TEXT NOT NULL REFERENCES transport_proxy_groups(id) ON DELETE CASCADE,

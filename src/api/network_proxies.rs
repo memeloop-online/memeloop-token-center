@@ -22,7 +22,7 @@ fn response(result: Result<(StatusCode, Value), AppError>) -> Response {
     let mut response = match result {
         Ok((StatusCode::NO_CONTENT, _)) => StatusCode::NO_CONTENT.into_response(),
         Ok((status, body)) => (status, Json(body)).into_response(),
-        Err(AppError::Storage(_)) => AppError::Overloaded.into_response(),
+        Err(AppError::Storage { .. }) => AppError::Overloaded.into_response(),
         Err(error) => error.into_response(),
     };
     response.headers_mut().insert(

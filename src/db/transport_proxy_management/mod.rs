@@ -1,4 +1,7 @@
 use super::*;
+use crate::db::network_proxies::{
+    load_group_members, normalize_legacy_members, store_group_members,
+};
 
 mod bindings;
 mod groups;
@@ -11,7 +14,6 @@ pub(crate) use oauth::lock_oauth_transport_group;
 pub(crate) use types::*;
 
 pub(crate) const CONFIG_KEY: &str = "__mtc_transport_proxy_binding";
-const MEMBERS_AAD: &[u8] = b"mtc/transport-proxy-members/v1";
 
 fn conflict(code: &'static str) -> AppError {
     AppError::ProxyGroupConflict(code)
@@ -69,14 +71,6 @@ fn validate_name(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn open_members(row: &AnyRow, key: &[u8]) -> Result<Vec<Member>, AppError> {
-    open_private_json(
-        &row.try_get::<String, _>("members_ciphertext")?,
-        key,
-        MEMBERS_AAD,
-    )
-}
-
 async fn available_name(
     tx: &mut Transaction<'_, Any>,
     tenant_id: &str,
@@ -95,11 +89,12 @@ async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppErro
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_groups")
         .fetch_one(&mut **tx)
         .await?;
-    let rows = sqlx::query("SELECT b.account_id, g.members_ciphertext FROM transport_proxy_bindings b JOIN transport_proxy_groups g ON g.id = b.group_id")
+    let rows = sqlx::query("SELECT b.account_id, g.id FROM transport_proxy_bindings b JOIN transport_proxy_groups g ON g.id = b.group_id")
         .fetch_all(&mut **tx).await?;
     let mut bytes = 0usize;
     for row in &rows {
-        let proxies = open_members(row, key)?
+        let proxies = load_group_members(&mut **tx, &row.try_get::<String, _>("id")?, key)
+            .await?
             .into_iter()
             .map(|member| member.proxy_url)
             .collect::<Vec<_>>();
@@ -116,4 +111,81 @@ async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppErro
         return Err(conflict("proxy_group_capacity_exceeded"));
     }
     Ok(())
+}
+
+impl Database {
+    pub(crate) async fn refresh_network_proxy_references(
+        &self,
+        tx: &mut Transaction<'_, Any>,
+        proxy_id: Uuid,
+        old_proxy: &str,
+        old_name: &str,
+        exclude_group: Option<&str>,
+        key: &[u8],
+    ) -> Result<(), AppError> {
+        let groups = sqlx::query("SELECT g.id, g.tenant_id, g.version FROM transport_proxy_groups g JOIN network_proxy_group_members m ON m.group_id = g.id WHERE m.proxy_id = $1 ORDER BY g.id")
+            .bind(proxy_id.to_string()).fetch_all(&mut **tx).await?;
+        for group in groups {
+            let id: String = group.try_get("id")?;
+            if exclude_group == Some(id.as_str()) {
+                continue;
+            }
+            let tenant_id: String = group.try_get("tenant_id")?;
+            let version = group
+                .try_get::<i64, _>("version")?
+                .checked_add(1)
+                .ok_or_else(|| AppError::internal("network_proxy_group_version"))?;
+            let next = load_group_members(&mut **tx, &id, key).await?;
+            let mut previous = next.clone();
+            if let Some(member) = previous.iter_mut().find(|member| member.id == proxy_id) {
+                member.proxy_url = old_proxy.to_owned();
+                member.label = old_name.to_owned();
+            }
+            sqlx::query(
+                "UPDATE transport_proxy_groups SET version = $1, updated_at = $2 WHERE id = $3",
+            )
+            .bind(version)
+            .bind(unix_millis())
+            .bind(&id)
+            .execute(&mut **tx)
+            .await?;
+            let accounts = sqlx::query("SELECT account_id, version, initial_member_id FROM transport_proxy_bindings WHERE group_id = $1 ORDER BY account_id")
+                .bind(&id).fetch_all(&mut **tx).await?;
+            for account in accounts {
+                let account_id = parse_uuid(account.try_get("account_id")?)?;
+                let initial = parse_uuid(account.try_get("initial_member_id")?)?;
+                let base = next
+                    .iter()
+                    .find(|member| member.id == initial)
+                    .ok_or_else(invalid)?;
+                let stamp = BindingStamp {
+                    selection_version: revision(tx).await?,
+                    binding_version: account.try_get("version")?,
+                    group_id: Some(parse_uuid(id.clone())?),
+                    group_version: Some(version),
+                };
+                self.write_transport_account(
+                    tx,
+                    account_id,
+                    &tenant_id,
+                    &stamp,
+                    &base.proxy_url,
+                    None,
+                    key,
+                )
+                .await?;
+                selection::rebase_selection(
+                    tx,
+                    account_id,
+                    &previous,
+                    &next,
+                    initial,
+                    Some(initial),
+                    key,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
 }
