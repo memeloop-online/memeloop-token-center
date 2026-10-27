@@ -758,8 +758,8 @@ impl Database {
                 if body.is_empty() {
                     return Ok(false);
                 }
-                let (leaf, atom_hashes) =
-                    conversation_prefix_from_request_json(body.as_bytes()).map_err(|_| {
+                let (leaf, atom_hashes) = conversation_prefix_from_request_json(body.as_bytes())
+                    .map_err(|_| {
                         AppError::internal(
                             "conversations_project_claimed_conversation_projection_task_2",
                         )

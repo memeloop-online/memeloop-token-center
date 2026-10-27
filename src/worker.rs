@@ -1006,7 +1006,8 @@ pub(crate) async fn archive_session_body(
         },
         None => b"{}".to_vec(),
     };
-    let Ok(mut request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes) else {
+    let Ok(mut request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes)
+    else {
         return skip_session_body(
             state,
             lease_owner,

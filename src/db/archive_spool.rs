@@ -1295,12 +1295,31 @@ impl Database {
         hold.phase("gc_select_and_delete");
         let row = match self.backend {
             DatabaseBackend::PostgreSql => {
-                // Each indexed class contributes its oldest unlocked row, and
-                // the globally oldest candidate wins. Locking happens during
-                // selection so a busy oldest row cannot hide later work and
+                // Each class contributes its oldest unlocked row. Abandoned
+                // requests win first; other classes retain oldest-first order.
+                // Locking during selection means a busy oldest row cannot hide
+                // later work, and
                 // concurrent workers naturally fan out across the queue.
-                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose,
+                let (abandoned_candidate, abandoned_union) = if purpose
+                    == BufferedArchivePurpose::Request
+                {
+                    (
+                            "abandoned_candidate AS MATERIALIZED (
+                               SELECT s.request_id, s.updated_at AS eligible_at
+                               FROM response_archive_spools s CROSS JOIN db_clock c
+                               WHERE s.cleaned_at IS NULL AND s.state = 'pending'
+                                 AND s.updated_at <= c.db_now - 2700000
+                                 AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NULL)
+                               ORDER BY s.updated_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
+                             ),",
+                            "UNION ALL SELECT request_id, eligible_at, 0 AS priority FROM abandoned_candidate",
+                        )
+                } else {
+                    ("", "")
+                };
+                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, &format!(
                     "WITH db_clock AS MATERIALIZED (SELECT CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT) AS db_now),
+                     {abandoned_candidate}
                      bound_candidate AS MATERIALIZED (
                        SELECT s.request_id, s.updated_at AS eligible_at
                        FROM response_archive_spools s
@@ -1320,21 +1339,35 @@ impl Database {
                        ORDER BY s.lease_expires_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
                      ),
                      chosen AS (
-                       SELECT request_id, eligible_at FROM bound_candidate
-                       UNION ALL SELECT request_id, eligible_at FROM expired_candidate
-                       UNION ALL SELECT request_id, eligible_at FROM exhausted_candidate
-                       ORDER BY eligible_at, request_id LIMIT 1
+                       SELECT request_id, eligible_at, 1 AS priority FROM bound_candidate
+                       UNION ALL SELECT request_id, eligible_at, 1 AS priority FROM expired_candidate
+                       UNION ALL SELECT request_id, eligible_at, 1 AS priority FROM exhausted_candidate
+                       {abandoned_union}
+                       ORDER BY priority, eligible_at, request_id LIMIT 1
                      )
                      SELECT s.request_id, s.state, s.cipher_bytes, c.db_now
-                     FROM chosen JOIN response_archive_spools s USING (request_id) CROSS JOIN db_clock c")))
+                     FROM chosen JOIN response_archive_spools s USING (request_id) CROSS JOIN db_clock c"))))
                 .fetch_optional(&mut *tx)
                 .await?
             }
             DatabaseBackend::Sqlite => {
                 // BEGIN IMMEDIATE serializes SQLite writers, so row-level skip
                 // locking is neither available nor necessary. Preserve the
-                // three partial-index-friendly probes and recheck eligibility
-                // using database time inside the write transaction.
+                // existing partial-index-friendly probes, with abandoned
+                // requests first, and recheck using database time.
+                let abandoned_predicate = if purpose == BufferedArchivePurpose::Request {
+                    "s.state = 'pending' AND s.updated_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 2700000 AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NULL)"
+                } else {
+                    "0 = 1"
+                };
+                let abandoned = if purpose == BufferedArchivePurpose::Request {
+                    sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, &format!(
+                        "SELECT s.request_id FROM response_archive_spools s WHERE s.cleaned_at IS NULL AND ({abandoned_predicate}) ORDER BY s.updated_at, s.request_id LIMIT 1"
+                    ))))
+                    .fetch_optional(&mut *tx).await?
+                } else {
+                    None
+                };
                 let hint_now = super::unix_millis();
                 let bound = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT request_id, updated_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'bound' ORDER BY updated_at, request_id LIMIT 1")))
                     .fetch_optional(&mut *tx).await?;
@@ -1352,11 +1385,15 @@ impl Database {
                         candidate = Some(item);
                     }
                 }
-                let Some((_, id)) = candidate else {
+                let id = if let Some(abandoned) = abandoned {
+                    abandoned.try_get::<String, _>("request_id")?
+                } else if let Some((_, id)) = candidate {
+                    id
+                } else {
                     return Ok(None);
                 };
-                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose,
-                    "SELECT request_id, state, cipher_bytes, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AS db_now FROM response_archive_spools WHERE request_id = $1 AND cleaned_at IS NULL AND (state = 'bound' OR expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) OR (state = 'uploading' AND attempts >= 10 AND lease_expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)))")))
+                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, &format!(
+                    "SELECT request_id, state, cipher_bytes, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AS db_now FROM response_archive_spools s WHERE request_id = $1 AND cleaned_at IS NULL AND (state = 'bound' OR expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) OR (state = 'uploading' AND attempts >= 10 AND lease_expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)) OR ({abandoned_predicate}))"))))
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?

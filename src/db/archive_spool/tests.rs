@@ -1520,6 +1520,151 @@ async fn cleanup_time_budget_stops_between_committed_batches() {
 }
 
 #[tokio::test]
+async fn abandoned_request_spool_cleanup_releases_budget_before_bound_and_keeps_fresh_pending() {
+    let (_dir, db, abandoned) = fixture().await;
+    let fresh = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    let bound = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    let completed = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    let wrong_tenant = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    let wrong_reservation = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    for identity in [fresh, bound, completed, wrong_tenant, wrong_reservation] {
+        sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+            .bind(Uuid::new_v4().to_string()).bind(identity.reservation_id.to_string())
+            .execute(&db.pool).await.unwrap();
+    }
+    for identity in [
+        abandoned,
+        fresh,
+        bound,
+        completed,
+        wrong_tenant,
+        wrong_reservation,
+    ] {
+        assert!(
+            db.capture_buffered_archive_spool(
+                identity,
+                BufferedArchivePurpose::Request,
+                &[ArchiveSpoolChunk {
+                    seq: 0,
+                    byte_count: 3,
+                    ciphertext: "opaque".into(),
+                }],
+            )
+            .await
+            .unwrap()
+        );
+    }
+    assert!(
+        db.capture_buffered_archive_spool(
+            abandoned,
+            BufferedArchivePurpose::Response,
+            &[ArchiveSpoolChunk {
+                seq: 0,
+                byte_count: 3,
+                ciphertext: "opaque".into(),
+            }],
+        )
+        .await
+        .unwrap()
+    );
+    sqlx::query("UPDATE request_archive_spools SET updated_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 2700001 WHERE request_id <> $1")
+        .bind(fresh.request_id.to_string()).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE response_archive_spools SET updated_at = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE request_archive_spools SET state = 'bound', updated_at = 0 WHERE request_id = $1",
+    )
+    .bind(bound.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    terminal(&db, completed).await;
+    sqlx::query("UPDATE request_archive_spools SET tenant_id = $1 WHERE request_id = $2")
+        .bind(Uuid::new_v4().to_string())
+        .bind(wrong_tenant.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_archive_spools SET reservation_id = $1 WHERE request_id = $2")
+        .bind(Uuid::new_v4().to_string())
+        .bind(wrong_reservation.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let per_spool = SPOOL_OVERHEAD + CHUNK_OVERHEAD + 6;
+    assert_eq!(budget(&db).await, 7 * per_spool);
+    assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 1);
+    let row = sqlx::query("SELECT state, cleaned_at, cipher_bytes, attempts FROM request_archive_spools WHERE request_id = $1")
+        .bind(abandoned.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("state"), "gap");
+    assert!(row.get::<Option<i64>, _>("cleaned_at").is_some());
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), 0);
+    assert_eq!(row.get::<i64, _>("attempts"), 0);
+    let row = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), 6 * per_spool);
+    assert_eq!(row.get::<i64, _>("request_cipher_bytes"), 5 * per_spool);
+    let row =
+        sqlx::query("SELECT state, cleaned_at FROM request_archive_spools WHERE request_id = $1")
+            .bind(bound.request_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "bound");
+    assert!(row.get::<Option<i64>, _>("cleaned_at").is_none());
+
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    for identity in [fresh, completed, wrong_tenant, wrong_reservation] {
+        let row = sqlx::query("SELECT state, cleaned_at, cipher_bytes FROM request_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("state"), "pending");
+        assert!(row.get::<Option<i64>, _>("cleaned_at").is_none());
+        assert_eq!(row.get::<i64, _>("cipher_bytes"), per_spool);
+    }
+    assert_eq!(
+        db.cleanup_archive_spool_batch(BufferedArchivePurpose::Response)
+            .await
+            .unwrap(),
+        None
+    );
+    let remaining_chunks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = $1",
+    )
+    .bind(abandoned.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining_chunks, 0);
+    assert_eq!(budget(&db).await, 5 * per_spool);
+    let request_budget: i64 = sqlx::query_scalar(
+        "SELECT request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(request_budget, 4 * per_spool);
+}
+
+#[tokio::test]
 async fn sqlite_cleanup_preserves_oldest_eligible_fairness_across_classes() {
     let (_dir, db, identity) = fixture().await;
     let expired = identity.request_id.to_string();

@@ -71,16 +71,26 @@ async fn recovery_contract(database_url: &str) {
     assert!(encoded.len() <= 128 * 1024 * 1024);
     assert!(sqlx::query("UPDATE conversation_semantic_payloads SET encoded_bytes = 134217729 WHERE request_id = $1")
         .bind(request_id.to_string()).execute(&database.pool).await.is_err());
-    let marker = sqlx::query("SELECT semantic_snapshot_json, semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+    let marker = sqlx::query("SELECT request_json, semantic_snapshot_json, semantic_payload_snapshot_json, lease_owner, lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
         .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
     assert_eq!(
-        marker.get::<Option<String>, _>("semantic_snapshot_json"),
+        serde_json::from_str::<serde_json::Value>(
+            &marker.get::<String, _>("semantic_snapshot_json")
+        )
+        .unwrap(),
+        serde_json::json!({"leaf": null, "atom_hashes": []})
+    );
+    assert_eq!(
+        marker.get::<Option<String>, _>("semantic_payload_snapshot_json"),
         None
     );
-    let snapshot: String = marker.get("semantic_payload_snapshot_json");
-    let legacy_claimable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND (semantic_snapshot_json IS NOT NULL OR lease_expires_at IS NULL OR lease_expires_at <= 0)")
-        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
-    assert_eq!(legacy_claimable, 0);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&marker.get::<String, _>("request_json"))
+            .unwrap(),
+        body
+    );
+    assert_eq!(marker.get::<String, _>("lease_owner"), "terminal-v118");
+    assert_eq!(marker.get::<i64, _>("lease_expires_at"), i64::MAX);
     let atoms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1")
         .bind(key.tenant_id.to_string())
         .fetch_one(&database.pool)
@@ -101,6 +111,14 @@ async fn recovery_contract(database_url: &str) {
             .await
             .unwrap()
     );
+    // Exercise recovery from the reduced payload without an inline request body.
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET request_json = '{}' WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
     for statement in [
         "DELETE FROM request_records WHERE id = $1",
         "DELETE FROM request_record_locators WHERE id = $1",
@@ -120,28 +138,16 @@ async fn recovery_contract(database_url: &str) {
             .iter()
             .any(|task| task.request_id == request_id)
     );
-    let mut invalid_snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
-    invalid_snapshot["payload_digest"] = serde_json::Value::Null;
-    sqlx::query("UPDATE conversation_projection_outbox SET semantic_payload_snapshot_json = $1 WHERE request_id = $2")
-        .bind(invalid_snapshot.to_string()).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
-    assert!(
-        database
-            .project_claimed_conversation_projection_task(stale, request_id)
-            .await
-            .is_err()
-    );
-    sqlx::query("UPDATE conversation_projection_outbox SET semantic_payload_snapshot_json = $1 WHERE request_id = $2")
-        .bind(&snapshot).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
     sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
         .bind(request_id.to_string())
         .execute(&database.pool)
         .await
         .unwrap();
     assert!(
-        database
+        !database
             .project_claimed_conversation_projection_task(stale, request_id)
             .await
-            .is_err()
+            .unwrap()
     );
     sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)")
         .bind(request_id.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(key.principal_id.to_string()).bind(encoded.len() as i64).bind(payload.get::<String, _>("digest")).bind(&encoded).execute(&database.pool).await.unwrap();

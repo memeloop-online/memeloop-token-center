@@ -124,7 +124,7 @@ config:
   proxyLifecycleConcurrency: 64
   # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
   # this budget + 256Mi. The budget is not a multiple of the maximum body.
-  proxyMemoryBudgetBytes: 536870912
+  proxyMemoryBudgetBytes: 2147483648
   # Count admission for readers without complete shared byte accounting.
   # Metered default text bodies use bytes; other readers retain 1..8192 permits.
   gatewayBodyReadConcurrency: 1024
