@@ -174,8 +174,20 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
+    // 140 and 141 only add indexes, so the downgrade has to remove them too or
+    // replaying those migrations would look like a no-op instead of an upgrade.
+    for statement in [
+        "DROP INDEX IF EXISTS session_archive_unlinked_recent_idx",
+        "DROP INDEX IF EXISTS request_egress_attempts_request_idx",
+        "DROP INDEX IF EXISTS conversation_observations_compacted_probe_idx",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
     sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139)",
+        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138, 139, 140, 141)",
     )
     .execute(&database.pool)
     .await
@@ -236,7 +248,7 @@ async fn upgrade_contract(database: &Database) {
         tail,
         vec![
             117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133,
-            134, 135, 136, 137, 138, 139
+            134, 135, 136, 137, 138, 139, 140, 141
         ]
     );
     let policy: String = sqlx::query_scalar(
@@ -278,7 +290,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136, 137, 138, 139
+                133, 134, 135, 136, 137, 138, 139, 140, 141
             ]
         );
     }
