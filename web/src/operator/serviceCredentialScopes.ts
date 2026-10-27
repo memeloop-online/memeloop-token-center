@@ -62,6 +62,48 @@ export function serviceCredentialCreatePayload(name: string, scopes: string[], t
   return { name: normalizedName, scopes: uniqueScopes, tenant_external_id: tenant };
 }
 
+export interface ServiceCredentialUpdateRequest {
+  name?: string;
+  scopes?: string[];
+  tenant_external_id?: string | null;
+}
+
+export type ServiceCredentialUpdatePlan =
+  | { status: 'ready'; payload: ServiceCredentialUpdateRequest }
+  | { status: 'unchanged' }
+  | { status: 'invalid' };
+
+/**
+ * The edit panel shares the create form's fields but saves through PATCH:
+ * only sections that actually changed are sent, and an omitted section is
+ * preserved by the server. The draft tenant '' is the explicit global
+ * option; it is never inferred from a missing or unloaded tenant list.
+ */
+export function serviceCredentialUpdatePlan(
+  current: { name: string; scopes: string[]; tenant_external_id: string | null },
+  draft: { name: string; scopes: string[]; tenant: string },
+): ServiceCredentialUpdatePlan {
+  const payload: ServiceCredentialUpdateRequest = {};
+  const normalizedName = draft.name.trim();
+  if (normalizedName !== current.name) {
+    if (!normalizedName || new TextEncoder().encode(normalizedName).length > 120) return { status: 'invalid' };
+    payload.name = normalizedName;
+  }
+  const uniqueScopes = [...new Set(draft.scopes)];
+  if (uniqueScopes.some((scope) => !supportedServiceCredentialScopes.has(scope))) return { status: 'invalid' };
+  const currentScopes = new Set(current.scopes);
+  const scopesChanged = uniqueScopes.length !== currentScopes.size || uniqueScopes.some((scope) => !currentScopes.has(scope));
+  if (scopesChanged) {
+    if (uniqueScopes.length === 0) return { status: 'invalid' };
+    payload.scopes = uniqueScopes;
+  }
+  if (draft.tenant !== (current.tenant_external_id ?? '')) {
+    if (draft.tenant && new TextEncoder().encode(draft.tenant).length > 200) return { status: 'invalid' };
+    payload.tenant_external_id = draft.tenant || null;
+  }
+  return Object.keys(payload).length === 0 ? { status: 'unchanged' } : { status: 'ready', payload };
+}
+
 const scopeCopy = new Map<string, ServiceCredentialScopeCopy>(serviceCredentialScopeGroups.flatMap((group) => group.scopes.map((scope) => [scope.value, scope] as const)));
 
 /** Ordinary labels identify permissions by name; the technical scope value stays available in labeled details. */

@@ -1,7 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Button, ToggleButton } from '@fluentui/react-components';
 import { DetailTooltip, LoadingProgress, LoadingState, PageLoadingRegion } from '../../design-system';
-import { api, apiDiagnosticMessage } from '../../api';
+import { ApiError, api, apiDiagnosticMessage } from '../../api';
 import { DrawerFrame, RequestDiagnostics, RequestTable } from '../../components';
 import { formatCurrencyDisplay, formatDurationDisplay, formatMetricDisplay, formatPercent } from '../../format';
 import { LocalSettlementNotice, localSettlementLabel } from '../../LocalSettlementNotice';
@@ -51,6 +51,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const [detailResult, setDetail] = useState<{ value: RequestDetail; token: string; tenant: string; requestId: string }>();
   const [error, setError] = useState('');
   const [upstreamError, setUpstreamError] = useState('');
+  const [upstreamDenied, setUpstreamDenied] = useState(false);
   const [filteredResultsStale, setFilteredResultsStale] = useState(false);
   const [imageReviewOpen, setImageReviewOpen] = useState(false);
   const sequence = useRef(0);
@@ -240,12 +241,14 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     loadAbort.current?.abort(); loadAbort.current = null;
     errorSource.current = undefined;
     loadingRef.current = false;
-    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError('');
+    sequence.current += 1; setFilters(emptyTypedFilterAst); setRequests([]); setDetail(undefined); setHasOlder(false); setLoading(false); setFilteredResultsStale(false); setImageReviewOpen(false); setError(''); setUpstreamError(''); setUpstreamDenied(false);
     if (!token || !tenant) { setUpstreams([]); return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); }; }
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
-      .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); } })
-      .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); setUpstreamError(apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels)); } });
+      .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); setUpstreamDenied(false); } })
+      // A 403 on this optional catalog is a capability boundary, not a search
+      // failure: requests, filters, and details keep working with ID labels.
+      .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); const denied = reason instanceof ApiError && reason.status === 403; setUpstreamDenied(denied); setUpstreamError(denied ? '' : apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels)); } });
     void load(emptyTypedFilterAst);
     return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); };
   }, [tenant, token, writeTenant]);
@@ -406,6 +409,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0${writeTenant}\0requests`} label={t('common.loading')}>
     {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
+    {upstreamDenied && <div className="notice warning" role="status">{t('request.upstreamCatalogDenied')}</div>}
     {streamError && <div className="notice error" role="alert">{t('request.streamSource')}: {streamError}</div>}
     <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}

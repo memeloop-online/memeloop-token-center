@@ -1,16 +1,18 @@
 import { useCallback, useEffect, useReducer, useRef } from 'react';
 
+import { ApiError } from '../../api';
+
 export type ResourceState<T> =
   | { kind: 'idle'; scopeKey: string; disabled?: boolean }
   | { kind: 'loading'; scopeKey: string }
-  | { kind: 'ready'; scopeKey: string; value: T; refreshing?: boolean; refreshError?: string }
-  | { kind: 'failed'; scopeKey: string; message: string };
+  | { kind: 'ready'; scopeKey: string; value: T; refreshing?: boolean; refreshError?: string; refreshErrorStatus?: number }
+  | { kind: 'failed'; scopeKey: string; message: string; status?: number };
 
 type ResourceAction<T> =
   | { type: 'reset'; scopeKey: string }
   | { type: 'loading'; scopeKey: string }
   | { type: 'ready'; scopeKey: string; value: T }
-  | { type: 'failed'; scopeKey: string; message: string };
+  | { type: 'failed'; scopeKey: string; message: string; status?: number };
 
 function reducer<T>(state: ResourceState<T>, action: ResourceAction<T>): ResourceState<T> {
   switch (action.type) {
@@ -19,13 +21,13 @@ function reducer<T>(state: ResourceState<T>, action: ResourceAction<T>): Resourc
     // producing a distracting flash, unmounting loses in-progress OAuth state
     // and action confirmations owned by that workspace.
     case 'loading': return state.kind === 'ready' && state.scopeKey === action.scopeKey
-      ? { ...state, refreshing: true, refreshError: undefined } : { kind: 'loading', scopeKey: action.scopeKey };
+      ? { ...state, refreshing: true, refreshError: undefined, refreshErrorStatus: undefined } : { kind: 'loading', scopeKey: action.scopeKey };
     case 'ready': return { kind: 'ready', scopeKey: action.scopeKey, value: action.value, refreshing: false };
     // Keep an already usable workspace mounted when a background refresh
     // fails. Action-local feedback and OAuth/form state must not disappear.
     case 'failed': return state.kind === 'ready' && state.scopeKey === action.scopeKey
-      ? { ...state, refreshing: false, refreshError: action.message }
-      : { kind: 'failed', scopeKey: action.scopeKey, message: action.message };
+      ? { ...state, refreshing: false, refreshError: action.message, refreshErrorStatus: action.status }
+      : { kind: 'failed', scopeKey: action.scopeKey, message: action.message, status: action.status };
   }
 }
 
@@ -59,7 +61,7 @@ export function useOperatorResource<T>(
       if (!current.signal.aborted && request === sequence.current) dispatch({ type: 'ready', scopeKey, value });
     } catch (reason) {
       if (!current.signal.aborted && request === sequence.current) {
-        dispatch({ type: 'failed', scopeKey, message: reason instanceof Error ? reason.message : fallbackMessageRef.current });
+        dispatch({ type: 'failed', scopeKey, message: reason instanceof Error ? reason.message : fallbackMessageRef.current, status: reason instanceof ApiError ? reason.status : undefined });
       }
     }
   }, [enabled, scopeKey]);

@@ -10,7 +10,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-copy' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'client-form' | 'client-filter' | 'client-lifecycle';
+type Scenario = 'all-tenants' | 'route-failure' | 'scope-race' | 'scope-lock' | 'client-copy' | 'service-copy' | 'service-plaintext' | 'service-scope-aba' | 'service-edit' | 'client-form' | 'client-filter' | 'client-lifecycle';
 
 interface RecordedRequest {
   method: string;
@@ -41,6 +41,18 @@ const parameters = new URLSearchParams(location.search);
 const scenario = (parameters.get('scenario') ?? 'all-tenants') as Scenario;
 const initialTenant = scenario === 'all-tenants' ? '' : scenario === 'client-lifecycle' ? 'default' : 'tenant-a';
 const deletedClientIds = new Set<string>();
+
+let serviceEditState = {
+  service_id: 'service-existing',
+  name: 'Existing service credential',
+  credential_generation: 1,
+  credential_copy_available: false,
+  fingerprint: 'fixture-fingerprint',
+  scopes: ['keys:read'],
+  tenant_external_id: 'tenant-a' as string | null,
+  status: 'active',
+  created_at: 1_700_000_000_000,
+};
 
 const pendingIssues: Array<(response: Response) => void> = [];
 const pendingRouting: Array<(response: Response) => void> = [];
@@ -170,7 +182,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     credentials: init?.credentials,
     referrerPolicy: init?.referrerPolicy,
     hasSignal: Boolean(init?.signal),
-    ...((scenario === 'client-form' || scenario === 'client-lifecycle') && typeof init?.body === 'string' ? { body: init.body } : {}),
+    ...((scenario === 'client-form' || scenario === 'client-lifecycle' || scenario === 'service-edit') && typeof init?.body === 'string' ? { body: init.body } : {}),
   });
   if (url.pathname === '/internal/v1/schemas') {
     return json({
@@ -191,14 +203,25 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     // must fence a response from an old tenant/auth epoch.
     return new Promise<Response>((resolve) => pendingIssues.push(resolve));
   }
+  if (url.pathname === '/internal/v1/service-tokens/service-existing' && method === 'PATCH' && scenario === 'service-edit') {
+    if (parameters.has('forbidden')) return json({ error: { code: 'forbidden', message: 'fixture global service_tokens:write required' } }, 403);
+    const body = JSON.parse(String(init?.body ?? '{}'));
+    serviceEditState = {
+      ...serviceEditState,
+      name: typeof body.name === 'string' ? body.name : serviceEditState.name,
+      scopes: Array.isArray(body.scopes) ? body.scopes : serviceEditState.scopes,
+      tenant_external_id: body.tenant_external_id === undefined ? serviceEditState.tenant_external_id : body.tenant_external_id,
+    };
+    return json(serviceEditState);
+  }
   if (url.pathname === '/internal/v1/service-tokens') return json([{
     service_id: 'service-existing',
-    name: 'Existing service credential',
+    name: scenario === 'service-edit' ? serviceEditState.name : 'Existing service credential',
     credential_generation: 1,
     credential_copy_available: scenario === 'service-copy' && !parameters.has('missing-original'),
     fingerprint: 'fixture-fingerprint',
-    scopes: ['keys:read'],
-    tenant_external_id: initialTenant || 'tenant-a',
+    scopes: scenario === 'service-edit' ? serviceEditState.scopes : ['keys:read'],
+    tenant_external_id: scenario === 'service-edit' ? serviceEditState.tenant_external_id : (initialTenant || 'tenant-a'),
     status: parameters.has('revoked') ? 'revoked' : parameters.has('suspended') ? 'suspended' : 'active',
     created_at: 1_700_000_000_000,
   }]);
@@ -336,11 +359,11 @@ function Fixture() {
   const [tenant, setTenant] = useState(initialTenant);
   const { locale, setLocale } = useI18n();
   if (scenario === 'client-form') return <main style={{ maxWidth: 960, margin: '0 auto', padding: 12 }}><button data-change-locale type="button" onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Switch language</button><CredentialsPage token="mts_fixture" tenant={tenant} /></main>;
-  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba' || scenario === 'service-copy') {
+  if (scenario === 'service-plaintext' || scenario === 'service-scope-aba' || scenario === 'service-copy' || scenario === 'service-edit') {
     return <>
       {scenario === 'service-scope-aba' && <button type="button" onClick={() => setTenant((current) => current === 'tenant-a' ? 'tenant-b' : 'tenant-a')}>Switch tenant</button>}
       <span>Tenant {tenant}</span>
-      <ServiceCredentialsPage token="mts_fixture" tenant={tenant} />
+      <ServiceCredentialsPage token="mts_fixture" tenant={tenant} tenants={[{ external_id: 'tenant-a' }, { external_id: 'tenant-b' }]} />
     </>;
   }
   return <>
