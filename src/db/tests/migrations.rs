@@ -915,13 +915,12 @@ async fn sqlite_usage_analysis_compaction_probe_index_exists() {
     let database = Database::connect(&database_url).await.unwrap();
     database.migrate().await.unwrap();
 
-    let installed: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $1",
-    )
-    .bind("conversation_observations_compacted_probe_idx")
-    .fetch_one(&database.pool)
-    .await
-    .unwrap();
+    let installed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $1")
+            .bind("conversation_observations_compacted_probe_idx")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
     assert_eq!(
         installed, 1,
         "missing v141 usage-analysis compaction probe index"
@@ -931,13 +930,12 @@ async fn sqlite_usage_analysis_compaction_probe_index_exists() {
     // observation would just duplicate conversation_observations_request_id_key.  The
     // plan itself is not asserted because SQLite legitimately prefers that existing
     // unique key for a request_id equality lookup.
-    let definition: String = sqlx::query_scalar(
-        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = $1",
-    )
-    .bind("conversation_observations_compacted_probe_idx")
-    .fetch_one(&database.pool)
-    .await
-    .unwrap();
+    let definition: String =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = $1")
+            .bind("conversation_observations_compacted_probe_idx")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
     let normalized = definition.to_lowercase().replace(['\n', '\r'], " ");
     assert!(
         normalized.contains("where") && normalized.contains("compaction = 1"),

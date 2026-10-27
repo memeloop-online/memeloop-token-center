@@ -736,7 +736,9 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 141,
         name: "usage analysis compaction probe index",
-        sql: include_str!("../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"),
+        sql: include_str!(
+            "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
+        ),
     },
 ];
 
@@ -1457,7 +1459,9 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
     Migration {
         version: 141,
         name: "usage analysis compaction probe index",
-        sql: include_str!("../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"),
+        sql: include_str!(
+            "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
+        ),
     },
 ];
 

@@ -737,9 +737,7 @@ fn codex_egress_failure_stage(error: &ProxySendError) -> CodexEgressFailureStage
         ProxySendError::RetryableConnection("dns") => CodexEgressFailureStage::Dns,
         ProxySendError::RetryableConnection("tls") => CodexEgressFailureStage::Tls,
         ProxySendError::RetryableConnection("connect") => CodexEgressFailureStage::Connect,
-        ProxySendError::RetryableConnection("connect_timeout") => {
-            CodexEgressFailureStage::Connect
-        }
+        ProxySendError::RetryableConnection("connect_timeout") => CodexEgressFailureStage::Connect,
         ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout) => {
             CodexEgressFailureStage::Timeout
         }
