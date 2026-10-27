@@ -10,6 +10,9 @@ mod semantic_payload;
 #[cfg(test)]
 mod semantic_order_tests;
 
+#[cfg(test)]
+mod archive_readiness_tests;
+
 use projection_retry::ConversationContentError;
 
 // Candidate selection reads at most 50 observations. Persisting the complete
@@ -84,6 +87,12 @@ pub(crate) struct ConversationObservationInput<'a> {
 pub struct ConversationProjectionTask {
     pub request_id: Uuid,
     pub observed_at: i64,
+}
+
+pub(crate) struct SessionBodyLocators {
+    pub(crate) request: String,
+    pub(crate) response: Option<String>,
+    pub(crate) pending: bool,
 }
 
 pub(crate) struct ConversationProjectionEnqueueInput<'a> {
@@ -512,23 +521,54 @@ impl Database {
 
     /// 读取这条请求上的原始请求 JSON locator 和原始返回 JSON locator。
     /// 没有记录时两个都空，调用方应跳过会话正文归档，而不是让客户端失败。
-    pub async fn session_body_locators(
+    pub(crate) async fn session_body_locators(
         &self,
         request_id: Uuid,
-    ) -> Result<Option<(String, Option<String>)>, AppError> {
+    ) -> Result<Option<SessionBodyLocators>, AppError> {
         let row = sqlx::query(
-            "SELECT request_object, response_object FROM request_records WHERE id = $1 LIMIT 1",
+            "SELECT r.request_object, r.response_object, CAST(CASE WHEN
+                (q.state IN ('capturing', 'pending', 'uploading') AND q.expires_at > $2
+                 AND (q.state <> 'uploading' OR q.attempts < 10 OR q.lease_expires_at > $2))
+                OR (s.state IN ('capturing', 'pending', 'uploading') AND s.expires_at > $2
+                 AND (s.state <> 'uploading' OR s.attempts < 10 OR s.lease_expires_at > $2))
+                OR (COALESCE(r.completed_at, r.created_at) > $2 - $3 AND
+                    ((q.request_id IS NULL AND r.request_object = 'gap://' || r.id || '/request')
+                     OR (s.request_id IS NULL AND r.response_object = 'gap://' || r.id || '/response')))
+                THEN 1 ELSE 0 END AS BIGINT) AS archives_pending
+             FROM request_records r
+             LEFT JOIN request_archive_spools q ON q.request_id = r.id AND q.tenant_id = r.tenant_id AND q.reservation_id = r.reservation_id
+             LEFT JOIN response_archive_spools s ON s.request_id = r.id AND s.tenant_id = r.tenant_id AND s.reservation_id = r.reservation_id
+             WHERE r.id = $1 LIMIT 1",
         )
         .bind(request_id.to_string())
+        .bind(unix_millis())
+        .bind(super::super::archive_spool::CAPTURE_TTL)
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {
             return Ok(None);
         };
-        Ok(Some((
-            row.try_get("request_object")?,
-            row.try_get("response_object")?,
-        )))
+        Ok(Some(SessionBodyLocators {
+            request: row.try_get("request_object")?,
+            response: row.try_get("response_object")?,
+            pending: row.try_get::<i64, _>("archives_pending")? != 0,
+        }))
+    }
+
+    pub(crate) async fn defer_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+        )
+        .bind(unix_millis().saturating_add(5000))
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// locator 是 gap:// 时，用结算时已经收好的对话字段。不读对象存储。

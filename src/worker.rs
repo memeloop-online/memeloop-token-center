@@ -967,9 +967,7 @@ pub(crate) async fn archive_session_body(
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
-    let Some((request_locator, return_locator)) =
-        state.db.session_body_locators(request_id).await?
-    else {
+    let Some(locators) = state.db.session_body_locators(request_id).await? else {
         return skip_session_body(
             state,
             lease_owner,
@@ -978,7 +976,14 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
-    let request_bytes = match load_raw_document(state, &request_locator).await {
+    if locators.pending {
+        state
+            .db
+            .defer_session_body_archive(lease_owner, request_id)
+            .await?;
+        return Ok(false);
+    }
+    let request_bytes = match load_raw_document(state, &locators.request).await {
         Ok(bytes) => bytes,
         Err(_) => {
             let inline = state
@@ -986,7 +991,7 @@ pub(crate) async fn archive_session_body(
                 .session_body_inline_request(lease_owner, request_id)
                 .await?;
             match inline {
-                Some(json) if json != "{}" && !json.is_empty() => json.into_bytes(),
+                Some(json) if json != "{}" && !json.is_empty() => bytes::Bytes::from(json),
                 _ => {
                     return skip_session_body(
                         state,
@@ -999,13 +1004,6 @@ pub(crate) async fn archive_session_body(
             }
         }
     };
-    let return_bytes = match return_locator.filter(|locator| !locator.is_empty()) {
-        Some(locator) => match load_raw_document(state, &locator).await {
-            Ok(bytes) => bytes,
-            Err(_) => b"{}".to_vec(),
-        },
-        None => b"{}".to_vec(),
-    };
     let Ok(mut request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes)
     else {
         return skip_session_body(
@@ -1016,6 +1014,7 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
+    drop(request_bytes);
     // locator 读出来的占位文档没有对话字段时，改用结算时留下的缩减请求 JSON。
     if request_document.get("messages").is_none()
         && request_document.get("input").is_none()
@@ -1032,10 +1031,19 @@ pub(crate) async fn archive_session_body(
     }
     // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
     // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
+    let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
+        Some(locator) => load_raw_document(state, &locator)
+            .await
+            .unwrap_or_else(|_| bytes::Bytes::from_static(b"{}")),
+        None => bytes::Bytes::from_static(b"{}"),
+    };
     let return_document = crate::conversation::raw_return_document(&return_bytes)
         .unwrap_or_else(|| serde_json::json!({}));
+    drop(return_bytes);
     let mut body =
         crate::conversation::session_body_from_documents(&request_document, &return_document);
+    drop(request_document);
+    drop(return_document);
     let pending_media = body.take_media_bytes();
     for (turn_index, part_index, bytes) in pending_media {
         match state.archive.put_content(bytes::Bytes::from(bytes)).await {
@@ -1079,7 +1087,7 @@ async fn skip_session_body(
     Ok(false)
 }
 
-async fn load_raw_document(state: &AppState, locator: &str) -> Result<Vec<u8>, &'static str> {
+async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
     if locator.starts_with("gap://")
         || locator.starts_with("metadata-only-json:")
         || locator.starts_with("provider-reference-json:")
@@ -1087,14 +1095,14 @@ async fn load_raw_document(state: &AppState, locator: &str) -> Result<Vec<u8>, &
         return Err("session_body_skipped_archive_unreadable");
     }
     if let Some(inline) = locator.strip_prefix("inline-json:") {
-        return Ok(inline.as_bytes().to_vec());
+        return Ok(bytes::Bytes::copy_from_slice(inline.as_bytes()));
     }
     match state
         .archive
         .get_bounded(locator, SESSION_BODY_ARCHIVE_READ_LIMIT)
         .await
     {
-        Ok(bytes) => Ok(bytes.to_vec()),
+        Ok(bytes) => Ok(bytes),
         Err(_) => Err("session_body_skipped_archive_unreadable"),
     }
 }
