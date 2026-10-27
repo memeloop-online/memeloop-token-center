@@ -109,7 +109,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     assert.match(await allTenantBalance.getAttribute('title') ?? '', /9,223,372,036,854\.775807/, 'the complete prepaid balance remains available in the tooltip');
     assert.equal(await allTenants.getByText('key-all', { exact: true }).count(), 0, 'technical credential IDs are not part of the list reading path');
     await allTenants.getByRole('button', { name: 'More actions', exact: true }).click();
-    assert.equal(await allTenants.getByRole('menuitem', { name: 'Rename', exact: true }).isDisabled(), true);
+    assert.equal(await allTenants.getByRole('menuitem', { name: 'Edit', exact: true }).isDisabled(), true);
     const limits = allTenants.getByRole('menuitem', { name: 'Current limit state', exact: true });
     assert.equal(await limits.isDisabled(), false, 'stable key ID permits a read-only limit lookup without selecting a tenant');
     await limits.click();
@@ -330,8 +330,10 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
       const modeLabel = english ? 'Metering and limit mode' : '计量与限额模式';
       await client.getByText(english ? 'Research workspace' : '研发工作区', { exact: true }).waitFor();
       await client.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
-      await client.getByRole('menuitem', { name: english ? 'Policy and limits' : '权限与限流', exact: true }).click();
+      await client.getByRole('menuitem', { name: english ? 'Edit' : '编辑', exact: true }).click();
       const edit = client.locator('.inline-editor.form-panel');
+      const renamedAlias = english ? 'Research workspace renamed' : '研发工作区改名';
+      await edit.getByRole('textbox', { name: english ? 'Credential alias' : '凭据别名', exact: true }).fill(renamedAlias);
       const editMode = edit.getByRole('combobox', { name: modeLabel, exact: true });
       await edit.locator('#root_max_concurrency').focus();
       await client.keyboard.press('Tab');
@@ -342,21 +344,31 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
       await nextPaint(client);
       assert.deepEqual(await edit.locator('.schema-errors').allTextContents(), [], 'valid policy must submit without schema validation errors');
       await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy')));
+      await edit.waitFor({ state: 'hidden' });
       const policyRequest = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy'))!);
       assert.equal(JSON.parse(policyRequest.body!).enforcement_mode, editedMode);
       assert.equal(JSON.parse(policyRequest.body!).daily_budget, null);
+      const aliasRequest = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PATCH' && request.path.endsWith('/key-form/alias')));
+      assert.equal(JSON.parse(aliasRequest!.body!).alias, renamedAlias, 'the unified editor saves the alias through the existing rename endpoint');
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path.endsWith('/routing')).length), 0, 'an untouched routing section is never rewritten');
+      await client.getByText(english ? 'Saved changes to Research workspace renamed.' : '已保存对 研发工作区改名 的修改。', { exact: true }).waitFor();
 
       await client.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
-      await client.getByRole('menuitem', { name: english ? 'Route access' : '路由权限', exact: true }).click();
-      const existingRouting = client.locator('.routing-editor');
+      await client.getByRole('menuitem', { name: english ? 'Edit' : '编辑', exact: true }).click();
+      const reopenedEdit = client.locator('.inline-editor.form-panel');
+      const existingRouting = reopenedEdit.locator('.routing-editor');
       await existingRouting.getByRole('region', { name: english ? 'Authorization scope preview' : '授权范围预览' }).getByText(/Spark disabled/, { exact: false }).waitFor();
       await existingRouting.getByRole('button', { name: english ? 'Individual model grants (1)' : '单独授权模型（1）', exact: true }).click();
       assert.match(await existingRouting.locator('.selection-chip').innerText(), /Spark disabled/, 'an unavailable existing grant stays selected');
       assert.equal(await existingRouting.locator('.selection-chip button').isEnabled(), true, 'the existing disabled grant remains explicitly removable');
-      await existingRouting.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
+      await reopenedEdit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
+      await client.getByText(english ? 'No changes to save.' : '没有需要保存的修改。', { exact: true }).waitFor();
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path.endsWith('/routing')).length), 0, 'an unchanged draft never rewrites grants');
+      await existingRouting.locator('.selection-chip button').click();
+      await reopenedEdit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
       await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing')));
       const savedRouting = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing'))!);
-      assert.deepEqual(JSON.parse(savedRouting.body!).route_ids, ['00000000-0000-4000-8000-000000000004'], 'saving does not silently drop unavailable existing grants');
+      assert.deepEqual(JSON.parse(savedRouting.body!).route_ids, [], 'an explicit removal of an unavailable grant persists');
 
       const create = client.locator('.create-journey');
       await create.locator(':scope > .journey-heading [data-workspace-toggle]').click();
@@ -460,7 +472,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await policies.goto(`${fixture('client-form')}&multiple-policies=1`);
     const openPolicy = async (alias: string) => {
       await policies.locator('.credential-compact-row').filter({ has: policies.getByText(alias, { exact: true }) }).getByRole('button', { name: 'More actions', exact: true }).click();
-      await policies.getByRole('menuitem', { name: 'Policy and limits', exact: true }).click();
+      await policies.getByRole('menuitem', { name: 'Edit', exact: true }).click();
       await policies.locator('.inline-editor #root_max_concurrency').waitFor();
     };
     await openPolicy('Other workspace');

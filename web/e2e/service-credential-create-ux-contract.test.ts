@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { chromium, type Locator } from 'playwright';
+import { chromium } from 'playwright';
 import { createIsolatedFixtureServer } from './support/isolated-vite-server.js';
 
 declare global {
@@ -46,7 +46,7 @@ async function localChromiumExecutable() {
 }
 
 test('service credential scopes match the runtime capability set', async () => {
-  const source = await readFile(new URL('../src/operator/pages/ManagementPages.tsx', import.meta.url), 'utf8');
+  const source = await readFile(new URL('../src/operator/serviceCredentialScopes.ts', import.meta.url), 'utf8');
   const runtime = await readFile(new URL('../../src/db/credentials/service_tokens.rs', import.meta.url), 'utf8');
   const uiScopes = source.slice(source.indexOf('const serviceCredentialScopeGroups = ['), source.indexOf('const serviceCredentialStatisticsScopes'));
   const runtimeScopes = runtime.match(/const SUPPORTED_SERVICE_SCOPES:.*?= &\[([\s\S]*?)\];/)?.[1];
@@ -71,7 +71,7 @@ test('service credential creation validates the draft and issues only a read-onl
   await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-credential-workspace.html?scenario=service-plaintext`);
   await page.getByText('Existing service credential', { exact: true }).waitFor();
   const payloadResults = await page.evaluate(async () => {
-    const modulePath = '/src/operator/pages/ManagementPages.tsx';
+    const modulePath = '/src/operator/serviceCredentialScopes.ts';
     const { serviceCredentialCreatePayload } = await import(modulePath);
     return {
       emptyName: serviceCredentialCreatePayload('  ', ['metrics:read'], 'tenant-a') ?? null,
@@ -115,102 +115,14 @@ test('service credential creation validates the draft and issues only a read-onl
   assert.equal(await metrics.isChecked(), true);
   assert.equal(await requests.isChecked(), true);
   assert.equal(await form.getByRole('checkbox', { name: '管理客户端凭据 (keys:write)' }).isChecked(), false);
-  const scopeHints = form.locator('.service-credential-scope-option > span[aria-label]');
-  const hintCount = await scopeHints.count();
+  const scopeOptions = form.locator('.service-credential-scope-option');
+  const hintCount = await scopeOptions.count();
   assert.ok(hintCount > 20, 'each supported permission has a supplemental explanation');
-  const hints = await scopeHints.evaluateAll(elements => elements.map(element => element.getAttribute('aria-label')?.replace(/^\S+: /, '')));
-  for (const hint of hints) assert.ok(hint);
+  const hints = await form.locator('.service-credential-scope-hint').allTextContents();
+  assert.equal(hints.length, hintCount, 'every permission shows its capability description inline');
+  for (const hint of hints) assert.ok(hint.trim());
   const requestsHint = '读取请求记录、监控快照和用量分析；不允许写入。';
-  assert.equal(await form.locator('[aria-label^="requests:read:"]').getAttribute('aria-label'),
-    `requests:read: ${requestsHint}`);
-  const trace = await page.evaluateHandle<{ read: (index: number) => unknown; stop: () => void }>(`(() => {
-    const forms = document.querySelectorAll('form.service-credential-create');
-    if (forms.length !== 1) throw new Error('Expected exactly one synthetic service credential form');
-    const triggers = [...forms[0].querySelectorAll('.service-credential-scope-option > span[aria-label]')];
-    const tooltipFor = (trigger) => document.getElementById(trigger.getAttribute('aria-describedby') ?? '');
-    const scopeFor = (target) => target instanceof Node
-      ? triggers.findIndex(trigger => trigger.contains(target) || tooltipFor(trigger)?.contains(target)) : -1;
-    const box = (target) => {
-      if (!target) return null;
-      const { x, y, width, height } = target.getBoundingClientRect();
-      const { display, visibility, opacity } = getComputedStyle(target);
-      return { x, y, width, height, display, visibility, opacity, hidden: target.hidden };
-    };
-    const visibleScopes = () => triggers.flatMap((trigger, index) => {
-      const tooltip = box(tooltipFor(trigger));
-      return tooltip && tooltip.width > 0 && tooltip.height > 0 && tooltip.display !== 'none' && tooltip.visibility === 'visible' ? [index] : [];
-    });
-    const events = [];
-    const record = (type, target, programmatic) => {
-      events.push({ time: Math.round(performance.now()), type, scope: scopeFor(target), active: scopeFor(document.activeElement), visible: visibleScopes(), programmatic });
-      if (events.length > 48) events.shift();
-    };
-    const onEvent = (event) => {
-      if (event instanceof KeyboardEvent && event.key !== 'Tab') return;
-      if (event.type.startsWith('pointer') && scopeFor(event.target) < 0) return;
-      const programmatic = event.type === 'keyborg:focusin' ? event.detail?.isFocusedProgrammatically : undefined;
-      record(event.type, event.target, programmatic);
-    };
-    const eventTypes = ['focusin', 'focusout', 'keyborg:focusin', 'pointerenter', 'pointerleave', 'keydown', 'scroll', 'visibilitychange'];
-    for (const type of eventTypes) document.addEventListener(type, onEvent, true);
-    const observer = new MutationObserver(records => {
-      for (const target of new Set(records.map(record => record.target))) {
-        if (target instanceof HTMLElement && target.getAttribute('role') === 'tooltip') record('tooltip-state', target);
-      }
-    });
-    observer.observe(document.body, { subtree: true, attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'] });
-    return {
-      read: (index) => ({ events, index, active: scopeFor(document.activeElement), exactFocus: triggers[index] === document.activeElement,
-        documentFocused: document.hasFocus(), visibility: document.visibilityState, visible: visibleScopes(),
-        hovered: triggers.flatMap((trigger, position) => trigger.matches(':hover') ? [position] : []),
-        trigger: box(triggers[index] ?? null), tooltip: triggers[index] ? box(tooltipFor(triggers[index])) : null }),
-      stop: () => { observer.disconnect(); for (const type of eventTypes) document.removeEventListener(type, onEvent, true); },
-    };
-  })()`);
-  const assertScopeHintWithKeyboard = async (trigger: Locator, hint: string, nextHint?: string) => {
-    const tooltip = page.getByRole('tooltip', { name: hint, exact: true });
-    assert.equal(await trigger.evaluate(element => element === document.activeElement), true, 'Tab focuses the exact scope help trigger');
-    await tooltip.waitFor({ state: 'visible' });
-    assert.equal(await tooltip.innerText(), hint, 'the focused permission exposes its exact explanation');
-
-    if (nextHint) await page.getByRole('tooltip', { name: nextHint, exact: true }).waitFor({ state: 'hidden' });
-    for (let step = 0; step < 2 && await trigger.evaluate(element => element.contains(document.activeElement)); step += 1) {
-      await page.keyboard.press('Tab');
-    }
-    assert.equal(await trigger.evaluate(element => element.contains(document.activeElement)), false, 'Tab leaves the scope help trigger and its checkbox');
-    await tooltip.waitFor({ state: 'hidden' });
-  };
-  const tabFromStatisticsPreset = async () => {
-    await page.mouse.move(-1, -1);
-    assert.equal(await statisticsPreset.evaluate(element => element === document.activeElement), true, 'keyboard traversal starts at the selected preset');
-    await page.waitForFunction(() => [...document.querySelectorAll<HTMLElement>('[role="tooltip"]')].every(element => {
-      const { width, height } = element.getBoundingClientRect();
-      const style = getComputedStyle(element);
-      return width === 0 || height === 0 || style.display === 'none' || style.visibility !== 'visible';
-    }));
-    await page.keyboard.press('Tab');
-  };
-  let phase = 'all-scopes';
-  let hintIndex = 0;
-  try {
-    await tabFromStatisticsPreset();
-    for (; hintIndex < hintCount; hintIndex += 1) {
-      await assertScopeHintWithKeyboard(scopeHints.nth(hintIndex), hints[hintIndex]!, hints[hintIndex + 1]);
-    }
-    phase = 'requests-revisit';
-    hintIndex = 0;
-    await statisticsPreset.click();
-    await tabFromStatisticsPreset();
-    await assertScopeHintWithKeyboard(form.locator('[aria-label^="metrics:read:"]'), hints[0]!, requestsHint);
-    hintIndex = 1;
-    await assertScopeHintWithKeyboard(form.locator('[aria-label^="requests:read:"]'), requestsHint, hints[2]);
-  } catch (error) {
-    context.diagnostic(`Scope tooltip keyboard failure (${phase}): ${JSON.stringify(await trace.evaluate((value, index) => value.read(index), hintIndex))}`);
-    throw error;
-  } finally {
-    await trace.evaluate(value => value.stop());
-    await trace.dispose();
-  }
+  assert.ok(hints.includes(requestsHint), 'the requests permission explains that it covers usage analysis without write access');
 
   await metrics.uncheck();
   await requests.uncheck();

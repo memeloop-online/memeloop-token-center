@@ -233,6 +233,10 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       return json({ key_id: 'key-created', key: 'mtc_fixture_created' });
     }
     if (url.pathname === '/internal/v1/keys/key-form/policy' && method === 'PUT') return json({});
+    if (url.pathname === '/internal/v1/keys/key-form/alias' && method === 'PATCH') return json({});
+    if (/^\/internal\/v1\/keys\/[^/]+\/routing$/.test(url.pathname) && url.pathname !== '/internal/v1/keys/key-form/routing') {
+      return json({ ...routingResponse, key_id: url.pathname.split('/')[4] });
+    }
     if (url.pathname === '/internal/v1/keys') return json([
       // Match the API's descending (created_at, key_id) keyset order.
       // These rows share a timestamp, and key-other sorts before key-form.

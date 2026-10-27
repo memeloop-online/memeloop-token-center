@@ -141,10 +141,15 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
     // and a late error after closing an editor, without external writes.
     await page.goto(`${origin}/e2e/fixtures/operator-credential-workspace.html?scenario=client-form&routing-lifecycle`);
     await page.getByRole('button', { name: '更多操作', exact: true }).click();
-    await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+    await page.getByRole('menuitem', { name: '编辑', exact: true }).click();
     await page.waitForFunction(() => window.credentialFixture.requests.some(request => request.path.includes('/key-form/routing')));
     await page.evaluate(() => window.credentialFixture.releaseRoutingResponse(200));
-    const saveRouting = page.locator('.routing-editor').getByRole('button', { name: '保存', exact: true });
+    const groupGrant = page.locator('.routing-editor').getByRole('combobox', { name: '路由组', exact: true });
+    await groupGrant.fill('Research group');
+    await groupGrant.press('ArrowDown');
+    await groupGrant.press('Enter');
+    await groupGrant.press('Escape');
+    const saveRouting = page.locator('.credential-active-editor .inline-editor').getByRole('button', { name: '保存', exact: true });
     await saveRouting.waitFor();
     await saveRouting.evaluate(button => { (button as HTMLButtonElement).click(); (button as HTMLButtonElement).click(); });
     await page.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT'));
@@ -153,7 +158,7 @@ test('AppShell workspaces retain failed drafts, return after success, and priori
     await page.evaluate(() => window.credentialFixture.releaseRoutingResponse(200));
     await page.waitForFunction(() => document.querySelector('.create-journey')?.getAttribute('data-open') === 'false');
     await page.getByRole('button', { name: '更多操作', exact: true }).click();
-    await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+    await page.getByRole('menuitem', { name: '编辑', exact: true }).click();
     await page.waitForFunction(() => window.credentialFixture.requests.filter(request => request.method === 'GET' && request.path.includes('/key-form/routing')).length === 2);
     await page.locator('.create-journey [data-workspace-toggle]').click();
     await page.evaluate(() => window.credentialFixture.releaseRoutingResponse(409));

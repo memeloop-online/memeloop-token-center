@@ -610,7 +610,7 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   const credential = page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) });
   const openedRouting = page.waitForResponse((response) => response.url().includes(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'GET');
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
-  await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+  await page.getByRole('menuitem', { name: '编辑', exact: true }).click();
   const openedRoutingResponse = await openedRouting;
   assert.equal(openedRoutingResponse.status(), 200, `${openedRoutingResponse.request().method()} ${openedRoutingResponse.url()} ${await openedRoutingResponse.text()}`);
   const routing = page.locator('.credential-active-editor .routing-editor');
@@ -625,7 +625,7 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   await assertCount(selectedRouteGroups, 1);
   await assertExactText(selectedRouteGroups, '默认路由');
   const routingSaved = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
-  await routing.getByRole('button', { name: '保存', exact: true }).click();
+  await page.locator('.credential-active-editor .inline-editor').getByRole('button', { name: '保存', exact: true }).click();
   const routingSavedResponse = await routingSaved;
   assert.equal(routingSavedResponse.status(), 200);
   const routingPayload = routingSavedResponse.request().postDataJSON() as Record<string, unknown>;
@@ -634,7 +634,7 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   assert.ok(Array.isArray(routingPayload.route_group_ids));
   assert.equal(routingPayload.route_group_ids.length, 1, 'saving the selected group must persist exactly one group grant');
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
-  await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+  await page.getByRole('menuitem', { name: '编辑', exact: true }).click();
   await assertContains(selectedRouteGroups, '默认路由');
   await assertContains(routing, '已保存授权关联');
   await assertContains(routing, '不代表当前可用');
@@ -648,19 +648,20 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
     body: { tenant_external_id: tenant, route_ids: current.route_ids, route_group_ids: [], expected_grant_revision: current.grant_revision },
   });
   const staleSave = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
-  await routing.getByRole('button', { name: '保存', exact: true }).click();
+  await routing.locator('.selection-chip button').click();
+  await page.locator('.credential-active-editor .inline-editor').getByRole('button', { name: '保存', exact: true }).click();
   assert.equal((await staleSave).status(), 409);
   await assertContains(page.locator('.create-journey').getByRole('alert'), '你的草稿已保留');
-  await assertContains(selectedRouteGroups, '默认路由');
+  await assertNoCount(selectedRouteGroups);
   await page.locator('.create-journey [data-workspace-toggle]').click();
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
-  await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+  await page.getByRole('menuitem', { name: '编辑', exact: true }).click();
   await assertVisible(routeGroupInput);
   await assertNoCount(selectedRouteGroups);
   await routeGroupInput.fill('默认路由');
   await routeGroupInput.press('Enter');
   const retrySave = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
-  await routing.getByRole('button', { name: '保存', exact: true }).click();
+  await page.locator('.credential-active-editor .inline-editor').getByRole('button', { name: '保存', exact: true }).click();
   const retryResponse = await retrySave;
   assert.equal(retryResponse.status(), 200);
   const retryPayload = retryResponse.request().postDataJSON() as Record<string, unknown>;
@@ -718,7 +719,7 @@ Then('凭据组只用于分类且不改变凭据授权或可用模型', async fu
   await page.getByLabel('按凭据组筛选').selectOption('all');
   const credential = page.locator('.managed-resource').filter({ has: page.locator(`b[title*="${seed.clientKeyId}"]`) });
   await credential.getByRole('button', { name: '更多操作', exact: true }).click();
-  await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
+  await page.getByRole('menuitem', { name: '编辑', exact: true }).click();
   const routing = page.locator('.credential-active-editor .routing-editor');
   await assertVisible(routing);
   await assertContains(routing, '已保存授权关联');
