@@ -143,6 +143,100 @@ async fn sqlite_deferred_session_body_retries_after_terminal_completion() {
 }
 
 #[tokio::test]
+async fn sqlite_deferred_session_edges_follow_admission_when_settlement_is_reversed() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = crate::AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("deferred-session-order.db").display()
+    )))
+    .await
+    .unwrap();
+    let database = &state.db;
+    let (key, parent_reservation, parent) = admitted(database, false).await;
+    let price = database
+        .upsert_model_price("deferred-order", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let child = Uuid::now_v7();
+    let child_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: child,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai",
+            model: "deferred-order",
+            request_object: "gap://deferred-order/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let hints = ConversationHints {
+        session_id: Some("deferred-order".into()),
+        ..Default::default()
+    };
+    let parent_body = serde_json::json!({"messages": [{"role": "user", "content": "one"}]});
+    let child_body = serde_json::json!({"messages": [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "three"}
+    ]});
+    for (request_id, reservation, body) in [
+        (child, &child_reservation, &child_body),
+        (parent, &parent_reservation, &parent_body),
+    ] {
+        let mut input = finish(&key, reservation, request_id);
+        input.response_object =
+            r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+        input.conversation = Some(ProxyConversationInput {
+            key: &key,
+            request_json: body,
+            hints: &hints,
+            client_name: None,
+            upstream_response_id: None,
+        });
+        database.finish_proxy_request_deferred(input).await.unwrap();
+        let terminal_owner = Uuid::now_v7();
+        database
+            .claim_terminal_projection_tasks(terminal_owner, 2)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .project_claimed_terminal_projection_task(terminal_owner, request_id)
+                .await
+                .unwrap()
+        );
+        let owner = Uuid::now_v7();
+        assert_eq!(
+            database
+                .claim_conversation_projection_tasks(owner, 1)
+                .await
+                .unwrap()[0]
+                .request_id,
+            request_id
+        );
+        assert!(
+            crate::worker::archive_session_body(&state, owner, request_id)
+                .await
+                .unwrap()
+        );
+    }
+    let edges: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT source.request_id, target.request_id, edge.relation_kind FROM conversation_edges edge JOIN conversation_observations source ON source.id = edge.from_observation_id JOIN conversation_observations target ON target.id = edge.to_observation_id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        edges,
+        vec![(parent.to_string(), child.to_string(), "continues".into())]
+    );
+}
+
+#[tokio::test]
 async fn sqlite_session_body_rebuild_rewrites_only_two_locator_rows() {
     let directory = tempfile::tempdir().unwrap();
     let state = crate::AppState::initialize(crate::config::Config::for_test(format!(

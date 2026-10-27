@@ -1344,7 +1344,6 @@ impl Database {
                     (RelationKind::Candidate, 0)
                 };
             let created_at: i64 = row.try_get("created_at")?;
-            let causally_prior = created_at <= now;
             let direct_parent = hints.parent_turn_id.is_some()
                 && (hints.parent_turn_id.as_deref() == candidate_turn.as_deref()
                     || hints.parent_turn_id.as_deref() == candidate_response.as_deref());
@@ -1352,6 +1351,22 @@ impl Database {
                 hints.turn_id.is_some() && hints.turn_id.as_deref() == candidate_turn.as_deref();
             let explicit_match = hints.session_id.is_some()
                 && hints.session_id.as_deref() == candidate_session.as_deref();
+            // Settlement can finish after a later request has already settled.
+            // Native session ancestry follows admission time, not that async
+            // completion order. Imports retain their supplied observation time.
+            let causally_prior = if explicit_match
+                && let Some(request_created_at) = request_created_at
+            {
+                let candidate_created_at: i64 = sqlx::query_scalar(
+                    "SELECT COALESCE(r.created_at, t.created_at, o.created_at) FROM conversation_observations o LEFT JOIN request_record_locators r ON r.id = o.request_id LEFT JOIN terminal_projection_outbox t ON t.request_id = o.request_id WHERE o.id = $1",
+                )
+                .bind(row.try_get::<String, _>("id")?)
+                .fetch_one(&mut **transaction)
+                .await?;
+                candidate_created_at <= request_created_at
+            } else {
+                created_at <= now
+            };
             let conflicting_sessions =
                 hints.session_id.is_some() && candidate_session.is_some() && !explicit_match;
             let exact_prefix = merkle_prefix
@@ -1859,7 +1874,7 @@ async fn fetch_structured_conversation_candidate(
 
     if let Some(session_id) = hints.session_id.as_deref() {
         let causal = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
