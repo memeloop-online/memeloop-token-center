@@ -43,6 +43,23 @@ impl From<ConversationContentError> for AppError {
 }
 
 impl Database {
+    pub(super) async fn release_conversation_projection_lease(
+        &self,
+        request_id: Uuid,
+        lease_owner: Uuid,
+    ) -> Result<(), AppError> {
+        // Keep the primary sentinel: older workers must not claim a deferred
+        // body through the legacy queue. Only release the current worker's lease.
+        sqlx::query(
+            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE NULL END, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     pub(super) async fn try_schedule_rolled_back_conversation_retry(
         &self,
         request_id: Uuid,
@@ -67,7 +84,7 @@ impl Database {
     ) -> Result<bool, AppError> {
         let now = unix_millis();
         let updated = sqlx::query(
-            "UPDATE conversation_projection_outbox SET terminal_lease_expires_at = $1 + CASE attempts WHEN 1 THEN 1000 WHEN 2 THEN 2000 WHEN 3 THEN 4000 WHEN 4 THEN 8000 WHEN 5 THEN 16000 WHEN 6 THEN 32000 ELSE 60000 END WHERE request_id = $2 AND projected_at IS NULL AND terminal_lease_owner = $3 AND terminal_lease_expires_at > $1 AND lease_owner = 'terminal-v118' AND lease_expires_at = 9223372036854775807 AND semantic_payload_snapshot_json IS NOT NULL",
+            "UPDATE conversation_projection_outbox SET terminal_lease_expires_at = $1 + CASE attempts WHEN 1 THEN 1000 WHEN 2 THEN 2000 WHEN 3 THEN 4000 WHEN 4 THEN 8000 WHEN 5 THEN 16000 WHEN 6 THEN 32000 ELSE 60000 END WHERE request_id = $2 AND projected_at IS NULL AND terminal_lease_owner = $3 AND terminal_lease_expires_at > $1 AND lease_owner = 'terminal-v118' AND lease_expires_at = 9223372036854775807 AND (semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL)",
         )
         .bind(now)
         .bind(request_id.to_string())

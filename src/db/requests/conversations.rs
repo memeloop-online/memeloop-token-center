@@ -722,13 +722,16 @@ impl Database {
                 .transpose()?;
             let mut snapshot = snapshot;
             if snapshot.as_ref().is_some_and(empty_semantic_snapshot) {
-                // 主租约仍钉在 terminal-v118 上时，这是新 worker 的领取。
-                // 不把空快照当成已经写完的观测，也不清租约，避免旧 worker 用主领取抢走。
+                // Keep the primary terminal-v118 sentinel pinned so legacy
+                // workers cannot claim the deferred body. Release only this
+                // worker's lease when the empty snapshot needs another pass.
                 let pinned = prepare
                     .try_get::<Option<String>, _>("lease_owner")?
                     .as_deref()
                     == Some("terminal-v118");
                 if !pinned {
+                    self.release_conversation_projection_lease(request_id, lease_owner)
+                        .await?;
                     return Ok(false);
                 }
                 let terminal_open: Option<Option<i64>> = sqlx::query_scalar(
@@ -738,6 +741,8 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
                 if terminal_open.is_some_and(|projected_at| projected_at.is_none()) {
+                    self.release_conversation_projection_lease(request_id, lease_owner)
+                        .await?;
                     return Ok(false);
                 }
                 let inline: String = prepare.try_get("request_json")?;
@@ -756,6 +761,8 @@ impl Database {
                     .unwrap_or_default()
                 };
                 if body.is_empty() {
+                    self.release_conversation_projection_lease(request_id, lease_owner)
+                        .await?;
                     return Ok(false);
                 }
                 let (leaf, atom_hashes) = conversation_prefix_from_request_json(body.as_bytes())
@@ -770,6 +777,8 @@ impl Database {
                     payload_digest: None,
                 };
                 if empty_semantic_snapshot(&rebuilt) {
+                    self.release_conversation_projection_lease(request_id, lease_owner)
+                        .await?;
                     return Ok(false);
                 }
                 self.materialize_streamed_conversation_content(
@@ -855,12 +864,8 @@ impl Database {
                 .try_get::<Option<i64>, _>("projected_at")?
                 .is_none()
         {
-            // 终端还没写完时不能占着五分钟租约，否则下一轮会话正文归档赶不上。
-            sqlx::query("UPDATE conversation_projection_outbox SET lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2")
-                .bind(request_id.to_string())
-                .bind(lease_owner.to_string())
-                .execute(&mut *transaction)
-                .await?;
+            // Release ownership after rollback so the next worker can retry
+            // as soon as the terminal projection commits.
             return Ok(false);
         }
         if let Some(terminal) = terminal.as_ref()
@@ -1063,8 +1068,8 @@ impl Database {
             }
             Ok(false) => {
                 transaction.rollback().await?;
-                self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
-                    .await;
+                self.release_conversation_projection_lease(request_id, lease_owner)
+                    .await?;
                 Ok(false)
             }
             Err(error) => {

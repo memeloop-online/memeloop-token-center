@@ -22,6 +22,29 @@ pub(super) fn snapshot_matches(
     if existing == expected {
         return true;
     }
+    // New enqueues carry an empty placeholder; the deferred worker owns the
+    // derived snapshot. Request identity/body/hints are checked by the caller,
+    // so a replay must accept content the worker has already materialized.
+    if expected
+        .and_then(|encoded| serde_json::from_str::<ConversationSemanticSnapshot>(encoded).ok())
+        .as_ref()
+        .is_some_and(empty_semantic_snapshot)
+    {
+        return existing.is_some_and(|encoded| {
+            serde_json::from_str::<ConversationSemanticSnapshot>(encoded).is_ok()
+                || (completed
+                    && serde_json::from_str::<serde_json::Value>(encoded)
+                        .ok()
+                        .is_some_and(|value| {
+                            value["completed_snapshot_digest_v1"]
+                                .as_str()
+                                .is_some_and(|digest| {
+                                    digest.len() == 64
+                                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                })
+                        }))
+        });
+    }
     if !completed {
         return false;
     }
@@ -337,6 +360,15 @@ mod receipt_tests {
             "legacy completed rows remain replayable"
         );
         let empty = r#"{"leaf":null,"atom_hashes":[]}"#;
+        assert!(snapshot_matches(Some(&snapshot), Some(empty), false));
+        assert!(snapshot_matches(Some(&receipt), Some(empty), true));
+        assert!(!snapshot_matches(Some(&receipt), Some(empty), false));
+        assert!(!snapshot_matches(Some("{}"), Some(empty), true));
+        assert!(!snapshot_matches(
+            Some(r#"{"completed_snapshot_digest_v1":"invalid"}"#),
+            Some(empty),
+            true
+        ));
         assert_eq!(
             completed_receipt(empty),
             empty,

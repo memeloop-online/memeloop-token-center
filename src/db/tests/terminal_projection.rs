@@ -7,6 +7,142 @@ mod semantic_isolation;
 mod semantic_retry;
 
 #[tokio::test]
+async fn sqlite_deferred_session_body_retries_after_terminal_completion() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = crate::AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("deferred-session-body.db").display()
+    )))
+    .await
+    .unwrap();
+    let database = &state.db;
+    let (key, reservation, request_id) = admitted(database, false).await;
+    let request = serde_json::json!({"messages": [{"role": "user", "content": "retry this turn"}]});
+    let hints = ConversationHints::default();
+    let mut input = finish(&key, &reservation, request_id);
+    input.conversation = Some(ProxyConversationInput {
+        key: &key,
+        request_json: &request,
+        hints: &hints,
+        client_name: None,
+        upstream_response_id: None,
+    });
+    database.finish_proxy_request_deferred(input).await.unwrap();
+
+    let empty_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(empty_owner, 1)
+            .await
+            .unwrap()[0]
+            .request_id,
+        request_id
+    );
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(empty_owner, request_id)
+            .await
+            .unwrap()
+    );
+
+    // The empty snapshot must release its lease without waiting five minutes.
+    let body_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(body_owner, 1)
+            .await
+            .unwrap()[0]
+            .request_id,
+        request_id
+    );
+    // The worker materializes content before discovering the terminal writer
+    // is still pending. Its rolled-back observation must release ownership too.
+    assert!(
+        !crate::worker::archive_session_body(&state, body_owner, request_id)
+            .await
+            .unwrap()
+    );
+    let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at, projected_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+    assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+    assert_eq!(row.get::<Option<String>, _>("terminal_lease_owner"), None);
+    assert_eq!(row.get::<Option<i64>, _>("terminal_lease_expires_at"), None);
+    assert_eq!(row.get::<Option<i64>, _>("projected_at"), None);
+
+    let owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(owner, 1)
+            .await
+            .unwrap()[0]
+            .request_id,
+        request_id
+    );
+    // A stale owner cannot release the replacement worker's lease.
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(body_owner, request_id)
+            .await
+            .unwrap()
+    );
+    // Statement retries must also recognize an already materialized snapshot,
+    // whose payload marker has been cleared by the session-body worker.
+    assert!(
+        database
+            .schedule_rolled_back_conversation_retry(request_id, owner)
+            .await
+            .unwrap()
+    );
+    let retry_at: i64 = sqlx::query_scalar(
+        "SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert!(retry_at <= unix_millis() + 4000);
+    let terminal_owner = Uuid::now_v7();
+    assert!(
+        database
+            .claim_terminal_projection_tasks(terminal_owner, 1)
+            .await
+            .unwrap()
+            .contains(&request_id)
+    );
+    assert!(
+        database
+            .project_claimed_terminal_projection_task(terminal_owner, request_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        crate::worker::archive_session_body(&state, owner, request_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !crate::worker::archive_session_body(&state, owner, request_id)
+            .await
+            .unwrap()
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    assert!(
+        database
+            .claim_conversation_projection_tasks(Uuid::now_v7(), 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn sqlite_session_body_rebuild_rewrites_only_two_locator_rows() {
     let directory = tempfile::tempdir().unwrap();
     let state = crate::AppState::initialize(crate::config::Config::for_test(format!(
@@ -346,6 +482,14 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
             .project_claimed_conversation_projection_task(conversation_owner, request_id)
             .await
             .unwrap()
+    );
+    assert!(
+        database
+            .claim_conversation_projection_tasks(conversation_owner, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id)
     );
     sqlx::query("DELETE FROM request_records WHERE id = $1")
         .bind(request_id.to_string())

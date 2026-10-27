@@ -1514,7 +1514,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
                 ..ConversationHints::default()
             };
             pending_database
-                .finish_proxy_request(FinishProxyRequest {
+                .finish_proxy_request_deferred(FinishProxyRequest {
                     terminal_cause: None,
                     usage_basis: Some(crate::model::RequestUsageBasis::NotObserved),
                     first_output_ms: None,
@@ -1540,13 +1540,50 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
                         upstream_response_id: None,
                     }),
                 })
+                .await?;
+            let observations: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1",
+            )
+            .bind(pending_request_id.to_string())
+            .fetch_one(&pending_database.pool)
+            .await?;
+            assert_eq!(observations, 0, "settlement only enqueues the session body");
+            let terminal_owner = Uuid::now_v7();
+            assert!(
+                pending_database
+                    .claim_terminal_projection_tasks(terminal_owner, 1)
+                    .await?
+                    .contains(&pending_request_id)
+            );
+            assert!(
+                pending_database
+                    .project_claimed_terminal_projection_task(terminal_owner, pending_request_id)
+                    .await?
+            );
+            let owner = Uuid::now_v7();
+            let tasks = pending_database
+                .claim_conversation_projection_tasks(owner, 1)
+                .await?;
+            assert_eq!(tasks[0].request_id, pending_request_id);
+            let session = crate::conversation::session_body_from_documents(
+                &request_json,
+                &serde_json::json!({}),
+            );
+            let (atoms, nodes) = session.into_prefix();
+            assert!(
+                pending_database
+                    .prepare_session_body_archive(owner, pending_request_id, &atoms, &nodes, &[])
+                    .await?
+            );
+            pending_database
+                .project_claimed_conversation_projection_task(owner, pending_request_id)
                 .await
         });
         wait_for_postgres_blocker(
             &database,
             pending_pid,
             pause_gate_pid,
-            "pending terminal writer did not reach the post-session pause",
+            "deferred conversation projector did not reach the post-session pause",
         )
         .await;
 
@@ -1607,9 +1644,11 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
             })
             .await
             .expect("online projection writers exceeded the deadline or returned 55P03");
-        pending_result
-            .expect("pending terminal task panicked")
-            .expect("pending terminal writer returned 40P01 or 55P03");
+        assert!(
+            pending_result
+                .expect("deferred conversation task panicked")
+                .expect("deferred conversation projector returned 40P01 or 55P03")
+        );
         contender_result
             .expect("projection contender task panicked")
             .expect("projection contender returned 40P01 or 55P03");
