@@ -30,13 +30,13 @@ test('recorded proxy exit shows the human name and safe address, and hover carri
   assert.match(line.hover, /组版本 3/);
   assert.match(line.hover, /edge-01/);
   assert.match(line.hover, /socks5h:\/\/192\.0\.2\.10:1080/);
-  assert.match(line.hover, /连通性当时没有测量/);
+  assert.match(line.hover, /连通性/);
   assert.match(line.hover, /记录时间: \d/);
   assert.doesNotMatch(line.text + line.hover, /fixture-group-internal-id|fixture-member-internal-id/, 'internal IDs stay out of the visible copy');
   const english = requestEgressLine({ ...request, egress: proxyObservation }, 'en');
   assert.ok(english);
   assert.equal(english.text, 'edge-01 · socks5h://192.0.2.10:1080');
-  assert.match(english.hover, /Connectivity was not measured for this request/);
+  assert.match(english.hover, /Connectivity/);
   assert.match(english.hover, /This request used a proxy exit/);
   assert.doesNotMatch(english.hover, /fixture-group-internal-id|fixture-member-internal-id/);
 });

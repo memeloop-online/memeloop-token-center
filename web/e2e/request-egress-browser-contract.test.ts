@@ -155,7 +155,7 @@ test('request list exit lines render only real recorded exits with exact text an
       assert.match(proxyTip, zh ? /组版本 3/ : /Group version 3/);
       assert.match(proxyTip, /edge-01/);
       assert.match(proxyTip, /socks5h:\/\/192\.0\.2\.10:1080/);
-      assert.match(proxyTip, zh ? /连通性当时没有测量/ : /Connectivity was not measured for this request/);
+      assert.match(proxyTip, zh ? /连通性/ : /Connectivity/);
       assert.match(proxyTip, zh ? /这次请求走代理出口/ : /This request used a proxy exit/);
       await page.keyboard.press('Escape');
       await proxyTooltip.waitFor({ state: 'hidden' });

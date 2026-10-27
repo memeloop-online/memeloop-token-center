@@ -126,6 +126,20 @@ const recordedFailureCopy: Record<string, [string, string]> = {
   price_source_http_status: ['价格源返回了失败的 HTTP 状态', 'The price source returned an unsuccessful HTTP status'],
 };
 
+// Operational terminal stage recorded for a buffered request. For a failure this
+// marks where the gateway finalized the outcome, not necessarily where the
+// failure physically happened, so each stage needs its own copy instead of
+// being shown as a raw token.
+const recordedStageCopy: Record<string, [string, string]> = {
+  upstream_response_headers: ['上游刚开始返回响应头', 'The upstream had just started returning response headers'],
+  upstream_response_body: ['上游正在返回响应体', 'The upstream was returning the response body'],
+  response_delivery: ['网关正在把响应交给客户端', 'The gateway was delivering the response to the client'],
+  buffered_response_ready: [
+    '请求收尾阶段',
+    'Request finalization stage',
+  ],
+};
+
 const supplierFailureCopy: Record<string, [string, string]> = {
   no_active_plan: ['当前上游账号没有可用套餐，需在提供商处开通或更换账号。', 'The upstream account has no active plan. Activate a plan with the provider or use another account.'],
   insufficient_quota: ['当前上游账号额度不足，需在提供商处补充额度或更换账号。', 'The upstream account has insufficient quota. Add quota with the provider or use another account.'],
@@ -186,7 +200,7 @@ function withDiagnostic(base: string | null, request: RequestView, locale: 'zh-C
   let sentence = base;
   for (const token of [diagnostic.stage, diagnostic.reason]) {
     if (!serverErrorCode(token)) continue;
-    const extra = recordedCause(token, locale);
+    const extra = recordedCause(token, locale) ?? recordedStageCopy[token]?.[locale === 'zh-CN' ? 0 : 1];
     const fact = extra ?? (locale === 'zh-CN' ? `失败阶段 ${token}` : `failure stage ${token}`);
     if (sentence.includes(fact)) continue;
     sentence = locale === 'zh-CN' ? `${sentence}。${fact}` : `${sentence}. ${fact}`;
@@ -384,9 +398,11 @@ export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'):
     return null;
   }
   const recorded = `${zh ? '记录时间' : 'Recorded'}: ${egressObservedTime(observation, locale) ?? copy.unknown}`;
+  // The probe cadence lives in the gateway and can change, so the copy names
+  // the mechanism rather than hardcoding an interval.
   const connectivity = zh
-    ? '连通性当时没有测量。'
-    : 'Connectivity was not measured for this request.';
+    ? '连通性：代理出口到上游主机的隧道，按代理组周期探测判断。'
+    : 'Connectivity: the tunnel from the proxy exit to the upstream host, judged by the proxy group’s periodic probe.';
   if (selected.kind === 'direct') {
     return {
       kind: 'direct',
@@ -394,7 +410,7 @@ export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'):
       hover: [
         zh ? '这次请求走直连。' : 'This request used a direct connection.',
         recorded,
-        connectivity,
+        zh ? '连通性：网关到上游主机的直连通道。' : 'Connectivity: the gateway’s direct channel to the upstream host.',
       ].join(' · '),
     };
   }
