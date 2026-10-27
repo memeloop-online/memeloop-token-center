@@ -151,7 +151,11 @@ async fn typed_h2_before_headers_and_body_share_immutable_attempt_without_replay
                 let error = result.expect_err("peer reset must precede headers");
                 evidence.observe_error(&error, true);
                 assert!(matches!(
-                    classify_codex_send_error(error),
+                    classify_codex_send_error(
+                        error,
+                        evidence.body_consumption.polls(),
+                        evidence.body_consumption.bytes(),
+                    ),
                     ProxySendError::NonRetryableTransport(TransportFailureKind::Http2Reset)
                 ));
                 drop(release);

@@ -791,25 +791,15 @@ impl Serialize for RequestView {
         let diagnostic = diagnostic.map(|value| {
             // An operational terminal records a phase the request reached, and
             // that phase is finer evidence than the typed cause. A buffered
-            // request also ends with "buffered_response_ready", which marks
-            // finalization rather than a phase reached, so it must not
-            // overwrite the typed diagnostic stage.
-            let stage = match self
-                .operational_terminal
-                .as_ref()
-                .and_then(|terminal| terminal.stage.as_deref())
-            {
-                Some(stage)
-                    if matches!(
-                        stage,
-                        "upstream_response_headers"
-                            | "upstream_response_body"
-                            | "response_delivery"
-                    ) =>
-                {
-                    Some(stage)
-                }
-                _ => value.stage,
+            // request ends with "buffered_response_ready", which marks the
+            // start of finalization rather than a phase reached, so it must
+            // not overwrite the typed stage. An absent stage stays absent.
+            let stage = match self.operational_terminal.as_ref() {
+                None => value.stage,
+                Some(terminal) => match terminal.stage.as_deref() {
+                    Some("buffered_response_ready") => value.stage,
+                    other => other,
+                },
             };
             serde_json::json!({
                 "stage": stage,
