@@ -30,5 +30,5 @@ test('bucket navigation refuses ambiguous identities and OR scopes', () => {
   assert.equal(unlinkedRequestFilter(bucketId, '00000000-0000-4000-8000-000000000001'), undefined);
   assert.equal(unlinkedRequestFilter('unlinked:invalid'), undefined);
   assert.equal(unlinkedRequestFilter('unlinked:'), undefined);
-  assert.equal(unlinkedRequestFilter(bucketId, keyId, { logical_operator: 'or', conditions: [] }), undefined);
+  assert.equal(unlinkedRequestFilter(bucketId, keyId, JSON.parse('{"logical_operator":"or","conditions":[]}')), undefined);
 });
