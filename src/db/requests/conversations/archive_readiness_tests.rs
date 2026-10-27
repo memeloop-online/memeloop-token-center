@@ -10,10 +10,19 @@ struct Fixture {
     state: AppState,
     request_id: Uuid,
     identity: ArchiveSpoolIdentity,
+    source: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 }
 
 impl Fixture {
     async fn new(database_url: String, inline_request: bool) -> Self {
+        Self::new_with_protocol(database_url, inline_request, None).await
+    }
+
+    async fn new_with_protocol(
+        database_url: String,
+        inline_request: bool,
+        protocol: Option<&str>,
+    ) -> Self {
         let state = AppState::initialize(Config::for_test(database_url))
             .await
             .unwrap();
@@ -46,24 +55,66 @@ impl Fixture {
             .await
             .unwrap();
         let request_id = Uuid::now_v7();
-        let request_locator = format!("gap://{request_id}/request");
-        let response_locator = format!("gap://{request_id}/response");
-        let reservation = state
-            .db
-            .start_proxy_request(StartProxyRequest {
-                request_id,
-                key: &key,
-                price: &price,
-                input_token_ceiling: 10,
-                output_token_ceiling: 10,
-                protocol: "openai",
-                model: &unique,
-                request_object: &request_locator,
-                upstream_account_id: None,
-                model_route_id: None,
-            })
+        let source = if protocol.is_some() {
+            let body = match protocol {
+                Some("openai-responses") => Bytes::from_static(br#"{"input":[{"role":"user","content":[{"type":"input_text","text":"archive question"}]}],"provider_secret_field":"kept only in original object"}"#),
+                _ => Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}],"provider_secret_field":"kept only in original object"}"#),
+            };
+            Some(std::sync::Arc::new(
+                state
+                    .responses_request_spool
+                    .capture_with_memory(
+                        axum::body::Body::from(body.clone()),
+                        body.len(),
+                        Some(body.len()),
+                        None,
+                        0,
+                        Some(&request_id.to_string()),
+                    )
+                    .await
+                    .unwrap(),
+            ))
+        } else {
+            None
+        };
+        let request_locator = source
+            .as_ref()
+            .and_then(|source| source.object_locator())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("gap://{request_id}/request"));
+        let response_locator = if source.is_some() {
+            r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#.to_owned()
+        } else {
+            format!("gap://{request_id}/response")
+        };
+        let input = StartProxyRequest {
+            request_id,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: protocol.unwrap_or("openai"),
+            model: &unique,
+            request_object: &request_locator,
+            upstream_account_id: None,
+            model_route_id: None,
+        };
+        let reservation = if let Some(source) = source.as_ref() {
+            let held = state.db.saturate_gateway_persistence_for_test().await;
+            let admitted = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state
+                    .db
+                    .start_proxy_request_with_source(input, source, None, Some(10)),
+            )
             .await
+            .expect("source admission must not wait for the old archive queue")
             .unwrap();
+            drop(held);
+            admitted.reservation
+        } else {
+            state.db.start_proxy_request(input).await.unwrap()
+        };
         let request = if inline_request {
             serde_json::json!({"messages": [{"role": "user", "content": "archive question"}]})
         } else {
@@ -129,6 +180,7 @@ impl Fixture {
             state,
             request_id,
             identity,
+            source,
         }
     }
 
@@ -316,7 +368,7 @@ async fn sqlite_final_archive_gap_keeps_request_turn() {
 }
 
 #[tokio::test]
-async fn sqlite_missing_capture_expires_without_acknowledging_early() {
+async fn sqlite_missing_capture_never_becomes_final_from_elapsed_time() {
     let directory = tempfile::tempdir().unwrap();
     let fixture = Fixture::new(
         format!(
@@ -333,7 +385,7 @@ async fn sqlite_missing_capture_expires_without_acknowledging_early() {
         .execute(&fixture.state.db.pool)
         .await
         .unwrap();
-    fixture.assert_completed(false).await;
+    fixture.assert_deferred().await;
 }
 
 #[tokio::test]
@@ -352,6 +404,124 @@ async fn postgres_session_body_waits_for_capture_and_both_uploads() {
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
     readiness_contract(isolated.to_string()).await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+async fn source_contract(database_url: String) {
+    for protocol in ["openai", "anthropic", "openai-responses"] {
+        let mut fixture =
+            Fixture::new_with_protocol(database_url.clone(), true, Some(protocol)).await;
+        let source = fixture.source.take().unwrap();
+        assert!(source.upload_outcome().await);
+        let locator = source.object_locator().unwrap().to_owned();
+        let original = fixture.state.archive.get(&locator).await.unwrap();
+        source.release_retained();
+        drop(source);
+        assert!(String::from_utf8_lossy(&original).contains("provider_secret_field"));
+        fixture
+            .state
+            .db
+            .record_request_source(
+                fixture.identity,
+                &locator,
+                original.len(),
+                *blake3::hash(&original).as_bytes(),
+                true,
+            )
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM request_archive_spools WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .execute(&fixture.state.db.pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM archive_staging_attempts WHERE attempt_id = $1")
+            .bind(fixture.request_id.to_string())
+            .execute(&fixture.state.db.pool)
+            .await
+            .unwrap();
+        fixture.state.archive.delete(&locator).await.unwrap();
+        sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
+            .bind(unix_millis() - 24 * 60 * 60 * 1000)
+            .bind(fixture.request_id.to_string())
+            .execute(&fixture.state.db.pool)
+            .await
+            .unwrap();
+        fixture.assert_deferred().await;
+        fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+        fixture.assert_deferred().await;
+        fixture.state.archive.put(&locator, original).await.unwrap();
+        fixture.assert_completed(true).await;
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
+                .bind(fixture.request_id.to_string())
+                .fetch_one(&fixture.state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "bound");
+        let archived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'cleanup_pending'")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(archived, 1);
+        let chunks: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(chunks, 0);
+        let leaf: String = sqlx::query_scalar(
+            "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        let turns = fixture
+            .state
+            .db
+            .export_training_dialogue(fixture.identity.tenant_id, &leaf)
+            .await
+            .unwrap();
+        assert!(
+            turns
+                .iter()
+                .flat_map(|turn| &turn.parts)
+                .all(|part| !part.to_string().contains("provider_secret_field"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn sqlite_source_identity_recovers_after_request_drop_and_missing_binding() {
+    let directory = tempfile::tempdir().unwrap();
+    source_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("source-recovery.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_source_identity_recovers_after_request_drop_and_missing_binding() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+    let schema = format!("archive_source_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&database_url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    source_contract(isolated.to_string()).await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await

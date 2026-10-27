@@ -22,6 +22,9 @@ mod body_read_classification_tests;
 #[cfg(test)]
 mod metered_tests;
 
+#[cfg(test)]
+mod archive_source_tests;
+
 pub(crate) struct GatewayBodyReadActivity {
     active: Arc<AtomicUsize>,
 }
@@ -299,7 +302,14 @@ async fn admit_request_body_for_route(
     {
         return Err(GatewayBodyAdmissionError::UnsupportedEncoding);
     }
-    if route_class == GatewayBodyRouteClass::Responses {
+    let source_backed = matches!(
+        parts.uri.path(),
+        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
+    );
+    if route_class == GatewayBodyRouteClass::Responses
+        || (source_backed
+            && request_spool.is_some_and(request_spool::RequestSpoolAdmission::has_durable_store))
+    {
         let read_maximum = declared_content_length
             .and_then(|length| usize::try_from(length).ok())
             .unwrap_or(maximum)
@@ -357,11 +367,32 @@ async fn admit_request_body_for_route(
                 GatewayBodyRejectionReason::BodyReadRejected,
             ),
         })?;
+        let spool = Arc::new(spool);
+        if let Some(request_id) = body_key
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        {
+            request_spool.unwrap().register_source(request_id, &spool);
+        }
+        let body = if route_class == GatewayBodyRouteClass::Responses {
+            Body::empty()
+        } else {
+            if let Some(reservation) = reservation.as_ref()
+                && !reservation.try_grow(spool.len(), memory::REQUEST_MEMORY_WEIGHT)
+            {
+                return Err(GatewayBodyAdmissionError::CapacityExhausted);
+            }
+            let bytes = spool
+                .read_all()
+                .await
+                .map_err(|_| GatewayBodyAdmissionError::RequestSpoolUnavailable)?;
+            Body::from(spool.shared_bytes(bytes))
+        };
         if let Some(reservation) = reservation {
             parts.extensions.insert(reservation);
         }
-        parts.extensions.insert(Arc::new(spool));
-        return Ok(Request::from_parts(parts, Body::empty()));
+        parts.extensions.insert(spool);
+        return Ok(Request::from_parts(parts, body));
     }
     if let Some(reservation) = reservation {
         let read_maximum = declared_content_length

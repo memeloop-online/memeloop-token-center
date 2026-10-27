@@ -970,6 +970,8 @@ async fn proxy_with_cancellation_guard(
         crate::api::request_normalization::is_official_codex_user_agent(&headers);
     let diagnostic_context = proxy_diagnostics::Context::current();
     let request_id = diagnostic_context.request_id;
+    let conversation_spool =
+        conversation_spool.or_else(|| state.responses_request_spool.source(request_id));
     let preparation = proxy_diagnostics::Phase::new(diagnostic_context, "request_preparation");
     let _request_buffer = state
         .metrics
@@ -1183,21 +1185,37 @@ async fn proxy_with_cancellation_guard(
         upstream_account_id,
         Some(primary.credential_generation),
     );
-    let admitted_request_object = format!("gap://{request_id}/request");
-    let conversation_body = match conversation_spool {
-        Some(spool) => ConversationBody::source_backed(spool, original_request_json)?,
-        None => {
-            drop(original_request_json);
-            ConversationBody::InMemory(body.clone())
-        }
+    let source_backed = conversation_spool.is_some();
+    let source = match conversation_spool {
+        Some(source) => source,
+        None => std::sync::Arc::new(
+            state
+                .responses_request_spool
+                .capture_with_memory(
+                    Body::from(body.clone()),
+                    body.len(),
+                    Some(body.len()),
+                    Some(&memory),
+                    0,
+                    Some(&request_id.to_string()),
+                )
+                .await
+                .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?,
+        ),
     };
-    let request_capture_memory = state.metrics.memory_usage(
-        crate::metrics::MemoryComponent::StreamCapture,
-        body.len().saturating_mul(3),
-    );
+    let admitted_request_object = source
+        .object_locator()
+        .ok_or_else(|| AppError::internal("proxy_request_source_locator"))?
+        .to_owned();
+    let conversation_body = if source_backed {
+        ConversationBody::source_backed(source.clone(), original_request_json)?
+    } else {
+        drop(original_request_json);
+        ConversationBody::InMemory(body.clone())
+    };
     let started_request = match state
         .db
-        .start_proxy_request_with_deferred_archive(
+        .start_proxy_request_with_source(
             StartProxyRequest {
                 request_id,
                 key: &key,
@@ -1210,9 +1228,7 @@ async fn proxy_with_cancellation_guard(
                 upstream_account_id,
                 model_route_id,
             },
-            &body,
-            state.config.key_pepper.as_bytes(),
-            state.config.archive_spool_compression_enabled,
+            &source,
             Some(&primary.upstream_model),
             output_token_limit,
         )
@@ -1259,7 +1275,6 @@ async fn proxy_with_cancellation_guard(
         client_name,
         projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
     });
-    drop(request_capture_memory);
     memory.release(
         body.len(),
         crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,

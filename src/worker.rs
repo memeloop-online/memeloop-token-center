@@ -984,7 +984,34 @@ pub(crate) async fn archive_session_body(
         return Ok(false);
     }
     let request_bytes = match load_raw_document(state, &locators.request).await {
-        Ok(bytes) => bytes,
+        Ok(bytes) => {
+            if let Some(identity) = locators.source_identity
+                && !locators.source_recorded
+            {
+                state
+                    .db
+                    .record_request_source(
+                        identity,
+                        &locators.request,
+                        bytes.len(),
+                        *blake3::hash(&bytes).as_bytes(),
+                        true,
+                    )
+                    .await?;
+            }
+            bytes
+        }
+        Err(_)
+            if (locators.source_identity.is_some() && !locators.source_failed)
+                || (locators.source_identity.is_none()
+                    && !missing_raw_document(&locators.request)) =>
+        {
+            state
+                .db
+                .defer_session_body_archive(lease_owner, request_id)
+                .await?;
+            return Ok(false);
+        }
         Err(_) => {
             let inline = state
                 .db
@@ -1032,9 +1059,17 @@ pub(crate) async fn archive_session_body(
     // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
     // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
     let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
-        Some(locator) => load_raw_document(state, &locator)
-            .await
-            .unwrap_or_else(|_| bytes::Bytes::from_static(b"{}")),
+        Some(locator) => match load_raw_document(state, &locator).await {
+            Ok(bytes) => bytes,
+            Err(_) if missing_raw_document(&locator) => bytes::Bytes::from_static(b"{}"),
+            Err(_) => {
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
+        },
         None => bytes::Bytes::from_static(b"{}"),
     };
     let return_document = crate::conversation::raw_return_document(&return_bytes)
@@ -1087,11 +1122,15 @@ async fn skip_session_body(
     Ok(false)
 }
 
-async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
-    if locator.starts_with("gap://")
+fn missing_raw_document(locator: &str) -> bool {
+    locator.is_empty()
+        || locator.starts_with("gap://")
         || locator.starts_with("metadata-only-json:")
         || locator.starts_with("provider-reference-json:")
-    {
+}
+
+async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
+    if missing_raw_document(locator) {
         return Err("session_body_skipped_archive_unreadable");
     }
     if let Some(inline) = locator.strip_prefix("inline-json:") {

@@ -93,6 +93,9 @@ pub(crate) struct SessionBodyLocators {
     pub(crate) request: String,
     pub(crate) response: Option<String>,
     pub(crate) pending: bool,
+    pub(crate) source_identity: Option<ArchiveSpoolIdentity>,
+    pub(crate) source_failed: bool,
+    pub(crate) source_recorded: bool,
 }
 
 pub(crate) struct ConversationProjectionEnqueueInput<'a> {
@@ -584,14 +587,15 @@ impl Database {
         request_id: Uuid,
     ) -> Result<Option<SessionBodyLocators>, AppError> {
         let row = sqlx::query(
-            "SELECT r.request_object, r.response_object, CAST(CASE WHEN
-                (q.state IN ('capturing', 'pending', 'uploading') AND q.expires_at > $2
-                 AND (q.state <> 'uploading' OR q.attempts < 10 OR q.lease_expires_at > $2))
-                OR (s.state IN ('capturing', 'pending', 'uploading') AND s.expires_at > $2
-                 AND (s.state <> 'uploading' OR s.attempts < 10 OR s.lease_expires_at > $2))
-                OR (COALESCE(r.completed_at, r.created_at) > $2 - $3 AND
-                    ((q.request_id IS NULL AND r.request_object = 'gap://' || r.id || '/request')
-                     OR (s.request_id IS NULL AND r.response_object = 'gap://' || r.id || '/response')))
+            "SELECT r.request_object, r.response_object, r.tenant_id, r.reservation_id, q.state AS source_state,
+             CAST(CASE WHEN s.state IN ('capturing', 'pending', 'uploading')
+                OR (s.request_id IS NULL AND r.response_object = 'gap://' || r.id || '/response')
+                THEN 1 ELSE 0 END AS BIGINT) AS response_pending,
+             CAST(CASE WHEN
+                q.state IN ('capturing', 'pending', 'uploading')
+                OR s.state IN ('capturing', 'pending', 'uploading')
+                OR (q.request_id IS NULL AND r.request_object = 'gap://' || r.id || '/request')
+                OR (s.request_id IS NULL AND r.response_object = 'gap://' || r.id || '/response')
                 THEN 1 ELSE 0 END AS BIGINT) AS archives_pending
              FROM request_records r
              LEFT JOIN request_archive_spools q ON q.request_id = r.id AND q.tenant_id = r.tenant_id AND q.reservation_id = r.reservation_id
@@ -599,17 +603,31 @@ impl Database {
              WHERE r.id = $1 LIMIT 1",
         )
         .bind(request_id.to_string())
-        .bind(unix_millis())
-        .bind(super::super::archive_spool::CAPTURE_TTL)
         .fetch_optional(&self.pool)
         .await?;
         let Some(row) = row else {
             return Ok(None);
         };
+        let request: String = row.try_get("request_object")?;
+        let source_state: Option<String> = row.try_get("source_state")?;
+        let source_identity = (crate::gateway_body::request_spool::source_request_id(&request)
+            == Some(request_id))
+        .then(|| -> Result<_, AppError> {
+            Ok(ArchiveSpoolIdentity {
+                request_id,
+                tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+                reservation_id: parse_uuid(row.try_get("reservation_id")?)?,
+            })
+        })
+        .transpose()?;
         Ok(Some(SessionBodyLocators {
-            request: row.try_get("request_object")?,
+            request,
             response: row.try_get("response_object")?,
-            pending: row.try_get::<i64, _>("archives_pending")? != 0,
+            pending: row.try_get::<i64, _>("response_pending")? != 0
+                || (source_identity.is_none() && row.try_get::<i64, _>("archives_pending")? != 0),
+            source_identity,
+            source_failed: source_state.as_deref() == Some("gap"),
+            source_recorded: source_state.as_deref() == Some("bound"),
         }))
     }
 

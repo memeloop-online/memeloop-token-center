@@ -30,7 +30,16 @@ pub(crate) fn request_body_object_key(request_id: &str) -> Option<String> {
         && request_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-    safe.then(|| format!("gateway/request-bodies/{request_id}"))
+    safe.then(|| match uuid::Uuid::parse_str(request_id) {
+        Ok(request_id) => format!("staging/proxy/{request_id}/request/{request_id}/body.json"),
+        Err(_) => format!("gateway/request-bodies/{request_id}"),
+    })
+}
+
+pub(crate) fn source_request_id(locator: &str) -> Option<uuid::Uuid> {
+    let request_id = locator.strip_prefix("staging/proxy/")?.split('/').next()?;
+    let request_id = uuid::Uuid::parse_str(request_id).ok()?;
+    (request_body_object_key(&request_id.to_string())?.as_str() == locator).then_some(request_id)
 }
 
 #[derive(Clone)]
@@ -46,6 +55,7 @@ pub(crate) struct MemoryObjectStore {
     reads: AtomicUsize,
     writes: AtomicUsize,
     entered_writes: AtomicUsize,
+    fail_writes: AtomicBool,
     pauses: Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<()>>>,
 }
 
@@ -57,6 +67,7 @@ impl MemoryObjectStore {
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             entered_writes: AtomicUsize::new(0),
+            fail_writes: AtomicBool::new(false),
             pauses: Mutex::new(std::collections::VecDeque::new()),
         })
     }
@@ -83,6 +94,9 @@ impl DurableRequestBodies {
                     let _ = pause.await;
                 }
                 store.writes.fetch_add(1, Ordering::AcqRel);
+                if store.fail_writes.load(Ordering::Acquire) {
+                    return Err(());
+                }
                 store
                     .objects
                     .lock()
@@ -179,6 +193,19 @@ pub(crate) struct RequestSpoolAdmission {
 }
 
 impl RequestSpoolAdmission {
+    pub(crate) fn source(&self, request_id: uuid::Uuid) -> Option<Arc<RequestSpool>> {
+        self.usage.sources.lock().ok()?.get(&request_id)?.upgrade()
+    }
+
+    pub(crate) fn register_source(&self, request_id: uuid::Uuid, source: &Arc<RequestSpool>) {
+        if let Ok(mut sources) = self.usage.sources.lock() {
+            sources.insert(request_id, Arc::downgrade(source));
+        }
+    }
+    pub(crate) fn has_durable_store(&self) -> bool {
+        self.usage.durable.is_some()
+    }
+
     pub(crate) fn new(_directory: PathBuf) -> Self {
         Self {
             usage: Arc::new(RequestSpoolUsage::default()),
@@ -395,6 +422,17 @@ impl RequestSpoolAdmission {
                     DURABLE_IN_FLIGHT
                 })),
                 durable_write: Mutex::new(None),
+                archived: AtomicBool::new(false),
+                outcome: tokio::sync::watch::channel(if captured.durable_settled {
+                    Some(true)
+                } else {
+                    None
+                })
+                .0,
+                archive_owner: Mutex::new(None),
+                background_upload: !captured.durable_settled,
+                archive_ready: tokio::sync::Notify::new(),
+                source_dropped: AtomicBool::new(false),
             }),
             #[cfg(test)]
             read_count: self.read_count.clone(),
@@ -424,6 +462,7 @@ struct RequestSpoolUsage {
     durable: Option<DurableRequestBodies>,
     /// Oldest resident first. Only a settled object-storage copy may leave memory.
     residents: Mutex<std::collections::VecDeque<std::sync::Weak<SharedBody>>>,
+    sources: Mutex<std::collections::HashMap<uuid::Uuid, std::sync::Weak<RequestSpool>>>,
 }
 
 impl RequestSpoolUsage {
@@ -490,6 +529,12 @@ struct SharedBody {
     durable_ok: Arc<AtomicBool>,
     durable_phase: Arc<AtomicU8>,
     durable_write: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    archived: AtomicBool,
+    outcome: tokio::sync::watch::Sender<Option<bool>>,
+    archive_owner: Mutex<Option<(crate::db::Database, crate::db::ArchiveSpoolIdentity)>>,
+    background_upload: bool,
+    archive_ready: tokio::sync::Notify,
+    source_dropped: AtomicBool,
 }
 
 pub(crate) struct RequestSpool {
@@ -499,11 +544,65 @@ pub(crate) struct RequestSpool {
 }
 
 impl RequestSpool {
+    pub(crate) fn object_locator(&self) -> Option<&str> {
+        self.shared.object_key.as_deref()
+    }
+
+    pub(crate) fn retain_for_archive(
+        &self,
+        database: crate::db::Database,
+        identity: crate::db::ArchiveSpoolIdentity,
+    ) {
+        self.shared.archived.store(true, Ordering::Release);
+        let mut owner = self
+            .shared
+            .archive_owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *owner = Some((database, identity));
+        if !self.shared.background_upload {
+            let success = self.shared.outcome.borrow().unwrap_or(false);
+            let (database, identity) = owner.take().unwrap();
+            let locator = self.shared.object_key.clone().unwrap();
+            let length = self.shared.length;
+            let digest = self.shared.digest;
+            release_resident_memory(&self.shared);
+            database.schedule_request_source_completion(identity, locator, length, digest, success);
+        }
+        self.shared.archive_ready.notify_one();
+    }
+
+    pub(crate) async fn upload_outcome(&self) -> bool {
+        let mut outcome = self.shared.outcome.subscribe();
+        loop {
+            if let Some(success) = *outcome.borrow_and_update() {
+                return success;
+            }
+            if outcome.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    pub(crate) fn shared_bytes(self: &Arc<Self>, bytes: Bytes) -> Bytes {
+        struct BodySource {
+            bytes: Bytes,
+            _source: Arc<RequestSpool>,
+        }
+        impl AsRef<[u8]> for BodySource {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        Bytes::from_owner(BodySource {
+            bytes,
+            _source: self.clone(),
+        })
+    }
     pub(crate) fn len(&self) -> usize {
         self.shared.length
     }
 
-    #[cfg(test)]
     pub(crate) fn digest(&self) -> [u8; 32] {
         self.shared.digest
     }
@@ -553,16 +652,7 @@ impl RequestSpool {
         if let Some(body) = resident {
             return verified_body(&self.shared, body);
         }
-        let handle = self
-            .shared
-            .durable_write
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
-        }
-        if !self.shared.durable_ok.load(Ordering::Acquire) {
+        if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
             return Err(RequestSpoolReadError);
         }
         let Some(store) = self.shared.durable.as_ref() else {
@@ -582,6 +672,20 @@ impl RequestSpool {
 impl Drop for RequestSpool {
     fn drop(&mut self) {
         release_resident_memory(&self.shared);
+        self.shared.source_dropped.store(true, Ordering::Release);
+        self.shared.archive_ready.notify_one();
+        if let Some(request_id) = self.object_locator().and_then(source_request_id)
+            && let Ok(lease) = self.shared.lease.lock()
+            && let Ok(mut sources) = lease.usage.sources.lock()
+            && sources
+                .get(&request_id)
+                .is_some_and(|source| source.strong_count() == 0)
+        {
+            sources.remove(&request_id);
+        }
+        if self.shared.archived.load(Ordering::Acquire) {
+            return;
+        }
         // Detach the writer. Aborting it lets a late PutObject land after the
         // delete and leave a body no request still owns.
         drop(
@@ -664,7 +768,7 @@ fn evict_oldest_settled(usage: &RequestSpoolUsage) -> bool {
     false
 }
 
-fn publish_durable(shared: &SharedBody) {
+fn publish_durable(shared: &Arc<SharedBody>) {
     let Some(store) = shared.durable.clone() else {
         return;
     };
@@ -682,6 +786,8 @@ fn publish_durable(shared: &SharedBody) {
     let ok = Arc::clone(&shared.durable_ok);
     let phase = Arc::clone(&shared.durable_phase);
     let residency = shared.residency.clone();
+    let outcome = shared.outcome.clone();
+    let source = shared.clone();
     let handle = tokio::spawn(async move {
         let wrote = store.put(&key, bytes).await.is_ok();
         if wrote {
@@ -693,20 +799,56 @@ fn publish_durable(shared: &SharedBody) {
             ) {
                 Ok(_) => {
                     ok.store(true, Ordering::Release);
-                    // Only a completed upload may leave memory. A failed put
-                    // keeps this resident as the only copy.
-                    residency.durable_settled.store(true, Ordering::Release);
                 }
                 Err(DURABLE_DROPPED) => {
                     store.delete(&key).await;
-                    residency.durable_settled.store(true, Ordering::Release);
                 }
                 Err(_) => {}
             }
         } else {
             tracing::warn!("request body stayed in memory; object storage write failed");
         }
-        residency.release_if_idle();
+        outcome.send_replace(Some(wrote));
+        loop {
+            let ready = source.archive_ready.notified();
+            let owner = source
+                .archive_owner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take();
+            if let Some((database, identity)) = owner {
+                let permit = if wrote {
+                    database.try_request_source_completion()
+                } else {
+                    Some(database.request_source_completion().await)
+                };
+                release_resident_memory(&source);
+                residency.durable_settled.store(true, Ordering::Release);
+                residency.release_if_idle();
+                if let Some(_permit) = permit {
+                    database
+                        .complete_request_source(
+                            identity,
+                            &key,
+                            source.length,
+                            source.digest,
+                            wrote,
+                        )
+                        .await;
+                }
+                break;
+            }
+            if source.source_dropped.load(Ordering::Acquire) {
+                residency.durable_settled.store(true, Ordering::Release);
+                residency.release_if_idle();
+                break;
+            }
+            if wrote {
+                residency.durable_settled.store(true, Ordering::Release);
+                residency.release_if_idle();
+            }
+            ready.await;
+        }
     });
     *shared
         .durable_write
@@ -791,6 +933,9 @@ pub(crate) enum RequestSpoolCaptureError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestSpoolReadError;
+
+#[cfg(test)]
+mod archive_source_tests;
 
 #[cfg(test)]
 mod tests {
