@@ -53,11 +53,31 @@ struct UsageAnalysisSnapshot {
     completed_business_statements: Vec<&'static str>,
 }
 
+/// Planner cost assumptions for the usage-analysis snapshot only.
+///
+/// These statements are throughput-shaped (a small number of wide aggregations over a
+/// time range), and on the deployed instance almost nothing they touch is cached, so a
+/// random page is far more expensive than the `seq_page_cost = 1` baseline that the
+/// upstream default `random_page_cost = 4` assumes.  Measured on the production cluster
+/// (CNPG on single-replica local Longhorn, 1 vCPU, 128 MB `shared_buffers` for a 62 GB
+/// database) a seven-day `output_rate` statement spent 25 s of 38 s in an ordered index
+/// scan that fetched ~164k rows by random heap access, while the equivalent sequential
+/// scan of the same table finished in 3.9 s.
+///
+/// Raising `random_page_cost` to 20 makes the planner price that random access honestly
+/// and pick the sequential scan plus hash join instead.  The setting is transaction-local
+/// (and these transactions are read-only), so it cannot slow down or re-plan the OLTP
+/// paths that share the pool.
+const USAGE_ANALYSIS_RANDOM_PAGE_COST: &str = "SET LOCAL random_page_cost = 20";
+
 impl UsageAnalysisSnapshot {
     async fn begin(database: &Database) -> Result<Self, AppError> {
         let mut transaction = database.pool.begin().await?;
         if matches!(database.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(USAGE_ANALYSIS_RANDOM_PAGE_COST)
                 .execute(&mut *transaction)
                 .await?;
         }

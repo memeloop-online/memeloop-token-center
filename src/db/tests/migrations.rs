@@ -906,6 +906,46 @@ async fn sqlite_request_list_newest_page_scan_indexes_exist() {
 }
 
 #[tokio::test]
+async fn sqlite_usage_analysis_compaction_probe_index_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("compaction-probe.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+
+    let installed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $1",
+    )
+    .bind("conversation_observations_compacted_probe_idx")
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        installed, 1,
+        "missing v141 usage-analysis compaction probe index"
+    );
+
+    // The probe must stay a *partial* index over compacted rows only: covering every
+    // observation would just duplicate conversation_observations_request_id_key.  The
+    // plan itself is not asserted because SQLite legitimately prefers that existing
+    // unique key for a request_id equality lookup.
+    let definition: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = $1",
+    )
+    .bind("conversation_observations_compacted_probe_idx")
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    let normalized = definition.to_lowercase().replace(['\n', '\r'], " ");
+    assert!(
+        normalized.contains("where") && normalized.contains("compaction = 1"),
+        "compaction probe index must be restricted to compacted rows: {definition}"
+    );
+}
+
+#[tokio::test]
 async fn durable_oauth_migration_retires_bridge_routes_without_deleting_history() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(

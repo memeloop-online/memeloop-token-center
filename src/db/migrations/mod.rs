@@ -733,6 +733,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "request list newest-page scan indexes",
         sql: include_str!("../../../migrations/common/0140_request_list_scan_indexes.sql"),
     },
+    Migration {
+        version: 141,
+        name: "usage analysis compaction probe index",
+        sql: include_str!("../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1448,6 +1453,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 140,
         name: "request list newest-page scan indexes",
         sql: include_str!("../../../migrations/common/0140_request_list_scan_indexes.sql"),
+    },
+    Migration {
+        version: 141,
+        name: "usage analysis compaction probe index",
+        sql: include_str!("../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"),
     },
 ];
 
