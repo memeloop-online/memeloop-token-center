@@ -728,6 +728,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "archive spool plain byte count follows the chunk ceiling",
         sql: include_str!("../../../migrations/sqlite/0139_archive_spool_plain_byte_count.sql"),
     },
+    Migration {
+        version: 140,
+        name: "request list newest-page scan indexes",
+        sql: include_str!("../../../migrations/common/0140_request_list_scan_indexes.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1438,6 +1443,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 139,
         name: "archive spool plain byte count follows the chunk ceiling",
         sql: include_str!("../../../migrations/postgres/0139_archive_spool_plain_byte_count.sql"),
+    },
+    Migration {
+        version: 140,
+        name: "request list newest-page scan indexes",
+        sql: include_str!("../../../migrations/common/0140_request_list_scan_indexes.sql"),
     },
 ];
 
