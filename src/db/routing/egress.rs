@@ -231,27 +231,36 @@ impl Database {
                 "invalid egress observation window".into(),
             ));
         }
-        let rows = sqlx::query(
-            "SELECT snapshot_json, COUNT(*) AS recorded_attempts,
+        let aggregate = "SELECT snapshot_json, COUNT(*) AS recorded_attempts,
                     CAST(SUM(completed) AS BIGINT) AS completed_attempts,
                     CAST(SUM(final_response) AS BIGINT) AS final_response_attempts,
                     COUNT(request_payload_bytes) AS request_known_attempts,
                     COUNT(response_payload_bytes) AS response_known_attempts,
                     CAST(SUM(request_payload_bytes) AS BIGINT) AS request_payload_bytes,
                     CAST(SUM(response_payload_bytes) AS BIGINT) AS response_payload_bytes
-             FROM request_egress_attempts e WHERE observed_at >= $1 AND observed_at < $2
-                AND (CAST($3 AS TEXT) IS NULL OR EXISTS (
-                    SELECT 1 FROM request_record_locators locator
-                    JOIN tenants tenant ON tenant.id = locator.tenant_id
-                    WHERE locator.id = e.request_id AND tenant.external_id = $3
-                ))
-             GROUP BY snapshot_json ORDER BY snapshot_json",
-        )
-        .bind(start)
-        .bind(end)
-        .bind(tenant_external_id)
-        .fetch_all(&self.pool)
-        .await?;
+             FROM request_egress_attempts e";
+        let window = " WHERE e.observed_at >= $1 AND e.observed_at < $2";
+        let grouping = " GROUP BY snapshot_json ORDER BY snapshot_json";
+        let rows = if let Some(external_id) = tenant_external_id {
+            let query = format!(
+                "{aggregate} JOIN request_record_locators locator ON locator.id = e.request_id
+                 JOIN tenants tenant ON tenant.id = locator.tenant_id
+                 {window} AND tenant.external_id = $3{grouping}"
+            );
+            sqlx::query(&query)
+                .bind(start)
+                .bind(end)
+                .bind(external_id)
+                .fetch_all(&self.pool)
+                .await?
+        } else {
+            let query = format!("{aggregate}{window}{grouping}");
+            sqlx::query(&query)
+                .bind(start)
+                .bind(end)
+                .fetch_all(&self.pool)
+                .await?
+        };
         rows.into_iter()
             .map(|row| {
                 Ok(RequestEgressSummary {
