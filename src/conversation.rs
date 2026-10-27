@@ -556,6 +556,11 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
     }
     let mut completed = None;
     let mut text = String::new();
+    let mut chat_message = Map::new();
+    let mut chat_tools = BTreeMap::new();
+    let mut anthropic_message = None;
+    let mut blocks = BTreeMap::new();
+    let mut tool_inputs = BTreeMap::<u64, String>::new();
     for line in bytes.split(|byte| *byte == b'\n') {
         let line = trim_ascii(line);
         let Some(payload) = line.strip_prefix(b"data:") else {
@@ -574,9 +579,87 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
             completed = Some(response.clone());
             continue;
         }
-        if value.get("output").is_some() || value.get("choices").is_some() {
+        if value.get("output").is_some()
+            || (value.get("role").is_some() && value.get("content").is_some())
+        {
             completed = Some(value);
             continue;
+        }
+        if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+            for choice in choices {
+                if choice.get("index").and_then(Value::as_u64).unwrap_or(0) != 0 {
+                    continue;
+                }
+                if let Some(message) = choice.get("message").and_then(Value::as_object) {
+                    chat_message = message.clone();
+                    chat_tools.clear();
+                    if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
+                        for (index, call) in calls.iter().enumerate() {
+                            if let Some(call) = call.as_object() {
+                                chat_tools.insert(index as u64, call.clone());
+                            }
+                        }
+                    }
+                } else if let Some(delta) = choice.get("delta") {
+                    if let Some(role) = delta.get("role") {
+                        chat_message.insert("role".into(), role.clone());
+                    }
+                    append_stream_string(&mut chat_message, "content", delta.get("content"));
+                    if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+                        for call in calls {
+                            let Some(index) = call.get("index").and_then(Value::as_u64) else {
+                                continue;
+                            };
+                            let target = chat_tools.entry(index).or_default();
+                            append_stream_string(target, "id", call.get("id"));
+                            if let Some(kind) = call.get("type") {
+                                target.insert("type".into(), kind.clone());
+                            }
+                            let function = target
+                                .entry("function")
+                                .or_insert_with(|| Value::Object(Map::new()))
+                                .as_object_mut()
+                                .expect("tool function object");
+                            append_stream_string(function, "name", call.pointer("/function/name"));
+                            append_stream_string(
+                                function,
+                                "arguments",
+                                call.pointer("/function/arguments"),
+                            );
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        match value.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                anthropic_message = value.get("message").cloned();
+                continue;
+            }
+            Some("content_block_start") => {
+                if let (Some(index), Some(block)) = (
+                    value.get("index").and_then(Value::as_u64),
+                    value.get("content_block"),
+                ) {
+                    blocks.insert(index, block.clone());
+                }
+                continue;
+            }
+            Some("content_block_delta") => {
+                if let Some(index) = value.get("index").and_then(Value::as_u64)
+                    && let Some(block) = blocks.get_mut(&index).and_then(Value::as_object_mut)
+                {
+                    append_stream_string(block, "text", value.pointer("/delta/text"));
+                    if let Some(fragment) =
+                        value.pointer("/delta/partial_json").and_then(Value::as_str)
+                    {
+                        tool_inputs.entry(index).or_default().push_str(fragment);
+                    }
+                }
+                continue;
+            }
+            _ => {}
         }
         if let Some(fragment) = value.get("delta").and_then(Value::as_str) {
             text.push_str(fragment);
@@ -585,17 +668,40 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
         if let Some(fragment) = value
             .pointer("/delta/content")
             .and_then(Value::as_str)
-            .or_else(|| {
-                value
-                    .pointer("/choices/0/delta/content")
-                    .and_then(Value::as_str)
-            })
+            .or_else(|| value.pointer("/delta/text").and_then(Value::as_str))
         {
             text.push_str(fragment);
         }
     }
     if let Some(value) = completed {
         return Some(value);
+    }
+    if !chat_message.is_empty() || !chat_tools.is_empty() {
+        chat_message
+            .entry("role")
+            .or_insert_with(|| "assistant".into());
+        if !chat_tools.is_empty() {
+            chat_message.insert(
+                "tool_calls".into(),
+                chat_tools.into_values().map(Value::Object).collect(),
+            );
+        }
+        return Some(serde_json::json!({"choices": [{"message": chat_message}]}));
+    }
+    if anthropic_message.is_some() || !blocks.is_empty() {
+        let mut message =
+            anthropic_message.unwrap_or_else(|| serde_json::json!({"role": "assistant"}));
+        for (index, input) in tool_inputs {
+            if let Some(block) = blocks.get_mut(&index)
+                && let Ok(input) = serde_json::from_str::<Value>(&input)
+            {
+                block["input"] = input;
+            }
+        }
+        if !blocks.is_empty() {
+            message["content"] = blocks.into_values().collect();
+        }
+        return Some(message);
     }
     if text.is_empty() {
         return None;
@@ -607,6 +713,21 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
             "content": [{"type": "output_text", "text": text}]
         }]
     }))
+}
+
+fn append_stream_string(target: &mut Map<String, Value>, key: &str, fragment: Option<&Value>) {
+    let Some(fragment) = fragment.and_then(Value::as_str) else {
+        return;
+    };
+    let value = target
+        .entry(key)
+        .or_insert_with(|| Value::String(String::new()));
+    if !value.is_string() {
+        *value = Value::String(String::new());
+    }
+    if let Value::String(text) = value {
+        text.push_str(fragment);
+    }
 }
 
 impl SessionBody {
@@ -847,6 +968,7 @@ fn tool_call_part(part_index: u32, call: &Value) -> SessionBodyPart {
     let arguments = call
         .get("arguments")
         .or_else(|| call.pointer("/function/arguments"))
+        .or_else(|| call.get("input"))
         .map(value_text)
         .unwrap_or_default();
     SessionBodyPart {
@@ -909,6 +1031,26 @@ fn push_content_part(
     tool_call_id: Option<String>,
 ) {
     let cleaned = strip_private_provider_fields(item.clone());
+    match cleaned.get("type").and_then(Value::as_str) {
+        Some("tool_use") => {
+            parts.push(tool_call_part(parts.len() as u32, &cleaned));
+            return;
+        }
+        Some("tool_result") => {
+            parts.push(SessionBodyPart {
+                part_index: parts.len() as u32,
+                kind: "tool_result".into(),
+                text: cleaned.get("content").map(value_text),
+                tool_call_id: cleaned
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                ..empty_part()
+            });
+            return;
+        }
+        _ => {}
+    }
     if part_is_private_only(&cleaned) {
         return;
     }
@@ -1213,6 +1355,9 @@ pub(crate) fn digest_parts(parent: Option<&str>, atom: &str) -> String {
     hash.update(atom.as_bytes());
     hash.finalize().to_hex().to_string()
 }
+
+#[cfg(test)]
+mod return_stream_tests;
 
 #[cfg(test)]
 mod tests {
