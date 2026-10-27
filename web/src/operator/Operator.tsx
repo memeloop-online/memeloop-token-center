@@ -9,6 +9,7 @@ import './managementSurfaces.css';
 import '../plugins/pluginUiSlot.css';
 import type { SessionFocus } from './SessionMonitor';
 import type { RequestDrilldown } from './overviewDrilldown';
+import { isUnlinkedSession, unlinkedRequestFilter } from './sessionNavigation';
 import { useOperatorScope } from './hooks/useOperatorScope';
 import { useOperatorResource } from './hooks/useOperatorResource';
 import { useOperatorRequestStream } from './hooks/useOperatorRequestStream';
@@ -184,12 +185,20 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     });
   }
 
-  function openSession(session: UsageAnalysisSessionBucket) {
+  function openSession(session: UsageAnalysisSessionBucket, source?: TypedFilterAst) {
+    if (isUnlinkedSession(session.id, session.unlinked)) {
+      openUnlinkedRequests(session.id, session.key_id, source);
+      return;
+    }
     setSessionFocus({ sessionId: session.id, keyId: session.key_id, revision: Date.now() });
     navigate('sessions');
   }
 
   function openSessionById(sessionId: string) {
+    if (isUnlinkedSession(sessionId)) {
+      openUnlinkedRequests(sessionId);
+      return;
+    }
     setSessionFocus({ sessionId, revision: Date.now() });
     navigate('sessions');
   }
@@ -206,6 +215,15 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
       token: scope.activeCredential,
       tenant: scope.tenant,
     });
+  }
+
+  function openUnlinkedRequests(sessionId: string, keyId?: string, source?: TypedFilterAst) {
+    const ast = unlinkedRequestFilter(sessionId, keyId, source);
+    if (!ast) return;
+    setSessionFocus(undefined);
+    setRequestFocus(undefined);
+    queueRequestDrilldown(ast);
+    void navigate('requests');
   }
 
   const activeRequestDrilldown = requestDrilldown?.token === scope.activeCredential && requestDrilldown.tenant === scope.tenant
@@ -236,7 +254,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
       switch (activeRoute) {
         case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenRequest={openRequestById} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} /></>; break;
         case 'requests': page = <RequestsPage {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
-        case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} />; break;
+        case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} onOpenUnlinkedRequests={openUnlinkedRequests} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
         case 'generations': page = <GenerationsPage {...pageProps} />; break;
         case 'providers': page = <ProvidersPage {...pageProps} onOpenProxyGroups={openProxyGroups} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {

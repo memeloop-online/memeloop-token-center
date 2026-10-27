@@ -297,7 +297,7 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
         {scopeButton('related', t('sessions.rel.related'))}
       </div>
       {scope === 'related' && !cancelled && <Checkbox checked={includeSubtrees} label={t('tasks.scope.subtree')}
-        onChange={(_, data) => setIncludeSubtrees(data.checked === true)} />}
+        onChange={(_, data) => { clearAnalysis(); setIncludeSubtrees(data.checked === true); }} />}
       {scope === 'related' && !cancelled && relatedOptions !== undefined && (
         relatedOptions.length === 0
           ? <p className="muted">{t('tasks.relatedEmpty')}</p>
@@ -306,6 +306,7 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
               return <Checkbox key={key} checked={relatedChecked.has(key)}
                 label={`${labels.get(key) ?? t('sessions.logicalSession')} · ${option.key_id.slice(-8)}/${option.session_id.slice(-8)}`}
                 onChange={(_, data) => {
+                  clearAnalysis();
                   const next = new Set(relatedChecked);
                   if (data.checked === true) next.add(key); else next.delete(key);
                   setRelatedChecked(next);

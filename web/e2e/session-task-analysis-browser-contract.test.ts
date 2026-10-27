@@ -105,6 +105,7 @@ test('session tasks: CAS rename protects concurrent names, relations manage, rol
     await page.waitForFunction(() => window.analyzeCalls.length === 7);
     assert.equal((await page.evaluate(() => window.analyzeCalls[6])).include_subtrees, true);
     await page.getByRole('checkbox', { name: /Related Beta/ }).uncheck();
+    await page.locator('.usage-task-metrics').waitFor({ state: 'hidden' });
     assert.equal(await page.locator('.usage-task-metrics').count(), 0, 'deselection removes the previous union total');
 
     await page.evaluate(() => { window.holdAnalysis = true; });

@@ -26,6 +26,9 @@ const credential = 'mts_overview_drilldown_fixture';
 const tenant = 'drilldown-tenant';
 const now = Date.UTC(2026, 8, 8, 12, 0, 0);
 const bucketStart = now - 3_600_000;
+const usageSessions = new URLSearchParams(location.search).has('usage-sessions');
+const sessionKey = '5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650';
+const realSession = '00000000-0000-4000-8000-000000000002';
 
 window.overviewDrilldownFixture = { calls: [], requestQueryBodies: [], route: 'overview', openOverview: () => undefined };
 
@@ -45,7 +48,10 @@ const usageAnalysis: OperatorUsageAnalysis = {
   from_created_at: bucketStart, to_created_at: now, granularity: 'hour', time_zone: 'UTC',
   p95_is_approximate: true, p95_method: 'fixture_histogram', upstream_grouping: 'stable_account',
   summary: metrics(), time_series: [{ ...metrics(), bucket_start: bucketStart }],
-  by_model: [], by_key: [], by_session: [], by_upstream: [], by_protocol: [], by_status: [], errors: [], heatmap: [],
+  by_model: [], by_key: [], by_session: usageSessions ? [
+    { ...metrics(), id: `unlinked:${sessionKey}`, label: 'Codex credential', key_id: sessionKey, key_alias: 'Codex credential', unlinked: true },
+    { ...metrics(), id: realSession, label: 'Named Codex conversation', key_id: sessionKey, key_alias: 'Codex credential', unlinked: false },
+  ] : [], by_upstream: [], by_protocol: [], by_status: [], errors: [], heatmap: [],
 };
 
 const usageTrends: OperatorUsageAnalysisTrends = {
@@ -90,19 +96,31 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname === '/internal/v1/requests' && method === 'GET') return json([drilledRequest]);
   if (url.pathname === `/internal/v1/requests/${drilledRequest.request_id}` && method === 'GET') return json(drilledRequestDetail);
   if (url.pathname === '/internal/v1/upstreams') return json([]);
+  if (url.pathname === '/internal/v1/keys') return json([]);
+  if (url.pathname === '/internal/v1/filter-presets') return json({ named: [], recent: [] });
+  if (url.pathname === '/internal/v1/sessions' || url.pathname === '/internal/v1/sessions/summaries') return json({
+    generated_at: now, next_cursor: null,
+    sessions: [{
+      session_id: realSession, session_name: 'Named Codex conversation', cluster_id: realSession,
+      key_id: sessionKey, key_alias: 'Codex credential', unlinked: false,
+      last_activity_at: now, model: 'drilled-model', protocol: 'openai', last_status: 'success',
+      active_requests: 0, requests: 7, errors: 0, input_tokens: 84, output_tokens: 28, costs: [],
+      avg_duration_ms: 180, archived_only_requests: 0, archived_only_errors: 0,
+      archived_only_input_tokens: 0, archived_only_output_tokens: 0, archived_only_avg_duration_ms: null,
+    }],
+  });
   if (url.pathname === '/internal/v1/requests/query' && method === 'POST') {
     const body = JSON.parse(String(init?.body ?? '{}'));
     window.overviewDrilldownFixture.requestQueryBodies.push(body);
-    const filtered = Array.isArray(body.ast?.conditions) && body.ast.conditions.length === 1
-      && body.ast.conditions[0]?.field === 'created_at' && body.ast.conditions[0]?.operator === 'between';
+    const filtered = Array.isArray(body.ast?.conditions) && body.ast.conditions.some((condition: { field: string }) => condition.field === 'created_at');
     return json({ requests: filtered ? [drilledRequest] : [], next_cursor: null });
   }
   return json({ error: { message: `Unexpected fixture endpoint: ${url.pathname}` } }, 404);
 };
 
 function Fixture() {
-  const [route, setRoute] = useState<OperatorRouteKey>('overview');
-  window.overviewDrilldownFixture.openOverview = () => setRoute('overview');
+  const [route, setRoute] = useState<OperatorRouteKey>(usageSessions ? 'usage' : 'overview');
+  window.overviewDrilldownFixture.openOverview = () => setRoute(usageSessions ? 'usage' : 'overview');
   useEffect(() => { window.overviewDrilldownFixture.route = route; }, [route]);
   return <>
     <output data-fixture-route={route}>{route}</output>

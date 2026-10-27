@@ -13,6 +13,7 @@ import { LocalSettlementNotice, localSettlementLabel, localSettlementTrendLabel 
 import { analyticsDuration, finiteP95Points, histogramP95 } from './analyticsPresentation';
 import { UsageSummaryMetrics } from './UsageSummaryMetrics';
 import { SessionTaskPanel } from './SessionTaskPanel';
+import { credentialDisplayName } from '../identityPresentation';
 import { useI18n } from '../i18n';
 import type { KeyListCursor, KeyView, OperatorUsageAnalysis, TypedFilterAst, UsageAnalysisBucket, UsageAnalysisCost, UsageAnalysisMetrics, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket, UpstreamAccount } from '../types';
 import './usage.css';
@@ -125,7 +126,7 @@ function LazyChart({ children }: { children: ReactNode }) {
   return <Suspense fallback={<LoadingState label={t('common.loading')} variant="detail" />}>{children}</Suspense>;
 }
 
-export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { token: string; tenant: string; upstreams: UpstreamAccount[]; onOpenSession: (session: UsageAnalysisSessionBucket) => void }) {
+export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { token: string; tenant: string; upstreams: UpstreamAccount[]; onOpenSession: (session: UsageAnalysisSessionBucket, source?: TypedFilterAst) => void }) {
   const { locale, t } = useI18n(); const copy = localCopy[locale];
   const [tab, setTab] = useState<UsageTab>('overview'); const [dimension, setDimension] = useState<Dimension>('models');
   const [heatMetric, setHeatMetric] = useState<HeatmapMetric>('requests'); const [heatCurrency, setHeatCurrency] = useState(''); const [selectedHeatHour, setSelectedHeatHour] = useState<number>();
@@ -186,7 +187,18 @@ export function UsageAnalysis({ token, tenant, upstreams, onOpenSession }: { tok
     if (dimension === 'keys') return <DimensionTable title={t('usage.keys')} values={stats.by_key} onSelect={(bucket) => applyDimension('keyId', bucket)} />;
     if (dimension === 'sessions') return <>
       <SessionTaskPanel key={`${tenant}\0${token}`} token={token} tenant={tenant} />
-      <DimensionTable title={t('usage.sessions')} values={stats.by_session} labelForValue={(bucket) => bucket.unlinked || bucket.id.startsWith('unlinked:') ? t('sessions.unlinkedRequests') : bucket.label} onSelect={onOpenSession} />
+      <p className="muted">{t('usage.unlinkedNavigation')}</p>
+      <DimensionTable title={t('usage.sessions')} values={stats.by_session}
+        labelForValue={(bucket) => bucket.unlinked || bucket.id.startsWith('unlinked:') ? `${t('sessions.unlinkedRequests')} · ${credentialDisplayName(bucket.key_alias, t)} · ${bucket.key_id.slice(-8)}` : bucket.label}
+        onSelect={(bucket) => {
+          const source = usageAstFromSelection(emptyTypedFilterAst, {
+            ...applied,
+            preset: 'custom',
+            customFrom: localDateTimeInput(stats.from_created_at),
+            customTo: localDateTimeInput(stats.to_created_at),
+          });
+          if (source) onOpenSession(bucket, source);
+        }} />
     </>;
     if (dimension === 'upstreams') return <DimensionTable title={t('usage.upstreams')} values={stats.by_upstream} labelForValue={(bucket) => bucket.id === 'unassigned' ? t('usage.unassigned') : bucket.label} onSelect={(bucket) => applyDimension('upstreamId', bucket)} />;
     if (dimension === 'protocols') return <DimensionTable title={t('usage.protocols')} values={stats.by_protocol} labelForValue={(bucket) => t(`usage.protocol.${bucket.id}`)} onSelect={(bucket) => applyDimension('protocol', bucket)} />;

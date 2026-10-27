@@ -9,6 +9,7 @@ import { SessionCredentialFilter } from './SessionCredentialFilter.js';
 import { SessionRelationships } from './SessionRelationships.js';
 import { SessionTitleAction } from './SessionTitleAction.js';
 import { enqueueSessionTitles, useSessionParentLabel } from './sessionTasks.js';
+import { isUnlinkedSession } from './sessionNavigation.js';
 import { credentialDisplayName } from '../identityPresentation.js';
 import { unnamedSessionName } from '../sessionTitles.js';
 import { RequestRefreshControl } from './traffic/RequestRefreshControl.js';
@@ -95,7 +96,7 @@ function messageOf(reason: unknown, fallback: string) {
   return reason instanceof Error ? reason.message : fallback;
 }
 
-export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOverflowed, focus, streamState, onSelectRequest, refreshCadence }: {
+export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOverflowed, focus, streamState, onSelectRequest, onOpenUnlinkedRequests, refreshCadence }: {
   token: string;
   tenant: string;
   revision: number;
@@ -104,6 +105,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   focus?: SessionFocus;
   streamState: SessionStreamState;
   onSelectRequest: (request: RequestView) => Promise<void>;
+  onOpenUnlinkedRequests?: (sessionId: string, keyId?: string) => void;
   refreshCadence?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const { locale, t } = useI18n();
@@ -196,11 +198,23 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
       // A list read is idempotent. Retry early transient failures inside the
       // existing 15-second user-visible budget; scope/filter cancellation still
       // immediately aborts every attempt and its backoff.
-      const response = await apiRead<LogicalSessionListResponse>(
-        sessionsPath(tenant, selectedFilters, older ? nextCursor ?? undefined : undefined),
-        credential,
-        { attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal },
-      );
+      const exactFocus = !older && focus?.keyId && focus.sessionId === selectedFilters.q
+        && focus.keyId === selectedFilters.keyId && !isUnlinkedSession(focus.sessionId)
+        ? { key_id: focus.keyId, session_id: focus.sessionId } : undefined;
+      const response: LogicalSessionListResponse = exactFocus
+        ? {
+            ...await api<LogicalSessionSummaryBatchResponse>('/internal/v1/sessions/summaries', credential, {
+              method: 'POST',
+              body: sessionSummaryBatchBody(tenant, { ...selectedFilters, q: '' }, [exactFocus]),
+              signal: AbortSignal.any([request.signal, AbortSignal.timeout(15_000)]),
+            }),
+            next_cursor: null,
+          }
+        : await apiRead<LogicalSessionListResponse>(
+            sessionsPath(tenant, selectedFilters, older ? nextCursor ?? undefined : undefined),
+            credential,
+            { attempts: 3, attemptTimeoutMilliseconds: 15_000, totalTimeoutMilliseconds: 15_000, signal: request.signal },
+          );
       if (!request.isCurrent() || sequence !== listSequence.current) return false;
       const page = response.sessions;
       const resetActiveTail = background && loadedOlderList.current && selectedFilters.state === 'active';
@@ -287,6 +301,10 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   }
 
   async function selectSession(session: LogicalSessionSummary) {
+    if (isUnlinkedSession(session.session_id, session.unlinked)) {
+      onOpenUnlinkedRequests?.(session.session_id, session.key_id);
+      return;
+    }
     const request = detailRequests.current.begin();
     detailInFlight.current = true;
     selectedRef.current = session;
@@ -496,6 +514,10 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
 
   useEffect(() => {
     if (!focus) return;
+    if (isUnlinkedSession(focus.sessionId)) {
+      onOpenUnlinkedRequests?.(focus.sessionId, focus.keyId);
+      return;
+    }
     const focusedFilters: SessionFilters = { q: focus.sessionId, keyId: focus.keyId ?? '', model: '', state: '' };
     setDraft(focusedFilters);
     setFilters(focusedFilters);

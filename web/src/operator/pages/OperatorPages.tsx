@@ -76,7 +76,7 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenRequest, onOpenS
 }
 
 export function UsagePage({ token, tenant, onOpenSession }: OperatorPageProps & {
-  onOpenSession: (session: UsageAnalysisSessionBucket) => void;
+  onOpenSession: (session: UsageAnalysisSessionBucket, source?: TypedFilterAst) => void;
 }) {
   const { t } = useI18n();
   const resource = useOperatorResource(
