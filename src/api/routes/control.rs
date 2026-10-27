@@ -3,6 +3,16 @@ use super::super::*;
 pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route(
+            "/internal/v1/transport-proxies",
+            get(network_proxies::list_network_proxies).post(network_proxies::create_network_proxy),
+        )
+        .route(
+            "/internal/v1/transport-proxies/{proxy_id}",
+            get(network_proxies::get_network_proxy)
+                .put(network_proxies::update_network_proxy)
+                .delete(network_proxies::delete_network_proxy),
+        )
+        .route(
             "/internal/v1/api-schema",
             get(super::super::api_schema::discover),
         )

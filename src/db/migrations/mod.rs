@@ -740,6 +740,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
         ),
     },
+    Migration {
+        version: 143,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0143_network_proxies.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1462,6 +1467,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
         ),
+    },
+    Migration {
+        version: 143,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0143_network_proxies.sql"),
     },
 ];
 

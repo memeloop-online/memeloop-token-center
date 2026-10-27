@@ -104,6 +104,7 @@ pub(crate) use session_titles::{
 };
 mod tenants;
 mod transport_proxy_groups;
+pub(crate) mod network_proxies;
 pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;

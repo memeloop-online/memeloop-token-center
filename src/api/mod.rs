@@ -84,6 +84,7 @@ pub mod startup;
 mod tenants;
 mod traffic;
 mod transport_proxy_groups;
+mod network_proxies;
 mod upstreams;
 use transport_proxy_groups::*;
 pub(crate) use upstreams::run_upstream_service_probes;
