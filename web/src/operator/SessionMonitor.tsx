@@ -245,7 +245,9 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
           ? page.find((session) => session.session_id === pendingFocus.sessionId && (!pendingFocus.keyId || session.key_id === pendingFocus.keyId))
           : undefined;
         const currentlyVisible = selectedRef.current && page.some((session) => session.session_id === selectedRef.current?.session_id && session.key_id === selectedRef.current?.key_id);
-        const target = focused ?? (!pendingFocus && !currentlyVisible ? page[0] : undefined);
+        const target = focused ?? (!pendingFocus && !currentlyVisible
+          ? page.find((session) => !isUnlinkedSession(session.session_id, session.unlinked))
+          : undefined);
         if (focused && pendingFocus) handledFocus.current = pendingFocus.revision;
         if (target) void selectSession(target);
       }

@@ -27,6 +27,7 @@ const tenant = 'drilldown-tenant';
 const now = Date.UTC(2026, 8, 8, 12, 0, 0);
 const bucketStart = now - 3_600_000;
 const usageSessions = new URLSearchParams(location.search).has('usage-sessions');
+const initialSessions = new URLSearchParams(location.search).has('initial-sessions');
 const sessionKey = '5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650';
 const realSession = '00000000-0000-4000-8000-000000000002';
 
@@ -100,7 +101,14 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname === '/internal/v1/filter-presets') return json({ named: [], recent: [] });
   if (url.pathname === '/internal/v1/sessions' || url.pathname === '/internal/v1/sessions/summaries') return json({
     generated_at: now, next_cursor: null,
-    sessions: [{
+    sessions: [...(initialSessions && url.pathname === '/internal/v1/sessions' ? [{
+      session_id: `unlinked:${sessionKey}`, session_name: null, cluster_id: null,
+      key_id: sessionKey, key_alias: 'Codex credential', unlinked: true,
+      last_activity_at: now, model: 'drilled-model', protocol: 'openai', last_status: 'success',
+      active_requests: 0, requests: 7, errors: 0, input_tokens: 84, output_tokens: 28, costs: [],
+      avg_duration_ms: 180, archived_only_requests: 0, archived_only_errors: 0,
+      archived_only_input_tokens: 0, archived_only_output_tokens: 0, archived_only_avg_duration_ms: null,
+    }] : []), {
       session_id: realSession, session_name: 'Named Codex conversation', cluster_id: realSession,
       key_id: sessionKey, key_alias: 'Codex credential', unlinked: false,
       last_activity_at: now, model: 'drilled-model', protocol: 'openai', last_status: 'success',
@@ -119,7 +127,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 };
 
 function Fixture() {
-  const [route, setRoute] = useState<OperatorRouteKey>(usageSessions ? 'usage' : 'overview');
+  const [route, setRoute] = useState<OperatorRouteKey>(initialSessions ? 'sessions' : usageSessions ? 'usage' : 'overview');
   window.overviewDrilldownFixture.openOverview = () => setRoute(usageSessions ? 'usage' : 'overview');
   useEffect(() => { window.overviewDrilldownFixture.route = route; }, [route]);
   return <>

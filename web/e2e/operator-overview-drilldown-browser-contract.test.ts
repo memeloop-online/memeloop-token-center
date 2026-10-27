@@ -126,6 +126,15 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     const focusedCalls = await page.evaluate(() => window.overviewDrilldownFixture.calls);
     assert.equal(focusedCalls.some(call => call === 'POST /internal/v1/sessions/summaries'), true, 'known identity uses the summary endpoint');
     assert.equal(focusedCalls.some(call => call.includes('/sessions?') && call.includes('q=')), false, 'exact focus never waits for a name-search list');
+
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?initial-sessions=1`);
+    await page.waitForFunction(() => window.overviewDrilldownFixture.calls.some(call => call.includes('/sessions/00000000-0000-4000-8000-000000000002?')));
+    assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.route), 'sessions', 'an aggregate first row must not navigate automatically');
+    assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.length), 0);
+    await page.getByRole('button', { name: 'Open Unlinked requests', exact: true }).click();
+    await page.waitForFunction(() => window.overviewDrilldownFixture.requestQueryBodies.length > 0);
+    assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.route), 'requests', 'explicit aggregate selection navigates');
+    assert.equal((await page.evaluate(() => window.overviewDrilldownFixture.calls)).some(call => /\/sessions\/unlinked(?::|%3A)/.test(call)), false);
   } finally {
     await browser.close();
     await server.close();
