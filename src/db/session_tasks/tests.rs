@@ -595,3 +595,224 @@ async fn archive_identity_union_deduplicates_native_facts_and_keeps_unknown_cost
     assert_eq!(analysis["totals"]["unknown_cost_requests"], 1);
     assert_eq!(analysis["totals"]["costs"]["USD"], 7);
 }
+
+#[tokio::test]
+async fn parent_import_validates_existing_identity_graph_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("parent-conflicts.db").display()
+    ))
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    for cycle in [true, false] {
+        let owner = key(&db, &format!("parent-conflict-{cycle}")).await;
+        let first_thread = Uuid::now_v7();
+        let second_thread = Uuid::now_v7();
+        let first = session(&db, &owner, first_thread).await;
+        let second = session(&db, &owner, second_thread).await;
+        let third = session(&db, &owner, Uuid::now_v7()).await;
+        db.change_session_relationship(
+            owner.tenant_id,
+            &first,
+            if cycle { &second } else { &third },
+            "parent",
+            Some("thread_spawn_edges"),
+            false,
+        )
+        .await
+        .unwrap();
+        let imported = db
+            .import_session_parents(
+                owner.tenant_id,
+                &[
+                    ThreadParent {
+                        child_thread_id: Uuid::now_v7(),
+                        parent_thread_id: first_thread,
+                        evidence: "thread_spawn_edges".into(),
+                    },
+                    ThreadParent {
+                        child_thread_id: if cycle { second_thread } else { first_thread },
+                        parent_thread_id: if cycle { first_thread } else { second_thread },
+                        evidence: "thread_spawn_edges".into(),
+                    },
+                ],
+            )
+            .await;
+        assert!(matches!(imported, Err(AppError::Conflict(_))));
+        let threads: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_thread_parents WHERE tenant_id=$1")
+                .bind(owner.tenant_id.to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        let relationships: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_relationships WHERE tenant_id=$1")
+                .bind(owner.tenant_id.to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!((threads, relationships), (0, 1));
+    }
+    let owner = key(&db, "mapped-parents").await;
+    let other = key(&db, "mapped-parents").await;
+    let parent_thread = Uuid::now_v7();
+    let child_thread = Uuid::now_v7();
+    let parent = session(&db, &owner, parent_thread).await;
+    let other_parent = session(&db, &other, parent_thread).await;
+    let child = session(&db, &owner, child_thread).await;
+    db.change_session_relationship(
+        owner.tenant_id,
+        &child,
+        &parent,
+        "parent",
+        Some("thread_spawn_edges"),
+        false,
+    )
+    .await
+    .unwrap();
+    let edges = [ThreadParent {
+        child_thread_id: child_thread,
+        parent_thread_id: parent_thread,
+        evidence: "thread_spawn_edges".into(),
+    }];
+    assert_eq!(
+        db.import_session_parents(owner.tenant_id, &edges)
+            .await
+            .unwrap()["linked"],
+        1
+    );
+    assert_eq!(
+        db.import_session_parents(owner.tenant_id, &edges)
+            .await
+            .unwrap()["linked"],
+        0
+    );
+    let relationships = db
+        .session_relationships(owner.tenant_id, &child, None)
+        .await
+        .unwrap();
+    assert_eq!(relationships["relationships"].as_array().unwrap().len(), 2);
+    assert!(
+        relationships["relationships"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|edge| edge["target"] == json!(other_parent))
+    );
+}
+
+#[tokio::test]
+async fn late_parent_reconciliation_preserves_related_union_and_subtree_usage() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("task-reconciliation.db").display()
+    ))
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    let owner = key(&db, "task-reconciliation").await;
+    let target_thread = Uuid::now_v7();
+    let target = session(&db, &owner, target_thread).await;
+    let peer = session(&db, &owner, Uuid::now_v7()).await;
+    let source = SessionIdentity {
+        key_id: owner.key_id,
+        session_id: observe(
+            &db,
+            &owner,
+            &json!({"input":"delayed-parent child"}),
+            &ConversationHints {
+                parent_turn_id: Some("late-turn".into()),
+                ..Default::default()
+            },
+            Uuid::now_v7(),
+            2,
+            true,
+        )
+        .await,
+    };
+    let child = session(&db, &owner, Uuid::now_v7()).await;
+    let root = session(&db, &owner, Uuid::now_v7()).await;
+    for (from, to, kind) in [
+        (&source, &peer, "related"),
+        (&target, &peer, "related"),
+        (&source, &target, "related"),
+        (&source, &root, "parent"),
+        (&child, &source, "parent"),
+    ] {
+        db.change_session_relationship(
+            owner.tenant_id,
+            from,
+            to,
+            kind,
+            Some("thread_spawn_edges"),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    for identity in [&source, &target, &child, &peer] {
+        fact(&db, owner.tenant_id, identity, 1).await;
+    }
+    let reconciled = observe(
+        &db,
+        &owner,
+        &json!({"input":"parent now published"}),
+        &ConversationHints {
+            session_id: Some(target_thread.to_string()),
+            turn_id: Some("late-turn".into()),
+            ..Default::default()
+        },
+        Uuid::now_v7(),
+        3,
+        true,
+    )
+    .await;
+    assert_eq!(reconciled, target.session_id);
+    let stale: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM session_relationships WHERE tenant_id=$1 AND (session_id=$2 OR target_session_id=$2)")
+        .bind(owner.tenant_id.to_string()).bind(source.session_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(stale, 0);
+    let relationships = db
+        .session_relationships(owner.tenant_id, &peer, None)
+        .await
+        .unwrap();
+    let edge = &relationships["relationships"].as_array().unwrap()[0];
+    let selected = [
+        SessionIdentity {
+            key_id: parse_uuid(edge["key_id"].as_str().unwrap().to_owned()).unwrap(),
+            session_id: parse_uuid(edge["session_id"].as_str().unwrap().to_owned()).unwrap(),
+        },
+        serde_json::from_value(edge["target"].clone()).unwrap(),
+    ];
+    assert_eq!(
+        db.analyze_session_tasks(
+            owner.tenant_id,
+            &selected,
+            "related",
+            None,
+            &SessionTaskOptions::default()
+        )
+        .await
+        .unwrap()["totals"]["requests"],
+        3
+    );
+    assert_eq!(
+        db.analyze_session_tasks(
+            owner.tenant_id,
+            &[root],
+            "subtree",
+            None,
+            &SessionTaskOptions::default()
+        )
+        .await
+        .unwrap()["totals"]["requests"],
+        3
+    );
+    let facts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_stats_facts")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(facts, 4);
+}

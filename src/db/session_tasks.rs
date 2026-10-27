@@ -83,8 +83,38 @@ impl Database {
             sqlx::query("INSERT INTO session_thread_parents (tenant_id,child_thread_id,parent_thread_id,evidence) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING")
                 .bind(tenant.to_string()).bind(parent.child_thread_id.to_string()).bind(parent.parent_thread_id.to_string()).bind(&parent.evidence).execute(&mut *tx).await?;
         }
-        let linked=sqlx::query("WITH endpoints AS (SELECT DISTINCT o.explicit_session_id,o.key_id,o.cluster_id FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE c.tenant_id=$1 AND o.explicit_session_id IN (SELECT child_thread_id FROM session_thread_parents WHERE tenant_id=$1 UNION SELECT parent_thread_id FROM session_thread_parents WHERE tenant_id=$1)) INSERT INTO session_relationships (tenant_id,key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at) SELECT DISTINCT p.tenant_id,child.key_id,child.cluster_id,parent.key_id,parent.cluster_id,'parent',p.evidence,$2 FROM session_thread_parents p JOIN endpoints child ON child.explicit_session_id=p.child_thread_id JOIN endpoints parent ON parent.explicit_session_id=p.parent_thread_id WHERE p.tenant_id=$1 AND (child.key_id<>parent.key_id OR child.cluster_id<>parent.cluster_id) ON CONFLICT DO NOTHING")
-            .bind(tenant.to_string()).bind(unix_millis()).execute(&mut *tx).await?.rows_affected();
+        let rows=sqlx::query("WITH endpoints AS (SELECT DISTINCT o.explicit_session_id,o.key_id,o.cluster_id FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE c.tenant_id=$1 AND o.explicit_session_id IN (SELECT child_thread_id FROM session_thread_parents WHERE tenant_id=$1 UNION SELECT parent_thread_id FROM session_thread_parents WHERE tenant_id=$1)) SELECT DISTINCT p.child_thread_id,p.parent_thread_id,child.key_id,child.cluster_id,parent.key_id AS target_key_id,parent.cluster_id AS target_session_id,p.evidence FROM session_thread_parents p JOIN endpoints child ON child.explicit_session_id=p.child_thread_id JOIN endpoints parent ON parent.explicit_session_id=p.parent_thread_id WHERE p.tenant_id=$1 AND (child.key_id<>parent.key_id OR child.cluster_id<>parent.cluster_id)")
+            .bind(tenant.to_string()).fetch_all(&mut *tx).await?;
+        let mut parent_sets = BTreeMap::<_, BTreeMap<SessionIdentity, String>>::new();
+        for row in rows {
+            let source = SessionIdentity {
+                key_id: parse_uuid(row.try_get("key_id")?)?,
+                session_id: parse_uuid(row.try_get("cluster_id")?)?,
+            };
+            let target = SessionIdentity {
+                key_id: parse_uuid(row.try_get("target_key_id")?)?,
+                session_id: parse_uuid(row.try_get("target_session_id")?)?,
+            };
+            parent_sets
+                .entry((
+                    row.try_get::<String, _>("child_thread_id")?,
+                    row.try_get::<String, _>("parent_thread_id")?,
+                    source,
+                ))
+                .or_default()
+                .insert(target, row.try_get("evidence")?);
+        }
+        let mut linked = 0;
+        for ((_, _, source), targets) in parent_sets {
+            validate_session_parents(&mut tx, tenant, &source, &targets.keys().cloned().collect())
+                .await?;
+            for (target, evidence) in targets {
+                linked += sqlx::query("INSERT INTO session_relationships (tenant_id,key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at) VALUES ($1,$2,$3,$4,$5,'parent',$6,$7) ON CONFLICT DO NOTHING")
+                    .bind(tenant.to_string()).bind(source.key_id.to_string()).bind(source.session_id.to_string())
+                    .bind(target.key_id.to_string()).bind(target.session_id.to_string()).bind(evidence).bind(unix_millis())
+                    .execute(&mut *tx).await?.rows_affected();
+            }
+        }
         tx.commit().await?;
         Ok(json!({"accepted":parents.len(),"linked":linked}))
     }
@@ -313,20 +343,13 @@ impl Database {
                 .bind(tenant.to_string()).bind(source.key_id.to_string()).bind(source.session_id.to_string()).bind(target.key_id.to_string()).bind(target.session_id.to_string()).bind(kind).execute(&mut *tx).await?;
         } else {
             if kind == "parent" {
-                let cycle: i64 = sqlx::query_scalar("WITH RECURSIVE ancestors(key_id,session_id) AS (SELECT $2,$3 UNION SELECT r.target_key_id,r.target_session_id FROM session_relationships r JOIN ancestors a ON r.key_id=a.key_id AND r.session_id=a.session_id WHERE r.tenant_id=$1 AND r.kind='parent') SELECT COUNT(*) FROM ancestors WHERE key_id=$4 AND session_id=$5")
-                    .bind(tenant.to_string()).bind(target.key_id.to_string()).bind(target.session_id.to_string()).bind(source.key_id.to_string()).bind(source.session_id.to_string()).fetch_one(&mut *tx).await?;
-                if cycle > 0 {
-                    return Err(AppError::Conflict("parent cycle".into()));
-                }
-                let existing = sqlx::query("SELECT target_key_id,target_session_id FROM session_relationships WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3 AND kind='parent'")
-                    .bind(tenant.to_string()).bind(source.key_id.to_string()).bind(source.session_id.to_string()).fetch_optional(&mut *tx).await?;
-                if let Some(row) = existing
-                    && (row.try_get::<String, _>("target_key_id")? != target.key_id.to_string()
-                        || row.try_get::<String, _>("target_session_id")?
-                            != target.session_id.to_string())
-                {
-                    return Err(AppError::Conflict("contradictory parent evidence".into()));
-                }
+                validate_session_parents(
+                    &mut tx,
+                    tenant,
+                    source,
+                    &BTreeSet::from([target.clone()]),
+                )
+                .await?;
             }
             sqlx::query("INSERT INTO session_relationships (tenant_id,key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING")
                 .bind(tenant.to_string()).bind(source.key_id.to_string()).bind(source.session_id.to_string()).bind(target.key_id.to_string()).bind(target.session_id.to_string()).bind(kind).bind(evidence).bind(unix_millis()).execute(&mut *tx).await?;
@@ -489,6 +512,32 @@ impl Database {
             "coverage":"completed_request_facts_and_archive_only"
         }))
     }
+}
+
+async fn validate_session_parents(
+    tx: &mut Transaction<'_, Any>,
+    tenant: Uuid,
+    source: &SessionIdentity,
+    targets: &BTreeSet<SessionIdentity>,
+) -> Result<(), AppError> {
+    let existing = sqlx::query("SELECT target_key_id,target_session_id FROM session_relationships WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3 AND kind='parent'")
+        .bind(tenant.to_string()).bind(source.key_id.to_string()).bind(source.session_id.to_string()).fetch_all(&mut **tx).await?;
+    for row in existing {
+        if !targets.contains(&SessionIdentity {
+            key_id: parse_uuid(row.try_get("target_key_id")?)?,
+            session_id: parse_uuid(row.try_get("target_session_id")?)?,
+        }) {
+            return Err(AppError::Conflict("contradictory parent evidence".into()));
+        }
+    }
+    for target in targets {
+        let cycle: i64 = sqlx::query_scalar("WITH RECURSIVE ancestors(key_id,session_id) AS (SELECT $2,$3 UNION SELECT r.target_key_id,r.target_session_id FROM session_relationships r JOIN ancestors a ON r.key_id=a.key_id AND r.session_id=a.session_id WHERE r.tenant_id=$1 AND r.kind='parent') SELECT COUNT(*) FROM ancestors WHERE key_id=$4 AND session_id=$5")
+            .bind(tenant.to_string()).bind(target.key_id.to_string()).bind(target.session_id.to_string()).bind(source.key_id.to_string()).bind(source.session_id.to_string()).fetch_one(&mut **tx).await?;
+        if cycle > 0 {
+            return Err(AppError::Conflict("parent cycle".into()));
+        }
+    }
+    Ok(())
 }
 
 async fn lock_session_tenant(tx: &mut Transaction<'_, Any>, tenant: Uuid) -> Result<(), AppError> {
