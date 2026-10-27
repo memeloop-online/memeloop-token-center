@@ -1,44 +1,5 @@
 use super::super::*;
 
-/// Materialization is deferred: `finish_proxy_request` only enqueues the
-/// terminal and conversation projections, so a test that asserts the resulting
-/// `conversation_observations` row has to drive both queues first, terminal
-/// before conversation.
-async fn drain_projections(database: &Database, request_id: Uuid) {
-    for _ in 0..4 {
-        let owner = Uuid::now_v7();
-        let mut progressed = false;
-        if database
-            .claim_terminal_projection_tasks(owner, 32)
-            .await
-            .unwrap()
-            .contains(&request_id)
-        {
-            database
-                .project_claimed_terminal_projection_task(owner, request_id)
-                .await
-                .unwrap();
-            progressed = true;
-        }
-        if database
-            .claim_conversation_projection_tasks(owner, 32)
-            .await
-            .unwrap()
-            .iter()
-            .any(|task| task.request_id == request_id)
-        {
-            database
-                .project_claimed_conversation_projection_task(owner, request_id)
-                .await
-                .unwrap();
-            progressed = true;
-        }
-        if !progressed {
-            return;
-        }
-    }
-}
-
 const ADMISSION_SNAPSHOT_FAULTS: [(&str, &str, &str); 2] = [
     (
         "admission_snapshot_abort",

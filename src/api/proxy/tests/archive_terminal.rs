@@ -189,15 +189,10 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         .expect(1)
         .mount(&upstream)
         .await;
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({
-            "model": fixture.model, "input": "only safety must be durable before dispatch", "stream": false
-        }),
-    )
-    .await;
+    let request = json!({
+        "model": fixture.model, "input": "only safety must be durable before dispatch", "stream": false
+    });
+    let response = send_codex_route(&fixture, &upstream, "/v1/responses", request.clone()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
@@ -222,16 +217,18 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
+    gateway_persistence::assert_readable_source_without_spool(
+        &fixture,
+        &pool,
+        rows[0].request_id,
+        &request,
+    )
+    .await;
+    sqlx::query("DROP TRIGGER reject_request_capture")
+        .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        refs.request_archive_state,
-        crate::model::RequestArchiveState::Gap
-    );
+    drain_completed_response_archive(&fixture).await;
     wait_for_request_settlement(&fixture, 1).await;
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     upstream.verify().await;
