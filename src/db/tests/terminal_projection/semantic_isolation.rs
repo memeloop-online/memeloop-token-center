@@ -151,6 +151,14 @@ async fn recovery_contract(database_url: &str) {
     );
     sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)")
         .bind(request_id.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(key.principal_id.to_string()).bind(encoded.len() as i64).bind(payload.get::<String, _>("digest")).bind(&encoded).execute(&database.pool).await.unwrap();
+    assert!(
+        database
+            .claim_conversation_projection_tasks(stale, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id)
+    );
     for field in ["tenant_id", "key_id", "principal_id"] {
         let original = match field {
             "tenant_id" => key.tenant_id,
