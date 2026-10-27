@@ -35,10 +35,6 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         Some("upstream_invalid_response"),
     )
     .await;
-    assert_eq!(
-        receipt["conversation"]["request_json"]["input"],
-        "PRIVATE_OWNED_UNKNOWN_INPUT"
-    );
     let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -58,7 +54,22 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         .into_iter()
         .find(|item| item["receipt_id"] == receipt["receipt_id"])
         .expect("unknown finance keeps the in-memory receipt");
-    assert_eq!(retained_receipt, receipt);
+    let mut compact_receipt = receipt.clone();
+    compact_receipt["conversation"] = Value::Null;
+    assert_eq!(retained_receipt, compact_receipt);
+    let retained_body: String = sqlx::query_scalar(
+        "SELECT p.request_json FROM conversation_semantic_payloads p JOIN conversation_projection_outbox o ON o.request_id = p.request_id AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.principal_id = p.principal_id WHERE p.request_id = $1 AND p.tenant_id = $2 AND p.key_id = $3 AND o.projected_at IS NULL",
+    )
+    .bind(receipt["request_id"].as_str().unwrap())
+    .bind(receipt["claim"]["tenant_id"].as_str().unwrap())
+    .bind(receipt["claim"]["key_id"].as_str().unwrap())
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&retained_body).unwrap()["input"],
+        "PRIVATE_OWNED_UNKNOWN_INPUT"
+    );
     assert!(
         fixture
             .state
