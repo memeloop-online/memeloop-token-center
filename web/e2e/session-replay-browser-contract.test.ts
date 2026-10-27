@@ -149,7 +149,7 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     const page = await browser.newPage();
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1`);
-    const open = page.getByRole('button', { name: 'Read full Response content', exact: true });
+    const open = page.getByRole('button', { name: 'Read full Raw return JSON content', exact: true });
     await open.waitFor();
     assert.equal(await page.evaluate(() => window.archiveRangeReads), 0);
     assert.deepEqual(await page.locator('.session-replay-turn-heading b').allTextContents(), ['—'], 'snapshot-only data cannot claim zero user activity');

@@ -517,7 +517,11 @@ async fn fuel_exhaustion_and_guest_traps_fail_closed() {
         let error = runtime
             .apply_traffic(context(), &json!({"model": "test"}))
             .expect_err("plugin failure must reject the request");
-        assert!(error.to_string().contains(id));
+        assert_eq!(
+            error.to_string(),
+            "configured upstream is unavailable: plugin_execution_failed",
+            "{id}"
+        );
     }
 }
 
@@ -691,7 +695,10 @@ async fn epoch_timeout_interrupts_a_guest_even_with_effectively_unlimited_fuel()
     let error = runtime
         .apply_traffic(context(), &json!({"model": "test"}))
         .expect_err("execution timeout must reject the request");
-    assert!(error.to_string().contains("timeout-policy"));
+    assert_eq!(
+        error.to_string(),
+        "configured upstream is unavailable: plugin_execution_failed"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "epoch deadline was not enforced"
@@ -733,7 +740,11 @@ async fn component_prepare_trap_fuel_and_32_mib_memory_limit_fail_closed() {
                 &json!({"model": "test"}),
             )
             .expect_err("component failure must reject the request");
-        assert!(error.to_string().contains(id), "{id}: {error}");
+        assert_eq!(
+            error.to_string(),
+            "configured upstream is unavailable: plugin_execution_failed",
+            "{id}"
+        );
     }
 }
 
@@ -760,7 +771,10 @@ async fn component_prepare_epoch_deadline_fails_closed_with_unlimited_fuel() {
             &json!({"model": "test"}),
         )
         .expect_err("epoch timeout must reject component provider prepare");
-    assert!(error.to_string().contains("prepare-timeout"));
+    assert_eq!(
+        error.to_string(),
+        "configured upstream is unavailable: plugin_execution_failed"
+    );
     assert!(started.elapsed() < Duration::from_secs(1));
 }
 

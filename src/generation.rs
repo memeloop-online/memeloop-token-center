@@ -1999,7 +1999,7 @@ mod tests {
             let error = validated_upstream_job_id(&invalid).unwrap_err().to_string();
             assert_eq!(
                 error,
-                "configured upstream is unavailable: generation_submit_response_has_invalid_job_id"
+                "configured upstream is unavailable: generation_job_id_rejected"
             );
             assert!(!error.contains("must-not-leak"));
         }
@@ -2030,7 +2030,7 @@ mod tests {
         let unknown = unknown_generation_status("volcengine-seedance").to_string();
         assert_eq!(
             unknown,
-            "configured upstream is unavailable: unknown_seedance_generation_status"
+            "configured upstream is unavailable: unknown_generation_status"
         );
         let unknown_provider =
             unknown_generation_status("provider-status-with-sensitive-token").to_string();
@@ -2045,7 +2045,10 @@ mod tests {
             .await
             .expect_err("port zero must fail");
         let message = sanitized_http_error(&error, "generation asset request").to_string();
-        assert!(message.contains("generation asset request failed"));
+        assert_eq!(
+            message,
+            "configured upstream is unavailable: generation_upstream_http_failed"
+        );
         assert!(!message.contains("must-not-leak"));
     }
 }
