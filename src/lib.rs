@@ -192,16 +192,22 @@ impl AppState {
                 .migrate()
                 .await
                 .map_err(|error| InitializationError::Database(error.into()))?;
-            migration_db
-                .convert_sealed_state(config.key_pepper.as_bytes())
-                .await
-                .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db.close().await;
         }
         let db = Database::connect_with_max(&config.database_url, config.database_max_connections)
             .await
             .map_err(|error| InitializationError::Database(error.into()))?
             .with_terminal_projection_enabled(config.terminal_projection_enabled);
+        // Runs on every process start rather than behind the migration switch:
+        // a row that still holds a sealed envelope must be rewritten before the
+        // first request reads it, and the recorded schema version keeps every
+        // later start to a single SELECT. A failure here must not stop the
+        // process: an outage is worse than a few unreadable historic rows, and
+        // the next start retries because the version marker is only written on
+        // success.
+        if let Err(error) = db.convert_sealed_state(config.key_pepper.as_bytes()).await {
+            tracing::error!(%error, "converting sealed gateway state failed; serving existing rows");
+        }
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;

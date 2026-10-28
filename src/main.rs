@@ -194,6 +194,12 @@ async fn run() -> Result<(), &'static str> {
                 .migrate()
                 .await
                 .map_err(|_| "database_migration_failed")?;
+            if let Err(error) = database
+                .convert_sealed_state(config.key_pepper.as_bytes())
+                .await
+            {
+                tracing::error!(%error, "converting sealed gateway state failed");
+            }
             info!("database schema is current");
         }
         Command::BackfillExactFailedRequestCosts {
