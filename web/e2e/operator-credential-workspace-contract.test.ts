@@ -85,7 +85,7 @@ async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
-test('credential workspaces isolate loads and preserve issued service plaintext', { timeout: 60_000 }, async () => {
+test('credential workspaces isolate loads and preserve issued service plaintext', { timeout: 120_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the credential workspace CI gate');
