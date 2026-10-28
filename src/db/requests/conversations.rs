@@ -377,6 +377,24 @@ async fn rewrite_reopened_session_body_if_present(
     Ok(())
 }
 
+pub(crate) async fn wake_session_body_archive_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE conversation_projection_outbox
+         SET lease_expires_at = CASE WHEN lease_owner IS NULL THEN NULL ELSE lease_expires_at END,
+             terminal_lease_expires_at = NULL
+         WHERE request_id = $1 AND projected_at IS NULL
+           AND terminal_lease_owner IS NULL
+           AND (lease_owner IS NULL OR lease_owner = 'terminal-v118')",
+    )
+    .bind(request_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 impl Database {
     /// Retain conversation evidence without acknowledging financial settlement.
     /// The operational receipt supplies a stable timestamp for exact replay.

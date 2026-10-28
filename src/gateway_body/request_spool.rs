@@ -57,11 +57,12 @@ pub(crate) struct MemoryObjectStore {
     entered_writes: AtomicUsize,
     fail_writes: AtomicBool,
     pauses: Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<()>>>,
+    backing: Mutex<Option<crate::archive::ArchiveStore>>,
 }
 
 #[cfg(test)]
 impl MemoryObjectStore {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             objects: Mutex::new(std::collections::HashMap::new()),
             reads: AtomicUsize::new(0),
@@ -69,16 +70,26 @@ impl MemoryObjectStore {
             entered_writes: AtomicUsize::new(0),
             fail_writes: AtomicBool::new(false),
             pauses: Mutex::new(std::collections::VecDeque::new()),
+            backing: Mutex::new(None),
         })
     }
 
-    fn pause_next_write(&self) -> tokio::sync::oneshot::Sender<()> {
+    pub(crate) fn pause_next_write(&self) -> tokio::sync::oneshot::Sender<()> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.pauses
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push_back(receiver);
         sender
+    }
+
+    pub(crate) fn fail_writes_for_test(&self) {
+        self.fail_writes.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn resume_writes_for_test(&self, archive: crate::archive::ArchiveStore) {
+        *self.backing.lock().unwrap() = Some(archive);
+        self.fail_writes.store(false, Ordering::Release);
     }
 }
 
@@ -96,6 +107,10 @@ impl DurableRequestBodies {
                 store.writes.fetch_add(1, Ordering::AcqRel);
                 if store.fail_writes.load(Ordering::Acquire) {
                     return Err(());
+                }
+                let backing = store.backing.lock().map_err(|_| ())?.clone();
+                if let Some(backing) = backing {
+                    backing.put(key, body.clone()).await.map_err(|_| ())?;
                 }
                 store
                     .objects
@@ -224,7 +239,7 @@ impl RequestSpoolAdmission {
     }
 
     #[cfg(test)]
-    fn with_memory_store(mut self, store: Arc<MemoryObjectStore>) -> Self {
+    pub(crate) fn with_memory_store(mut self, store: Arc<MemoryObjectStore>) -> Self {
         let usage = Arc::get_mut(&mut self.usage)
             .expect("durable store is attached before the admission is shared");
         usage.durable = Some(DurableRequestBodies::Memory(store));
@@ -544,6 +559,13 @@ pub(crate) struct RequestSpool {
 }
 
 impl RequestSpool {
+    #[cfg(test)]
+    pub(crate) async fn abort_writer_for_test(&self) {
+        let handle = self.shared.durable_write.lock().unwrap().take().unwrap();
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+    }
+
     pub(crate) fn object_locator(&self) -> Option<&str> {
         self.shared.object_key.as_deref()
     }
@@ -789,66 +811,124 @@ fn publish_durable(shared: &Arc<SharedBody>) {
     let outcome = shared.outcome.clone();
     let source = shared.clone();
     let handle = tokio::spawn(async move {
-        let wrote = store.put(&key, bytes).await.is_ok();
-        if wrote {
-            match phase.compare_exchange(
-                DURABLE_IN_FLIGHT,
-                DURABLE_COMMITTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    ok.store(true, Ordering::Release);
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let upload = async {
+            let retry_upload = async {
+                loop {
+                    if store.put(&key, bytes.clone()).await.is_ok() {
+                        break true;
+                    }
+                    if source.source_dropped.load(Ordering::Acquire)
+                        && !source.archived.load(Ordering::Acquire)
+                    {
+                        break false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                Err(DURABLE_DROPPED) => {
-                    store.delete(&key).await;
-                }
-                Err(_) => {}
-            }
-        } else {
-            tracing::warn!("request body stayed in memory; object storage write failed");
-        }
-        outcome.send_replace(Some(wrote));
-        loop {
-            let ready = source.archive_ready.notified();
-            let owner = source
-                .archive_owner
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            if let Some((database, identity)) = owner {
-                let permit = if wrote {
-                    database.try_request_source_completion()
-                } else {
-                    Some(database.request_source_completion().await)
-                };
-                release_resident_memory(&source);
-                residency.durable_settled.store(true, Ordering::Release);
-                residency.release_if_idle();
-                if let Some(_permit) = permit {
-                    database
-                        .complete_request_source(
-                            identity,
-                            &key,
-                            source.length,
-                            source.digest,
-                            wrote,
-                        )
-                        .await;
-                }
-                break;
-            }
-            if source.source_dropped.load(Ordering::Acquire) {
-                residency.durable_settled.store(true, Ordering::Release);
-                residency.release_if_idle();
-                break;
-            }
+            };
+            let wrote = tokio::select! {
+                biased;
+                _ = cancelled => false,
+                result = retry_upload => result,
+            };
             if wrote {
+                match phase.compare_exchange(
+                    DURABLE_IN_FLIGHT,
+                    DURABLE_COMMITTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        ok.store(true, Ordering::Release);
+                    }
+                    Err(DURABLE_DROPPED) => {
+                        store.delete(&key).await;
+                    }
+                    Err(_) => {}
+                }
+                if source.archived.load(Ordering::Acquire) {
+                    release_resident_memory(&source);
+                }
                 residency.durable_settled.store(true, Ordering::Release);
                 residency.release_if_idle();
+            } else {
+                tracing::warn!("request body stayed in memory; object storage write failed");
             }
-            ready.await;
-        }
+            outcome.send_replace(Some(wrote));
+        };
+        let completion = async {
+            loop {
+                let ready = source.archive_ready.notified();
+                let owner = source
+                    .archive_owner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some((database, identity)) = owner {
+                    let lease = async {
+                        let wrote = database
+                            .wait_request_source_upload(
+                                identity,
+                                &key,
+                                source.length,
+                                source.digest,
+                                outcome.subscribe(),
+                            )
+                            .await;
+                        if wrote.is_none() {
+                            let _ = cancel.send(());
+                        }
+                        wrote
+                    };
+                    let handoff = async {
+                        let mut settled = outcome.subscribe();
+                        let success = loop {
+                            if let Some(success) = *settled.borrow_and_update() {
+                                break success;
+                            }
+                            if settled.changed().await.is_err() {
+                                break false;
+                            }
+                        };
+                        let permit = if success {
+                            database.try_request_source_completion()
+                        } else {
+                            Some(database.request_source_completion().await)
+                        };
+                        release_resident_memory(&source);
+                        residency.durable_settled.store(true, Ordering::Release);
+                        residency.release_if_idle();
+                        permit
+                    };
+                    let (wrote, permit) = tokio::join!(lease, handoff);
+                    if let (Some(_permit), Some(wrote)) = (permit, wrote) {
+                        database
+                            .complete_request_source(
+                                identity,
+                                &key,
+                                source.length,
+                                source.digest,
+                                wrote,
+                            )
+                            .await;
+                    }
+                    break;
+                }
+                if source.source_dropped.load(Ordering::Acquire) {
+                    let mut settled = outcome.subscribe();
+                    while settled.borrow_and_update().is_none() {
+                        if settled.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    residency.durable_settled.store(true, Ordering::Release);
+                    residency.release_if_idle();
+                    break;
+                }
+                ready.await;
+            }
+        };
+        tokio::join!(upload, completion);
     });
     *shared
         .durable_write

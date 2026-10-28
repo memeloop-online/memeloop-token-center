@@ -1048,18 +1048,27 @@ pub(crate) async fn archive_session_body(
             }
             bytes
         }
-        Err(_)
-            if (locators.source_identity.is_some() && !locators.source_failed)
-                || (locators.source_identity.is_none()
-                    && !missing_raw_document(&locators.request)) =>
-        {
-            state
-                .db
-                .defer_session_body_archive(lease_owner, request_id)
-                .await?;
-            return Ok(false);
-        }
         Err(_) => {
+            let retry = if let Some(identity) = locators.source_identity {
+                !locators.source_failed
+                    && (state
+                        .archive
+                        .source_object_exists(&locators.request)
+                        .await?
+                        || !state
+                            .db
+                            .recover_request_source(identity, &locators.request)
+                            .await?)
+            } else {
+                !missing_raw_document(&locators.request)
+            };
+            if retry {
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
             let inline = state
                 .db
                 .session_body_inline_request(lease_owner, request_id)
