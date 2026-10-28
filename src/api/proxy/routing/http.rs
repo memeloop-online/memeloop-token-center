@@ -1,13 +1,12 @@
 use super::*;
 use bytes::Bytes;
 
-const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct RequestTimeout {
-    duration: std::time::Duration,
-    deadline: tokio::time::Instant,
+    duration: Option<std::time::Duration>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 fn log_preparation_failure(
@@ -54,7 +53,12 @@ fn record_preparation_failure(
 /// already-dispatched attempt's deadline.
 fn configured_timeout(config: &Value) -> Result<RequestTimeout, ProxySendError> {
     let seconds = match config.get("timeout_seconds") {
-        None => DEFAULT_TIMEOUT_SECONDS,
+        None => {
+            return Ok(RequestTimeout {
+                duration: None,
+                deadline: None,
+            });
+        }
         Some(value) => value
             .as_u64()
             .or_else(|| {
@@ -72,7 +76,10 @@ fn configured_timeout(config: &Value) -> Result<RequestTimeout, ProxySendError> 
     let deadline = tokio::time::Instant::now()
         .checked_add(duration)
         .ok_or(ProxySendError::CandidateUnavailable)?;
-    Ok(RequestTimeout { duration, deadline })
+    Ok(RequestTimeout {
+        duration: Some(duration),
+        deadline: Some(deadline),
+    })
 }
 
 pub(super) async fn send_reqwest_proxy_route(
@@ -198,7 +205,11 @@ where
         "upstream SSE framing policy frozen"
     );
     let outbound_base_url = route.route.base_url.clone();
-    let outbound_http = match tokio::time::timeout_at(request_deadline, preparation).await {
+    let preparation_result = match request_deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, preparation).await,
+        None => Ok(preparation.await),
+    };
+    let outbound_http = match preparation_result {
         Ok(Ok(client)) => client,
         // Endpoint validation and DNS happen before the POST leaves this
         // process, so a route-budget expiry here is safe to fail over.
@@ -214,11 +225,10 @@ where
     let target_url = network::upstream_api_url(&outbound_base_url, route.upstream_path);
     let mut request = outbound_http
         .post(target_url)
-        // Reqwest's per-request timeout covers connection/header acquisition;
-        // the absolute deadline below also covers DNS/client setup and body
-        // reads, so no phase can restart the configured attempt budget.
-        .timeout(timeout)
         .body(route.forwarded_body.clone());
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
     let accept = if ((route.responses_chat.is_some() || route.responses_anthropic.is_some())
         && route.upstream_stream)
         || (crate::provider::is_openai_compatible_http_driver(&route.route.driver)
@@ -308,11 +318,12 @@ where
             };
             Ok(ProxyRouteResponse {
                 egress_selection: None,
-                // Keep one absolute deadline from before DNS through first
-                // byte and every subsequent streaming read. The inactivity
-                // window uses the same configured scalar and resets only on
-                // actual upstream progress.
-                response: response.with_body_timeouts(request_deadline, timeout),
+                response: match (request_deadline, timeout) {
+                    (Some(deadline), Some(timeout)) => {
+                        response.with_body_timeouts(deadline, timeout)
+                    }
+                    _ => response,
+                },
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::inactive(),
                 sse_framing_limits,
@@ -323,12 +334,15 @@ where
 }
 
 async fn send_until_request_deadline<F>(
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     send: F,
 ) -> Result<reqwest::Response, ProxySendError>
 where
     F: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
 {
+    let Some(deadline) = deadline else {
+        return send.await.map_err(classify_reqwest_send_error);
+    };
     tokio::pin!(send);
     tokio::select! {
         // A POST may have been accepted before the local deadline fired;
@@ -623,23 +637,20 @@ mod tests {
 
     #[test]
     fn configured_timeout_preserves_explicit_seconds_and_rejects_invalid_values() {
-        assert_eq!(
-            configured_timeout(&json!({})).unwrap().duration,
-            Duration::from_secs(120)
-        );
+        assert_eq!(configured_timeout(&json!({})).unwrap().duration, None);
         for seconds in [1, 120, 600, 601, 900, 1261] {
             assert_eq!(
                 configured_timeout(&json!({"timeout_seconds": seconds}))
                     .unwrap()
                     .duration,
-                Duration::from_secs(seconds)
+                Some(Duration::from_secs(seconds))
             );
         }
         assert_eq!(
             configured_timeout(&json!({"timeout_seconds": 900.0}))
                 .unwrap()
                 .duration,
-            Duration::from_secs(900)
+            Some(Duration::from_secs(900))
         );
         for invalid in [
             json!(0),
@@ -657,12 +668,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn default_send_waits_for_real_result_after_old_deadlines() {
+        let timeout = configured_timeout(&json!({})).unwrap();
+        let started = tokio::time::Instant::now();
+        let response = send_until_request_deadline(timeout.deadline, async {
+            tokio::time::sleep(Duration::from_secs(1_300)).await;
+            Ok(compact_response(StatusCode::OK, "{}"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(started.elapsed(), Duration::from_secs(1_300));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn explicit_timeout_remains_frozen_across_preparation_and_elapsed_stream_time() {
         let request_timeout = configured_timeout(&json!({"timeout_seconds": 900})).unwrap();
         let started = tokio::time::Instant::now();
         tokio::time::advance(Duration::from_secs(601)).await;
-        assert_eq!(request_timeout.duration, Duration::from_secs(900));
-        assert_eq!(request_timeout.deadline, started + Duration::from_secs(900));
+        assert_eq!(request_timeout.duration, Some(Duration::from_secs(900)));
+        assert_eq!(
+            request_timeout.deadline,
+            Some(started + Duration::from_secs(900))
+        );
         let response = send_until_request_deadline(request_timeout.deadline, async {
             tokio::time::sleep(Duration::from_secs(250)).await;
             Ok(compact_response(StatusCode::OK, "{}"))
@@ -682,7 +710,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn request_deadline_timeout_is_ambiguous_and_never_replayable() {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
         let result = send_until_request_deadline(deadline, std::future::pending()).await;
         assert!(matches!(
             result,

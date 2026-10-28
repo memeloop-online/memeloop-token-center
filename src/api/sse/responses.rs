@@ -287,9 +287,6 @@ impl ResponsesStreamingSanitizer {
         self.terminal == Some(StreamTerminal::Failed)
     }
 
-    /// A canonical, non-terminal Responses lifecycle event while downstream
-    /// still awaits its terminal. The caller sends this directly to the body:
-    /// it is intentionally excluded from capture, archival, usage, and billing.
     pub(in crate::api) fn progress_heartbeat(&self) -> Option<Bytes> {
         self.progress_heartbeat.clone()
     }
@@ -457,9 +454,9 @@ impl ResponsesStreamingSanitizer {
                 terminal,
                 Some(StreamTerminal::Completed | StreamTerminal::Incomplete)
             ))
-            && let Some(response_id) = self.identity.response_id.as_deref()
+            && self.identity.response_id.is_some()
         {
-            self.progress_heartbeat = Some(progress_heartbeat_event(response_id));
+            self.progress_heartbeat = Some(Bytes::from_static(b": keep-alive\n\n"));
         }
         if self.terminal == Some(StreamTerminal::Failed) {
             self.progress_heartbeat = None;
@@ -501,28 +498,6 @@ impl ResponsesStreamingSanitizer {
         }
         Ok(())
     }
-}
-
-fn progress_heartbeat_event(response_id: &str) -> Bytes {
-    // Serialize the identifier rather than interpolating it into SSE. The
-    // identity gate already bounds and validates it, and JSON serialization
-    // preserves that guarantee if the accepted character set changes.
-    let data = serde_json::to_vec(&json!({
-        "type": "response.in_progress",
-        "response": {
-            "id": response_id,
-            "object": "response",
-            "status": "in_progress",
-            "output": [],
-        },
-    }))
-    .expect("a fixed Responses progress heartbeat is serializable");
-    let mut event =
-        Vec::with_capacity(b"event: response.in_progress\ndata: \n\n".len() + data.len());
-    event.extend_from_slice(b"event: response.in_progress\ndata: ");
-    event.extend_from_slice(&data);
-    event.extend_from_slice(b"\n\n");
-    Bytes::from(event)
 }
 
 fn safe_sse_fields(event: &BoundedSseEvent) -> Vec<u8> {
