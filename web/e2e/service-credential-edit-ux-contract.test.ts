@@ -145,7 +145,7 @@ test('a real 403 retires service credential write affordances with the capabilit
   const form = page.locator('form.service-credential-create');
   await form.getByRole('textbox', { name: '名称', exact: true }).fill('被拒绝的改名');
   await form.getByRole('button', { name: '保存修改', exact: true }).click();
-  await page.getByText('当前凭据没有服务凭据写入权限', { exact: false }).waitFor();
+  await page.getByRole('alert').getByText('当前凭据没有服务凭据写入权限', { exact: false }).waitFor();
   await page.getByText('fixture global service_tokens:write required', { exact: true }).waitFor();
   assert.equal(await row.getByRole('button', { name: '编辑', exact: true }).isEnabled(), false, 'the observed 403 disables further edit affordances');
   assert.equal(await row.getByRole('button', { name: '轮换服务凭据', exact: true }).isEnabled(), false, 'the observed 403 disables other write affordances');

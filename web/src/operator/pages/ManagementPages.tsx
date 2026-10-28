@@ -1555,6 +1555,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [secret, setSecret] = useState<{ value: string; kind: 'issued' | 'revealed'; alias?: string; displayId: string; scopeGeneration: number }>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const [editNotice, setEditNotice] = useState('');
   const scopeGeneration = useRef(0);
   const keyRequestGeneration = useRef(0);
   const routeRequestGeneration = useRef(0);
@@ -1701,7 +1702,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     secretRequest.current?.abort(); secretRequest.current = undefined; secretOperation.current = undefined; secretRef.current = undefined;
     routingSaveLock.current = undefined; routingBaseline.current = undefined; scopeGeneration.current += 1; setValues([]); setRoutes([]); setRoutingDraft(undefined);
     setAliasDrafts({}); setPolicyErrors({}); setEditingCredential(undefined); setCredentialValue(''); setLimitSnapshots({}); setGranting(undefined); setGrant({ amount: '', source: '' }); setBusy('');
-    setPolicyDrafts({}); setCreateCredentialDraft(undefined); setCreatePrincipalOverride(''); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); setWriteDenied('');
+    setPolicyDrafts({}); setCreateCredentialDraft(undefined); setCreatePrincipalOverride(''); setNewRouteIds([]); setNewRouteGroupIds([]); setGroupFilter('all'); setSearch(''); setNextCursor(undefined); setKeyListState('initial-loading'); setKeyError(''); setRouteError(''); setSecret(undefined); setMessage(''); setError(''); setWriteDenied(''); setEditNotice('');
     void loadRoutes(token, tenant, scopeGeneration.current);
     setCreationSource(tenant === 'default' ? 'manual_or_unknown' : 'all');
     return () => { keyRequest.current?.controller.abort(); routeRequest.current?.controller.abort(); secretRequest.current?.abort(); };
@@ -1860,7 +1861,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const routeOptions = routes.filter((route) => route.tenant_external_id === writeTenant);
   const routeGroupOptions = routeGroups.groups;
   const openCredentialEditor = async (value: KeyView) => {
-    setError(''); setMessage('');
+    setError(''); setMessage(''); setEditNotice('');
     activateEditor('edit', value.key_id);
     setRoutingDraft(undefined); routingBaseline.current = undefined; setPolicyErrors({});
     setAliasDrafts(drafts => drafts[value.key_id] === undefined ? { ...drafts, [value.key_id]: value.alias } : drafts);
@@ -1895,10 +1896,10 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
         return;
       }
     }
-    if (operations.length === 0) { setMessage(t('credentials.editNoChanges')); return; }
+    if (operations.length === 0) { setEditNotice(t('credentials.editNoChanges')); return; }
     const operation = Symbol('credential-edit-save');
     routingSaveLock.current = operation;
-    setError(''); setMessage('');
+    setError(''); setMessage(''); setEditNotice('');
     let failedSection: CredentialEditSection = operations[0].section;
     try {
       for (const edit of operations) {
@@ -1942,7 +1943,8 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
                 {routingDraft.effective_route_ids.length > 0 && <small className="field-hint">{t('credentials.effectiveRoutes', { count: formatNumber(routingDraft.effective_route_ids.length, locale) })}</small>}
               </> : <LoadingState label={t('common.loading')} variant="detail" />}
             </section>
-            <div className="journey-actions"><Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy) || !credentialAliasReady(aliasDrafts[value.key_id] ?? value.alias)} onClick={() => void saveCredentialEdit(value)}>{busy.startsWith('edit-') ? t('common.loading') : t('common.save')}</Button></div>
+            {editNotice && <p className="muted" role="status">{editNotice}</p>}
+            <div className="journey-actions"><Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy) || !credentialAliasReady(aliasDrafts[value.key_id] ?? value.alias)} onClick={() => void saveCredentialEdit(value)}>{t('common.save')}</Button></div>
           </div>}
           {editingCredential === value.key_id && <div className="inline-editor form-panel"><h3>{t('credentials.storeFor', { alias: value.alias })}</h3><p className="muted">{t('credentials.storeHint')}</p><label>{t('credentials.revealedValue')}<Input type="password" autoComplete="off" value={credentialValue} onChange={(event) => setCredentialValue(event.target.value)} /></label><Button appearance="primary" type="button" disabled={!canManage(value) || Boolean(busy) || !credentialValue} onClick={async () => { const knownValue = credentialValue; setBusy(`store-${value.key_id}`); setError(''); setMessage(''); try { await api<void>(`/internal/v1/keys/${value.key_id}/credential`, token, { ...secretResponseRequestPolicy, method: 'PUT', body: JSON.stringify({ key: knownValue }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setCredentialValue(''); setEditingCredential(undefined); setMessage(t('credentials.stored', { alias: value.alias })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(messageOf(reason, t('common.requestFailed'))); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } }}>{t('common.save')}</Button></div>}
           {workspace?.kind === 'limits' && (limitSnapshots[value.key_id] ? <LimitSnapshot value={limitSnapshots[value.key_id]} /> : <><LoadingProgress active label={t('common.loading')} level="page" /><LoadingState label={t('common.loading')} variant="detail" /></>)}
