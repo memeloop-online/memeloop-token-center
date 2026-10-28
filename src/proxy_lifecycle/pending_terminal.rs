@@ -475,18 +475,26 @@ impl Journal {
             .values_mut()
             .filter(|entry| entry.durable && entry.reconcile && !entry.running)
         {
-            let keep_unknown_evidence = entry.unknown_annotated
+            // An unknown receipt keeps its parsed conversation only while
+            // that is the sole copy: once the projection outbox row holds
+            // the payload, the evidence is durable and the compact disk
+            // receipt identifies the financial hold. Retaining the
+            // conversation after that is what made gateway memory grow
+            // without bound under quota-rejection traffic, and a restart
+            // already recovers from the conversation-less disk receipt, so
+            // nothing after enqueue may depend on the in-memory value.
+            let keep_unknown_conversation = entry.unknown_annotated
                 && entry.snapshot.claim.is_some()
                 && entry.snapshot.usage_basis
-                    != Some(crate::model::RequestUsageBasis::ProviderReported);
-            if !keep_unknown_evidence && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
+                    != Some(crate::model::RequestUsageBasis::ProviderReported)
+                && !entry.conversation_enqueued;
+            if !keep_unknown_conversation && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot)
+            {
                 snapshot.conversation = None;
             }
             // The budgeted body can leave once its projection is durable.
             // Until then the permit stays with the unenqueued evidence.
-            // The conversation value itself stays: it is the receipt, not the
-            // budgeted buffer.
-            if !keep_unknown_evidence || entry.conversation_enqueued {
+            if !keep_unknown_conversation || entry.conversation_enqueued {
                 entry.projection_retained = None;
             }
         }

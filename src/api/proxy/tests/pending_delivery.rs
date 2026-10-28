@@ -54,7 +54,22 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         .into_iter()
         .find(|item| item["receipt_id"] == receipt["receipt_id"])
         .expect("unknown finance keeps the in-memory receipt");
-    assert_eq!(retained_receipt, receipt);
+    // Once the outbox row holds the payload the receipt drops the parsed
+    // conversation from memory, so only the identity survives in-process.
+    assert_eq!(retained_receipt["receipt_id"], receipt["receipt_id"]);
+    assert_eq!(retained_receipt["request_id"], receipt["request_id"]);
+    assert_eq!(retained_receipt["status_code"], receipt["status_code"]);
+    assert_eq!(retained_receipt["error_code"], receipt["error_code"]);
+    assert_eq!(retained_receipt["claim"], receipt["claim"]);
+    assert_eq!(
+        fixture
+            .state
+            .pending_terminals
+            .idle_conversation_retained_for_test(receipt_id)
+            .await,
+        Some(false),
+        "durable enqueue must drop the parsed conversation from memory"
+    );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let retained_body: String = sqlx::query_scalar(
         "SELECT p.request_json FROM conversation_semantic_payloads p JOIN conversation_projection_outbox o ON o.request_id = p.request_id AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.principal_id = p.principal_id WHERE p.request_id = $1 AND p.tenant_id = $2 AND p.key_id = $3 AND o.projected_at IS NULL",
@@ -1312,7 +1327,14 @@ async fn unknown_failure_retries_operational_projection() {
         Some("upstream_failed_response"),
     )
     .await;
-    assert_eq!(receipt, original);
+    // The retried pass may have enqueued the conversation and reaped the
+    // parsed copy already; the receipt's identity must be unchanged either
+    // way.
+    assert_eq!(receipt["receipt_id"], original["receipt_id"]);
+    assert_eq!(receipt["request_id"], original["request_id"]);
+    assert_eq!(receipt["status_code"], original["status_code"]);
+    assert_eq!(receipt["error_code"], original["error_code"]);
+    assert_eq!(receipt["claim"], original["claim"]);
     assert!(
         fixture
             .state
@@ -1373,7 +1395,7 @@ async fn unknown_failure_retries_operational_projection() {
                 .pending_terminals
                 .idle_conversation_retained_for_test(receipt_id)
                 .await
-                == Some(true)
+                == Some(false)
             {
                 let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
                 if used == 0 && retained == 0 {
@@ -1384,7 +1406,9 @@ async fn unknown_failure_retries_operational_projection() {
         }
     })
     .await
-    .expect("unknown with durable semantic enqueue must release memory and keep the receipt conversation");
+    .expect(
+        "unknown with durable semantic enqueue must release memory and the parsed conversation",
+    );
     let owner = Uuid::now_v7();
     let tasks = fixture
         .state
@@ -1493,7 +1517,29 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
         cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled")).await;
     assert_eq!(receipt["receipt_id"], original.0);
     assert_eq!(receipt["operational_terminal"]["completed_at"], original.2);
-    assert!(receipt["conversation"].is_object());
+    // The recovered annotation enqueues the conversation as durable
+    // evidence; the parsed copy leaves memory once that lands.
+    let enqueued: String = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(payload) = sqlx::query_scalar::<_, String>(
+                "SELECT request_json FROM conversation_semantic_payloads WHERE request_id = $1",
+            )
+            .bind(record.request_id.to_string())
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            {
+                break payload;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime ACK recovery must enqueue the conversation as durable evidence");
+    assert_eq!(
+        serde_json::from_str::<Value>(&enqueued).unwrap()["input"],
+        "cancel before provider terminal"
+    );
     assert!(
         fixture
             .state
@@ -1515,7 +1561,7 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
                     .pending_terminals
                     .idle_conversation_retained_for_test(receipt_id)
                     .await
-                    == Some(true)
+                    == Some(false)
             {
                 break;
             }
@@ -1524,7 +1570,7 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
     })
     .await
     .expect(
-        "durable semantic enqueue must release every memory permit and keep the receipt conversation",
+        "durable semantic enqueue must release every memory permit and drop the parsed conversation",
     );
     assert!(
         fixture
