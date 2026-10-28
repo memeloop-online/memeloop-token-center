@@ -497,8 +497,8 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await pagedCatalog.getByText('Research workspace', { exact: true }).waitFor();
     await pagedCatalog.waitForFunction(() => window.credentialFixture.calls.some((call) => call.startsWith('/internal/v1/model-routes?') && call.includes('before_created_at=')), undefined, { timeout: 10_000 });
     await pagedCatalog.getByRole('button', { name: 'More actions', exact: true }).click();
-    await pagedCatalog.getByRole('menuitem', { name: 'Route access', exact: true }).click();
-    const pagedRouting = pagedCatalog.locator('.routing-editor');
+    await pagedCatalog.getByRole('menuitem', { name: 'Edit', exact: true }).click();
+    const pagedRouting = pagedCatalog.locator('.inline-editor .routing-editor');
     const pagedPreview = pagedRouting.getByRole('region', { name: 'Authorization scope preview' });
     await pagedPreview.getByText(/Spark disabled/, { exact: false }).waitFor();
     assert.equal(await pagedPreview.getByText(/Unknown route/).count(), 0, 'a grant stored beyond the first catalog page resolves its route name once paging completes');
@@ -514,8 +514,8 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     // route count, is what ends the walk.
     await exactCatalog.waitForFunction(() => window.credentialFixture.calls.filter((call) => call.startsWith('/internal/v1/model-routes?') && call.includes('before_created_at=')).length === 2, undefined, { timeout: 10_000 });
     await exactCatalog.getByRole('button', { name: 'More actions', exact: true }).click();
-    await exactCatalog.getByRole('menuitem', { name: 'Route access', exact: true }).click();
-    const exactRouting = exactCatalog.locator('.routing-editor');
+    await exactCatalog.getByRole('menuitem', { name: 'Edit', exact: true }).click();
+    const exactRouting = exactCatalog.locator('.inline-editor .routing-editor');
     const exactPreview = exactRouting.getByRole('region', { name: 'Authorization scope preview' });
     await exactPreview.getByText(/Spark disabled/, { exact: false }).waitFor();
     assert.equal(await exactPreview.getByText(/Unknown route/).count(), 0, 'a catalog sized to an exact page multiple still resolves every grant');
