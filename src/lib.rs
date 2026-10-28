@@ -73,12 +73,6 @@ use db::Database;
 use plugin::PluginRuntime;
 use provider::ProviderCatalog;
 
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// Synchronous image providers may legitimately stay silent while generating.
-// The image path has its own 2-request concurrency and 16 MiB body bounds, so
-// matching the read timeout to the overall deadline does not make it unbounded.
-const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
-const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 #[cfg(test)]
 pub(crate) use simple_http::{
     CODEX_HTTP2_KEEP_ALIVE_INTERVAL, build_codex_http_client, build_codex_http2_test_client,
@@ -440,9 +434,6 @@ impl AppState {
 fn base_http_client_builder() -> reqwest::ClientBuilder {
     simple_http::install_ring_provider();
     reqwest::Client::builder()
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .read_timeout(HTTP_READ_TIMEOUT)
-        .timeout(HTTP_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         // An inherited proxy would perform its own DNS lookup and bypass
         // resolve_to_addrs pinning. A future trusted proxy must be explicit.

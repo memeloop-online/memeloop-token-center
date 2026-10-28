@@ -2,6 +2,8 @@ use super::*;
 
 mod observation_prefix;
 mod plaintext_sweep;
+#[cfg(test)]
+mod transport_policy_tests;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartitionMaintenanceReport {
@@ -740,6 +742,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
         ),
     },
+    Migration {
+        version: 144,
+        name: "retire unused failover deadline config",
+        sql: include_str!("../../../migrations/sqlite/0144_retire_failover_deadline.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1462,6 +1469,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
         ),
+    },
+    Migration {
+        version: 144,
+        name: "retire unused failover deadline config",
+        sql: include_str!("../../../migrations/postgres/0144_retire_failover_deadline.sql"),
     },
 ];
 
