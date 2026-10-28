@@ -113,7 +113,7 @@ fn encode_form(form: &[(&str, &str)]) -> String {
 }
 
 async fn post(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     proxy: Option<&str>,
     device: &str,
@@ -121,7 +121,7 @@ async fn post(
     allow_test_loopback: bool,
 ) -> Result<Value, AppError> {
     let client = network::client_for_config_url_no_retry(
-        http,
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
         endpoint,
         &json!({"network_scope":"public"}),
         proxy.map(|url| (url, OutboundScope::Private)),
@@ -133,7 +133,6 @@ async fn post(
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(encode_form(form))
-        .timeout(std::time::Duration::from_secs(10))
         .send()
         .await
         .map_err(|_| failed())?;
@@ -149,7 +148,7 @@ async fn post(
 
 pub async fn start_kimi_device_login(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     input: StartKimiDeviceLogin,
     key: &[u8],
     now: i64,
@@ -169,7 +168,7 @@ pub async fn start_kimi_device_login(
 
 async fn start_at(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     input: StartKimiDeviceLogin,
     key: &[u8],
     now: i64,
@@ -270,7 +269,7 @@ async fn start_at(
 
 pub async fn poll_kimi_device_login(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     token: &str,
     key: &[u8],
     now: i64,
@@ -294,7 +293,7 @@ pub async fn poll_kimi_device_login(
 #[allow(clippy::too_many_arguments)]
 async fn poll_at(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     token: &str,
     key: &[u8],
     now: i64,
@@ -321,7 +320,7 @@ async fn poll_at(
 #[allow(clippy::too_many_arguments)]
 async fn poll_at_with_clock(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     token: &str,
     key: &[u8],
     now: i64,

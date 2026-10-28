@@ -76,6 +76,7 @@ async fn fresh_snapshot(
     let reset = match tokio::time::timeout(
         budget.total,
         get_codex_json(
+            &state.codex_clients,
             policy,
             auth,
             CREDITS_URL,

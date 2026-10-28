@@ -75,7 +75,12 @@ const WIRE_SHIM_FUEL_PER_BODY_BYTE: u64 = 2;
 const WIRE_SHIM_MEMORY_BYTES: usize = 96 * 1024 * 1024;
 // These plugin_kv namespaces contain core-owned policy or its immutable
 // receipt. Guest components must never acquire them through their manifest ID.
-const CORE_PLUGIN_KV_NAMESPACES: &[&str] = &["typed-filter", "filter-assistant-audit"];
+const CORE_PLUGIN_KV_NAMESPACES: &[&str] = &[
+    "typed-filter",
+    "filter-assistant-audit",
+    "system-settings",
+    "http-settings-audit",
+];
 const CORE_OPERATOR_ROUTES: &[&str] = &[
     "overview",
     "requests",
@@ -609,7 +614,7 @@ struct ComponentProviderUsage {
 #[derive(Clone, Default)]
 pub struct PluginRuntime {
     engine: Option<Engine>,
-    http: Option<reqwest::Client>,
+    http: Option<crate::http_settings::HttpClient>,
     runtime: Option<tokio::runtime::Handle>,
     kv: Option<PluginKv>,
     plugins: Arc<Vec<LoadedPlugin>>,
@@ -639,7 +644,7 @@ struct PluginKv {
 struct HostState {
     plugin_id: String,
     capabilities: Vec<PluginCapability>,
-    http: reqwest::Client,
+    http: crate::http_settings::HttpClient,
     runtime: tokio::runtime::Handle,
     kv: Option<PluginKv>,
     limits: StoreLimits,
@@ -847,17 +852,11 @@ impl PluginRuntime {
         let epoch_task = Arc::new(EpochTask(epoch_task));
         #[cfg(not(feature = "experimental-plugin-revisions"))]
         drop(epoch_task); // Preserve the default loader's detached epoch timer.
-        crate::simple_http::install_ring_provider();
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(30))
-            .redirect(reqwest::redirect::Policy::none())
-            // The service-data and guest HTTP paths use DNS-pinned clients for
-            // hostnames. Keep the shared literal-IP fallback equally isolated
-            // from inherited proxy configuration.
-            .no_proxy()
-            .build()
-            .map_err(|_| plugin_runtime_failure("http_initialization"))?;
+        let http = database
+            .as_ref()
+            .map(|database| database.http_clients.clone())
+            .unwrap_or_default()
+            .handle(crate::http_settings::HttpPurpose::Plugin);
         let canonical_root =
             fs::canonicalize(root).map_err(|_| plugin_runtime_failure("directory_resolution"))?;
         let directories = plugin_directories(&canonical_root)?;
@@ -4036,10 +4035,7 @@ mod tests {
             capabilities: vec![PluginCapability::Http {
                 allowed_origins: vec!["https://does-not-resolve.invalid".to_owned()],
             }],
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
+            http: crate::http_settings::HttpClient::default(),
             runtime: tokio::runtime::Handle::current(),
             kv: None,
             limits: StoreLimitsBuilder::new().build(),
@@ -4252,10 +4248,7 @@ mod tests {
         let mut state = HostState {
             plugin_id: "least-privilege-plugin".to_owned(),
             capabilities: Vec::new(),
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap(),
+            http: crate::http_settings::HttpClient::default(),
             runtime: tokio::runtime::Handle::current(),
             kv: None,
             limits: StoreLimitsBuilder::new().build(),

@@ -14,6 +14,7 @@ pub mod filter_ast;
 mod gateway_body;
 pub mod generation;
 mod group_routing;
+pub mod http_settings;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc_control;
 pub mod metrics;
@@ -64,7 +65,7 @@ mod upstream_quota;
 mod windows_dir;
 pub mod worker;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use archive::ArchiveStore;
 use config::Config;
@@ -78,6 +79,7 @@ pub(crate) use simple_http::{
     codex_http_client_builder, codex_http_client_builder_with_proxy,
     codex_http_protocol_test_builder,
 };
+#[cfg(test)]
 pub(crate) use simple_http::{
     build_codex_http_client_with_policy, build_codex_http_client_with_proxy,
 };
@@ -97,7 +99,7 @@ pub struct AppState {
     pub(crate) routing_persistence_db: Database,
     pub(crate) session_preferences: Arc<api::proxy::session_preferences::SessionPreferences>,
     pub archive: ArchiveStore,
-    pub http: reqwest::Client,
+    pub http: http_settings::HttpClient,
     pub(crate) codex_clients: Arc<codex_clients::CodexClients>,
     pub(crate) transport_proxy_groups: Arc<db::TransportProxyGroups>,
     pub providers: ProviderCatalog,
@@ -191,6 +193,11 @@ impl AppState {
             .await
             .map_err(|error| InitializationError::Database(error.into()))?
             .with_terminal_projection_enabled(config.terminal_projection_enabled);
+        db.refresh_http_settings()
+            .await
+            .map_err(InitializationError::Database)?;
+        db.start_http_settings_refresh();
+        let http_clients = db.http_clients.clone();
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
@@ -262,7 +269,8 @@ impl AppState {
             return Err(InitializationError::Plugin);
         }
 
-        let transport_proxy_groups = Arc::new(transport_proxy_groups);
+        let transport_proxy_groups =
+            Arc::new(transport_proxy_groups.with_http_clients(http_clients.clone()));
         transport_proxy_groups
             .start(&config.database_url)
             .map_err(|_| InitializationError::TransportProxyGroups)?;
@@ -308,8 +316,8 @@ impl AppState {
             proxy_archive_stream_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROXY_ARCHIVE_STREAM_CONCURRENCY,
             )),
-            http: build_http_client().map_err(|_| InitializationError::HttpClient)?,
-            codex_clients: Arc::new(codex_clients::CodexClients::default()),
+            http: http_clients.handle(http_settings::HttpPurpose::General),
+            codex_clients: Arc::new(codex_clients::CodexClients::with_http_clients(http_clients)),
             transport_proxy_groups,
         })
     }
@@ -420,21 +428,19 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
 fn base_http_client_builder() -> reqwest::ClientBuilder {
-    simple_http::install_ring_provider();
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        // An inherited proxy would perform its own DNS lookup and bypass
-        // resolve_to_addrs pinning. A future trusted proxy must be explicit.
-        .no_proxy()
-        .pool_max_idle_per_host(8)
-        .pool_idle_timeout(Duration::from_secs(30))
+    http_settings::HttpClientFactory::default()
+        .snapshot()
+        .builder(http_settings::HttpPurpose::General)
 }
 
+#[cfg(test)]
 pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
     base_http_client_builder().build()
 }
 
+#[cfg(test)]
 pub(crate) fn build_pinned_http_client(
     hostname: &str,
     addresses: &[std::net::SocketAddr],
@@ -447,6 +453,7 @@ pub(crate) fn build_pinned_http_client(
         .build()
 }
 
+#[cfg(test)]
 pub(crate) fn build_no_retry_http_client(
     proxy_url: Option<&str>,
     pinned_hosts: &[(&str, &[std::net::SocketAddr])],
@@ -454,6 +461,7 @@ pub(crate) fn build_no_retry_http_client(
     no_retry_http_client_builder(proxy_url, pinned_hosts)?.build()
 }
 
+#[cfg(test)]
 fn no_retry_http_client_builder(
     proxy_url: Option<&str>,
     pinned_hosts: &[(&str, &[std::net::SocketAddr])],
@@ -480,6 +488,7 @@ pub(crate) fn build_no_retry_http2_test_client() -> reqwest::Client {
         .unwrap()
 }
 
+#[cfg(test)]
 pub(crate) fn build_explicit_proxy_http_client(
     proxy_url: &str,
     pinned_hosts: &[(&str, &[std::net::SocketAddr])],

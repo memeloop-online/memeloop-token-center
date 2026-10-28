@@ -349,7 +349,7 @@ pub(crate) fn cursor_login_application_revision(
 pub async fn poll_cursor_login(
     db: &Database,
     providers: &ProviderCatalog,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     session_token: &str,
     key_material: &[u8],
     now: i64,
@@ -461,7 +461,7 @@ pub async fn poll_cursor_login(
         .await?
     } else {
         network::client_for_url(
-            http,
+            &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
             poll_url.as_str(),
             scope,
             authority.allow_test_loopback,
@@ -594,7 +594,7 @@ pub async fn poll_cursor_login(
 }
 
 pub async fn refresh_cursor_credential(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     refresh_url: &str,
     credential: &UpstreamCredential,
     now: i64,
@@ -612,6 +612,11 @@ pub async fn refresh_cursor_credential(
     };
     let refresh_url =
         validate_oauth_endpoint_with_scope(refresh_url, "refresh_url", configured_scope)?;
+    let http = http.http_client(crate::http_settings::ClientOptions {
+        purpose: Some(crate::http_settings::HttpPurpose::Oauth),
+        no_retry: true,
+        ..Default::default()
+    })?;
     let request = http
         .post(refresh_url.as_str())
         .bearer_auth(refresh_token)

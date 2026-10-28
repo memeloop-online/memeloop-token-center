@@ -34,7 +34,7 @@ pub fn model_price_sources(config: &Config) -> [(&'static str, &str); 3] {
 
 pub async fn sync_model_prices(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],
@@ -53,7 +53,7 @@ pub async fn sync_model_prices(
 
 async fn sync_model_prices_with_sources(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],
@@ -75,7 +75,7 @@ async fn sync_model_prices_with_sources(
 /// fetching each source once and chunking database reads, not network requests.
 pub(crate) async fn sync_catalog_model_prices(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     models: Vec<String>,
     source_specs: &[(&'static str, &str)],
     allow_test_loopback: bool,
@@ -98,7 +98,7 @@ pub(crate) async fn sync_catalog_model_prices(
 
 async fn run_price_sync(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     mut models: Vec<String>,
     currency: &str,
     source_specs: &[(&'static str, &str)],

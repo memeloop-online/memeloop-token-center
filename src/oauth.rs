@@ -1,4 +1,3 @@
-use futures_util::StreamExt;
 use uuid::Uuid;
 
 use crate::{db::Database, error::AppError, provider::seal_private_json};
@@ -33,7 +32,6 @@ pub use cursor::{
 pub(crate) use endpoint::validate_oauth_endpoint;
 pub(crate) use endpoint::{oauth_adapter_endpoint_scope, validate_oauth_adapter_endpoint};
 
-const MAX_OAUTH_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_OAUTH_LOGIN_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_OAUTH_LOGIN_STATE_BYTES: usize = 64 * 1024;
 
@@ -138,22 +136,11 @@ pub(crate) static TEST_OAUTH_REFRESH_REQUEST_GUARD: TestOAuthRefreshRequestGuard
     TestOAuthRefreshRequestGuard;
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
-    {
-        return Err(AppError::upstream("oauth_response_is_too_large"));
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(AppError::from)?;
-        if body.len().saturating_add(chunk.len()) > MAX_OAUTH_RESPONSE_BYTES {
-            return Err(AppError::upstream("oauth_response_is_too_large"));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(AppError::from)
 }
 
 #[cfg(test)]

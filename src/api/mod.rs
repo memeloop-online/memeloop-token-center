@@ -51,6 +51,7 @@ mod generation;
 mod generation_quarantine;
 mod groups;
 mod health;
+mod http_settings;
 mod image_generation_quarantine;
 mod kimi_transport;
 mod limits;

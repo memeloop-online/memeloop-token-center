@@ -161,7 +161,7 @@ pub fn authorize_config_update(
 }
 
 pub struct NativeClient<'a> {
-    pub http: &'a reqwest::Client,
+    pub http: &'a dyn crate::http_settings::HttpClientSource,
     pub credential: &'a UpstreamCredential,
     pub config: &'a Config,
     pub allow_test_loopback: bool,

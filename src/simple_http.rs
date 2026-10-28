@@ -21,13 +21,23 @@ pub(crate) fn codex_http_client_builder(
         .expect("codex client without a proxy")
 }
 
+#[cfg(test)]
 pub(crate) fn codex_http_client_builder_with_proxy(
     policy: CodexTransportPolicy,
     keep_alive_interval: Duration,
     proxy_url: Option<&str>,
 ) -> Result<reqwest::ClientBuilder, reqwest::Error> {
-    install_ring_provider();
-    let mut builder = reqwest::Client::builder();
+    let snapshot = crate::http_settings::HttpClientFactory::default().snapshot();
+    configured_codex_builder(&snapshot, policy, keep_alive_interval, proxy_url)
+}
+
+pub(crate) fn configured_codex_builder(
+    snapshot: &crate::http_settings::HttpSnapshot,
+    policy: CodexTransportPolicy,
+    keep_alive_interval: Duration,
+    proxy_url: Option<&str>,
+) -> Result<reqwest::ClientBuilder, reqwest::Error> {
+    let mut builder = snapshot.builder(crate::http_settings::HttpPurpose::Codex);
     if let Some(connect_timeout) = policy.connect_timeout_millis {
         builder = builder.connect_timeout(Duration::from_millis(connect_timeout));
     }
@@ -40,8 +50,6 @@ pub(crate) fn codex_http_client_builder_with_proxy(
         // Candidate failover remains explicit and pre-delivery in the proxy.
         .retry(reqwest::retry::never())
         .no_proxy()
-        .pool_max_idle_per_host(8)
-        .pool_idle_timeout(Duration::from_secs(90))
         .tcp_keepalive(None::<Duration>)
         .tcp_keepalive_interval(None::<Duration>)
         .tcp_keepalive_retries(None::<u32>)
@@ -59,12 +67,14 @@ pub(crate) fn codex_http_client_builder_with_proxy(
     Ok(builder)
 }
 
+#[cfg(test)]
 pub(crate) fn build_codex_http_client_with_policy(
     policy: CodexTransportPolicy,
 ) -> Result<reqwest::Client, reqwest::Error> {
     build_codex_http_client_with_proxy(policy, None)
 }
 
+#[cfg(test)]
 pub(crate) fn build_codex_http_client_with_proxy(
     policy: CodexTransportPolicy,
     proxy_url: Option<&str>,

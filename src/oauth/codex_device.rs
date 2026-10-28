@@ -1,7 +1,7 @@
+#[cfg(test)]
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures_util::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use reqwest::header::{ACCEPT, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -34,8 +34,6 @@ const EXPECTED_ISSUER: &str = "https://auth.openai.com";
 const SESSION_AAD: &[u8] = b"memeloop-token-center/openai-codex-device-login/v1";
 const STATE_AAD: &[u8] = b"memeloop-token-center/openai-codex-device-state/v1";
 const READY_AAD: &[u8] = b"memeloop-token-center/openai-codex-device-ready/v1";
-const RESPONSE_LIMIT: usize = 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_LIFETIME_MILLIS: i64 = 15 * 60 * 1_000;
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const MIN_POLL_SECONDS: u64 = 1;
@@ -227,7 +225,7 @@ struct OpenAiAuthClaims {
 
 pub async fn start_codex_device_login(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     input: StartCodexDeviceLogin,
     key_material: &[u8],
     now: i64,
@@ -246,7 +244,7 @@ pub async fn start_codex_device_login(
 }
 
 async fn start_codex_device_login_at(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     db: &Database,
     input: StartCodexDeviceLogin,
     key_material: &[u8],
@@ -333,7 +331,7 @@ async fn start_codex_device_login_at(
 
 pub async fn poll_codex_device_login(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     session_token: &str,
     key_material: &[u8],
     now: i64,
@@ -391,7 +389,7 @@ pub async fn recover_codex_device_session_token(
 }
 
 async fn poll_codex_device_login_at(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     db: &Database,
     session_token: &str,
     runtime: CodexDevicePollRuntime<'_>,
@@ -626,7 +624,7 @@ async fn poll_codex_device_login_at(
 }
 
 async fn exchange_authorization_code(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     code: &str,
     verifier: &str,
     proxy_url: Option<&str>,
@@ -646,7 +644,6 @@ async fn exchange_authorization_code(
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(form)
-        .timeout(REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|_| device_error())?;
@@ -658,7 +655,7 @@ async fn exchange_authorization_code(
 }
 
 async fn verify_id_token(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     id_token: &str,
     now: i64,
     proxy_url: Option<&str>,
@@ -675,7 +672,6 @@ async fn verify_id_token(
     let response = client
         .get(&endpoints.jwks)
         .header(ACCEPT, "application/json")
-        .timeout(REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|_| device_error())?;
@@ -706,7 +702,7 @@ async fn verify_id_token(
 }
 
 async fn post_json<T: Serialize + ?Sized>(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     body: &T,
     proxy_url: Option<&str>,
@@ -717,14 +713,13 @@ async fn post_json<T: Serialize + ?Sized>(
         .post(endpoint)
         .header(ACCEPT, "application/json")
         .json(body)
-        .timeout(REQUEST_TIMEOUT)
         .send()
         .await
         .map_err(|_| device_error())
 }
 
 async fn oauth_client(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     proxy_url: Option<&str>,
     allow_test_loopback: bool,
@@ -740,22 +735,11 @@ async fn oauth_client(
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > RESPONSE_LIMIT as u64)
-    {
-        return Err(device_error());
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| device_error())?;
-        if body.len().saturating_add(chunk.len()) > RESPONSE_LIMIT {
-            return Err(device_error());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|_| device_error())
 }
 
 fn parse_poll_seconds(value: Option<&Value>) -> u64 {
