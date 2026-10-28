@@ -12,3 +12,19 @@
 .settings-billing-field { display: grid; gap: 7px; min-width: 0; }
 .settings-billing-field > .fui-Combobox { width: 100%; min-width: 0; }
 .system-settings .settings-status-note { border: 0; padding: 0; }
+.system-settings .request-config-scope { display: grid; gap: 12px; padding: 10px 0 18px; }
+.system-settings .request-config-scope h4 { margin: 0; font-size: 15px; }
+.system-settings .request-config-purpose { display: grid; gap: 12px; padding: 6px 0 10px; }
+.system-settings .request-config-row { display: grid; grid-template-columns: minmax(150px, 200px) minmax(150px, 230px) minmax(0, 1fr); gap: 4px 16px; align-items: start; }
+.system-settings .request-config-name { color: var(--colorNeutralForeground1, inherit); padding-top: 5px; }
+.system-settings .request-config-name span { border-bottom: 1px dashed var(--colorNeutralStroke2, #888); cursor: help; }
+.system-settings .request-config-input { min-width: 0; }
+.system-settings .request-config-input .fui-Input { width: 100%; min-width: 0; }
+.system-settings .request-config-unit { color: var(--colorNeutralForeground2, inherit); font-size: 12px; white-space: nowrap; }
+.system-settings .request-config-state { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; padding-top: 5px; min-width: 0; }
+.system-settings .request-config-state small { color: var(--colorNeutralForeground2, inherit); font-size: 13px; }
+@media (width <= 640px) {
+  .system-settings .request-config-row { grid-template-columns: 1fr; }
+  .system-settings .request-config-name,
+  .system-settings .request-config-state { padding-top: 0; }
+}
