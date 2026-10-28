@@ -1127,24 +1127,50 @@ pub(crate) async fn archive_session_body(
     drop(request_document);
     drop(return_document);
     let pending_media = body.take_media_bytes();
+    let mut media_staging = Vec::new();
+    let mut uploaded_media = std::collections::HashMap::new();
     for (turn_index, part_index, bytes) in pending_media {
-        match state.archive.put_content(bytes::Bytes::from(bytes)).await {
-            Ok(locator) => body.set_media_locator(turn_index, part_index, locator),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %request_id,
-                    "会话正文归档未能把媒体字节写成 blake3 对象"
-                );
-                return Err(error);
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        if let Some(locator) = uploaded_media.get(&hash) {
+            body.set_media_locator(turn_index, part_index, String::clone(locator));
+            continue;
+        }
+        let attempt = crate::proxy_lifecycle::begin_proxy_archive_attempt(
+            &state.db,
+            request_id,
+            crate::archive_staging::ArchiveStagingPurpose::Media,
+        )
+        .await?;
+        let locator = crate::archive_staging::conversation_media_locator(attempt.lease.key, &hash)?;
+        media_staging.push(attempt.lease);
+        {
+            let upload = state.archive.put(&locator, bytes::Bytes::from(bytes));
+            tokio::pin!(upload);
+            let mut heartbeat = tokio::time::interval(Duration::from_millis(
+                crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
+            ));
+            loop {
+                tokio::select! {
+                    result = &mut upload => {
+                        result?;
+                        break;
+                    }
+                    _ = heartbeat.tick() => {
+                        for lease in &mut media_staging {
+                            if !state.db.heartbeat_archive_staging_write(lease).await? {
+                                return Err(AppError::Conflict("session media staging writer was fenced".into()));
+                            }
+                        }
+                    }
+                }
             }
         }
+        body.set_media_locator(turn_index, part_index, locator.clone());
+        uploaded_media.insert(hash, locator);
     }
-    let (atoms, nodes) = body.into_prefix();
-    let media = body.media_locators(&atoms);
     if !state
         .db
-        .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
+        .prepare_staged_session_body_archive(lease_owner, request_id, body, &media_staging)
         .await?
     {
         return Ok(false);
