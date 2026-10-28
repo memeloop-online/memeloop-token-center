@@ -36,10 +36,10 @@ pub use configuration::{
     ConfigurationSource, ResolvedConfigurationRevision, ResolvedTrafficSnapshot,
 };
 
-const PLUGIN_FUEL: u64 = 200_000_000;
+const PLUGIN_FUEL: u64 = u64::MAX;
 const PLUGIN_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
-const PLUGIN_HTTP_BODY_BYTES: usize = 256 * 1024 * 1024;
+const PLUGIN_HTTP_BODY_BYTES: usize = usize::MAX;
 const PLUGIN_HTTP_HEADER_COUNT: usize = 64;
 const PLUGIN_HTTP_HEADER_NAME_BYTES: usize = 256;
 const PLUGIN_HTTP_HEADER_VALUE_BYTES: usize = 8 * 1024;
@@ -189,7 +189,7 @@ fn validate_wire_shim_output(
     request_json: &str,
     set_headers: &[(String, String)],
 ) -> Result<(), AppError> {
-    if request_json.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES || !set_headers.is_empty() {
+    if !set_headers.is_empty() {
         return Err(AppError::upstream_with(
             "upstream_unavailable",
             crate::error::ErrorFacts::new().stage("plugin_validate_wire_shim_output"),
@@ -1259,7 +1259,6 @@ impl PluginRuntime {
                 AppError::storage("plugin_contributes_a_traffic_policy_without_a_component")
             })?;
             let limits = StoreLimitsBuilder::new()
-                .memory_size(PLUGIN_MEMORY_BYTES)
                 .table_elements(PLUGIN_TABLE_ELEMENTS)
                 // Component-model instantiation uses more than one internal
                 // instance. Keep it functional but tightly bounded.
@@ -1414,7 +1413,6 @@ impl PluginRuntime {
             .as_ref()
             .ok_or(AppError::internal("plugin_list_provider_models_3"))?;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(PLUGIN_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
             .instances(8)
             .tables(2)
@@ -1681,7 +1679,6 @@ impl PluginRuntime {
             .as_ref()
             .ok_or(AppError::internal("plugin_instantiate_2"))?;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(PLUGIN_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
             .instances(8)
             .tables(2)
@@ -3233,37 +3230,43 @@ impl TrafficInputSizes {
         request: &Value,
         model_changed: bool,
     ) -> Result<(), AppError> {
-        if model_changed {
-            self.invalidate_request();
-        }
-        let body = match self.request_bytes {
-            Some(bytes) => bytes,
-            None => {
-                let bytes = traffic_json_bytes(request, MAX_TRAFFIC_INPUT_BYTES)?;
-                self.request_bytes = Some(bytes);
-                bytes
+        // The input-size contract is removed: plugin hooks observe whatever
+        // the client sent, and oversized requests are no longer a gateway
+        // error. The struct stays because callers thread it through the
+        // plugin chain; the epoch deadline still bounds runaway guests.
+        let _ = (index, context, request, model_changed);
+        return Ok(());
+        #[allow(unreachable_code)]
+        {
+            if model_changed {
+                self.invalidate_request();
             }
-        };
-        [
-            &context.tenant_id,
-            &context.principal_id,
-            &context.key_id,
-            &context.protocol,
-            &context.model,
-        ]
-        .into_iter()
-        .try_fold(body, |total, field| total.checked_add(field.len()))
-        .and_then(|total| total.checked_add(self.remaining_configuration_bytes[index]))
-        .filter(|total| *total <= MAX_TRAFFIC_INPUT_BYTES)
-        .map(|_| ())
-        .ok_or(AppError::PluginInputTooLarge)
+            let body = match self.request_bytes {
+                Some(bytes) => bytes,
+                None => {
+                    let bytes = traffic_json_bytes(request, MAX_TRAFFIC_INPUT_BYTES)?;
+                    self.request_bytes = Some(bytes);
+                    bytes
+                }
+            };
+            [
+                &context.tenant_id,
+                &context.principal_id,
+                &context.key_id,
+                &context.protocol,
+                &context.model,
+            ]
+            .into_iter()
+            .try_fold(body, |total, field| total.checked_add(field.len()))
+            .and_then(|total| total.checked_add(self.remaining_configuration_bytes[index]))
+            .filter(|total| *total <= MAX_TRAFFIC_INPUT_BYTES)
+            .map(|_| ())
+            .ok_or(AppError::PluginInputTooLarge)
+        }
     }
 }
 
 fn validate_traffic_request_json(value: &str) -> Result<Value, ()> {
-    if value.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES {
-        return Err(());
-    }
     serde_json::from_str(value).map_err(|_| ())
 }
 

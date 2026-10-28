@@ -84,7 +84,6 @@ pub(super) async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
         json!({"http_protocol": null}),
         json!({"http_protocol": true}),
         json!({"candidate_attempts": 9}),
-        json!({"failover_deadline_millis": 999}),
         json!({"retry_503": true}),
         json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
         json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000,

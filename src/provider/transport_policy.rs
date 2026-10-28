@@ -62,8 +62,6 @@ pub(crate) struct CodexTransportPolicy {
     pub connect_retry_delay_millis: u64,
     pub shared_probe_attempts: Option<u32>,
     pub candidate_attempts: usize,
-    /// Absolute selection/send budget, not the successful stream lifetime.
-    pub failover_deadline_millis: u64,
     pub connect_timeout_millis: u64,
     pub read_timeout_millis: u64,
     pub request_timeout_millis: u64,
@@ -88,7 +86,6 @@ impl Default for CodexTransportPolicy {
             connect_retry_delay_millis: 150,
             shared_probe_attempts: None,
             candidate_attempts: super::types::PROXY_ROUTING_POLICY.max_attempts(),
-            failover_deadline_millis: 300_000,
             connect_timeout_millis: 60_000,
             read_timeout_millis: 600_000,
             request_timeout_millis: 1_260_000,
@@ -137,7 +134,6 @@ impl CodexTransportPolicy {
                 attempts > crate::config::MAX_UPSTREAM_SHARED_PROBE_ATTEMPTS
             })
             || !(1..=8).contains(&policy.candidate_attempts)
-            || !(1_000..=300_000).contains(&policy.failover_deadline_millis)
             || !(100..=600_000).contains(&policy.connect_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
@@ -222,7 +218,6 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(policy.candidate_attempts, 8);
-        assert_eq!(policy.failover_deadline_millis, 1000);
         assert_eq!(policy.shared_probe_attempts, Some(0));
         assert_eq!(policy.connect_timeout_millis, 60_000);
         assert_eq!(policy.read_timeout_millis, 600_000);
@@ -380,8 +375,6 @@ mod tests {
             json!({"version": 2}),
             json!({"candidate_attempts": 0}),
             json!({"candidate_attempts": 9}),
-            json!({"failover_deadline_millis": 999}),
-            json!({"failover_deadline_millis": 300001}),
             json!({"connect_attempts": -1}),
             json!({"connect_attempts": 5}),
             json!({"connect_retry_delay_millis": 2001}),

@@ -41,7 +41,7 @@ impl RequestAttemptBudget {
                 deadline: None,
                 version: 1,
             };
-            budget.record_snapshot(route, request_id, "host_default", None);
+            budget.record_snapshot(route, request_id, "host_default");
             return Ok(budget);
         }
         let policy =
@@ -63,20 +63,13 @@ impl RequestAttemptBudget {
             } else {
                 "codex_default"
             },
-            Some(policy.failover_deadline_millis),
         );
         Ok(budget)
     }
 
     // Only explicit scalar fields cross the logging boundary. In particular,
     // never record route/config/credential Debug output or provider strings.
-    fn record_snapshot(
-        &self,
-        route: &ResolvedUpstream,
-        request_id: Uuid,
-        source: &'static str,
-        deadline_millis: Option<u64>,
-    ) {
+    fn record_snapshot(&self, route: &ResolvedUpstream, request_id: Uuid, source: &'static str) {
         tracing::info!(
             %request_id,
             route_id = %route.route_id,
@@ -87,8 +80,6 @@ impl RequestAttemptBudget {
             policy_source = source,
             policy_version = self.version,
             candidate_attempts = self.max_attempts,
-            failover_deadline_enabled = false,
-            failover_deadline_millis = deadline_millis.unwrap_or(0),
             "proxy request attempt budget frozen"
         );
     }
@@ -158,15 +149,14 @@ mod tests {
 
     #[test]
     fn snapshot_logs_effective_budgets_and_only_allowlisted_fields() {
-        for (driver, policy, source, attempts, deadline) in [
-            ("http_json", None, "host_default", 3, 0),
-            (codex_transport::DRIVER, None, "codex_default", 3, 300_000),
+        for (driver, policy, source, attempts) in [
+            ("http_json", None, "host_default", 3),
+            (codex_transport::DRIVER, None, "codex_default", 3),
             (
                 codex_transport::DRIVER,
-                Some(json!({"candidate_attempts": 2, "failover_deadline_millis": 1000})),
+                Some(json!({"candidate_attempts": 2})),
                 "account_transport_policy",
                 2,
-                1000,
             ),
         ] {
             let log = LogBuffer::default();
@@ -189,8 +179,6 @@ mod tests {
             let fields = &event["fields"];
             assert_eq!(fields["policy_source"], source);
             assert_eq!(fields["candidate_attempts"], attempts);
-            assert_eq!(fields["failover_deadline_millis"], deadline);
-            assert_eq!(fields["failover_deadline_enabled"], false);
             assert_eq!(fields["policy_version"], 1);
             assert_eq!(fields["transport_revision"], 42);
             assert_eq!(fields["credential_generation"], 7);
@@ -201,7 +189,7 @@ mod tests {
                 Uuid::from_u128(2).to_string()
             );
             assert_eq!(fields["stage"], "request_attempt_budget_snapshot");
-            assert_eq!(fields.as_object().unwrap().len(), 12);
+            assert_eq!(fields.as_object().unwrap().len(), 10);
             assert!(!String::from_utf8_lossy(&bytes).contains("do-not-log"));
         }
     }

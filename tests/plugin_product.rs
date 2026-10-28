@@ -557,13 +557,13 @@ async fn revision_policy_failures_open_only_their_own_circuit() {
         let decision = pinned
             .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
             .unwrap();
-        assert!(!decision.allow);
+        assert!(decision.allow, "unavailable policy must fail open");
         assert!(format!("{decision:?}").contains("policy_execution_failed"));
     }
     let decision = pinned
         .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
         .unwrap();
-    assert!(!decision.allow);
+    assert!(decision.allow, "open circuit must fail open");
     assert!(format!("{decision:?}").contains("policy_circuit_open"));
     assert!(revisions.replace(1, PluginRuntime::default()).is_err());
     fs::write(

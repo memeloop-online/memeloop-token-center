@@ -334,7 +334,6 @@ impl PluginRuntime {
             .min(Duration::from_millis(endpoint.timeout_millis));
         let deadline = Instant::now() + timeout;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(PLUGIN_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
             .instances(8)
             .tables(2)

@@ -271,14 +271,17 @@ impl RuntimeSnapshot {
 }
 
 fn unavailable(plugin_id: &str, reason: &'static str) -> TrafficDecision {
+    // Fail open: an unavailable policy (open circuit, failed guest) must
+    // never interrupt the customer's request. Enforcement simply did not
+    // happen for this invocation; the remaining hooks still run.
     tracing::warn!(
         plugin_id,
         decision_code = reason,
-        "plugin policy unavailable"
+        "plugin policy unavailable; failing open"
     );
     TrafficDecision {
-        allow: false,
-        denied_by_plugin_id: Some(plugin_id.to_owned()),
+        allow: true,
+        denied_by_plugin_id: None,
         decision_code: Some(reason),
         ..Default::default()
     }

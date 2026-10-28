@@ -786,12 +786,6 @@ impl ProviderCatalog {
                     "maximum": 8,
                     "default": 3
                 },
-                "failover_deadline_millis": {
-                    "type": "integer",
-                    "minimum": 1000,
-                    "maximum": 300000,
-                    "default": 300000
-                },
                 "connect_attempts": {
                     "type": "integer",
                     "minimum": 1,

@@ -722,7 +722,6 @@ fn builtin_codex_routes_openai_and_verified_image_generation() {
         ("version", "enum", json!([1])),
         ("candidate_attempts", "minimum", json!(1)),
         ("candidate_attempts", "maximum", json!(8)),
-        ("failover_deadline_millis", "minimum", json!(1000)),
         ("failover_deadline_millis", "maximum", json!(300000)),
         ("max_sse_event_bytes", "default", json!(8388608)),
         ("max_sse_event_bytes", "maximum", json!(16777216)),
