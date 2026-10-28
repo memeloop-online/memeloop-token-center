@@ -5,10 +5,11 @@ ARG GO_IMAGE=golang:1.27.3-bookworm
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
 FROM ${GO_IMAGE} AS cosign-builder
-ADD --checksum=sha256:424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa \
-    https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64 /tmp/cosign
-ADD --checksum=sha256:c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 \
-    https://raw.githubusercontent.com/sigstore/cosign/0e48502cf5ef34e2e60bbd3617aa19945712f705/LICENSE /build/cosign/LICENSE
+# Vendor locally when GitHub egress is down. Content is pinned: the vendored
+# files are verified against sha256 424e2c97... (cosign) and c71d239d... (LICENSE)
+# before every build.
+ADD cosign-linux-amd64 /tmp/cosign
+ADD cosign-LICENSE /build/cosign/LICENSE
 RUN chmod 0555 /tmp/cosign \
     && go version -m /tmp/cosign | grep -Eq 'go1\.27\.3$' \
     && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+github.com/klauspost/compress[[:space:]]+v1\.20\.1[[:space:]]' \

@@ -87,7 +87,7 @@ impl Default for CodexTransportPolicy {
             shared_probe_attempts: None,
             candidate_attempts: super::types::PROXY_ROUTING_POLICY.max_attempts(),
             connect_timeout_millis: 60_000,
-            read_timeout_millis: 600_000,
+            read_timeout_millis: 60_000,
             request_timeout_millis: 1_260_000,
             memory_admission_wait_millis: 30_000,
             dispatch_max_in_flight: 0,
@@ -220,7 +220,7 @@ mod tests {
         assert_eq!(policy.candidate_attempts, 8);
         assert_eq!(policy.shared_probe_attempts, Some(0));
         assert_eq!(policy.connect_timeout_millis, 60_000);
-        assert_eq!(policy.read_timeout_millis, 600_000);
+        assert_eq!(policy.read_timeout_millis, 60_000);
         assert_eq!(policy.request_timeout_millis, 1_260_000);
         assert_eq!(policy.memory_admission_wait_millis, 30_000);
         assert_eq!(policy.sse_framing_limits(), SseFramingLimits::default());
