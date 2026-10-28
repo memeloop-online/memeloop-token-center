@@ -55,10 +55,12 @@ interface ServiceCredential {
   bytes and tenant IDs to 200 bytes; control characters are rejected.
 - Scopes replace the complete set. At least one unique supported exact scope is
   required. `*`, `analytics:read`, unknown values, duplicates and empty arrays are
-  rejected. Null `name`/`scopes` and unknown properties return 422.
+  rejected. Null `name`/`scopes` and unknown properties fail the same way:
+  the control plane normalizes every request-shape rejection to a uniform 400.
 - 200 returns `ServiceCredential`, with no token, key or other secret.
   Generation, fingerprint and the existing secret remain unchanged.
-- Validation returns 400; missing/invalid authentication 401; insufficient scope
+- Validation and malformed request shapes return 400; missing/invalid
+  authentication 401; insufficient scope
   or a tenant-scoped caller 403; missing identity/current generation 404;
   revoked identity 409. Suspended credentials can be edited and remain suspended.
 - A principal lock serializes updates with rotation. Credential fields are read

@@ -12,7 +12,21 @@ declare global {
   interface Window {
     credentialFixture: {
       calls: string[];
-      requests: Array<{ method: string; path: string; body?: string }>;
+      requests: Array<{
+        method: string;
+        path: string;
+        cache?: RequestCache;
+        credentials?: RequestCredentials;
+        referrerPolicy?: ReferrerPolicy;
+        hasSignal: boolean;
+        body?: string;
+      }>;
+      releaseIssue: (token: string) => void;
+      releaseRoutingResponse: (status: number) => void;
+      releaseCredentialScopeA: () => void;
+      releaseCredentialCursor: () => void;
+      createdObjectUrls: string[];
+      revokedObjectUrls: string[];
     };
   }
 }
@@ -24,7 +38,7 @@ async function localChromiumExecutable() {
   const installations = await readdir(workspaceUserCache, { withFileTypes: true }).catch(() => []);
   for (const installation of installations) {
     if (!installation.isDirectory() || !installation.name.startsWith('chromium-')) continue;
-    const executable = join(installation.name, 'chrome-linux64', 'chrome');
+    const executable = join(workspaceUserCache, installation.name, 'chrome-linux64', 'chrome');
     if (existsSync(executable)) return executable;
   }
   return undefined;
@@ -55,7 +69,8 @@ test('service credential edit plan sends only changed sections through PATCH', {
   const page = await editFixturePage(context, 'scenario=service-edit');
   if (!page) return;
   const plans = await page.evaluate(async () => {
-    const { serviceCredentialUpdatePlan } = await import('/src/operator/serviceCredentialScopes.ts');
+    const modulePath = '/src/operator/serviceCredentialScopes.ts';
+    const { serviceCredentialUpdatePlan } = await import(modulePath);
     const current = { name: 'Existing service credential', scopes: ['keys:read'], tenant_external_id: 'tenant-a' };
     const globalCurrent = { ...current, tenant_external_id: null };
     return {

@@ -1376,9 +1376,6 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
-          },
-          "422": {
-            "description": "Malformed JSON field types, null name/scopes, or unknown properties."
           }
         }
       }

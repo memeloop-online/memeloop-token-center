@@ -753,8 +753,6 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
-        '422':
-          description: Malformed JSON field types, null name/scopes, or unknown properties.
 
   /internal/v1/service-tokens/{service_id}/rotate:
     post:

@@ -109,12 +109,15 @@ async fn service_update_requires_global_writer_even_when_target_is_self() {
     let (state, _directory) = test_state().await;
     let target = issue(&state, "target", &["requests:read"], None).await;
     let path = format!("/internal/v1/service-tokens/{}", target.service_id);
-    for (scopes, tenant) in [
+    for (index, (scopes, tenant)) in [
         (vec!["service_tokens:read"], None),
         (vec!["requests:read"], None),
         (vec!["service_tokens:write"], Some("default")),
-    ] {
-        let caller = issue(&state, "caller", &scopes, tenant).await;
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let caller = issue(&state, &format!("caller-{index}"), &scopes, tenant).await;
         assert_eq!(
             request(
                 &state,
@@ -173,6 +176,9 @@ async fn invalid_partial_service_updates_leave_all_fields_unchanged() {
     let (state, _directory) = test_state().await;
     let issued = issue(&state, "original", &["requests:read"], None).await;
     let path = format!("/internal/v1/service-tokens/{}", issued.service_id);
+    // The control-plane middleware normalizes every plain-text extractor
+    // rejection (schema-shape errors included) to a uniform 400, so semantic
+    // validation failures and malformed request shapes share one status here.
     for body in [
         json!({}),
         json!({"name":"changed", "scopes": []}),
@@ -181,21 +187,6 @@ async fn invalid_partial_service_updates_leave_all_fields_unchanged() {
         json!({"name":"changed", "scopes": ["requests:read", "requests:read"]}),
         json!({"name":" "}),
         json!({"name":"changed", "tenant_external_id":" "}),
-    ] {
-        assert_eq!(
-            request(
-                &state,
-                "PATCH",
-                &path,
-                &state.config.service_token,
-                Some(body)
-            )
-            .await
-            .0,
-            StatusCode::BAD_REQUEST
-        );
-    }
-    for body in [
         json!({"name":null}),
         json!({"scopes":null}),
         json!({"name":"changed", "alias":"unknown"}),
@@ -210,7 +201,7 @@ async fn invalid_partial_service_updates_leave_all_fields_unchanged() {
             )
             .await
             .0,
-            StatusCode::UNPROCESSABLE_ENTITY
+            StatusCode::BAD_REQUEST
         );
     }
     let values = state.db.list_service_tokens().await.unwrap();

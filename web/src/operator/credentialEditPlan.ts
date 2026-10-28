@@ -1,4 +1,4 @@
-import type { CredentialRoutingView, KeyView } from '../types';
+import type { CredentialRoutingView, KeyView } from '../types.js';
 
 export type CredentialEditSection = 'alias' | 'policy' | 'routing';
 
