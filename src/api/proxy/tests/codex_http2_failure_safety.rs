@@ -152,8 +152,7 @@ async fn set_short_http2_deadline(fixture: &CodexRouteFixture) {
         "candidate_attempts": 2,
         "connect_timeout_millis": 100,
         "read_timeout_millis": 1000,
-        "request_timeout_millis": 3000,
-        "failover_deadline_millis": 5000
+        "request_timeout_millis": 3000
     });
     sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
         .bind(config.to_string())

@@ -411,7 +411,7 @@ impl ProviderCatalog {
                     "default": "public",
                     "description": "Private destinations require a global operator credential."
                 },
-                "timeout_seconds": {"type": "integer", "minimum": 1, "default": 120},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "description": "Optional explicit end-to-end request timeout in seconds. When omitted, no application deadline is imposed."},
                 "reservation_token_bounds": {
                     "type": "object",
                     "propertyNames": {"minLength": 1, "maxLength": 500},
@@ -737,8 +737,8 @@ impl ProviderCatalog {
                     "description": "Provider default preserves native TLS protocol negotiation. HTTP/1.1 only is an explicit account override for controlled compatibility checks; it does not enable automatic fallback. Changes affect new account clients, including model and quota reads; existing requests retain their client."
                 },
                 "connect_timeout_millis": {
-                    "type": "integer", "minimum": 100, "maximum": 60000, "default": 5000,
-                    "description": "Stored with the account and still required to be lower than the total request timeout. A Codex forward does not use it as a connection deadline. Proxy reachability is a separate probe configured on the proxy group."
+                    "type": ["integer", "null"], "minimum": 100, "maximum": 600000, "default": null,
+                    "description": "Optional connection-establishment timeout. Unset by default; no application connection deadline is imposed. An explicit value covers connection establishment, including TLS and the configured proxy, without limiting response duration."
                 },
                 "read_timeout_millis": {
                     "type": ["integer", "null"], "minimum": 1000, "maximum": 1260000, "default": null,
@@ -746,7 +746,7 @@ impl ProviderCatalog {
                 },
                 "request_timeout_millis": {
                     "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 1260000,
-                    "description": "Stored with the account. A Codex forward, including compaction, does not apply this absolute deadline. The attempt ends when the upstream answers, the client cancels, or the socket fails."
+                    "description": "HTTP/2 keepalive PING acknowledgement timeout, and explicit total budget for model catalog and quota reads. This does not impose an absolute deadline on inference or compaction. Quiet upstream responses continue while the connection remains healthy."
                 },
                 "memory_admission_wait_millis": {
                     "type": "integer", "minimum": 100, "maximum": 300000, "default": 30000,
@@ -903,8 +903,7 @@ impl ProviderCatalog {
         kimi.config_schema["properties"]["timeout_seconds"] = json!({
             "type": "integer",
             "minimum": 1,
-            "default": 120,
-            "description": "Request timeout in seconds, including the complete response stream."
+            "description": "Optional explicit request timeout in seconds, including the complete response stream. When omitted, no application deadline is imposed."
         });
         kimi.oauth_adapter = Some(OAuthAdapterContribution {
             api_version: "oauth-adapter-v1".to_owned(),

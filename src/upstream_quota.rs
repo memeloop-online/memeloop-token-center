@@ -159,12 +159,12 @@ fn codex_quota_transport_policy(
     let value = config.get("transport_policy");
     let mut policy = crate::provider::CodexTransportPolicy::parse(value)?;
     let total_millis = budget.total.as_millis() as u64;
-    policy.connect_timeout_millis =
-        if value.is_some_and(|policy| policy.get("connect_timeout_millis").is_some()) {
-            policy.connect_timeout_millis.min(total_millis)
-        } else {
-            total_millis
-        };
+    policy.connect_timeout_millis = Some(
+        policy
+            .connect_timeout_millis
+            .unwrap_or(total_millis)
+            .min(total_millis),
+    );
     Ok(policy)
 }
 
@@ -1349,16 +1349,14 @@ mod tests {
         ] {
             let budget = codex_quota_budget(&config).unwrap();
             let policy = codex_quota_transport_policy(&config, budget).unwrap();
-            assert_eq!(policy.connect_timeout_millis, expected_millis);
+            assert_eq!(policy.connect_timeout_millis, Some(expected_millis));
             assert_eq!(budget.attempt_limit, 3);
             let model_policy =
                 crate::provider::CodexTransportPolicy::parse(config.get("transport_policy"))
                     .unwrap();
             assert_eq!(
                 model_policy.connect_timeout_millis,
-                config["transport_policy"]["connect_timeout_millis"]
-                    .as_u64()
-                    .unwrap_or(5_000)
+                config["transport_policy"]["connect_timeout_millis"].as_u64()
             );
         }
     }
