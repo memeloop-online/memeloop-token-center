@@ -85,7 +85,7 @@ async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
-test('credential workspaces isolate loads and preserve issued service plaintext', { timeout: 60_000 }, async () => {
+test('credential workspaces isolate loads and preserve issued service plaintext', { timeout: 120_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the credential workspace CI gate');
@@ -109,7 +109,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     assert.match(await allTenantBalance.getAttribute('title') ?? '', /9,223,372,036,854\.775807/, 'the complete prepaid balance remains available in the tooltip');
     assert.equal(await allTenants.getByText('key-all', { exact: true }).count(), 0, 'technical credential IDs are not part of the list reading path');
     await allTenants.getByRole('button', { name: 'More actions', exact: true }).click();
-    assert.equal(await allTenants.getByRole('menuitem', { name: 'Rename', exact: true }).isDisabled(), true);
+    assert.equal(await allTenants.getByRole('menuitem', { name: 'Edit', exact: true }).isDisabled(), true);
     const limits = allTenants.getByRole('menuitem', { name: 'Current limit state', exact: true });
     assert.equal(await limits.isDisabled(), false, 'stable key ID permits a read-only limit lookup without selecting a tenant');
     await limits.click();
@@ -319,8 +319,9 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await aba.getByText('mts_service_secret_current', { exact: true }).waitFor();
 
     // Exercise the actual page and shipped schemas on this same server. Each
-    // locale creates and edits a different mode, covering both payload values
-    // in both endpoints without a second synthetic component/server fixture.
+    // locale creates a different mode and both edit to the remaining value,
+    // covering both payload values in both endpoints without a second
+    // synthetic component/server fixture.
     for (const locale of ['en', 'zh-CN'] as const) {
       const client = await browser.newPage({ viewport: { width: 390, height: 844 } });
       client.setDefaultTimeout(5_000);
@@ -330,33 +331,45 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
       const modeLabel = english ? 'Metering and limit mode' : '计量与限额模式';
       await client.getByText(english ? 'Research workspace' : '研发工作区', { exact: true }).waitFor();
       await client.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
-      await client.getByRole('menuitem', { name: english ? 'Policy and limits' : '权限与限流', exact: true }).click();
+      await client.getByRole('menuitem', { name: english ? 'Edit' : '编辑', exact: true }).click();
       const edit = client.locator('.inline-editor.form-panel');
+      const renamedAlias = english ? 'Research workspace renamed' : '研发工作区改名';
+      await edit.getByRole('textbox', { name: english ? 'Credential alias' : '凭据别名', exact: true }).fill(renamedAlias);
       const editMode = edit.getByRole('combobox', { name: modeLabel, exact: true });
       await edit.locator('#root_max_concurrency').focus();
       await client.keyboard.press('Tab');
       assert.equal(await editMode.evaluate(element => document.activeElement === element), true);
-      const editedMode = english ? 'metered_unlimited' : 'prepaid';
+      const editedMode = 'metered_unlimited';
       await editMode.selectOption(editedMode);
       await edit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
       await nextPaint(client);
       assert.deepEqual(await edit.locator('.schema-errors').allTextContents(), [], 'valid policy must submit without schema validation errors');
       await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy')));
+      await edit.waitFor({ state: 'hidden' });
       const policyRequest = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/policy'))!);
       assert.equal(JSON.parse(policyRequest.body!).enforcement_mode, editedMode);
       assert.equal(JSON.parse(policyRequest.body!).daily_budget, null);
+      const aliasRequest = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PATCH' && request.path.endsWith('/key-form/alias')));
+      assert.equal(JSON.parse(aliasRequest!.body!).alias, renamedAlias, 'the unified editor saves the alias through the existing rename endpoint');
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path.endsWith('/routing')).length), 0, 'an untouched routing section is never rewritten');
+      await client.getByText(english ? 'Saved changes to Research workspace renamed.' : '已保存对 研发工作区改名 的修改。', { exact: true }).waitFor();
 
       await client.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
-      await client.getByRole('menuitem', { name: english ? 'Route access' : '路由权限', exact: true }).click();
-      const existingRouting = client.locator('.routing-editor');
+      await client.getByRole('menuitem', { name: english ? 'Edit' : '编辑', exact: true }).click();
+      const reopenedEdit = client.locator('.inline-editor.form-panel');
+      const existingRouting = reopenedEdit.locator('.routing-editor');
       await existingRouting.getByRole('region', { name: english ? 'Authorization scope preview' : '授权范围预览' }).getByText(/Spark disabled/, { exact: false }).waitFor();
       await existingRouting.getByRole('button', { name: english ? 'Individual model grants (1)' : '单独授权模型（1）', exact: true }).click();
       assert.match(await existingRouting.locator('.selection-chip').innerText(), /Spark disabled/, 'an unavailable existing grant stays selected');
       assert.equal(await existingRouting.locator('.selection-chip button').isEnabled(), true, 'the existing disabled grant remains explicitly removable');
-      await existingRouting.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
+      await reopenedEdit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
+      await client.getByText(english ? 'No changes to save.' : '没有需要保存的修改。', { exact: true }).waitFor();
+      assert.equal(await client.evaluate(() => window.credentialFixture.requests.filter(request => request.method === 'PUT' && request.path.endsWith('/routing')).length), 0, 'an unchanged draft never rewrites grants');
+      await existingRouting.locator('.selection-chip button').click();
+      await reopenedEdit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
       await client.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing')));
       const savedRouting = await client.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing'))!);
-      assert.deepEqual(JSON.parse(savedRouting.body!).route_ids, ['00000000-0000-4000-8000-000000000004'], 'saving does not silently drop unavailable existing grants');
+      assert.deepEqual(JSON.parse(savedRouting.body!).route_ids, [], 'an explicit removal of an unavailable grant persists');
 
       const create = client.locator('.create-journey');
       await create.locator(':scope > .journey-heading [data-workspace-toggle]').click();
@@ -460,7 +473,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await policies.goto(`${fixture('client-form')}&multiple-policies=1`);
     const openPolicy = async (alias: string) => {
       await policies.locator('.credential-compact-row').filter({ has: policies.getByText(alias, { exact: true }) }).getByRole('button', { name: 'More actions', exact: true }).click();
-      await policies.getByRole('menuitem', { name: 'Policy and limits', exact: true }).click();
+      await policies.getByRole('menuitem', { name: 'Edit', exact: true }).click();
       await policies.locator('.inline-editor #root_max_concurrency').waitFor();
     };
     await openPolicy('Other workspace');
@@ -477,6 +490,45 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     assert.equal(policyWrites[0].path, '/internal/v1/keys/key-form/policy');
     assert.equal(JSON.parse(policyWrites[0].body!).max_concurrency, 3);
     await policies.close();
+
+    const pagedCatalog = await browser.newPage();
+    await pagedCatalog.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await pagedCatalog.goto(`${fixture('client-form')}&paged-route-catalog`);
+    await pagedCatalog.getByText('Research workspace', { exact: true }).waitFor();
+    await pagedCatalog.waitForFunction(() => window.credentialFixture.calls.some((call) => call.startsWith('/internal/v1/model-routes?') && call.includes('before_created_at=')), undefined, { timeout: 10_000 });
+    await pagedCatalog.getByRole('button', { name: 'More actions', exact: true }).click();
+    await pagedCatalog.getByRole('menuitem', { name: 'Edit', exact: true }).click();
+    const pagedRouting = pagedCatalog.locator('.inline-editor .routing-editor');
+    const pagedPreview = pagedRouting.getByRole('region', { name: 'Authorization scope preview' });
+    await pagedPreview.getByText(/Spark disabled/, { exact: false }).waitFor();
+    assert.equal(await pagedPreview.getByText(/Unknown route/).count(), 0, 'a grant stored beyond the first catalog page resolves its route name once paging completes');
+    await pagedRouting.getByRole('button', { name: 'Individual model grants (1)', exact: true }).click();
+    assert.match(await pagedRouting.locator('.selection-chip').innerText(), /Spark disabled/, 'the paged-in grant stays selected under its own name');
+    await pagedCatalog.close();
+
+    const exactCatalog = await browser.newPage();
+    await exactCatalog.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await exactCatalog.goto(`${fixture('client-form')}&paged-route-catalog-exact`);
+    await exactCatalog.getByText('Research workspace', { exact: true }).waitFor();
+    // Two full pages are followed by one empty read: the empty page, not a
+    // route count, is what ends the walk.
+    await exactCatalog.waitForFunction(() => window.credentialFixture.calls.filter((call) => call.startsWith('/internal/v1/model-routes?') && call.includes('before_created_at=')).length === 2, undefined, { timeout: 10_000 });
+    await exactCatalog.getByRole('button', { name: 'More actions', exact: true }).click();
+    await exactCatalog.getByRole('menuitem', { name: 'Edit', exact: true }).click();
+    const exactRouting = exactCatalog.locator('.inline-editor .routing-editor');
+    const exactPreview = exactRouting.getByRole('region', { name: 'Authorization scope preview' });
+    await exactPreview.getByText(/Spark disabled/, { exact: false }).waitFor();
+    assert.equal(await exactPreview.getByText(/Unknown route/).count(), 0, 'a catalog sized to an exact page multiple still resolves every grant');
+    await exactCatalog.close();
+
+    const stuckCatalog = await browser.newPage();
+    await stuckCatalog.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await stuckCatalog.goto(`${fixture('client-form')}&paged-route-catalog-stuck`);
+    await stuckCatalog.getByText('Research workspace', { exact: true }).waitFor();
+    await stuckCatalog.getByRole('alert').filter({ hasText: 'The existing route list could not be loaded completely. Try again.' }).first().waitFor();
+    const stuckReads = await stuckCatalog.evaluate(() => window.credentialFixture.calls.filter((call) => call.startsWith('/internal/v1/model-routes?')).length);
+    assert.equal(stuckReads, 2, 'a non-advancing cursor fails after the repeated page instead of paging forever');
+    await stuckCatalog.close();
   } finally {
     await browser.close();
     await server.close();

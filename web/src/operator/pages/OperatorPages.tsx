@@ -88,10 +88,17 @@ export function UsagePage({ token, tenant, onOpenSession }: OperatorPageProps & 
   const upstreamMetadataError = resource.state.kind === 'failed'
     ? resource.state.message
     : resource.state.kind === 'ready' ? resource.state.refreshError : undefined;
+  // An optional catalog 403 is a capability boundary, not a page failure:
+  // usage analysis keeps rendering while upstream names fall back to IDs.
+  const upstreamMetadataDenied = resource.state.kind === 'failed'
+    ? resource.state.status === 403
+    : resource.state.kind === 'ready' && resource.state.refreshErrorStatus === 403;
   return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0usage`} label={t('common.loading')}>
     {(resource.state.kind === 'loading' || (resource.state.kind === 'idle' && !resource.state.disabled)) && <LoadingState label={t('common.loading')} variant="compact" />}
     <LoadingProgress active={resource.state.kind === 'ready' && resource.state.refreshing === true} label={t('common.loading')} />
-    {upstreamMetadataError && <div className="notice error" role="alert">{t('usage.upstreams')}: {upstreamMetadataError}</div>}
+    {upstreamMetadataDenied
+      ? <div className="notice warning" role="status">{t('usage.upstreamCatalogDenied')}</div>
+      : upstreamMetadataError && <div className="notice error" role="alert">{t('usage.upstreams')}: {upstreamMetadataError}</div>}
     <UsageAnalysis token={token} tenant={tenant} upstreams={upstreams} onOpenSession={onOpenSession} />
   </PageLoadingRegion>;
 }

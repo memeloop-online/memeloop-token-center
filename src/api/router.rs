@@ -18,6 +18,15 @@ pub fn router_for_role(mut state: AppState, role: RuntimeRole) -> Router {
         application = application.route("/metrics", get(prometheus_metrics));
     }
     if matches!(role, RuntimeRole::Control | RuntimeRole::All) {
+        application = application.route(
+            "/internal/v1/service-tokens/{service_id}",
+            patch(update_service_token)
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    authenticate_control_before_body,
+                ))
+                .layer(ConcurrencyLimitLayer::new(CONTROL_IN_FLIGHT_REQUESTS)),
+        );
         application = application.route("/version", get(version));
         if state.config.runtime_profiling_enabled {
             application =
