@@ -5,6 +5,9 @@ impl TransportProxyGroups {
         self: &Arc<Self>,
         database_url: &str,
         plugins: crate::plugin::PluginRuntime,
+        #[cfg(feature = "experimental-plugin-revisions")] application_plugins: Option<
+            Arc<crate::plugin::application::ApplicationPlugins>,
+        >,
     ) -> Result<(), sqlx::Error> {
         let pool = AnyPoolOptions::new()
             .max_connections(1)
@@ -16,7 +19,21 @@ impl TransportProxyGroups {
                 if current.refresh_managed(&pool).await.is_err() {
                     tracing::debug!("transport proxy configuration refresh deferred");
                 }
-                if current.evaluate_strategies(&pool, &plugins).await.is_err() {
+                let active_plugins = plugins.clone();
+                #[cfg(feature = "experimental-plugin-revisions")]
+                let active_plugins = if let Some(application) = &application_plugins {
+                    match application.pin().await {
+                        Ok(snapshot) => snapshot.runtime.runtime().clone(),
+                        Err(_) => crate::plugin::PluginRuntime::default(),
+                    }
+                } else {
+                    active_plugins
+                };
+                if current
+                    .evaluate_strategies(&pool, &active_plugins)
+                    .await
+                    .is_err()
+                {
                     tracing::debug!("network proxy strategy refresh deferred");
                 }
                 for entry in current.persistence_entries().unwrap_or_default() {

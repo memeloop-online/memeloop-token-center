@@ -418,6 +418,8 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: Validate canonical proxies, legacy saves, snapshots, policies and tenant query plans
+        uses: ./.github/actions/checkout-plugin-examples
+      - name: Run network proxy contracts on both SQL backends
         run: |
           cargo test --locked --all-features --lib db::network_proxies:: -- --nocapture
           cargo test --locked --all-features --lib db::transport_proxy_management:: -- --nocapture
