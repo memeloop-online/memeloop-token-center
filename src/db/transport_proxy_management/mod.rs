@@ -69,12 +69,19 @@ fn validate_name(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Proxy members are stored as plain JSON so operators can read and repair
+/// them directly. Rows written before that change still hold a sealed
+/// envelope, so those are decrypted on read; the fallback is only needed
+/// until every row has been rewritten.
+pub(super) fn decode_members(stored: &str, key: &[u8]) -> Result<Vec<Member>, AppError> {
+    if let Ok(members) = serde_json::from_str::<Vec<Member>>(stored) {
+        return Ok(members);
+    }
+    open_private_json(stored, key, MEMBERS_AAD)
+}
+
 fn open_members(row: &AnyRow, key: &[u8]) -> Result<Vec<Member>, AppError> {
-    open_private_json(
-        &row.try_get::<String, _>("members_ciphertext")?,
-        key,
-        MEMBERS_AAD,
-    )
+    decode_members(&row.try_get::<String, _>("members_ciphertext")?, key)
 }
 
 async fn available_name(
