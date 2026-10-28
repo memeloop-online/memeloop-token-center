@@ -5,10 +5,9 @@ use serde_json::Value;
 use wasmtime::{Store, StoreLimitsBuilder};
 
 use super::{
-    HostState, PLUGIN_MEMORY_BYTES, PLUGIN_TABLE_ELEMENTS, PluginRuntime,
-    PluginServiceDataEndpoint, PluginServiceDataProvenance, PluginServiceDataView,
-    epoch_deadline_ticks, plugin_configuration_schema_digest, plugin_failure,
-    plugin_reported_error,
+    HostState, PLUGIN_TABLE_ELEMENTS, PluginRuntime, PluginServiceDataEndpoint,
+    PluginServiceDataProvenance, PluginServiceDataView, epoch_deadline_ticks,
+    plugin_configuration_schema_digest, plugin_failure, plugin_reported_error,
 };
 use crate::{
     db::PluginServiceDataRefreshErrorCode,

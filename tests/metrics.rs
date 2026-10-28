@@ -253,7 +253,7 @@ async fn diagnostics_are_explicit_control_only_and_scope_protected() {
     let gateway = api::router_for_role(state.clone(), RuntimeRole::Gateway);
     let control = api::router_for_role(state, RuntimeRole::Control);
 
-    let mut operations = vec![(Method::GET, "/internal/v1/diagnostics/runtime")];
+    let operations = vec![(Method::GET, "/internal/v1/diagnostics/runtime")];
     #[cfg(target_os = "linux")]
     operations.push((Method::POST, "/internal/v1/diagnostics/cpu-profile"));
     #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]

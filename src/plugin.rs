@@ -185,10 +185,7 @@ pub(crate) struct WireShimOutcome {
     pub(crate) request_json: String,
 }
 
-fn validate_wire_shim_output(
-    request_json: &str,
-    set_headers: &[(String, String)],
-) -> Result<(), AppError> {
+fn validate_wire_shim_output(set_headers: &[(String, String)]) -> Result<(), AppError> {
     if !set_headers.is_empty() {
         return Err(AppError::upstream_with(
             "upstream_unavailable",
@@ -792,7 +789,7 @@ impl PluginRuntime {
             .map_err(|error| {
                 plugin_reported_error(&plugin.manifest.id, "wire-shim-finalize", &error)
             })?;
-        validate_wire_shim_output(&result.request_json, &result.set_headers)?;
+        validate_wire_shim_output(&result.set_headers)?;
         Ok(Some(WireShimOutcome {
             request_json: result.request_json,
         }))
@@ -3346,15 +3343,9 @@ mod tests {
     }
 
     #[test]
-    fn privacy_wire_shim_output_rejects_headers_but_not_valid_growth() {
-        assert!(validate_wire_shim_output("{\"text\":\"\\u4fdd\\u7559\"}", &[]).is_ok());
-        assert!(
-            validate_wire_shim_output("{}", &[("authorization".into(), "bad".into())]).is_err()
-        );
-        assert!(
-            validate_wire_shim_output(&"x".repeat(MAX_TRAFFIC_REQUEST_JSON_BYTES + 1), &[])
-                .is_err()
-        );
+    fn privacy_wire_shim_output_rejects_headers_and_ignores_payload_size() {
+        assert!(validate_wire_shim_output(&[]).is_ok());
+        assert!(validate_wire_shim_output(&[("authorization".into(), "bad".into())]).is_err());
     }
 
     #[test]

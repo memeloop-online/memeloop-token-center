@@ -22,6 +22,7 @@ pub mod model;
 pub mod native_cli;
 pub mod network;
 pub mod oauth;
+mod plain_json;
 pub mod plugin;
 #[cfg(feature = "plugin-distribution")]
 pub mod plugin_distribution;
@@ -188,7 +189,11 @@ impl AppState {
             .await
             .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db
-                .migrate_with_credential_pepper(config.key_pepper.as_bytes())
+                .migrate()
+                .await
+                .map_err(|error| InitializationError::Database(error.into()))?;
+            migration_db
+                .convert_sealed_state(config.key_pepper.as_bytes())
                 .await
                 .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db.close().await;

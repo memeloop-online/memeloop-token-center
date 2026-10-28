@@ -300,7 +300,7 @@ fn request_cipher_domain_is_distinct_and_schema71_response_aad_is_unchanged() {
         "memeloop-token-center/response-archive-spool/v1/{}/{}/{}/0",
         identity.tenant_id, identity.request_id, identity.reservation_id
     );
-    let legacy = crate::provider::seal_private_json(
+    let legacy = crate::provider::seal_envelope(
         &serde_json::json!({"bytes":"cHJpdmF0ZSBhcmNoaXZl"}),
         PEPPER,
         legacy_aad.as_bytes(),

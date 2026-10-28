@@ -44,7 +44,7 @@ use crate::{
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
-        open_private_json, seal_credential, seal_private_json, validate_config,
+        seal_credential, validate_config,
     },
 };
 

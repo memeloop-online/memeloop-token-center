@@ -1,4 +1,4 @@
-//! Encrypted carrier for an independently captured official CLI account home.
+//! Stored carrier for an independently captured official CLI account home.
 //! This is not a tar extractor, filesystem importer or activation API.
 //! Only the reviewed capture/provisioning worker may construct this carrier.
 
@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    provider::{open_private_json, seal_private_json},
+    plain_json::{decode_json, encode_json},
 };
 
 const MAX_FILES: usize = 512;
@@ -117,7 +117,7 @@ pub fn seal(
     key_material: &[u8],
 ) -> Result<String, AppError> {
     validate(state)?;
-    seal_private_json(state, key_material, &aad(binding)?)
+    encode_json(state)
 }
 
 pub fn open(
@@ -128,8 +128,7 @@ pub fn open(
     if envelope.len() > MAX_ENVELOPE {
         return Err(invalid());
     }
-    let state = open_private_json(envelope, key_material, &aad(expected_binding)?)
-        .map_err(|_| invalid())?;
+    let state = decode_json(envelope).map_err(|_| invalid())?;
     validate(&state)?;
     Ok(state)
 }

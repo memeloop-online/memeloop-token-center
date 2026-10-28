@@ -154,7 +154,7 @@ async fn delayed_ping_server(
 fn policy(read_timeout: Duration, request_timeout: Duration) -> CodexTransportPolicy {
     CodexTransportPolicy {
         connect_timeout_millis: 100,
-        read_timeout_millis: read_timeout.as_millis() as u64,
+        read_timeout_millis: Some(read_timeout.as_millis() as u64),
         request_timeout_millis: request_timeout.as_millis() as u64,
         ..CodexTransportPolicy::default()
     }

@@ -65,7 +65,6 @@ impl TransportProxyGroups {
                 active += 1;
                 crate::db::transport_proxy_management::decode_members(
                     &row.try_get::<String, _>("members_ciphertext")?,
-                    &self.key,
                 )?
             } else {
                 Vec::new()

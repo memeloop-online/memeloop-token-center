@@ -161,11 +161,6 @@ impl Database {
                 response_ciphertext: row.try_get("response_ciphertext")?,
                 expires_at: row.try_get("expires_at")?,
             },
-            UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE,
-            account_id,
-            idempotency_key,
-            &request_hash,
-            key_material,
             unix_millis(),
         )
         .map(Some)
@@ -221,15 +216,7 @@ impl Database {
         )
         .await?
         {
-            let view = open_rotation_replay(
-                replay,
-                UPSTREAM_TRANSPORT_PROXY_ROTATION_RESOURCE,
-                account_id,
-                idempotency_key,
-                &request_hash,
-                key_material,
-                now,
-            )?;
+            let view = open_rotation_replay(replay, now)?;
             tx.commit().await?;
             return Ok((view, false));
         }
@@ -410,7 +397,6 @@ impl Database {
             account_id,
             &request_hash,
             replay_expires_at,
-            key_material,
         )
         .await?;
         tx.commit().await?;
@@ -800,15 +786,7 @@ impl Database {
         )
         .await?
         {
-            let view = open_rotation_replay(
-                replay,
-                UPSTREAM_CREDENTIAL_ROTATION_RESOURCE,
-                account_id,
-                idempotency_key,
-                &request_hash,
-                key_material,
-                now,
-            )?;
+            let view = open_rotation_replay(replay, now)?;
             tx.commit().await?;
             return Ok((view, false));
         }
@@ -876,15 +854,7 @@ impl Database {
         .await?;
         if let Some(replay) = replay {
             if replay.response_ciphertext.is_some() {
-                let view = open_rotation_replay(
-                    replay,
-                    UPSTREAM_OAUTH_REFRESH_RESOURCE,
-                    account_id,
-                    idempotency_key,
-                    &request_hash,
-                    key_material,
-                    now,
-                )?;
+                let view = open_rotation_replay(replay, now)?;
                 tx.commit().await?;
                 return Ok(ClaimUpstreamOAuthRefreshResult::Replay(Box::new(view)));
             }
@@ -1235,11 +1205,6 @@ impl Database {
                     response_ciphertext,
                     expires_at,
                 },
-                UPSTREAM_OAUTH_REFRESH_RESOURCE,
-                account_id,
-                idempotency_key,
-                &request_hash,
-                key_material,
                 unix_millis(),
             )?;
             tx.commit().await?;
@@ -1295,7 +1260,7 @@ impl Database {
         pending_ciphertext: &str,
         idempotency_key: &str,
         request_hash: &str,
-        key_material: &[u8],
+        _key_material: &[u8],
     ) -> Result<Option<UpstreamAccountView>, AppError> {
         let mut tx = self
             .begin_upstream_oauth_write_transaction(account_id, OAuthRefreshWritePhase::Stage)
@@ -1323,11 +1288,6 @@ impl Database {
                     response_ciphertext,
                     expires_at,
                 },
-                UPSTREAM_OAUTH_REFRESH_RESOURCE,
-                account_id,
-                idempotency_key,
-                request_hash,
-                key_material,
                 unix_millis(),
             )?;
             tx.commit().await?;
@@ -1598,7 +1558,6 @@ impl Database {
             account_id,
             request_hash,
             replay_expires_at,
-            key_material,
         )
         .await?;
         Ok(view)

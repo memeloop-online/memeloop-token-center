@@ -41,7 +41,7 @@ async fn interrupted_exchange_is_not_replayed_after_worker_restart() {
             flow_kind: OAUTH_DRIVER.into(),
             tenant_external_id: state.tenant_external_id.clone(),
             operator_service_id: None,
-            state_ciphertext: seal_private_json(&state, key, STATE_AAD).unwrap(),
+            state_ciphertext: encode_handle(&state).unwrap(),
             next_poll_at: now,
             expires_at: state.expires_at,
         })

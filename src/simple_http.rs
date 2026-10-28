@@ -44,9 +44,16 @@ pub(crate) fn codex_http_client_builder_with_proxy(
         .no_proxy()
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
-        .tcp_keepalive(None::<Duration>)
-        .tcp_keepalive_interval(None::<Duration>)
-        .tcp_keepalive_retries(None::<u32>)
+        // Keepalive is a liveness probe, not a deadline: it never interrupts a
+        // request. Large uploads pause while the proxy drains its buffer, and
+        // intermediate NAT/proxy devices silently drop a connection that goes
+        // quiet. Without SO_KEEPALIVE the gateway neither refreshes that
+        // mapping nor notices the peer is gone, so the next send (or the rest
+        // of a large body) hits a half-open socket and dies as a connection
+        // failure. Probing keeps the path warm and detects dead peers early.
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .tcp_keepalive_interval(Some(Duration::from_secs(30)))
+        .tcp_keepalive_retries(Some(3))
         .http2_keep_alive_interval(keep_alive_interval)
         .http2_keep_alive_timeout(Duration::from_millis(policy.request_timeout_millis))
         .http2_keep_alive_while_idle(false)
