@@ -85,9 +85,8 @@ pub(super) async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
         json!({"http_protocol": true}),
         json!({"candidate_attempts": 9}),
         json!({"retry_503": true}),
-        json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
-        json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000,
-            "request_timeout_millis": 1000}),
+        json!({"read_timeout_millis": 999}),
+        json!({"connect_timeout_millis": 99}),
         json!({"max_sse_event_bytes": 262143}),
         json!({"max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1048575}),
         json!({"max_sse_event_bytes": 1048576, "max_sse_terminal_hold_bytes": 1048575}),
@@ -122,7 +121,7 @@ async fn versioned_policy_roundtrips_through_authorized_cas_api() {
     set_policy(
         &fixture,
         json!({"version": 1, "candidate_attempts": 8,
-        "failover_deadline_millis": 1234, "connect_timeout_millis": 1000,
+        "connect_timeout_millis": 1000,
         "read_timeout_millis": 2000, "request_timeout_millis": 3000,
         "max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112,
         "max_sse_terminal_hold_bytes": 1114112}),
@@ -219,9 +218,7 @@ async fn native_compaction_waits_past_failover_and_transport_deadlines() {
     set_policy(
         &fixture,
         json!({
-            "failover_deadline_millis": 1000,
             "connect_timeout_millis": 1000,
-            "read_timeout_millis": 1000,
             "request_timeout_millis": 2000
         }),
     )
@@ -262,7 +259,7 @@ async fn native_compaction_waits_past_failover_and_transport_deadlines() {
 #[tokio::test]
 async fn ordinary_codex_headers_outlive_selection_and_settle_once_without_standby_replay() {
     let fixture = codex_route_fixture("ordinary-selection-deadline").await;
-    set_policy(&fixture, json!({"failover_deadline_millis": 1000})).await;
+    set_policy(&fixture, json!({})).await;
     add_codex_standby_route(
         &fixture,
         "codex-route-ordinary-selection-deadline",

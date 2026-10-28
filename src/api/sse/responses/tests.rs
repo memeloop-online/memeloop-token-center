@@ -132,7 +132,7 @@ fn safe_failure_is_an_explicit_failed_terminal_without_a_fabricated_identity() {
 }
 
 #[test]
-fn sanitizer_mints_progress_heartbeats_until_downstream_terminal_release() {
+fn sanitizer_sends_connection_comments_until_downstream_terminal_release() {
     let mut sanitizer = ResponsesStreamingSanitizer::default();
     assert!(sanitizer.progress_heartbeat().is_none());
 
@@ -142,22 +142,9 @@ fn sanitizer_mints_progress_heartbeats_until_downstream_terminal_release() {
         )
         .unwrap();
     let heartbeat = sanitizer.progress_heartbeat().unwrap();
-    let mut heartbeat_framer = BoundedSseFramer::default();
-    let event = heartbeat_framer
-        .push(&heartbeat)
-        .events
-        .into_iter()
-        .next()
-        .unwrap();
-    let (event_name, data) = parse_sse_event(&event).unwrap();
-    assert_eq!(event_name.as_deref(), Some("response.in_progress"));
-    let payload: Value = serde_json::from_slice(&data.unwrap()).unwrap();
-    assert_eq!(payload["type"], "response.in_progress");
-    assert_eq!(payload["response"]["id"], "resp-heartbeat");
-    assert_eq!(payload["response"]["status"], "in_progress");
-    assert_eq!(payload["response"]["output"], json!([]));
-    assert!(payload.pointer("/response/model").is_none());
-    assert!(payload.pointer("/response/metadata").is_none());
+    assert_eq!(heartbeat.as_ref(), b": keep-alive\n\n");
+    assert!(!String::from_utf8_lossy(&heartbeat).contains("response.in_progress"));
+    assert!(!String::from_utf8_lossy(&heartbeat).contains("resp-heartbeat"));
 
     sanitizer
         .push(
@@ -178,7 +165,7 @@ fn sanitizer_mints_progress_heartbeats_until_downstream_terminal_release() {
             .is_empty()
     );
     let heartbeat = terminal_only.progress_heartbeat().unwrap();
-    assert!(String::from_utf8_lossy(&heartbeat).contains("resp-terminal-only"));
+    assert_eq!(heartbeat.as_ref(), b": keep-alive\n\n");
     assert!(!terminal_only.finish().unwrap().is_empty());
     assert!(terminal_only.progress_heartbeat().is_none());
 
