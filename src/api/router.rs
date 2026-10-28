@@ -21,7 +21,7 @@ pub fn router_for_role(mut state: AppState, role: RuntimeRole) -> Router {
         application = application.route(
             "/internal/v1/service-tokens/{service_id}",
             patch(update_service_token)
-                .layer(middleware::from_fn_with_state(
+                .route_layer(middleware::from_fn_with_state(
                     state.clone(),
                     authenticate_control_before_body,
                 ))
