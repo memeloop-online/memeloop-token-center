@@ -25,7 +25,7 @@ const SWEEP_VERSION: i64 = 142;
 const SWEEP_NAME: &str = "plaintext state instead of sealed envelopes";
 
 const MEMBERS_AAD: &[u8] = b"mtc/transport-proxy-members/v1";
-const KEY_PROVISIONING_AAD: &[u8] = b"memeloop-token-center/key-provisioning-response/v1";
+const KEY_CREDENTIAL_RECOVERY_AAD: &str = "memeloop-token-center/key-credential-recovery/v1";
 const ROTATION_AAD: &str = "memeloop-token-center/credential-rotation-response/v1";
 const INSTALLER_NETWORK_AAD: &str = "mtc/plugin-installer-network/v1";
 
@@ -207,7 +207,7 @@ async fn convert_key_recovery(
     report: &mut SweepReport,
 ) -> Result<usize, sqlx::Error> {
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT credential_id, ciphertext FROM key_credential_recovery_secrets WHERE {}",
+        "SELECT credential_id, key_id, credential_generation, ciphertext FROM key_credential_recovery_secrets WHERE {}",
         sealed_where("ciphertext")
     )))
     .fetch_all(&mut **transaction)
@@ -216,7 +216,14 @@ async fn convert_key_recovery(
     for row in rows {
         let credential_id: String = row.try_get("credential_id")?;
         let stored: String = row.try_get("ciphertext")?;
-        let Some(issued) = open(&stored, pepper, KEY_PROVISIONING_AAD) else {
+        // This table predates the credential copy: it sealed the recovered
+        // secret per key generation, not per row identifier.
+        let aad = format!(
+            "{KEY_CREDENTIAL_RECOVERY_AAD}/{}/{}",
+            row.try_get::<String, _>("key_id")?,
+            row.try_get::<i64, _>("credential_generation")?,
+        );
+        let Some(issued) = open(&stored, pepper, aad.as_bytes()) else {
             report.failed += 1;
             continue;
         };
