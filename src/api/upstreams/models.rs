@@ -75,11 +75,10 @@ fn codex_catalog_budget(config: &Value) -> Result<CatalogBudget, &'static str> {
     } else {
         CODEX_MODEL_CATALOG_TIMEOUT
     };
-    let read = if value.is_some_and(|p| p.get("read_timeout_millis").is_some()) {
-        Duration::from_millis(policy.read_timeout_millis).min(total)
-    } else {
-        total
-    };
+    let read = policy
+        .read_timeout_millis
+        .filter(|_| value.is_some_and(|p| p.get("read_timeout_millis").is_some()))
+        .map_or(total, |millis| Duration::from_millis(millis).min(total));
     Ok(CatalogBudget { total, read })
 }
 

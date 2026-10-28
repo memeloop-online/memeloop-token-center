@@ -63,7 +63,7 @@ pub(crate) struct CodexTransportPolicy {
     pub shared_probe_attempts: Option<u32>,
     pub candidate_attempts: usize,
     pub connect_timeout_millis: u64,
-    pub read_timeout_millis: u64,
+    pub read_timeout_millis: Option<u64>,
     pub request_timeout_millis: u64,
     /// Maximum local memory queue time; does not extend the request deadline.
     pub memory_admission_wait_millis: u64,
@@ -87,7 +87,7 @@ impl Default for CodexTransportPolicy {
             shared_probe_attempts: None,
             candidate_attempts: super::types::PROXY_ROUTING_POLICY.max_attempts(),
             connect_timeout_millis: 60_000,
-            read_timeout_millis: 60_000,
+            read_timeout_millis: None,
             request_timeout_millis: 1_260_000,
             memory_admission_wait_millis: 30_000,
             dispatch_max_in_flight: 0,
@@ -135,7 +135,9 @@ impl CodexTransportPolicy {
             })
             || !(1..=8).contains(&policy.candidate_attempts)
             || !(100..=600_000).contains(&policy.connect_timeout_millis)
-            || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
+            || policy
+                .read_timeout_millis
+                .is_some_and(|value| !(1_000..=1_260_000).contains(&value))
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
             || !(100..=300_000).contains(&policy.memory_admission_wait_millis)
             || policy.dispatch_max_in_flight > 64
@@ -149,7 +151,9 @@ impl CodexTransportPolicy {
                 .contains(&policy.max_sse_terminal_hold_bytes)
             || policy.max_sse_terminal_hold_bytes > policy.max_sse_framed_bytes
             || policy.connect_timeout_millis >= policy.request_timeout_millis
-            || policy.read_timeout_millis > policy.request_timeout_millis
+            || policy
+                .read_timeout_millis
+                .is_some_and(|read| read > policy.request_timeout_millis)
             || value.is_some_and(|value| value.get("shared_probe_attempts") == Some(&Value::Null))
         {
             return Err("invalid_transport_policy");
@@ -220,7 +224,7 @@ mod tests {
         assert_eq!(policy.candidate_attempts, 8);
         assert_eq!(policy.shared_probe_attempts, Some(0));
         assert_eq!(policy.connect_timeout_millis, 60_000);
-        assert_eq!(policy.read_timeout_millis, 60_000);
+        assert_eq!(policy.read_timeout_millis, None);
         assert_eq!(policy.request_timeout_millis, 1_260_000);
         assert_eq!(policy.memory_admission_wait_millis, 30_000);
         assert_eq!(policy.sse_framing_limits(), SseFramingLimits::default());
@@ -251,7 +255,7 @@ mod tests {
         })))
         .unwrap();
         assert_eq!(independent_phases.connect_timeout_millis, 5_000);
-        assert_eq!(independent_phases.read_timeout_millis, 1_000);
+        assert_eq!(independent_phases.read_timeout_millis, Some(1_000));
         let framing = CodexTransportPolicy::parse(Some(&json!({
             "max_sse_event_bytes": 1_048_576,
             "max_sse_framed_bytes": 1_114_112,

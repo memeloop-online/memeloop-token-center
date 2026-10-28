@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
 ARG NODE_IMAGE=node:24.18.0-bookworm-slim
 ARG RUST_IMAGE=rust:1.95.0-bookworm
 ARG GO_IMAGE=golang:1.27.3-bookworm

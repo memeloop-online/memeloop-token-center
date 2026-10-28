@@ -42,7 +42,7 @@ impl ClientKey {
             http_protocol: policy.http_protocol,
             timeouts: [
                 policy.connect_timeout_millis,
-                policy.read_timeout_millis,
+                policy.read_timeout_millis.unwrap_or(0),
                 policy.request_timeout_millis,
             ],
         }

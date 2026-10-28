@@ -27,12 +27,16 @@ pub(crate) fn codex_http_client_builder_with_proxy(
     proxy_url: Option<&str>,
 ) -> Result<reqwest::ClientBuilder, reqwest::Error> {
     install_ring_provider();
+    // A stalled upstream (proxy accepts, then sends nothing and no EOF)
+    // hangs until the client gives up unless a read timeout is configured.
+    // Opt-in per account: the window restarts on every byte, so active
+    // streams are untouched when the account sets one.
     let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
-        // A stalled upstream (proxy accepts, then sends nothing and no EOF)
-        // must fail fast instead of hanging until the client gives up. The
-        // window restarts on every byte, so active streams are untouched.
-        .read_timeout(Duration::from_millis(policy.read_timeout_millis))
+        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis));
+    if let Some(read_timeout) = policy.read_timeout_millis {
+        builder = builder.read_timeout(Duration::from_millis(read_timeout));
+    }
+    let mut builder = builder
         .redirect(reqwest::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.

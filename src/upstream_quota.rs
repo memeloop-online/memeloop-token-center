@@ -137,11 +137,13 @@ fn codex_quota_budget(config: &Value) -> Result<QuotaBudget, &'static str> {
     } else {
         quota_total
     };
-    let read = if value.is_some_and(|p| p.get("read_timeout_millis").is_some()) {
-        Duration::from_millis(policy.read_timeout_millis).min(total)
-    } else {
-        QUOTA_TIMEOUT.min(total)
-    };
+    let read = policy
+        .read_timeout_millis
+        .filter(|_| value.is_some_and(|p| p.get("read_timeout_millis").is_some()))
+        .map_or_else(
+            || QUOTA_TIMEOUT.min(total),
+            |millis| Duration::from_millis(millis).min(total),
+        );
     Ok(QuotaBudget {
         total,
         read,
