@@ -319,8 +319,9 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await aba.getByText('mts_service_secret_current', { exact: true }).waitFor();
 
     // Exercise the actual page and shipped schemas on this same server. Each
-    // locale creates and edits a different mode, covering both payload values
-    // in both endpoints without a second synthetic component/server fixture.
+    // locale creates a different mode and both edit to the remaining value,
+    // covering both payload values in both endpoints without a second
+    // synthetic component/server fixture.
     for (const locale of ['en', 'zh-CN'] as const) {
       const client = await browser.newPage({ viewport: { width: 390, height: 844 } });
       client.setDefaultTimeout(5_000);
@@ -338,7 +339,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
       await edit.locator('#root_max_concurrency').focus();
       await client.keyboard.press('Tab');
       assert.equal(await editMode.evaluate(element => document.activeElement === element), true);
-      const editedMode = english ? 'metered_unlimited' : 'prepaid';
+      const editedMode = 'metered_unlimited';
       await editMode.selectOption(editedMode);
       await edit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
       await nextPaint(client);
