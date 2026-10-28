@@ -76,17 +76,75 @@ impl Database {
             return Ok(());
         }
         let mut report = SweepReport::default();
+        // Each table converts in its own transaction. One unreadable row must
+        // never roll back the tables that did convert, and every step only
+        // matches values that still start with an envelope version prefix, so a
+        // second process racing through the same sweep is a no-op.
+        let mut complete = true;
         let mut transaction = self.pool.begin().await?;
-        if matches!(self.backend, crate::db::DatabaseBackend::PostgreSql) {
-            sqlx::query("SELECT pg_advisory_xact_lock(734627102948312)")
-                .execute(&mut *transaction)
-                .await?;
+        match convert_members(&mut transaction, pepper, &mut report).await {
+            Ok(converted) => {
+                transaction.commit().await?;
+                report.rewritten += converted;
+            }
+            Err(error) => {
+                complete = false;
+                tracing::error!(%error, "converting sealed proxy group members failed");
+            }
         }
-        report.rewritten += convert_members(&mut transaction, pepper, &mut report).await?;
-        report.rewritten += convert_key_recovery(&mut transaction, pepper, &mut report).await?;
-        report.rewritten += convert_rotation_replays(&mut transaction, pepper).await?;
-        report.rewritten += convert_installer_network(&mut transaction, pepper).await?;
-        convert_login_sessions(&mut transaction, pepper, &mut report).await?;
+        let mut transaction = self.pool.begin().await?;
+        match convert_key_recovery(&mut transaction, pepper, &mut report).await {
+            Ok(converted) => {
+                transaction.commit().await?;
+                report.rewritten += converted;
+            }
+            Err(error) => {
+                complete = false;
+                tracing::error!(%error, "converting sealed credential recovery copies failed");
+            }
+        }
+        let mut transaction = self.pool.begin().await?;
+        match convert_rotation_replays(&mut transaction, pepper).await {
+            Ok(converted) => {
+                transaction.commit().await?;
+                report.rewritten += converted;
+            }
+            Err(error) => {
+                complete = false;
+                tracing::error!(%error, "converting sealed rotation replays failed");
+            }
+        }
+        let mut transaction = self.pool.begin().await?;
+        match convert_installer_network(&mut transaction, pepper).await {
+            Ok(converted) => {
+                transaction.commit().await?;
+                report.rewritten += converted;
+            }
+            Err(error) => {
+                complete = false;
+                tracing::error!(%error, "converting sealed installer network rows failed");
+            }
+        }
+        let mut transaction = self.pool.begin().await?;
+        match convert_login_sessions(&mut transaction, pepper, &mut report).await {
+            Ok(()) => transaction.commit().await?,
+            Err(error) => {
+                complete = false;
+                tracing::error!(%error, "converting sealed login sessions failed");
+            }
+        }
+        if !complete {
+            // Leave the marker unwritten so the next start retries the tables
+            // that failed.
+            tracing::warn!(
+                rewritten = report.rewritten,
+                dropped = report.dropped,
+                failed = report.failed,
+                "sealed state conversion is incomplete"
+            );
+            return Ok(());
+        }
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO schema_migrations (version, name, applied_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
         )
@@ -289,7 +347,9 @@ async fn convert_login_sessions(
             .and_then(|value| open_flow_state(value, pepper, &flow_kind, true));
         // A login the current build cannot resume is unusable: the operator
         // restarts the flow, which is cheaper than an unreadable session row.
-        if state_plaintext.is_none() {
+        // The ready column is part of a status CHECK, so a half-decoded row
+        // cannot be patched in place either.
+        if state_plaintext.is_none() || (ready.is_some() && ready_plaintext.is_none()) {
             sqlx::query("DELETE FROM oauth_login_sessions WHERE id = $1")
                 .bind(id)
                 .execute(&mut **transaction)
