@@ -36,10 +36,10 @@ pub use configuration::{
     ConfigurationSource, ResolvedConfigurationRevision, ResolvedTrafficSnapshot,
 };
 
-const PLUGIN_FUEL: u64 = 5_000_000;
-const PLUGIN_MEMORY_BYTES: usize = 32 * 1024 * 1024;
+const PLUGIN_FUEL: u64 = 200_000_000;
+const PLUGIN_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
-const PLUGIN_HTTP_BODY_BYTES: usize = 16 * 1024 * 1024;
+const PLUGIN_HTTP_BODY_BYTES: usize = 256 * 1024 * 1024;
 const PLUGIN_HTTP_HEADER_COUNT: usize = 64;
 const PLUGIN_HTTP_HEADER_NAME_BYTES: usize = 256;
 const PLUGIN_HTTP_HEADER_VALUE_BYTES: usize = 8 * 1024;
@@ -53,12 +53,12 @@ const MAX_PLUGIN_ID_BYTES: usize = 64;
 const MAX_TRAFFIC_REASON_BYTES: usize = 256;
 const MAX_TRAFFIC_MODEL_BYTES: usize = 200;
 const MAX_TRAFFIC_ACCOUNT_ID_BYTES: usize = 64;
-const MAX_TRAFFIC_REQUEST_JSON_BYTES: usize = 16 * 1024 * 1024;
+const MAX_TRAFFIC_REQUEST_JSON_BYTES: usize = 256 * 1024 * 1024;
 // Total UTF-8 strings lowered for one post-auth call, including serialized JSON
-// and the six context fields. Reserve the other half of the unchanged 32 MiB
-// guest ceiling for allocator/runtime data and bounded return values. A guest
-// may still exhaust its own budget; this is an input contract, not a guarantee
-// about arbitrary guest allocations. Requests without traffic hooks are exempt.
+// and the six context fields. Reserve the other half of the guest ceiling for
+// allocator/runtime data and bounded return values. A guest may still exhaust
+// its own budget; this is an input contract, not a guarantee about arbitrary
+// guest allocations. Requests without traffic hooks are exempt.
 const MAX_TRAFFIC_INPUT_BYTES: usize = PLUGIN_MEMORY_BYTES / 2;
 const PLUGIN_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);

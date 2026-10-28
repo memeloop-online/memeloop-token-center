@@ -324,7 +324,7 @@ async fn downstream_policy_observes_effective_model_and_canonical_body_in_both_e
     .await;
 }
 
-const TRAFFIC_INPUT_LIMIT: usize = 16 * 1024 * 1024;
+const TRAFFIC_INPUT_LIMIT: usize = 256 * 1024 * 1024;
 
 #[cfg(feature = "experimental-plugin-revisions")]
 fn revisions(runtime: PluginRuntime) -> memeloop_token_center::plugin::lifecycle::RuntimeRevisions {

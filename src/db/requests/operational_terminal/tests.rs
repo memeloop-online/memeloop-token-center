@@ -328,6 +328,103 @@ async fn postgres_operational_statistics_preserve_unknown_finance_and_filters() 
     }
 }
 
+#[tokio::test]
+async fn sqlite_unsettled_requests_count_as_failures_in_success_rates() {
+    unsettled_requests_count_as_failures_in_success_rates(Fixture::sqlite().await).await;
+}
+
+#[tokio::test]
+async fn postgres_unsettled_requests_count_as_failures_in_success_rates() {
+    let Some(fixture) = Fixture::postgres().await else {
+        return;
+    };
+    unsettled_requests_count_as_failures_in_success_rates(fixture).await;
+}
+
+async fn unsettled_requests_count_as_failures_in_success_rates(fixture: Fixture) {
+    let created_at: i64 =
+        sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1")
+            .bind(fixture.claim.request_id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    let filter = StatsFilter {
+        from_created_at: Some(created_at),
+        to_created_at: Some(created_at),
+        ..StatsFilter::default()
+    };
+    // Without any terminal evidence the request still lands in the denominator
+    // as a failure: unknown settlement is never dropped from success rates.
+    let unsettled = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(unsettled.summary.total_requests, 1);
+    assert_eq!(unsettled.summary.successful_requests, 0);
+    assert_eq!(unsettled.summary.failed_requests, 1);
+    assert_eq!(unsettled.summary.total_cost, None);
+    assert!(unsettled.summary.costs.is_empty());
+    assert_eq!(unsettled.by_model.len(), 1);
+    assert_eq!(unsettled.by_model[0].requests, 1);
+    assert_eq!(unsettled.by_day.len(), 1);
+    assert_eq!(unsettled.by_day[0].requests, 1);
+    let errored = fixture
+        .database
+        .stats_filtered(
+            fixture.key.key_id,
+            StatsFilter {
+                status: Some("error".into()),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(errored.summary.total_requests, 1);
+    assert_eq!(errored.summary.failed_requests, 1);
+    let succeeded = fixture
+        .database
+        .stats_filtered(
+            fixture.key.key_id,
+            StatsFilter {
+                status: Some("success".into()),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(succeeded.summary.total_requests, 0);
+    // The dedicated pending operational view keeps its own classification.
+    let pending = fixture
+        .database
+        .stats_filtered(
+            fixture.key.key_id,
+            StatsFilter {
+                status: Some("pending".into()),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.summary.total_requests, 1);
+    assert_eq!(pending.summary.failed_requests, 0);
+
+    // Once a 499 operational terminal is recorded it stays exactly one failure.
+    let terminal = fixture.operational(499);
+    fixture.record(Uuid::now_v7(), &terminal).await.unwrap();
+    let cancelled = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(cancelled.summary.total_requests, 1);
+    assert_eq!(cancelled.summary.successful_requests, 0);
+    assert_eq!(cancelled.summary.failed_requests, 1);
+    assert_eq!(cancelled.errors.len(), 1);
+    assert_eq!(cancelled.errors[0].name, "client_cancelled");
+    fixture.close().await;
+}
+
 async fn operational_statistics_contract(fixture: Fixture, status: i64) {
     let mut terminal = fixture.operational(status);
     if status == 200 {

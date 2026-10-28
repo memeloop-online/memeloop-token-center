@@ -89,7 +89,7 @@ impl Default for CodexTransportPolicy {
             shared_probe_attempts: None,
             candidate_attempts: super::types::PROXY_ROUTING_POLICY.max_attempts(),
             failover_deadline_millis: 300_000,
-            connect_timeout_millis: 5_000,
+            connect_timeout_millis: 60_000,
             read_timeout_millis: 600_000,
             request_timeout_millis: 1_260_000,
             memory_admission_wait_millis: 30_000,
@@ -138,7 +138,7 @@ impl CodexTransportPolicy {
             })
             || !(1..=8).contains(&policy.candidate_attempts)
             || !(1_000..=300_000).contains(&policy.failover_deadline_millis)
-            || !(100..=60_000).contains(&policy.connect_timeout_millis)
+            || !(100..=600_000).contains(&policy.connect_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.read_timeout_millis)
             || !(1_000..=1_260_000).contains(&policy.request_timeout_millis)
             || !(100..=300_000).contains(&policy.memory_admission_wait_millis)
@@ -224,7 +224,7 @@ mod tests {
         assert_eq!(policy.candidate_attempts, 8);
         assert_eq!(policy.failover_deadline_millis, 1000);
         assert_eq!(policy.shared_probe_attempts, Some(0));
-        assert_eq!(policy.connect_timeout_millis, 5_000);
+        assert_eq!(policy.connect_timeout_millis, 60_000);
         assert_eq!(policy.read_timeout_millis, 600_000);
         assert_eq!(policy.request_timeout_millis, 1_260_000);
         assert_eq!(policy.memory_admission_wait_millis, 30_000);
@@ -394,7 +394,7 @@ mod tests {
             json!({"chat_controls": true}),
             json!({"responses_output_limits": 1}),
             json!({"connect_timeout_millis": 99}),
-            json!({"connect_timeout_millis": 60001}),
+            json!({"connect_timeout_millis": 600001}),
             json!({"read_timeout_millis": 999}),
             json!({"request_timeout_millis": 1260001}),
             json!({"memory_admission_wait_millis": 99}),

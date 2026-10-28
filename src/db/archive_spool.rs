@@ -23,7 +23,7 @@ use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingWriteLease};
 #[cfg_attr(not(test), allow(dead_code))]
 const PLAIN_LIMIT: i64 = 64 * 1024 * 1024;
 const CIPHER_CHUNK_LIMIT: usize = 512 * 1024;
-const CIPHER_LIMIT: i64 = 256 * 1024 * 1024;
+const CIPHER_LIMIT: i64 = 2 * 1024 * 1024 * 1024;
 pub(super) const REQUEST_CIPHER_LIMIT: i64 = CIPHER_LIMIT / 2;
 pub(super) const RESPONSE_CIPHER_LIMIT: i64 = CIPHER_LIMIT - REQUEST_CIPHER_LIMIT;
 pub(super) const ARCHIVE_SLOT_LIMIT: i64 = 4096;
@@ -925,10 +925,10 @@ impl Database {
         let hint_now = archive_clock(&mut tx, self.backend).await?;
         let claim = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED"
+                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND ((r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') OR EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = r.id AND o.tenant_id = r.tenant_id AND o.reservation_id = r.reservation_id AND o.error_code = 'gateway_owner_lost'))) ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') ORDER BY s.next_attempt_at, s.request_id LIMIT 1"
+                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND ((r.completed_at IS NOT NULL AND r.response_object = 'gap://' || s.request_id || '/response') OR EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = r.id AND o.tenant_id = r.tenant_id AND o.reservation_id = r.reservation_id AND o.error_code = 'gateway_owner_lost'))) ORDER BY s.next_attempt_at, s.request_id LIMIT 1"
             }
         };
         let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
@@ -1083,7 +1083,7 @@ impl Database {
         let Some((_, now)) = locked_live_task(&mut tx, self.backend, task).await? else {
             return Ok(false);
         };
-        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND reservation_id = $4 AND completed_at IS NOT NULL AND response_object = $5")))
+        let changed = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND reservation_id = $4 AND ((completed_at IS NOT NULL AND response_object = $5) OR EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = request_records.id AND o.tenant_id = request_records.tenant_id AND o.reservation_id = request_records.reservation_id AND o.error_code = 'gateway_owner_lost'))")))
             .bind(locator).bind(task.identity.request_id.to_string()).bind(task.identity.tenant_id.to_string())
             .bind(task.identity.reservation_id.to_string()).bind(format!("gap://{}/{}", task.identity.request_id, purpose.as_str())).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {

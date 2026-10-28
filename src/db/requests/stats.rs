@@ -297,6 +297,51 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND $17 >= 0 AND $18 >= 0
 "#;
 
+// Every request the user observed must land in the success-rate denominator, so
+// requests without a terminal fact (still pending settlement, cancelled without a
+// fact, or otherwise lacking terminal evidence) are counted as failures here. The
+// aggregate only appends this source when the status filter is '' or 'error'; the
+// 'pending' operational view keeps its dedicated source below.
+pub(crate) const FILTERED_ACTIVITY_SOURCE_UNSETTLED: &str = r#"
+SELECT r.created_at,
+       r.model,
+       r.protocol,
+       'failure' AS status_class,
+       COALESCE(r.error_code, '') AS error_code,
+       CASE WHEN r.protocol = 'audio-transcription' THEN 0 ELSE r.input_tokens END AS input_tokens,
+       CASE WHEN r.protocol = 'audio-transcription' THEN 0 ELSE r.output_tokens END AS output_tokens,
+       CAST(0 AS BIGINT) AS cache_known_read_tokens,
+       CAST(0 AS BIGINT) AS cache_known_input_tokens,
+       CAST(0 AS BIGINT) AS cache_eligible_requests,
+       CAST(1 AS BIGINT) AS cache_unknown_requests,
+       CAST(0 AS BIGINT) AS cache_reported_read_tokens,
+       CAST(0 AS BIGINT) AS cache_reported_requests,
+       r.currency,
+       CASE WHEN r.completed_at IS NULL THEN CAST(NULL AS BIGINT) ELSE r.cost_micros END AS cost_micros,
+       CAST(1 AS BIGINT) AS requests
+FROM request_records r
+LEFT JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id
+LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
+JOIN tenants t ON t.id = r.tenant_id
+WHERE ($1 = '' OR t.external_id = $1)
+  AND ($2 = '' OR r.key_id = $2)
+  AND r.created_at >= $3 AND r.created_at <= $4
+  AND ($5 = '' OR r.model = $5)
+  AND ($6 = '' OR r.protocol = $6)
+  AND ($7 = '' OR $7 = 'error')
+  AND NOT EXISTS (SELECT 1 FROM request_stats_facts fact WHERE fact.request_id = r.id)
+  AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = r.id AND operational.tenant_id = r.tenant_id AND operational.key_id = r.key_id AND operational.reservation_id = r.reservation_id)
+  AND NOT EXISTS (SELECT 1 FROM observability_prune_boundaries prune WHERE prune.scope = 'global' AND prune.before_day > r.created_at / 86400000)
+  AND ($8 = '' OR COALESCE(r.error_code, '') = $8)
+  AND ($9 = '' OR COALESCE(r.upstream_account_id, '') = $9)
+  AND ($10 = '' OR COALESCE(r.model_route_id, '') = $10)
+  AND $11 < 0 AND $12 < 0
+  AND ($13 < 0 OR r.cost_micros >= $13)
+  AND ($14 < 0 OR r.cost_micros <= $14)
+  AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
+  AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
+"#;
+
 pub(crate) const FILTERED_ACTIVITY_SOURCE_PENDING: &str = r#"
 SELECT r.created_at,
        r.model,
@@ -572,7 +617,9 @@ impl Database {
         // Ordinary terminal statistics use compact daily rollups for complete UTC days and
         // exact facts for the two possible boundary days. Per-request duration/cost filters
         // use compact facts for the whole bounded interval. Date-bounded operational terminals
-        // add point reads of their pending/projection state and request metadata.
+        // add point reads of their pending/projection state and request metadata. Requests
+        // without terminal evidence (no fact, no operational terminal) always count as
+        // failures so the success-rate denominator never drops them.
         let use_facts = filter.min_duration_ms.is_some()
             || filter.max_duration_ms.is_some()
             || filter.min_cost_micros.is_some()
@@ -587,7 +634,9 @@ impl Database {
         let activity_source = if filter.status.as_deref() == Some("pending") {
             base_activity_source.to_owned()
         } else {
-            format!("{base_activity_source}\nUNION ALL\n{OPERATIONAL_ACTIVITY_DELTA}")
+            format!(
+                "{base_activity_source}\nUNION ALL\n{OPERATIONAL_ACTIVITY_DELTA}\nUNION ALL\n{FILTERED_ACTIVITY_SOURCE_UNSETTLED}"
+            )
         };
         const DAY_MILLIS: i64 = 86_400_000;
         let full_day_from = from_created_at
