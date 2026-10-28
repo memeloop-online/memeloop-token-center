@@ -10,7 +10,7 @@ use axum::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{MAX_IMAGE_REQUEST_BODY, MAX_REPORTED_TOKENS};
+use super::MAX_REPORTED_TOKENS;
 use crate::{
     AppState,
     error::AppError,
@@ -538,12 +538,10 @@ async fn apply_traffic_plugin(
         ));
     }
     request_json["model"] = Value::String(model.clone());
-    if crate::gateway_body::memory::json_encoded_length(&request_json)? > MAX_IMAGE_REQUEST_BODY {
-        return Err(AppError::upstream_with(
-            "upstream_unavailable",
-            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
-        ));
-    }
+    // Request size is enforced once, by ingress body admission. Re-checking it
+    // here with the image-generation ceiling rejected large Codex contexts with
+    // a misleading 502 "upstream_unavailable" even though the upstream was
+    // reachable and the body had already been admitted.
     let upstream_account_hint = plugin_decision
         .upstream_account_id
         .map(|value| {
