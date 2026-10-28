@@ -648,7 +648,7 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
     body: { tenant_external_id: tenant, route_ids: current.route_ids, route_group_ids: [], expected_grant_revision: current.grant_revision },
   });
   const staleSave = page.waitForResponse((response) => response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/routing`) && response.request().method() === 'PUT');
-  await routing.locator('.selection-chip button').click();
+  await routeGroupField.locator('.selection-chip button').click();
   await page.locator('.credential-active-editor .inline-editor').getByRole('button', { name: '保存', exact: true }).click();
   assert.equal((await staleSave).status(), 409);
   await assertContains(page.locator('.create-journey').getByRole('alert'), '你的草稿已保留');
