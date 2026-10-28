@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Button, Combobox, Option } from '@fluentui/react-components';
 import { LoadingState } from '../../design-system';
 import { api } from '../../api';
@@ -6,6 +6,7 @@ import { useI18n } from '../../i18n';
 import { ModelPicker } from '../../ModelPicker';
 import type { FilterAssistantSettings } from '../../types';
 import { assistantRouteCatalog, type ModelPickerProjectionItem, type ModelPickerProjectionPage } from '../modelCatalog';
+import { RequestConfigSettings } from '../RequestConfigSettings';
 import { messageOf } from '../scope/operatorShared';
 import './systemSettings.css';
 
@@ -38,10 +39,12 @@ async function loadAssistantRouteCatalog(token: string, tenant: string): Promise
  * fetches nor displays a client or upstream credential secret.
  */
 export function SystemSettingsPage({ token, tenant }: { token: string; tenant: string; writeTenant?: string }) {
-  return <AssistantSettings key={JSON.stringify([token, tenant])} token={token} tenant={tenant} />;
+  const scopeKey = JSON.stringify([token, tenant]);
+  return <AssistantSettings key={scopeKey} token={token} tenant={tenant}
+    requestConfig={<RequestConfigSettings key={`${scopeKey}:request-config`} token={token} tenant={tenant} />} />;
 }
 
-function AssistantSettings({ token, tenant }: { token: string; tenant: string }) {
+function AssistantSettings({ token, tenant, requestConfig }: { token: string; tenant: string; requestConfig?: ReactNode }) {
   const { t } = useI18n();
   // Locale is presentation state, not the identity of these remote resources.
   // Async completions still use the current locale without reloading drafts.
@@ -180,6 +183,7 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
         {settings && !settings.billing_key_id && <p className="settings-status-note">{t('settings.assistantExecutionNotEnabled')}</p>}
       </article>
+      {requestConfig}
     </>}
   </section>;
 }
