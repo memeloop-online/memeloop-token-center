@@ -30,6 +30,7 @@ mod objects;
 mod path;
 mod readiness;
 mod staging;
+mod text;
 
 pub use cas::CasArchiveObject;
 pub use conversation::{

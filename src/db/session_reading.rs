@@ -183,8 +183,8 @@ impl Database {
         .await?
         .ok_or_else(context_gap)?;
         let encoded: String = row.try_get("content_json")?;
-        let body = self.read_body_reference(scope.tenant_id, &encoded).await?;
-        super::object_bodies::text_slice(&body, offset, CONTEXT_CONTENT_CHARS)
+        self.read_body_reference_range(scope.tenant_id, &encoded, offset, CONTEXT_CONTENT_CHARS)
+            .await
     }
 
     /// Extract only declared message text. Mixed Anthropic tool results and

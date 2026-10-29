@@ -2,8 +2,6 @@ use super::*;
 use crate::archive::{ArchiveStore, ConversationBodyReference};
 use bytes::Bytes;
 
-const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
-
 impl Database {
     pub(crate) async fn conversation_object_context(
         &self,
@@ -60,18 +58,53 @@ impl Database {
     ) -> Result<String, AppError> {
         let reference: ConversationBodyReference = serde_json::from_str(encoded)
             .map_err(|_| AppError::storage("conversation_object_migration_required"))?;
-        let bytes = self
+        let (document, chars) = self
             .body_archive()?
-            .get_tenant_content(tenant_id, &reference.conversation_body_v1, MAX_BODY_BYTES)
+            .read_tenant_text_range(
+                tenant_id,
+                &reference.conversation_body_v1,
+                0..reference.chars,
+            )
             .await?;
-        let document = String::from_utf8(bytes.to_vec())
-            .map_err(|_| AppError::storage("conversation_body_encoding_invalid"))?;
-        if document.chars().count() as u64 != reference.chars {
+        if chars != reference.chars {
             return Err(AppError::storage(
                 "conversation_body_character_count_mismatch",
             ));
         }
         Ok(document)
+    }
+
+    pub(crate) async fn read_body_reference_range(
+        &self,
+        tenant_id: Uuid,
+        encoded: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(String, i64), AppError> {
+        let reference: ConversationBodyReference = serde_json::from_str(encoded)
+            .map_err(|_| AppError::storage("conversation_object_migration_required"))?;
+        let start = u64::try_from(offset)
+            .map_err(|_| AppError::BadRequest("invalid text offset".into()))?;
+        let end = start
+            .checked_add(
+                u64::try_from(limit)
+                    .map_err(|_| AppError::BadRequest("invalid text limit".into()))?,
+            )
+            .ok_or_else(|| AppError::BadRequest("text range overflow".into()))?;
+        let (text, chars) = self
+            .body_archive()?
+            .read_tenant_text_range(tenant_id, &reference.conversation_body_v1, start..end)
+            .await?;
+        if chars != reference.chars {
+            return Err(AppError::storage(
+                "conversation_body_character_count_mismatch",
+            ));
+        }
+        Ok((
+            text,
+            i64::try_from(chars)
+                .map_err(|_| AppError::storage("conversation_body_character_count_invalid"))?,
+        ))
     }
 
     pub(crate) async fn archive_atom_bodies(

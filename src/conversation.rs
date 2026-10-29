@@ -1348,7 +1348,7 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-pub(crate) fn digest_parts(parent: Option<&str>, atom: &str) -> String {
+pub fn digest_parts(parent: Option<&str>, atom: &str) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(parent.unwrap_or("root").as_bytes());
     hash.update(&[0]);
