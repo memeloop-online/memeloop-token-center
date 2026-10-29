@@ -45,12 +45,19 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
             "revision": database.history_revision().await?,
         }));
     }
-    let client =
-        ClickHouse::from_env(crate::build_http_client().map_err(|_| HistoryError::Unavailable)?)?
-            .ok_or(HistoryError::Invalid("MTC_REQUEST_HISTORY_URL is required"))?;
-    client.initialize().await?;
+    database.refresh_http_settings().await?;
+    database.start_http_settings_refresh();
+    let client = ClickHouse::from_env(
+        database
+            .http_clients
+            .handle(crate::http_settings::HttpPurpose::General),
+    )?
+    .ok_or(HistoryError::Invalid("MTC_REQUEST_HISTORY_URL is required"))?;
     match command {
-        HistoryCommand::Start => database.history_start().await?,
+        HistoryCommand::Start => {
+            client.initialize().await?;
+            database.history_start().await?;
+        }
         HistoryCommand::Backfill { page_size } => {
             while !database.history_backfill_done().await? {
                 database.history_backfill_page(page_size).await?;
@@ -103,7 +110,6 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
         }
     };
     let database = state.db.independent_persistence_pool();
-    let mut initialized = false;
     loop {
         if *shutdown.borrow() {
             return;
@@ -115,10 +121,6 @@ pub(crate) async fn run_worker(state: AppState, mut shutdown: watch::Receiver<bo
                     let result = async {
                         if database.history_mode().await? == "off" {
                             return Ok::<_, HistoryError>(());
-                        }
-                        if !initialized {
-                            client.initialize().await?;
-                            initialized = true;
                         }
                         export_page(&database, client, 500).await?;
                         Ok(())
@@ -167,6 +169,9 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             if expected.identity != snapshot.identity
                 || expected.payload != snapshot.payload
                 || expected.filter_cost_micros != snapshot.filter_cost_micros
+                || expected.statistics != snapshot.statistics
+                || snapshot.revision <= 0
+                || snapshot.revision > revision
                 || expected.payload != Some(serde_json::to_value(view)?)
             {
                 return Err(HistoryError::Mismatch);
@@ -178,7 +183,9 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             hash.update(super::canonical_hash(&expected.identity)?);
             hash.update(super::canonical_hash(&expected.payload)?);
             hash.update(super::canonical_hash(&expected.filter_cost_micros)?);
-            add_daily(&mut daily, &expected.row()?);
+            hash.update(super::canonical_hash(&expected.statistics)?);
+            hash.update(snapshot.revision.to_be_bytes());
+            add_daily(&mut daily, &expected.row()?)?;
         }
         let Some(last) = source.last() else { break };
         filter.before_created_at = Some(last.created_at);
@@ -228,9 +235,12 @@ fn daily_key(bucket: &DailyBucket) -> DailyKey {
     )
 }
 
-fn add_daily(buckets: &mut BTreeMap<DailyKey, DailyBucket>, row: &Value) {
+fn add_daily(
+    buckets: &mut BTreeMap<DailyKey, DailyBucket>,
+    row: &Value,
+) -> Result<(), HistoryError> {
     if row["source"] == "archive" {
-        return;
+        return Ok(());
     }
     let bucket = DailyBucket {
         day_bucket: row["created_at"].as_i64().unwrap_or_default() / 86_400_000,
@@ -259,10 +269,15 @@ fn add_daily(buckets: &mut BTreeMap<DailyKey, DailyBucket>, row: &Value) {
         ("cost_micros", &mut bucket.cost_micros),
     ] {
         if let Some(value) = row[field].as_i64() {
-            *sum = Some(sum.unwrap_or_default() + value);
+            *sum = Some(
+                sum.unwrap_or_default()
+                    .checked_add(value)
+                    .ok_or(HistoryError::Invalid("daily aggregate overflow"))?,
+            );
         }
     }
     bucket.input_known_requests += u64::from(row["input_tokens"].is_i64());
     bucket.output_known_requests += u64::from(row["output_tokens"].is_i64());
     bucket.cost_known_requests += u64::from(row["cost_micros"].is_i64());
+    Ok(())
 }

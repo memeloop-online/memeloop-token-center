@@ -141,15 +141,17 @@ pub(in crate::api) async fn self_requests(
     let key = authenticate_downstream(&headers, &state).await?;
     let filter = query.to_filter(false)?;
     if let Some(value) = crate::request_history_api::list_if_enabled(
-        &state, crate::request_history_api::authenticated_key_scope(&key), &filter, false,
-    ).await? {
+        &state,
+        crate::request_history_api::authenticated_key_scope(&key),
+        &filter,
+        false,
+    )
+    .await?
+    {
         return Ok(Json(value));
     }
     Ok(Json(serde_json::json!(
-        state
-            .db
-            .list_requests_filtered(key.key_id, filter)
-            .await?,
+        state.db.list_requests_filtered(key.key_id, filter).await?
     )))
 }
 
@@ -228,10 +230,21 @@ pub(in crate::api) async fn self_stats(
     Query(query): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    Ok(Json(
-        state
-            .db
-            .stats_filtered(key.key_id, query.to_filter(false, Some(key.key_id))?)
-            .await?,
-    ))
+    let filter = query.to_filter(false, Some(key.key_id))?;
+    if let Some(stats) = crate::request_history_api::statistics_if_enabled(
+        &state,
+        crate::request_history_api::authenticated_key_scope(&key),
+        &filter,
+    )
+    .await?
+    {
+        return Ok(Json(crate::model::SelfStats {
+            key_id: key.key_id,
+            summary: stats.summary,
+            by_model: stats.by_model,
+            by_day: stats.by_day,
+            errors: stats.errors,
+        }));
+    }
+    Ok(Json(state.db.stats_filtered(key.key_id, filter).await?))
 }

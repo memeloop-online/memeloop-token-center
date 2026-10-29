@@ -1,5 +1,7 @@
 use super::*;
-use crate::request_history::{HistoryError, HistoryIdentity, HistoryScope, HistorySnapshot};
+use crate::request_history::{
+    HistoryError, HistoryIdentity, HistoryScope, HistorySnapshot, HistoryStatistics,
+};
 
 const COLUMNS: &str = "source, request_id, tenant_id, key_id, created_at";
 
@@ -20,6 +22,7 @@ impl Database {
             ("response_archive_spools", None),
             ("request_egress_attempts", None),
             ("generation_stats_facts", None),
+            ("request_stats_facts", None),
             ("session_archive_correlations", None),
             ("key_records", None),
             ("principals", None),
@@ -62,7 +65,7 @@ impl Database {
                 let name = format!("history_{table}_{}", event.to_lowercase());
                 let sql = match self.backend {
                     DatabaseBackend::PostgreSql => format!(
-                        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $history$ BEGIN {enqueue} RETURN NULL; END $history$;
+                        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $history$ BEGIN PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; {enqueue} RETURN NULL; END $history$;
                          DROP TRIGGER IF EXISTS {name} ON {table};
                          CREATE TRIGGER {name} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {name}();"
                     ),
@@ -246,9 +249,14 @@ impl Database {
     pub async fn history_switch(&self, clickhouse: bool) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
         if clickhouse {
-            let revision: Option<i64> = sqlx::query_scalar(
-                "SELECT verified_revision FROM request_history_state WHERE id = 1",
-            )
+            let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                " FOR UPDATE"
+            } else {
+                ""
+            };
+            let revision: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT verified_revision FROM request_history_state WHERE id = 1{lock}"
+            )))
             .fetch_one(&mut *transaction)
             .await?;
             if revision != Some(self.history_revision().await?)
@@ -297,12 +305,75 @@ impl Database {
                 .bind(identity.request_id.to_string()).fetch_optional(&self.pool).await?.flatten(),
             _ => None,
         };
+        let statistics = if let Some(payload) = &payload {
+            self.history_statistics(&identity, payload).await?
+        } else {
+            None
+        };
         Ok(HistorySnapshot {
             identity,
             revision,
             filter_cost_micros,
             payload,
+            statistics,
         })
+    }
+
+    async fn history_statistics(
+        &self,
+        identity: &HistoryIdentity,
+        payload: &Value,
+    ) -> Result<Option<HistoryStatistics>, HistoryError> {
+        let terminal =
+            payload["operational_terminal"].is_object() || !payload["completed_at"].is_null();
+        let status = if !terminal {
+            "pending"
+        } else if payload["status_code"]
+            .as_i64()
+            .is_some_and(|status| (200..400).contains(&status))
+            && payload["error_code"].as_str().is_none_or(str::is_empty)
+        {
+            "success"
+        } else {
+            "error"
+        };
+        let sql = match identity.source.as_str() {
+            "native" => {
+                "SELECT CASE WHEN completed_at IS NOT NULL AND protocol != 'audio-transcription' THEN input_tokens ELSE 0 END AS input_tokens, CASE WHEN completed_at IS NOT NULL AND protocol != 'audio-transcription' THEN output_tokens ELSE 0 END AS output_tokens, CASE WHEN completed_at IS NOT NULL THEN cache_known_read_tokens ELSE NULL END AS cache_known_read_tokens, CASE WHEN completed_at IS NOT NULL THEN cache_known_input_tokens ELSE NULL END AS cache_known_input_tokens, CASE WHEN completed_at IS NOT NULL THEN cost_micros ELSE NULL END AS cost_micros, currency FROM request_records WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            "generation" => {
+                "SELECT CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(NULL AS BIGINT) AS cache_known_read_tokens, CAST(NULL AS BIGINT) AS cache_known_input_tokens, cost_micros, currency FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            _ => return Ok(None),
+        };
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(identity.request_id.to_string())
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.key_id.to_string())
+            .bind(identity.created_at)
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(row) = row {
+            Ok(Some(HistoryStatistics {
+                status: status.into(),
+                input_tokens: row.try_get("input_tokens")?,
+                output_tokens: row.try_get("output_tokens")?,
+                cache_known_read_tokens: row.try_get("cache_known_read_tokens")?,
+                cache_known_input_tokens: row.try_get("cache_known_input_tokens")?,
+                cost_micros: row.try_get("cost_micros")?,
+                currency: row.try_get("currency")?,
+            }))
+        } else {
+            Ok(Some(HistoryStatistics {
+                status: "pending".into(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_known_read_tokens: None,
+                cache_known_input_tokens: None,
+                cost_micros: None,
+                currency: payload["billing"]["currency"].as_str().map(str::to_owned),
+            }))
+        }
     }
 }
 
@@ -321,3 +392,7 @@ fn history_identity(row: &AnyRow) -> Result<HistoryIdentity, HistoryError> {
         source: row.try_get("source")?,
     })
 }
+
+#[cfg(test)]
+#[path = "../request_history/persistence_tests.rs"]
+mod tests;

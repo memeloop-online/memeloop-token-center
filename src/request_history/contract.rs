@@ -47,6 +47,18 @@ pub struct HistorySnapshot {
     pub revision: i64,
     pub filter_cost_micros: Option<i64>,
     pub payload: Option<Value>,
+    pub statistics: Option<HistoryStatistics>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct HistoryStatistics {
+    pub status: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_known_read_tokens: Option<i64>,
+    pub cache_known_input_tokens: Option<i64>,
+    pub cost_micros: Option<i64>,
+    pub currency: Option<String>,
 }
 
 impl HistorySnapshot {
@@ -91,7 +103,8 @@ impl HistorySnapshot {
             "source": self.identity.source,
             "revision": self.revision,
             "deleted": u8::from(self.payload.is_none()),
-            "snapshot_hash": canonical_hash(&self.payload)?,
+            "snapshot_hash": canonical_hash(self)?,
+            "stats_status": self.statistics.as_ref().map(|value| value.status.as_str()).unwrap_or("pending"),
             "model": payload["model"].as_str().unwrap_or_default(),
             "protocol": payload["protocol"].as_str().unwrap_or_default(),
             "outcome": outcome,

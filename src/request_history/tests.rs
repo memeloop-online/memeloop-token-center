@@ -41,6 +41,7 @@ fn financial_unknown_and_operational_failure_remain_independent() {
         filter_cost_micros: None,
         payload: Some(json!({"lifecycle_state": "failed", "status_code": 200,
             "operational_terminal": {"financial_state": "unknown"}})),
+        statistics: None,
     };
     let row = snapshot.row().unwrap();
     assert_eq!(row["outcome"], "failed");

@@ -191,7 +191,7 @@ impl HistoryQuery {
         }
         let limit = query.bind(self.limit + 1, "UInt64");
         query.sql = format!(
-            "SELECT snapshot FROM ({}) ORDER BY created_at DESC, toString(request_id) DESC LIMIT {limit} FORMAT JSONEachRow",
+            "SELECT snapshot, snapshot_hash FROM ({}) ORDER BY created_at DESC, toString(request_id) DESC LIMIT {limit} FORMAT JSONEachRow",
             query.sql
         );
         Ok(query)

@@ -1,5 +1,7 @@
+use crate::http_settings::{ClientOptions, HttpClientSource};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::sync::Arc;
 
 use super::{
     DailyBucket, HistoryCursor, HistoryError, HistoryPage, HistoryQuery, HistoryScope,
@@ -8,7 +10,7 @@ use super::{
 
 #[derive(Clone)]
 pub struct ClickHouse {
-    client: reqwest::Client,
+    client: Arc<dyn HttpClientSource>,
     endpoint: reqwest::Url,
     database: String,
     user: String,
@@ -16,7 +18,7 @@ pub struct ClickHouse {
 }
 
 impl ClickHouse {
-    pub fn from_env(client: reqwest::Client) -> Result<Option<Self>, HistoryError> {
+    pub fn from_env(client: impl HttpClientSource + 'static) -> Result<Option<Self>, HistoryError> {
         let Ok(endpoint) = std::env::var("MTC_REQUEST_HISTORY_URL") else {
             return Ok(None);
         };
@@ -31,7 +33,7 @@ impl ClickHouse {
     }
 
     pub fn new(
-        client: reqwest::Client,
+        client: impl HttpClientSource + 'static,
         endpoint: &str,
         database: String,
         user: String,
@@ -49,7 +51,7 @@ impl ClickHouse {
             return Err(HistoryError::Invalid("ClickHouse HTTP(S) URL"));
         }
         Ok(Self {
-            client,
+            client: Arc::new(client),
             endpoint,
             database,
             user,
@@ -81,6 +83,8 @@ impl ClickHouse {
         };
         let response = self
             .client
+            .http_client(ClientOptions::default())
+            .map_err(|_| HistoryError::Unavailable)?
             .post(self.endpoint.clone())
             .basic_auth(&self.user, Some(&self.password))
             .header("X-ClickHouse-Database", &self.database)
@@ -144,7 +148,23 @@ impl ClickHouse {
             return Ok(());
         }
         let mut body = String::new();
+        let mut identities = std::collections::BTreeMap::new();
         for snapshot in snapshots {
+            if snapshot.revision <= 0 {
+                return Err(HistoryError::Invalid("durable revision is required"));
+            }
+            let identity = (
+                snapshot.identity.source.clone(),
+                snapshot.identity.request_id,
+                snapshot.revision,
+            );
+            let hash = super::canonical_hash(snapshot)?;
+            if identities
+                .insert(identity, hash.clone())
+                .is_some_and(|prior| prior != hash)
+            {
+                return Err(HistoryError::Mismatch);
+            }
             body.push_str(&serde_json::to_string(&snapshot.row()?)?);
             body.push('\n');
         }
@@ -167,14 +187,42 @@ impl ClickHouse {
         &self,
         query: &HistoryQuery,
     ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        self.read_snapshots(query, false).await
+    }
+
+    pub(crate) async fn read_snapshots(
+        &self,
+        query: &HistoryQuery,
+        statistics: bool,
+    ) -> Result<Vec<HistorySnapshot>, HistoryError> {
         #[derive(serde::Deserialize)]
         struct Stored {
             snapshot: String,
+            snapshot_hash: String,
         }
-        self.rows::<Stored>(query.list_sql()?)
+        let mut sql = query.list_sql()?;
+        if statistics {
+            sql.sql = sql.sql.replace("filter_status", "stats_status");
+        }
+        self.rows::<Stored>(sql)
             .await?
             .into_iter()
-            .map(|row| serde_json::from_str(&row.snapshot).map_err(Into::into))
+            .map(|row| {
+                let snapshot: HistorySnapshot = serde_json::from_str(&row.snapshot)?;
+                let allowed = match query.scope {
+                    HistoryScope::EmptyTenant => false,
+                    HistoryScope::Key { tenant_id, key_id } => {
+                        snapshot.identity.tenant_id == tenant_id
+                            && snapshot.identity.key_id == key_id
+                    }
+                    HistoryScope::Tenant(tenant_id) => snapshot.identity.tenant_id == tenant_id,
+                    HistoryScope::GlobalOperator => true,
+                };
+                if !allowed || super::canonical_hash(&snapshot)? != row.snapshot_hash {
+                    return Err(HistoryError::Mismatch);
+                }
+                Ok(snapshot)
+            })
             .collect()
     }
 

@@ -2,6 +2,7 @@ mod clickhouse;
 mod contract;
 pub mod migration;
 mod query;
+mod statistics;
 
 pub use clickhouse::ClickHouse;
 pub use contract::*;

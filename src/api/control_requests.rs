@@ -124,9 +124,9 @@ pub(super) async fn internal_requests(
     let mut query_filter = filter;
     query_filter.lookahead = paged;
     let scope = state.db.history_scope(tenant.as_deref()).await?;
-    if let Some(value) = crate::request_history_api::list_if_enabled(
-        &state, scope, &query_filter, paged,
-    ).await? {
+    if let Some(value) =
+        crate::request_history_api::list_if_enabled(&state, scope, &query_filter, paged).await?
+    {
         return Ok(Json(value));
     }
     let values = match tenant {
@@ -195,9 +195,9 @@ pub(super) async fn typed_internal_requests(
         ..crate::db::RequestListFilter::default()
     };
     let scope = state.db.history_scope(tenant.as_deref()).await?;
-    if let Some(value) = crate::request_history_api::list_if_enabled(
-        &state, scope, &filter, body.paged,
-    ).await? {
+    if let Some(value) =
+        crate::request_history_api::list_if_enabled(&state, scope, &filter, body.paged).await?
+    {
         return Ok(Json(value));
     }
     let mut values = match tenant {
@@ -836,6 +836,12 @@ pub(super) async fn internal_stats(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
     let filter = query.to_filter(true, None)?;
+    let scope = state.db.history_scope(tenant.as_deref()).await?;
+    if let Some(stats) =
+        crate::request_history_api::statistics_if_enabled(&state, scope, &filter).await?
+    {
+        return Ok(Json(stats));
+    }
     let stats = match tenant {
         Some(tenant) => state.db.operator_stats_filtered(&tenant, filter).await?,
         None => state.db.global_operator_stats_filtered(filter).await?,

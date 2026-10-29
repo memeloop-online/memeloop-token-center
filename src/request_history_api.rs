@@ -21,13 +21,48 @@ pub(crate) async fn list_if_enabled(
     filter: &RequestListFilter,
     paged: bool,
 ) -> Result<Option<serde_json::Value>, crate::error::AppError> {
+    let Some(client) = crate::request_history::ClickHouse::from_env(state.http.clone())? else {
+        return Ok(None);
+    };
     if state.db.history_mode().await? != "clickhouse" {
         return Ok(None);
     }
-    let client = crate::request_history::ClickHouse::from_env(state.http.clone())?
-        .ok_or(HistoryError::Unavailable)?;
     let query = query_from_request_filter(scope, filter)?;
     Ok(Some(client.list(&query).await?.into_api_response(paged)?))
+}
+
+pub(crate) async fn statistics_if_enabled(
+    state: &crate::AppState,
+    scope: HistoryScope,
+    filter: &crate::db::StatsFilter,
+) -> Result<Option<crate::model::OperatorStats>, crate::error::AppError> {
+    let Some(client) = crate::request_history::ClickHouse::from_env(state.http.clone())? else {
+        return Ok(None);
+    };
+    if state.db.history_mode().await? != "clickhouse" {
+        return Ok(None);
+    }
+    let filter = RequestListFilter {
+        from_created_at: filter.from_created_at,
+        to_created_at: filter.to_created_at,
+        key_id: filter.key_id,
+        model: filter.model.clone(),
+        protocol: filter.protocol.clone(),
+        status: filter.status.clone(),
+        error_code: filter.error_code.clone(),
+        upstream_account_id: filter.upstream_account_id,
+        route_id: filter.route_id,
+        min_duration_ms: filter.min_duration_ms,
+        max_duration_ms: filter.max_duration_ms,
+        min_cost_micros: filter.min_cost_micros,
+        max_cost_micros: filter.max_cost_micros,
+        key_alias: filter.key_alias.clone(),
+        principal: filter.principal.clone(),
+        limit: 500,
+        ..RequestListFilter::default()
+    };
+    let query = query_from_request_filter(scope, &filter)?;
+    Ok(Some(client.statistics(&query).await?))
 }
 
 pub fn query_from_request_filter(
