@@ -79,6 +79,7 @@ mod plugin_service_data;
 mod projection_lock;
 mod providers;
 mod requests;
+mod request_history;
 pub(crate) use requests::EarlyRequestTerminal;
 #[allow(unused_imports)] // Consumed by the separately owned API receipt integration.
 pub(crate) use requests::pending_settlement::{

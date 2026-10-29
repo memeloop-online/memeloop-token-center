@@ -139,12 +139,18 @@ pub(in crate::api) async fn self_requests(
     Query(query): Query<RequestsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    Ok(Json(
+    let filter = query.to_filter(false)?;
+    if let Some(value) = crate::request_history_api::list_if_enabled(
+        &state, crate::request_history_api::authenticated_key_scope(&key), &filter, false,
+    ).await? {
+        return Ok(Json(value));
+    }
+    Ok(Json(serde_json::json!(
         state
             .db
-            .list_requests_filtered(key.key_id, query.to_filter(false)?)
+            .list_requests_filtered(key.key_id, filter)
             .await?,
-    ))
+    )))
 }
 
 pub(in crate::api) async fn self_request_detail(
