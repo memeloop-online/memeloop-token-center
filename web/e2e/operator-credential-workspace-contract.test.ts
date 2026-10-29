@@ -117,7 +117,7 @@ test('credential route access retries incomplete catalogs and finds models beyon
     await astra.waitFor();
     assert.match(await astra.innerText(), /Personal Kimi/, 'the older model identifies its account');
     const routeCalls = (await calls(page)).filter(path => path.startsWith('/internal/v1/model-routes'));
-    assert.equal(routeCalls.length, 4, 'one failed two-page walk and one complete retry, with no refetch on model search');
+    assert.equal(routeCalls.length, 7, 'first page, four automatic 503 attempts, then a complete two-page retry; searching does not refetch');
     await astra.click();
     await input.press('Escape');
     await editor.getByRole('button', { name: 'Save', exact: true }).click();

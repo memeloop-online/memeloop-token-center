@@ -82,7 +82,7 @@ wasmtime = { version = "48.0.7", default-features = false, features = ["componen
 wreq = { version = "=6.0.0-rc.31", default-features = false, features = ["prefix-symbols", "socks", "stream", "tokio-rt", "webpki-roots"] }
 wreq-util = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation"] }
 wreq-proto = { version = "=0.2.6", default-features = false }
-zstd = "0.13.3"
+zstd = "0.14.3"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemalloc-sys = { version = "0.7.1", features = ["profiling", "stats"] }
@@ -117,3 +117,6 @@ strip = "debuginfo"
 # dormant surface; see vendor/rust_decimal/MEMELOOP-FORK.md.
 rust_decimal = { path = "vendor/rust_decimal" }
 wreq-proto = { path = "vendor/wreq-proto" }
+
+# Manifest-only fork: share the security-fixed zstd graph with emulation.
+wreq-util = { path = "vendor/wreq-util" }

@@ -85,11 +85,16 @@ test('catalog loading and failure stay honest, retry restores readable names, de
     await page.locator('.combobox-state.error').getByRole('button', { name: '重试', exact: true }).click();
     await page.waitForFunction(() => document.querySelector('[data-testid="retry-count"]')?.textContent === '1');
     await routes.fill('');
-    const option = page.getByRole('option').filter({ hasText: 'Voice model' });
+    // The granted Voice model is already selected, so the picker excludes it;
+    // the readable directory offers the remaining available route instead.
+    const option = page.getByRole('option').filter({ hasText: 'Additional model' });
     await option.waitFor();
-    assert.match(await option.innerText(), /primary-account-with-long-name@example\.test/, 'readable options pair the model name with its account');
+    assert.equal(await option.getAttribute('aria-disabled'), null, 'a healthy route stays selectable after retry');
+    assert.match(await option.innerText(), /secondary-account@example\.test/, 'readable options pair the model name with its account');
     await page.keyboard.press('Escape');
-    await page.locator('.selection-chip-hierarchy').filter({ hasText: 'Voice model' }).waitFor();
+    const voiceChip = page.locator('.selection-chip-hierarchy').filter({ hasText: 'Voice model' });
+    await voiceChip.waitFor();
+    assert.match(await voiceChip.innerText(), /primary-account-with-long-name@example\.test/, 'the granted Voice model keeps its readable name and primary account');
     const missingChip = page.locator('.selection-chip-hierarchy').filter({ hasText: '未知路由 …9f8e7d' });
     await missingChip.waitFor();
     await missingChip.hover();
