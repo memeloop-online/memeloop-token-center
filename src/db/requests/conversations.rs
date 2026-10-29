@@ -125,22 +125,9 @@ const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
 const SESSION_BODY_REBUILD_OUTCOME: &str = "session_body";
-const SESSION_BODY_INLINE_REQUEST_LIMIT: usize = 1024 * 1024;
-
-fn inline_session_request(value: &serde_json::Value) -> String {
-    let Ok(encoded) = serde_json::to_string(value) else {
-        return "{}".to_owned();
-    };
-    if encoded.len() > SESSION_BODY_INLINE_REQUEST_LIMIT {
-        "{}".to_owned()
-    } else {
-        encoded
-    }
-}
-
 /// 网关结算只把请求身份放进队列。
 /// 不在这里解析原始请求 JSON 或原始返回 JSON。
-/// 会话正文归档由 worker 读取这两个 locator 之后写入 CNPG。
+/// 会话正文由 worker 读取 locator 后存入对象归档。
 pub(crate) async fn enqueue_conversation_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     input: ConversationProjectionEnqueueInput<'_>,
@@ -148,22 +135,14 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let ConversationProjectionEnqueueInput {
         request_id,
         key,
-        request_json,
+        request_json: _,
         hints,
         client_name,
         upstream_response_id,
         observed_at,
     } = input;
-    // 这里不解析对象存储里的原始请求 JSON。只留下结算时已经收好的对话字段，
-    // 供 locator 仍是 gap:// 时归档。超过上限的内容仍留给对象存储。
-    //
-    // The raw request body never lands in PostgreSQL: object storage owns it, and
-    // this row only carries the bounded conversation fields the projection needs
-    // while the locator is still `gap://`. An earlier revision persisted the full
-    // body into `conversation_semantic_payloads` for every request, which grew the
-    // database by roughly a gigabyte per hour of Codex traffic.
     let payload: Option<(String, String)> = None;
-    let request_json = inline_session_request(request_json);
+    let request_json = "{}";
     let semantic_snapshot = {
         let snapshot = ConversationSemanticSnapshot {
             leaf: None,
@@ -504,33 +483,6 @@ impl Database {
         Ok(updated.rows_affected())
     }
 
-    /// Deletes projection queue rows whose request never reached a terminal.
-    ///
-    /// A request that dies mid-flight (client abort, upstream reset, gateway
-    /// restart) is never projected, so neither its outbox row nor its payload is
-    /// ever consumed and the compaction pass - which only looks at projected
-    /// rows - cannot retire it. Left alone these rows accumulate forever; at
-    /// Codex traffic that was roughly a gigabyte of dead conversation rows per
-    /// hour, which is what filled the database volume.
-    ///
-    /// The payload table cascades from the outbox primary key, so one delete
-    /// frees both.
-    pub(crate) async fn reap_abandoned_conversation_projections(
-        &self,
-        older_than_millis: i64,
-        limit: i64,
-    ) -> Result<u64, AppError> {
-        let cutoff = unix_millis().saturating_sub(older_than_millis);
-        let deleted = sqlx::query(
-            "DELETE FROM conversation_projection_outbox WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND observed_at < $1 LIMIT $2)",
-        )
-        .bind(cutoff)
-        .bind(limit)
-        .execute(&self.pool)
-        .await?;
-        Ok(deleted.rows_affected())
-    }
-
     /// Claims a bounded batch of terminal conversation observations for one
     /// projector. A crashed worker's lease expires and another worker can
     /// safely retry the same durable payload.
@@ -680,26 +632,7 @@ impl Database {
         Ok(())
     }
 
-    /// locator 是 gap:// 时，用结算时已经收好的对话字段。不读对象存储。
-    pub async fn session_body_inline_request(
-        &self,
-        lease_owner: Uuid,
-        request_id: Uuid,
-    ) -> Result<Option<String>, AppError> {
-        let now = unix_millis();
-        let row = sqlx::query(
-            "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
-        )
-        .bind(request_id.to_string())
-        .bind(lease_owner.to_string())
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.and_then(|row| row.try_get("request_json").ok()))
-    }
-
-    /// 把已经整理好的会话正文写入 CNPG。媒体 locator 记在 `conversation_media_parts`。
-    /// 不读取对象存储，也不碰 `generation_assets`。
+    /// 先持久化对象，再把正文引用及媒体 locator 写入投影元数据。
     pub async fn prepare_session_body_archive(
         &self,
         lease_owner: Uuid,
