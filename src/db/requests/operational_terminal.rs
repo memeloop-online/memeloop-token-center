@@ -220,6 +220,11 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         }
+        super::terminal_projection::enqueue_unknown_terminal_projection_in_transaction(
+            &mut tx,
+            &claim.request_id.to_string(),
+        )
+        .await?;
         tx.commit().await?;
         Ok(PendingProxyOperationalTerminalAck {
             request_id: claim.request_id,
