@@ -34,7 +34,7 @@ test('dedicated RustFS is isolated and archive routing requires explicit cutover
   assert.equal(storage.spec.strategy.type, 'Recreate');
   assert.equal(storage.spec.template.spec.automountServiceAccountToken, false);
   assert.equal(storage.spec.template.spec.securityContext.runAsUser, 10001);
-  assert.equal(storage.spec.template.spec.containers[0].image, 'rustfs/rustfs:1.0.4');
+  assert.equal(storage.spec.template.spec.containers[0].image, 'rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2');
   assert.deepEqual(storage.spec.template.spec.volumes.find((volume: any) => volume.name === 'tmp').emptyDir, {});
   assert.equal(storage.spec.template.spec.volumes.some((volume: any) => volume.name === 'logs'), false);
   assert.equal(storage.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'RUSTFS_OBS_LOG_DIRECTORY').value, '');
