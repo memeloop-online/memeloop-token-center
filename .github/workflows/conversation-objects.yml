@@ -29,5 +29,7 @@ jobs:
         with:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+      - uses: ./.github/actions/checkout-plugin-examples
       - run: cargo test --locked --lib archive::conversation
+      - run: cargo test --locked --lib archive::text
       - run: cargo test --locked --lib db::object_bodies

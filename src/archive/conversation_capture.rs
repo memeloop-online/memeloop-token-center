@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use bytes::Bytes;
-use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
+use object_store::{PutMode, PutOptions, PutPayload};
 use serde_json::value::RawValue;
 use uuid::Uuid;
 
