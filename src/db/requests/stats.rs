@@ -16,15 +16,16 @@ SELECT r.created_at,
        CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN r.cache_known_read_tokens ELSE 0 END AS cache_known_read_tokens,
        CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN r.cache_known_input_tokens ELSE 0 END AS cache_known_input_tokens,
        CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END AS cache_eligible_requests,
-       CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END AS cache_unknown_requests,
+       CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL AND r.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END - CASE WHEN bridge.request_id IS NOT NULL AND $13 < 0 AND $14 < 0 THEN 1 ELSE 0 END AS cache_unknown_requests,
        CASE WHEN r.completed_at IS NOT NULL THEN COALESCE(r.cache_known_read_tokens, 0) ELSE 0 END AS cache_reported_read_tokens,
        CASE WHEN r.completed_at IS NOT NULL AND r.cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END AS cache_reported_requests,
        r.currency,
        CASE WHEN r.completed_at IS NULL THEN CAST(NULL AS BIGINT) ELSE r.cost_micros END AS cost_micros,
-       CAST(1 AS BIGINT) AS requests
+       CAST(CASE WHEN bridge.request_id IS NOT NULL AND $13 < 0 AND $14 < 0 THEN 0 ELSE 1 END AS BIGINT) AS requests
 FROM operational_candidates op
 JOIN request_records r ON r.id = op.request_id AND r.created_at = op.request_created_at
      AND r.tenant_id = op.tenant_id AND r.key_id = op.key_id AND r.reservation_id = op.reservation_id
+LEFT JOIN request_stats_facts bridge ON bridge.request_id = r.id AND bridge.tenant_id = r.tenant_id AND bridge.key_id = r.key_id
 LEFT JOIN key_records k ON k.id = op.key_id AND k.tenant_id = op.tenant_id
 LEFT JOIN principals p ON p.id = k.principal_id AND p.tenant_id = k.tenant_id
 JOIN tenants t ON t.id = op.tenant_id
@@ -46,7 +47,7 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($14 < 0 OR (r.completed_at IS NOT NULL AND r.cost_micros <= $14))
   AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
   AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
-  AND NOT EXISTS (SELECT 1 FROM request_stats_facts fact WHERE fact.request_id = op.request_id LIMIT 1 OFFSET 0)
+  AND (r.completed_at IS NULL OR bridge.request_id IS NULL OR EXISTS (SELECT 1 FROM terminal_projection_outbox replacement JOIN pending_proxy_settlements settlement ON settlement.request_id = replacement.request_id WHERE replacement.request_id = r.id AND replacement.projected_at IS NULL AND settlement.unknown_reason IS NOT NULL))
   AND (EXISTS (
        SELECT 1 FROM pending_proxy_settlements pending
        WHERE pending.request_id = op.request_id AND pending.state = 'pending'
@@ -253,6 +254,7 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($12 < 0 OR f.duration_ms <= $12)
   AND ($13 < 0 OR f.cost_micros >= $13)
   AND ($14 < 0 OR f.cost_micros <= $14)
+  AND (($13 < 0 AND $14 < 0) OR NOT EXISTS (SELECT 1 FROM pending_proxy_settlements unknown WHERE unknown.request_id = f.request_id AND unknown.tenant_id = f.tenant_id AND unknown.key_id = f.key_id AND unknown.unknown_reason IS NOT NULL AND (unknown.state = 'pending' OR EXISTS (SELECT 1 FROM terminal_projection_outbox replacement WHERE replacement.request_id = f.request_id AND replacement.projected_at IS NULL))))
   AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
   AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
@@ -306,7 +308,7 @@ pub(crate) const FILTERED_ACTIVITY_SOURCE_UNSETTLED: &str = r#"
 SELECT r.created_at,
        r.model,
        r.protocol,
-       'failure' AS status_class,
+       CASE WHEN r.completed_at IS NULL AND r.status_code IS NULL AND COALESCE(r.error_code, '') = '' THEN 'pending' ELSE 'failure' END AS status_class,
        COALESCE(r.error_code, '') AS error_code,
        CASE WHEN r.protocol = 'audio-transcription' THEN 0 ELSE r.input_tokens END AS input_tokens,
        CASE WHEN r.protocol = 'audio-transcription' THEN 0 ELSE r.output_tokens END AS output_tokens,
@@ -328,7 +330,7 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND r.created_at >= $3 AND r.created_at <= $4
   AND ($5 = '' OR r.model = $5)
   AND ($6 = '' OR r.protocol = $6)
-  AND ($7 = '' OR $7 = 'error')
+  AND ($7 = '' OR ($7 = 'error' AND (r.completed_at IS NOT NULL OR r.status_code IS NOT NULL OR COALESCE(r.error_code, '') <> '')))
   AND NOT EXISTS (SELECT 1 FROM request_stats_facts fact WHERE fact.request_id = r.id)
   AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = r.id AND operational.tenant_id = r.tenant_id AND operational.key_id = r.key_id AND operational.reservation_id = r.reservation_id)
   AND NOT EXISTS (SELECT 1 FROM observability_prune_boundaries prune WHERE prune.scope = 'global' AND prune.before_day > r.created_at / 86400000)
@@ -514,6 +516,10 @@ impl StatsProjectionAccumulator {
             total_requests: self.total_requests,
             successful_requests: self.successful_requests,
             failed_requests: self.failed_requests,
+            pending_requests: self
+                .total_requests
+                .saturating_sub(self.successful_requests)
+                .saturating_sub(self.failed_requests),
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
             total_cost: if self.unknown_cost { None } else { total_cost },
@@ -618,8 +624,7 @@ impl Database {
         // exact facts for the two possible boundary days. Per-request duration/cost filters
         // use compact facts for the whole bounded interval. Date-bounded operational terminals
         // add point reads of their pending/projection state and request metadata. Requests
-        // without terminal evidence (no fact, no operational terminal) always count as
-        // failures so the success-rate denominator never drops them.
+        // without terminal evidence stay pending until their observed outcome arrives.
         let use_facts = filter.min_duration_ms.is_some()
             || filter.max_duration_ms.is_some()
             || filter.min_cost_micros.is_some()
