@@ -628,6 +628,25 @@ async fn lost_source_writer_contract(database_url: String) {
     source.abort_writer_for_test().await;
     drop(source);
     assert!(release.send(()).is_err());
+    sqlx::query("DELETE FROM request_archive_spools WHERE request_id = $1")
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM archive_staging_attempts WHERE attempt_id = $1")
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !fixture
+            .state
+            .db
+            .recover_request_source(fixture.identity, &locator)
+            .await
+            .unwrap(),
+        "missing registration must establish a fence, not declare an immediate gap"
+    );
     sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
         .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
     fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();

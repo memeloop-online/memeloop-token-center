@@ -831,6 +831,7 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                 _ = cancelled => false,
                 result = retry_upload => result,
             };
+            drop(bytes);
             if wrote {
                 match phase.compare_exchange(
                     DURABLE_IN_FLIGHT,
