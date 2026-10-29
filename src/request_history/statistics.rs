@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ClickHouse, HistoryCursor, HistoryError, HistoryQuery, HistorySnapshot};
 use crate::model::{CacheStats, OperatorStats, StatsBucket, StatsSummary, UsageAnalysisCost};
@@ -13,6 +13,7 @@ struct Accumulator {
     cache: CacheStats,
     costs: BTreeMap<String, i64>,
     unknown_cost: bool,
+    unknown_currencies: BTreeSet<String>,
 }
 
 fn add(total: &mut i64, value: i64) -> Result<(), HistoryError> {
@@ -54,6 +55,9 @@ impl Accumulator {
             add(self.costs.entry(currency.clone()).or_default(), cost)?;
         } else {
             self.unknown_cost = true;
+            if let Some(currency) = &stats.currency {
+                self.unknown_currencies.insert(currency.clone());
+            }
         }
         Ok(())
     }
@@ -62,6 +66,7 @@ impl Accumulator {
         let costs: Vec<_> = self
             .costs
             .iter()
+            .filter(|(currency, _)| !self.unknown_currencies.contains(*currency))
             .map(|(currency, micros)| UsageAnalysisCost {
                 currency: currency.clone(),
                 cost: rust_decimal::Decimal::from_i128_with_scale(i128::from(*micros), 6)

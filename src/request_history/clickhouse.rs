@@ -116,7 +116,14 @@ impl ClickHouse {
                 .get("X-ClickHouse-Exception-Code")
                 .is_some_and(|value| value.as_bytes() != b"0")
         {
-            return Err(HistoryError::Unavailable);
+            return Err(HistoryError::Rejected {
+                status: response.status().as_u16(),
+                code: response
+                    .headers()
+                    .get("X-ClickHouse-Exception-Code")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse().ok()),
+            });
         }
         Ok(response)
     }
@@ -152,11 +159,15 @@ impl ClickHouse {
     }
 
     pub async fn initialize(&self) -> Result<(), HistoryError> {
-        self.execute(BoundQuery::new(super::SCHEMA), None)
+        let response = self
+            .execute(BoundQuery::new(super::SCHEMA), None)
             .await?
             .bytes()
             .await
             .map_err(|_| HistoryError::Unavailable)?;
+        if !response.iter().all(u8::is_ascii_whitespace) {
+            return Err(HistoryError::Unavailable);
+        }
         Ok(())
     }
 

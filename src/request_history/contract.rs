@@ -10,6 +10,8 @@ pub enum HistoryError {
     Invalid(&'static str),
     #[error("request history unavailable")]
     Unavailable,
+    #[error("request history HTTP request rejected (status {status}, ClickHouse code {code:?})")]
+    Rejected { status: u16, code: Option<u32> },
     #[error("history changed during verification; retry after export catches up")]
     Changed,
     #[error("request history verification mismatch")]
