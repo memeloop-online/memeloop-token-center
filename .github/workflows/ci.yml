@@ -271,6 +271,7 @@ jobs:
         env:
           MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
           MTC_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+          MTC_REQUEST_HISTORY_URL: http://127.0.0.1:8123
         run: |
           cargo test --locked --all-features --lib request_history -- --nocapture
           cargo test --locked --all-features --lib request_history_real_services_acceptance -- --ignored --nocapture

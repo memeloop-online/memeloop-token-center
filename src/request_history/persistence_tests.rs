@@ -1,8 +1,8 @@
 use super::*;
 use crate::request_history::{ClickHouse, HistoryQuery};
 
-async fn seed(database: &Database) -> (AuthenticatedKey, Uuid) {
-    let pepper = b"request history synthetic fixture credential pepper";
+async fn seed(database: &Database) -> (AuthenticatedKey, Uuid, String) {
+    let pepper = b"test-pepper-must-have-at-least-32-bytes";
     let issued = database
         .create_key(
             CreateKeyInput {
@@ -37,7 +37,7 @@ async fn seed(database: &Database) -> (AuthenticatedKey, Uuid) {
         })
         .await
         .unwrap();
-    (key, request_id)
+    (key, request_id, issued.key)
 }
 
 async fn finish(database: &Database, request_id: Uuid) {
@@ -64,7 +64,7 @@ async fn finish(database: &Database, request_id: Uuid) {
 async fn capture_replay(database: &Database) {
     database.migrate().await.unwrap();
     database.history_start().await.unwrap();
-    let (_, request_id) = seed(database).await;
+    let (_, request_id, _) = seed(database).await;
     let pending = database.history_pending(1).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].statistics.as_ref().unwrap().status, "pending");
@@ -169,7 +169,10 @@ async fn request_history_real_services_acceptance() {
     let database = Database::connect(isolated.as_str()).await.unwrap();
     database.migrate().await.unwrap();
     database.history_start().await.unwrap();
-    let (key, request_id) = seed(&database).await;
+    let (key, request_id, credential) = seed(&database).await;
+    let state = crate::AppState::initialize(crate::config::Config::for_test(isolated.to_string()))
+        .await
+        .unwrap();
     let client = ClickHouse::new(
         database
             .http_clients
@@ -267,12 +270,65 @@ async fn request_history_real_services_acceptance() {
     let stats = client.statistics(&query).await.unwrap();
     assert_eq!(stats.summary.pending_requests, 2);
     assert!(stats.summary.total_cost.is_none());
+    database.history_switch(true).await.unwrap();
+    use tower::ServiceExt;
+    let app = crate::api::router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/self/v1/requests")
+                .header("authorization", format!("Bearer {credential}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let response: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response.as_array().unwrap().len(), 3);
+    assert!(
+        response
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|request| request["credential_identity"].is_null())
+    );
+    let response = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri(format!(
+                    "/self/v1/stats?from_created_at=0&to_created_at={}",
+                    i64::MAX
+                ))
+                .header("authorization", format!("Bearer {credential}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let response: Value = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(response["summary"]["total_requests"], 3);
+    assert_eq!(response["summary"]["pending_requests"], 2);
+    database.history_switch(false).await.unwrap();
     let ledger_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries")
         .fetch_one(&database.pool)
         .await
         .unwrap();
     assert_eq!(ledger_before, ledger_after);
     database.close().await;
+    state.db.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await
