@@ -152,10 +152,14 @@ async fn updates_replace_pools_but_keep_old_clients_and_ignore_stale_refresh() {
 
 #[tokio::test]
 async fn settings_cas_is_durable_and_refresh_publishes_a_snapshot() {
-    let database = crate::db::Database::connect("sqlite::memory:")
-        .await
-        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("http-settings.db").display()
+    );
+    let database = crate::db::Database::connect(&url).await.unwrap();
     database.migrate().await.unwrap();
+    let replica = crate::db::Database::connect(&url).await.unwrap();
     let settings: HttpSettings = serde_json::from_value(json!({
         "purposes":{"probe":{"request_timeout_ms":1000}}
     }))
@@ -169,8 +173,11 @@ async fn settings_cas_is_durable_and_refresh_publishes_a_snapshot() {
         database.replace_http_settings(0, settings, None).await,
         Err(crate::error::AppError::Conflict(_))
     ));
-    database.refresh_http_settings().await.unwrap();
-    assert_eq!(database.http_clients.snapshot().document, document);
+    assert_eq!(replica.http_clients.snapshot().document.revision, 0);
+    replica.refresh_http_settings().await.unwrap();
+    assert_eq!(replica.http_clients.snapshot().document, document);
+    database.close().await;
+    replica.close().await;
 }
 
 #[tokio::test]
@@ -182,12 +189,12 @@ async fn changed_deadline_affects_new_requests_but_not_a_body_already_in_flight(
     let server = tokio::spawn(async move {
         let (mut old, _) = listener.accept().await.unwrap();
         let mut buffer = [0; 4096];
-        old.read(&mut buffer).await.unwrap();
+        assert!(old.read(&mut buffer).await.unwrap() > 0);
         old.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
             .await
             .unwrap();
         let (mut new, _) = listener.accept().await.unwrap();
-        new.read(&mut buffer).await.unwrap();
+        assert!(new.read(&mut buffer).await.unwrap() > 0);
         released.await.unwrap();
         old.write_all(b"ok").await.unwrap();
     });

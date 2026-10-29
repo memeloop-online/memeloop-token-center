@@ -232,7 +232,9 @@ impl CodexClients {
             cached.account_id != key.account_id
                 || cached.control != key.control
                 || (cached.settings_revision == key.settings_revision
-                    && cached.revision == key.revision)
+                    && cached.revision == key.revision
+                    && cached.http_protocol == key.http_protocol
+                    && cached.timeouts == key.timeouts)
         });
         if clients.len() >= 64 {
             clients.pop_front();

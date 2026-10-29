@@ -37,14 +37,8 @@ pub(crate) fn configured_codex_builder(
     keep_alive_interval: Duration,
     proxy_url: Option<&str>,
 ) -> Result<reqwest::ClientBuilder, reqwest::Error> {
-    let mut builder = snapshot.builder(crate::http_settings::HttpPurpose::Codex);
-    if let Some(connect_timeout) = policy.connect_timeout_millis {
-        builder = builder.connect_timeout(Duration::from_millis(connect_timeout));
-    }
-    if let Some(read_timeout) = policy.read_timeout_millis {
-        builder = builder.read_timeout(Duration::from_millis(read_timeout));
-    }
-    let mut builder = builder
+    let mut builder = snapshot
+        .builder(crate::http_settings::HttpPurpose::Codex)
         .redirect(reqwest::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.
@@ -191,7 +185,7 @@ mod tests {
     use tokio::io::AsyncReadExt;
 
     async fn stalled_tls_request(
-        policy: CodexTransportPolicy,
+        settings: crate::http_settings::HttpSettings,
     ) -> (
         tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>>,
         tokio::task::JoinHandle<()>,
@@ -207,7 +201,24 @@ mod tests {
             std::future::pending::<()>().await;
             drop(socket);
         });
-        let client = build_codex_http_client_with_policy(policy).unwrap();
+        let factory = crate::http_settings::HttpClientFactory::default();
+        factory.publish(crate::http_settings::HttpSettingsDocument {
+            revision: 1,
+            settings,
+        });
+        let client = configured_codex_builder(
+            &factory.snapshot(),
+            CodexTransportPolicy {
+                connect_timeout_millis: Some(1),
+                read_timeout_millis: Some(1),
+                ..CodexTransportPolicy::default()
+            },
+            CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+            None,
+        )
+        .unwrap()
+        .build()
+        .unwrap();
         let request =
             tokio::spawn(async move { client.post(endpoint).body("one POST").send().await });
         hello_received.await.unwrap();
@@ -216,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn default_connection_survives_old_fixed_windows_and_can_be_cancelled() {
-        let (request, server) = stalled_tls_request(CodexTransportPolicy::default()).await;
+        let (request, server) = stalled_tls_request(Default::default()).await;
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(1_300)).await;
         tokio::task::yield_now().await;
@@ -228,14 +239,35 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_connection_window_still_bounds_tls_establishment() {
-        let (request, server) = stalled_tls_request(CodexTransportPolicy {
-            connect_timeout_millis: Some(1000),
-            ..CodexTransportPolicy::default()
-        })
+        let (request, server) = stalled_tls_request(
+            serde_json::from_value(serde_json::json!({
+                "defaults": {"connect_timeout_ms": 1000}
+            }))
+            .unwrap(),
+        )
         .await;
         tokio::time::pause();
         tokio::time::advance(Duration::from_millis(1001)).await;
         assert!(request.await.unwrap().unwrap_err().is_timeout());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn purpose_null_disables_global_and_legacy_connection_deadlines() {
+        let (request, server) = stalled_tls_request(
+            serde_json::from_value(serde_json::json!({
+                "defaults": {"connect_timeout_ms": 1000, "read_timeout_ms": 1000},
+                "purposes": {"codex": {"connect_timeout_ms": null, "read_timeout_ms": null}}
+            }))
+            .unwrap(),
+        )
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1_300)).await;
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished());
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
         server.abort();
     }
 }

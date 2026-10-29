@@ -118,3 +118,88 @@ fn decode(bytes: Option<&[u8]>) -> Result<HttpSettingsDocument, AppError> {
         .map_err(|_| AppError::internal("http_settings_invalid"))?;
     Ok(document)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn assert_concurrent_writers(database_url: &str) {
+        let first = Database::connect(database_url).await.unwrap();
+        first.migrate().await.unwrap();
+        let second = Database::connect(database_url).await.unwrap();
+        let actor = Uuid::now_v7();
+        for expected_revision in 0..2 {
+            let first_settings: HttpSettings = serde_json::from_value(serde_json::json!({
+                "defaults": {"request_timeout_ms": 1000 + expected_revision}
+            }))
+            .unwrap();
+            let second_settings: HttpSettings = serde_json::from_value(serde_json::json!({
+                "defaults": {"request_timeout_ms": 2000 + expected_revision}
+            }))
+            .unwrap();
+            let (left, right) = tokio::join!(
+                first.replace_http_settings(expected_revision, first_settings, Some(actor)),
+                second.replace_http_settings(expected_revision, second_settings, Some(actor)),
+            );
+            let winner = match (left, right) {
+                (Ok(winner), Err(AppError::Conflict(_)))
+                | (Err(AppError::Conflict(_)), Ok(winner)) => winner,
+                results => panic!("expected one durable CAS winner: {results:?}"),
+            };
+            assert_eq!(winner.revision, expected_revision + 1);
+            first.refresh_http_settings().await.unwrap();
+            second.refresh_http_settings().await.unwrap();
+            assert_eq!(first.http_clients.snapshot().document, winner);
+            assert_eq!(second.http_clients.snapshot().document, winner);
+            let rows =
+                sqlx::query("SELECT value FROM plugin_kv WHERE plugin_id='http-settings-audit'")
+                    .fetch_all(&first.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(rows.len() as u64, winner.revision);
+            let audits: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|row| serde_json::from_slice(&row.get::<Vec<u8>, _>("value")).unwrap())
+                .collect();
+            assert!(audits.iter().any(|audit| {
+                audit["actor_service_id"] == serde_json::json!(actor)
+                    && audit["document"] == serde_json::to_value(&winner).unwrap()
+            }));
+        }
+        first.close().await;
+        second.close().await;
+    }
+
+    #[tokio::test]
+    async fn sqlite_http_settings_concurrent_cas_and_audit_are_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("http-settings-cas.db").display()
+        );
+        assert_concurrent_writers(&database_url).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_http_settings_concurrent_cas_and_audit_are_atomic() {
+        let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("http_settings_{}", Uuid::now_v7().simple());
+        let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        let mut isolated_url = url::Url::parse(&database_url).unwrap();
+        isolated_url
+            .query_pairs_mut()
+            .append_pair("options", &format!("-csearch_path={schema}"));
+        assert_concurrent_writers(isolated_url.as_str()).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+    }
+}
