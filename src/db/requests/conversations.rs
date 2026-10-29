@@ -519,33 +519,6 @@ impl Database {
         Ok(updated.rows_affected())
     }
 
-    /// Deletes projection queue rows whose request never reached a terminal.
-    ///
-    /// A request that dies mid-flight (client abort, upstream reset, gateway
-    /// restart) is never projected, so neither its outbox row nor its payload is
-    /// ever consumed and the compaction pass - which only looks at projected
-    /// rows - cannot retire it. Left alone these rows accumulate forever; at
-    /// Codex traffic that was roughly a gigabyte of dead conversation rows per
-    /// hour, which is what filled the database volume.
-    ///
-    /// The payload table cascades from the outbox primary key, so one delete
-    /// frees both.
-    pub(crate) async fn reap_abandoned_conversation_projections(
-        &self,
-        older_than_millis: i64,
-        limit: i64,
-    ) -> Result<u64, AppError> {
-        let cutoff = unix_millis().saturating_sub(older_than_millis);
-        let deleted = sqlx::query(
-            "DELETE FROM conversation_projection_outbox WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND observed_at < $1 LIMIT $2)",
-        )
-        .bind(cutoff)
-        .bind(limit)
-        .execute(&self.pool)
-        .await?;
-        Ok(deleted.rows_affected())
-    }
-
     /// Claims a bounded batch of terminal conversation observations for one
     /// projector. A crashed worker's lease expires and another worker can
     /// safely retry the same durable payload.
