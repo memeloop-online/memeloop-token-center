@@ -17,17 +17,23 @@ pub enum HistoryError {
     #[error("request history verification mismatch")]
     Mismatch,
     #[error(transparent)]
-    Database(#[from] crate::error::AppError),
+    Database(Box<crate::error::AppError>),
     #[error(transparent)]
     Sql(#[from] sqlx::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
 }
 
+impl From<crate::error::AppError> for HistoryError {
+    fn from(error: crate::error::AppError) -> Self {
+        Self::Database(Box::new(error))
+    }
+}
+
 impl From<HistoryError> for crate::error::AppError {
     fn from(error: HistoryError) -> Self {
         match error {
-            HistoryError::Database(error) => error,
+            HistoryError::Database(error) => *error,
             HistoryError::Invalid(message) => Self::BadRequest(message.into()),
             _ => Self::internal("request_history_unavailable"),
         }
