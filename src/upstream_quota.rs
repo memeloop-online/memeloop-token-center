@@ -844,19 +844,27 @@ async fn read_codex(
     })?;
     let budget = codex_quota_budget(&account.config)?;
     let policy = codex_quota_transport_policy(&account.config, budget)?;
-    crate::build_codex_http_client_with_policy(policy).map_err(|_| {
-        tracing::warn!(
-            operation = "quota_supplier_read",
-            upstream_account_id = %account.id,
-            credential_generation = account.credential_generation,
-            endpoint_kind = "quota_client",
-            trigger = trigger.as_str(),
-            phase = "client",
-            error_kind = "transport_client_unavailable",
-            "quota supplier client setup failed"
-        );
-        "quota_transport_failed"
-    })?;
+    state
+        .codex_clients
+        .control_snapshot(
+            account.id,
+            account.credential_generation,
+            policy,
+            credential.proxy().map(|(url, _)| url),
+        )
+        .map_err(|_| {
+            tracing::warn!(
+                operation = "quota_supplier_read",
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                endpoint_kind = "quota_client",
+                trigger = trigger.as_str(),
+                phase = "client",
+                error_kind = "transport_client_unavailable",
+                "quota supplier client setup failed"
+            );
+            "quota_transport_failed"
+        })?;
     let (credential_header, credential_value) = credential
         .request_header(observation_started_at)
         .map_err(|_| "credential_invalid")?
@@ -869,6 +877,7 @@ async fn read_codex(
     };
     let (usage, reset) = tokio::join!(
         get_codex_json_with_routes(
+            &state.codex_clients,
             policy,
             auth.clone(),
             USAGE_URL,
@@ -878,6 +887,7 @@ async fn read_codex(
             Some(&routes),
         ),
         get_codex_json_with_routes(
+            &state.codex_clients,
             policy,
             auth,
             CREDITS_URL,
@@ -1020,6 +1030,7 @@ async fn decode_response(
 }
 
 async fn get_codex_json(
+    clients: &crate::codex_clients::CodexClients,
     policy: crate::provider::CodexTransportPolicy,
     auth: CodexQuotaAuth<'_>,
     url: &str,
@@ -1027,10 +1038,12 @@ async fn get_codex_json(
     budget: QuotaBudget,
     session: &retry::ReadSession<'_>,
 ) -> Result<Value, &'static str> {
-    get_codex_json_with_routes(policy, auth, url, context, budget, session, None).await
+    get_codex_json_with_routes(clients, policy, auth, url, context, budget, session, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_codex_json_with_routes(
+    clients: &crate::codex_clients::CodexClients,
     policy: crate::provider::CodexTransportPolicy,
     auth: CodexQuotaAuth<'_>,
     url: &str,
@@ -1054,7 +1067,13 @@ async fn get_codex_json_with_routes(
             // connection/request deadline. The account's connection limit
             // (including a 15s SOCKS handshake) runs inside session.deadline.
             let proxy_url = routes.map_or(auth.proxy_url, |routes| routes.proxy_url(route));
-            let http = crate::build_codex_http_client_with_proxy(policy, proxy_url)
+            let http = clients
+                .control_snapshot(
+                    context.account_id,
+                    context.credential_generation,
+                    policy,
+                    proxy_url,
+                )
                 .map_err(|_| retry::Failure::terminal("quota_destination_invalid", "client"))?;
             let mut request = http
                 .get(url)
@@ -1391,6 +1410,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let session = retry::ReadSession::testing(budget);
             get_codex_json(
+                &crate::codex_clients::CodexClients::default(),
                 codex_quota_transport_policy(&config, budget).unwrap(),
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,
@@ -1459,6 +1479,7 @@ mod tests {
         let url = format!("http://{}/usage", listener.local_addr().unwrap());
         let task = tokio::spawn(async move {
             get_codex_json(
+                &crate::codex_clients::CodexClients::default(),
                 crate::provider::CodexTransportPolicy::default(),
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,
@@ -1565,6 +1586,7 @@ mod tests {
         };
         assert_eq!(
             get_codex_json(
+                &crate::codex_clients::CodexClients::default(),
                 crate::provider::CodexTransportPolicy::default(),
                 CodexQuotaAuth {
                     credential_header: credential_header.clone(),
@@ -1583,6 +1605,7 @@ mod tests {
         );
         assert_eq!(
             get_codex_json(
+                &crate::codex_clients::CodexClients::default(),
                 crate::provider::CodexTransportPolicy::default(),
                 CodexQuotaAuth {
                     credential_header,

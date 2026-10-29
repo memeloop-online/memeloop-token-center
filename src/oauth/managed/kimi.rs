@@ -1,4 +1,5 @@
 //! Native Kimi OAuth refresh and request identity handling.
+#[cfg(test)]
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -19,7 +20,6 @@ pub const BASE_URL: &str = "https://api.kimi.com/coding";
 pub const TOKEN_ENDPOINT: &str = "https://auth.kimi.com/api/oauth/token";
 pub(crate) const CLIENT_ID: &str = "17e5f671-d194-4dfb-9706-5516cb48c098";
 const SCHEMA: &str = "kimi-oauth-v1";
-const TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,7 +67,7 @@ fn observed_failure(
             failure.observation = Some(OAuthRefreshObservation {
                 phase,
                 elapsed_ms: started.elapsed().as_millis() as u64,
-                budget_ms: TIMEOUT.as_millis() as u64,
+                budget_ms: 0,
                 connector_failure,
                 timeout_source,
             });
@@ -257,7 +257,7 @@ struct TokenResponse {
 }
 
 pub async fn refresh(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
     request_guard: &dyn OAuthRefreshRequestGuard,
@@ -273,7 +273,7 @@ pub async fn refresh(
 }
 
 async fn refresh_at(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
     endpoint: &str,
@@ -282,7 +282,7 @@ async fn refresh_at(
     validate_credential(credential)
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     let client = network::client_for_config_url_no_retry(
-        http,
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
         endpoint,
         &json!({"network_scope": "public"}),
         credential.proxy(),
@@ -321,12 +321,10 @@ async fn refresh_with_client(
         .header("Accept", "application/json")
         .header("Content-Type", "application/x-www-form-urlencoded")
         .body(form)
-        .timeout(TIMEOUT)
         .build()
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     request_guard.mark_request_started().await?;
     let started = tokio::time::Instant::now();
-    let mut response_status = None;
     let operation = async {
         let response = match client.execute(request).await {
             Ok(response) => response,
@@ -353,7 +351,6 @@ async fn refresh_with_client(
             }
         };
         let status = response.status().as_u16();
-        response_status = Some(status);
         let bytes = super::super::bounded_body(response).await.map_err(|_| {
             observed_failure(
                 refresh_failure(OAuthRefreshFailureKind::ResponseBody, Some(status)),
@@ -368,21 +365,7 @@ async fn refresh_with_client(
         }
         Ok(bytes)
     };
-    let bytes = tokio::time::timeout(TIMEOUT, operation)
-        .await
-        .map_err(|_| {
-            observed_failure(
-                refresh_failure(OAuthRefreshFailureKind::Timeout, response_status),
-                if response_status.is_some() {
-                    OAuthRefreshPhase::ResponseBody
-                } else {
-                    OAuthRefreshPhase::BeforeHeaders
-                },
-                started,
-                false,
-                Some(OAuthRefreshTimeoutSource::OperationDeadline),
-            )
-        })??;
+    let bytes = operation.await?;
     let response: TokenResponse = serde_json::from_slice(&bytes)
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseDecode, Some(200)))?;
     super::bearer_token(&response.access_token, "Kimi").map_err(|_| failed())?;
@@ -649,7 +632,7 @@ mod tests {
             not_sent: AtomicBool::new(false),
         };
         let error = refresh_at(
-            &crate::build_http_client().unwrap(),
+            &crate::http_settings::tests::configured_timeout(100),
             &credential("fixture-device"),
             true,
             &format!("http://{address}/token"),
@@ -708,7 +691,7 @@ mod tests {
             not_sent: AtomicBool::new(false),
         };
         let error = refresh_at(
-            &crate::build_http_client().unwrap(),
+            &crate::http_settings::tests::configured_timeout(100),
             &credential("fixture-device"),
             true,
             &format!("http://{address}/token"),
@@ -731,7 +714,7 @@ mod tests {
                 OAuthRefreshPhase::BeforeHeaders
             }
         );
-        assert_eq!(observation.budget_ms, 120_000);
+        assert_eq!(observation.budget_ms, 0);
         assert!(!observation.connector_failure);
         assert!(matches!(
             failure.kind,
@@ -788,7 +771,7 @@ mod tests {
         assert_eq!(observation.phase, OAuthRefreshPhase::BeforeHeaders);
         assert!(observation.elapsed_ms >= 100);
         assert!(observation.elapsed_ms < 120_000);
-        assert_eq!(observation.budget_ms, 120_000);
+        assert_eq!(observation.budget_ms, 0);
         assert_eq!(
             observation.timeout_source,
             Some(OAuthRefreshTimeoutSource::HttpClient)

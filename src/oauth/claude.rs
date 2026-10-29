@@ -1,7 +1,7 @@
+#[cfg(test)]
 use std::time::Duration;
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use futures_util::StreamExt;
 use getrandom::fill;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
@@ -33,8 +33,6 @@ pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback"
 pub const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 const FLOW_KIND: &str = "claude_manual_pkce";
-const RESPONSE_LIMIT: usize = 1024 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_LIFETIME_MILLIS: i64 = 10 * 60 * 1_000;
 const MAX_TOKEN_LIFETIME_SECONDS: i64 = 365 * 24 * 60 * 60;
 const MAX_SECRET_BYTES: usize = 128 * 1024;
@@ -130,7 +128,6 @@ struct ClaudeEndpoints {
     token: String,
     revoke: String,
     profile: String,
-    timeout: Duration,
 }
 
 impl ClaudeEndpoints {
@@ -140,7 +137,6 @@ impl ClaudeEndpoints {
             token: TOKEN_ENDPOINT.into(),
             revoke: REVOKE_ENDPOINT.into(),
             profile: PROFILE_ENDPOINT.into(),
-            timeout: REQUEST_TIMEOUT,
         }
     }
 
@@ -151,7 +147,6 @@ impl ClaudeEndpoints {
             token: format!("{origin}/oauth/token"),
             revoke: format!("{origin}/oauth/token/revoke"),
             profile: format!("{origin}/api/oauth/profile"),
-            timeout: REQUEST_TIMEOUT,
         }
     }
 }
@@ -282,7 +277,7 @@ async fn start_claude_login_at(
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_claude_login(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     session_token: &str,
     code_and_state: &str,
     key_material: &[u8],
@@ -307,7 +302,7 @@ pub async fn complete_claude_login(
 #[allow(clippy::too_many_arguments)]
 async fn complete_claude_login_at(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     session_token: &str,
     code_and_state: &str,
     _key_material: &[u8],
@@ -419,7 +414,7 @@ async fn complete_claude_login_at(
 }
 
 async fn finish_claimed_login(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     code: &str,
     supplied_state: &str,
     state: ClaudeLoginState,
@@ -439,7 +434,6 @@ async fn finish_claimed_login(
             code_verifier: &state.verifier,
         },
         allow_test_loopback,
-        endpoints.timeout,
         None,
         state.proxy_url.as_deref(),
     )
@@ -450,7 +444,6 @@ async fn finish_claimed_login(
         &endpoints.profile,
         &tokens.access_token,
         allow_test_loopback,
-        endpoints.timeout,
         state.proxy_url.as_deref(),
     )
     .await?;
@@ -480,7 +473,7 @@ async fn finish_claimed_login(
 }
 
 pub async fn refresh_claude_credential(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     now: i64,
     allow_test_loopback: bool,
@@ -498,7 +491,7 @@ pub async fn refresh_claude_credential(
 }
 
 async fn refresh_claude_credential_at(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     now: i64,
     allow_test_loopback: bool,
@@ -525,7 +518,6 @@ async fn refresh_claude_credential_at(
             refresh_token: old_refresh_token,
         },
         allow_test_loopback,
-        endpoints.timeout,
         Some(request_guard),
         credential.proxy().map(|(url, _)| url),
     )
@@ -547,7 +539,7 @@ async fn refresh_claude_credential_at(
 }
 
 pub async fn revoke_claude_credential(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
 ) -> Result<ClaudeRevokeStatus, AppError> {
@@ -561,7 +553,7 @@ pub async fn revoke_claude_credential(
 }
 
 async fn revoke_claude_credential_at(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
     endpoints: &ClaudeEndpoints,
@@ -605,7 +597,6 @@ async fn revoke_claude_credential_at(
             token: refresh_token,
             token_type_hint: "refresh_token",
         })
-        .timeout(endpoints.timeout)
         .send()
         .await;
     let Ok(response) = response else {
@@ -645,11 +636,10 @@ pub fn claude_account_id(credential: &UpstreamCredential) -> Result<Uuid, AppErr
 }
 
 async fn post_token_grant<T: Serialize + ?Sized>(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     grant: &T,
     allow_test_loopback: bool,
-    timeout: Duration,
     request_guard: Option<&dyn OAuthRefreshRequestGuard>,
     proxy_url: Option<&str>,
 ) -> Result<TokenResponse, AppError> {
@@ -659,7 +649,6 @@ async fn post_token_grant<T: Serialize + ?Sized>(
         .header(ACCEPT, "application/json")
         .header(CONTENT_TYPE, "application/json")
         .json(grant)
-        .timeout(timeout)
         .build()
         .map_err(|_| claude_error())?;
     if let Some(request_guard) = request_guard {
@@ -674,11 +663,10 @@ async fn post_token_grant<T: Serialize + ?Sized>(
 }
 
 async fn fetch_profile_account_id(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     access_token: &str,
     allow_test_loopback: bool,
-    timeout: Duration,
     proxy_url: Option<&str>,
 ) -> Result<Uuid, AppError> {
     validate_secret(access_token)?;
@@ -688,7 +676,6 @@ async fn fetch_profile_account_id(
         .header(ACCEPT, "application/json")
         .header(AUTHORIZATION, format!("Bearer {access_token}"))
         .header("anthropic-beta", OAUTH_BETA_HEADER)
-        .timeout(timeout)
         .send()
         .await
         .map_err(|_| claude_error())?;
@@ -701,7 +688,7 @@ async fn fetch_profile_account_id(
 }
 
 async fn oauth_client(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     proxy_url: Option<&str>,
     allow_test_loopback: bool,
@@ -717,22 +704,11 @@ async fn oauth_client(
 }
 
 async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > RESPONSE_LIMIT as u64)
-    {
-        return Err(claude_error());
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| claude_error())?;
-        if body.len().saturating_add(chunk.len()) > RESPONSE_LIMIT {
-            return Err(claude_error());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    response
+        .bytes()
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|_| claude_error())
 }
 
 fn parse_manual_completion(value: &str) -> Result<(&str, &str), AppError> {
@@ -1167,10 +1143,9 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
             .mount(&slow)
             .await;
-        let mut slow_endpoints = ClaudeEndpoints::for_test(&slow.uri());
-        slow_endpoints.timeout = Duration::from_millis(25);
+        let slow_endpoints = ClaudeEndpoints::for_test(&slow.uri());
         let timeout = refresh_claude_credential_at(
-            &crate::build_http_client().unwrap(),
+            &crate::http_settings::tests::configured_timeout(25),
             &credential(Some("refresh-timeout")),
             now,
             true,
