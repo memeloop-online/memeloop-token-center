@@ -239,6 +239,34 @@ async fn request_history_real_services_acceptance() {
     assert_eq!(report["count"], 1);
     database.history_switch(true).await.unwrap();
     database.history_switch(false).await.unwrap();
+    for _ in 0..2 {
+        sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id, currency) VALUES ($1, $2, $3, 1, 'openai', 'history-model', 0, 0, 0, 'gap://fixture/request', $4, 'USD')")
+            .bind(Uuid::now_v7().to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(Uuid::now_v7().to_string())
+            .execute(&database.pool).await.unwrap();
+    }
+    crate::request_history::migration::drain(&database, &client, 1)
+        .await
+        .unwrap();
+    let mut pagination = query.clone();
+    let mut observed = std::collections::BTreeSet::new();
+    loop {
+        let page = client.list(&pagination).await.unwrap();
+        for request in page.requests {
+            assert!(observed.insert(request["request_id"].as_str().unwrap().to_owned()));
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        pagination.cursor = Some(cursor);
+    }
+    assert_eq!(observed.len(), 3);
+    let report = crate::request_history::migration::verify(&database, &client)
+        .await
+        .unwrap();
+    assert_eq!(report["count"], 3);
+    let stats = client.statistics(&query).await.unwrap();
+    assert_eq!(stats.summary.pending_requests, 2);
+    assert!(stats.summary.total_cost.is_none());
     let ledger_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries")
         .fetch_one(&database.pool)
         .await

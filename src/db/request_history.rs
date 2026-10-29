@@ -62,15 +62,34 @@ impl Database {
                 let enqueue = format!(
                     "INSERT INTO request_history_export ({COLUMNS}) {select} ON CONFLICT (source, request_id) DO UPDATE SET revision = {revision}, snapshot = NULL;"
                 );
+                let identity_guard = if event == "UPDATE" {
+                    if let Some((_, id, created_at)) = identity {
+                        let changed = format!(
+                            "OLD.{id} <> NEW.{id} OR OLD.tenant_id <> NEW.tenant_id OR OLD.key_id <> NEW.key_id OR OLD.{created_at} <> NEW.{created_at}"
+                        );
+                        match self.backend {
+                            DatabaseBackend::PostgreSql => format!(
+                                "IF {changed} THEN RAISE EXCEPTION 'request_history_identity_changed'; END IF;"
+                            ),
+                            DatabaseBackend::Sqlite => format!(
+                                "SELECT RAISE(ABORT, 'request_history_identity_changed') WHERE {changed};"
+                            ),
+                        }
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
                 let name = format!("history_{table}_{}", event.to_lowercase());
                 let sql = match self.backend {
                     DatabaseBackend::PostgreSql => format!(
-                        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $history$ BEGIN PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; {enqueue} RETURN NULL; END $history$;
+                        "CREATE OR REPLACE FUNCTION {name}() RETURNS trigger LANGUAGE plpgsql AS $history$ BEGIN PERFORM id FROM request_history_state WHERE id = 1 FOR SHARE; {identity_guard} {enqueue} RETURN NULL; END $history$;
                          DROP TRIGGER IF EXISTS {name} ON {table};
                          CREATE TRIGGER {name} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {name}();"
                     ),
                     DatabaseBackend::Sqlite => format!(
-                        "CREATE TRIGGER IF NOT EXISTS {name} AFTER {event} ON {table} BEGIN {enqueue} END;"
+                        "CREATE TRIGGER IF NOT EXISTS {name} AFTER {event} ON {table} BEGIN {identity_guard} {enqueue} END;"
                     ),
                 };
                 sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
