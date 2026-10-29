@@ -14,6 +14,7 @@ pub(crate) struct Persistence {
     accepted: AtomicU64,
     rejected: AtomicU64,
     failed: AtomicU64,
+    archives: AtomicU64,
 }
 
 impl Default for Persistence {
@@ -25,6 +26,7 @@ impl Default for Persistence {
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            archives: AtomicU64::new(0),
         }
     }
 }
@@ -48,6 +50,13 @@ impl Persistence {
 
     #[cfg(test)]
     pub(crate) async fn drain_for_test(&self) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.archives.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all accepted archive bodies must finish their handoff");
         let _permits =
             tokio::time::timeout(Duration::from_secs(5), self.jobs.acquire_many(JOBS as u32))
                 .await
@@ -138,45 +147,162 @@ pub(super) fn capture(
     identity: crate::db::ArchiveSpoolIdentity,
     purpose: crate::response_archive_spool::BufferedArchivePurpose,
     body: Bytes,
+    memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) {
     let background = state.clone();
-    let nodes = crate::gateway_body::memory::JsonMemoryScanner::default().observe(&body);
-    let charge = body
-        .len()
-        .saturating_mul(3)
-        .saturating_add(nodes.saturating_mul(256))
-        .saturating_add(4 * 1024 * 1024);
-    state.persistence.submit(charge, async move {
+    state.persistence.accepted.fetch_add(1, Ordering::Relaxed);
+    state.persistence.archives.fetch_add(1, Ordering::Release);
+    tokio::spawn(async move {
+        let _memory = memory;
+        let _job = background
+            .persistence
+            .jobs
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("archive capture semaphore stays open");
         let db = &background.persistence_db;
-        if purpose == crate::response_archive_spool::BufferedArchivePurpose::Request {
-            if let Err(error) = db.publish_proxy_started_event(identity).await {
-                tracing::warn!(request_id = %identity.request_id, stage = "deferred_started_event", error_category = error.diagnostic_category(), "request event publication failed");
+        loop {
+            let result: Result<bool, AppError> = async {
+                if db
+                    .deferred_archive_is_captured(identity, purpose, &body)
+                    .await?
+                {
+                    return Ok(true);
+                }
+                let archive = BufferedArchive::new(
+                    identity,
+                    purpose,
+                    &body,
+                    background.config.key_pepper.as_bytes(),
+                    background.config.archive_spool_compression_enabled,
+                )?;
+                db.capture_deferred_archive(&archive).await
             }
-            if body.len() > 16 * 1024 * 1024 {
-                background.metrics.record_request_archive_gap(crate::metrics::RequestArchiveGapReason::RetentionLimit);
-                return db.record_deferred_request_retention_gap(identity, &body).await;
+            .await;
+            match result {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => {
+                    background
+                        .persistence
+                        .failed
+                        .fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                        "buffered archive capture retains original bytes for retry");
+                }
             }
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        let retained = archive_retention::prepare_json_body_if_valid(&body);
-        let body = retained.as_ref().map_or_else(
-            || body.clone(), |retained| archive_retention::encode_json_body(&body, retained),
-        );
-        drop(retained);
-        let archive = BufferedArchive::new(
-            identity, purpose, &body, background.config.key_pepper.as_bytes(),
-            background.config.archive_spool_compression_enabled,
-        )?;
-        if !db.capture_deferred_archive(&archive).await?
-            && purpose == crate::response_archive_spool::BufferedArchivePurpose::Request {
-            background.metrics.record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity);
-        }
-        Ok(())
+        background
+            .persistence
+            .archives
+            .fetch_sub(1, Ordering::Release);
     });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn buffered_archive_waits_off_frontend_and_retries_without_losing_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("buffered-recovery.db").display()
+        );
+        let state = AppState::initialize(crate::config::Config::for_test(database_url.clone()))
+            .await
+            .unwrap();
+        let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+        let identity = crate::db::ArchiveSpoolIdentity {
+            request_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            reservation_id: Uuid::new_v4(),
+        };
+        sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'openai', 'test', 0, 0, 0, 'inline-json:{}', $4)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+            .bind(Uuid::new_v4().to_string()).bind(identity.reservation_id.to_string())
+            .execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER pause_buffered_capture BEFORE INSERT ON response_archive_spool_chunks BEGIN SELECT RAISE(ABORT, 'injected archive outage'); END")
+            .execute(&pool).await.unwrap();
+        let jobs = state
+            .persistence
+            .jobs
+            .clone()
+            .acquire_many_owned(JOBS as u32)
+            .await
+            .unwrap();
+        let memory = state.proxy_memory_budget.reservation();
+        assert!(memory.reserve_buffered_response(64 * 1024, tokio::time::Instant::now()));
+        let body = Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"complete answer","tool_calls":[{"id":"call","type":"function","function":{"name":"search","arguments":"{}"}}]}}],"provider_field":"original"}"#);
+        capture(
+            &state,
+            identity,
+            crate::response_archive_spool::BufferedArchivePurpose::Response,
+            body.clone(),
+            memory,
+        );
+        assert_eq!(state.persistence.rejected.load(Ordering::Relaxed), 0);
+        assert_eq!(state.persistence.archives.load(Ordering::Acquire), 1);
+        assert!(state.proxy_memory_budget.snapshot().0 > 0);
+        drop(jobs);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.persistence.failed.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(state.proxy_memory_budget.snapshot().0 > 0);
+        sqlx::query("DROP TRIGGER pause_buffered_capture")
+            .execute(&pool)
+            .await
+            .unwrap();
+        state.persistence.drain_for_test().await;
+        assert!(
+            state
+                .db
+                .deferred_archive_is_captured(
+                    identity,
+                    crate::response_archive_spool::BufferedArchivePurpose::Response,
+                    &body,
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !state
+                .db
+                .deferred_archive_is_captured(
+                    identity,
+                    crate::response_archive_spool::BufferedArchivePurpose::Response,
+                    &vec![b'x'; body.len()],
+                )
+                .await
+                .unwrap()
+        );
+        assert!(crate::response_archive_spool::process_one_for_test(&state).await);
+        let locator: String =
+            sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state.archive.get(&locator).await.unwrap(), body);
+        assert!(!crate::response_archive_spool::process_one_for_test(&state).await);
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, 0);
+        assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+        pool.close().await;
+        state.db.close().await;
+    }
 
     #[tokio::test]
     async fn observations_leave_existing_health_work_a_job_without_waiting() {

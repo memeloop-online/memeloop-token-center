@@ -743,6 +743,15 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         ),
     },
     Migration {
+        version: 143,
+        name: "archive spool storage accounting and ready indexes",
+        sql: concat!(
+            include_str!("../../../migrations/sqlite/0143_archive_spool_storage_accounting.sql"),
+            "\n",
+            include_str!("../../../migrations/common/0143_archive_spool_ready_indexes.sql"),
+        ),
+    },
+    Migration {
         version: 144,
         name: "retire unused failover deadline config",
         sql: include_str!("../../../migrations/sqlite/0144_retire_failover_deadline.sql"),
@@ -1468,6 +1477,15 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "usage analysis compaction probe index",
         sql: include_str!(
             "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
+        ),
+    },
+    Migration {
+        version: 143,
+        name: "archive spool storage accounting and ready indexes",
+        sql: concat!(
+            include_str!("../../../migrations/postgres/0143_archive_spool_storage_accounting.sql"),
+            "\n",
+            include_str!("../../../migrations/common/0143_archive_spool_ready_indexes.sql"),
         ),
     },
     Migration {
