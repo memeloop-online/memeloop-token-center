@@ -1,5 +1,5 @@
-//! Bounded reads of existing immutable context nodes. No archive objects or
-//! tool bodies are read by the context-page query.
+//! Bounded pages of immutable context references. Small message objects are
+//! loaded directly from the archive; tool bodies are loaded only on demand.
 use super::*;
 
 pub(crate) const CONTEXT_PAGE_NODES: i64 = 32;
@@ -93,42 +93,53 @@ impl Database {
                  FROM context_nodes n JOIN path p ON n.node_hash = p.parent_hash \
                  AND n.depth = p.depth - 1 WHERE n.tenant_id = $1 AND p.step < $3\
              ) \
-             SELECT p.node_hash, p.parent_hash, p.atom_hash, p.depth, a.role, a.kind, \
-                    CASE WHEN a.role IN ('user', 'assistant') \
-                         AND a.kind IN ('message', 'agent_message') \
-                         THEN CAST(LENGTH(a.content_json) AS BIGINT) \
-                         ELSE NULL END AS content_chars, \
-                    CASE WHEN a.role IN ('user', 'assistant') \
-                         AND a.kind IN ('message', 'agent_message') \
-                         AND LENGTH(a.content_json) <= $4 \
-                         THEN a.content_json ELSE NULL END AS content_json \
+             SELECT p.node_hash, p.parent_hash, p.atom_hash, p.depth, a.role, a.kind, a.content_json \
              FROM path p LEFT JOIN semantic_atoms a \
              ON a.tenant_id = $1 AND a.content_hash = p.atom_hash ORDER BY p.step DESC",
         )
         .bind(scope.tenant_id.to_string())
         .bind(head)
         .bind(CONTEXT_PAGE_NODES)
-        .bind(CONTEXT_INLINE_CHARS)
         .fetch_all(&self.pool)
         .await?;
         let mut nodes = Vec::with_capacity(rows.len());
         for row in rows {
             let encoded: Option<String> = row.try_get("content_json")?;
+            let role: String = row
+                .try_get::<Option<String>, _>("role")?
+                .ok_or_else(context_gap)?;
+            let kind: String = row
+                .try_get::<Option<String>, _>("kind")?
+                .ok_or_else(context_gap)?;
+            let readable = matches!(role.as_str(), "user" | "assistant")
+                && matches!(kind.as_str(), "message" | "agent_message");
+            let content_chars = if readable {
+                Some(super::object_bodies::body_reference_chars(
+                    encoded.as_deref().ok_or_else(context_gap)?,
+                )?)
+            } else {
+                None
+            };
+            let content = if content_chars.is_some_and(|chars| chars <= CONTEXT_INLINE_CHARS) {
+                let body = self
+                    .read_body_reference(
+                        scope.tenant_id,
+                        encoded.as_deref().ok_or_else(context_gap)?,
+                    )
+                    .await?;
+                Some(serde_json::from_str(&body).map_err(|_| context_gap())?)
+            } else {
+                None
+            };
             let node = SessionContextNode {
                 hash: row.try_get("node_hash")?,
                 parent: row.try_get("parent_hash")?,
                 atom: row.try_get("atom_hash")?,
                 depth: row.try_get("depth")?,
-                role: row
-                    .try_get::<Option<String>, _>("role")?
-                    .ok_or_else(context_gap)?,
-                kind: row
-                    .try_get::<Option<String>, _>("kind")?
-                    .ok_or_else(context_gap)?,
-                content_chars: row.try_get("content_chars")?,
-                content: encoded
-                    .map(|value| serde_json::from_str(&value).map_err(|_| context_gap()))
-                    .transpose()?,
+                role,
+                kind,
+                content_chars,
+                content,
             };
             if node.depth < 1
                 || crate::conversation::digest_parts(node.parent.as_deref(), &node.atom)
@@ -146,8 +157,7 @@ impl Database {
         })
     }
 
-    /// Only called with a node/atom pair from a verified item cursor. SQL
-    /// returns one character range, never the entire potentially huge body.
+    /// Only called with a node/atom pair from a verified item cursor.
     pub(crate) async fn session_context_content(
         &self,
         scope: &SessionContextScope,
@@ -161,8 +171,7 @@ impl Database {
             ));
         }
         let row = sqlx::query(
-            "SELECT SUBSTR(a.content_json, $4, $5) AS content, \
-                    CAST(LENGTH(a.content_json) AS BIGINT) AS total_chars \
+            "SELECT a.content_json \
              FROM context_nodes n JOIN semantic_atoms a \
              ON a.tenant_id = n.tenant_id AND a.content_hash = n.atom_hash \
              WHERE n.tenant_id = $1 AND n.node_hash = $2 AND n.atom_hash = $3",
@@ -170,19 +179,16 @@ impl Database {
         .bind(scope.tenant_id.to_string())
         .bind(node)
         .bind(atom)
-        .bind(
-            i32::try_from(offset + 1)
-                .map_err(|_| AppError::BadRequest("context offset exceeds storage limit".into()))?,
-        )
-        .bind(CONTEXT_CONTENT_CHARS as i32)
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(context_gap)?;
-        Ok((row.try_get("content")?, row.try_get("total_chars")?))
+        let encoded: String = row.try_get("content_json")?;
+        let body = self.read_body_reference(scope.tenant_id, &encoded).await?;
+        super::object_bodies::text_slice(&body, offset, CONTEXT_CONTENT_CHARS)
     }
 
     /// Extract only declared message text. Mixed Anthropic tool results and
-    /// media never leave the database through the default user-message reader.
+    /// media never leave the archive through the default user-message reader.
     /// This uses the existing atom, not a second persisted copy of its text.
     pub(crate) async fn session_context_text(
         &self,
@@ -194,53 +200,37 @@ impl Database {
         if !(0..=i64::MAX - CONTEXT_CONTENT_CHARS - 1).contains(&offset) {
             return Err(AppError::BadRequest("invalid context text offset".into()));
         }
-        let extraction = match self.backend {
-            DatabaseBackend::PostgreSql => "
-                CASE jsonb_typeof(a.content_json::jsonb->'content')
-                  WHEN 'string' THEN a.content_json::jsonb->>'content'
-                  WHEN 'array' THEN COALESCE((
-                    SELECT string_agg(part.value->>'text', '' ORDER BY part.ordinal)
-                    FROM jsonb_array_elements(a.content_json::jsonb->'content') WITH ORDINALITY AS part(value, ordinal)
-                    WHERE part.value->>'type' IN ('text', 'input_text', 'output_text')
-                      AND jsonb_typeof(part.value->'text') = 'string'
-                  ), '')
-                  ELSE '' END",
-            DatabaseBackend::Sqlite => "
-                CASE json_type(a.content_json, '$.content')
-                  WHEN 'text' THEN json_extract(a.content_json, '$.content')
-                  WHEN 'array' THEN COALESCE((
-                    SELECT group_concat(text, '') FROM (
-                      SELECT json_extract(CASE WHEN part.type = 'object' THEN part.value ELSE '{}' END, '$.text') AS text
-                      FROM json_each(a.content_json, '$.content') part
-                      WHERE part.type = 'object'
-                        AND json_extract(CASE WHEN part.type = 'object' THEN part.value ELSE '{}' END, '$.type') IN ('text', 'input_text', 'output_text')
-                        AND json_type(CASE WHEN part.type = 'object' THEN part.value ELSE '{}' END, '$.text') = 'text'
-                      ORDER BY CAST(part.key AS INTEGER)
-                    )
-                  ), '')
-                  ELSE '' END",
-        };
-        let statement = format!(
-            "WITH message AS (SELECT {extraction} AS text \
+        let row = sqlx::query(
+            "SELECT a.content_json \
              FROM context_nodes n JOIN semantic_atoms a \
              ON a.tenant_id = n.tenant_id AND a.content_hash = n.atom_hash \
              WHERE n.tenant_id = $1 AND n.node_hash = $2 AND n.atom_hash = $3 \
-               AND a.role IN ('user', 'assistant') AND a.kind IN ('message', 'agent_message')) \
-             SELECT SUBSTR(text, $4, $5) AS content, CAST(LENGTH(text) AS BIGINT) AS total_chars FROM message"
-        );
-        let row =
-            sqlx::query(sqlx::AssertSqlSafe(statement))
-                .bind(scope.tenant_id.to_string())
-                .bind(node)
-                .bind(atom)
-                .bind(i32::try_from(offset + 1).map_err(|_| {
-                    AppError::BadRequest("context offset exceeds storage limit".into())
-                })?)
-                .bind(CONTEXT_CONTENT_CHARS as i32)
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or_else(context_gap)?;
-        Ok((row.try_get("content")?, row.try_get("total_chars")?))
+               AND a.role IN ('user', 'assistant') AND a.kind IN ('message', 'agent_message')",
+        )
+        .bind(scope.tenant_id.to_string())
+        .bind(node)
+        .bind(atom)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(context_gap)?;
+        let encoded: String = row.try_get("content_json")?;
+        let body = self.read_body_reference(scope.tenant_id, &encoded).await?;
+        let document: Value = serde_json::from_str(&body).map_err(|_| context_gap())?;
+        let text = match document.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter(|part| {
+                    matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("text" | "input_text" | "output_text")
+                    )
+                })
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<String>(),
+            _ => String::new(),
+        };
+        super::object_bodies::text_slice(&text, offset, CONTEXT_CONTENT_CHARS)
     }
 }
 

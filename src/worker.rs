@@ -1007,13 +1007,15 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
     }
 }
 
-/// 读取原始请求 JSON 和原始返回 JSON 的 locator，整理会话正文并写入 CNPG。
+/// 读取原始请求/返回，正文写对象存储，CNPG 仅记录引用和投影元数据。
 /// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
 pub(crate) async fn archive_session_body(
     state: &AppState,
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
+    let (tenant_id, hints, response_complete) =
+        state.db.conversation_object_context(request_id).await?;
     let Some(locators) = state.db.session_body_locators(request_id).await? else {
         return skip_session_body(
             state,
@@ -1088,7 +1090,6 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
-    drop(request_bytes);
     // locator 读出来的占位文档没有对话字段时，改用结算时留下的缩减请求 JSON。
     if request_document.get("messages").is_none()
         && request_document.get("input").is_none()
@@ -1121,15 +1122,29 @@ pub(crate) async fn archive_session_body(
     };
     let return_document = crate::conversation::raw_return_document(&return_bytes)
         .unwrap_or_else(|| serde_json::json!({}));
-    drop(return_bytes);
+    state
+        .archive
+        .capture_conversation_documents(
+            tenant_id,
+            request_id,
+            &hints,
+            request_bytes,
+            return_bytes,
+            response_complete,
+        )
+        .await?;
     let mut body =
         crate::conversation::session_body_from_documents(&request_document, &return_document);
     drop(request_document);
     drop(return_document);
     let pending_media = body.take_media_bytes();
     for (turn_index, part_index, bytes) in pending_media {
-        match state.archive.put_content(bytes::Bytes::from(bytes)).await {
-            Ok(locator) => body.set_media_locator(turn_index, part_index, locator),
+        match state
+            .archive
+            .put_tenant_content(tenant_id, bytes::Bytes::from(bytes))
+            .await
+        {
+            Ok(object) => body.set_media_locator(turn_index, part_index, object.object_locator),
             Err(error) => {
                 tracing::warn!(
                     %error,

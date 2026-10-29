@@ -211,6 +211,7 @@ impl AppState {
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
+        let db = db.with_archive(archive.clone());
         responses_request_spool = responses_request_spool.with_archive(archive.clone());
         let persistence_db = db.independent_persistence_pool();
         let routing_persistence_db = db.independent_persistence_pool();

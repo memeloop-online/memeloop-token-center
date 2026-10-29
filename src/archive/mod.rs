@@ -21,6 +21,9 @@ mod backend;
 mod cas;
 mod compressed;
 mod conversation;
+mod conversation_capture;
+#[cfg(test)]
+mod conversation_capture_tests;
 mod download;
 mod multipart;
 mod objects;
@@ -30,8 +33,9 @@ mod staging;
 
 pub use cas::CasArchiveObject;
 pub use conversation::{
-    ConversationEvent, ConversationExport, ConversationManifest, ConversationMedia,
-    ConversationPrefix, ConversationReadLimits, RawConversationCapture, RawConversationFormat,
+    ConversationBodyReference, ConversationEvent, ConversationExport, ConversationManifest,
+    ConversationMedia, ConversationPrefix, ConversationReadLimits, RawConversationCapture,
+    RawConversationFormat,
 };
 pub use download::ArchiveDownload;
 #[cfg(test)]

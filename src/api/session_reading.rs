@@ -279,6 +279,32 @@ pub(super) async fn self_session_dialogue(
     session_dialogue(&state, scope).await.map(Json)
 }
 
+pub(super) async fn internal_session_training(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, request_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<ContextQuery>,
+) -> Result<Json<crate::archive::ConversationExport>, AppError> {
+    let scope = operator_scope(&state, &headers, &query, session_id, request_id).await?;
+    let reference = state
+        .archive
+        .request_conversation_reference(scope.tenant_id, scope.request_id)
+        .await?;
+    state
+        .archive
+        .export_conversation(
+            scope.tenant_id,
+            &reference,
+            crate::archive::ConversationReadLimits {
+                max_events: 1_000_000,
+                max_object_bytes: 128 * 1024 * 1024,
+                max_total_bytes: 4 * 1024 * 1024 * 1024,
+            },
+        )
+        .await
+        .map(Json)
+}
+
 async fn session_dialogue(
     state: &AppState,
     scope: SessionContextScope,

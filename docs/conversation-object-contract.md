@@ -1,8 +1,20 @@
 # Conversation object contract v1
 
-This is an additive product contract on the existing `ArchiveStore`, not an
-enabled storage migration. Deployment, external migration commands, application
-read/write cutover and retirement of the old schema remain separate gates.
+This topic wires conversation body writers and readers to the existing
+`ArchiveStore`. It is not safe to deploy over unmigrated rows: readers reject
+legacy plaintext instead of silently falling back. External migration,
+verification, cutover and source retirement are deployment gates.
+
+The long-lived archive retains exact raw JSON/SSE alongside conversation and
+media objects. Raw request cache eviction is separate; it must never target
+`tenants/*/cas/` or conversation roots. Raw captures in manifests reference
+long-lived archive objects, not evictable cache objects.
+
+`semantic_atoms.content_json` temporarily holds only a
+`ConversationBodyReference` (CAS reference plus Unicode character count).
+This avoids colliding with the coordinated accounting/transport migrations.
+Renaming that metadata column and dropping retired body/spool columns belong
+to a separately numbered, post-verification cleanup migration.
 
 ## Objects and identity
 

@@ -445,6 +445,9 @@ impl Database {
     ) -> Result<(), AppError> {
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
+        let atoms = self
+            .archive_atom_bodies(parse_uuid(tenant_id.to_owned())?, &atoms)
+            .await?;
         let mut transaction = self.begin_write_transaction().await?;
         let result = materialize_conversation_content_with_statement_error(
             &mut transaction,
@@ -705,6 +708,19 @@ impl Database {
         nodes: &[PrefixNode],
         media: &[crate::conversation::SessionMediaLocator],
     ) -> Result<bool, AppError> {
+        let tenant_id: Option<String> = sqlx::query_scalar(
+            "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(tenant_id) = tenant_id else {
+            return Ok(false);
+        };
+        let archived_atoms = self
+            .archive_atom_bodies(parse_uuid(tenant_id)?, atoms)
+            .await?;
         let mut transaction = self.begin_write_transaction().await?;
         let now = unix_millis();
         let row = sqlx::query(
@@ -724,7 +740,7 @@ impl Database {
         materialize_conversation_content_in_transaction(
             &mut transaction,
             &tenant_id,
-            atoms,
+            &archived_atoms,
             nodes,
             observed_at,
         )
@@ -823,7 +839,8 @@ impl Database {
         .await?;
         let mut turns = Vec::with_capacity(rows.len());
         for row in rows {
-            let content: String = row.try_get("content_json")?;
+            let reference: String = row.try_get("content_json")?;
+            let content = self.read_body_reference(tenant_id, &reference).await?;
             let value = serde_json::from_str(&content)
                 .map_err(|_| AppError::internal("conversations_export_training_dialogue_1"))?;
             turns.push(value);
@@ -1368,10 +1385,11 @@ impl Database {
 
         let tenant_id = key.tenant_id.to_string();
         if !content_materialized {
+            let archived_atoms = self.archive_atom_bodies(key.tenant_id, &atoms).await?;
             materialize_conversation_content_in_transaction(
                 transaction,
                 &tenant_id,
-                &atoms,
+                &archived_atoms,
                 &nodes,
                 now,
             )
@@ -2864,6 +2882,7 @@ impl Database {
         }
         let mut transaction = self.begin_write_transaction().await?;
         let result = insert_streamed_conversation_content(
+            self,
             &mut transaction,
             tenant_id,
             request_json,
@@ -2891,6 +2910,7 @@ impl Database {
 }
 
 async fn insert_streamed_conversation_content(
+    database: &Database,
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
     request_json: String,
@@ -2923,6 +2943,9 @@ async fn insert_streamed_conversation_content(
             );
             break;
         };
+        let content_json = database
+            .store_body_reference(parse_uuid(tenant_id.to_owned())?, content_json)
+            .await?;
         drop(content);
         depth += 1;
         let node_hash = crate::conversation::digest_parts(parent.as_deref(), &content_hash);

@@ -29,7 +29,7 @@ pub struct ConversationMedia {
 #[serde(deny_unknown_fields)]
 pub struct ConversationEvent {
     pub event_id: String,
-    pub request_id: String,
+    pub request_id: Option<String>,
     pub branch_id: String,
     pub parent_event_id: Option<String>,
     pub agent_id: Option<String>,
@@ -94,6 +94,13 @@ pub struct ConversationReadLimits {
     pub max_total_bytes: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConversationBodyReference {
+    pub conversation_body_v1: CasArchiveObject,
+    pub chars: u64,
+}
+
 struct ReadBudget {
     limits: ConversationReadLimits,
     consumed: u64,
@@ -150,7 +157,7 @@ fn validate_manifest(tenant_id: Uuid, manifest: &ConversationManifest) -> Result
 
 fn validate_event(tenant_id: Uuid, event: &ConversationEvent) -> Result<(), AppError> {
     if event.event_id.is_empty()
-        || event.request_id.is_empty()
+        || event.request_id.as_ref().is_some_and(String::is_empty)
         || event.branch_id.is_empty()
         || event.origin.is_empty()
         || event.kind.is_empty()

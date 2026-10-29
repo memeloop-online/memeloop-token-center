@@ -19,7 +19,7 @@ fn event(
 ) -> ConversationEvent {
     ConversationEvent {
         event_id: event_id.to_owned(),
-        request_id: "request-1".into(),
+        request_id: Some("request-1".into()),
         branch_id: branch_id.into(),
         parent_event_id: parent.map(str::to_owned),
         agent_id: Some("agent-1".into()),

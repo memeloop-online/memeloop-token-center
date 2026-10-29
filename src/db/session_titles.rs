@@ -190,16 +190,22 @@ impl Database {
              selected AS (SELECT p.atom_hash FROM path p JOIN semantic_atoms a \
                  ON a.tenant_id = $1 AND a.content_hash = p.atom_hash \
                  WHERE a.role = 'user' AND a.kind = 'message' ORDER BY p.depth {order} LIMIT 1) \
-             SELECT SUBSTR(a.content_json, 1, 1024) FROM selected \
+             SELECT a.content_json FROM selected \
              JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = selected.atom_hash"
         );
-        Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+        let reference: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
             .bind(task.tenant_id.to_string())
             .bind(task.key_id.to_string())
             .bind(task.session_id.to_string())
             .fetch_optional(&self.pool)
-            .await?
-            .unwrap_or_default())
+            .await?;
+        match reference {
+            Some(reference) => {
+                let body = self.read_body_reference(task.tenant_id, &reference).await?;
+                Ok(body.chars().take(1024).collect())
+            }
+            None => Ok(String::new()),
+        }
     }
 
     /// One indexed batch for the already authorized list page; never one

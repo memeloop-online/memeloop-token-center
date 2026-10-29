@@ -1,0 +1,156 @@
+use super::*;
+use crate::archive::{ArchiveStore, ConversationBodyReference};
+use bytes::Bytes;
+
+const MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
+
+impl Database {
+    pub(crate) async fn conversation_object_context(
+        &self,
+        request_id: Uuid,
+    ) -> Result<(Uuid, crate::conversation::ConversationHints, bool), AppError> {
+        let row = sqlx::query(
+            "SELECT o.tenant_id, o.hints_json, (SELECT CAST(CASE WHEN r.completed_at IS NOT NULL AND r.status_code BETWEEN 200 AND 299 AND r.error_code IS NULL THEN 1 ELSE 0 END AS BIGINT) FROM request_records r WHERE r.id = o.request_id LIMIT 1) AS complete FROM conversation_projection_outbox o WHERE o.request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        let hints: String = row.try_get("hints_json")?;
+        Ok((
+            parse_uuid(row.try_get("tenant_id")?)?,
+            serde_json::from_str(&hints)
+                .map_err(|_| AppError::storage("conversation_hints_invalid"))?,
+            row.try_get::<Option<i64>, _>("complete")? == Some(1),
+        ))
+    }
+
+    pub fn with_archive(mut self, archive: ArchiveStore) -> Self {
+        self.archive = Some(archive);
+        self
+    }
+
+    pub(crate) fn body_archive(&self) -> Result<&ArchiveStore, AppError> {
+        self.archive
+            .as_ref()
+            .ok_or_else(|| AppError::storage("conversation_archive_not_configured"))
+    }
+
+    pub(crate) async fn store_body_reference(
+        &self,
+        tenant_id: Uuid,
+        document: String,
+    ) -> Result<String, AppError> {
+        let chars = document.chars().count() as u64;
+        let object = self
+            .body_archive()?
+            .put_tenant_content(tenant_id, Bytes::from(document))
+            .await?;
+        serde_json::to_string(&ConversationBodyReference {
+            conversation_body_v1: object,
+            chars,
+        })
+        .map_err(|_| AppError::internal("conversation_body_reference_encode"))
+    }
+
+    pub(crate) async fn read_body_reference(
+        &self,
+        tenant_id: Uuid,
+        encoded: &str,
+    ) -> Result<String, AppError> {
+        let reference: ConversationBodyReference = serde_json::from_str(encoded)
+            .map_err(|_| AppError::storage("conversation_object_migration_required"))?;
+        let bytes = self
+            .body_archive()?
+            .get_tenant_content(tenant_id, &reference.conversation_body_v1, MAX_BODY_BYTES)
+            .await?;
+        let document = String::from_utf8(bytes.to_vec())
+            .map_err(|_| AppError::storage("conversation_body_encoding_invalid"))?;
+        if document.chars().count() as u64 != reference.chars {
+            return Err(AppError::storage(
+                "conversation_body_character_count_mismatch",
+            ));
+        }
+        Ok(document)
+    }
+
+    pub(crate) async fn archive_atom_bodies(
+        &self,
+        tenant_id: Uuid,
+        atoms: &[crate::conversation::SemanticAtom],
+    ) -> Result<Vec<crate::conversation::SemanticAtom>, AppError> {
+        let mut references = Vec::with_capacity(atoms.len());
+        for atom in atoms {
+            let document = serde_json::to_string(&atom.content)
+                .map_err(|_| AppError::internal("conversation_body_encode"))?;
+            let reference = self.store_body_reference(tenant_id, document).await?;
+            references.push(crate::conversation::SemanticAtom {
+                role: atom.role.clone(),
+                kind: atom.kind.clone(),
+                content: serde_json::from_str(&reference)
+                    .map_err(|_| AppError::internal("conversation_body_reference_decode"))?,
+                content_hash: atom.content_hash.clone(),
+                instance_hash: atom.instance_hash.clone(),
+            });
+        }
+        Ok(references)
+    }
+}
+
+pub(super) fn body_reference_chars(encoded: &str) -> Result<i64, AppError> {
+    let reference: ConversationBodyReference = serde_json::from_str(encoded)
+        .map_err(|_| AppError::storage("conversation_object_migration_required"))?;
+    i64::try_from(reference.chars)
+        .map_err(|_| AppError::storage("conversation_body_character_count_invalid"))
+}
+
+pub(super) fn text_slice(text: &str, offset: i64, limit: i64) -> Result<(String, i64), AppError> {
+    let start = usize::try_from(offset)
+        .map_err(|_| AppError::BadRequest("invalid conversation text offset".into()))?;
+    let maximum = usize::try_from(limit)
+        .map_err(|_| AppError::BadRequest("invalid conversation text limit".into()))?;
+    let total = i64::try_from(text.chars().count())
+        .map_err(|_| AppError::storage("conversation_text_length_invalid"))?;
+    Ok((text.chars().skip(start).take(maximum).collect(), total))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn reference_only_writer_reader_round_trip_and_fail_closed_legacy() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let tenant = Uuid::now_v7();
+        let document = r#"{"role":"tool","content":"工具 result"}"#.to_owned();
+        let encoded = database
+            .store_body_reference(tenant, document.clone())
+            .await
+            .unwrap();
+        assert!(!encoded.contains("result"));
+        assert_eq!(
+            database
+                .read_body_reference(tenant, &encoded)
+                .await
+                .unwrap(),
+            document
+        );
+        assert_eq!(
+            body_reference_chars(&encoded).unwrap(),
+            document.chars().count() as i64
+        );
+        assert!(
+            database
+                .read_body_reference(Uuid::now_v7(), &encoded)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .read_body_reference(tenant, &document)
+                .await
+                .is_err()
+        );
+        assert_eq!(text_slice("甲乙丙丁", 1, 2).unwrap(), ("乙丙".into(), 4));
+    }
+}
