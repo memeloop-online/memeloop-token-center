@@ -1,7 +1,5 @@
-use std::{str::FromStr, time::Duration};
+use std::str::FromStr;
 
-use bytes::BytesMut;
-use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde_json::Value;
 
@@ -10,9 +8,7 @@ use crate::{
     network::{self, OutboundScope},
 };
 
-use super::{MAX_SOURCE_BYTES, MAX_SOURCE_PRICES, RemotePrice};
-
-const SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
+use super::{MAX_SOURCE_PRICES, RemotePrice};
 
 fn price_source_stage(source: &str) -> &'static str {
     match source {
@@ -36,50 +32,26 @@ pub(super) async fn fetch_source(
     url: &str,
     allow_test_loopback: bool,
 ) -> Result<(Vec<RemotePrice>, usize), AppError> {
-    let task = async {
-        let outbound =
-            network::client_for_url(http, url, OutboundScope::Public, allow_test_loopback).await?;
-        let response = outbound.get(url).send().await?;
-        if !response.status().is_success() {
-            return Err(AppError::upstream_with(
-                "price_source_http_status",
-                crate::error::ErrorFacts::new()
-                    .stage(price_source_stage(source))
-                    .status(response.status().as_u16()),
-            ));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_SOURCE_BYTES as u64)
-        {
-            return Err(price_upstream("price_source_response_too_large", source));
-        }
-        let mut bytes = BytesMut::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if bytes.len().saturating_add(chunk.len()) > MAX_SOURCE_BYTES {
-                return Err(AppError::upstream_with(
-                    "price_source_response_too_large",
-                    crate::error::ErrorFacts::new()
-                        .stage(price_source_stage(source))
-                        .limit(MAX_SOURCE_BYTES as u64),
-                ));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let document: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| price_upstream("price_source_invalid_json", source))?;
-        match source {
-            "models.dev" => parse_models_dev(&document),
-            "litellm" => parse_litellm(&document),
-            "openrouter" => parse_openrouter(&document),
-            _ => Err(AppError::internal("sources_fetch_source_1")),
-        }
-    };
-    tokio::time::timeout(SOURCE_TIMEOUT, task)
-        .await
-        .map_err(|_| price_upstream("price_source_timeout", source))?
+    let outbound =
+        network::client_for_url(http, url, OutboundScope::Public, allow_test_loopback).await?;
+    let response = outbound.get(url).send().await?;
+    if !response.status().is_success() {
+        return Err(AppError::upstream_with(
+            "price_source_http_status",
+            crate::error::ErrorFacts::new()
+                .stage(price_source_stage(source))
+                .status(response.status().as_u16()),
+        ));
+    }
+    let bytes = response.bytes().await?;
+    let document: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| price_upstream("price_source_invalid_json", source))?;
+    match source {
+        "models.dev" => parse_models_dev(&document),
+        "litellm" => parse_litellm(&document),
+        "openrouter" => parse_openrouter(&document),
+        _ => Err(AppError::internal("sources_fetch_source_1")),
+    }
 }
 
 fn parse_models_dev(document: &Value) -> Result<(Vec<RemotePrice>, usize), AppError> {
