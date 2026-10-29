@@ -356,6 +356,24 @@ async fn rewrite_reopened_session_body_if_present(
     Ok(())
 }
 
+pub(crate) async fn wake_session_body_archive_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "UPDATE conversation_projection_outbox
+         SET lease_expires_at = CASE WHEN lease_owner IS NULL THEN NULL ELSE lease_expires_at END,
+             terminal_lease_expires_at = NULL
+         WHERE request_id = $1 AND projected_at IS NULL
+           AND terminal_lease_owner IS NULL
+           AND (lease_owner IS NULL OR lease_owner = 'terminal-v118')",
+    )
+    .bind(request_id.to_string())
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
 impl Database {
     /// Retain conversation evidence without acknowledging financial settlement.
     /// The operational receipt supplies a stable timestamp for exact replay.
@@ -655,6 +673,33 @@ impl Database {
             .archive_atom_bodies(parse_uuid(tenant_id)?, atoms)
             .await?;
         let mut transaction = self.begin_write_transaction().await?;
+        let prepared = self
+            .prepare_session_body_archive_in_transaction(
+                &mut transaction,
+                lease_owner,
+                request_id,
+                &archived_atoms,
+                nodes,
+                media,
+            )
+            .await?;
+        if !prepared {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        transaction.commit().await?;
+        Ok(prepared)
+    }
+
+    pub(in crate::db) async fn prepare_session_body_archive_in_transaction(
+        &self,
+        transaction: &mut Transaction<'_, Any>,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        atoms: &[SemanticAtom],
+        nodes: &[PrefixNode],
+        media: &[crate::conversation::SessionMediaLocator],
+    ) -> Result<bool, AppError> {
         let now = unix_millis();
         let row = sqlx::query(
             "SELECT tenant_id, observed_at FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
@@ -662,18 +707,17 @@ impl Database {
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
         .bind(now)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
         let Some(row) = row else {
-            transaction.rollback().await?;
             return Ok(false);
         };
         let tenant_id: String = row.try_get("tenant_id")?;
         let observed_at: i64 = row.try_get("observed_at")?;
         materialize_conversation_content_in_transaction(
-            &mut transaction,
+            transaction,
             &tenant_id,
-            &archived_atoms,
+            atoms,
             nodes,
             observed_at,
         )
@@ -700,7 +744,7 @@ impl Database {
             .bind(item.byte_length)
             .bind(&item.content_blake3)
             .bind(&item.object_locator)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await?;
         }
         let snapshot = ConversationSemanticSnapshot {
@@ -716,13 +760,11 @@ impl Database {
         .bind(encoded)
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await?;
         if updated.rows_affected() != 1 {
-            transaction.rollback().await?;
             return Ok(false);
         }
-        transaction.commit().await?;
         Ok(true)
     }
 

@@ -134,7 +134,7 @@ async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queu
 }
 
 #[tokio::test]
-async fn failed_source_keeps_its_budget_until_bounded_status_handoff() {
+async fn failed_source_retries_the_original_bytes_without_releasing_their_budget() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
@@ -146,7 +146,7 @@ async fn failed_source_keeps_its_budget_until_bounded_status_handoff() {
     let store = MemoryObjectStore::new();
     store.fail_writes.store(true, Ordering::Release);
     let admission =
-        RequestSpoolAdmission::new(directory.path().to_owned()).with_memory_store(store);
+        RequestSpoolAdmission::new(directory.path().to_owned()).with_memory_store(store.clone());
     let budget = ProxyMemoryBudget::new(512 * 1024);
     let memory = budget.reservation();
     let request_id = uuid::Uuid::now_v7();
@@ -163,20 +163,66 @@ async fn failed_source_keeps_its_budget_until_bounded_status_handoff() {
             .await
             .unwrap(),
     );
-    source.retain_for_archive(
-        database.clone(),
-        ArchiveSpoolIdentity {
-            request_id,
-            tenant_id: uuid::Uuid::now_v7(),
-            reservation_id: uuid::Uuid::now_v7(),
-        },
+    let pepper = b"source-failure-real-admission-test-pepper";
+    let issued = database
+        .create_key(
+            crate::db::CreateKeyInput {
+                tenant_external_id: request_id.to_string(),
+                principal_external_id: "member".into(),
+                alias: "failed-source".into(),
+                currency: "USD".into(),
+                policy: crate::model::KeyPolicy::default(),
+                initial_balance: rust_decimal::Decimal::TEN,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(
+            "source",
+            "USD",
+            rust_decimal::Decimal::ONE,
+            rust_decimal::Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    database
+        .start_proxy_request_with_source(
+            crate::db::StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 1,
+                output_token_ceiling: 1,
+                protocol: "openai",
+                model: "source",
+                request_object: source.object_locator().unwrap(),
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            &source,
+            None,
+            Some(1),
+        )
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), source.upload_outcome())
+            .await
+            .is_err()
     );
-    assert!(!source.upload_outcome().await);
     source.release_retained();
     drop(source);
     drop(memory);
     assert!(budget.snapshot().0 >= 128 * 1024);
     drop(held);
+    store.fail_writes.store(false, Ordering::Release);
     tokio::time::timeout(Duration::from_secs(3), async {
         while budget.snapshot().0 != 0 {
             tokio::task::yield_now().await;

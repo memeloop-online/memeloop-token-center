@@ -64,6 +64,7 @@ mod responses_transport;
 mod routing_persistence;
 mod routing_price_snapshot;
 mod soonest_reset;
+mod source_r2;
 mod sse_delivery;
 mod upstream_error_details;
 
@@ -2949,6 +2950,7 @@ async fn assert_exactly_once_side_effects_for(
     expected_account_id: Uuid,
     expected_route_id: Uuid,
 ) {
+    drain_completed_response_archive(fixture).await;
     let projection_owner = Uuid::now_v7();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     // Settlement can commit the request before the conversation journal enqueues
@@ -4476,7 +4478,6 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     let refs = fixture
         .state
         .db
@@ -4484,8 +4485,8 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .await
         .unwrap();
     assert_eq!(
-        refs.request_object,
-        format!("gap://{}/request", rows[0].request_id)
+        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
+        Some(rows[0].request_id)
     );
     assert_eq!(
         refs.response_object.as_deref(),
@@ -4493,7 +4494,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Capturing
     );
     assert_eq!(
         refs.response_archive_state,

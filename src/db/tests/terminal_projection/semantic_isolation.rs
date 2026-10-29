@@ -58,6 +58,30 @@ async fn recovery_contract(database_url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
+    let mut legacy = database.begin_write_transaction().await.unwrap();
+    assert!(
+        Database::persist_legacy_conversation_payload_for_test(
+            &mut legacy,
+            request_id,
+            &key,
+            &body,
+        )
+        .await
+        .is_err()
+    );
+    legacy.rollback().await.unwrap();
+    let reject_enqueue = match database.backend {
+        DatabaseBackend::Sqlite => {
+            "CREATE TRIGGER reject_semantic_enqueue BEFORE INSERT ON conversation_projection_outbox BEGIN SELECT RAISE(ABORT, 'injected enqueue failure'); END;"
+        }
+        DatabaseBackend::PostgreSql => {
+            "CREATE FUNCTION reject_semantic_enqueue() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected enqueue failure'; END $$; CREATE TRIGGER reject_semantic_enqueue BEFORE INSERT ON conversation_projection_outbox FOR EACH ROW EXECUTE FUNCTION reject_semantic_enqueue();"
+        }
+    };
+    sqlx::raw_sql(reject_enqueue)
+        .execute(&database.pool)
+        .await
+        .unwrap();
     assert!(
         database
             .finish_proxy_request_deferred(input.clone())
@@ -80,6 +104,16 @@ async fn recovery_contract(database_url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
+    let drop_enqueue = match database.backend {
+        DatabaseBackend::Sqlite => "DROP TRIGGER reject_semantic_enqueue",
+        DatabaseBackend::PostgreSql => {
+            "DROP TRIGGER reject_semantic_enqueue ON conversation_projection_outbox; DROP FUNCTION reject_semantic_enqueue();"
+        }
+    };
+    sqlx::raw_sql(drop_enqueue)
+        .execute(&database.pool)
+        .await
+        .unwrap();
     database
         .finish_proxy_request_deferred(input.clone())
         .await
@@ -88,6 +122,19 @@ async fn recovery_contract(database_url: &str) {
         database.finish_proxy_request_deferred(input).await.unwrap(),
         FinishProxyRequestResult::AlreadyFinished { .. }
     ));
+    let payloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(payloads, 0, "new enqueue must not persist raw payloads");
+    let mut legacy = database.begin_write_transaction().await.unwrap();
+    Database::persist_legacy_conversation_payload_for_test(&mut legacy, request_id, &key, &body)
+        .await
+        .unwrap();
+    legacy.commit().await.unwrap();
     let payload = sqlx::query("SELECT request_json, encoded_bytes, digest FROM conversation_semantic_payloads WHERE request_id = $1")
         .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
     let encoded: String = payload.get("request_json");
@@ -177,8 +224,11 @@ async fn recovery_contract(database_url: &str) {
             .await
             .unwrap()
     );
-    sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)")
-        .bind(request_id.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(key.principal_id.to_string()).bind(encoded.len() as i64).bind(payload.get::<String, _>("digest")).bind(&encoded).execute(&database.pool).await.unwrap();
+    let mut legacy = database.begin_write_transaction().await.unwrap();
+    Database::persist_legacy_conversation_payload_for_test(&mut legacy, request_id, &key, &body)
+        .await
+        .unwrap();
+    legacy.commit().await.unwrap();
     assert!(
         database
             .claim_conversation_projection_tasks(stale, 32)

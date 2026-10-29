@@ -1003,18 +1003,27 @@ pub(crate) async fn archive_session_body(
             }
             bytes
         }
-        Err(_)
-            if (locators.source_identity.is_some() && !locators.source_failed)
-                || (locators.source_identity.is_none()
-                    && !missing_raw_document(&locators.request)) =>
-        {
-            state
-                .db
-                .defer_session_body_archive(lease_owner, request_id)
-                .await?;
-            return Ok(false);
-        }
         Err(_) => {
+            let retry = if let Some(identity) = locators.source_identity {
+                state
+                    .archive
+                    .source_object_exists(&locators.request)
+                    .await?
+                    || (!locators.source_failed
+                        && !state
+                            .db
+                            .recover_request_source(identity, &locators.request)
+                            .await?)
+            } else {
+                !missing_raw_document(&locators.request)
+            };
+            if retry {
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
             return skip_session_body(
                 state,
                 lease_owner,
@@ -1067,22 +1076,20 @@ pub(crate) async fn archive_session_body(
     drop(request_document);
     drop(return_document);
     let pending_media = body.take_media_bytes();
+    let mut uploaded_media = std::collections::HashMap::new();
     for (turn_index, part_index, bytes) in pending_media {
-        match state
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        if let Some(locator) = uploaded_media.get(&hash) {
+            body.set_media_locator(turn_index, part_index, String::clone(locator));
+            continue;
+        }
+        let locator = state
             .archive
             .put_tenant_content(tenant_id, bytes::Bytes::from(bytes))
-            .await
-        {
-            Ok(object) => body.set_media_locator(turn_index, part_index, object.object_locator),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %request_id,
-                    "会话正文归档未能把媒体字节写成 blake3 对象"
-                );
-                return Err(error);
-            }
-        }
+            .await?
+            .object_locator;
+        body.set_media_locator(turn_index, part_index, locator.clone());
+        uploaded_media.insert(hash, locator);
     }
     let (atoms, nodes) = body.into_prefix();
     let media = body.media_locators(&atoms);

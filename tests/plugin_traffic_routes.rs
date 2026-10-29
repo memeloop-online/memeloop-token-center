@@ -100,7 +100,7 @@ fn policy_wat(body: &str) -> String {
 }
 
 #[tokio::test]
-async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
+async fn small_text_input_can_expand_past_sixteen_mib_in_a_real_traffic_hook() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(successful_hint_response("expanded"))
@@ -121,13 +121,13 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
         fixture.model
     );
     let suffix = "\"}],\"stream\":false}";
-    let length = 16 * 1024 * 1024;
+    let length = 16 * 1024 * 1024 + 1;
     let pointer = 64 * 1024;
     let start = stores_for_string(pointer, &prefix);
     let end = stores_for_string(pointer + length - suffix.len(), suffix);
     let body = format!(
         r#"
-        i32.const 256 memory.grow drop
+        i32.const 257 memory.grow drop
         i32.const {pointer} i32.const 120 i32.const {length} memory.fill
         {start}
         {end}
@@ -146,12 +146,6 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
     fixture.state = AppState::initialize((*fixture.state.config).clone())
         .await
         .unwrap();
-    // Isolate this memory-admission boundary from the independently tested
-    // guest fuel ceiling: bulk-filling 16 MiB intentionally exceeds it.
-    fixture
-        .state
-        .plugins
-        .set_execution_limits_for_tests(std::time::Duration::from_secs(30), u64::MAX);
     let (status, response) = call_hint_routing_fixture(&fixture).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let received = upstream.received_requests().await.unwrap();
@@ -160,6 +154,62 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
         rewritten["messages"][0]["content"].as_str().unwrap().len(),
         length - prefix.len() - suffix.len()
     );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn traffic_rewrite_over_256_mib_reaches_upstream_with_service_memory_capacity() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("large-whitespace-rewrite"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut fixture = hint_routing_fixture_with_database(
+        "large-whitespace-rewrite",
+        upstream.uri(),
+        upstream.uri(),
+        false,
+        None,
+        None,
+    )
+    .await;
+    let rewritten = json!({
+        "model": fixture.model,
+        "messages": [{"role":"user", "content":"kept after padding"}],
+        "stream": false
+    });
+    let length: usize = 256 * 1024 * 1024 + 1;
+    let pointer: usize = 64 * 1024;
+    let pages = (pointer + length).div_ceil(65536);
+    let contents = stores_for_string(pointer, &serde_json::to_string(&rewritten).unwrap());
+    let body = format!(
+        r#"
+        i32.const {pages} memory.size i32.sub memory.grow
+        i32.const -1 i32.eq if unreachable end
+        i32.const {pointer} i32.const 32 i32.const {length} memory.fill
+        {contents}
+        i32.const 256 i32.const 0 i32.store
+        i32.const 260 i32.const 1 i32.store
+        i32.const 264 i32.const 0 i32.store
+        i32.const 276 i32.const 0 i32.store
+        i32.const 288 i32.const 0 i32.store
+        i32.const 300 i32.const 1 i32.store
+        i32.const 304 i32.const {pointer} i32.store
+        i32.const 308 i32.const {length} i32.store
+        i32.const 256
+        "#,
+    );
+    write_policy_package(fixture._directory.path(), &body, json!([]));
+    let mut config = (*fixture.state.config).clone();
+    config.proxy_memory_budget_bytes = 2 * 1024 * 1024 * 1024;
+    fixture.state = AppState::initialize(config).await.unwrap();
+    let (status, response) = call_hint_routing_fixture(&fixture).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let received = upstream.received_requests().await.unwrap();
+    let request: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(request["messages"], rewritten["messages"]);
+    assert!(received[0].body.len() < 1024);
     upstream.verify().await;
 }
 
@@ -1427,7 +1477,7 @@ async fn call(state: &AppState, key: &str, path: &str, body: Value) -> (StatusCo
 }
 
 #[tokio::test]
-async fn component_input_limit_returns_413_after_authentication_and_route_authorization() {
+async fn large_traffic_input_preserves_real_guest_errors_and_authorization() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
@@ -1454,8 +1504,6 @@ async fn component_input_limit_returns_413_after_authentication_and_route_author
     let length = 16 * 1024 * 1024 - 1;
     let overhead = serde_json::to_vec(&request).unwrap().len();
     request["prompt"] = json!("x".repeat(length - overhead));
-    // The image endpoint accepts this raw body, but its JSON plus authenticated
-    // context exceeds the component ABI limit. No guest/upstream may execute.
     assert_eq!(serde_json::to_vec(&request).unwrap().len(), length);
     let (status, body) = call(
         &state,
@@ -1464,8 +1512,8 @@ async fn component_input_limit_returns_413_after_authentication_and_route_author
         request.clone(),
     )
     .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(body["error"]["code"], "plugin_input_too_large");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"]["code"], "plugin_execution_failed");
     let (status, _) = call(
         &state,
         "invalid-test-key",

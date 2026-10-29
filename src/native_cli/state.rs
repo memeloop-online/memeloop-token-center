@@ -23,7 +23,7 @@ pub enum CliProvider {
     Cursor,
 }
 
-/// Independent immutable target binding is authenticated as AAD. The source
+/// Independent immutable target binding is stored and checked on read. The source
 /// handle is *not* a credential or authoritative target account identity.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -53,7 +53,7 @@ fn invalid() -> AppError {
     AppError::BadRequest("native CLI state carrier is invalid".into())
 }
 
-fn aad(binding: &StateBinding) -> Result<Vec<u8>, AppError> {
+fn validate_binding(binding: &StateBinding) -> Result<(), AppError> {
     if binding.tenant_external_id.is_empty()
         || binding.tenant_external_id.len() > 200
         || binding.tenant_external_id.trim() != binding.tenant_external_id
@@ -62,9 +62,7 @@ fn aad(binding: &StateBinding) -> Result<Vec<u8>, AppError> {
     {
         return Err(invalid());
     }
-    let mut aad = b"memeloop-token-center/native-cli-state/v1\0".to_vec();
-    aad.extend(serde_json::to_vec(binding).map_err(|_| invalid())?);
-    Ok(aad)
+    Ok(())
 }
 
 fn validate(state: &AccountState) -> Result<(), AppError> {
@@ -114,21 +112,27 @@ fn validate(state: &AccountState) -> Result<(), AppError> {
 pub fn seal(
     state: &AccountState,
     binding: &StateBinding,
-    key_material: &[u8],
+    _key_material: &[u8],
 ) -> Result<String, AppError> {
+    validate_binding(binding)?;
     validate(state)?;
-    encode_json(state)
+    encode_json(&(binding, state))
 }
 
 pub fn open(
     envelope: &str,
     expected_binding: &StateBinding,
-    key_material: &[u8],
+    _key_material: &[u8],
 ) -> Result<AccountState, AppError> {
     if envelope.len() > MAX_ENVELOPE {
         return Err(invalid());
     }
-    let state = decode_json(envelope).map_err(|_| invalid())?;
+    validate_binding(expected_binding)?;
+    let (binding, state): (StateBinding, AccountState) =
+        decode_json(envelope).map_err(|_| invalid())?;
+    if &binding != expected_binding {
+        return Err(invalid());
+    }
     validate(&state)?;
     Ok(state)
 }
@@ -157,12 +161,14 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_state_is_bound_to_account_tenant_generation_and_provider() {
+    fn plaintext_state_is_bound_to_account_tenant_generation_and_provider() {
         let binding = binding();
         let envelope = seal(&fixture(), &binding, b"synthetic-key").unwrap();
-        assert!(!envelope.contains("synthetic-secret"));
+        let json: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        assert_eq!(json[0], serde_json::to_value(&binding).unwrap());
+        assert_eq!(json[1], serde_json::to_value(fixture()).unwrap());
         assert_eq!(
-            open(&envelope, &binding, b"synthetic-key").unwrap().files[0].content,
+            open(&envelope, &binding, b"different-key").unwrap().files[0].content,
             b"synthetic-secret"
         );
         let mut wrong = binding.clone();
@@ -180,7 +186,27 @@ mod tests {
     }
 
     #[test]
+    fn invalid_or_missing_target_binding_is_rejected() {
+        let binding = binding();
+        let state = fixture();
+        assert!(open(&encode_json(&state).unwrap(), &binding, b"key").is_err());
+        for tenant in ["", " tenant-a", "tenant-a ", "tenant\na", &"a".repeat(201)] {
+            let mut invalid_binding = binding.clone();
+            invalid_binding.tenant_external_id = tenant.into();
+            assert!(seal(&state, &invalid_binding, b"key").is_err());
+            let carrier = encode_json(&(&invalid_binding, &state)).unwrap();
+            assert!(open(&carrier, &invalid_binding, b"key").is_err());
+        }
+        let mut invalid_binding = binding;
+        invalid_binding.account_id = Uuid::nil();
+        assert!(seal(&state, &invalid_binding, b"key").is_err());
+        let carrier = encode_json(&(&invalid_binding, &state)).unwrap();
+        assert!(open(&carrier, &invalid_binding, b"key").is_err());
+    }
+
+    #[test]
     fn traversal_duplicate_and_path_prefixes_are_rejected() {
+        let binding = binding();
         for path in [
             "/etc/passwd",
             "../state",
@@ -192,12 +218,20 @@ mod tests {
             let mut state = fixture();
             state.files[0].relative_path = path.into();
             assert!(validate(&state).is_err());
+            assert!(seal(&state, &binding, b"key").is_err());
+            let carrier = encode_json(&(&binding, &state)).unwrap();
+            assert!(open(&carrier, &binding, b"key").is_err());
         }
-        let mut state = fixture();
-        state.files.push(StateFile {
-            relative_path: ".copilot".into(),
-            content: vec![],
-        });
-        assert!(validate(&state).is_err());
+        for path in [".copilot", ".copilot/account.json"] {
+            let mut state = fixture();
+            state.files.push(StateFile {
+                relative_path: path.into(),
+                content: vec![],
+            });
+            assert!(validate(&state).is_err());
+            assert!(seal(&state, &binding, b"key").is_err());
+            let carrier = encode_json(&(&binding, &state)).unwrap();
+            assert!(open(&carrier, &binding, b"key").is_err());
+        }
     }
 }

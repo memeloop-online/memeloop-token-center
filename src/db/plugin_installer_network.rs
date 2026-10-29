@@ -103,10 +103,6 @@ pub(crate) struct FrozenInstallerNetwork {
     pub group: Option<OAuthGroupSnapshot>,
 }
 
-fn aad(kind: &str, actor: &str, operation: &str) -> Vec<u8> {
-    format!("mtc/plugin-installer-network/v1/{kind}/{actor}/{operation}").into_bytes()
-}
-
 fn changed_selection() -> AppError {
     AppError::Conflict("installation operation already has a different network selection".into())
 }
@@ -123,7 +119,7 @@ impl Database {
     pub(crate) async fn installer_network_preference(
         &self,
         actor: &str,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<InstallerNetworkInput, AppError> {
         let row = sqlx::query(
             "SELECT preference_ciphertext FROM plugin_installer_network_preferences WHERE actor=$1",
@@ -207,7 +203,7 @@ impl Database {
         &self,
         actor: &str,
         input: &InstallerNetworkInput,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<(), AppError> {
         let ciphertext = encode_json(input)?;
         sqlx::query("INSERT INTO plugin_installer_network_preferences(actor,preference_ciphertext,updated_at) VALUES ($1,$2,$3) ON CONFLICT(actor) DO UPDATE SET preference_ciphertext=excluded.preference_ciphertext,updated_at=excluded.updated_at")
@@ -367,7 +363,7 @@ impl Database {
             None => self.installer_network_preference(actor, key).await?,
         };
         // Keep the remembered selection as Default; deployment credentials are
-        // only stored in the encrypted operation snapshot, never preferences.
+        // only stored in the operation snapshot, never preferences.
         let effective = if matches!(input, InstallerNetworkInput::Default) {
             deployment_default
                 .as_ref()
@@ -398,7 +394,7 @@ impl Database {
         actor: &str,
         digest: &str,
         snapshot: &FrozenInstallerNetwork,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<FrozenInstallerNetwork, AppError> {
         let ciphertext = encode_json(snapshot)?;
         sqlx::query("INSERT INTO plugin_installer_network_snapshots(operation_key,actor,selection_digest,snapshot_ciphertext,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(operation_key) DO NOTHING")
@@ -418,7 +414,7 @@ impl Database {
         &self,
         operation_key: &str,
         actor: &str,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<FrozenInstallerNetwork, AppError> {
         let row = sqlx::query("SELECT snapshot_ciphertext FROM plugin_installer_network_snapshots WHERE operation_key=$1 AND actor=$2")
             .bind(operation_key).bind(actor).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;

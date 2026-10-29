@@ -24,6 +24,139 @@ use super::{
 };
 
 impl Database {
+    pub(crate) async fn prepare_staged_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        mut body: crate::conversation::SessionBody,
+        staging: &[ArchiveStagingWriteLease],
+    ) -> Result<bool, AppError> {
+        if staging.is_empty() {
+            let (atoms, nodes) = body.into_prefix();
+            let media = body.media_locators(&atoms);
+            return self
+                .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
+                .await;
+        }
+        let mut transaction = self.begin_write_transaction().await?;
+        let now = archive_database_now(&mut transaction, self.backend).await?;
+        let lock = match self.backend {
+            DatabaseBackend::PostgreSql => " FOR UPDATE",
+            DatabaseBackend::Sqlite => "",
+        };
+        let tenant_id: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3{lock}"
+        )))
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .bind(now)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(tenant_id) = tenant_id else {
+            return Ok(false);
+        };
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948340))")
+                .bind(format!("conversation-media:{tenant_id}"))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        for lease in staging {
+            if lease.key.owner != ArchiveStagingOwner::ProxyRequest(request_id)
+                || lease.key.purpose != crate::archive_staging::ArchiveStagingPurpose::Media
+                || !bind_archive_staging_attempt_in_transaction(
+                    &mut transaction,
+                    self.backend,
+                    lease,
+                    &lease.key.canonical_prefix(),
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        let mut canonical: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for turn in &mut body.turns {
+            for part in &mut turn.parts {
+                let (Some(hash), Some(locator)) = (&part.content_blake3, &part.object_locator)
+                else {
+                    continue;
+                };
+                if part
+                    .media_type
+                    .as_deref()
+                    .is_some_and(|media_type| media_type.is_empty() || media_type.len() > 128)
+                    || part
+                        .byte_length
+                        .is_none_or(|length| i64::try_from(length).is_err())
+                {
+                    return Err(AppError::BadRequest(
+                        "invalid session media reference".into(),
+                    ));
+                }
+                if !staging.iter().any(|lease| {
+                    crate::archive_staging::conversation_media_locator(lease.key, hash)
+                        .is_ok_and(|expected| expected == *locator)
+                }) {
+                    return Err(AppError::Conflict(
+                        "session media staging locator mismatch".into(),
+                    ));
+                }
+                let canonical_locator = match canonical.entry(hash.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let existing: Option<String> = sqlx::query_scalar(
+                            "SELECT object_locator FROM conversation_media_parts WHERE tenant_id = $1 AND content_blake3 = $2 ORDER BY object_locator LIMIT 1",
+                        )
+                        .bind(&tenant_id)
+                        .bind(hash)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                        entry
+                            .insert(existing.unwrap_or_else(|| locator.clone()))
+                            .clone()
+                    }
+                };
+                part.object_locator = Some(canonical_locator);
+            }
+        }
+        let (atoms, nodes) = body.into_prefix();
+        let media = body.media_locators(&atoms);
+        let atoms = self
+            .archive_atom_bodies(super::parse_uuid(tenant_id)?, &atoms)
+            .await?;
+        if !self
+            .prepare_session_body_archive_in_transaction(
+                &mut transaction,
+                lease_owner,
+                request_id,
+                &atoms,
+                &nodes,
+                &media,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        for lease in staging {
+            if !release_bound_archive_staging_attempt_in_transaction(
+                &mut transaction,
+                self.backend,
+                lease.key,
+                &lease.key.canonical_prefix(),
+            )
+            .await?
+            {
+                return Err(AppError::Conflict(
+                    "session media staging release was fenced".into(),
+                ));
+            }
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     /// Creates a writing attempt or returns the exact idempotent replay.
     ///
     /// `lease_token` must be persisted by the caller before retrying. Reusing an
@@ -924,3 +1057,6 @@ async fn archive_database_now(
     }
     Ok(now)
 }
+
+#[cfg(test)]
+mod media_tests;

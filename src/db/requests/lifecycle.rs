@@ -2639,7 +2639,15 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         return Ok(false);
     }
     super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
-    let Some(project_aggregates) = project_aggregates else {
+    let bridged: i64 = if project_aggregates.is_some() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM terminal_projection_outbox WHERE request_id = $1")
+            .bind(&request_id)
+            .fetch_one(&mut **tx)
+            .await?
+    } else {
+        0
+    };
+    let Some(project_aggregates) = project_aggregates.filter(|_| bridged == 0) else {
         super::terminal_projection::enqueue_terminal_projection_in_transaction(tx, &request_id)
             .await?;
         return Ok(true);
@@ -2669,7 +2677,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .bind(&request_id)
         .execute(&mut **tx)
         .await?;
-        add_request_fact_to_session_projection_in_transaction(tx, &request_id).await?;
+        add_request_fact_to_session_projection_in_transaction(tx, &request_id, 1).await?;
         sqlx::query(
             r#"INSERT INTO usage_analysis_hourly (
                    tenant_id, key_id, hour_bucket, source_kind, model, protocol, status_class,

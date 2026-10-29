@@ -17,6 +17,18 @@ async fn pending(database: &Database) -> (AuthenticatedKey, UsageReservation, Uu
         upstream_response_id: None,
     });
     database.finish_proxy_request_deferred(input).await.unwrap();
+    let mut legacy = database.begin_write_transaction().await.unwrap();
+    Database::persist_legacy_conversation_payload_for_test(&mut legacy, request_id, &key, &body)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET request_json = '{}' WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .execute(&mut *legacy)
+    .await
+    .unwrap();
+    legacy.commit().await.unwrap();
     let terminal_owner = Uuid::now_v7();
     assert!(
         database

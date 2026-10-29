@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Component as PathComponent, Path, PathBuf},
@@ -37,9 +38,7 @@ pub use configuration::{
 };
 
 const PLUGIN_FUEL: u64 = u64::MAX;
-const PLUGIN_MEMORY_BYTES: usize = 512 * 1024 * 1024;
 const PLUGIN_TABLE_ELEMENTS: usize = 100_000;
-const PLUGIN_HTTP_BODY_BYTES: usize = usize::MAX;
 const PLUGIN_HTTP_HEADER_COUNT: usize = 64;
 const PLUGIN_HTTP_HEADER_NAME_BYTES: usize = 256;
 const PLUGIN_HTTP_HEADER_VALUE_BYTES: usize = 8 * 1024;
@@ -53,13 +52,6 @@ const MAX_PLUGIN_ID_BYTES: usize = 64;
 const MAX_TRAFFIC_REASON_BYTES: usize = 256;
 const MAX_TRAFFIC_MODEL_BYTES: usize = 200;
 const MAX_TRAFFIC_ACCOUNT_ID_BYTES: usize = 64;
-const MAX_TRAFFIC_REQUEST_JSON_BYTES: usize = 256 * 1024 * 1024;
-// Total UTF-8 strings lowered for one post-auth call, including serialized JSON
-// and the six context fields. Reserve the other half of the guest ceiling for
-// allocator/runtime data and bounded return values. A guest may still exhaust
-// its own budget; this is an input contract, not a guarantee about arbitrary
-// guest allocations. Requests without traffic hooks are exempt.
-const MAX_TRAFFIC_INPUT_BYTES: usize = PLUGIN_MEMORY_BYTES / 2;
 const PLUGIN_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 const PLUGIN_EPOCH_TICK: Duration = Duration::from_millis(10);
 const PLUGIN_CONFIGURATION_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -70,9 +62,6 @@ const MAX_PLUGIN_SERVICE_DATA_BODY_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_SERVICE_DATA_ENDPOINTS: usize = 32;
 const PLUGIN_SERVICE_DATA_COMPONENT_API: &str = "component-v1";
 const SUPPORTED_WIT_REQUIREMENT: &str = ">=0.2.0, <0.4.0";
-const WIRE_SHIM_FUEL_BASE: u64 = 8_000_000;
-const WIRE_SHIM_FUEL_PER_BODY_BYTE: u64 = 2;
-const WIRE_SHIM_MEMORY_BYTES: usize = 96 * 1024 * 1024;
 // These plugin_kv namespaces contain core-owned policy or its immutable
 // receipt. Guest components must never acquire them through their manifest ID.
 const CORE_PLUGIN_KV_NAMESPACES: &[&str] = &["typed-filter", "filter-assistant-audit"];
@@ -487,11 +476,11 @@ impl TrafficDecision {
     /// explicit model decision remains authoritative across later body rewrites.
     /// Keep the JSON presented to the next guest consistent with its context,
     /// without changing the original authentication identity or returned metadata.
-    fn project_context(
+    fn project_context<'request>(
         &self,
         original: &types::RequestContext,
-        request: &mut Value,
-    ) -> (types::RequestContext, bool) {
+        request: &'request Value,
+    ) -> (types::RequestContext, Cow<'request, Value>) {
         let model = self
             .model
             .as_deref()
@@ -507,19 +496,15 @@ impl TrafficDecision {
             .to_owned();
         // Preserve non-object rewrites so the proxy still rejects them instead
         // of accidentally turning malformed guest output into a valid request.
-        let changed = if let Some(object) = request.as_object_mut() {
-            if object.get("model").and_then(Value::as_str) == Some(model.as_str()) {
-                false
-            } else {
-                object.insert("model".to_owned(), Value::String(model.clone()));
-                true
-            }
-        } else {
-            false
-        };
+        let mut request = Cow::Borrowed(request);
+        if request.is_object()
+            && request.get("model").and_then(Value::as_str) != Some(model.as_str())
+        {
+            request.to_mut()["model"] = Value::String(model.clone());
+        }
         let mut context = original.clone();
         context.model = model;
-        (context, changed)
+        (context, request)
     }
 
     pub(crate) fn log_denial(&self) {
@@ -641,7 +626,7 @@ struct HostState {
     kv: Option<PluginKv>,
     limits: StoreLimits,
     deadline: Instant,
-    http_body_limit: usize,
+    http_body_limit: Option<usize>,
     http_diagnostic: PluginHttpDiagnostic,
 }
 
@@ -722,7 +707,6 @@ impl PluginRuntime {
             .as_ref()
             .ok_or(AppError::internal("plugin_finalize_wire_shim_2"))?;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(WIRE_SHIM_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
             .instances(8)
             .tables(2)
@@ -746,30 +730,16 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
-                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_body_limit: None,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
         store
-            .set_fuel(WIRE_SHIM_FUEL_BASE.saturating_add(
-                (request_json.len() as u64).saturating_mul(WIRE_SHIM_FUEL_PER_BODY_BYTE),
-            ))
+            .set_fuel(self.fuel)
             .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
-        let configuration = configurations
-            .get(&plugin.manifest.id)
-            .cloned()
-            .or_else(|| {
-                plugin
-                    .manifest
-                    .contributions
-                    .configuration
-                    .as_ref()
-                    .map(|value| value.default.clone())
-            })
-            .unwrap_or_else(empty_json_object);
-        context.config_json = serde_json::to_string(&configuration)
+        context.config_json = serde_json::to_string(traffic_configuration(plugin, configurations))
             .map_err(|_| AppError::internal("plugin_finalize_wire_shim_1"))?;
         let context = wire_shim_component::memeloop::token_center0_3_0::types::RequestContext {
             tenant_id: context.tenant_id,
@@ -1233,21 +1203,21 @@ impl PluginRuntime {
         let runtime = self.runtime.as_ref().ok_or(AppError::internal(
             "plugin_apply_traffic_with_config_and_memory_2",
         ))?;
-        let mut input_sizes = TrafficInputSizes::new(&self.plugins, configurations)?;
-        let mut current = request_json.clone();
         let mut decision = TrafficDecision {
             allow: true,
             ..TrafficDecision::default()
         };
-        for (index, plugin) in self.plugins.iter().enumerate().filter(|(_, plugin)| {
+        for plugin in self.plugins.iter().filter(|plugin| {
             plugin.manifest.contributions.traffic_policy
                 || plugin.manifest.contributions.request_rewrite
         }) {
-            let (mut plugin_context, model_changed) =
-                decision.project_context(&context, &mut current);
-            input_sizes.validate(index, &plugin_context, &current, model_changed)?;
-            let request = serde_json::to_string(&current)
+            let (mut plugin_context, current) = decision.project_context(
+                &context,
+                decision.request_json.as_ref().unwrap_or(request_json),
+            );
+            let request = serde_json::to_string(current.as_ref())
                 .map_err(|_| AppError::internal("plugin_apply_traffic_with_config_and_memory_1"))?;
+            drop(current);
             plugin_context.config_json =
                 serde_json::to_string(traffic_configuration(plugin, configurations)).map_err(
                     |_| AppError::internal("plugin_apply_traffic_with_config_and_memory_2"),
@@ -1273,7 +1243,7 @@ impl PluginRuntime {
                     kv: self.kv.clone(),
                     limits,
                     deadline: Instant::now() + self.execution_timeout,
-                    http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                    http_body_limit: None,
                     http_diagnostic: PluginHttpDiagnostic::default(),
                 },
             );
@@ -1294,6 +1264,8 @@ impl PluginRuntime {
                 .map_err(|error| {
                     plugin_reported_error(&plugin.manifest.id, "traffic-policy", &error)
                 })?;
+            drop(request);
+            drop(store);
             let reason_is_valid = result.reason.as_deref().is_none_or(|reason| {
                 validate_plugin_text(reason, MAX_TRAFFIC_REASON_BYTES, false).is_ok()
             });
@@ -1309,8 +1281,7 @@ impl PluginRuntime {
                             .is_ok()
                     });
             if let (Some(memory), Some(rewrite)) = (memory, result.request_json.as_deref())
-                && (rewrite.len() > MAX_TRAFFIC_REQUEST_JSON_BYTES
-                    || !memory.try_reserve_rewrite(rewrite.as_bytes()))
+                && !memory.try_reserve_rewrite(rewrite.as_bytes())
             {
                 return Err(AppError::capacity_error("proxy_memory_plugin"));
             }
@@ -1358,9 +1329,7 @@ impl PluginRuntime {
             if let Some(request) = validated_request.map_err(|_| {
                 invalid_plugin_result(&plugin.manifest.id, "traffic policy request JSON")
             })? {
-                current = request;
-                input_sizes.invalidate_request();
-                decision.request_json = Some(current.clone());
+                decision.request_json = Some(request);
             }
             if let Some(model) = result.model {
                 decision.model = Some(model);
@@ -1425,7 +1394,7 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
-                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_body_limit: None,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
@@ -1691,7 +1660,7 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline: Instant::now() + self.execution_timeout,
-                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_body_limit: None,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
@@ -2033,7 +2002,7 @@ impl memeloop::token_center::host::Host for HostState {
             stage: "request_validation",
             ..PluginHttpDiagnostic::default()
         };
-        if body.len() > self.http_body_limit {
+        if self.http_body_limit.is_some_and(|limit| body.len() > limit) {
             return Err("plugin HTTP request exceeds its configured body limit".to_owned());
         }
         let url = url::Url::parse(&url).map_err(|_| "plugin HTTP URL is invalid".to_owned())?;
@@ -2129,7 +2098,9 @@ impl memeloop::token_center::host::Host for HostState {
             let mut stream = response.bytes_stream();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| "plugin HTTP response read failed".to_owned())?;
-                if response_body.len().saturating_add(chunk.len()) > http_body_limit {
+                if http_body_limit
+                    .is_some_and(|limit| response_body.len().saturating_add(chunk.len()) > limit)
+                {
                     return Err("plugin HTTP response exceeds its configured body limit".to_owned());
                 }
                 response_body.extend_from_slice(&chunk);
@@ -3139,31 +3110,6 @@ fn validate_plugin_text(value: &str, maximum: usize, allow_empty: bool) -> Resul
     Ok(())
 }
 
-// Count serde's actual output (including JSON escaping) without allocating a
-// second unbounded String. Stop as soon as the remaining ABI budget is exceeded.
-fn traffic_json_bytes(value: &Value, limit: usize) -> Result<usize, AppError> {
-    struct Counter {
-        bytes: usize,
-        limit: usize,
-    }
-    impl std::io::Write for Counter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let remaining = self.limit.saturating_sub(self.bytes);
-            if bytes.len() > remaining {
-                return Err(std::io::Error::other("traffic input limit"));
-            }
-            self.bytes += bytes.len();
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut counter = Counter { bytes: 0, limit };
-    serde_json::to_writer(&mut counter, value).map_err(|_| AppError::PluginInputTooLarge)?;
-    Ok(counter.bytes)
-}
-
 fn traffic_configuration<'a>(
     plugin: &'a LoadedPlugin,
     configurations: &'a BTreeMap<String, Value>,
@@ -3180,87 +3126,6 @@ fn traffic_configuration<'a>(
                 .map(|configuration| &configuration.default)
         })
         .unwrap_or(&EMPTY)
-}
-
-// Cache configuration byte sizes once and suffix maxima in O(hooks). A body
-// is recounted only after a guest rewrite or model projection changes its JSON;
-// checking every remaining hook then requires constant work at each position.
-struct TrafficInputSizes {
-    remaining_configuration_bytes: Vec<usize>,
-    request_bytes: Option<usize>,
-}
-
-impl TrafficInputSizes {
-    fn new(
-        plugins: &[LoadedPlugin],
-        configurations: &BTreeMap<String, Value>,
-    ) -> Result<Self, AppError> {
-        let mut remaining_configuration_bytes = vec![0; plugins.len() + 1];
-        for (index, plugin) in plugins.iter().enumerate().rev() {
-            let own = if plugin.manifest.contributions.traffic_policy
-                || plugin.manifest.contributions.request_rewrite
-            {
-                traffic_json_bytes(
-                    traffic_configuration(plugin, configurations),
-                    MAX_TRAFFIC_INPUT_BYTES,
-                )?
-            } else {
-                0
-            };
-            remaining_configuration_bytes[index] =
-                own.max(remaining_configuration_bytes[index + 1]);
-        }
-        Ok(Self {
-            remaining_configuration_bytes,
-            request_bytes: None,
-        })
-    }
-
-    fn invalidate_request(&mut self) {
-        self.request_bytes = None;
-    }
-
-    fn validate(
-        &mut self,
-        index: usize,
-        context: &types::RequestContext,
-        request: &Value,
-        model_changed: bool,
-    ) -> Result<(), AppError> {
-        // The input-size contract is removed: plugin hooks observe whatever
-        // the client sent, and oversized requests are no longer a gateway
-        // error. The struct stays because callers thread it through the
-        // plugin chain; the epoch deadline still bounds runaway guests.
-        let _ = (index, context, request, model_changed);
-        return Ok(());
-        #[allow(unreachable_code)]
-        {
-            if model_changed {
-                self.invalidate_request();
-            }
-            let body = match self.request_bytes {
-                Some(bytes) => bytes,
-                None => {
-                    let bytes = traffic_json_bytes(request, MAX_TRAFFIC_INPUT_BYTES)?;
-                    self.request_bytes = Some(bytes);
-                    bytes
-                }
-            };
-            [
-                &context.tenant_id,
-                &context.principal_id,
-                &context.key_id,
-                &context.protocol,
-                &context.model,
-            ]
-            .into_iter()
-            .try_fold(body, |total, field| total.checked_add(field.len()))
-            .and_then(|total| total.checked_add(self.remaining_configuration_bytes[index]))
-            .filter(|total| *total <= MAX_TRAFFIC_INPUT_BYTES)
-            .map(|_| ())
-            .ok_or(AppError::PluginInputTooLarge)
-        }
-    }
 }
 
 fn validate_traffic_request_json(value: &str) -> Result<Value, ()> {
@@ -4035,7 +3900,7 @@ mod tests {
             kv: None,
             limits: StoreLimitsBuilder::new().build(),
             deadline: Instant::now() + Duration::from_secs(1),
-            http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+            http_body_limit: None,
             http_diagnostic: PluginHttpDiagnostic::default(),
         };
         let error = memeloop::token_center::host::Host::http_request(
@@ -4251,7 +4116,7 @@ mod tests {
             kv: None,
             limits: StoreLimitsBuilder::new().build(),
             deadline: Instant::now() + Duration::from_secs(1),
-            http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+            http_body_limit: None,
             http_diagnostic: PluginHttpDiagnostic::default(),
         };
         assert!(
