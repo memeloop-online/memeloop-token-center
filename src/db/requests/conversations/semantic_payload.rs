@@ -135,6 +135,7 @@ impl Database {
     }
 }
 
+#[cfg(test)]
 pub(super) fn encode(
     request_id: Uuid,
     key: &AuthenticatedKey,
@@ -161,6 +162,7 @@ pub(super) fn encode(
     Ok((body, digest))
 }
 
+#[cfg(test)]
 pub(super) async fn persist(
     transaction: &mut Transaction<'_, Any>,
     request_id: Uuid,

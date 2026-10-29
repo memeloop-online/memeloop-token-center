@@ -24,6 +24,47 @@ const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
 const CODEX_MODEL_CATALOG_RETRY_MILLIS: i64 = 60 * 60 * 1_000;
 const PROJECTION_BATCH_LIMIT: i64 = 32;
 
+/// A request that never reaches a terminal is never projected, so its queue row
+/// is never retired by the compaction pass. Sweep those instead of keeping them
+/// forever: the payload column is bounded, but the volume is not.
+const ABANDONED_CONVERSATION_GRACE_MILLIS: i64 = 24 * 60 * 60 * 1_000;
+const ABANDONED_CONVERSATION_BATCH: i64 = 2_000;
+
+async fn reap_abandoned_conversations(state: AppState, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(10 * 60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+            }
+            _ = ticker.tick() => {
+                if *shutdown.borrow() { break; }
+                loop {
+                    match state
+                        .db
+                        .reap_abandoned_conversation_projections(
+                            ABANDONED_CONVERSATION_GRACE_MILLIS,
+                            ABANDONED_CONVERSATION_BATCH,
+                        )
+                        .await
+                    {
+                        Ok(0) => break,
+                        Ok(deleted) => {
+                            tracing::info!(deleted, "reaped abandoned conversation projections");
+                            if deleted < ABANDONED_CONVERSATION_BATCH as u64 { break; }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "failed to reap abandoned conversation projections");
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn compact_conversation_receipts(state: AppState, mut shutdown: watch::Receiver<bool>) {
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -202,6 +243,12 @@ pub async fn run_until_shutdown_with_oauth_stop(
     roles.spawn(async move {
         compact_conversation_receipts(receipt_state, receipt_shutdown).await;
         "conversation_receipts"
+    });
+    let reap_state = state.clone();
+    let reap_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        reap_abandoned_conversations(reap_state, reap_shutdown).await;
+        "conversation_reaper"
     });
 
     // No spawn-per-tick: generation remains single-flight and OAuth remains serial.

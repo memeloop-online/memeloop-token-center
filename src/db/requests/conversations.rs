@@ -156,9 +156,13 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     } = input;
     // 这里不解析对象存储里的原始请求 JSON。只留下结算时已经收好的对话字段，
     // 供 locator 仍是 gap:// 时归档。超过上限的内容仍留给对象存储。
-    // 缩减后的对话另存一行，SQL 失败后还能重试。这不是原始请求 JSON，也不是会话正文。
+    //
+    // The raw request body never lands in PostgreSQL: object storage owns it, and
+    // this row only carries the bounded conversation fields the projection needs
+    // while the locator is still `gap://`. An earlier revision persisted the full
+    // body into `conversation_semantic_payloads` for every request, which grew the
+    // database by roughly a gigabyte per hour of Codex traffic.
     let payload: Option<(String, String)> = None;
-    let reduced = semantic_payload::encode(request_id, key, request_json)?;
     let request_json = inline_session_request(request_json);
     let semantic_snapshot = {
         let snapshot = ConversationSemanticSnapshot {
@@ -297,7 +301,6 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
             return Ok(());
         }
     }
-    semantic_payload::persist(transaction, request_id, key, &reduced.0, &reduced.1).await?;
     Ok(())
 }
 
@@ -496,6 +499,33 @@ impl Database {
             .await?;
         transaction.commit().await?;
         Ok(updated.rows_affected())
+    }
+
+    /// Deletes projection queue rows whose request never reached a terminal.
+    ///
+    /// A request that dies mid-flight (client abort, upstream reset, gateway
+    /// restart) is never projected, so neither its outbox row nor its payload is
+    /// ever consumed and the compaction pass - which only looks at projected
+    /// rows - cannot retire it. Left alone these rows accumulate forever; at
+    /// Codex traffic that was roughly a gigabyte of dead conversation rows per
+    /// hour, which is what filled the database volume.
+    ///
+    /// The payload table cascades from the outbox primary key, so one delete
+    /// frees both.
+    pub(crate) async fn reap_abandoned_conversation_projections(
+        &self,
+        older_than_millis: i64,
+        limit: i64,
+    ) -> Result<u64, AppError> {
+        let cutoff = unix_millis().saturating_sub(older_than_millis);
+        let deleted = sqlx::query(
+            "DELETE FROM conversation_projection_outbox WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND observed_at < $1 LIMIT $2)",
+        )
+        .bind(cutoff)
+        .bind(limit)
+        .execute(&self.pool)
+        .await?;
+        Ok(deleted.rows_affected())
     }
 
     /// Claims a bounded batch of terminal conversation observations for one
