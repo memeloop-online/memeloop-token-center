@@ -1050,12 +1050,12 @@ pub(crate) async fn archive_session_body(
         }
         Err(_) => {
             let retry = if let Some(identity) = locators.source_identity {
-                !locators.source_failed
-                    && (state
-                        .archive
-                        .source_object_exists(&locators.request)
-                        .await?
-                        || !state
+                state
+                    .archive
+                    .source_object_exists(&locators.request)
+                    .await?
+                    || (!locators.source_failed
+                        && !state
                             .db
                             .recover_request_source(identity, &locators.request)
                             .await?)
