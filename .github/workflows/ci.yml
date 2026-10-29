@@ -59,7 +59,7 @@ jobs:
       - name: HTTP settings and transport regressions
         run: |
           failed=0
-          for filter in http_settings network::tests oauth:: codex_clients plugin_release db::transport_proxy_groups::probe http2_keepalive_tests simple_http::tests pricing::tests
+          for filter in http_settings network::tests oauth:: codex_clients plugin_release db::transport_proxy_groups::probe http2_keepalive_tests simple_http::tests pricing::tests cursor_native:: provider::antigravity::
           do
             echo "::group::$filter"
             timeout 8m cargo test --locked --all-features --lib "$filter" -- --test-threads=1 || failed=1
