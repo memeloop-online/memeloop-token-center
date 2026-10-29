@@ -100,6 +100,58 @@ async fn sqlite_request_history_capture_freezes_retries_and_preserves_newer_corr
 }
 
 #[tokio::test]
+async fn sqlite_request_history_failed_sink_retains_frozen_replay_across_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("failed-export.db").display()
+    );
+    let database = Database::connect(&url).await.unwrap();
+    database.migrate().await.unwrap();
+    database.history_start().await.unwrap();
+    seed(&database).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let service = axum::Router::new().route(
+        "/",
+        axum::routing::post(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, service).await.unwrap();
+    });
+    let client = ClickHouse::new(
+        database
+            .http_clients
+            .handle(crate::http_settings::HttpPurpose::General),
+        &endpoint,
+        "default".into(),
+        "default".into(),
+        String::new(),
+    )
+    .unwrap();
+    assert!(
+        crate::request_history::migration::export_page(&database, &client, 1)
+            .await
+            .is_err()
+    );
+    let frozen = database.history_pending(1).await.unwrap();
+    assert_eq!(frozen.len(), 1);
+    let mut conflict = frozen[0].clone();
+    conflict.payload.as_mut().unwrap()["model"] = serde_json::json!("conflicting-revision");
+    assert!(matches!(
+        client.append(&[frozen[0].clone(), conflict]).await,
+        Err(HistoryError::Mismatch)
+    ));
+    database.close().await;
+    let restarted = Database::connect(&url).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(restarted.history_pending(1).await.unwrap()).unwrap(),
+        serde_json::to_value(frozen).unwrap()
+    );
+    server.abort();
+}
+
+#[tokio::test]
 #[ignore = "existing CI supplies real PostgreSQL and ClickHouse services"]
 async fn request_history_real_services_acceptance() {
     let postgres = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL acceptance URL");

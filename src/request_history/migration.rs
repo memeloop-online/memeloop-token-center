@@ -47,10 +47,16 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     }
     database.refresh_http_settings().await?;
     database.start_http_settings_refresh();
-    let client = ClickHouse::from_env(
+    let role = match command {
+        HistoryCommand::Start => "ADMIN",
+        HistoryCommand::Verify | HistoryCommand::Switch => "READER",
+        _ => "WRITER",
+    };
+    let client = ClickHouse::from_env_role(
         database
             .http_clients
             .handle(crate::http_settings::HttpPurpose::General),
+        role,
     )?
     .ok_or(HistoryError::Invalid("MTC_REQUEST_HISTORY_URL is required"))?;
     match command {
@@ -146,6 +152,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
     };
     let mut count = 0_u64;
     let mut tenants = BTreeMap::<String, u64>::new();
+    let mut credentials = BTreeMap::<(uuid::Uuid, uuid::Uuid), (u64, Sha256)>::new();
     let mut hash = Sha256::new();
     let mut daily = BTreeMap::new();
     loop {
@@ -180,6 +187,11 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             *tenants
                 .entry(expected.identity.tenant_id.to_string())
                 .or_default() += 1;
+            let scoped = credentials
+                .entry((expected.identity.tenant_id, expected.identity.key_id))
+                .or_insert_with(|| (0, Sha256::new()));
+            scoped.0 += 1;
+            scoped.1.update(super::canonical_hash(&snapshot)?);
             hash.update(super::canonical_hash(&expected.identity)?);
             hash.update(super::canonical_hash(&expected.payload)?);
             hash.update(super::canonical_hash(&expected.filter_cost_micros)?);
@@ -208,6 +220,96 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
     if daily != actual {
         return Err(HistoryError::Mismatch);
     }
+    for ((tenant_id, key_id), (expected_count, expected_hash)) in &credentials {
+        let mut scoped = HistoryQuery {
+            scope: HistoryScope::Key {
+                tenant_id: *tenant_id,
+                key_id: *key_id,
+            },
+            ..query.clone()
+        };
+        let mut actual_count = 0_u64;
+        let mut actual_hash = Sha256::new();
+        loop {
+            let mut page = client.snapshots(&scoped).await?;
+            page.truncate(scoped.limit);
+            if page.is_empty() {
+                break;
+            }
+            for snapshot in &page {
+                actual_count += 1;
+                actual_hash.update(super::canonical_hash(snapshot)?);
+            }
+            let last = page.last().ok_or(HistoryError::Mismatch)?;
+            scoped.cursor = Some(super::HistoryCursor {
+                before_created_at: last.identity.created_at,
+                before_id: last.identity.request_id,
+            });
+        }
+        if actual_count != *expected_count
+            || actual_hash.finalize() != expected_hash.clone().finalize()
+        {
+            return Err(HistoryError::Mismatch);
+        }
+        let hidden = client
+            .list(&HistoryQuery {
+                limit: 1,
+                cursor: None,
+                ..scoped
+            })
+            .await?;
+        if hidden
+            .requests
+            .iter()
+            .any(|payload| !payload["credential_identity"].is_null())
+        {
+            return Err(HistoryError::Mismatch);
+        }
+        let absent_key = HistoryQuery {
+            scope: HistoryScope::Key {
+                tenant_id: *tenant_id,
+                key_id: uuid::Uuid::new_v4(),
+            },
+            limit: 1,
+            ..query.clone()
+        };
+        if !client.snapshots(&absent_key).await?.is_empty() {
+            return Err(HistoryError::Mismatch);
+        }
+    }
+    if !client
+        .snapshots(&HistoryQuery {
+            scope: HistoryScope::EmptyTenant,
+            ..query.clone()
+        })
+        .await?
+        .is_empty()
+    {
+        return Err(HistoryError::Mismatch);
+    }
+    let days: std::collections::BTreeSet<_> = daily.keys().map(|key| key.0).collect();
+    for day in days {
+        let from = day
+            .checked_mul(86_400_000)
+            .ok_or(HistoryError::Invalid("verification date"))?;
+        let to = from.saturating_add(86_399_999);
+        let filter = crate::db::StatsFilter {
+            from_created_at: Some(from),
+            to_created_at: Some(to),
+            ..Default::default()
+        };
+        let expected = database.global_operator_stats_filtered(filter).await?;
+        let actual = client
+            .statistics(&HistoryQuery {
+                from_created_at: Some(from),
+                to_created_at: Some(to),
+                ..query.clone()
+            })
+            .await?;
+        if serde_json::to_value(expected)? != serde_json::to_value(actual)? {
+            return Err(HistoryError::Mismatch);
+        }
+    }
     if revision != database.history_revision().await?
         || database.history_pending_count().await? != 0
     {
@@ -216,7 +318,9 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
     let report = json!({
         "revision": revision, "count": count, "sha256": format!("{:x}", hash.finalize()),
         "tenants": tenants, "daily": daily.values().collect::<Vec<_>>(),
-        "request_list_payloads_equal": true,
+        "request_list_payloads_equal": true, "statistics_equal": true,
+        "credential_scopes_verified": credentials.len(), "tenant_key_negative_probes": true,
+        "read_surfaces": ["requests", "stats"], "other_surfaces_use_existing_readers": true,
     });
     database
         .history_save_verification(revision, &report)

@@ -28,7 +28,7 @@ impl ClickHouse {
         Self::from_env_role(client, "READER")
     }
 
-    fn from_env_role(
+    pub(crate) fn from_env_role(
         client: impl HttpClientSource + 'static,
         role: &str,
     ) -> Result<Option<Self>, HistoryError> {

@@ -340,6 +340,27 @@ impl Database {
         identity: &HistoryIdentity,
         payload: &Value,
     ) -> Result<Option<HistoryStatistics>, HistoryError> {
+        if identity.source == "native" && !payload["completed_at"].is_null() {
+            let fact = sqlx::query("SELECT f.status_class, CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.input_tokens END AS input_tokens, CASE WHEN f.protocol = 'audio-transcription' THEN 0 ELSE f.output_tokens END AS output_tokens, f.cache_known_read_tokens, f.cache_known_input_tokens, f.cost_micros, f.currency FROM request_stats_facts f WHERE f.request_id = $1 AND f.tenant_id = $2 AND f.key_id = $3 AND f.created_at = $4 AND NOT EXISTS (SELECT 1 FROM pending_proxy_settlements pending WHERE pending.request_id = f.request_id AND pending.state = 'pending') AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox outbox WHERE outbox.request_id = f.request_id AND outbox.projected_at IS NULL)")
+                .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at)
+                .fetch_optional(&self.pool).await?;
+            if let Some(fact) = fact {
+                let status: String = fact.try_get("status_class")?;
+                return Ok(Some(HistoryStatistics {
+                    status: if status == "success" {
+                        "success".into()
+                    } else {
+                        "error".into()
+                    },
+                    input_tokens: fact.try_get("input_tokens")?,
+                    output_tokens: fact.try_get("output_tokens")?,
+                    cache_known_read_tokens: fact.try_get("cache_known_read_tokens")?,
+                    cache_known_input_tokens: fact.try_get("cache_known_input_tokens")?,
+                    cost_micros: fact.try_get("cost_micros")?,
+                    currency: fact.try_get("currency")?,
+                }));
+            }
+        }
         let terminal =
             payload["operational_terminal"].is_object() || !payload["completed_at"].is_null();
         let status = if !terminal {
