@@ -35,6 +35,14 @@ test('dedicated RustFS is isolated and archive routing requires explicit cutover
   assert.equal(storage.spec.template.spec.automountServiceAccountToken, false);
   assert.equal(storage.spec.template.spec.securityContext.runAsUser, 10001);
   assert.equal(storage.spec.template.spec.containers[0].image, 'rustfs/rustfs:1.0.4');
+  assert.deepEqual(storage.spec.template.spec.volumes.find((volume: any) => volume.name === 'tmp').emptyDir, {});
+  assert.equal(storage.spec.template.spec.volumes.some((volume: any) => volume.name === 'logs'), false);
+  assert.equal(storage.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'RUSTFS_OBS_LOG_DIRECTORY').value, '');
+  const tuned = render([...flags, '--set', 'rustfs.terminationGracePeriodSeconds=180', '--set', 'rustfs.probes.readiness.timeoutSeconds=7']);
+  const tunedStorage = tuned.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(tunedStorage.spec.template.spec.terminationGracePeriodSeconds, 180);
+  assert.equal(tunedStorage.spec.template.spec.containers[0].readinessProbe.timeoutSeconds, 7);
+  assert.throws(() => render([...flags, '--set', 'rustfs.probes.startup.periodSeconds=0']));
   const claim = prepared.find(document => document.kind === 'PersistentVolumeClaim' && document.metadata.name.endsWith('-rustfs'));
   assert.equal(claim.spec.storageClassName, 'longhorn-large-single');
   assert.equal(claim.metadata.annotations['helm.sh/resource-policy'], 'keep');

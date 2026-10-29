@@ -59,7 +59,7 @@ spec:
         {{- include "memeloop-token-center.rustfsSelector" . | nindent 8 }}
     spec:
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: {{ .Values.rustfs.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
@@ -87,7 +87,7 @@ spec:
             - { name: RUSTFS_ADDRESS, value: ":9000" }
             - { name: RUSTFS_CONSOLE_ENABLE, value: "false" }
             - { name: RUSTFS_OBS_LOGGER_LEVEL, value: "warn" }
-            - { name: RUSTFS_OBS_LOG_DIRECTORY, value: "/logs" }
+            - { name: RUSTFS_OBS_LOG_DIRECTORY, value: "" }
             - name: RUSTFS_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
@@ -100,32 +100,22 @@ spec:
                   key: {{ .Values.config.s3.credentialsSecret.secretKey }}
           resources:
             {{- toYaml .Values.rustfs.resources | nindent 12 }}
-          startupProbe:
-            httpGet: { path: /health, port: s3 }
-            periodSeconds: 5
-            timeoutSeconds: 2
-            failureThreshold: 60
-          readinessProbe:
-            httpGet: { path: /health/ready, port: s3 }
-            periodSeconds: 5
-            timeoutSeconds: 2
-          livenessProbe:
-            httpGet: { path: /health, port: s3 }
-            periodSeconds: 10
-            timeoutSeconds: 2
-            failureThreshold: 6
+          {{- range $kind, $probe := .Values.rustfs.probes }}
+          {{ $kind }}Probe:
+            httpGet: { path: {{ $probe.path | quote }}, port: s3 }
+            periodSeconds: {{ $probe.periodSeconds }}
+            timeoutSeconds: {{ $probe.timeoutSeconds }}
+            failureThreshold: {{ $probe.failureThreshold }}
+          {{- end }}
           volumeMounts:
             - { name: data, mountPath: /data }
-            - { name: logs, mountPath: /logs }
             - { name: tmp, mountPath: /tmp }
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: {{ default $name .Values.rustfs.persistence.existingClaim }}
-        - name: logs
-          emptyDir: { sizeLimit: 64Mi }
         - name: tmp
-          emptyDir: { sizeLimit: 64Mi }
+          emptyDir: {}
       {{- with .Values.rustfs.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

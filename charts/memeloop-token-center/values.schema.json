@@ -33,7 +33,7 @@
     "rustfs": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["enabled", "connectArchive", "image", "persistence", "resources", "nodeSelector", "tolerations", "affinity"],
+      "required": ["enabled", "connectArchive", "image", "persistence", "resources", "terminationGracePeriodSeconds", "probes", "nodeSelector", "tolerations", "affinity"],
       "properties": {
         "enabled": { "type": "boolean" },
         "connectArchive": { "type": "boolean" },
@@ -57,6 +57,19 @@
           }
         },
         "resources": { "$ref": "#/definitions/resources" },
+        "terminationGracePeriodSeconds": {
+          "type": "integer", "minimum": 1,
+          "description": "Time Kubernetes allows RustFS to finish in-flight operations before stopping the dedicated Pod."
+        },
+        "probes": {
+          "type": "object", "additionalProperties": false,
+          "required": ["startup", "readiness", "liveness"],
+          "properties": {
+            "startup": { "$ref": "#/definitions/probe" },
+            "readiness": { "$ref": "#/definitions/probe" },
+            "liveness": { "$ref": "#/definitions/probe" }
+          }
+        },
         "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
         "tolerations": { "type": "array", "items": { "type": "object" } },
         "affinity": { "$ref": "#/definitions/affinity" }
