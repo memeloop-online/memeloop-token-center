@@ -53,7 +53,7 @@ test('HTTP settings save full documents, preserve inheritance and drafts, and ex
     const card = page.locator('.request-config');
     await card.getByText('当前实例生效版本：7').waitFor();
     await card.getByRole('button', { name: 'Codex 请求', exact: true }).click();
-    const purpose = card.locator('.request-config-purpose');
+    const purpose = card.locator('.request-config-purpose').filter({ has: page.locator('#request-config-codex-read_timeout_ms') });
     const read = purpose.locator('#request-config-codex-read_timeout_ms');
     assert.equal(await read.inputValue(), '');
     assert.match(await read.getAttribute('placeholder') ?? '', /继承：15000 毫秒/);
@@ -78,6 +78,7 @@ test('HTTP settings save full documents, preserve inheritance and drafts, and ex
 
     await purpose.getByRole('button', { name: '清除覆盖', exact: true }).click();
     await card.getByText('当前实例生效版本：9').waitFor();
+    assert.equal(await page.evaluate(() => 'codex' in ((window as FixtureWindow).requestConfigFixture.lastBody?.settings.purposes ?? {})), false);
     assert.equal(await read.inputValue(), '');
     await purpose.getByText('实际生效：15000 毫秒').waitFor();
 

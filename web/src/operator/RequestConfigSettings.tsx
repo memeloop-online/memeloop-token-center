@@ -133,7 +133,11 @@ export function RequestConfigSettings({ token }: { token: string }) {
     const values: HttpOverrides = {};
     for (const field of requestConfigFields) {
       const parsed = parseConfigInput(scopeDraftMap[field.key] ?? '', field);
-      if (parsed.ok && parsed.value !== undefined) values[field.key] = parsed.value;
+      if (parsed.ok && parsed.value !== undefined) {
+        if (field.key === 'pool_max_idle_per_host') {
+          if (typeof parsed.value === 'number') values.pool_max_idle_per_host = parsed.value;
+        } else values[field.key] = parsed.value;
+      }
     }
     void submit(scope, values, false);
   };
@@ -145,7 +149,8 @@ export function RequestConfigSettings({ token }: { token: string }) {
   const changeDraft = (scope: string, field: string, value: string) => {
     setDrafts((previous) => ({ ...previous, [scope]: { ...previous[scope], [field]: value } }));
     setTouched((previous) => ({ ...previous, [scope]: true }));
-    setMessage(''); setError('');
+    setMessage('');
+    if (!conflict) setError('');
   };
 
   const renderRow = (scope: string, field: RequestConfigFieldMeta, purpose?: RequestConfigPurpose) => {

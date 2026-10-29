@@ -1,7 +1,7 @@
 export const requestConfigPurposes = ['general', 'codex', 'oauth', 'plugin', 'plugin_release', 'probe'] as const;
 export type RequestConfigPurpose = (typeof requestConfigPurposes)[number];
 export type RequestConfigField = 'connect_timeout_ms' | 'read_timeout_ms' | 'request_timeout_ms' | 'pool_idle_timeout_ms' | 'pool_max_idle_per_host';
-export type HttpOverrides = Partial<Record<RequestConfigField, number | null>>;
+export type HttpOverrides = Partial<Record<Exclude<RequestConfigField, 'pool_max_idle_per_host'>, number | null>> & { pool_max_idle_per_host?: number };
 export type HttpSettings = { defaults: HttpOverrides; purposes: Partial<Record<RequestConfigPurpose, HttpOverrides>> };
 export type RequestConfigSource = 'purpose_override' | 'global_default' | 'source_default';
 export interface RequestConfigFieldMeta { key: RequestConfigField; unit: 'milliseconds' | 'connections'; nullable: boolean }
