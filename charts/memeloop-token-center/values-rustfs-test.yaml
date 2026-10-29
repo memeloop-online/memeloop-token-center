@@ -1,0 +1,6 @@
+rustfs:
+  enabled: true
+  connectArchive: false
+  persistence:
+    storageClass: longhorn-large-single
+    size: 10Gi

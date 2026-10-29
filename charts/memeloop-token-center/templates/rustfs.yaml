@@ -1,0 +1,180 @@
+{{- if .Values.rustfs.enabled }}
+{{- $name := include "memeloop-token-center.rustfsName" . }}
+{{- $image := printf "%s:%s" .Values.rustfs.image.repository .Values.rustfs.image.tag }}
+{{- if .Values.rustfs.image.digest }}
+{{- $image = printf "%s@%s" .Values.rustfs.image.repository .Values.rustfs.image.digest }}
+{{- end }}
+{{- if not .Values.rustfs.persistence.existingClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $name }}
+  annotations:
+    helm.sh/resource-policy: keep
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+    argocd.argoproj.io/sync-wave: "-2"
+  labels:
+    {{- include "memeloop-token-center.rustfsSelector" . | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  {{- if .Values.rustfs.persistence.storageClass }}
+  storageClassName: {{ .Values.rustfs.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.rustfs.persistence.size | quote }}
+---
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "memeloop-token-center.rustfsSelector" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "memeloop-token-center.rustfsSelector" . | nindent 4 }}
+  ports:
+    - { name: s3, port: 9000, targetPort: s3, protocol: TCP }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+  labels:
+    {{- include "memeloop-token-center.rustfsSelector" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      {{- include "memeloop-token-center.rustfsSelector" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "memeloop-token-center.rustfsSelector" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: rustfs
+          image: {{ $image | quote }}
+          imagePullPolicy: {{ .Values.rustfs.image.pullPolicy }}
+          command: ["/usr/bin/rustfs"]
+          args: ["/data"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          ports:
+            - { name: s3, containerPort: 9000, protocol: TCP }
+          env:
+            - { name: RUSTFS_ADDRESS, value: ":9000" }
+            - { name: RUSTFS_CONSOLE_ENABLE, value: "false" }
+            - { name: RUSTFS_OBS_LOGGER_LEVEL, value: "warn" }
+            - { name: RUSTFS_OBS_LOG_DIRECTORY, value: "/logs" }
+            - name: RUSTFS_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.s3.credentialsSecret.name }}
+                  key: {{ .Values.config.s3.credentialsSecret.accessKey }}
+            - name: RUSTFS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.config.s3.credentialsSecret.name }}
+                  key: {{ .Values.config.s3.credentialsSecret.secretKey }}
+          resources:
+            {{- toYaml .Values.rustfs.resources | nindent 12 }}
+          startupProbe:
+            httpGet: { path: /health, port: s3 }
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 60
+          readinessProbe:
+            httpGet: { path: /health/ready, port: s3 }
+            periodSeconds: 5
+            timeoutSeconds: 2
+          livenessProbe:
+            httpGet: { path: /health, port: s3 }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          volumeMounts:
+            - { name: data, mountPath: /data }
+            - { name: logs, mountPath: /logs }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ default $name .Values.rustfs.persistence.existingClaim }}
+        - name: logs
+          emptyDir: { sizeLimit: 64Mi }
+        - name: tmp
+          emptyDir: { sizeLimit: 64Mi }
+      {{- with .Values.rustfs.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.rustfs.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.rustfs.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- if .Values.networkPolicy.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "memeloop-token-center.rustfsSelector" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - { protocol: TCP, port: 9000 }
+  egress: []
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-clients
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "memeloop-token-center.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "memeloop-token-center.rustfsSelector" . | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: 9000 }
+{{- end }}
+{{- end }}

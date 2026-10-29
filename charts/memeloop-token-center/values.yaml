@@ -7,6 +7,25 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 
+rustfs:
+  enabled: false
+  connectArchive: false
+  image:
+    repository: rustfs/rustfs
+    tag: "1.0.4"
+    digest: ""
+    pullPolicy: IfNotPresent
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    size: 10Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -184,10 +203,8 @@ config:
   memeloopCloudWebhookSecret:
     name: ""
     key: memeloop-cloud-webhook-secret
-  # The Kubernetes chart supports only externally managed S3-compatible
-  # storage. The runtime filesystem/memory backends are intentionally limited
-  # to local and test harnesses; mounting them into this hardened Pod would
-  # create a single-replica, non-durable archive.
+  # External S3 remains the default. rustfs.connectArchive selects the dedicated
+  # chart-managed S3 service after bucket provisioning and reader validation.
   archiveBackend: s3
   s3:
     # Shared by all roles; configuration changes need a rolling restart, not a build.

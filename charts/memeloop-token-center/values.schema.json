@@ -30,6 +30,39 @@
     "serviceMonitor"
   ],
   "properties": {
+    "rustfs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "connectArchive", "image", "persistence", "resources", "nodeSelector", "tolerations", "affinity"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "connectArchive": { "type": "boolean" },
+        "image": {
+          "type": "object", "additionalProperties": false,
+          "required": ["repository", "tag", "digest", "pullPolicy"],
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string", "minLength": 1 },
+            "digest": { "type": "string", "pattern": "^$|^sha256:[a-f0-9]{64}$" },
+            "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "persistence": {
+          "type": "object", "additionalProperties": false,
+          "required": ["existingClaim", "storageClass", "size"],
+          "properties": {
+            "existingClaim": { "type": "string" },
+            "storageClass": { "type": "string" },
+            "size": { "type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$" }
+          }
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+        "tolerations": { "type": "array", "items": { "type": "object" } },
+        "affinity": { "$ref": "#/definitions/affinity" }
+      },
+      "allOf": [{ "if": { "properties": { "connectArchive": { "const": true } } }, "then": { "properties": { "enabled": { "const": true } } } }]
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,
