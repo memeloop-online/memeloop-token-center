@@ -172,3 +172,49 @@ async fn settings_cas_is_durable_and_refresh_publishes_a_snapshot() {
     database.refresh_http_settings().await.unwrap();
     assert_eq!(database.http_clients.snapshot().document, document);
 }
+
+#[tokio::test]
+async fn changed_deadline_affects_new_requests_but_not_a_body_already_in_flight() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (release, released) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut old, _) = listener.accept().await.unwrap();
+        let mut buffer = [0; 4096];
+        old.read(&mut buffer).await.unwrap();
+        old.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+            .await
+            .unwrap();
+        let (mut new, _) = listener.accept().await.unwrap();
+        new.read(&mut buffer).await.unwrap();
+        released.await.unwrap();
+        old.write_all(b"ok").await.unwrap();
+    });
+    let factory = Arc::new(HttpClientFactory::default());
+    let handle = factory.handle(HttpPurpose::General);
+    let old = handle
+        .http_client(ClientOptions::default())
+        .unwrap()
+        .get(&url)
+        .send()
+        .await
+        .unwrap();
+    factory.publish(
+        serde_json::from_value(json!({
+            "revision": 1, "settings": {"defaults": {"request_timeout_ms": 25}}
+        }))
+        .unwrap(),
+    );
+    let error = handle
+        .http_client(ClientOptions::default())
+        .unwrap()
+        .get(&url)
+        .send()
+        .await
+        .unwrap_err();
+    assert!(error.is_timeout());
+    release.send(()).unwrap();
+    assert_eq!(old.text().await.unwrap(), "ok");
+    server.await.unwrap();
+}

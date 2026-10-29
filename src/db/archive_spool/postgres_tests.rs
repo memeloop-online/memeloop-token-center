@@ -450,6 +450,7 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
     }).await.expect("server finishes atomic admission after client loses COMMIT ACK");
     fixture.db.close().await;
     fixture.db = Database {
+        http_clients: fixture.db.http_clients.clone(),
         pool: schema_pool(&fixture.url, &fixture.schema).await,
         pool_role: "serve",
         backend: DatabaseBackend::PostgreSql,
@@ -823,6 +824,7 @@ impl PgFixture {
             .await
             .unwrap();
         let db = Database {
+            http_clients: std::sync::Arc::default(),
             pool: schema_pool(&url, &schema).await,
             pool_role: "serve",
             backend: DatabaseBackend::PostgreSql,
@@ -1024,6 +1026,7 @@ async fn postgres_seal_precedes_terminal_delivery_and_survives_producer_loss() {
     fixture.wait_state("pending").await;
     fixture.db.close().await;
     fixture.db = Database {
+        http_clients: fixture.db.http_clients.clone(),
         pool: schema_pool(&fixture.url, &fixture.schema).await,
         pool_role: "serve",
         backend: DatabaseBackend::PostgreSql,
@@ -1095,6 +1098,7 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
     fixture.wait_state("pending").await;
     fixture.db.close().await;
     fixture.db = Database {
+        http_clients: fixture.db.http_clients.clone(),
         pool: schema_pool(&fixture.url, &fixture.schema).await,
         pool_role: "serve",
         backend: DatabaseBackend::PostgreSql,
