@@ -969,7 +969,7 @@ pub(crate) async fn archive_session_body(
 ) -> Result<bool, AppError> {
     let (tenant_id, hints, response_complete) =
         state.db.conversation_object_context(request_id).await?;
-    let Some(locators) = state.db.session_body_locators(request_id).await? else {
+    let Some(mut locators) = state.db.session_body_locators(request_id).await? else {
         return skip_session_body(
             state,
             lease_owner,
@@ -978,6 +978,30 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
+    if let Some(response) = state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "response")
+        .await?
+    {
+        state
+            .db
+            .bind_raw_capture(tenant_id, request_id, "response", &response)
+            .await?;
+        locators.response = Some(response.object_locator);
+        locators.pending = false;
+    }
+    if let Some(request) = state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "request")
+        .await?
+    {
+        state
+            .db
+            .bind_raw_capture(tenant_id, request_id, "request", &request)
+            .await?;
+        locators.request = request.object_locator;
+        locators.source_identity = None;
+    }
     if locators.pending {
         state
             .db
@@ -1047,7 +1071,6 @@ pub(crate) async fn archive_session_body(
     let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
         Some(locator) => match load_raw_document(state, &locator).await {
             Ok(bytes) => bytes,
-            Err(_) if missing_raw_document(&locator) => bytes::Bytes::from_static(b"{}"),
             Err(_) => {
                 state
                     .db
@@ -1056,7 +1079,13 @@ pub(crate) async fn archive_session_body(
                 return Ok(false);
             }
         },
-        None => bytes::Bytes::from_static(b"{}"),
+        None => {
+            state
+                .db
+                .defer_session_body_archive(lease_owner, request_id)
+                .await?;
+            return Ok(false);
+        }
     };
     let return_document = crate::conversation::raw_return_document(&return_bytes)
         .unwrap_or_else(|| serde_json::json!({}));

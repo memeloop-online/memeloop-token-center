@@ -32,4 +32,6 @@ jobs:
       - uses: ./.github/actions/checkout-plugin-examples
       - run: cargo test --locked --lib archive::conversation
       - run: cargo test --locked --lib archive::text
+      - run: cargo test --locked --lib archive::raw_capture
       - run: cargo test --locked --lib db::object_bodies
+      - run: cargo test --locked --lib buffered_archive_waits_off_frontend

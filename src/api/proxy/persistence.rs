@@ -20,7 +20,7 @@ pub(crate) struct Persistence {
 impl Default for Persistence {
     fn default() -> Self {
         Self {
-            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(4 * 1024 * 1024),
+            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(16 * 1024 * 1024),
             jobs: Arc::new(tokio::sync::Semaphore::new(JOBS)),
             bytes: Arc::new(tokio::sync::Semaphore::new(BYTES)),
             accepted: AtomicU64::new(0),
@@ -161,23 +161,42 @@ pub(super) fn capture(
             .acquire_owned()
             .await
             .expect("archive capture semaphore stays open");
-        let db = &background.persistence_db;
+        let mut durable = None;
         loop {
             let result: Result<bool, AppError> = async {
-                if db
-                    .deferred_archive_is_captured(identity, purpose, &body)
-                    .await?
-                {
-                    return Ok(true);
-                }
-                let archive = BufferedArchive::new(
-                    identity,
-                    purpose,
-                    &body,
-                    background.config.key_pepper.as_bytes(),
-                    background.config.archive_spool_compression_enabled,
-                )?;
-                db.capture_deferred_archive(&archive).await
+                let reference = match &durable {
+                    Some(reference) => reference,
+                    None => {
+                        durable = Some(
+                            background
+                                .archive
+                                .put_tenant_content(identity.tenant_id, body.clone())
+                                .await?,
+                        );
+                        durable
+                            .as_ref()
+                            .expect("archive reference was just persisted")
+                    }
+                };
+                background
+                    .archive
+                    .publish_raw_capture(
+                        identity.tenant_id,
+                        identity.request_id,
+                        purpose.as_str(),
+                        reference,
+                    )
+                    .await?;
+                let _ = background
+                    .persistence_db
+                    .bind_raw_capture(
+                        identity.tenant_id,
+                        identity.request_id,
+                        purpose.as_str(),
+                        reference,
+                    )
+                    .await?;
+                Ok(true)
             }
             .await;
             match result {
@@ -225,7 +244,12 @@ mod tests {
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(Uuid::new_v4().to_string()).bind(identity.reservation_id.to_string())
             .execute(&pool).await.unwrap();
-        sqlx::query("CREATE TRIGGER pause_buffered_capture BEFORE INSERT ON response_archive_spool_chunks BEGIN SELECT RAISE(ABORT, 'injected archive outage'); END")
+        sqlx::query("UPDATE request_records SET completed_at = 2 WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER pause_buffered_capture BEFORE UPDATE OF response_object ON request_records BEGIN SELECT RAISE(ABORT, 'injected metadata outage'); END")
             .execute(&pool).await.unwrap();
         let jobs = state
             .persistence
@@ -261,29 +285,22 @@ mod tests {
             .await
             .unwrap();
         state.persistence.drain_for_test().await;
-        assert!(
-            state
-                .db
-                .deferred_archive_is_captured(
-                    identity,
-                    crate::response_archive_spool::BufferedArchivePurpose::Response,
-                    &body,
-                )
-                .await
-                .unwrap()
+        let reference = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reference.blake3_digest,
+            blake3::hash(&body).to_hex().to_string()
         );
-        assert!(
-            !state
-                .db
-                .deferred_archive_is_captured(
-                    identity,
-                    crate::response_archive_spool::BufferedArchivePurpose::Response,
-                    &vec![b'x'; body.len()],
-                )
+        let encrypted_chunks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+                .fetch_one(&pool)
                 .await
-                .unwrap()
-        );
-        assert!(crate::response_archive_spool::process_one_for_test(&state).await);
+                .unwrap();
+        assert_eq!(encrypted_chunks, 0);
         let locator: String =
             sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
                 .bind(identity.request_id.to_string())

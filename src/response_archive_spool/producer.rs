@@ -903,23 +903,20 @@ async fn run_response_archive_writer(
 ) -> Result<WriterOutcome, AppError> {
     #[cfg(test)]
     pause_begin_for_test(&state).await;
-    let mut writer = ResponseArchiveWriter::begin_inner(state.clone(), identity).await?;
+    let staging = format!(
+        "raw-capture-staging/{}/{}/{}",
+        identity.tenant_id,
+        identity.request_id,
+        uuid::Uuid::now_v7()
+    );
+    let mut writer = state.archive.start_writer(&staging).await?;
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
     while let Some(first) = receiver.recv().await {
         if !active.load(Ordering::Acquire) {
             return Ok(writer_interrupted(identity, "abandoned_before_append"));
         }
-        let mut batch = Vec::with_capacity(super::CAPTURE_DATABASE_BATCH_CHUNKS);
-        batch.push(first);
-        while batch.len() < super::CAPTURE_DATABASE_BATCH_CHUNKS {
-            match receiver.try_recv() {
-                Ok(chunk) => batch.push(chunk),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-        writer.append_chunks(batch).await?;
+        writer.write(first.bytes).await?;
     }
     let Ok(tail) = terminal.await else {
         return Ok(writer_interrupted(identity, "terminal_sender_dropped"));
@@ -928,12 +925,25 @@ async fn run_response_archive_writer(
         return Ok(writer_interrupted(identity, "abandoned_before_tail"));
     }
     if !tail.is_empty() {
-        writer.append_chunk(tail).await?;
+        writer.write(tail).await?;
     }
     if !active.load(Ordering::Acquire) {
         return Ok(writer_interrupted(identity, "abandoned_before_seal"));
     }
-    writer.seal_inner().await?;
+    let staged = writer.finish_staged().await?;
+    let object = state
+        .archive
+        .promote_staged_text_to_cas(identity.tenant_id, &staged)
+        .await?;
+    state
+        .archive
+        .publish_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
+        .await?;
+    state.archive.delete(&staged.object_locator).await?;
+    state
+        .db
+        .bind_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
+        .await?;
     Ok(WriterOutcome::Sealed)
 }
 

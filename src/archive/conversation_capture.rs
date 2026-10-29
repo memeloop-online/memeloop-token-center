@@ -37,6 +37,10 @@ impl ArchiveStore {
     ) -> Result<CasArchiveObject, AppError> {
         let raw_request = self.put_tenant_content(tenant_id, request.clone()).await?;
         let raw_response = self.put_tenant_content(tenant_id, response.clone()).await?;
+        self.publish_raw_capture(tenant_id, request_id, "request", &raw_request)
+            .await?;
+        self.publish_raw_capture(tenant_id, request_id, "response", &raw_response)
+            .await?;
         let branch = hints.branch_id.as_deref().unwrap_or("main");
         let mut head = None;
         let mut gaps = Vec::new();

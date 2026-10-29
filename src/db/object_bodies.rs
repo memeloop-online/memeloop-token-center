@@ -3,6 +3,34 @@ use crate::archive::{ArchiveStore, ConversationBodyReference};
 use bytes::Bytes;
 
 impl Database {
+    pub(crate) async fn bind_raw_capture(
+        &self,
+        tenant_id: Uuid,
+        request_id: Uuid,
+        side: &str,
+        object: &crate::archive::CasArchiveObject,
+    ) -> Result<bool, AppError> {
+        self.body_archive()?
+            .verify_tenant_content(tenant_id, object)
+            .await?;
+        let statement = match side {
+            "request" => {
+                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND completed_at IS NOT NULL AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')"
+            }
+            "response" => {
+                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND completed_at IS NOT NULL AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response')"
+            }
+            _ => return Err(AppError::BadRequest("invalid raw archive side".into())),
+        };
+        let changed = sqlx::query(statement)
+            .bind(&object.object_locator)
+            .bind(request_id.to_string())
+            .bind(tenant_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(changed.rows_affected() == 1)
+    }
+
     pub(crate) async fn conversation_object_context(
         &self,
         request_id: Uuid,

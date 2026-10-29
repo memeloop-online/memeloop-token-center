@@ -47,7 +47,6 @@ mod upstream_response;
 
 #[cfg(test)]
 use crate::db::UpstreamFailureKind;
-use crate::response_archive_spool::BufferedArchive;
 use crate::{
     db::{ProxyRequestUpstreamAttribution, SwitchProxyCandidateInput, UpstreamAttemptAdmission},
     metrics::{UpstreamHealthEvent, UpstreamHealthReason},

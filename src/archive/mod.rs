@@ -28,6 +28,9 @@ mod download;
 mod multipart;
 mod objects;
 mod path;
+mod raw_capture;
+#[cfg(test)]
+mod raw_capture_tests;
 mod readiness;
 mod staging;
 mod text;
