@@ -66,7 +66,7 @@ test('HTTP settings save full documents, preserve inheritance and drafts, and ex
     await read.fill('');
     await page.screenshot({ path: `${artifacts}/loaded-zh-1440.png`, fullPage: true });
 
-    await purpose.locator('.request-config-row').filter({ has: read }).getByRole('checkbox', { name: '不设限' }).check();
+    await purpose.locator('.request-config-row').filter({ has: page.locator('#request-config-codex-read_timeout_ms') }).getByRole('checkbox', { name: '不设限' }).check();
     await purpose.getByRole('button', { name: '保存覆盖', exact: true }).click();
     await card.getByText('当前实例生效版本：8').waitFor();
     const body = await page.evaluate(() => (window as FixtureWindow).requestConfigFixture.lastBody);
