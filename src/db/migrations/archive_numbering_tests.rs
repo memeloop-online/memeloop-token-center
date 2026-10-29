@@ -20,7 +20,7 @@ async fn archive_upgrade_preserves_142(url: &str, migrations: &[Migration]) {
         include_str!("../../../migrations/common/0112_request_archive_gap_evidence.sql"),
     ] {
         let schema = schema.replace("CREATE TABLE ", "CREATE TEMP TABLE ");
-        sqlx::raw_sql(&schema)
+        sqlx::raw_sql(sqlx::AssertSqlSafe(schema))
             .execute(&mut *transaction)
             .await
             .unwrap();

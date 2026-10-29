@@ -255,7 +255,10 @@ impl Database {
     ) -> Result<Option<RequestView>, AppError> {
         let query = build_request_list_query_for_history(
             RequestListScope::Global,
-            &RequestListFilter { limit: 1, ..RequestListFilter::default() },
+            &RequestListFilter {
+                limit: 1,
+                ..RequestListFilter::default()
+            },
             Some(identity),
         );
         Ok(self.fetch_request_list(query).await?.into_iter().next())

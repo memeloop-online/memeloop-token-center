@@ -21,7 +21,8 @@ pub(crate) async fn list_if_enabled(
     filter: &RequestListFilter,
     paged: bool,
 ) -> Result<Option<serde_json::Value>, crate::error::AppError> {
-    let Some(client) = crate::request_history::ClickHouse::from_env(state.http.clone())? else {
+    let Some(client) = crate::request_history::ClickHouse::reader_from_env(state.http.clone())?
+    else {
         return Ok(None);
     };
     if state.db.history_mode().await? != "clickhouse" {
@@ -36,7 +37,8 @@ pub(crate) async fn statistics_if_enabled(
     scope: HistoryScope,
     filter: &crate::db::StatsFilter,
 ) -> Result<Option<crate::model::OperatorStats>, crate::error::AppError> {
-    let Some(client) = crate::request_history::ClickHouse::from_env(state.http.clone())? else {
+    let Some(client) = crate::request_history::ClickHouse::reader_from_env(state.http.clone())?
+    else {
         return Ok(None);
     };
     if state.db.history_mode().await? != "clickhouse" {

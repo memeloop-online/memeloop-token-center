@@ -208,8 +208,9 @@ impl Database {
     ) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
         for snapshot in snapshots {
-            sqlx::query("DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3")
+            sqlx::query("DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4")
                 .bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string())
+                .bind(serde_json::to_string(snapshot)?)
                 .execute(&mut *transaction).await?;
         }
         transaction.commit().await?;
@@ -247,7 +248,7 @@ impl Database {
     }
 
     pub async fn history_switch(&self, clickhouse: bool) -> Result<(), HistoryError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write_transaction().await?;
         if clickhouse {
             let lock = if matches!(self.backend, DatabaseBackend::PostgreSql) {
                 " FOR UPDATE"
@@ -259,10 +260,25 @@ impl Database {
             )))
             .fetch_one(&mut *transaction)
             .await?;
-            if revision != Some(self.history_revision().await?)
-                || self.history_pending_count().await? != 0
-                || !self.history_backfill_done().await?
-            {
+            let revision_sql = match self.backend {
+                DatabaseBackend::PostgreSql => {
+                    "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM request_history_export_revision_seq"
+                }
+                DatabaseBackend::Sqlite => {
+                    "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'request_history_export'), 0)"
+                }
+            };
+            let current: i64 = sqlx::query_scalar(revision_sql)
+                .fetch_one(&mut *transaction)
+                .await?;
+            let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
+                .fetch_one(&mut *transaction)
+                .await?;
+            let backfill: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM request_history_backfill WHERE done = 0")
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            if revision != Some(current) || pending != 0 || backfill != 0 {
                 return Err(HistoryError::Changed);
             }
         }

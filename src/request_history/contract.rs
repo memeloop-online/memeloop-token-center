@@ -70,7 +70,8 @@ impl HistorySnapshot {
             .transpose()
             .map_err(|_| HistoryError::Invalid("stored cost"))?
             .map(|cost| {
-                (cost * Decimal::from(1_000_000))
+                cost.checked_mul(Decimal::from(1_000_000))
+                    .ok_or(HistoryError::Invalid("stored cost overflow"))?
                     .to_i64()
                     .ok_or(HistoryError::Invalid("stored cost overflow"))
             })
@@ -111,7 +112,7 @@ impl HistorySnapshot {
             "filter_status": filter_status,
             "filter_cost_micros": self.filter_cost_micros,
             "settlement_state": payload["operational_terminal"]["financial_state"].as_str()
-                .unwrap_or(if payload["completed_at"].is_null() { "pending" } else { "applied" }),
+                .unwrap_or("unknown"),
             "error_code": payload["error_code"],
             "upstream_account_id": payload["upstream_account_id"],
             "route_id": payload["route_id"],

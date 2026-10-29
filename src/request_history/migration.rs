@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
-use super::{ClickHouse, DailyBucket, HistoryError, HistoryQuery, HistoryScope, HistorySnapshot};
+use super::{ClickHouse, DailyBucket, HistoryError, HistoryQuery, HistoryScope};
 use crate::{
     AppState,
     config::Config,

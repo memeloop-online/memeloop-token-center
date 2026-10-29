@@ -19,6 +19,19 @@ pub struct ClickHouse {
 
 impl ClickHouse {
     pub fn from_env(client: impl HttpClientSource + 'static) -> Result<Option<Self>, HistoryError> {
+        Self::from_env_role(client, "WRITER")
+    }
+
+    pub fn reader_from_env(
+        client: impl HttpClientSource + 'static,
+    ) -> Result<Option<Self>, HistoryError> {
+        Self::from_env_role(client, "READER")
+    }
+
+    fn from_env_role(
+        client: impl HttpClientSource + 'static,
+        role: &str,
+    ) -> Result<Option<Self>, HistoryError> {
         let Ok(endpoint) = std::env::var("MTC_REQUEST_HISTORY_URL") else {
             return Ok(None);
         };
@@ -26,8 +39,12 @@ impl ClickHouse {
             client,
             &endpoint,
             std::env::var("MTC_REQUEST_HISTORY_DATABASE").unwrap_or_else(|_| "default".into()),
-            std::env::var("MTC_REQUEST_HISTORY_USER").unwrap_or_else(|_| "default".into()),
-            std::env::var("MTC_REQUEST_HISTORY_PASSWORD").unwrap_or_default(),
+            std::env::var(format!("MTC_REQUEST_HISTORY_{role}_USER"))
+                .or_else(|_| std::env::var("MTC_REQUEST_HISTORY_USER"))
+                .unwrap_or_else(|_| "default".into()),
+            std::env::var(format!("MTC_REQUEST_HISTORY_{role}_PASSWORD"))
+                .or_else(|_| std::env::var("MTC_REQUEST_HISTORY_PASSWORD"))
+                .unwrap_or_default(),
         )
         .map(Some)
     }
