@@ -589,6 +589,115 @@ async fn failed_source_metadata_contract(database_url: String) {
     fixture.assert_completed(true).await;
 }
 
+async fn expired_live_source_writer_contract(database_url: String) {
+    use crate::gateway_body::request_spool::{MemoryObjectStore, RequestSpoolAdmission};
+    use std::time::Duration;
+
+    let store = MemoryObjectStore::new();
+    let release = store.pause_next_write();
+    let admission =
+        RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
+    let mut fixture =
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    let source = fixture.source.take().unwrap();
+    let locator = source.object_locator().unwrap().to_owned();
+    let length = source.len();
+    let digest = source.digest();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let capturing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'capturing'")
+                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+            if capturing == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the admitted source must register before its metadata outage");
+    let held = fixture
+        .state
+        .db
+        .hold_gateway_archive_connection_for_test()
+        .await;
+    let before = fixture.state.db.request_source_write_failures_for_test();
+    sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
+        .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    drop(source);
+    let charged = fixture.state.proxy_memory_budget.snapshot().0;
+    assert!(
+        charged > 0,
+        "the pending Put still owns the raw bytes after request drop"
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while fixture.state.db.request_source_write_failures_for_test() == before {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the live writer must encounter metadata unavailability");
+    assert!(
+        !release.is_closed(),
+        "metadata failure must retain the paused Put"
+    );
+    assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, charged);
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let expiry: i64 = sqlx::query_scalar("SELECT lease_expires_at FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
+                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+            if expiry > unix_millis() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("the original writer must renew its expired lease before takeover");
+    assert!(
+        !release.is_closed(),
+        "renewal must keep the original Put alive"
+    );
+    assert_eq!(
+        fixture.state.proxy_memory_budget.snapshot().0,
+        charged,
+        "renewal must not release the raw budget before Put"
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .recover_request_source(fixture.identity, &locator)
+            .await
+            .unwrap(),
+        "recovery must defer to the renewed live writer"
+    );
+    store.resume_writes_for_test(fixture.state.archive.clone());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM request_archive_spools WHERE request_id = $1",
+            )
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+            if state == "bound" && fixture.state.proxy_memory_budget.snapshot().0 == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the original Put must bind and release its raw budget");
+    let original = fixture.state.archive.get(&locator).await.unwrap();
+    assert_eq!(original.len(), length);
+    assert_eq!(*blake3::hash(&original).as_bytes(), digest);
+    assert!(
+        std::str::from_utf8(&original)
+            .unwrap()
+            .contains("provider_secret_field")
+    );
+    fixture.assert_completed(true).await;
+}
+
 async fn lost_source_writer_contract(database_url: String) {
     use crate::gateway_body::request_spool::{MemoryObjectStore, RequestSpoolAdmission};
     use std::time::Duration;
@@ -680,6 +789,7 @@ async fn sqlite_source_failed_state_write_retries_and_lost_writer_converges() {
         directory.path().join("source-failures.db").display()
     );
     failed_source_metadata_contract(database_url.clone()).await;
+    expired_live_source_writer_contract(database_url.clone()).await;
     lost_source_writer_contract(database_url).await;
 }
 
@@ -698,6 +808,7 @@ async fn postgres_source_failed_state_write_retries_and_lost_writer_converges() 
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
     failed_source_metadata_contract(isolated.to_string()).await;
+    expired_live_source_writer_contract(isolated.to_string()).await;
     lost_source_writer_contract(isolated.to_string()).await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)

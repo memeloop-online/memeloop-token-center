@@ -1,5 +1,7 @@
 use super::*;
 
+#[cfg(test)]
+mod archive_numbering_tests;
 mod observation_prefix;
 mod plaintext_sweep;
 #[cfg(test)]

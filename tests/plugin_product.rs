@@ -559,13 +559,17 @@ async fn revision_policy_failures_open_only_their_own_circuit() {
             .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
             .unwrap();
         assert!(decision.allow, "unavailable policy must fail open");
-        assert!(decision.denied_by_plugin_id.is_none());
+        assert!(decision.request_json.is_none());
+        assert!(decision.model.is_none());
+        assert!(decision.upstream_account_id.is_none());
     }
     let decision = pinned
         .apply_traffic_with_config(context(), &json!({"model": "test"}), &BTreeMap::new())
         .unwrap();
     assert!(decision.allow, "open circuit must fail open");
-    assert!(decision.denied_by_plugin_id.is_none());
+    assert!(decision.request_json.is_none());
+    assert!(decision.model.is_none());
+    assert!(decision.upstream_account_id.is_none());
     assert!(revisions.replace(1, PluginRuntime::default()).is_err());
     fs::write(
         plugins.join("trap-policy/plugin.wasm"),

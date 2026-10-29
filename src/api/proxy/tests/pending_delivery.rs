@@ -1,5 +1,69 @@
 use super::*;
 
+async fn owned_enqueued_source(
+    fixture: &CodexRouteFixture,
+    pool: &sqlx::AnyPool,
+    request_id: Uuid,
+    expected: &Value,
+) -> Value {
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let locator: String = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(locator) = sqlx::query_scalar::<_, String>(
+                "SELECT r.request_object FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3 AND o.principal_id = $4 AND o.projected_at IS NULL",
+            )
+            .bind(request_id.to_string())
+            .bind(key.tenant_id.to_string())
+            .bind(key.key_id.to_string())
+            .bind(key.principal_id.to_string())
+            .fetch_optional(pool).await.unwrap() {
+                break locator;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("original identity must retain an enqueued source object");
+    assert_eq!(
+        locator,
+        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
+            .unwrap()
+    );
+    assert_eq!(
+        crate::gateway_body::request_spool::source_request_id(&locator),
+        Some(request_id)
+    );
+    let raw = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(raw) = fixture.state.archive.get(&locator).await {
+                break raw;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original source bytes must remain readable after enqueue");
+    assert_eq!(
+        raw.as_ref(),
+        serde_json::to_vec(expected).unwrap().as_slice()
+    );
+    let payloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        payloads, 0,
+        "new enqueue must not duplicate raw bytes in the database"
+    );
+    serde_json::from_slice(&raw).unwrap()
+}
+
 #[tokio::test]
 async fn durable_unknown_receipt_releases_projection_memory_without_discarding_evidence() {
     let upstream = MockServer::start().await;
@@ -54,7 +118,7 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         .into_iter()
         .find(|item| item["receipt_id"] == receipt["receipt_id"])
         .expect("unknown finance keeps the in-memory receipt");
-    // Once the outbox row holds the payload the receipt drops the parsed
+    // Once the outbox retains the source identity the receipt drops the parsed
     // conversation from memory, so only the identity survives in-process.
     assert_eq!(retained_receipt["receipt_id"], receipt["receipt_id"]);
     assert_eq!(retained_receipt["request_id"], receipt["request_id"]);
@@ -71,19 +135,15 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         "durable enqueue must drop the parsed conversation from memory"
     );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let retained_body: String = sqlx::query_scalar(
-        "SELECT p.request_json FROM conversation_semantic_payloads p JOIN conversation_projection_outbox o ON o.request_id = p.request_id AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.principal_id = p.principal_id WHERE p.request_id = $1 AND p.tenant_id = $2 AND p.key_id = $3 AND o.projected_at IS NULL",
+    let retained_body = owned_enqueued_source(
+        &fixture,
+        &pool,
+        Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap(),
+        &json!({"model": fixture.model, "input": "PRIVATE_OWNED_UNKNOWN_INPUT",
+            "stream": false, "max_output_tokens": 16}),
     )
-    .bind(receipt["request_id"].as_str().unwrap())
-    .bind(receipt["claim"]["tenant_id"].as_str().unwrap())
-    .bind(receipt["claim"]["key_id"].as_str().unwrap())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        serde_json::from_str::<Value>(&retained_body).unwrap()["input"],
-        "PRIVATE_OWNED_UNKNOWN_INPUT"
-    );
+    .await;
+    assert_eq!(retained_body["input"], "PRIVATE_OWNED_UNKNOWN_INPUT");
     pool.close().await;
     assert!(
         fixture
@@ -1367,27 +1427,14 @@ async fn unknown_failure_retries_operational_projection() {
         .execute(&pool)
         .await
         .unwrap();
-    let payload: String = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(payload) = sqlx::query_scalar::<_, String>(
-                "SELECT request_json FROM conversation_semantic_payloads WHERE request_id = $1",
-            )
-            .bind(request_id.to_string())
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            {
-                break payload;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("financial arbitration must keep retrying the original semantic projection");
-    assert_eq!(
-        serde_json::from_str::<Value>(&payload).unwrap(),
-        original["conversation"]["request_json"]
-    );
+    let payload = owned_enqueued_source(
+        &fixture,
+        &pool,
+        request_id,
+        &json!({"model": fixture.model, "input": "operational failure retry", "stream": true}),
+    )
+    .await;
+    assert_eq!(payload, original["conversation"]["request_json"]);
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if fixture
@@ -1536,27 +1583,11 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
     assert_eq!(receipt["operational_terminal"]["completed_at"], original.2);
     // The recovered annotation enqueues the conversation as durable
     // evidence; the parsed copy leaves memory once that lands.
-    let enqueued: String = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(payload) = sqlx::query_scalar::<_, String>(
-                "SELECT request_json FROM conversation_semantic_payloads WHERE request_id = $1",
-            )
-            .bind(record.request_id.to_string())
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            {
-                break payload;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("runtime ACK recovery must enqueue the conversation as durable evidence");
-    assert_eq!(
-        serde_json::from_str::<Value>(&enqueued).unwrap()["input"],
-        "cancel before provider terminal"
-    );
+    let enqueued = owned_enqueued_source(
+        &fixture, &pool, record.request_id,
+        &json!({"model": fixture.model, "input": "cancel before provider terminal", "stream": true}),
+    ).await;
+    assert_eq!(enqueued["input"], "cancel before provider terminal");
     assert!(
         fixture
             .state

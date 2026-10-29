@@ -410,7 +410,7 @@ impl Database {
             transaction.commit().await?;
             return Ok(false);
         }
-        let stage = sqlx::query("UPDATE archive_staging_attempts SET updated_at = updated_at WHERE attempt_id = $1 AND owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = 'request' AND writer_owner = 'gateway-source' AND writer_token = $1 RETURNING state, lease_expires_at")
+        let stage = sqlx::query("UPDATE archive_staging_attempts SET updated_at = updated_at WHERE attempt_id = $1 AND owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = 'request' AND writer_owner = 'gateway-source' AND writer_token = $1 RETURNING state, lease_owner, lease_token, lease_expires_at")
             .bind(identity.request_id.to_string()).fetch_optional(&mut *transaction).await?;
         let Some(stage) = stage else {
             return Ok(false);
@@ -430,8 +430,18 @@ impl Database {
             if existing.as_deref() == Some("gap") && success == Some(false) {
                 return Ok(true);
             }
-        } else if !live {
-            return Ok(false);
+        } else {
+            if !writing
+                || stage
+                    .try_get::<Option<String>, _>("lease_owner")?
+                    .as_deref()
+                    != Some("gateway-source")
+                || stage
+                    .try_get::<Option<String>, _>("lease_token")?
+                    .is_none_or(|token| token != identity.request_id.to_string())
+            {
+                return Ok(false);
+            }
         }
         if success.is_some() {
             sqlx::query("UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, next_cleanup_at = $2, updated_at = $2 WHERE attempt_id = $1")
