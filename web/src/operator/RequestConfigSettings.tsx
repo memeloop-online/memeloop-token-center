@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Button, Input } from '@fluentui/react-components';
+import { Button, Checkbox, Input } from '@fluentui/react-components';
 import { ApiError } from '../api';
 import { DetailTooltip, Disclosure, LoadingState } from '../design-system';
-import { useI18n, type Locale } from '../i18n';
+import { useI18n } from '../i18n';
 import {
-  formatConfigValue, parseConfigInput, configRangeLabel, requestConfigFields, requestConfigPurposes,
-  toDisplayValue, type RequestConfigFieldMeta, type RequestConfigPurpose, type RequestConfigSnapshot,
+  formatConfigValue, parseConfigInput, requestConfigFields, requestConfigPurposes,
+  toDisplayValue, type HttpOverrides, type RequestConfigFieldMeta, type RequestConfigPurpose, type RequestConfigSnapshot,
 } from './requestConfig';
 import { loadRequestConfig, saveRequestConfig, type RequestConfigScope } from './requestConfigApi';
 import { messageOf } from './scope/operatorShared';
@@ -14,27 +14,24 @@ type Drafts = Record<string, string>;
 
 const defaultScope = 'default';
 
-function scopeDrafts(snapshot: RequestConfigSnapshot, scope: string, locale: Locale): Drafts {
+function scopeDrafts(snapshot: RequestConfigSnapshot, scope: string): Drafts {
   const entries = scope === defaultScope
-    ? requestConfigFields.map((field) => [field.key, toDisplayValue(snapshot.defaults[field.key], field, locale)])
+    ? requestConfigFields.map((field) => [field.key, toDisplayValue(snapshot.settings.defaults[field.key])])
     : requestConfigFields.map((field) => {
-      const override = snapshot.purposes[scope]?.overrides[field.key];
-      return [field.key, override === undefined ? '' : toDisplayValue(override, field, locale)];
+      const override = snapshot.settings.purposes[scope as RequestConfigPurpose]?.[field.key];
+      return [field.key, toDisplayValue(override)];
     });
   return Object.fromEntries(entries);
 }
 
 function effectiveValue(snapshot: RequestConfigSnapshot, purpose: RequestConfigPurpose, field: RequestConfigFieldMeta) {
-  return snapshot.purposes[purpose]?.effective[field.key]
-    ?? { value: snapshot.defaults[field.key] ?? null, source: 'default' as const };
+  return snapshot.effective[purpose][field.key];
 }
 
-export function RequestConfigSettings({ token, tenant }: { token: string; tenant: string }) {
-  const { t, locale } = useI18n();
+export function RequestConfigSettings({ token }: { token: string }) {
+  const { t } = useI18n();
   const translate = useRef(t);
   translate.current = t;
-  const localeRef = useRef(locale);
-  localeRef.current = locale;
   const [snapshot, setSnapshot] = useState<RequestConfigSnapshot | null>(null);
   const [drafts, setDrafts] = useState<Record<string, Drafts>>({});
   const [touched, setTouched] = useState<Record<string, boolean>>({});
@@ -44,40 +41,42 @@ export function RequestConfigSettings({ token, tenant }: { token: string; tenant
   const [savingScope, setSavingScope] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [conflict, setConflict] = useState(false);
   const loadSequence = useRef(0);
   const savingRequest = useRef<symbol | null>(null);
   const submittedDrafts = useRef<{ scope: string; drafts: Drafts } | null>(null);
   const units = useMemo(() => ({
-    seconds: t('settings.requestConfigUnitSecond'),
-    mebibytes: t('settings.requestConfigUnitMebibyte'),
+    milliseconds: t('settings.requestConfigUnitMillisecond'),
+    connections: t('settings.requestConfigUnitConnection'),
   }), [t]);
   const unlimited = t('settings.requestConfigUnlimited');
   const format = useCallback(
-    (value: number | null, field: RequestConfigFieldMeta) => formatConfigValue(value, field, locale, unlimited, units),
-    [locale, unlimited, units],
+    (value: number | null, field: RequestConfigFieldMeta) => formatConfigValue(value, field, unlimited, units),
+    [unlimited, units],
   );
 
   const load = useCallback(async () => {
     const request = ++loadSequence.current;
     savingRequest.current = null; setSavingScope('');
-    setError(''); setLoadError(''); setMessage(''); setUnavailable(false);
-    if (!token || !tenant) { setSnapshot(null); setLoading(false); return; }
+    setError(''); setLoadError(''); setMessage(''); setUnavailable(false); setConflict(false);
+    if (!token) { setSnapshot(null); setLoading(false); return; }
     setLoading(true);
     try {
-      const next = await loadRequestConfig(token, tenant);
+      const next = await loadRequestConfig(token);
       if (request !== loadSequence.current) return;
       setSnapshot(next);
-      const nextDrafts: Record<string, Drafts> = { [defaultScope]: scopeDrafts(next, defaultScope, localeRef.current) };
-      for (const purpose of requestConfigPurposes) nextDrafts[purpose] = scopeDrafts(next, purpose, localeRef.current);
+      const nextDrafts: Record<string, Drafts> = { [defaultScope]: scopeDrafts(next, defaultScope) };
+      for (const purpose of requestConfigPurposes) nextDrafts[purpose] = scopeDrafts(next, purpose);
       setDrafts(nextDrafts); setTouched({});
     } catch (reason) {
       if (request !== loadSequence.current) return;
       if (reason instanceof ApiError && reason.status === 404) setUnavailable(true);
-      else setLoadError(messageOf(reason, translate.current('common.requestFailed')));
+      else setLoadError(reason instanceof ApiError && (reason.status === 401 || reason.status === 403)
+        ? translate.current('settings.requestConfigPermission') : messageOf(reason, translate.current('common.requestFailed')));
     } finally {
       if (request === loadSequence.current) setLoading(false);
     }
-  }, [tenant, token]);
+  }, [token]);
 
   useEffect(() => {
     void load();
@@ -89,31 +88,37 @@ export function RequestConfigSettings({ token, tenant }: { token: string; tenant
     const parsed = parseConfigInput(text, field);
     if (parsed.ok) return '';
     if (!text.trim()) return translate.current('settings.requestConfigRequired');
-    return translate.current('settings.requestConfigInvalid', { range: configRangeLabel(field, locale, units) });
-  }, [locale, units]);
+    return translate.current(field.nullable ? 'settings.requestConfigInvalidDuration' : 'settings.requestConfigInvalidCount');
+  }, []);
 
-  const submit = async (scope: string, values: Record<string, number | null>, cleared: boolean) => {
-    if (savingRequest.current || loading || loadError || !snapshot || !tenant) return;
+  const submit = async (scope: string, values: HttpOverrides, cleared: boolean) => {
+    if (savingRequest.current || loading || loadError || conflict || !snapshot) return;
     const operation = Symbol();
     savingRequest.current = operation;
     const request = loadSequence.current;
     submittedDrafts.current = { scope, drafts: { ...drafts[scope] } };
     const current = () => request === loadSequence.current && savingRequest.current === operation;
-    const contractScope: RequestConfigScope = scope === defaultScope ? { scope: 'default' } : { scope: 'purpose', purpose: scope };
+    const contractScope: RequestConfigScope = scope === defaultScope ? { scope: 'default' } : { scope: 'purpose', purpose: scope as RequestConfigPurpose };
     setSavingScope(scope); setError(''); setMessage('');
     try {
-      const next = await saveRequestConfig(token, tenant, contractScope, values, snapshot.updated_at);
+      const next = await saveRequestConfig(token, contractScope, values, snapshot);
       if (!current()) return;
       setSnapshot(next);
       setMessage(translate.current(cleared ? 'settings.requestConfigCleared' : 'settings.requestConfigSaved'));
       setDrafts((previous) => {
         const submitted = submittedDrafts.current;
         if (!submitted || submitted.scope !== scope || JSON.stringify(previous[scope]) !== JSON.stringify(submitted.drafts)) return previous;
-        return { ...previous, [scope]: scopeDrafts(next, scope, locale) };
+        return { ...previous, [scope]: scopeDrafts(next, scope) };
       });
       setTouched((previous) => ({ ...previous, [scope]: false }));
     } catch (reason) {
-      if (current()) setError(messageOf(reason, translate.current('common.requestFailed')));
+      if (current()) {
+        const stale = reason instanceof ApiError && reason.status === 409;
+        setConflict(stale);
+        setError(stale ? translate.current('settings.requestConfigConflict')
+          : reason instanceof ApiError && (reason.status === 401 || reason.status === 403)
+            ? translate.current('settings.requestConfigPermission') : messageOf(reason, translate.current('common.requestFailed')));
+      }
     } finally {
       if (savingRequest.current === operation) {
         savingRequest.current = null;
@@ -125,16 +130,16 @@ export function RequestConfigSettings({ token, tenant }: { token: string; tenant
   const saveScope = (scope: string) => {
     const scopeDraftMap = drafts[scope] ?? {};
     if (requestConfigFields.some((field) => rowError(field, scopeDraftMap[field.key]))) return;
-    const values: Record<string, number | null> = {};
+    const values: HttpOverrides = {};
     for (const field of requestConfigFields) {
       const parsed = parseConfigInput(scopeDraftMap[field.key] ?? '', field);
-      values[field.key] = parsed.ok ? parsed.value : null;
+      if (parsed.ok && parsed.value !== undefined) values[field.key] = parsed.value;
     }
     void submit(scope, values, false);
   };
 
   const clearPurpose = (purpose: RequestConfigPurpose) => {
-    void submit(purpose, Object.fromEntries(requestConfigFields.map((field) => [field.key, null])), true);
+    void submit(purpose, {}, true);
   };
 
   const changeDraft = (scope: string, field: string, value: string) => {
@@ -148,41 +153,44 @@ export function RequestConfigSettings({ token, tenant }: { token: string; tenant
     const inputId = `request-config-${scope}-${field.key}`;
     const draft = drafts[scope]?.[field.key] ?? '';
     const problem = rowError(field, drafts[scope]?.[field.key]);
-    const unit = field.unit === 'milliseconds' ? units.seconds : field.unit === 'bytes' ? units.mebibytes : '';
+    const unit = units[field.unit];
     const effective = purpose
       ? effectiveValue(snapshot, purpose, field)
-      : { value: snapshot.defaults[field.key] ?? null, source: 'default' as const };
-    const placeholder = purpose ? translate.current('settings.requestConfigInheritsPlaceholder', { value: format(snapshot.defaults[field.key] ?? null, field) }) : undefined;
+      : { value: snapshot.settings.defaults[field.key] ?? (field.nullable ? null : 8), source: field.key in snapshot.settings.defaults ? 'global_default' as const : 'source_default' as const };
+    const inherited = snapshot.settings.defaults[field.key] ?? (field.nullable ? null : 8);
+    const placeholder = translate.current('settings.requestConfigInheritsPlaceholder', { value: format(inherited, field) });
     return <div className="request-config-row" key={field.key}>
       <label className="request-config-name" htmlFor={inputId}>
         <DetailTooltip content={t(`settings.requestConfigField.${field.key}Hint`)}><span tabIndex={0}>{t(`settings.requestConfigField.${field.key}`)}</span></DetailTooltip>
       </label>
       <div className="request-config-input">
-        <Input id={inputId} inputMode="decimal" value={draft} placeholder={placeholder} disabled={Boolean(savingScope)}
+        <Input id={inputId} inputMode="numeric" value={draft === 'off' ? '' : draft} placeholder={draft === 'off' ? unlimited : placeholder} disabled={Boolean(savingScope) || draft === 'off'}
           aria-invalid={Boolean(problem)} aria-describedby={`${inputId}-state`}
           contentAfter={unit ? <span className="request-config-unit">{unit}</span> : undefined}
           onChange={(_, data) => changeDraft(scope, field.key, data.value)} />
+        {field.nullable && <Checkbox label={t('settings.requestConfigDisable')} checked={draft === 'off'} disabled={Boolean(savingScope)}
+          onChange={(_, data) => changeDraft(scope, field.key, data.checked ? 'off' : '')} />}
         {problem && <small className="error-text" role="alert">{problem}</small>}
       </div>
       <div className="request-config-state" id={`${inputId}-state`}>
-        {purpose && <span className={`status ${effective.source === 'override' ? 'pending' : 'ok'}`}>
-          {t(effective.source === 'override' ? 'settings.requestConfigSourceOverride' : 'settings.requestConfigSourceDefault')}
-        </span>}
+        <span className={`status ${effective.source === 'purpose_override' ? 'pending' : 'ok'}`}>
+          {t(effective.source === 'purpose_override' ? 'settings.requestConfigSourceOverride' : effective.source === 'global_default' ? 'settings.requestConfigSourceDefault' : 'settings.requestConfigSourceBuiltin')}
+        </span>
         <small>{t('settings.requestConfigEffective', { value: format(effective.value, field) })}</small>
       </div>
     </div>;
   };
 
   const renderActions = (scope: string, label: string, purpose?: RequestConfigPurpose) => {
-    const hasOverride = Boolean(purpose && snapshot && Object.keys(snapshot.purposes[purpose]?.overrides ?? {}).length > 0);
+    const hasOverride = Boolean(purpose && snapshot && Object.keys(snapshot.settings.purposes[purpose] ?? {}).length > 0);
     const scopeDraftMap = drafts[scope] ?? {};
     const invalid = requestConfigFields.some((field) => rowError(field, scopeDraftMap[field.key]));
     const busy = savingScope === scope;
     return <div className="button-row">
-      <Button appearance={purpose ? 'secondary' : 'primary'} disabled={busy || Boolean(savingScope) || invalid || !touched[scope]} onClick={() => saveScope(scope)}>
+      <Button appearance={purpose ? 'secondary' : 'primary'} disabled={conflict || busy || Boolean(savingScope) || invalid || !touched[scope]} onClick={() => saveScope(scope)}>
         {busy ? t('common.loading') : label}
       </Button>
-      {purpose && hasOverride && <Button appearance="subtle" disabled={Boolean(savingScope)} onClick={() => clearPurpose(purpose)}>
+      {purpose && hasOverride && <Button appearance="subtle" disabled={conflict || Boolean(savingScope)} onClick={() => clearPurpose(purpose)}>
         {t('settings.requestConfigClearOverride')}
       </Button>}
     </div>;
@@ -194,9 +202,10 @@ export function RequestConfigSettings({ token, tenant }: { token: string; tenant
         <h3 id="request-config-title">{t('settings.requestConfigTitle')}</h3>
         <p className="muted">{t('settings.requestConfigDescription')}</p>
       </div>
-      {snapshot && <span className="status ok">{t('settings.configured')}</span>}
+      {snapshot && <span className="status ok">{t('settings.requestConfigRevision', { revision: snapshot.revision })}</span>}
     </div>
     {error && <div className="notice error" role="alert">{error}</div>}
+    {conflict && <Button onClick={() => void load()}>{t('settings.requestConfigReload')}</Button>}
     {message && <div className="notice success" role="status">{message}</div>}
     {loading ? <LoadingState label={t('common.loading')} level="page" />
       : loadError ? <div className="settings-empty" role="alert"><b>{t('settings.requestConfigLoadFailed')}</b><span>{loadError}</span><button type="button" className="secondary" onClick={() => void load()}>{t('common.retry')}</button></div>

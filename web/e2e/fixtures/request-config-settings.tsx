@@ -1,61 +1,51 @@
 import { createRoot } from 'react-dom/client';
+import { useState } from 'react';
 import { I18nProvider, useI18n } from '../../src/i18n';
 import { MtcFluentProvider } from '../../src/design-system/MtcFluentProvider';
 import { SystemSettingsPage } from '../../src/operator/pages/SystemSettingsPage';
-import { requestConfigFields, requestConfigPurposes, type RequestConfigSnapshot } from '../../src/operator/requestConfig';
+import { requestConfigFields, requestConfigPurposes, type HttpSettings, type RequestConfigSnapshot } from '../../src/operator/requestConfig';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/operator/operator.css';
 
-// Fixture-side implementation of the draft request-config contract.
-function withEffective(state: RequestConfigSnapshot): RequestConfigSnapshot {
-  const purposes: RequestConfigSnapshot['purposes'] = {};
+function withEffective(revision: number, settings: HttpSettings): RequestConfigSnapshot {
+  const effective = {} as RequestConfigSnapshot['effective'];
   for (const purpose of requestConfigPurposes) {
-    const overrides = state.purposes[purpose]?.overrides ?? {};
-    const effective: Record<string, { value: number | null; source: 'default' | 'override' }> = {};
+    effective[purpose] = {} as RequestConfigSnapshot['effective'][typeof purpose];
     for (const field of requestConfigFields) {
-      effective[field.key] = field.key in overrides
-        ? { value: overrides[field.key], source: 'override' }
-        : { value: state.defaults[field.key] ?? null, source: 'default' };
+      const overrides = settings.purposes[purpose] ?? {};
+      const source = field.key in overrides ? 'purpose_override' : field.key in settings.defaults ? 'global_default' : 'source_default';
+      const value = source === 'purpose_override' ? overrides[field.key] : source === 'global_default' ? settings.defaults[field.key] : field.nullable ? null : 8;
+      effective[purpose][field.key] = { value: value ?? null, source, unit: field.unit };
     }
-    purposes[purpose] = { overrides: { ...overrides }, effective };
   }
-  return { ...state, purposes };
+  return { revision, settings, effective };
 }
 
 const control = {
-  failLoad: false, unavailable: false, delaySave: false, failSave: false, writes: 0,
+  failLoad: false, unavailable: false, forbidden: false, delaySave: false, failSave: false, conflict: false, writes: 0,
+  lastBody: null as { expected_revision: number; settings: HttpSettings } | null,
   releaseSave: () => {},
-  state: withEffective({
-    contract_version: 'request_config_v1',
-    defaults: { timeout_ms: 30_000, stream_idle_timeout_ms: 15_000, max_request_bytes: null },
-    purposes: { text: { overrides: { timeout_ms: 60_000 }, effective: {} } },
-    updated_at: 7,
+  state: withEffective(7, {
+    defaults: { connect_timeout_ms: 30000, read_timeout_ms: 15000 },
+    purposes: { codex: { connect_timeout_ms: 60000 }, oauth: { request_timeout_ms: 90000 } },
   }),
 };
 Object.assign(window, { requestConfigFixture: control });
 
 globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url, location.origin);
-  if (url.pathname.endsWith('/request-config/settings')) {
+  if (url.pathname === '/internal/v1/system-settings/http') {
+    if (url.search) throw new Error('Global settings must not include a tenant query');
+    if (control.forbidden) return Response.json({ error: { message: 'Forbidden' } }, { status: 403 });
     if (init?.method === 'PUT') {
       control.writes += 1;
       if (control.delaySave) await new Promise<void>((resolve) => { control.releaseSave = resolve; });
       if (control.failSave) return Response.json({ error: { message: 'Save rejected' } }, { status: 503 });
-      const body = JSON.parse(String(init.body)) as { scope: 'default' | 'purpose'; purpose?: string; values: Record<string, number | null>; expected_updated_at: number | null };
-      if (body.expected_updated_at !== control.state.updated_at) return Response.json({ error: { code: 'conflict', message: 'Request configuration changed elsewhere' } }, { status: 409 });
-      if (body.scope === 'default') {
-        for (const field of requestConfigFields) if (field.key in body.values) control.state.defaults[field.key] = body.values[field.key];
-      } else if (body.purpose) {
-        const entry = control.state.purposes[body.purpose] ?? { overrides: {}, effective: {} };
-        for (const field of requestConfigFields) {
-          if (!(field.key in body.values)) continue;
-          if (body.values[field.key] === null) delete entry.overrides[field.key];
-          else entry.overrides[field.key] = body.values[field.key] as number;
-        }
-        control.state.purposes[body.purpose] = entry;
-      }
-      control.state = withEffective({ ...control.state, updated_at: control.state.updated_at + 1 });
+      const body = JSON.parse(String(init.body)) as { expected_revision: number; settings: HttpSettings };
+      control.lastBody = body;
+      if (control.conflict || body.expected_revision !== control.state.revision) return Response.json({ error: { message: 'Changed elsewhere' } }, { status: 409 });
+      control.state = withEffective(control.state.revision + 1, body.settings);
       return Response.json(control.state);
     }
     if (control.failLoad) return Response.json({ error: { message: 'Store unavailable' } }, { status: 503 });
@@ -69,9 +59,13 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
 
 function Fixture() {
   const { locale, setLocale } = useI18n();
+  const [generation, setGeneration] = useState(0);
+  const [tenant, setTenant] = useState('tenant');
   return <main style={{ padding: 12 }}>
-    <button type="button" data-switch-locale onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Switch language</button>
-    <SystemSettingsPage token="fixture" tenant="tenant" />
+    <button type="button" onClick={() => setLocale(locale === 'en' ? 'zh-CN' : 'en')}>Switch language</button>
+    <button type="button" onClick={() => setGeneration((previous) => previous + 1)}>Reload settings</button>
+    <button type="button" onClick={() => setTenant(tenant ? '' : 'tenant')}>Switch tenant</button>
+    <SystemSettingsPage token={`fixture-${generation}`} tenant={tenant} />
   </main>;
 }
 createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);

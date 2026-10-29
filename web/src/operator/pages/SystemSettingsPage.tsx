@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button, Combobox, Option } from '@fluentui/react-components';
 import { LoadingState } from '../../design-system';
 import { api } from '../../api';
@@ -40,11 +40,11 @@ async function loadAssistantRouteCatalog(token: string, tenant: string): Promise
  */
 export function SystemSettingsPage({ token, tenant }: { token: string; tenant: string; writeTenant?: string }) {
   const scopeKey = JSON.stringify([token, tenant]);
-  return <AssistantSettings key={scopeKey} token={token} tenant={tenant}
-    requestConfig={<RequestConfigSettings key={`${scopeKey}:request-config`} token={token} tenant={tenant} />} />;
+  return <><AssistantSettings key={scopeKey} token={token} tenant={tenant} />
+    <div className="system-settings"><RequestConfigSettings key={token} token={token} /></div></>;
 }
 
-function AssistantSettings({ token, tenant, requestConfig }: { token: string; tenant: string; requestConfig?: ReactNode }) {
+function AssistantSettings({ token, tenant }: { token: string; tenant: string }) {
   const { t } = useI18n();
   // Locale is presentation state, not the identity of these remote resources.
   // Async completions still use the current locale without reloading drafts.
@@ -183,7 +183,6 @@ function AssistantSettings({ token, tenant, requestConfig }: { token: string; te
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
         {settings && !settings.billing_key_id && <p className="settings-status-note">{t('settings.assistantExecutionNotEnabled')}</p>}
       </article>
-      {requestConfig}
     </>}
   </section>;
 }
