@@ -20,6 +20,7 @@ use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 mod backend;
 mod cas;
 mod compressed;
+mod conversation;
 mod download;
 mod multipart;
 mod objects;
@@ -28,6 +29,10 @@ mod readiness;
 mod staging;
 
 pub use cas::CasArchiveObject;
+pub use conversation::{
+    ConversationEvent, ConversationExport, ConversationManifest, ConversationMedia,
+    ConversationPrefix, ConversationReadLimits, RawConversationCapture, RawConversationFormat,
+};
 pub use download::ArchiveDownload;
 #[cfg(test)]
 use download::{validate_download_range, verified_download_stream};
