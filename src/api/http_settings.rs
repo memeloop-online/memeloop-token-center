@@ -194,6 +194,23 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
+        for revision in [
+            json!(-1),
+            json!(1.5),
+            json!(9_007_199_254_740_992_u64),
+            Value::Null,
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "PUT",
+                    Some(&token),
+                    json!({"expected_revision":revision,"settings":{}}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
         let cleared = app
             .clone()
             .oneshot(request(

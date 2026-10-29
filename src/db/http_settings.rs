@@ -1,5 +1,5 @@
 use super::*;
-use crate::http_settings::{HttpSettings, HttpSettingsDocument};
+use crate::http_settings::{HttpSettings, HttpSettingsDocument, MAX_SAFE_INTEGER};
 use std::sync::Arc;
 
 pub(crate) const HTTP_SETTINGS_NAMESPACE: &str = "system-settings";
@@ -21,6 +21,11 @@ impl Database {
         settings: HttpSettings,
         actor: Option<Uuid>,
     ) -> Result<HttpSettingsDocument, AppError> {
+        if expected_revision > MAX_SAFE_INTEGER {
+            return Err(AppError::BadRequest(
+                "HTTP settings revision must be a nonnegative safe integer".into(),
+            ));
+        }
         settings
             .validate()
             .map_err(|message| AppError::BadRequest(message.into()))?;
@@ -38,7 +43,7 @@ impl Database {
         let document = HttpSettingsDocument {
             revision: expected_revision
                 .checked_add(1)
-                .filter(|value| *value <= 9_007_199_254_740_991)
+                .filter(|value| *value <= MAX_SAFE_INTEGER)
                 .ok_or_else(conflict)?,
             settings,
         };
@@ -112,6 +117,9 @@ fn decode(bytes: Option<&[u8]>) -> Result<HttpSettingsDocument, AppError> {
         .transpose()
         .map_err(|_| AppError::internal("http_settings_decode"))?
         .unwrap_or_default();
+    if document.revision > MAX_SAFE_INTEGER {
+        return Err(AppError::internal("http_settings_invalid"));
+    }
     document
         .settings
         .validate()
@@ -166,6 +174,19 @@ mod tests {
                     && audit["document"] == serde_json::to_value(&winner).unwrap()
             }));
         }
+        first
+            .plugin_kv_put(
+                HTTP_SETTINGS_NAMESPACE,
+                HTTP_SETTINGS_KEY,
+                &serde_json::to_vec(&serde_json::json!({
+                    "revision": MAX_SAFE_INTEGER + 1, "settings": {}
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(second.refresh_http_settings().await.is_err());
+        assert_eq!(second.http_clients.snapshot().document.revision, 2);
         first.close().await;
         second.close().await;
     }
