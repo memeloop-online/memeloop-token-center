@@ -117,6 +117,6 @@ strip = "debuginfo"
 # dormant surface; see vendor/rust_decimal/MEMELOOP-FORK.md.
 rust_decimal = { path = "vendor/rust_decimal" }
 wreq-proto = { path = "vendor/wreq-proto" }
-
-# Manifest-only fork: share the security-fixed zstd graph with emulation.
+# Keep the compatible wreq-util release while updating its zstd constraint.
+# All Rust source is unchanged; see vendor/wreq-util/MEMELOOP-FORK.md.
 wreq-util = { path = "vendor/wreq-util" }
