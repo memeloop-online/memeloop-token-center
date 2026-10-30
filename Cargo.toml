@@ -79,7 +79,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
-wasmtime = { version = "48.0.7", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
+wasmtime = { version = "48.0.8", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 zstd = "0.14.3"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
