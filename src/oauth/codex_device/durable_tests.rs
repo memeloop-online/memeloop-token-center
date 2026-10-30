@@ -60,7 +60,6 @@ async fn interrupted_exchange_is_not_replayed_after_worker_restart() {
         &database,
         &token,
         CodexDevicePollRuntime {
-            key_material: key,
             now,
             scope,
             allow_test_loopback: true,

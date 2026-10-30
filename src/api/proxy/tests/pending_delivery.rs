@@ -1434,7 +1434,12 @@ async fn unknown_failure_retries_operational_projection() {
         &json!({"model": fixture.model, "input": "operational failure retry", "stream": true}),
     )
     .await;
-    assert_eq!(payload, original["conversation"]["request_json"]);
+    // The durable source retains the entire ingress envelope; the receipt
+    // deliberately keeps only the conversation fields.
+    assert_eq!(
+        payload["input"],
+        original["conversation"]["request_json"]["input"]
+    );
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if fixture

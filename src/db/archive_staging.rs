@@ -33,8 +33,7 @@ impl Database {
         staging: &[ArchiveStagingWriteLease],
     ) -> Result<bool, AppError> {
         if staging.is_empty() {
-            let (atoms, nodes) = body.into_prefix();
-            let media = body.media_locators(&atoms);
+            let (atoms, nodes, media) = body.into_archive_parts();
             return self
                 .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
                 .await;
@@ -122,8 +121,7 @@ impl Database {
                 part.object_locator = Some(canonical_locator);
             }
         }
-        let (atoms, nodes) = body.into_prefix();
-        let media = body.media_locators(&atoms);
+        let (atoms, nodes, media) = body.into_archive_parts();
         let atoms = self
             .archive_atom_bodies(super::parse_uuid(tenant_id)?, &atoms)
             .await?;

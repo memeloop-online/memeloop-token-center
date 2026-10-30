@@ -50,19 +50,21 @@ pub(super) async fn wait_for_financial_events(state: &AppState, key_id: Uuid, ex
     loop {
         let rows = state.db.list_requests(key_id, 10).await.unwrap();
         if rows.len() == expected && rows.iter().all(|row| row.completed_at.is_some()) {
-            for request_id in state
-                .db
-                .claim_terminal_projection_tasks(owner, 10)
-                .await
-                .unwrap()
-            {
-                assert!(
-                    state
-                        .db
-                        .project_claimed_terminal_projection_task(owner, request_id)
-                        .await
-                        .unwrap()
-                );
+            if state.config.terminal_projection_enabled {
+                for request_id in state
+                    .db
+                    .claim_terminal_projection_tasks(owner, 10)
+                    .await
+                    .expect("claim enabled terminal projections")
+                {
+                    assert!(
+                        state
+                            .db
+                            .project_claimed_terminal_projection_task(owner, request_id)
+                            .await
+                            .unwrap()
+                    );
+                }
             }
             let finished: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM request_events WHERE key_id = $1 AND event_kind = 'finished'",

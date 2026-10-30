@@ -1012,7 +1012,7 @@ pub(crate) async fn archive_session_body(
     if locators.pending {
         state
             .db
-            .defer_session_body_archive(lease_owner, request_id)
+            .defer_pending_session_body_archive(lease_owner, request_id)
             .await?;
         return Ok(false);
     }

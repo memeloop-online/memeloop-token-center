@@ -14,9 +14,12 @@ async fn postgres_source_archive_pool_locked_still_dispatches_and_reaches_eof() 
     isolated
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = Config::for_test(isolated.to_string());
+    config.responses_request_spool_path = directory.path().join("spool").display().to_string();
     let state = crate::db::Database::with_source_pool_timeout_for_test(
         Duration::from_secs(30),
-        AppState::initialize(Config::for_test(isolated.to_string())),
+        AppState::initialize(config),
     )
     .await
     .unwrap();

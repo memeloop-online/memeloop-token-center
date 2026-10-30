@@ -603,22 +603,36 @@ export async function run(binary: string, output: string): Promise<boolean> {
       const callsBefore = upstreamCalls;
       const from = report.samples.length;
       const operationStarted = performance.now();
-      const entry = { name, result: undefined as unknown, upstream_calls: 0, peak_rss_mib: 0, operation_duration_ms: 0, drain_duration_ms: 0, drain: {} };
+      const entry = { name, started_at_ms: operationStarted, operation_finished_at_ms: 0, finished_at_ms: 0, result: undefined as unknown, upstream_calls: 0, operation_peak_rss_mib: 0, peak_rss_mib: 0, kernel_high_water_mib: 0, operation_duration_ms: 0, drain_duration_ms: 0, drain: {} };
       report.phases.push(entry);
       try {
         entry.result = await deadline(operation(), 60_000, name);
       } finally {
-        entry.operation_duration_ms = performance.now() - operationStarted;
+        entry.operation_finished_at_ms = performance.now();
+        entry.operation_duration_ms = entry.operation_finished_at_ms - operationStarted;
         entry.upstream_calls = upstreamCalls - callsBefore;
         sample();
         entry.peak_rss_mib = Math.max(...report.samples.slice(from).map((s: any) => s.rss_mib));
+        entry.operation_peak_rss_mib = entry.peak_rss_mib;
       }
       assert(entry.peak_rss_mib <= LIMIT_MIB, `${name}: service RSS exceeded 448 MiB (512 MiB pod minus 64 MiB headroom)`);
       const drainStarted = performance.now();
       const unknownRequestId = expectUnknown ? (entry.result as Result).requestId : undefined;
       if (expectUnknown) assert(unknownRequestId, "failed client response must identify its unknown financial responsibility");
-      entry.drain = await drain(unknownRequestId);
-      entry.drain_duration_ms = performance.now() - drainStarted;
+      try {
+        entry.drain = await drain(unknownRequestId);
+      } finally {
+        entry.finished_at_ms = performance.now();
+        entry.drain_duration_ms = entry.finished_at_ms - drainStarted;
+        sample();
+        // Background archive/projection work can peak after client delivery.
+        // Attribute those continuously collected samples to this phase too.
+        const samples = report.samples.slice(from);
+        entry.peak_rss_mib = Math.max(...samples.map((s: any) => s.rss_mib));
+        entry.kernel_high_water_mib = Math.max(...samples.map((s: any) => s.high_water_mib));
+        report.peak_rss_or_kernel_high_water_mib = Math.max(...report.samples.map((s: any) => Math.max(s.rss_mib, s.high_water_mib)));
+      }
+      assert(entry.peak_rss_mib <= LIMIT_MIB && entry.kernel_high_water_mib <= LIMIT_MIB, `${name}: service RSS or kernel VmHWM exceeded 448 MiB through archive drain`);
     };
 
     await phase("single-64MiB-buffered-response", async () => {

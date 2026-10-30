@@ -761,6 +761,30 @@ impl SessionBody {
         (atoms, nodes)
     }
 
+    /// Moves text into archive atoms and releases the body before SQL serialization.
+    pub(crate) fn into_archive_parts(
+        mut self,
+    ) -> (Vec<SemanticAtom>, Vec<PrefixNode>, Vec<SessionMediaLocator>) {
+        let atoms: Vec<SemanticAtom> = self
+            .turns
+            .iter_mut()
+            .map(|turn| {
+                let parts = turn
+                    .parts
+                    .iter_mut()
+                    .map(|part| {
+                        let text = part.text.take();
+                        part_value(part, text)
+                    })
+                    .collect();
+                atom_from_turn_content(turn.role.clone(), turn_value(turn, parts))
+            })
+            .collect();
+        let media = self.media_locators(&atoms);
+        let nodes = build_prefix(&atoms);
+        (atoms, nodes, media)
+    }
+
     pub fn media_locators(&self, atoms: &[SemanticAtom]) -> Vec<SessionMediaLocator> {
         self.turns
             .iter()
@@ -1230,18 +1254,34 @@ impl SessionBodyPart {
 }
 
 fn atom_from_turn(turn: &SessionBodyTurn) -> SemanticAtom {
-    let content = turn_value(turn);
+    let parts = turn
+        .parts
+        .iter()
+        .map(|part| part_value(part, part.text.clone()))
+        .collect();
+    atom_from_turn_content(turn.role.clone(), turn_value(turn, parts))
+}
+
+fn atom_from_turn_content(role: String, mut content: Value) -> SemanticAtom {
     // 前缀身份只看角色和片段。客户端回放的助手回合来源是 request，
     // 上一轮归档时来源是 return。文本相同就应接上，origin 仍留在入库 JSON 里。
-    let mut identity = content.clone();
-    if let Some(object) = identity.as_object_mut() {
-        object.remove("origin");
+    let origin = content
+        .as_object_mut()
+        .expect("turn object")
+        .remove("origin");
+    let instance_hash = digest_value(&content);
+    // turn_value/part_value emit only fixed keys and scalar leaves. None of
+    // those keys is id/request_id/created_at, so strip_instance_ids is a no-op.
+    // call_id/tool_call_id remain in both the hash and the stored JSON.
+    let content_hash = instance_hash.clone();
+    if let Some(origin) = origin {
+        content
+            .as_object_mut()
+            .expect("turn object")
+            .insert("origin".into(), origin);
     }
-    let instance_hash = digest_value(&identity);
-    strip_instance_ids(&mut identity);
-    let content_hash = digest_value(&identity);
     SemanticAtom {
-        role: turn.role.clone(),
+        role,
         kind: "turn".into(),
         content,
         content_hash,
@@ -1249,23 +1289,20 @@ fn atom_from_turn(turn: &SessionBodyTurn) -> SemanticAtom {
     }
 }
 
-fn turn_value(turn: &SessionBodyTurn) -> Value {
+fn turn_value(turn: &SessionBodyTurn, parts: Vec<Value>) -> Value {
     let mut map = Map::new();
     map.insert("role".into(), Value::String(turn.role.clone()));
     map.insert("origin".into(), Value::String(turn.origin.clone()));
-    map.insert(
-        "parts".into(),
-        Value::Array(turn.parts.iter().map(part_value).collect()),
-    );
+    map.insert("parts".into(), Value::Array(parts));
     Value::Object(map)
 }
 
-fn part_value(part: &SessionBodyPart) -> Value {
+fn part_value(part: &SessionBodyPart, text: Option<String>) -> Value {
     let mut map = Map::new();
     map.insert("part_index".into(), Value::from(part.part_index));
     map.insert("kind".into(), Value::String(part.kind.clone()));
-    if let Some(text) = &part.text {
-        map.insert("text".into(), Value::String(text.clone()));
+    if let Some(text) = text {
+        map.insert("text".into(), Value::String(text));
     }
     if let Some(media_type) = &part.media_type {
         map.insert("media_type".into(), Value::String(media_type.clone()));
@@ -1310,6 +1347,7 @@ fn strip_private_provider_fields(value: Value) -> Value {
     }
 }
 
+#[cfg(test)]
 fn strip_instance_ids(value: &mut Value) {
     match value {
         Value::Array(items) => {
@@ -1415,6 +1453,201 @@ mod tests {
         assert_eq!(first_atoms[1].content_hash, second_atoms[1].content_hash);
         assert_eq!(first_nodes[0].node_hash, second_nodes[0].node_hash);
         assert_eq!(first_nodes[1].node_hash, second_nodes[1].node_hash);
+    }
+
+    #[test]
+    fn consuming_archive_matches_legacy_content_hashes_nodes_and_media() {
+        let tool_text = r#"{"id":"keep","request_id":"keep","created_at":1}"#;
+        let body = SessionBody {
+            turns: vec![
+                SessionBodyTurn {
+                    role: "user".into(),
+                    origin: "request".into(),
+                    parts: vec![
+                        SessionBodyPart {
+                            kind: "text".into(),
+                            text: Some("文本\n\"quoted\" \\".into()),
+                            ..empty_part()
+                        },
+                        SessionBodyPart {
+                            part_index: 7,
+                            kind: "image".into(),
+                            text: Some(String::new()),
+                            media_type: Some("image/png".into()),
+                            byte_length: Some(9),
+                            content_blake3: Some("image-hash".into()),
+                            object_locator: Some("objects/image".into()),
+                            call_id: Some("original-call".into()),
+                            tool_call_id: Some("original-tool-call".into()),
+                            media_bytes: Some(b"png-bytes".to_vec()),
+                        },
+                        SessionBodyPart {
+                            part_index: 8,
+                            kind: "file".into(),
+                            content_blake3: Some("default-hash".into()),
+                            object_locator: Some("objects/default".into()),
+                            ..empty_part()
+                        },
+                        SessionBodyPart {
+                            part_index: 9,
+                            kind: "file".into(),
+                            byte_length: Some(u64::MAX),
+                            content_blake3: Some("overflow-hash".into()),
+                            object_locator: Some("objects/overflow".into()),
+                            ..empty_part()
+                        },
+                        SessionBodyPart {
+                            part_index: 10,
+                            kind: "file".into(),
+                            content_blake3: Some("pending-hash".into()),
+                            ..empty_part()
+                        },
+                    ],
+                },
+                SessionBodyTurn {
+                    role: "assistant".into(),
+                    origin: "return".into(),
+                    parts: vec![SessionBodyPart {
+                        kind: "tool_call".into(),
+                        text: Some(tool_text.into()),
+                        call_id: Some("original-call".into()),
+                        tool_call_id: Some("original-tool-call".into()),
+                        ..empty_part()
+                    }],
+                },
+                SessionBodyTurn {
+                    role: "custom".into(),
+                    origin: String::new(),
+                    parts: vec![],
+                },
+            ],
+        };
+        let contents = vec![
+            json!({"role": "user", "origin": "request", "parts": [
+                {"part_index": 0, "kind": "text", "text": "文本\n\"quoted\" \\"},
+                {"part_index": 7, "kind": "image", "text": "", "media_type": "image/png",
+                 "byte_length": 9, "content_blake3": "image-hash", "object_locator": "objects/image",
+                 "call_id": "original-call", "tool_call_id": "original-tool-call"},
+                {"part_index": 8, "kind": "file", "content_blake3": "default-hash", "object_locator": "objects/default"},
+                {"part_index": 9, "kind": "file", "byte_length": u64::MAX,
+                 "content_blake3": "overflow-hash", "object_locator": "objects/overflow"},
+                {"part_index": 10, "kind": "file", "content_blake3": "pending-hash"}
+            ]}),
+            json!({"role": "assistant", "origin": "return", "parts": [
+                {"part_index": 0, "kind": "tool_call", "text": tool_text,
+                 "call_id": "original-call", "tool_call_id": "original-tool-call"}
+            ]}),
+            json!({"role": "custom", "origin": "", "parts": []}),
+        ];
+        // Reproduce the former clone/remove/strip algorithm from explicit JSON,
+        // independently of the production turn and part serializers.
+        let expected: Vec<_> = contents
+            .into_iter()
+            .map(|content| {
+                let mut identity = content.clone();
+                identity.as_object_mut().unwrap().remove("origin");
+                let instance_hash = blake3::hash(&serde_json::to_vec(&identity).unwrap())
+                    .to_hex()
+                    .to_string();
+                let before_strip = identity.clone();
+                strip_instance_ids(&mut identity);
+                // Every optional schema field is exercised above. JSON-looking
+                // text stays a scalar, and call IDs are not stripped.
+                assert_eq!(identity, before_strip);
+                let content_hash = blake3::hash(&serde_json::to_vec(&identity).unwrap())
+                    .to_hex()
+                    .to_string();
+                SemanticAtom {
+                    role: content["role"].as_str().unwrap().into(),
+                    kind: "turn".into(),
+                    content,
+                    content_hash,
+                    instance_hash,
+                }
+            })
+            .collect();
+        let expected_nodes = build_prefix(&expected);
+        let expected_media = vec![
+            SessionMediaLocator {
+                turn_id: expected[0].content_hash.clone(),
+                part_index: 7,
+                media_type: "image/png".into(),
+                byte_length: 9,
+                content_blake3: "image-hash".into(),
+                object_locator: "objects/image".into(),
+            },
+            SessionMediaLocator {
+                turn_id: expected[0].content_hash.clone(),
+                part_index: 8,
+                media_type: "application/octet-stream".into(),
+                byte_length: 0,
+                content_blake3: "default-hash".into(),
+                object_locator: "objects/default".into(),
+            },
+        ];
+        assert_eq!(
+            body.into_prefix(),
+            (expected.clone(), expected_nodes.clone())
+        );
+        assert_eq!(body.media_locators(&expected), expected_media);
+        let text_ptr = body.turns[0].parts[0].text.as_ref().unwrap().as_ptr();
+        let (atoms, nodes, media) = body.into_archive_parts();
+        assert_eq!(
+            atoms[0].content["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .as_ptr(),
+            text_ptr
+        );
+        for (atom, expected) in atoms.iter().zip(&expected) {
+            assert_eq!(
+                serde_json::to_vec(&atom.content).unwrap(),
+                serde_json::to_vec(&expected.content).unwrap()
+            );
+        }
+        assert_eq!(
+            (atoms, nodes, media),
+            (expected, expected_nodes, expected_media)
+        );
+        assert_eq!(
+            SessionBody { turns: vec![] }.into_archive_parts(),
+            (vec![], vec![], vec![])
+        );
+    }
+
+    #[test]
+    fn consuming_archive_keeps_original_call_ids_in_identity() {
+        let body = session_body_from_documents(
+            &json!({"input": []}),
+            &json!({"output": [
+                {"type": "function_call", "call_id": "original", "name": "lookup", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "original", "tool_call_id": "original", "output": "ok"}
+            ]}),
+        );
+        let mut changed = body.clone();
+        changed.turns[0].parts[0].call_id = Some("changed".into());
+        changed.turns[1].parts[0].tool_call_id = Some("changed".into());
+        let mut replay = body.clone();
+        for turn in &mut replay.turns {
+            turn.origin = "request".into();
+        }
+        let (original, original_nodes, _) = body.into_archive_parts();
+        let (changed, changed_nodes, _) = changed.into_archive_parts();
+        let (replay, replay_nodes, _) = replay.into_archive_parts();
+        assert_eq!(original[0].content["parts"][0]["call_id"], "original");
+        assert_eq!(original[1].content["parts"][0]["tool_call_id"], "original");
+        for (original, changed) in original.iter().zip(&changed) {
+            assert_ne!(original.instance_hash, changed.instance_hash);
+            assert_ne!(original.content_hash, changed.content_hash);
+        }
+        assert_ne!(original_nodes, changed_nodes);
+        assert_eq!(original_nodes, replay_nodes);
+        for (original, replay) in original.iter().zip(&replay) {
+            assert_eq!(original.instance_hash, replay.instance_hash);
+            assert_eq!(original.content_hash, replay.content_hash);
+            assert_eq!(original.content["origin"], "return");
+            assert_eq!(replay.content["origin"], "request");
+        }
     }
 
     #[test]

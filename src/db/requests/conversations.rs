@@ -585,6 +585,14 @@ impl Database {
         &self,
         request_id: Uuid,
     ) -> Result<Option<SessionBodyLocators>, AppError> {
+        let mut connection = self.pool.acquire().await?;
+        Self::session_body_locators_on(&mut connection, request_id).await
+    }
+
+    async fn session_body_locators_on(
+        connection: &mut sqlx::AnyConnection,
+        request_id: Uuid,
+    ) -> Result<Option<SessionBodyLocators>, AppError> {
         let row = sqlx::query(
             "SELECT r.request_object, r.response_object, r.tenant_id, r.reservation_id, q.state AS source_state,
              CAST(CASE WHEN s.state IN ('capturing', 'pending', 'uploading')
@@ -602,7 +610,7 @@ impl Database {
              WHERE r.id = $1 LIMIT 1",
         )
         .bind(request_id.to_string())
-        .fetch_optional(&self.pool)
+        .fetch_optional(connection)
         .await?;
         let Some(row) = row else {
             return Ok(None);
@@ -628,6 +636,31 @@ impl Database {
             source_failed: source_state.as_deref() == Some("gap"),
             source_recorded: source_state.as_deref() == Some("bound"),
         }))
+    }
+
+    pub(crate) async fn defer_pending_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+    ) -> Result<(), AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        let updated = sqlx::query(
+            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+        )
+        .bind(unix_millis().saturating_add(5000))
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() == 1
+            && Self::session_body_locators_on(&mut transaction, request_id)
+                .await?
+                .is_some_and(|locators| !locators.pending)
+        {
+            wake_session_body_archive_in_transaction(&mut transaction, request_id).await?;
+        }
+        transaction.commit().await?;
+        Ok(())
     }
 
     pub(crate) async fn defer_session_body_archive(
