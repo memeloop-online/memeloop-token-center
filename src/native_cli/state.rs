@@ -143,26 +143,34 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_state_is_bound_to_account_tenant_generation_and_provider() {
+    fn plain_json_state_round_trips_independently_of_legacy_binding_and_key() {
         let binding = binding();
         let envelope = seal(&fixture(), &binding, b"synthetic-key").unwrap();
-        assert!(!envelope.contains("synthetic-secret"));
+        let stored: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        assert_eq!(stored["source_handle"], "FixtureHandle123");
+        assert_eq!(stored["files"][0]["relative_path"], ".copilot/account.json");
         assert_eq!(
-            open(&envelope, &binding, b"synthetic-key").unwrap().files[0].content,
-            b"synthetic-secret"
+            stored["files"][0]["content"],
+            serde_json::json!(b"synthetic-secret".to_vec())
         );
-        let mut wrong = binding.clone();
-        wrong.tenant_external_id = "tenant-b".into();
-        assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
-        wrong = binding.clone();
-        wrong.account_id = Uuid::now_v7();
-        assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
-        wrong = binding.clone();
-        wrong.generation += 1;
-        assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
-        wrong = binding;
-        wrong.provider = CliProvider::Cursor;
-        assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
+        let changed_binding = StateBinding {
+            tenant_external_id: "tenant-b".into(),
+            account_id: Uuid::now_v7(),
+            generation: binding.generation + 1,
+            provider: CliProvider::Cursor,
+        };
+        for (expected, key) in [
+            (&binding, b"synthetic-key".as_slice()),
+            (&changed_binding, b"different-key".as_slice()),
+        ] {
+            let restored = open(&envelope, expected, key).unwrap();
+            assert_eq!(restored.source_handle, "FixtureHandle123");
+            assert_eq!(restored.files[0].content, b"synthetic-secret");
+        }
+        assert!(open("not JSON", &binding, b"synthetic-key").is_err());
+        let mut invalid = stored;
+        invalid["files"][0]["relative_path"] = serde_json::json!("../state");
+        assert!(open(&invalid.to_string(), &binding, b"synthetic-key").is_err());
     }
 
     #[test]

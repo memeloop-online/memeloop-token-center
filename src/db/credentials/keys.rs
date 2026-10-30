@@ -1658,7 +1658,9 @@ mod tests {
         let request_hash: String = replay_row.try_get("request_hash").unwrap();
         let ciphertext: String = replay_row.try_get("response_ciphertext").unwrap();
         assert_eq!(request_hash.len(), 64);
-        assert!(!ciphertext.contains(&rotated[0].key));
+        let stored: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
+        assert_eq!(stored["key"], rotated[0].key);
+        assert_eq!(stored["credential_generation"], 2);
 
         sqlx::query(
             "UPDATE credential_rotation_replays SET expires_at = $1 WHERE idempotency_key = $2",
@@ -1699,7 +1701,7 @@ mod tests {
         assert_eq!(generation, 2);
     }
     #[tokio::test]
-    async fn key_provisioning_replays_one_encrypted_response_for_an_idempotency_key() {
+    async fn key_provisioning_replays_one_plain_json_response_for_an_idempotency_key() {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
             "sqlite://{}?mode=rwc",
@@ -1749,7 +1751,9 @@ mod tests {
                 .unwrap()
                 .try_get("issued_key_ciphertext")
                 .unwrap();
-        assert!(!ciphertext.contains(&first.key));
+        let stored: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
+        assert_eq!(stored["key"], first.key);
+        assert_eq!(stored["key_id"], first.key_id.to_string());
 
         let other_tenant = database
             .create_key(
