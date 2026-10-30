@@ -45,7 +45,7 @@ test('artifact identity rejects substitution, expiration and empty input', () =>
 
 type Workflow = { on: Record<string, unknown>; permissions: Record<string, string>; jobs: Record<string, Job> };
 type Step = { uses?: string; run?: string; with?: Record<string, unknown> };
-type Job = { if?: string; needs?: string[]; permissions?: Record<string, string>; steps: Step[]; strategy?: unknown };
+type Job = { environment?: string; if?: string; needs?: string[]; permissions?: Record<string, string>; steps: Step[]; strategy?: unknown };
 const candidate = parse(readFileSync('.github/workflows/publish-candidate.yml', 'utf8')) as Workflow;
 const normal = parse(readFileSync('.github/workflows/ci.yml', 'utf8')) as Workflow;
 
@@ -63,6 +63,7 @@ test('candidate publishing preserves exact existing image scan and verification 
   for (const field of ['outputs', 'platforms', 'provenance', 'sbom']) assert.equal(build(publication).with![field], build(existing).with![field]);
   assert.equal(build(publication).with!.tags, '${{ matrix.image }}:sha-${{ needs.validate-candidate.outputs.revision }}');
   assert.deepEqual(publication.permissions, { contents: 'read', packages: 'write' });
+  assert.equal(publication.environment, 'production-candidate');
   for (const job of Object.values(candidate.jobs)) {
     assert.match(job.if!, /github\.ref == 'refs\/heads\/master'/);
     assert.match(job.if!, /github\.ref_protected == true/);

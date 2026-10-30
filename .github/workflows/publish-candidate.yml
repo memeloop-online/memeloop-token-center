@@ -97,6 +97,7 @@ jobs:
       github.repository == 'memeloop-online/memeloop-token-center' &&
       github.ref == 'refs/heads/master' && github.ref_protected == true
     needs: [validate-candidate]
+    environment: production-candidate
     env:
       CANDIDATE_SHA: ${{ needs.validate-candidate.outputs.revision }}
       TRUSTED_WORKFLOW_SHA: ${{ github.sha }}
