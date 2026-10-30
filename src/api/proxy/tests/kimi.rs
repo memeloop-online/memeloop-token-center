@@ -169,10 +169,6 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 tenant_id: key.tenant_id,
                 memory: fixture.state.proxy_memory_budget.reservation(),
             };
-            let stored_response = format!(
-                "inline-json:{}",
-                std::str::from_utf8(&rejection.body).unwrap()
-            );
             let response = finish_buffered_request_with_upstream_attribution_and_response_object(
                 &request,
                 StatusCode::FORBIDDEN,
@@ -185,7 +181,6 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 Some("http_403".to_owned()),
                 BufferedFinishPolicy {
                     upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                    response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
                     terminal_cause: rejection.terminal_cause,
                 },
             )
@@ -197,6 +192,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 .unwrap();
             assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), delivered);
             wait_for_request_settlement(&fixture, 1).await;
+            fixture.state.persistence.drain_for_test().await;
             let records = fixture
                 .state
                 .db
@@ -221,12 +217,13 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 .await
                 .unwrap();
             assert_eq!(
-                refs.response_object
-                    .as_deref()
+                fixture
+                    .state
+                    .archive
+                    .get(refs.response_object.as_deref().unwrap())
+                    .await
                     .unwrap()
-                    .strip_prefix("inline-json:")
-                    .unwrap()
-                    .as_bytes(),
+                    .as_ref(),
                 bytes.as_ref()
             );
             let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;

@@ -74,6 +74,85 @@ async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
         rows[0].error_code.as_deref(),
         Some("upstream_invalid_content_encoding")
     );
+    fixture.state.persistence.drain_for_test().await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    let locator = refs.response_object.as_deref().unwrap();
+    assert!(!locator.starts_with("inline-json:"));
+    let captured = fixture.state.archive.get(locator).await.unwrap();
+    assert!(serde_json::from_slice::<Value>(&captured).is_ok());
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn streaming_raw_archive_preserves_upstream_framing_before_delivery_translation() {
+    let fixture = codex_route_fixture("raw-upstream-framing").await;
+    let upstream = MockServer::start().await;
+    let payload = format!(
+        ": original provider heartbeat\r\n\r\n{}",
+        completed_codex_sse("original tool and provider bytes")
+    );
+    Mock::given(method("POST"))
+        .and(path(codex_transport::RESPONSES_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(payload.clone(), "text/event-stream"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "capture wire bytes", "stream": true}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&delivered).contains("response.completed"));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: Option<(String, String)> =
+                sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            if let Some((tenant, request)) = row {
+                let tenant = Uuid::parse_str(&tenant).unwrap();
+                let request = Uuid::parse_str(&request).unwrap();
+                if let Some(reference) = fixture
+                    .state
+                    .archive
+                    .raw_capture_reference(tenant, request, "response")
+                    .await
+                    .unwrap()
+                {
+                    let captured = fixture
+                        .state
+                        .archive
+                        .get_tenant_content(tenant, &reference, MAX_PROXY_RESPONSE_BODY)
+                        .await
+                        .unwrap();
+                    assert_eq!(captured.as_ref(), payload.as_bytes());
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original upstream bytes must be independently recoverable");
+    let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(chunks, 0);
+    pool.close().await;
     upstream.verify().await;
 }
 

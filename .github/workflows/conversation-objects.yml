@@ -8,6 +8,8 @@ on:
       - src/worker.rs
       - src/api/session_reading.rs
       - src/api/proxy/persistence.rs
+      - src/api/proxy.rs
+      - src/api/proxy/streaming.rs
       - src/api/proxy/tests/archive_terminal.rs
       - src/api/proxy/tests/gateway_persistence.rs
       - src/response_archive_spool/**
@@ -40,3 +42,4 @@ jobs:
       - run: cargo test --locked --lib db::object_bodies
       - run: cargo test --locked --lib buffered_archive_waits_off_frontend
       - run: cargo test --locked --lib api::proxy::tests::archive_terminal
+      - run: cargo test --locked --lib api::proxy::tests::kimi

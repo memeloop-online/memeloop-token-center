@@ -30,7 +30,6 @@ pub(in crate::api) async fn classify_codex_media_rate_limit(
 #[path = "codex_transport.rs"]
 pub(in crate::api) mod codex_transport;
 
-pub(crate) mod archive_retention;
 mod buffered_upstream;
 mod chat_sse_usage;
 mod conversation_hints;
@@ -1814,7 +1813,7 @@ async fn proxy_with_cancellation_guard(
             .map(Bytes::from);
             let mut result = match body {
                 Ok(body) => {
-                    finish_unarchived_proxy_response(
+                    finish_passthrough_error_response(
                         &buffered_request,
                         status,
                         body,
@@ -1866,10 +1865,6 @@ async fn proxy_with_cancellation_guard(
             };
             (upstream_error::fallback_body(), terminal_cause)
         };
-        let stored_response = format!(
-            "inline-json:{}",
-            std::str::from_utf8(&body).map_err(|_| AppError::internal("proxy_site_1"))?
-        );
         let result = finish_buffered_request_with_upstream_attribution_and_response_object(
             &buffered_request,
             status,
@@ -1882,7 +1877,6 @@ async fn proxy_with_cancellation_guard(
             Some(format!("http_{}", status.as_u16())),
             BufferedFinishPolicy {
                 upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
                 terminal_cause,
             },
         )
@@ -2752,7 +2746,6 @@ async fn execute_component_provider(
             Some(format!("http_{}", upstream_status.as_u16())),
             BufferedFinishPolicy {
                 upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                response_storage: BufferedResponseStorage::DurableArchive,
                 terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
             },
         )
@@ -3062,11 +3055,6 @@ async fn finish_proxy_failure_with_cause(
         error_code,
         facts,
     ));
-    let stored_response = format!(
-        "inline-json:{}",
-        std::str::from_utf8(&body)
-            .map_err(|_| AppError::internal("proxy_finish_proxy_failure_with_cause_1"))?
-    );
     finish_buffered_request_with_upstream_attribution_and_response_object(
         request,
         StatusCode::BAD_GATEWAY,
@@ -3079,7 +3067,6 @@ async fn finish_proxy_failure_with_cause(
         Some(error_code.to_owned()),
         BufferedFinishPolicy {
             upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-            response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
             terminal_cause,
         },
     )
@@ -3115,17 +3102,6 @@ async fn finish_local_buffered_error_with_upstream_attribution(
     error_code: Option<String>,
     upstream_attribution: ProxyRequestUpstreamAttribution,
 ) -> Result<Response, AppError> {
-    const MAX_INLINE_LOCAL_ERROR_BYTES: usize = 4 * 1024;
-    if body.len() > MAX_INLINE_LOCAL_ERROR_BYTES || serde_json::from_slice::<Value>(&body).is_err()
-    {
-        return Err(AppError::internal(
-            "proxy_finish_local_buffered_error_with_upstream_attribution_1",
-        ));
-    }
-    let body_text = std::str::from_utf8(&body).map_err(|_| {
-        AppError::internal("proxy_finish_local_buffered_error_with_upstream_attribution_1")
-    })?;
-    let stored_response = format!("inline-json:{body_text}");
     finish_buffered_request_with_upstream_attribution_and_response_object(
         request,
         status,
@@ -3135,25 +3111,14 @@ async fn finish_local_buffered_error_with_upstream_attribution(
         error_code,
         BufferedFinishPolicy {
             upstream_attribution,
-            response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
             terminal_cause: None,
         },
     )
     .await
 }
 
-enum BufferedResponseStorage {
-    DurableArchive,
-    InlineLocalJson(String),
-    /// A passthrough error is returned to the client so its protocol-level
-    /// recovery can inspect it, while archival retains only the request and
-    /// terminal facts. Upstream error text is not a durable audit payload.
-    Omit,
-}
-
 struct BufferedFinishPolicy {
     upstream_attribution: ProxyRequestUpstreamAttribution,
-    response_storage: BufferedResponseStorage,
     terminal_cause: Option<crate::model::RequestTerminalCause>,
 }
 
@@ -3195,14 +3160,13 @@ async fn finish_buffered_request_with_upstream_attribution(
         error_code,
         BufferedFinishPolicy {
             upstream_attribution,
-            response_storage: BufferedResponseStorage::DurableArchive,
             terminal_cause: None,
         },
     )
     .await
 }
 
-async fn finish_unarchived_proxy_response(
+async fn finish_passthrough_error_response(
     request: &BufferedRequest<'_>,
     status: StatusCode,
     body: Bytes,
@@ -3219,7 +3183,6 @@ async fn finish_unarchived_proxy_response(
         error_code,
         BufferedFinishPolicy {
             upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-            response_storage: BufferedResponseStorage::Omit,
             terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
         },
     )
@@ -3262,14 +3225,8 @@ async fn finish_buffered_request_before_deadline(
 ) -> Result<Response, AppError> {
     let BufferedFinishPolicy {
         upstream_attribution,
-        response_storage,
         terminal_cause,
     } = policy;
-    let (inline_response_object, archive_response) = match response_storage {
-        BufferedResponseStorage::DurableArchive => (None, true),
-        BufferedResponseStorage::InlineLocalJson(stored_response) => (Some(stored_response), false),
-        BufferedResponseStorage::Omit => (None, false),
-    };
     if let Some(conversation) = request.conversation.as_ref() {
         conversation.release_retained_upload();
     }
@@ -3302,8 +3259,7 @@ async fn finish_buffered_request_before_deadline(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
-    let stored_response =
-        inline_response_object.unwrap_or_else(|| format!("gap://{request_id}/response"));
+    let stored_response = format!("gap://{request_id}/response");
     let routing_session_id = request
         .conversation
         .as_ref()
@@ -3363,19 +3319,17 @@ async fn finish_buffered_request_before_deadline(
             "runtime terminal was not durable before the client response returned"
         );
     }
-    if archive_response {
-        persistence::capture(
-            request.state,
-            crate::db::ArchiveSpoolIdentity {
-                request_id,
-                tenant_id: request.tenant_id,
-                reservation_id: request.reservation.id,
-            },
-            crate::response_archive_spool::BufferedArchivePurpose::Response,
-            body.clone(),
-            request.memory.clone(),
-        );
-    }
+    persistence::capture(
+        request.state,
+        crate::db::ArchiveSpoolIdentity {
+            request_id,
+            tenant_id: request.tenant_id,
+            reservation_id: request.reservation.id,
+        },
+        crate::response_archive_spool::BufferedArchivePurpose::Response,
+        body.clone(),
+        request.memory.clone(),
+    );
     if let Some(identity) = request.session_preference {
         request
             .state

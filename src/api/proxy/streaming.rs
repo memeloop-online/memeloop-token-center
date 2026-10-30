@@ -407,6 +407,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 };
                 match next {
                     Ok(raw_chunk) => {
+                        if !flushing_terminal
+                            && let Some(archive) = archive_sender.as_mut()
+                            && !archive.append(vec![raw_chunk.clone()])
+                        {
+                            tracing::warn!(%request_id, stage = "raw_response_capture", "proxy archive gap");
+                            drop(archive_sender.take());
+                        }
                         if is_sse
                             && !flushing_terminal
                             && !raw_chunk.is_empty()
@@ -624,30 +631,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         let observed_ms = diagnostic_context.elapsed_millis_at(Instant::now());
                         for frame in &delivery_frames {
                             output_timing.observe(&frame.bytes, frame.terminal, observed_ms);
-                        }
-                        if let Some(spool) = archive_sender.as_mut() {
-                            let mut archive_failed = false;
-                            for frame in &delivery_frames {
-                                let Some(_retention_memory) =
-                                    request_memory.try_reserve_archive_json_transform(&frame.bytes)
-                                else {
-                                    archive_failed = true;
-                                    break;
-                                };
-                                if !spool.append(vec![
-                                    super::archive_retention::sse_frame_with_limits(
-                                        &frame.bytes,
-                                        sse_framing_limits,
-                                    ),
-                                ]) {
-                                    archive_failed = true;
-                                    break;
-                                }
-                            }
-                            if archive_failed {
-                                tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
-                                drop(archive_sender.take());
-                            }
                         }
                         // A successful Responses terminal is held privately
                         // until EOF validates its tail. Once the receiver is
