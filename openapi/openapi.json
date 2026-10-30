@@ -314,7 +314,7 @@
         ],
         "operationId": "operatorChatCompletion",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\ncompletions are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\ncompletions are supported; stream=true is rejected.\n",
         "security": [
           {
             "serviceBearer": []
@@ -341,6 +341,9 @@
                   "key_id": {
                     "type": "string",
                     "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
                   },
                   "request": {
                     "type": "object",
@@ -395,7 +398,7 @@
         ],
         "operationId": "operatorMessages",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
         "security": [
           {
             "serviceBearer": []
@@ -422,6 +425,9 @@
                   "key_id": {
                     "type": "string",
                     "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
                   },
                   "request": {
                     "type": "object",
@@ -452,6 +458,90 @@
           },
           "400": {
             "description": "Invalid JSON Messages request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/internal/v1/inference/responses": {
+      "post": {
+        "tags": [
+          "Client credentials"
+        ],
+        "operationId": "operatorResponse",
+        "summary": "Run inference using an explicitly authorized billing credential",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nResponses are supported; stream=true is rejected.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "keys:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key_id",
+                  "request"
+                ],
+                "properties": {
+                  "key_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
+                  },
+                  "request": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                      "stream": {
+                        "type": "boolean",
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI Responses result including image generation output, billed to the selected key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON Responses request",
             "content": {
               "application/json": {
                 "schema": {
@@ -15871,6 +15961,48 @@
       }
     },
     "schemas": {
+      "OperatorInferenceConversation": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": false,
+        "required": [
+          "id"
+        ],
+        "description": "Gateway-owned session and turn identifiers; consumed before forwarding the inference request.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+          },
+          "turn_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parent_turn_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "OperatorInferenceConversationIdentifier": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9._:-]+$"
+      },
       "SessionContextItem": {
         "type": "object",
         "required": [
