@@ -896,7 +896,7 @@ enum WriterOutcome {
 }
 
 async fn run_response_archive_writer(
-    state: AppState,
+    mut state: AppState,
     identity: ArchiveSpoolIdentity,
     mut receiver: tokio::sync::mpsc::Receiver<QueuedArchiveChunk>,
     terminal: tokio::sync::oneshot::Receiver<Bytes>,
@@ -904,7 +904,28 @@ async fn run_response_archive_writer(
 ) -> Result<WriterOutcome, AppError> {
     #[cfg(test)]
     pause_begin_for_test(&state).await;
-    let mut writer = ResponseArchiveWriter::begin_inner(state.clone(), identity).await?;
+    let mut writer = loop {
+        if !active.load(Ordering::Acquire) {
+            return Ok(writer_interrupted(identity, "abandoned_before_begin"));
+        }
+        state.db.refresh_closed_persistence_pool();
+        match ResponseArchiveWriter::begin_inner(state.clone(), identity).await {
+            Ok(writer) => break writer,
+            Err(error)
+                if error.diagnostic_category() == "database_operation_failed"
+                    || error.diagnostic_category() == "database_pool_exhausted"
+                    || matches!(error, AppError::DatabaseUnavailable(_)) =>
+            {
+                tracing::warn!(
+                    request_id = %identity.request_id,
+                    error_category = error.diagnostic_category(),
+                    "response archive retains queued bytes while begin recovers"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
     while let Some(first) = receiver.recv().await {

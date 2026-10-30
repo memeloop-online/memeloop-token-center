@@ -8,6 +8,42 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
+async fn deferred_capture_recovers_a_completed_request_without_a_response_locator() {
+    let (_directory, state, pool, identity) = fixture().await;
+    sqlx::query(
+        "UPDATE request_records SET completed_at = 2, response_object = NULL WHERE id = $1",
+    )
+    .bind(identity.request_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let body = Bytes::from_static(b"{\"output\":\"original delivered response\"}");
+    let archive = BufferedArchive::new(
+        identity,
+        BufferedArchivePurpose::Response,
+        &body,
+        state.config.key_pepper.as_bytes(),
+        false,
+    )
+    .unwrap();
+    assert!(state.db.capture_deferred_archive(&archive).await.unwrap());
+    assert!(
+        state
+            .db
+            .deferred_archive_is_captured(identity, BufferedArchivePurpose::Response, &body)
+            .await
+            .unwrap()
+    );
+    let completed_at: i64 =
+        sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(completed_at, 2);
+}
+
+#[tokio::test]
 async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_binding() {
     for compressed in [false, true] {
         for (status_code, error_code, early_upload) in [

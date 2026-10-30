@@ -935,8 +935,12 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
                 if terminal_open.is_some_and(|projected_at| projected_at.is_none()) {
-                    self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
-                        .await;
+                    if let Err(error) = self
+                        .release_conversation_projection_lease(request_id, lease_owner)
+                        .await
+                    {
+                        tracing::warn!(%request_id, %error, "conversation projection lease release failed");
+                    }
                     return Ok(false);
                 }
                 let inline: String = prepare.try_get("request_json")?;
@@ -1262,8 +1266,12 @@ impl Database {
             }
             Ok(false) => {
                 transaction.rollback().await?;
-                self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
-                    .await;
+                if let Err(error) = self
+                    .release_conversation_projection_lease(request_id, lease_owner)
+                    .await
+                {
+                    tracing::warn!(%request_id, %error, "conversation projection lease release failed");
+                }
                 Ok(false)
             }
             Err(error) => {

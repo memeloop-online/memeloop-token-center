@@ -1005,6 +1005,11 @@ async fn self_service_idor_is_closed(world: &mut TokenCenterWorld) {
         "self-service must ignore an attacker-controlled key_id and remain bound to the authenticated key"
     );
 
+    wait_for_bound_proxy_archives(
+        world,
+        &[world.matrix_second_request_id.expect("second request id")],
+    )
+    .await;
     let cluster_id = wait_for_own_conversation_cluster(world, &world.matrix_second_key).await;
     let conversation_idor = world
         .client
