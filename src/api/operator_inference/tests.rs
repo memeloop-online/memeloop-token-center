@@ -6,6 +6,10 @@ use crate::{
 };
 use tower::ServiceExt;
 
+// A complete 1 × 1 transparent RGBA PNG, including its zlib payload and CRCs.
+const IMAGE_FIXTURE_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII=";
+
 fn inference(token: &str, key_id: Uuid) -> Request {
     Request::post("/internal/v1/inference/chat/completions")
         .header(header::AUTHORIZATION, format!("Bearer {token}"))
@@ -262,7 +266,7 @@ async fn successful_inference(protocol: Protocol) {
     } else if responses {
         json!({
             "id":"resp_operator_fixture", "object":"response", "status":"completed", "model":"fixture",
-            "output":[{"type":"image_generation_call","id":"ig_fixture","status":"completed","result":"aW1hZ2UtZml4dHVyZQ=="}],
+            "output":[{"type":"image_generation_call","id":"ig_fixture","status":"completed","result":IMAGE_FIXTURE_PNG}],
             "usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
         })
     } else {
@@ -408,7 +412,10 @@ async fn successful_inference(protocol: Protocol) {
         assert_eq!(actual["content"], completion["content"]);
         assert_eq!(actual["stop_reason"], "tool_use");
     } else if responses {
-        assert_eq!(actual["output"], completion["output"]);
+        assert_eq!(
+            actual, completion,
+            "the caller receives the complete original image result"
+        );
     } else {
         assert_eq!(actual["choices"], completion["choices"]);
     }
@@ -461,12 +468,21 @@ async fn successful_inference(protocol: Protocol) {
     ] {
         assert!(!forwarded[0].headers.contains_key(name), "forwarded {name}");
     }
+    let mut archived_response = completion.clone();
+    if responses {
+        // Core archives preserve the response envelope and usage while replacing
+        // inline image bytes with the established retention marker. Delivery to
+        // the caller above preserves the original image result.
+        archived_response["output"][0]["result"] = json!({
+            "retained":false,"kind":"inline_media","original_bytes":IMAGE_FIXTURE_PNG.len()
+        });
+    }
     assert_inference_archive(
         &state,
         key.key_id,
         rows[0].request_id,
         &provider_request,
-        &completion,
+        &archived_response,
     )
     .await;
 }
