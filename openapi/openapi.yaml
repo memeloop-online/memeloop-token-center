@@ -5554,7 +5554,7 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '503': {description: Archive is incomplete, inconsistent or unavailable.}
+        '503': {description: 'Archive is incomplete, inconsistent or unavailable.'}
 
   /internal/v1/sessions/{session_id}/requests/{request_id}/training/raw/{side}:
     get:

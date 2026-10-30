@@ -101,8 +101,6 @@ pub(crate) struct SessionBodyLocators {
 pub(crate) struct ConversationProjectionEnqueueInput<'a> {
     pub(crate) request_id: Uuid,
     pub(crate) key: &'a AuthenticatedKey,
-    /// 结算时已经收好的对话字段。不是带填充的原始请求 JSON。
-    pub(crate) request_json: &'a serde_json::Value,
     pub(crate) hints: &'a ConversationHints,
     pub(crate) client_name: Option<&'a str>,
     pub(crate) upstream_response_id: Option<&'a str>,
@@ -135,7 +133,6 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let ConversationProjectionEnqueueInput {
         request_id,
         key,
-        request_json: _,
         hints,
         client_name,
         upstream_response_id,
@@ -171,7 +168,7 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     .bind(key.tenant_id.to_string())
     .bind(key.key_id.to_string())
     .bind(key.principal_id.to_string())
-    .bind(&request_json)
+    .bind(request_json)
     .bind(&hints_json)
     .bind(client_name)
     .bind(upstream_response_id)
@@ -419,7 +416,6 @@ impl Database {
             ConversationProjectionEnqueueInput {
                 request_id: claim.request_id,
                 key: conversation.key,
-                request_json: conversation.request_json,
                 hints: conversation.hints,
                 client_name: conversation.client_name,
                 upstream_response_id: conversation.upstream_response_id,

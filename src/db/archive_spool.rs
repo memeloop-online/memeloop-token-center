@@ -448,6 +448,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn begin_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -577,6 +578,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn append_response_archive_spool_batch_with<F>(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -731,6 +733,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn seal_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -1632,6 +1635,7 @@ fn spool_sql(purpose: BufferedArchivePurpose, sql: &str) -> String {
     }
 }
 
+#[cfg(test)]
 fn spool_write_rejected(
     identity: ArchiveSpoolIdentity,
     operation: &'static str,

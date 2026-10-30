@@ -24,6 +24,7 @@ use super::{
 };
 
 impl Database {
+    #[cfg(test)]
     pub(crate) async fn prepare_staged_session_body_archive(
         &self,
         lease_owner: Uuid,

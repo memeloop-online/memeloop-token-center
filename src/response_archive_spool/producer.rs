@@ -460,6 +460,7 @@ impl ResponseArchiveSettlement {
     }
 }
 
+#[cfg(test)]
 pub(super) struct ResponseArchiveWriter {
     state: AppState,
     identity: ArchiveSpoolIdentity,
@@ -471,6 +472,7 @@ pub(super) struct ResponseArchiveWriter {
     max_append_wait: std::time::Duration,
 }
 
+#[cfg(test)]
 impl Drop for ResponseArchiveWriter {
     fn drop(&mut self) {
         tracing::info!(request_id = %self.identity.request_id, phase = "response_spool_writer_summary",
@@ -705,6 +707,7 @@ impl ResponseArchiveProducer {
     }
 }
 
+#[cfg(test)]
 impl ResponseArchiveWriter {
     async fn begin_inner(
         state: AppState,
@@ -817,14 +820,6 @@ impl ResponseArchiveWriter {
             .checked_add(batch_bytes)
             .ok_or(AppError::internal("producer_append_chunks_6"))?;
         Ok(())
-    }
-
-    async fn append_chunk(&mut self, bytes: Bytes) -> Result<(), AppError> {
-        self.append_chunks(vec![QueuedArchiveChunk {
-            bytes,
-            _memory: None,
-        }])
-        .await
     }
 
     #[cfg(test)]
