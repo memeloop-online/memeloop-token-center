@@ -266,7 +266,11 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::internal("queries_site_1"))?;
-            request_archive_refs_from_row(row)
+            self.resolve_raw_archive_roots(
+                parse_uuid(locator.tenant_id)?,
+                request_archive_refs_from_row(row)?,
+            )
+            .await
         } else {
             match self
                 .generation_archive_refs(key_id, parse_uuid(request_id.clone())?)
@@ -300,7 +304,12 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {
-                return request_archive_refs_from_row(row);
+                return self
+                    .resolve_raw_archive_roots(
+                        parse_uuid(locator.tenant_id)?,
+                        request_archive_refs_from_row(row)?,
+                    )
+                    .await;
             }
             let identity = self
                 .historical_credential_identity(
@@ -377,7 +386,12 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {
-                return request_archive_refs_from_row(row);
+                return self
+                    .resolve_raw_archive_roots(
+                        parse_uuid(locator.tenant_id)?,
+                        request_archive_refs_from_row(row)?,
+                    )
+                    .await;
             }
             let identity = self
                 .historical_credential_identity(&locator.tenant_id, &locator.key_id, None)

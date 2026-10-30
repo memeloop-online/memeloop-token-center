@@ -217,6 +217,36 @@ impl Database {
         digest: [u8; 32],
         success: bool,
     ) {
+        if success {
+            loop {
+                let persisted: Result<(), AppError> = async {
+                    let archive = self.body_archive()?;
+                    let staged = crate::archive::StagedArchiveObject {
+                        object_locator: locator.to_owned(),
+                        size_bytes: length as u64,
+                        blake3_digest: blake3::Hash::from_bytes(digest).to_hex().to_string(),
+                    };
+                    let object = archive
+                        .promote_staged_text_to_cas(identity.tenant_id, &staged)
+                        .await?;
+                    archive
+                        .publish_raw_capture(
+                            identity.tenant_id,
+                            identity.request_id,
+                            "request",
+                            &object,
+                        )
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if persisted.is_ok() {
+                    break;
+                }
+                tracing::warn!(request_id = %identity.request_id, "request object publication retained for retry");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
         loop {
             if self
                 .persist_request_source(identity, locator, length, digest, Some(success))

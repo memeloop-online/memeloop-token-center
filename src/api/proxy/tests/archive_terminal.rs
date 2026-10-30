@@ -78,7 +78,7 @@ async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
 }
 
 #[tokio::test]
-async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat_settlement() {
+async fn legacy_request_metadata_failure_does_not_mask_durable_objects_or_repeat_settlement() {
     let fixture = codex_route_fixture("request-capture-gap").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let upstream = MockServer::start().await;
@@ -132,16 +132,17 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
         .unwrap();
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Gap
+        crate::model::RequestArchiveState::Bound
     );
-    assert!(refs.request_archive_reason.is_some());
+    assert!(refs.request_archive_reason.is_none());
     assert_eq!(
         refs.response_archive_state,
         crate::model::RequestArchiveState::Bound
     );
     assert!(refs.response_archive_reason.is_none());
     let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
-    assert!(detail.archive.request.reason.is_some());
+    assert!(detail.archive.request.reason.is_none());
+    assert!(detail.archive.request.complete);
     assert!(detail.archive.response.reason.is_none());
     assert!(detail.archive.response.complete);
     drain_completed_response_archive(&fixture).await;
@@ -153,7 +154,7 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
         .unwrap();
     assert_eq!(
         refs.view.archive_state,
-        crate::model::RequestArchiveState::Gap
+        crate::model::RequestArchiveState::Bound
     );
     assert_eq!(
         refs.response_archive_state,

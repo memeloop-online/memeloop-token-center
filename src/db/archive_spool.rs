@@ -781,6 +781,7 @@ impl Database {
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(crate) async fn fail_response_archive_spool(
         &self,
         identity: ArchiveSpoolIdentity,
@@ -1276,6 +1277,17 @@ impl Database {
         let Some(row) = row else { return Ok(None) };
         let id: String = row.try_get("request_id")?;
         let now: i64 = row.try_get("db_now")?;
+        let retained: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(
+            purpose,
+            "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1",
+        )))
+        .bind(&id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if retained != 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
         let chunk_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT seq, CAST(OCTET_LENGTH(ciphertext) AS BIGINT) AS cipher_len FROM response_archive_spool_chunks WHERE request_id = $1 ORDER BY seq LIMIT $2"

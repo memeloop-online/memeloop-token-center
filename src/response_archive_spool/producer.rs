@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(test)]
 use tracing::Instrument;
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
@@ -961,6 +962,7 @@ fn writer_interrupted(identity: ArchiveSpoolIdentity, reason: &'static str) -> W
     WriterOutcome::Abandoned
 }
 
+#[cfg(test)]
 async fn observe_writer_database(
     identity: ArchiveSpoolIdentity,
     phase: &'static str,

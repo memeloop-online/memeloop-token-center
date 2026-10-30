@@ -3,6 +3,63 @@ use crate::archive::{ArchiveStore, ConversationBodyReference};
 use bytes::Bytes;
 
 impl Database {
+    pub(crate) async fn resolve_raw_archive_roots(
+        &self,
+        tenant_id: Uuid,
+        mut refs: crate::model::RequestArchiveRefs,
+    ) -> Result<crate::model::RequestArchiveRefs, AppError> {
+        let archive = self.body_archive()?;
+        let request_id = refs.view.request_id;
+        for side in ["request", "response"] {
+            let (locator, state, reason) = if let Some(object) = archive
+                .raw_capture_reference(tenant_id, request_id, side)
+                .await?
+            {
+                (
+                    object.object_locator,
+                    crate::model::RequestArchiveState::Bound,
+                    None,
+                )
+            } else {
+                let failed = archive
+                    .raw_capture_failed(tenant_id, request_id, side)
+                    .await?;
+                (
+                    format!("gap://{request_id}/{side}"),
+                    if failed {
+                        crate::model::RequestArchiveState::Gap
+                    } else {
+                        crate::model::RequestArchiveState::Pending
+                    },
+                    failed.then(|| "capture_failed".to_owned()),
+                )
+            };
+            if side == "request" {
+                refs.request_object = locator;
+                refs.request_archive_state = state;
+                refs.request_archive_reason = reason;
+            } else {
+                refs.response_object = Some(locator);
+                refs.response_json = None;
+                refs.response_archive_state = state;
+                refs.response_archive_reason = reason;
+            }
+        }
+        refs.view.archive_state = if refs.request_archive_state
+            == crate::model::RequestArchiveState::Gap
+            || refs.response_archive_state == crate::model::RequestArchiveState::Gap
+        {
+            crate::model::RequestArchiveState::Gap
+        } else if refs.request_archive_state == crate::model::RequestArchiveState::Pending
+            || refs.response_archive_state == crate::model::RequestArchiveState::Pending
+        {
+            crate::model::RequestArchiveState::Pending
+        } else {
+            crate::model::RequestArchiveState::Bound
+        };
+        Ok(refs)
+    }
+
     pub(crate) async fn bind_raw_capture(
         &self,
         tenant_id: Uuid,

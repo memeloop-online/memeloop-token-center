@@ -133,11 +133,6 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             if updated.rows_affected() == 1 {
-                // Old enqueue implementations could recreate this consumed
-                // payload on a completed replay. It is no longer recovery
-                // input once the matching retained path has been verified.
-                sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3")
-                    .bind(&request).bind(&tenant).bind(&key).execute(&mut *tx).await?;
                 compacted += 1;
             }
             tx.commit().await?;
