@@ -17,8 +17,8 @@ export const codexTransportPolicySchema = {
       description: 'Stored with the account and still required to be lower than the total request timeout. A Codex forward does not use it as a connection deadline. Proxy reachability is a separate probe configured on the proxy group.',
     },
     read_timeout_millis: {
-      type: 'integer', minimum: 1000, maximum: 1260000, default: 600000,
-      description: 'Stored with the account. A Codex forward does not abort when the body is quiet. The body ends when the upstream finishes, the client cancels, or the socket fails.',
+      type: ['integer', 'null'], minimum: 1000, maximum: 1260000, default: null,
+      description: 'Stored with the account; optional. When unset (the default) a quiet upstream is never aborted. When set, the value is a read-inactivity window that restarts on every byte. A Codex forward does not apply it as an absolute deadline.',
     },
     request_timeout_millis: {
       type: 'integer', minimum: 1000, maximum: 1260000, default: 1260000,
@@ -57,7 +57,6 @@ export const codexTransportPolicySchema = {
       description: 'Maximum validated Responses terminal bytes held until EOF. Must be between max_sse_event_bytes and max_sse_framed_bytes.',
     },
     candidate_attempts: { type: 'integer', minimum: 1, maximum: 8, default: 3 },
-    failover_deadline_millis: { type: 'integer', minimum: 1000, maximum: 300000, default: 300000 },
     connect_attempts: { type: 'integer', minimum: 1, maximum: 4, default: 2 },
     connect_retry_delay_millis: { type: 'integer', minimum: 0, maximum: 2000, default: 150 },
     shared_probe_attempts: { type: 'integer', minimum: 0, maximum: 4, default: 1 },
