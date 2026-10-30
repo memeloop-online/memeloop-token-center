@@ -89,6 +89,28 @@ pub(super) async fn internal_monitoring_snapshot(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(snapshot)))
 }
 
+#[derive(Deserialize)]
+pub(super) struct ConcurrencyQuery {
+    tenant_external_id: Option<String>,
+}
+
+pub(super) async fn internal_upstream_concurrency(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ConcurrencyQuery>,
+) -> Result<impl axum::response::IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(
+            state
+                .metrics
+                .upstream_concurrency_snapshot(tenant.as_deref()),
+        ),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

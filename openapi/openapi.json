@@ -14666,6 +14666,62 @@
           }
         }
       }
+    },
+    "/internal/v1/upstream-concurrency": {
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getUpstreamConcurrency",
+        "summary": "Read sampled active leases and observed proxy concurrency",
+        "description": "Read-only asynchronous samples across gateways sharing the database. Live request-owner leases, generation job states, and unfinished egress attempts have separate measurement bases. Five-second sampled peaks are lower bounds; history is process-local for 15 minutes. Expired/missing request leases are excluded. Metadata gaps, truncation and stale collection are explicit. Unknown proxy attribution is never inferred from configured proxies or health. Recommendations are null; application is manual only.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "parameters": [
+          {
+            "name": "tenant_external_id",
+            "in": "query",
+            "required": false,
+            "description": "Tenant-scoped credentials remain restricted to their tenant. Global credentials may select a tenant or omit for global observations.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cached operational concurrency samples.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamConcurrencySnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -29237,6 +29293,247 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 32000
+          }
+        }
+      },
+      "UpstreamConcurrencySnapshot": {
+        "type": "object",
+        "required": [
+          "contract_version",
+          "scope",
+          "generated_at",
+          "observed_at",
+          "last_attempt_at",
+          "last_error_at",
+          "stale",
+          "expired_and_missing_request_leases_excluded",
+          "sample_interval_ms",
+          "retention_ms",
+          "peak_is_sampled_lower_bound",
+          "samples_truncated",
+          "recommendation",
+          "application_mode",
+          "series",
+          "samples",
+          "metadata_gaps"
+        ],
+        "properties": {
+          "contract_version": {
+            "const": "upstream_concurrency_v1"
+          },
+          "scope": {
+            "const": "shared_database_operational_leases_and_generation_states"
+          },
+          "generated_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "observed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_attempt_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_error_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "expired_and_missing_request_leases_excluded": {
+            "const": true
+          },
+          "sample_interval_ms": {
+            "const": 5000
+          },
+          "retention_ms": {
+            "const": 900000
+          },
+          "peak_is_sampled_lower_bound": {
+            "const": true
+          },
+          "samples_truncated": {
+            "type": "boolean"
+          },
+          "recommendation": {
+            "type": "null"
+          },
+          "application_mode": {
+            "const": "manual_only"
+          },
+          "series": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "tenant_external_id",
+                "dimension",
+                "identity",
+                "measurement_basis",
+                "current",
+                "sampled_peak",
+                "points",
+                "sample_ids"
+              ],
+              "properties": {
+                "tenant_external_id": {
+                  "type": "string"
+                },
+                "dimension": {
+                  "enum": [
+                    "upstream_account",
+                    "network_proxy"
+                  ]
+                },
+                "identity": {
+                  "type": "string"
+                },
+                "measurement_basis": {
+                  "type": "string"
+                },
+                "current": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "sampled_peak": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "points": {
+                  "type": "array",
+                  "maxItems": 180,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "observed_at": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "value": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "truncated": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "sample_ids": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "samples": {
+            "type": "array",
+            "maxItems": 4096,
+            "items": {
+              "type": "object",
+              "required": [
+                "tenant_external_id",
+                "sample_id",
+                "source",
+                "upstream_account_id",
+                "state",
+                "lease_expires_at",
+                "lease_state",
+                "selected_egress",
+                "egress_attempt_id",
+                "egress_upstream_account_id",
+                "egress_state"
+              ],
+              "properties": {
+                "tenant_external_id": {
+                  "type": "string"
+                },
+                "sample_id": {
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "request_owner",
+                    "generation_job"
+                  ]
+                },
+                "upstream_account_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "type": "string"
+                },
+                "lease_expires_at": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "lease_state": {
+                  "enum": [
+                    "live",
+                    "expired",
+                    "missing"
+                  ]
+                },
+                "selected_egress": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Sanitized selected egress metadata, without authentication material."
+                },
+                "egress_attempt_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "egress_upstream_account_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "egress_state": {
+                  "enum": [
+                    "unfinished_attempt",
+                    "completed_attempt",
+                    "invalid_metadata",
+                    "missing_metadata"
+                  ]
+                }
+              }
+            }
+          },
+          "metadata_gaps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         }
       }
