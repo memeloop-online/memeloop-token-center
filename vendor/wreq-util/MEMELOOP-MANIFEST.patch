@@ -1,0 +1,11 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -135,7 +135,7 @@
+ default-features = false
+ 
+ [dependencies.zstd]
+-version = "0.13.3"
++version = "0.14.3"
+ optional = true
+ 
+ [dev-dependencies.http]
