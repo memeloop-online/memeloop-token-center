@@ -246,7 +246,9 @@ pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,
     UpstreamAccountAvailabilityWindow,
 };
-pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
+pub use usage_analysis::{
+    UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter,
+};
 
 #[derive(Clone)]
 pub struct Database {

@@ -84,6 +84,43 @@ test('request filters find older astra routes, accept historical names, and prev
       await apply.click();
       await page.locator('.typed-filter-dialog').waitFor({ state: 'detached' });
       assert.equal(JSON.parse(await page.locator('#applied-filter').innerText()).conditions[0].value.value, 'gpt-6-astra');
+      // Shared quick-range controls: a preset replaces only the time row and
+      // all time drops it, while every other condition stays as entered.
+      await page.goto(url);
+      await open();
+      await page.getByRole('button', { name: locale === 'en' ? 'Last 7 days' : '最近 7 天', exact: true }).click();
+      assert.equal(await page.locator('.typed-filter-row').count(), 2, 'a quick range adds one time row beside the model row');
+      await page.setViewportSize({ width: 320, height: 900 });
+      const timeBounds = await page.locator('.typed-filter-row [data-filter-field="created_at"] input[type="datetime-local"]').evaluateAll((inputs) => inputs.map((input) => {
+        const rect = input.getBoundingClientRect();
+        const row = input.closest('.typed-filter-row');
+        const dialog = input.closest('.typed-filter-dialog');
+        const rowRect = row ? row.getBoundingClientRect() : rect;
+        const dialogRect = dialog ? dialog.getBoundingClientRect() : rect;
+        return { left: rect.left, right: rect.right, rowLeft: rowRect.left, rowRight: rowRect.right, dialogRight: dialogRect.right };
+      }));
+      assert.equal(timeBounds.length, 2, 'a between time range renders lower and upper datetime inputs');
+      for (const bounds of timeBounds) {
+        assert.ok(bounds.left >= bounds.rowLeft - 1 && bounds.right <= bounds.rowRight + 1, 'datetime input stays within its filter row card at 320px');
+        assert.ok(bounds.right <= bounds.dialogRight + 1, 'datetime input stays within the filter dialog at 320px');
+      }
+      assert.equal(await page.locator('.typed-filter-dialog').evaluate((element) => element.scrollWidth > element.clientWidth), false);
+      await apply.click();
+      await page.locator('.typed-filter-dialog').waitFor({ state: 'detached' });
+      const ranged = JSON.parse(await page.locator('#applied-filter').innerText());
+      assert.equal(ranged.conditions.filter((condition: { field: string }) => condition.field === 'created_at').length, 1, 'repeated quick ranges never stack time rows');
+      assert.equal(ranged.conditions[0].operator, 'between');
+      assert.equal(ranged.conditions[1].field, 'model');
+      await open();
+      await page.getByRole('button', { name: locale === 'en' ? 'Last 30 days' : '最近 30 天', exact: true }).click();
+      assert.equal(await page.locator('.typed-filter-row').count(), 2, 'choosing another range replaces the existing time row');
+      await page.getByRole('button', { name: locale === 'en' ? 'All time' : '全部时间', exact: true }).click();
+      assert.equal(await page.locator('.typed-filter-row').count(), 1, 'all time removes only the time row');
+      await apply.click();
+      await page.locator('.typed-filter-dialog').waitFor({ state: 'detached' });
+      const openEnded = JSON.parse(await page.locator('#applied-filter').innerText());
+      assert.equal(openEnded.conditions.some((condition: { field: string }) => condition.field === 'created_at'), false);
+      assert.equal(openEnded.conditions[0].field, 'model');
       assert.deepEqual(errors, []);
       await page.close();
     }
