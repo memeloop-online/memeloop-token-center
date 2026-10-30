@@ -87,14 +87,18 @@ test('plugin activation shares the complete React DOM and JSX runtimes with host
   try {
     const page = await browser.newPage();
     const pageErrors: string[] = [];
+    const consoleErrors: string[] = [];
     page.on('pageerror', error => pageErrors.push(error.message));
+    page.on('console', message => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
+    });
     await page.route('**/ui-assets/plugins/**', route => route.fulfill({
       contentType: 'text/javascript; charset=utf-8',
       body: `
-        function componentLibrary(require) {
-          const React = require('react');
-          const ReactDOM = require('react-dom');
-          const JSX = require('react/jsx-runtime');
+        function componentLibrary(loadExternal) {
+          const React = loadExternal('react');
+          const ReactDOM = loadExternal('react-dom');
+          const JSX = loadExternal('react/jsx-runtime');
           const Context = React.createContext('missing');
           const PortalCounter = React.memo(function PortalCounter() {
             const value = React.useContext(Context);
@@ -116,9 +120,15 @@ test('plugin activation shares the complete React DOM and JSX runtimes with host
         }
         export function activateOperatorUi(host) {
           const expected = window.__operatorRuntimeBindingsFixture;
-          if (!Object.isFrozen(host) || host.React !== expected.React
-            || host.ReactDOM !== expected.ReactDOM || host.ReactJSXRuntime !== expected.ReactJSXRuntime) {
-            throw new Error('Plugin runtimes must be the exact host namespaces');
+          if (!Object.isFrozen(host)) throw new Error('Plugin activation host must be frozen');
+          // Vite may wrap a CommonJS namespace separately at each import site.
+          // Every export, including the default module instance, must stay shared.
+          for (const name of ['React', 'ReactDOM', 'ReactJSXRuntime']) {
+            for (const key of Object.keys(expected[name])) {
+              if (host[name]?.[key] !== expected[name][key]) {
+                throw new Error('Plugin runtime must share host export ' + name + '.' + key);
+              }
+            }
           }
           const externals = {
             react: host.React, 'react-dom': host.ReactDOM, 'react/jsx-runtime': host.ReactJSXRuntime,
@@ -136,7 +146,18 @@ test('plugin activation shares the complete React DOM and JSX runtimes with host
       `,
     }));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-plugin-runtime-bindings.html`);
-    await page.getByTestId('runtime-single-instance').waitFor();
+    const ready = page.getByTestId('runtime-single-instance');
+    try {
+      await ready.or(page.getByRole('alert')).first().waitFor();
+      assert.equal(await ready.count(), 1, 'the plugin must render instead of its error boundary');
+    } catch (cause) {
+      throw new Error(JSON.stringify({
+        message: 'Runtime binding fixture failed to render',
+        pageErrors,
+        consoleErrors,
+        body: await page.locator('body').innerText(),
+      }), { cause });
+    }
     assert.equal(await page.getByTestId('runtime-single-instance').innerText(), 'Shared runtime');
     const portal = page.locator('#portal-target').getByRole('button', { name: 'Portal shared 0', exact: true });
     await portal.click();
