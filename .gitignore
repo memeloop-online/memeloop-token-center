@@ -1,7 +1,6 @@
 /target/
 /.cargo/*
 !/.cargo/config.toml
-!/.cargo/audit.toml
 /.env
 /web/node_modules/
 /web/dist/
