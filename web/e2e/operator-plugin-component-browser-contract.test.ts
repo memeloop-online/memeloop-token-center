@@ -73,3 +73,75 @@ test('an installed runtime module renders without rebuilding MTC and failures st
     assert.equal(moduleLoads, 1);
   } finally { await browser.close(); await server.close(); }
 });
+
+test('plugin activation shares the complete React DOM and JSX runtimes with host hooks and portals', { timeout: 60_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    return test.skip('Chromium is required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    const pageErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
+    await page.route('**/ui-assets/plugins/**', route => route.fulfill({
+      contentType: 'text/javascript; charset=utf-8',
+      body: `
+        function componentLibrary(require) {
+          const React = require('react');
+          const ReactDOM = require('react-dom');
+          const JSX = require('react/jsx-runtime');
+          const Context = React.createContext('missing');
+          const PortalCounter = React.memo(function PortalCounter() {
+            const value = React.useContext(Context);
+            const [count, setCount] = React.useState(0);
+            return JSX.jsx('button', {
+              type: 'button',
+              onClick: () => ReactDOM.flushSync(() => setCount(current => current + 1)),
+              children: 'Portal ' + value + ' ' + count,
+            });
+          });
+          return React.memo(function Workspace() {
+            return JSX.jsx(Context.Provider, { value: 'shared', children:
+              JSX.jsxs(JSX.Fragment, { children: [
+                JSX.jsx('div', { 'data-testid': 'runtime-single-instance', children: 'Shared runtime' }),
+                ReactDOM.createPortal(JSX.jsx(PortalCounter, {}), document.getElementById('portal-target')),
+              ] }),
+            });
+          });
+        }
+        export function activateOperatorUi(host) {
+          const expected = window.__operatorRuntimeBindingsFixture;
+          if (!Object.isFrozen(host) || host.React !== expected.React
+            || host.ReactDOM !== expected.ReactDOM || host.ReactJSXRuntime !== expected.ReactJSXRuntime) {
+            throw new Error('Plugin runtimes must be the exact host namespaces');
+          }
+          const externals = {
+            react: host.React, 'react-dom': host.ReactDOM, 'react/jsx-runtime': host.ReactJSXRuntime,
+          };
+          // Evaluate the bundled library only after activation supplies externals.
+          const Workspace = componentLibrary(name => {
+            if (!Object.hasOwn(externals, name)) throw new Error('Unknown runtime external');
+            return externals[name];
+          });
+          return host.defineOperatorUiPackage({
+            apiVersion: 'operator-ui-package-v1', pluginId: 'runtime-bindings',
+            compatiblePluginVersions: ['1.0.0'], components: { workspace: Workspace },
+          });
+        }
+      `,
+    }));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-plugin-runtime-bindings.html`);
+    await page.getByTestId('runtime-single-instance').waitFor();
+    assert.equal(await page.getByTestId('runtime-single-instance').innerText(), 'Shared runtime');
+    const portal = page.locator('#portal-target').getByRole('button', { name: 'Portal shared 0', exact: true });
+    await portal.click();
+    await page.locator('#portal-target').getByRole('button', { name: 'Portal shared 1', exact: true }).waitFor();
+    assert.equal(await page.locator('#root #portal-target').count(), 0, 'the portal renders outside the plugin root');
+    assert.deepEqual(pageErrors, []);
+  } finally { await browser.close(); await server.close(); }
+});
