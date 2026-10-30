@@ -272,13 +272,13 @@ mod tests {
     #[test]
     fn snapshots_isolate_tenants_and_do_not_present_expired_cache_as_current() {
         let observer = Observer::default();
-        let first = (
+        let first: SeriesKey = (
             "one".into(),
             "upstream_account".into(),
             "account-one".into(),
             "request_owner_live_lease".into(),
         );
-        let second = (
+        let second: SeriesKey = (
             "two".into(),
             "upstream_account".into(),
             "account-two".into(),

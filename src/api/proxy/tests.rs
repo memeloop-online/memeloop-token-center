@@ -1493,7 +1493,11 @@ async fn default_routing_distributes_requests_within_the_same_session() {
             .mount(upstream)
             .await;
     }
-    let fixture = resilient_route_fixture("default-session-fairness", &[(first.uri(), 0), (second.uri(), 0)]).await;
+    let fixture = resilient_route_fixture(
+        "default-session-fairness",
+        &[(first.uri(), 0), (second.uri(), 0)],
+    )
+    .await;
     for _ in 0..32 {
         let response = send_resilient_chat(&fixture, Some("logical-session-42"), false).await;
         assert_eq!(response.status(), StatusCode::OK);
