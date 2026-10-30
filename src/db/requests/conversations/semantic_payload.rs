@@ -367,6 +367,21 @@ mod receipt_tests {
             )
             .await
             .unwrap();
+            // Seed the legacy recovery rows explicitly: current enqueue keeps
+            // bounded inline JSON and no longer duplicates it in this table.
+            let encoded = body.to_string();
+            let request_id = Uuid::from_u128(index).to_string();
+            let payload_digest = digest(
+                &request_id,
+                &key.tenant_id.to_string(),
+                &key.key_id.to_string(),
+                &key.principal_id.to_string(),
+                &encoded,
+            );
+            sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)")
+                .bind(request_id).bind(key.tenant_id.to_string()).bind(key.key_id.to_string())
+                .bind(key.principal_id.to_string()).bind(encoded.len() as i64)
+                .bind(payload_digest).bind(encoded).execute(&mut *tx).await.unwrap();
             tx.commit().await.unwrap();
         }
         observe(&db, &key, &body, &hints, Uuid::from_u128(1), 1, true).await;

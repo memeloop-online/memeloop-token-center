@@ -2313,7 +2313,7 @@ async fn concurrent_proxy_starts_serialize_in_sqlite() {
 
 async fn archive_queued_lifecycle_body(database: &Database, request_id: Uuid) {
     let row = sqlx::query(
-        "SELECT o.observed_at, r.completed_at, p.request_json, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = o.request_id) AS observations FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id JOIN conversation_semantic_payloads p ON p.request_id = o.request_id WHERE o.request_id = $1 AND o.projected_at IS NULL",
+        "SELECT o.observed_at, r.completed_at, o.request_json, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = o.request_id) AS observations FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id WHERE o.request_id = $1 AND o.projected_at IS NULL",
     )
     .bind(request_id.to_string())
     .fetch_one(&database.pool)

@@ -23,6 +23,15 @@ impl Fixture {
         inline_request: bool,
         protocol: Option<&str>,
     ) -> Self {
+        Self::new_with_capture(database_url, inline_request, protocol, false).await
+    }
+
+    async fn new_with_capture(
+        database_url: String,
+        inline_request: bool,
+        protocol: Option<&str>,
+        capture_before_finish: bool,
+    ) -> Self {
         let state = AppState::initialize(Config::for_test(database_url))
             .await
             .unwrap();
@@ -115,6 +124,19 @@ impl Fixture {
         } else {
             state.db.start_proxy_request(input).await.unwrap()
         };
+        if capture_before_finish {
+            let identity = ArchiveSpoolIdentity {
+                request_id,
+                tenant_id: key.tenant_id,
+                reservation_id: reservation.id,
+            };
+            for (purpose, body) in [
+                (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
+                (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
+            ] {
+                assert!(response_archive_spool::capture_buffered(&state, identity, purpose, body).await);
+            }
+        }
         let request = if inline_request {
             serde_json::json!({"messages": [{"role": "user", "content": "archive question"}]})
         } else {
@@ -345,15 +367,16 @@ async fn sqlite_session_body_waits_for_capture_and_both_uploads() {
 #[tokio::test]
 async fn sqlite_final_archive_gap_keeps_request_turn() {
     let directory = tempfile::tempdir().unwrap();
-    let fixture = Fixture::new(
+    let fixture = Fixture::new_with_capture(
         format!(
             "sqlite://{}?mode=rwc",
             directory.path().join("gap.db").display()
         ),
         true,
+        None,
+        true,
     )
     .await;
-    fixture.capture().await;
     sqlx::query("UPDATE request_archive_spools SET state = 'gap' WHERE request_id = $1")
         .bind(fixture.request_id.to_string())
         .execute(&fixture.state.db.pool)
