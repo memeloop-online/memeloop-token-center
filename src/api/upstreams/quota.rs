@@ -342,7 +342,6 @@ pub(in crate::api) async fn reconcile_quota_reset(
 pub(in crate::api) struct ResetRecovery {
     expected_updated_at: i64,
     reason: ResetRecoveryReason,
-    confirmation: String,
 }
 
 #[derive(Deserialize)]
@@ -368,12 +367,6 @@ pub(in crate::api) async fn recover_quota_reset(
     Query(query): Query<QuotaQuery>,
     Json(body): Json<ResetRecovery>,
 ) -> Result<impl IntoResponse, AppError> {
-    if body.confirmation != "release_unknown_lock_and_accept_duplicate_consumption_risk" {
-        return Err(AppError::BadRequest(
-            "recovery requires explicit acknowledgement of duplicate credit consumption risk"
-                .into(),
-        ));
-    }
     let service = require_service(&headers, &state, "providers:write").await?;
     require_global_service(&service)?;
     let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
@@ -525,10 +518,9 @@ mod tests {
     #[test]
     fn reset_recovery_requires_a_closed_reason_and_review_revision() {
         let valid = json!({"expected_updated_at":42,
-            "reason":"operator_authorized_retry",
-            "confirmation":"release_unknown_lock_and_accept_duplicate_consumption_risk"});
+            "reason":"operator_authorized_retry"});
         assert!(serde_json::from_value::<ResetRecovery>(valid.clone()).is_ok());
-        for field in ["expected_updated_at", "reason", "confirmation"] {
+        for field in ["expected_updated_at", "reason"] {
             let mut missing = valid.clone();
             missing.as_object_mut().unwrap().remove(field);
             assert!(serde_json::from_value::<ResetRecovery>(missing).is_err());
@@ -577,7 +569,6 @@ mod tests {
             Json(ResetRecovery {
                 expected_updated_at: 42,
                 reason: ResetRecoveryReason::OperatorAuthorizedRetry,
-                confirmation: "release_unknown_lock_and_accept_duplicate_consumption_risk".into(),
             }),
         )
         .await;

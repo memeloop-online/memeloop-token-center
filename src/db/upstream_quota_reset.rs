@@ -378,19 +378,27 @@ impl Database {
         let settled_at: Option<i64> = row.try_get("settled_at")?;
         let error_code: Option<String> = row.try_get("error_code")?;
         let dispatch_diagnostic = QuotaResetDispatchDiagnostic::from_code(error_code.as_deref());
-        let quota_refresh_status = audit
-            .iter()
-            .rev()
-            .find_map(|event| match event.error_code.as_deref() {
-                Some("reset_readback_succeeded") => Some("succeeded"),
-                Some(code) if code.starts_with("reset_readback_pending_") => Some("pending"),
-                _ => None,
-            })
-            .unwrap_or(if state == "accepted" {
-                "pending"
-            } else {
-                "not_attempted"
-            });
+        // Display pagination must not discard the durable readback outcome.
+        let latest_readback = sqlx::query_scalar::<_, String>(
+            "SELECT error_code FROM upstream_quota_reset_audit
+             WHERE operation_id = $1 AND tenant_id = $2 AND upstream_account_id = $3
+               AND event = 'reconciled'
+               AND (error_code = 'reset_readback_succeeded'
+                    OR substr(error_code, 1, 23) = 'reset_readback_pending_')
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(id)
+        .bind(tenant)
+        .bind(account)
+        .fetch_optional(&self.pool)
+        .await?;
+        let quota_refresh_status = match latest_readback.as_deref() {
+            Some("reset_readback_succeeded") => "succeeded",
+            Some(_) => "pending",
+            None if state == "accepted" => "pending",
+            None => "not_attempted",
+        };
         let manual_unlock_available = state == "unknown" && settled_at.is_none();
         Ok(QuotaResetOperation {
             id: row.try_get("id")?,
@@ -1322,6 +1330,57 @@ mod tests {
         assert_eq!(read.state, "accepted");
         assert_eq!(read.quota_refresh_status, "succeeded");
         assert_eq!(read.available_credits, 2);
+
+        // Ordinary reconciliation can evict every readback from the display window.
+        for _ in 0..32 {
+            db.reconcile_quota_reset(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+                "actor",
+                accepted_account.credential_generation,
+                accepted_account.updated_at,
+                2,
+                2,
+                unix_millis(),
+            )
+            .await
+            .unwrap();
+        }
+        let outside_window = db
+            .quota_reset_operation(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outside_window.audit.len(), 32);
+        assert!(
+            outside_window
+                .audit
+                .iter()
+                .all(|event| { event.event == "reconciled" && event.error_code.is_none() })
+        );
+        assert_eq!(outside_window.quota_refresh_status, "succeeded");
+
+        // The latest readback wins in both directions, independent of pagination.
+        for (error, expected) in [(Some("quota_timeout"), "pending"), (None, "succeeded")] {
+            db.record_quota_reset_readback(&accepted_account, &accepted.id, "actor", error)
+                .await
+                .unwrap();
+            let latest = db
+                .quota_reset_operation(
+                    &tenant.to_string(),
+                    &accepted_account.id.to_string(),
+                    &accepted.id,
+                )
+                .await
+                .unwrap();
+            assert_eq!(latest.quota_refresh_status, expected);
+            assert_eq!(latest.state, "accepted");
+            assert_eq!(latest.available_credits, 2);
+        }
 
         assert!(
             db.current_quota_reset_operation_for_tenant(

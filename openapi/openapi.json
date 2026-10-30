@@ -14692,7 +14692,7 @@
         ],
         "x-required-scope": "providers:write",
         "x-global-operator-only": true,
-        "description": "Global operator only. Performs a fresh supplier GET and atomically releases only the reviewed unknown operation lock. A read cannot prove non-execution. Preserves unknown state, original dispatch error and baseline. Records reconciled audit with actor, time and manual_lock_released_<reason>. Never consumes a credit or repeats the old request. A new reset requires independent preparation and confirmation. An explicit risk acknowledgement is mandatory even when the supplier reportedly confirmed non-execution.",
+        "description": "Global operator only. Performs a fresh supplier GET and atomically releases only the reviewed unknown operation lock. A read cannot prove non-execution. Preserves unknown state, original dispatch error and baseline. Records reconciled audit with actor, time and manual_lock_released_<reason>. Never consumes a credit or repeats the old request. A new reset requires independent preparation and confirmation in a separate user action. Tenant/account authority and current operation/credential/transport revisions are enforced.",
         "parameters": [
           {
             "$ref": "#/components/parameters/AccountId"
@@ -14726,8 +14726,7 @@
                 "additionalProperties": false,
                 "required": [
                   "expected_updated_at",
-                  "reason",
-                  "confirmation"
+                  "reason"
                 ],
                 "properties": {
                   "expected_updated_at": {
@@ -14741,9 +14740,6 @@
                       "supplier_confirmed_not_applied",
                       "operator_authorized_retry"
                     ]
-                  },
-                  "confirmation": {
-                    "const": "release_unknown_lock_and_accept_duplicate_consumption_risk"
                   }
                 }
               }
@@ -14762,7 +14758,7 @@
             }
           },
           "400": {
-            "description": "Invalid acknowledgement, reason, or recovery request."
+            "description": "Invalid reason or recovery request."
           },
           "401": {
             "$ref": "#/components/responses/Unauthorized"
