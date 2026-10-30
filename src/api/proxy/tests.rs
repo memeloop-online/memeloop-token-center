@@ -2988,37 +2988,13 @@ async fn assert_exactly_once_side_effects_for(
                 .await
                 .unwrap()
             {
-                // Some finalizer fixtures admit a reservation directly, without
-                // running ingress capture. Give their saved request JSON an
-                // explicit locator before exercising the raw-document worker;
-                // an unrecorded gap otherwise means capture is still pending.
-                let synthetic_request: Option<String> = sqlx::query_scalar(
-                    "SELECT o.request_json FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND r.request_object = 'gap://' || r.id || '/request' AND NOT EXISTS (SELECT 1 FROM request_archive_spools s WHERE s.request_id = r.id)",
-                )
-                .bind(task.request_id.to_string())
-                .fetch_optional(&pool)
-                .await
-                .unwrap();
-                if let Some(raw_request) = synthetic_request {
-                    let document: Value = serde_json::from_str(&raw_request).unwrap();
-                    assert!(document.get("messages").is_some() || document.get("input").is_some());
-                    sqlx::query(
-                        "UPDATE request_records SET request_object = $1 WHERE id = $2 AND key_id = $3 AND request_object = 'gap://' || id || '/request'",
-                    )
-                    .bind(format!("inline-json:{raw_request}"))
-                    .bind(task.request_id.to_string())
-                    .bind(fixture.key_id.to_string())
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-                }
                 if !crate::worker::archive_session_body(
-                        &fixture.state,
-                        projection_owner,
-                        task.request_id
-                    )
-                    .await
-                    .unwrap()
+                    &fixture.state,
+                    projection_owner,
+                    task.request_id,
+                )
+                .await
+                .unwrap()
                 {
                     continue;
                 }

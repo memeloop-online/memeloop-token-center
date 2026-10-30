@@ -52,6 +52,24 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         })
         .await
         .unwrap();
+    let request_body = Bytes::from(
+        serde_json::to_vec(
+            &json!({"model":fixture.model,"messages":[{"role":"user","content":"test cached input"}]}),
+        )
+        .unwrap(),
+    );
+    let raw_request = fixture
+        .state
+        .archive
+        .put_tenant_content(key.tenant_id, request_body.clone())
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .publish_raw_capture(key.tenant_id, request_id, "request", &raw_request)
+        .await
+        .unwrap();
     let request = BufferedRequest {
         session_preference: None,
         state: &fixture.state,
@@ -64,17 +82,10 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         requested_service_tier: None,
         conversation: Some(ProxyConversation {
             key: key.clone(),
-            request_body: ConversationBody::InMemory(Bytes::from(
-                serde_json::to_vec(
-                    &json!({"model":fixture.model,"messages":[{"role":"user","content":"test cached input"}]}),
-                )
-                .unwrap(),
-            )),
+            request_body: ConversationBody::InMemory(request_body),
             hints: crate::conversation::ConversationHints::default(),
             client_name: None,
-            projection_admission: std::sync::Mutex::new(
-                ConversationProjectionAdmission::Deferred,
-            ),
+            projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
         }),
         protocol: Protocol::OpenAiChat,
         tenant_id: key.tenant_id,
