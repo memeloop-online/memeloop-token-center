@@ -731,6 +731,46 @@ fn append_stream_string(target: &mut Map<String, Value>, key: &str, fragment: Op
 }
 
 impl SessionBody {
+    /// Consume the request before the worker loads the (potentially larger) reply.
+    pub(crate) fn from_request_document(mut request: Value) -> Self {
+        let mut body = Self { turns: Vec::new() };
+        let value = if request.get("messages").is_some() {
+            request.get_mut("messages")
+        } else {
+            request.get_mut("input")
+        };
+        if let Some(value) = value {
+            match value.take() {
+                Value::String(text) => body.turns.push(turn_from_owned_content(
+                    "user".into(),
+                    "request",
+                    Value::String(text),
+                    None,
+                    None,
+                )),
+                Value::Array(items) => append_owned_entry_turns(&mut body.turns, items, "request"),
+                value @ Value::Object(_) => {
+                    body.turns.push(turn_from_owned_entry(value, "request"))
+                }
+                _ => {}
+            }
+        }
+        body
+    }
+
+    pub(crate) fn append_return_document(&mut self, mut document: Value) {
+        if let Some(output) = document.get_mut("output").and_then(Value::as_array_mut)
+            && !output.is_empty()
+        {
+            append_owned_entry_turns(&mut self.turns, std::mem::take(output), "return");
+        } else if let Some(message) = document.pointer_mut("/choices/0/message") {
+            self.turns
+                .push(turn_from_owned_entry(message.take(), "return"));
+        } else if document.get("role").is_some() || document.get("content").is_some() {
+            self.turns.push(turn_from_owned_entry(document, "return"));
+        }
+    }
+
     /// 取出尚未写入对象存储的媒体字节。序号用于把 locator 填回对应片段。
     pub fn take_media_bytes(&mut self) -> Vec<(usize, usize, Vec<u8>)> {
         let mut pending = Vec::new();
@@ -909,6 +949,179 @@ fn is_bare_content_part(value: &Value) -> bool {
                         | "file"
                 )
             })
+}
+
+fn append_owned_entry_turns(turns: &mut Vec<SessionBodyTurn>, items: Vec<Value>, origin: &str) {
+    let mut bare_parts = Vec::new();
+    for item in items {
+        if is_bare_content_part(&item) {
+            bare_parts.push(item);
+            continue;
+        }
+        flush_owned_bare_parts(turns, &mut bare_parts, origin);
+        turns.push(turn_from_owned_entry(item, origin));
+    }
+    flush_owned_bare_parts(turns, &mut bare_parts, origin);
+}
+
+fn flush_owned_bare_parts(turns: &mut Vec<SessionBodyTurn>, parts: &mut Vec<Value>, origin: &str) {
+    if !parts.is_empty() {
+        turns.push(turn_from_owned_content(
+            "user".into(),
+            origin,
+            Value::Array(std::mem::take(parts)),
+            None,
+            None,
+        ));
+    }
+}
+
+fn turn_from_owned_entry(mut entry: Value, origin: &str) -> SessionBodyTurn {
+    let kind = entry.get("type").and_then(Value::as_str).unwrap_or("");
+    let role = entry
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or(
+            if matches!(kind, "function_call" | "function_call_output") {
+                "tool"
+            } else if origin == "return" {
+                "assistant"
+            } else {
+                "user"
+            },
+        )
+        .to_owned();
+    // Entry-level tool fields retain the existing protocol-specific serialization.
+    if kind == "function_call" || kind == "function_call_output" || role == "tool" {
+        return turn_from_entry(&entry, origin);
+    }
+    let call_id = entry
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let tool_call_id = entry
+        .get("tool_call_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let content = entry
+        .get_mut("content")
+        .map(Value::take)
+        .unwrap_or(Value::Null);
+    let mut turn = if content.is_null() {
+        SessionBodyTurn {
+            role,
+            origin: origin.to_owned(),
+            parts: Vec::new(),
+        }
+    } else {
+        turn_from_owned_content(role, origin, content, call_id, tool_call_id)
+    };
+    if let Some(calls) = entry.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            turn.parts
+                .push(tool_call_part(turn.parts.len() as u32, call));
+        }
+    }
+    turn
+}
+
+fn turn_from_owned_content(
+    role: String,
+    origin: &str,
+    content: Value,
+    call_id: Option<String>,
+    tool_call_id: Option<String>,
+) -> SessionBodyTurn {
+    let mut parts = Vec::new();
+    match content {
+        Value::Array(items) => {
+            for item in items {
+                push_owned_content_part(&mut parts, item, call_id.clone(), tool_call_id.clone());
+            }
+        }
+        other => push_owned_content_part(&mut parts, other, call_id, tool_call_id),
+    }
+    SessionBodyTurn {
+        role,
+        origin: origin.to_owned(),
+        parts,
+    }
+}
+
+fn push_owned_content_part(
+    parts: &mut Vec<SessionBodyPart>,
+    mut item: Value,
+    call_id: Option<String>,
+    tool_call_id: Option<String>,
+) {
+    // Only tool payloads serialize nested JSON. Normal text/media reads fixed
+    // public fields, so recursively copying/cleaning their entire item is wasteful.
+    if matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("tool_use" | "tool_result")
+    ) {
+        item = strip_private_provider_fields(item);
+        if item.get("type").and_then(Value::as_str) == Some("tool_use") {
+            parts.push(tool_call_part(parts.len() as u32, &item));
+        } else {
+            parts.push(SessionBodyPart {
+                part_index: parts.len() as u32,
+                kind: "tool_result".into(),
+                text: item.get("content").map(value_text),
+                tool_call_id: item
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                ..empty_part()
+            });
+        }
+        return;
+    }
+    if part_is_private_only(&item) {
+        return;
+    }
+    let index = parts.len() as u32;
+    if let Some((media_type, bytes)) = media_bytes_from_part(&item) {
+        parts.push(SessionBodyPart {
+            part_index: index,
+            kind: media_kind(&media_type),
+            content_blake3: Some(blake3::hash(&bytes).to_hex().to_string()),
+            byte_length: Some(bytes.len() as u64),
+            media_type: Some(media_type),
+            media_bytes: Some(bytes),
+            call_id,
+            tool_call_id,
+            ..empty_part()
+        });
+        return;
+    }
+    let is_string = item.is_string();
+    let text = match item {
+        Value::String(text) => Some(text),
+        Value::Object(mut map) => {
+            let key = if map.get("text").is_some_and(Value::is_string) {
+                "text"
+            } else {
+                "content"
+            };
+            match map.remove(key) {
+                Some(Value::String(text)) => Some(text),
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    if text.as_deref().is_none_or(str::is_empty) && !is_string {
+        return;
+    }
+    parts.push(SessionBodyPart {
+        part_index: index,
+        kind: "text".into(),
+        text,
+        call_id,
+        tool_call_id,
+        ..empty_part()
+    });
 }
 
 fn turn_from_entry(entry: &Value, origin: &str) -> SessionBodyTurn {
@@ -1647,6 +1860,153 @@ mod tests {
             assert_eq!(original.content_hash, replay.content_hash);
             assert_eq!(original.content["origin"], "return");
             assert_eq!(replay.content["origin"], "request");
+        }
+    }
+
+    #[test]
+    fn consuming_documents_match_borrowed_protocol_media_and_tool_semantics() {
+        let media = base64::engine::general_purpose::STANDARD.encode(b"media-bytes-long-enough");
+        let samples = [
+            (json!({"input": "plain\n文本"}), json!({})),
+            (
+                json!({"messages": null, "input": "ignored"}),
+                json!({"output": [], "choices": [{"message": null}], "content": "ignored"}),
+            ),
+            (
+                json!({"input": {"content": "object", "call_id": "c", "tool_call_id": "t"}}),
+                json!({"role": "custom", "content": "direct"}),
+            ),
+            (
+                json!({"messages": [
+                    {"role": "user", "content": ""},
+                    {"role": "assistant", "content": null, "tool_calls": [
+                        {"id": "chat-call", "function": {"name": "lookup", "arguments": {"encrypted_content": "entry-keeps-private", "q": 1}}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "chat-call", "content": {"encrypted_reasoning": "entry-keeps-private", "result": [1, 2]}}
+                ]}),
+                json!({"choices": [{"message": {"role": "assistant", "content": "chat reply"}}]}),
+            ),
+            (
+                json!({"input": [
+                    {"type": "input_text", "text": "bare one"},
+                    {"type": "input_image", "image_url": {"url": format!("data:image/png;base64,{media}")}},
+                    {"role": "user", "content": "boundary"},
+                    {"type": "input_text", "text": "bare two"},
+                    {"type": "input_audio", "data": media},
+                    {"type": "input_video", "content": media},
+                    {"type": "input_file", "file_data": media},
+                    1, true, null, "entry string"
+                ]}),
+                json!({"output": [
+                {"type": "function_call", "call_id": "response-call", "id": "other-id", "name": "lookup", "arguments": {"thought_signature": "entry-keeps-private", "q": 2}},
+                {"type": "function_call_output", "call_id": "response-call", "tool_call_id": "t", "output": ["ok", {"reasoning_opaque": "entry-keeps-private"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "response reply", "encrypted_content": "drop"}]}
+            ], "choices": [{"message": {"content": "ignored"}}]}),
+            ),
+            (
+                json!({"messages": [{"role": "user", "call_id": "parent", "tool_call_id": "parent-tool", "content": [
+                    "", "scalar", {"text": "", "content": "ignored"}, {"text": 1, "content": "fallback"},
+                    {"type": "reasoning", "encrypted_content": "drop"},
+                    {"type": "compaction", "content": "public", "reasoning_opaque": "drop"},
+                    {"type": "image", "source": {"data": media, "thought_signature": "drop"}},
+                    {"type": "image", "url": "invalid", "text": "media fallback"},
+                    {"type": "image_generation_call", "result": media},
+                    {"b64_json": format!("data:application/pdf;base64,{media}")}
+                ]}]}),
+                json!({"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "anthropic-call", "name": "lookup", "input": {"keep": [{"text": "yes", "encrypted_content": "drop", "encrypted_reasoning": "drop", "thought_signature": "drop", "reasoning_opaque": "drop"}]}},
+                    {"type": "tool_result", "tool_use_id": "anthropic-call", "content": [{"text": "result", "encrypted_reasoning": "drop"}]},
+                    {"type": "text", "text": "anthropic reply", "thought_signature": "drop"}
+                ]}),
+            ),
+            (
+                json!([]),
+                json!({"output": [{"type": "output_text", "text": "bare return"}]}),
+            ),
+        ];
+        for (request, response) in samples {
+            let mut borrowed = session_body_from_documents(&request, &response);
+            let mut consumed = SessionBody::from_request_document(request);
+            consumed.append_return_document(response);
+            assert_eq!(consumed, borrowed);
+            let media = borrowed.take_media_bytes();
+            assert_eq!(consumed.take_media_bytes(), media);
+            for (turn, part, _) in media {
+                let locator = format!("objects/{turn}/{part}");
+                borrowed.set_media_locator(turn, part, locator.clone());
+                consumed.set_media_locator(turn, part, locator);
+            }
+            let (expected_atoms, expected_nodes) = borrowed.into_prefix();
+            let expected_media = borrowed.media_locators(&expected_atoms);
+            let (atoms, nodes, media) = consumed.into_archive_parts();
+            for (atom, expected) in atoms.iter().zip(&expected_atoms) {
+                assert_eq!(
+                    serde_json::to_vec(&atom.content).unwrap(),
+                    serde_json::to_vec(&expected.content).unwrap()
+                );
+            }
+            assert_eq!(
+                (atoms, nodes, media),
+                (expected_atoms, expected_nodes, expected_media)
+            );
+        }
+    }
+
+    #[test]
+    fn consuming_documents_move_request_and_response_text_buffers() {
+        let input = "input text ".repeat(128);
+        let reply = "reply 文本 ".repeat(128);
+        for request in [
+            json!({"input": input}),
+            json!({"messages": [{"role": "user", "content": input}]}),
+            json!({"input": [{"type": "input_text", "text": input}]}),
+        ] {
+            let input_ptr = request
+                .pointer("/input")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    request
+                        .pointer("/messages/0/content")
+                        .and_then(Value::as_str)
+                })
+                .or_else(|| request.pointer("/input/0/text").and_then(Value::as_str))
+                .unwrap()
+                .as_ptr();
+            let mut body = SessionBody::from_request_document(request);
+            assert_eq!(
+                body.turns[0].parts[0].text.as_ref().unwrap().as_ptr(),
+                input_ptr
+            );
+            for (response, pointer) in [
+                (
+                    json!({"choices": [{"message": {"content": reply}}]}),
+                    "/choices/0/message/content",
+                ),
+                (
+                    json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": reply}]}]}),
+                    "/output/0/content/0/text",
+                ),
+                (
+                    json!({"role": "assistant", "content": [{"type": "text", "text": reply}]}),
+                    "/content/0/text",
+                ),
+            ] {
+                let reply_ptr = response
+                    .pointer(pointer)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .as_ptr();
+                body.append_return_document(response);
+                assert_eq!(
+                    body.turns.last().unwrap().parts[0]
+                        .text
+                        .as_ref()
+                        .unwrap()
+                        .as_ptr(),
+                    reply_ptr
+                );
+            }
         }
     }
 

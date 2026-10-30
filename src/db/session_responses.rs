@@ -17,6 +17,30 @@ pub(crate) struct SessionResponseSummary {
     pub error_code: Option<String>,
 }
 
+fn encode_session_response(answer: &str) -> Result<String, serde_json::Error> {
+    // Match the existing JSON Value's sorted key order and atom identity,
+    // without constructing another owned copy of the answer in a Value.
+    #[derive(serde::Serialize)]
+    struct Summary<'a> {
+        content: &'a str,
+        role: &'static str,
+        #[serde(rename = "type")]
+        kind: &'static str,
+    }
+    // Leave room for the envelope so a large, mostly unescaped paragraph does
+    // not double the output allocation just to append the JSON metadata.
+    let mut encoded = Vec::with_capacity(answer.len() + 64);
+    serde_json::to_writer(
+        &mut encoded,
+        &Summary {
+            content: answer,
+            role: "assistant",
+            kind: "response_summary",
+        },
+    )?;
+    Ok(String::from_utf8(encoded).expect("serialized JSON is UTF-8"))
+}
+
 impl Database {
     /// A derived reading job only. The HTTP path never fetches an archive.
     pub(crate) async fn session_response_summary(
@@ -83,7 +107,7 @@ impl Database {
     pub(crate) async fn finish_session_response(
         &self,
         task: &SessionResponseTask,
-        answer: Option<&str>,
+        answer: Option<String>,
         error: Option<&str>,
     ) -> Result<(), AppError> {
         let now = unix_millis();
@@ -97,10 +121,9 @@ impl Database {
         };
         let archived_answer = match answer {
             Some(answer) => {
-                let encoded = serde_json::to_string(&serde_json::json!({
-                    "role": "assistant", "type": "response_summary", "content": answer
-                }))
-                .map_err(|_| AppError::internal("session_response_body_encode"))?;
+                let encoded = encode_session_response(&answer)
+                    .map_err(|_| AppError::internal("session_response_body_encode"))?;
+                drop(answer);
                 let digest = blake3::hash(encoded.as_bytes()).to_hex().to_string();
                 Some((
                     digest,

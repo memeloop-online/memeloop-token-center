@@ -555,6 +555,7 @@ impl ResponseArchiveProducer {
         let failure_active = active.clone();
         let mut writer_state = state.clone();
         writer_state.db = state.persistence_db.clone();
+        writer_state.db.refresh_closed_persistence_pool();
         let writer_memory = queue_memory.clone();
         let writer = super::OwnedTask::spawn(
             async move {

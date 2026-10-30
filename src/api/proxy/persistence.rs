@@ -162,7 +162,9 @@ pub(super) fn capture(
             .await
             .expect("archive capture semaphore stays open");
         let mut durable = None;
+        let mut db = background.persistence_db.clone();
         loop {
+            db.refresh_closed_persistence_pool();
             let result: Result<bool, AppError> = async {
                 let reference = match &durable {
                     Some(reference) => reference,
@@ -187,8 +189,7 @@ pub(super) fn capture(
                         reference,
                     )
                     .await?;
-                let _ = background
-                    .persistence_db
+                let _ = db
                     .bind_raw_capture(
                         identity.tenant_id,
                         identity.request_id,

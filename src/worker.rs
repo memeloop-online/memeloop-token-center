@@ -1101,10 +1101,8 @@ pub(crate) async fn archive_session_body(
             response_complete,
         )
         .await?;
-    let mut body =
-        crate::conversation::session_body_from_documents(&request_document, &return_document);
-    drop(request_document);
-    drop(return_document);
+    let mut body = crate::conversation::SessionBody::from_request_document(request_document);
+    body.append_return_document(return_document);
     let pending_media = body.take_media_bytes();
     let mut uploaded_media = std::collections::HashMap::new();
     for (turn_index, part_index, bytes) in pending_media {

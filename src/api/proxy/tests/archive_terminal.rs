@@ -224,6 +224,7 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         &request,
     )
     .await;
+    // The retained metadata job retries until this injected outage is removed.
     sqlx::query("DROP TRIGGER reject_request_capture")
         .execute(&pool)
         .await
