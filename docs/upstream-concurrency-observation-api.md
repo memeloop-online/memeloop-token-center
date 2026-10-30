@@ -1,6 +1,6 @@
 # Upstream concurrency observations
 
-`GET /internal/v1/upstream-concurrency?tenant_external_id=…` requires `providers:read`. Tenant service credentials remain scoped to their tenant. Global credentials can omit the selector. Responses use `Cache-Control: no-store`.
+`GET /internal/v1/upstream-concurrency?tenant_external_id=…` requires both `providers:read` and `requests:read`. Tenant service credentials remain scoped to their tenant. Global credentials can omit the selector. Responses use `Cache-Control: no-store`.
 
 The control process asynchronously samples existing shared database request-owner leases, generation states and egress-attempt observations every five seconds. Reading this API returns the cache. Request admission does not query or lock this collector. Each control process retains up to 15 minutes of history; restart or another control replica can change the available history.
 
@@ -17,7 +17,7 @@ The control process asynchronously samples existing shared database request-owne
 | `samples_truncated`, `points[].truncated` | Observation bounds were reached; counts/peaks can undercount. Bounds limit observability memory, not customer concurrency. |
 | `recommendation`, `application_mode` | Null and `manual_only`. This API does not choose, apply or enforce a concurrency limit. |
 
-Request owner leases include preparation, streaming and delivery; they are distinct from simultaneous upstream HTTP exchanges. Expired/missing request leases are excluded even if their request row remains unresolved. Generation running/submitting/cancelling/preparing/queued states remain separate and expose their lease metadata; they do not imply a live network exchange. Every account in the sampled inventory gets a zero live-request series when idle. Proxy series describe actual observed endpoints; configured but unobserved proxies have no fabricated zero series.
+Request-owner phase metadata is unavailable in the repository schema and is reported as `unknown`. Rows with a recorded operational terminal are excluded even if financial settlement is pending. Request owner leases include preparation, streaming and delivery; they are distinct from simultaneous upstream HTTP exchanges. Expired/missing request leases are excluded even if their request row remains unresolved. Generation running/submitting/cancelling/preparing/queued states remain separate and expose their lease metadata; they do not imply a live network exchange. Every account in the sampled inventory gets a zero live-request series when idle. Proxy series describe actual observed endpoints; configured but unobserved proxies have no fabricated zero series.
 
 Codex already asynchronously persists sanitized egress-attempt evidence. Generic HTTP and component-provider requests do not currently persist equivalent per-request selected-proxy evidence: their live request leases are attributed to accounts, with missing egress metadata recorded explicitly. An unfinished event may lag its transport through asynchronous persistence. Do not equate these proxy samples with connection/stream IDs or provider-side concurrency. Independent network-proxy probe health and independent upstream-service probe health are separate systems and neither is used to invent concurrency observations.
 

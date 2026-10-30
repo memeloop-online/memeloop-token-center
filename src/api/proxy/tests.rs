@@ -1498,6 +1498,14 @@ async fn default_routing_distributes_requests_within_the_same_session() {
         &[(first.uri(), 0), (second.uri(), 0)],
     )
     .await;
+    // This fixture's explicit admission limit is unrelated to scheduling;
+    // completed responses may still await their asynchronous settlement.
+    fixture
+        .state
+        .db
+        .update_key_policy(fixture.key_id, KeyPolicy::default())
+        .await
+        .unwrap();
     for _ in 0..32 {
         let response = send_resilient_chat(&fixture, Some("logical-session-42"), false).await;
         assert_eq!(response.status(), StatusCode::OK);

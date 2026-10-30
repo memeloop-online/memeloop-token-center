@@ -14674,7 +14674,7 @@
         ],
         "operationId": "getUpstreamConcurrency",
         "summary": "Read sampled active leases and observed proxy concurrency",
-        "description": "Read-only asynchronous samples across gateways sharing the database. Live request-owner leases, generation job states, and unfinished egress attempts have separate measurement bases. Five-second sampled peaks are lower bounds; history is process-local for 15 minutes. Expired/missing request leases are excluded. Metadata gaps, truncation and stale collection are explicit. Unknown proxy attribution is never inferred from configured proxies or health. Recommendations are null; application is manual only.",
+        "description": "Requires both providers:read and requests:read. Read-only asynchronous samples across gateways sharing the database. Live request-owner leases, generation job states, and unfinished egress attempts have separate measurement bases. Five-second sampled peaks are lower bounds; history is process-local for 15 minutes. Expired/missing request leases are excluded. Metadata gaps, truncation and stale collection are explicit. Unknown proxy attribution is never inferred from configured proxies or health. Recommendations are null; application is manual only.",
         "security": [
           {
             "serviceBearer": []
@@ -14720,7 +14720,11 @@
           "403": {
             "$ref": "#/components/responses/Forbidden"
           }
-        }
+        },
+        "x-required-scopes": [
+          "providers:read",
+          "requests:read"
+        ]
       }
     }
   },

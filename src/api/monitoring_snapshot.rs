@@ -94,13 +94,26 @@ pub(super) struct ConcurrencyQuery {
     tenant_external_id: Option<String>,
 }
 
+impl ConcurrencyQuery {
+    fn into_tenant(
+        self,
+        service: &crate::model::AuthenticatedService,
+    ) -> Result<Option<String>, AppError> {
+        // Request/job identifiers and operational evidence are request data.
+        if !service.allows("requests:read") {
+            return Err(AppError::Forbidden);
+        }
+        management_tenant(service, self.tenant_external_id)
+    }
+}
+
 pub(super) async fn internal_upstream_concurrency(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<ConcurrencyQuery>,
 ) -> Result<impl axum::response::IntoResponse, AppError> {
     let service = require_service(&headers, &state, "providers:read").await?;
-    let tenant = management_tenant(&service, query.tenant_external_id)?;
+    let tenant = query.into_tenant(&service)?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(
@@ -114,6 +127,39 @@ pub(super) async fn internal_upstream_concurrency(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrency_attribution_requires_request_scope_and_cannot_cross_tenants() {
+        let mut service = crate::model::AuthenticatedService {
+            service_id: Some(uuid::Uuid::now_v7()),
+            credential_generation: Some(1),
+            scopes: vec!["providers:read".into()],
+            tenant_external_id: Some("one".into()),
+        };
+        assert!(
+            ConcurrencyQuery {
+                tenant_external_id: None
+            }
+            .into_tenant(&service)
+            .is_err()
+        );
+        service.scopes.push("requests:read".into());
+        assert_eq!(
+            ConcurrencyQuery {
+                tenant_external_id: None
+            }
+            .into_tenant(&service)
+            .unwrap(),
+            Some("one".into())
+        );
+        assert!(
+            ConcurrencyQuery {
+                tenant_external_id: Some("two".into())
+            }
+            .into_tenant(&service)
+            .is_err()
+        );
+    }
 
     #[test]
     fn operator_monitoring_requires_an_explicit_scope_and_window() {

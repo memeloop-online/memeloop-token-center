@@ -35,12 +35,14 @@ impl Database {
                     {now} AS sampled_at
              FROM (
                SELECT r.tenant_id, r.id AS sample_id, 'request_owner' AS source,
-                      r.upstream_account_id, COALESCE(r.in_flight_stage, 'unknown') AS state,
+                      r.upstream_account_id, 'unknown' AS state,
                       r.proxy_owner_expires_at AS lease_expires_at,
                       e.snapshot_json, e.attempt_id AS egress_attempt_id,
                       e.completed AS egress_completed, e.upstream_account_id AS egress_upstream_account_id, r.created_at
                FROM (SELECT * FROM request_records
                      WHERE completed_at IS NULL AND proxy_owner_expires_at > {now}
+                       AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals terminal
+                                       WHERE terminal.request_id = request_records.id)
                      ORDER BY proxy_owner_expires_at DESC, id DESC LIMIT $1) r
                LEFT JOIN request_egress_attempts e ON e.request_id = r.id
                  AND e.attempt_id = (
@@ -174,6 +176,37 @@ mod tests {
             .execute(&database.pool)
             .await
             .unwrap();
+        assert!(
+            !database
+                .upstream_concurrency_samples(4097)
+                .await
+                .unwrap()
+                .iter()
+                .any(|sample| sample.sample_id == request_id.to_string())
+        );
+        sqlx::query("UPDATE request_records SET proxy_owner_expires_at = $1 WHERE id = $2")
+            .bind(unix_millis() + 60_000)
+            .bind(request_id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        // Delivery is over; settlement may still leave the original row and
+        // lease unfinished. Operational completion takes precedence.
+        sqlx::query(
+            "INSERT INTO proxy_operational_terminals
+            (request_id, request_created_at, tenant_id, key_id, account_id, reservation_id,
+             owner_token, fence, contract_digest, receipt_id, operational_digest, status_code,
+             completed_at, duration_ms, response_object, recorded_at)
+            SELECT id, created_at, tenant_id, key_id, $2, reservation_id, proxy_owner_token,
+                   'test-fence', 'test-contract', 'test-receipt', 'test-operation', 200,
+                   created_at, 0, 'inline-json:{}', created_at
+            FROM request_records WHERE id = $1",
+        )
+        .bind(request_id.to_string())
+        .bind(key.account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
         assert!(
             !database
                 .upstream_concurrency_samples(4097)
