@@ -163,7 +163,7 @@ async fn oauth_only_provider_rejects_raw_oauth_on_the_direct_creation_api() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"]["code"], "invalid_request");
     assert!(
-        error["error"]["message"]
+        error["error"]["message_en"]
             .as_str()
             .is_some_and(|message| message.contains("authorization flow"))
     );
@@ -466,7 +466,13 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .await
             .unwrap();
         let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-        assert!(refs.request_object.starts_with(&cas_prefix));
+        assert_eq!(
+            refs.request_object,
+            format!(
+                "staging/proxy/{0}/request/{0}/body.json",
+                request.request_id
+            )
+        );
         let response_object = refs.response_object.as_deref().unwrap();
         assert!(response_object.starts_with(&cas_prefix));
         let archived_request = state
@@ -479,7 +485,15 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .get_bounded(response_object, 1024 * 1024)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&archived_request).contains("requested-model"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&archived_request).unwrap(),
+            json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "canonical"}],
+                "stream": false,
+                "max_tokens": 32
+            })
+        );
         assert_eq!(
             serde_json::from_slice::<Value>(&archived_response).unwrap()["choices"][0]["message"]["content"],
             "normalized by component"

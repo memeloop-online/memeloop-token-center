@@ -1065,6 +1065,9 @@ pub(crate) async fn archive_session_body(
     {
         request_document = fallback;
     }
+    // Release the request JSON (including unused schemas/private fields) before
+    // loading/parsing the response. Public text moves into the body.
+    let mut body = crate::conversation::SessionBody::from_request_document(request_document);
     // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
     // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
     let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
@@ -1084,10 +1087,7 @@ pub(crate) async fn archive_session_body(
     let return_document = crate::conversation::raw_return_document(&return_bytes)
         .unwrap_or_else(|| serde_json::json!({}));
     drop(return_bytes);
-    let mut body =
-        crate::conversation::session_body_from_documents(&request_document, &return_document);
-    drop(request_document);
-    drop(return_document);
+    body.append_return_document(return_document);
     let pending_media = body.take_media_bytes();
     let mut media_staging = Vec::new();
     let mut uploaded_media = std::collections::HashMap::new();

@@ -263,8 +263,16 @@ async fn traffic_rewrite_over_256_mib_reaches_upstream_with_service_memory_capac
     let mut config = (*fixture.state.config).clone();
     config.proxy_memory_budget_bytes = 2 * 1024 * 1024 * 1024;
     fixture.state = AppState::initialize(config).await.unwrap();
-    let (status, response) = call_hint_routing_fixture(&fixture).await;
-    assert_eq!(status, StatusCode::OK, "{response}");
+    let capture = LogCapture::default();
+    let (status, response) = call_hint_routing_fixture(&fixture)
+        .with_subscriber(capture.dispatch())
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{response}; {}",
+        String::from_utf8_lossy(&capture.0.lock().unwrap())
+    );
     let received = upstream.received_requests().await.unwrap();
     let request: Value = serde_json::from_slice(&received[0].body).unwrap();
     assert_eq!(request["messages"], rewritten["messages"]);

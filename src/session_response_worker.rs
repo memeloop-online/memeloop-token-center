@@ -18,12 +18,7 @@ pub(crate) async fn process_one(state: &AppState) -> Result<(), AppError> {
     };
     let result = project(state, &task).await;
     match result {
-        Ok(text) => {
-            state
-                .db
-                .finish_session_response(&task, text.as_deref(), None)
-                .await
-        }
+        Ok(text) => state.db.finish_session_response(&task, text, None).await,
         Err(reason) => {
             state
                 .db

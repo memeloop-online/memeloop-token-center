@@ -161,8 +161,9 @@ pub(super) fn capture(
             .acquire_owned()
             .await
             .expect("archive capture semaphore stays open");
-        let db = &background.persistence_db;
+        let mut db = background.persistence_db.clone();
         loop {
+            db.refresh_closed_persistence_pool();
             let result: Result<bool, AppError> = async {
                 if db
                     .deferred_archive_is_captured(identity, purpose, &body)
