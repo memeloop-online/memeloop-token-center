@@ -59,9 +59,16 @@ function releasePendingSessionWaiters() {
   }
 }
 
+// These finite JSON fixtures are fully buffered before sending. Declare their exact
+// size so the gateway reserves the payload rather than an unknown-length maximum.
+function sendChatJson(response, status, value) {
+  const payload = JSON.stringify(value);
+  response.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload) });
+  response.end(payload);
+}
+
 function sendSessionResponse(response, fail, body) {
-  response.writeHead(fail ? 429 : 200, { 'content-type': 'application/json' });
-  response.end(JSON.stringify(fail ? {
+  sendChatJson(response, fail ? 429 : 200, fail ? {
     error: { type: 'rate_limit_error', message: 'mock gated session rate limit' },
   } : {
     id: 'chatcmpl-browser-session-live',
@@ -70,7 +77,7 @@ function sendSessionResponse(response, fail, body) {
     model: body.model,
     choices: [{ index: 0, message: { role: 'assistant', content: 'browser gated session response' }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
-  }));
+  });
 }
 
 function releasePendingSessionResponses() {
@@ -276,19 +283,17 @@ const upstream = createServer((request, response) => {
       return;
     }
     if (prompt.includes('force observable error')) {
-      response.writeHead(429, { 'content-type': 'application/json' });
-      response.end(JSON.stringify({ error: { type: 'rate_limit_error', message: 'mock observable rate limit' } }));
+      sendChatJson(response, 429, { error: { type: 'rate_limit_error', message: 'mock observable rate limit' } });
       return;
     }
-    response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({
+    sendChatJson(response, 200, {
       id: 'chatcmpl-browser-e2e',
       object: 'chat.completion',
       created: Math.floor(Date.now() / 1000),
       model: body.model,
       choices: [{ index: 0, message: { role: 'assistant', content: 'browser e2e response' }, finish_reason: 'stop' }],
       usage: { prompt_tokens: 8, completion_tokens: 4, total_tokens: 12 },
-    }));
+    });
   });
 });
 

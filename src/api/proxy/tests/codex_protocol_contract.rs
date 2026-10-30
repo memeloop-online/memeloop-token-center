@@ -184,8 +184,11 @@ async fn compact(version: http::Version) {
             .unwrap(),
     )
     .unwrap();
-    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"failover_deadline_millis":1000,"connect_timeout_millis":1000,
-        "read_timeout_millis":1000,"request_timeout_millis":2000});
+    // Production keeps account read timeouts opt-in. A configured 1-second
+    // socket read timeout would correctly terminate this 3-second silence,
+    // independently of the removed gateway request/failover clocks.
+    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"connect_timeout_millis":1000,
+        "read_timeout_millis":null,"request_timeout_millis":2000});
     sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
         .bind(config.to_string())
         .bind(fixture.upstream_account_id.to_string())
@@ -211,7 +214,7 @@ async fn compact(version: http::Version) {
     };
     tokio::select! {
         _ = tokio::time::sleep(Duration::from_secs(3)) => {},
-        _ = &mut send => panic!("compact must outlive failover and transport deadlines"),
+        _ = &mut send => panic!("compact without an account read deadline must stay open"),
     }
     emit(&post, CREATED).await;
     complete(post).await;

@@ -53,20 +53,6 @@ fn invalid() -> AppError {
     AppError::BadRequest("native CLI state carrier is invalid".into())
 }
 
-fn aad(binding: &StateBinding) -> Result<Vec<u8>, AppError> {
-    if binding.tenant_external_id.is_empty()
-        || binding.tenant_external_id.len() > 200
-        || binding.tenant_external_id.trim() != binding.tenant_external_id
-        || binding.tenant_external_id.chars().any(char::is_control)
-        || binding.account_id.is_nil()
-    {
-        return Err(invalid());
-    }
-    let mut aad = b"memeloop-token-center/native-cli-state/v1\0".to_vec();
-    aad.extend(serde_json::to_vec(binding).map_err(|_| invalid())?);
-    Ok(aad)
-}
-
 fn validate(state: &AccountState) -> Result<(), AppError> {
     if state.source_handle.is_empty()
         || state.source_handle.len() > 80
@@ -113,8 +99,8 @@ fn validate(state: &AccountState) -> Result<(), AppError> {
 
 pub fn seal(
     state: &AccountState,
-    binding: &StateBinding,
-    key_material: &[u8],
+    _binding: &StateBinding,
+    _key_material: &[u8],
 ) -> Result<String, AppError> {
     validate(state)?;
     encode_json(state)
@@ -122,8 +108,8 @@ pub fn seal(
 
 pub fn open(
     envelope: &str,
-    expected_binding: &StateBinding,
-    key_material: &[u8],
+    _expected_binding: &StateBinding,
+    _key_material: &[u8],
 ) -> Result<AccountState, AppError> {
     if envelope.len() > MAX_ENVELOPE {
         return Err(invalid());

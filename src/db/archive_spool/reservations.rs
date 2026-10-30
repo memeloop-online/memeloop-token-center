@@ -102,6 +102,7 @@ impl Database {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn reserve_deferred_archive_capacity(
         &self,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,

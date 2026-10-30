@@ -64,9 +64,30 @@ export function assertUnknownFinancialEvidence(row: Record<string, unknown>, rec
     assert(operational[field] === row[column], `operational ACK must match owned receipt: ${field}`);
   }
   assert(receipt.response_object === `inline-json:${SAFE_UPSTREAM_ERROR}` && operational.response_object === receipt.response_object, "failed response archive must contain only the safe local error");
-  assert(row.spool_state === "pending" && row.spool_plain_bytes === 512 && row.chunk_plain_bytes === 512, "unknown request archive must remain durable, not be discarded");
-  assert(typeof row.spool_cipher_bytes === "number" && Number.isSafeInteger(row.spool_cipher_bytes) && row.spool_cipher_bytes > 0, "retained request archive must have exact positive accounting");
-  return row.spool_cipher_bytes;
+  return assertUnknownArchiveEvidence(row);
+}
+
+export function assertUnknownArchiveEvidence(row: Record<string, unknown>): number {
+  if (row.spool_state === "pending") {
+    assert(row.spool_plain_bytes === 512 && row.chunk_plain_bytes === 512, "unknown request archive must remain durable, not be discarded");
+    assert(typeof row.spool_cipher_bytes === "number" && Number.isSafeInteger(row.spool_cipher_bytes) && row.spool_cipher_bytes > 0, "retained request archive must have exact positive accounting");
+    return row.spool_cipher_bytes;
+  }
+  // 61d gateway sources are already archived; encrypted spool accounting does
+  // not own their bytes. Prove the source binding and cleanup ownership first.
+  assert(row.spool_state === "bound", "unknown request archive must remain durable, not be discarded");
+  assert(row.spool_tenant_id === row.tenant_id && row.spool_reservation_id === row.reservation_id, "source archive must retain exact financial ownership");
+  const locator = `staging/proxy/${row.request_id}/request/${row.request_id}/body.json`;
+  assert(row.request_object === locator && row.bound_locator === locator, "source archive must retain its canonical matching locator");
+  assert(row.body_byte_count === 512 && typeof row.body_blake3 === "string" && /^[0-9a-f]{64}$/u.test(row.body_blake3), "source archive must retain body metadata");
+  assert(row.spool_plain_bytes === 0 && row.spool_cipher_bytes === 0 && row.spool_chunk_count === 0 && row.chunk_count === 0 && row.chunk_plain_bytes === null, "source archive must not fabricate encrypted spool accounting");
+  assert(row.staging_attempt_id === row.request_id && row.staging_owner_id === row.request_id
+    && row.staging_owner_kind === "proxy_request" && row.staging_purpose === "request"
+    && row.staging_writer_owner === "gateway-source" && row.staging_writer_token === row.request_id
+    && row.staging_intent_digest === row.body_blake3 && row.staging_state === "cleanup_pending"
+    && row.staging_bound_locator === null && typeof row.staging_bound_at === "number" && row.staging_bound_at > 0,
+  "source cleanup must retain the actual gateway ownership and matching digest");
+  return 0;
 }
 
 export function assertUnknownSemanticEvidence(row: Record<string, unknown>, previous?: Record<string, unknown>): Record<string, unknown> {
@@ -476,7 +497,15 @@ export async function run(binary: string, output: string): Promise<boolean> {
                   o.status_code AS operational_status, o.error_code AS operational_error,
                   o.completed_at AS operational_completed, o.stage AS operational_stage,
                   o.receipt_id AS operational_receipt_id, o.response_object AS operational_response_object,
+                  q.request_object, s.tenant_id AS spool_tenant_id, s.reservation_id AS spool_reservation_id,
                   s.state AS spool_state, s.byte_count AS spool_plain_bytes, s.cipher_bytes AS spool_cipher_bytes,
+                  s.chunk_count AS spool_chunk_count, s.bound_locator, s.body_byte_count, s.body_blake3,
+                  a.attempt_id AS staging_attempt_id, a.owner_id AS staging_owner_id,
+                  a.owner_kind AS staging_owner_kind, a.purpose AS staging_purpose,
+                  a.writer_owner AS staging_writer_owner, a.writer_token AS staging_writer_token,
+                  a.intent_digest AS staging_intent_digest, a.state AS staging_state,
+                  a.bound_locator AS staging_bound_locator, a.bound_at AS staging_bound_at,
+                  (SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = q.id) AS chunk_count,
                   (SELECT SUM(byte_count) FROM request_archive_spool_chunks WHERE request_id = q.id) AS chunk_plain_bytes,
                   (SELECT COUNT(*) FROM ledger_entries WHERE source = q.reservation_id) AS ledger_count,
                   (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'finished') AS event_count,
@@ -500,6 +529,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
                   AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.account_id = p.account_id
                   AND o.reservation_id = p.reservation_id AND o.owner_token = p.owner_token
                 LEFT JOIN request_archive_spools s ON s.request_id = p.request_id AND s.reservation_id = p.reservation_id
+                LEFT JOIN archive_staging_attempts a ON a.attempt_id = q.id
                 LEFT JOIN conversation_observations v ON v.request_id = q.id
                 LEFT JOIN conversation_clusters c ON c.id = v.cluster_id
                 LEFT JOIN conversation_projection_outbox x ON x.request_id = q.id
@@ -514,12 +544,24 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 "observation_count", "projected_event_count", "projection_completed",
               ].map((field) => [field, unknown[field]])) : null;
               drainEvidence.durable_receipt_found = receipt !== undefined;
-              if (!unknown || unknown.unknown_reason === null || !receipt || unknown.spool_state === null || unknown.spool_state === "capturing") {
+              if (!unknown || unknown.unknown_reason === null || !receipt || unknown.spool_state === null || unknown.spool_state === "capturing" || unknown.spool_state === "uploading") {
                 await delay(100); continue;
               }
               retainedRequestCipherBytes = assertUnknownFinancialEvidence(unknown, receipt);
+              if (unknown.spool_state === "pending") { await delay(100); continue; }
               if (unknown.projection_completed === null) { await delay(100); continue; }
               const semantics = assertUnknownSemanticEvidence(unknown, previousSemantics);
+              const archived = await apiRequest(base, "GET", `/self/v1/requests/${unknownRequestId}/archive/request`, key, undefined, 5000);
+              const archive = {
+                locator: unknown.bound_locator, body_byte_count: unknown.body_byte_count,
+                body_blake3: unknown.body_blake3, status: archived.status, bytes: archived.body.length,
+                sha256: createHash("sha256").update(archived.body).digest("hex"),
+              };
+              assert(archive.status === 200 && archive.bytes === 512 && archive.sha256 === planHash(inputPlan(512)), "unknown request archive GET must return the exact original 512-byte body/hash");
+              if (archiveGapBaseline) {
+                const prior = (archiveGapBaseline as ArchiveGapBaseline & { unknown_financial_responsibility?: { archive?: typeof archive } }).unknown_financial_responsibility?.archive;
+                assert(prior && JSON.stringify(prior) === JSON.stringify(archive), "unknown request archive replay must preserve body metadata, locator and raw bytes/hash");
+              }
               unknownEvidence = {
                 request_id: unknownRequestId, receipt_id: receipt.receipt_id, fence: unknown.fence,
                 financial_state: "unknown", status_code: unknown.operational_status,
@@ -527,7 +569,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 completed_at: unknown.operational_completed, reservation_status: unknown.reservation_status,
                 reserved_micros: unknown.reserved_micros, retained_request_cipher_bytes: retainedRequestCipherBytes,
                 durable_journal: true, financial_ack: false, financial_side_effects: 0,
-                semantics,
+                semantics, archive,
               };
             }
             const row = reader.prepare("SELECT cipher_bytes, request_cipher_bytes, (SELECT COUNT(*) FROM request_records WHERE completed_at IS NULL) AS pending_requests, (SELECT COUNT(*) FROM usage_reservations WHERE status = 'reserved') AS unsettled_reservations FROM response_archive_spool_budget WHERE singleton = 1").get();
