@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 
 const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = resolve(webRoot, '..');
@@ -37,6 +38,14 @@ writeFileSync(join(configurablePlugin, 'plugin.json'), JSON.stringify({
   },
 }));
 let application;
+let applicationLogCanary = false;
+let applicationLogTail = '';
+function forwardApplicationLog(chunk, output) {
+  const text = applicationLogTail + chunk.toString();
+  applicationLogCanary ||= text.includes('never-persist');
+  applicationLogTail = text.slice(-32);
+  output.write(chunk);
+}
 let stopping = false;
 let stopPromise;
 let comfySequence = 0;
@@ -156,9 +165,18 @@ const upstream = createServer((request, response) => {
     if (request.method === 'GET' && requestUrl.pathname === '/__e2e/never-persist-state') {
       const needle = Buffer.from('never-persist');
       response.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      const database = new DatabaseSync(join(testDirectory, 'browser.db'), { readOnly: true });
+      let result;
+      try {
+        result = database.prepare('SELECT result_json FROM generation_jobs WHERE id = ?').get(requestUrl.searchParams.get('job_id'));
+      } finally {
+        database.close();
+      }
       response.end(JSON.stringify({
         database: databaseContains(needle),
+        result_json: result?.result_json ?? null,
         archive: directoryContains(join(testDirectory, 'archive'), needle),
+        logs: applicationLogCanary,
       }));
       return;
     }
@@ -369,10 +387,12 @@ upstream.listen(mockPort, '127.0.0.1', () => {
         MTC_ALLOW_OAUTH_LOOPBACK: 'true',
         RUST_LOG: process.env.RUST_LOG ?? 'warn',
       },
-      stdio: 'inherit',
+      stdio: ['inherit', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
     },
   );
+  application.stdout.on('data', (chunk) => forwardApplicationLog(chunk, process.stdout));
+  application.stderr.on('data', (chunk) => forwardApplicationLog(chunk, process.stderr));
   application.on('exit', (code, signal) => {
     if (!stopping) {
       process.stderr.write(`browser e2e application exited (${code ?? signal})\n`);
