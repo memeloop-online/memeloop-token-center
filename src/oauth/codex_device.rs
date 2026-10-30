@@ -965,6 +965,7 @@ mod tests {
                 proxy_url: Some(proxy_url.clone()),
                 reauthorize: None,
             },
+            key_material,
             now,
             true,
             &endpoints,
