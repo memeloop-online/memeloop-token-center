@@ -1572,7 +1572,7 @@ async fn postgres_online_projection_writers_share_stats_lock_before_session_and_
             let (atoms, nodes) = session.into_prefix();
             assert!(
                 pending_database
-                    .prepare_session_body_archive(owner, pending_request_id, &atoms, &nodes, &[])
+                    .prepare_session_body_archive(owner, pending_request_id, atoms, &nodes, &[])
                     .await?
             );
             pending_database
@@ -2342,7 +2342,7 @@ async fn archive_queued_lifecycle_body(
     let (atoms, nodes) = body.into_prefix();
     assert!(
         database
-            .prepare_session_body_archive(owner, request_id, &atoms, &nodes, &[])
+            .prepare_session_body_archive(owner, request_id, atoms, &nodes, &[])
             .await
             .unwrap()
     );

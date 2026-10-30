@@ -172,7 +172,7 @@ When('下游用户筛选失败请求并打开详情', async function (this: Dogf
   await assertValue(filters.getByLabel('错误码'), 'http_429');
   await assertCount(page.locator('.self-history tbody tr'), 1);
   await assertContains(page.locator('.self-history tbody'), '429');
-  await assertContains(page.locator('.self-history tbody'), '已记录原因: 上游服务返回了错误状态');
+  await assertContains(page.locator('.self-history tbody'), '已记录原因: 上游服务在响应开始时返回了错误状态');
   assert.doesNotMatch(await page.locator('.self-history tbody').innerText(), /http_429/);
   await page.locator('.self-history').getByRole('button', { name: /请求详情$/ }).click();
 });
@@ -716,7 +716,19 @@ Then('上游短期签名只保存在受保护引用中且不出现在公开响�
     signal: AbortSignal.timeout(1_000),
   });
   assert.equal(persistenceResponse.status, 200);
-  assert.deepEqual(await persistenceResponse.json(), { database: false, archive: false });
+  const persistence = await persistenceResponse.json() as {
+    database: boolean; archive: boolean;
+    references: Array<{ job_id: string; key_id: string; owner_matches: boolean; plaintext: boolean; public_clean: boolean }>;
+  };
+  assert.equal(persistence.database, true);
+  assert.equal(persistence.archive, false);
+  assert.deepEqual(persistence.references, [{
+    job_id: video.job_id,
+    key_id: observation.clientKeyId,
+    owner_matches: true,
+    plaintext: true,
+    public_clean: true,
+  }]);
 });
 
 Then('用户通过真实下载控件取得代理图片和视频', async function (this: DogfoodWorld) {

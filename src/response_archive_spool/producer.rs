@@ -888,7 +888,7 @@ enum WriterOutcome {
 }
 
 async fn run_response_archive_writer(
-    state: AppState,
+    mut state: AppState,
     identity: ArchiveSpoolIdentity,
     mut receiver: tokio::sync::mpsc::Receiver<QueuedArchiveChunk>,
     terminal: tokio::sync::oneshot::Receiver<Bytes>,
@@ -933,6 +933,7 @@ async fn run_response_archive_writer(
         .publish_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
         .await?;
     state.archive.delete(&staged.object_locator).await?;
+    state.db.refresh_closed_persistence_pool();
     state
         .db
         .bind_raw_capture(identity.tenant_id, identity.request_id, "response", &object)

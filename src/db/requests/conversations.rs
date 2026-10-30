@@ -684,7 +684,7 @@ impl Database {
         &self,
         lease_owner: Uuid,
         request_id: Uuid,
-        atoms: &[SemanticAtom],
+        atoms: Vec<SemanticAtom>,
         nodes: &[PrefixNode],
         media: &[crate::conversation::SessionMediaLocator],
     ) -> Result<bool, AppError> {
@@ -707,7 +707,7 @@ impl Database {
                 &mut transaction,
                 lease_owner,
                 request_id,
-                &archived_atoms,
+                archived_atoms,
                 nodes,
                 media,
             )
@@ -725,7 +725,7 @@ impl Database {
         transaction: &mut Transaction<'_, Any>,
         lease_owner: Uuid,
         request_id: Uuid,
-        atoms: &[SemanticAtom],
+        atoms: Vec<SemanticAtom>,
         nodes: &[PrefixNode],
         media: &[crate::conversation::SessionMediaLocator],
     ) -> Result<bool, AppError> {
@@ -743,6 +743,11 @@ impl Database {
         };
         let tenant_id: String = row.try_get("tenant_id")?;
         let observed_at: i64 = row.try_get("observed_at")?;
+        let snapshot = ConversationSemanticSnapshot {
+            leaf: nodes.last().map(|node| node.node_hash.clone()),
+            atom_hashes: bounded_atom_hashes(&atoms),
+            payload_digest: None,
+        };
         materialize_conversation_content_in_transaction(
             transaction,
             &tenant_id,
@@ -776,11 +781,6 @@ impl Database {
             .execute(&mut **transaction)
             .await?;
         }
-        let snapshot = ConversationSemanticSnapshot {
-            leaf: nodes.last().map(|node| node.node_hash.clone()),
-            atom_hashes: bounded_atom_hashes(atoms),
-            payload_digest: None,
-        };
         let encoded = serde_json::to_string(&snapshot)
             .map_err(|_| AppError::internal("conversations_prepare_session_body_archive_1"))?;
         let updated = sqlx::query(
@@ -908,8 +908,12 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
                 if terminal_open.is_some_and(|projected_at| projected_at.is_none()) {
-                    self.release_conversation_projection_lease(request_id, lease_owner)
-                        .await?;
+                    if let Err(error) = self
+                        .release_conversation_projection_lease(request_id, lease_owner)
+                        .await
+                    {
+                        tracing::warn!(%request_id, %error, "conversation projection lease release failed");
+                    }
                     return Ok(false);
                 }
                 let inline: String = prepare.try_get("request_json")?;
@@ -1235,8 +1239,12 @@ impl Database {
             }
             Ok(false) => {
                 transaction.rollback().await?;
-                self.release_conversation_projection_lease(request_id, lease_owner)
-                    .await?;
+                if let Err(error) = self
+                    .release_conversation_projection_lease(request_id, lease_owner)
+                    .await
+                {
+                    tracing::warn!(%request_id, %error, "conversation projection lease release failed");
+                }
                 Ok(false)
             }
             Err(error) => {
@@ -3057,10 +3065,12 @@ async fn flush_conversation_batches(
     Ok(())
 }
 
-pub(crate) async fn materialize_conversation_content_in_transaction(
+pub(crate) async fn materialize_conversation_content_in_transaction<
+    Atom: std::borrow::Borrow<SemanticAtom>,
+>(
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
-    atoms: &[SemanticAtom],
+    atoms: impl IntoIterator<Item = Atom>,
     nodes: &[PrefixNode],
     observed_at: i64,
 ) -> Result<(), AppError> {
@@ -3075,16 +3085,24 @@ pub(crate) async fn materialize_conversation_content_in_transaction(
     .map_err(Into::into)
 }
 
-async fn materialize_conversation_content_with_statement_error(
+async fn materialize_conversation_content_with_statement_error<
+    Atom: std::borrow::Borrow<SemanticAtom>,
+>(
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
-    atoms: &[SemanticAtom],
+    atoms: impl IntoIterator<Item = Atom>,
     nodes: &[PrefixNode],
     observed_at: i64,
 ) -> Result<(), ConversationContentError> {
-    for atom_batch in
-        atoms.chunks(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
-    {
+    let mut atoms = atoms.into_iter();
+    loop {
+        let atom_batch: Vec<_> = atoms
+            .by_ref()
+            .take(CONVERSATION_INSERT_BATCH_BIND_LIMIT / SEMANTIC_ATOM_INSERT_BIND_COUNT)
+            .collect();
+        if atom_batch.is_empty() {
+            break;
+        }
         let statement = conversation_batch_insert_statement(
             "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ",
             atom_batch.len(),
@@ -3092,19 +3110,26 @@ async fn materialize_conversation_content_with_statement_error(
             " ON CONFLICT(tenant_id, content_hash) DO NOTHING",
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
-        for atom in atom_batch {
+        for owned_atom in atom_batch {
+            let atom = owned_atom.borrow();
+            let encoded_length = crate::gateway_body::memory::json_encoded_length(&atom.content)?;
+            let mut encoded = Vec::with_capacity(encoded_length);
+            serde_json::to_writer(&mut encoded, &atom.content).map_err(|_| {
+                AppError::internal(
+                    "conversations_materialize_conversation_content_with_statement_er",
+                )
+            })?;
+            let encoded =
+                String::from_utf8(encoded).expect("serialized conversation JSON is UTF-8");
             query = query
                 .bind(tenant_id)
-                .bind(&atom.content_hash)
-                .bind(&atom.instance_hash)
-                .bind(&atom.role)
-                .bind(&atom.kind)
-                .bind(serde_json::to_string(&atom.content).map_err(|_| {
-                    AppError::internal(
-                        "conversations_materialize_conversation_content_with_statement_er",
-                    )
-                })?)
+                .bind(atom.content_hash.clone())
+                .bind(atom.instance_hash.clone())
+                .bind(atom.role.clone())
+                .bind(atom.kind.clone())
+                .bind(encoded)
                 .bind(observed_at);
+            drop(owned_atom);
         }
         query.execute(&mut **transaction).await?;
     }
@@ -3310,6 +3335,43 @@ mod tests {
                 .map(|atom| atom.content_hash.clone())
                 .collect::<Vec<_>>()
         );
+        let owned_tenant = Uuid::now_v7().to_string();
+        let mut transaction = db.begin_write_transaction().await.unwrap();
+        materialize_conversation_content_in_transaction(
+            &mut transaction,
+            &owned_tenant,
+            extract_atoms(&body),
+            &nodes,
+            7,
+        )
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        let atom_sql = "SELECT content_hash, instance_hash, role, kind, content_json FROM semantic_atoms WHERE tenant_id = $1 ORDER BY content_hash";
+        let expected_atoms: Vec<(String, String, String, String, String)> =
+            sqlx::query_as(atom_sql)
+                .bind(&tenant)
+                .fetch_all(&db.pool)
+                .await
+                .unwrap();
+        let owned_atoms: Vec<(String, String, String, String, String)> = sqlx::query_as(atom_sql)
+            .bind(&owned_tenant)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(owned_atoms, expected_atoms);
+        let node_sql = "SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 ORDER BY depth";
+        let expected_nodes: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(node_sql)
+            .bind(&tenant)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        let owned_nodes: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(node_sql)
+            .bind(&owned_tenant)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(owned_nodes, expected_nodes);
         db.pool.close().await;
     }
 

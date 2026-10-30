@@ -165,7 +165,7 @@ async fn contract(fixture: Fixture) {
     assert!(
         fixture
             .database
-            .prepare_session_body_archive(owner, request_id, &atoms, &nodes, &[])
+            .prepare_session_body_archive(owner, request_id, atoms, &nodes, &[])
             .await
             .unwrap()
     );

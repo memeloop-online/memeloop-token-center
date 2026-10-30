@@ -2319,7 +2319,7 @@ pub(crate) async fn allocate_request_event_cursor(
     )
     .fetch_optional(&mut **transaction)
     .await?;
-    let cursor = match last {
+    let mut cursor = match last {
         None => RequestEventCursor {
             event_id: fresh_v7_at(now)?,
             event_at: now,
@@ -2349,22 +2349,29 @@ pub(crate) async fn allocate_request_event_cursor(
         }
     };
 
-    let claimed = sqlx::query(
-        "INSERT INTO request_event_locators (id, created_at, tenant_id, key_id, request_id) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(&cursor.event_id)
-    .bind(cursor.event_at)
-    .bind(tenant_id)
-    .bind(key_id)
-    .bind(request_id)
-    .execute(&mut **transaction)
-    .await?;
-    if claimed.rows_affected() != 1 {
-        return Err(AppError::internal(
-            "lifecycle_allocate_request_event_cursor_2",
-        ));
+    loop {
+        let claimed = sqlx::query(
+            "INSERT INTO request_event_locators (id, created_at, tenant_id, key_id, request_id) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&cursor.event_id)
+        .bind(cursor.event_at)
+        .bind(tenant_id)
+        .bind(key_id)
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await?;
+        if claimed.rows_affected() == 1 {
+            return Ok(cursor);
+        }
+        if let Some(event_id) = increment_v7_random_b(&cursor.event_id, cursor.event_at) {
+            cursor.event_id = event_id;
+        } else {
+            cursor.event_at = cursor.event_at.checked_add(1).ok_or(AppError::internal(
+                "lifecycle_allocate_request_event_cursor_2",
+            ))?;
+            cursor.event_id = fresh_v7_at(cursor.event_at)?;
+        }
     }
-    Ok(cursor)
 }
 
 fn fresh_v7_at(event_at: i64) -> Result<String, AppError> {

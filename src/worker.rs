@@ -1122,7 +1122,7 @@ pub(crate) async fn archive_session_body(
     let (atoms, nodes, media) = body.into_archive_parts();
     if !state
         .db
-        .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
+        .prepare_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
         .await?
     {
         return Ok(false);

@@ -8,6 +8,42 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
+async fn deferred_capture_recovers_a_completed_request_without_a_response_locator() {
+    let (_directory, state, pool, identity) = fixture().await;
+    sqlx::query(
+        "UPDATE request_records SET completed_at = 2, response_object = NULL WHERE id = $1",
+    )
+    .bind(identity.request_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let body = Bytes::from_static(b"{\"output\":\"original delivered response\"}");
+    let archive = BufferedArchive::new(
+        identity,
+        BufferedArchivePurpose::Response,
+        &body,
+        state.config.key_pepper.as_bytes(),
+        false,
+    )
+    .unwrap();
+    assert!(state.db.capture_deferred_archive(&archive).await.unwrap());
+    assert!(
+        state
+            .db
+            .deferred_archive_is_captured(identity, BufferedArchivePurpose::Response, &body)
+            .await
+            .unwrap()
+    );
+    let completed_at: i64 =
+        sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(completed_at, 2);
+}
+
+#[tokio::test]
 async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_binding() {
     for compressed in [false, true] {
         for (status_code, error_code, early_upload) in [
@@ -71,10 +107,13 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(before_cleanup, retained);
+            let remaining = sqlx::query("SELECT COUNT(*) AS spool_count, SUM(cipher_bytes) AS cipher_bytes FROM (SELECT cipher_bytes FROM request_archive_spools WHERE cipher_bytes > 0 UNION ALL SELECT cipher_bytes FROM response_archive_spools WHERE cipher_bytes > 0) remaining")
+                .fetch_one(&pool).await.unwrap();
+            assert!(before_cleanup > 0 && before_cleanup <= retained);
+            assert_eq!(before_cleanup, remaining.get::<i64, _>("cipher_bytes"));
             assert_eq!(
                 state.db.cleanup_response_archive_spools(32).await.unwrap(),
-                2
+                remaining.get::<i64, _>("spool_count") as u64
             );
             // Settlement preserves the already-bound locators.
             if early_upload {
@@ -344,9 +383,12 @@ async fn buffered_purposes_recover(compressed: bool, early_upload: bool) {
         assert!(attempt.get::<Option<String>, _>("lease_token").is_none());
         assert!(attempt.get::<Option<i64>, _>("lease_expires_at").is_none());
     }
+    let remaining: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE cipher_bytes > 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE cipher_bytes > 0)")
+        .fetch_one(&pool).await.unwrap();
+    assert!(remaining > 0 && remaining <= 2);
     assert_eq!(
         state.db.cleanup_response_archive_spools(32).await.unwrap(),
-        2
+        remaining as u64
     );
     let budget = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
         .fetch_one(&pool).await.unwrap();

@@ -1248,6 +1248,7 @@ impl PluginRuntime {
                 },
             );
             store.limiter(|state| &mut state.limits);
+            store.set_hostcall_fuel(usize::MAX);
             store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
             store
                 .set_fuel(self.fuel)

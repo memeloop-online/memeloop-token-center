@@ -192,13 +192,16 @@ impl Database {
         ))
     }
 
-    pub(crate) async fn archive_atom_bodies(
+    pub(crate) async fn archive_atom_bodies<
+        Atom: std::borrow::Borrow<crate::conversation::SemanticAtom>,
+    >(
         &self,
         tenant_id: Uuid,
-        atoms: &[crate::conversation::SemanticAtom],
+        atoms: impl IntoIterator<Item = Atom>,
     ) -> Result<Vec<crate::conversation::SemanticAtom>, AppError> {
-        let mut references = Vec::with_capacity(atoms.len());
-        for atom in atoms {
+        let mut references = Vec::new();
+        for owned_atom in atoms {
+            let atom = owned_atom.borrow();
             let document = serde_json::to_string(&atom.content)
                 .map_err(|_| AppError::internal("conversation_body_encode"))?;
             let reference = self.store_body_reference(tenant_id, document).await?;

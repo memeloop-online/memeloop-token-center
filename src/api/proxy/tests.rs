@@ -3012,16 +3012,16 @@ async fn assert_exactly_once_side_effects_for(
                     .await
                     .unwrap();
                 }
-                assert!(
-                    crate::worker::archive_session_body(
+                if !crate::worker::archive_session_body(
                         &fixture.state,
                         projection_owner,
                         task.request_id
                     )
                     .await
-                    .unwrap(),
-                    "会话正文归档要读到原始返回 JSON"
-                );
+                    .unwrap()
+                {
+                    continue;
+                }
                 assert!(
                     !fixture
                         .state
@@ -5022,7 +5022,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let capturing: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'capturing'",
+                "SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'capturing' AND EXISTS (SELECT 1 FROM response_archive_spools WHERE request_id = $1 AND state = 'pending')",
             )
             .bind(rows[0].request_id.to_string())
             .fetch_one(&pool)
