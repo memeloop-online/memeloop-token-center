@@ -53,4 +53,21 @@ function GroupedFixture() {
     <output data-testid="grant-ids" style={{ overflowWrap: 'anywhere' }}>{JSON.stringify({ ids, groupIds })}</output>
   </main>;
 }
-createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{new URLSearchParams(location.search).has('grouped') ? <GroupedFixture /> : <Fixture />}</MtcFluentProvider></I18nProvider>);
+// The page owns the route directory load; this fixture drives the loading,
+// failure and readable states through the CredentialRouteAuthorization props.
+// 'deleted-route-9f8e7d' is granted but never present in the readable catalog.
+function CatalogStateFixture({ mode }: { mode: string }) {
+  const [phase, setPhase] = useState(mode);
+  const [retries, setRetries] = useState(0);
+  const [ids, setIds] = useState(['single-route-id', 'deleted-route-9f8e7d']);
+  return <main style={{ padding: 16, maxWidth: 1100, margin: 'auto' }}>
+    <h1>目录状态</h1>
+    <CredentialRouteAuthorization token="fixture" tenant="fixture" routes={phase === 'ready' ? routes : []} groups={[]} routeIds={ids} groupIds={[]} onRoutes={setIds} onGroups={() => {}}
+      routesLoading={phase === 'loading'} routesError={phase === 'error' ? 'fixture: route catalog unavailable' : ''}
+      onRetryRoutes={() => { setRetries(value => value + 1); setPhase('loading'); window.setTimeout(() => setPhase('ready'), 30); }} />
+    <output data-testid="grant-ids">{JSON.stringify(ids)}</output>
+    <output data-testid="retry-count">{retries}</output>
+  </main>;
+}
+const catalogMode = new URLSearchParams(location.search).get('catalog');
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{catalogMode ? <CatalogStateFixture mode={catalogMode} /> : new URLSearchParams(location.search).has('grouped') ? <GroupedFixture /> : <Fixture />}</MtcFluentProvider></I18nProvider>);
