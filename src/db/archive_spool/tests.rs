@@ -644,6 +644,28 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
         reservation.id.to_string()
     );
     assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
+    // Production uploads the durable request source before terminal settlement.
+    // Admission is still pending financially; claiming must retain its bytes.
+    let charged = budget(&db).await;
+    assert!(charged > 0);
+    let task = db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("admitted request source can upload before terminal settlement");
+    assert_eq!(task.identity.request_id, request_id);
+    assert_eq!(task.identity.tenant_id, key.tenant_id);
+    assert_eq!(task.identity.reservation_id, reservation.id);
+    assert_eq!(task.purpose, BufferedArchivePurpose::Request);
+    assert!(!task.successful_terminal);
+    assert_eq!(task.chunk_count, 1);
+    assert_eq!(task.byte_count, body.len() as i64);
+    let chunks = db.load_response_archive_spool_batch(&task, 0).await.unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].seq, 0);
+    assert_eq!(chunks[0].byte_count, body.len() as i64);
+    assert!(!chunks[0].ciphertext.is_empty());
+    assert_eq!(budget(&db).await, charged);
     assert!(
         db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
             .await
