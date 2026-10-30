@@ -33,6 +33,8 @@ mod raw_capture;
 #[cfg(test)]
 mod raw_capture_tests;
 mod readiness;
+#[cfg(test)]
+mod rustfs_contract_tests;
 mod staging;
 mod text;
 

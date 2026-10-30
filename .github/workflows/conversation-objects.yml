@@ -37,11 +37,59 @@ jobs:
           toolchain: 1.95.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
       - uses: ./.github/actions/checkout-plugin-examples
+      - name: Start isolated RustFS TEST fixture
+        env:
+          RUSTFS_ACCESS_KEY: rustfs-test-fixture
+          RUSTFS_SECRET_KEY: synthetic-test-only-secret-707
+        run: |
+          docker run --detach --name rustfs-contract --publish 127.0.0.1:19000:9000 \
+            --memory 1g --cpus 2 \
+            --env RUSTFS_ACCESS_KEY --env RUSTFS_SECRET_KEY \
+            --env RUSTFS_ADDRESS=:9000 --env RUSTFS_CONSOLE_ENABLE=false \
+            --env RUSTFS_OBS_LOG_DIRECTORY= --env RUSTFS_OBS_LOGGER_LEVEL=warn \
+            --entrypoint /usr/bin/rustfs \
+            rustfs/rustfs:1.0.4@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2 /data
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --aws-sigv4 'aws:amz:us-east-1:s3' \
+              --user "$RUSTFS_ACCESS_KEY:$RUSTFS_SECRET_KEY" \
+              --request PUT http://127.0.0.1:19000/conversation-contract-test; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
       - run: cargo test --locked --lib archive::conversation
       - run: cargo test --locked --lib archive::text
       - run: cargo test --locked --lib archive::raw_capture
       - run: cargo test --locked --lib db::object_bodies
       - run: cargo test --locked --lib buffered_archive_waits_off_frontend
       - run: cargo test --locked --lib object_capture_recovers_a_completed_request
+      - name: Verify RustFS multipart CAS and restart restoration
+        env:
+          MTC_RUSTFS_TEST_ENDPOINT: http://127.0.0.1:19000
+          MTC_RUSTFS_TEST_BUCKET: conversation-contract-test
+          MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-test-fixture
+          MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
+        run: |
+          cargo test --locked --lib rustfs_multipart_cas_promotion_and_restart_reconstruction -- --ignored
+          docker restart rustfs-contract
+          ready=false
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent --aws-sigv4 'aws:amz:us-east-1:s3' \
+              --user "$MTC_RUSTFS_TEST_ACCESS_KEY:$MTC_RUSTFS_TEST_SECRET_KEY" \
+              http://127.0.0.1:19000/conversation-contract-test >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          MTC_RUSTFS_RESTORE_ONLY=1 cargo test --locked --lib rustfs_multipart_cas_promotion_and_restart_reconstruction -- --ignored
       - run: cargo test --locked --lib api::proxy::tests::archive_terminal
       - run: cargo test --locked --lib api::proxy::tests::kimi
+      - name: RustFS fixture diagnostics
+        if: always()
+        run: |
+          docker inspect rustfs-contract --format 'OOMKilled={{.State.OOMKilled}}'
+          docker stats --no-stream rustfs-contract
+          docker logs --tail 100 rustfs-contract
