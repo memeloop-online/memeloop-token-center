@@ -1760,6 +1760,11 @@ async fn proxy_with_cancellation_guard(
             "Upstream rejection header structure"
         );
     }
+    let upstream = if status.is_success() {
+        upstream
+    } else {
+        buffered_request.capture_original_response(upstream)
+    };
     let (upstream, rejection) = read_safe_proxy_rejection(
         upstream,
         protocol,

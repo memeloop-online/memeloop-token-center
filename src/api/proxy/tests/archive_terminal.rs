@@ -103,6 +103,61 @@ async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
 }
 
 #[tokio::test]
+async fn original_rejection_is_archived_without_leaking_it_into_the_delivered_error() {
+    let upstream = MockServer::start().await;
+    let original = br#"{ "error": { "message": "private-original-provider-text", "opaque": {"tool_call_id":"call-1"} } }"#;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(403).set_body_raw(original.as_slice(), "application/json"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = resilient_route_fixture("raw-rejection", &[(upstream.uri(), 0)]).await;
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&delivered).contains("private-original-provider-text"));
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: Option<(String, String)> =
+                sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            if let Some((tenant, request)) = row {
+                let tenant = Uuid::parse_str(&tenant).unwrap();
+                let request = Uuid::parse_str(&request).unwrap();
+                if let Some(reference) = fixture
+                    .state
+                    .archive
+                    .raw_capture_reference(tenant, request, "response")
+                    .await
+                    .unwrap()
+                {
+                    let restored = fixture
+                        .state
+                        .archive
+                        .get_tenant_content(tenant, &reference, MAX_PROXY_RESPONSE_BODY)
+                        .await
+                        .unwrap();
+                    assert_eq!(restored.as_ref(), original.as_slice());
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("safe delivery must not replace the original archive");
+    pool.close().await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
 async fn raw_archive_preserves_upstream_framing_before_streaming_or_buffered_translation() {
     for streaming in [true, false] {
         let fixture = codex_route_fixture("raw-upstream-framing").await;
