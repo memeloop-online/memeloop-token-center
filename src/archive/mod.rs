@@ -38,10 +38,11 @@ mod text;
 
 pub use cas::CasArchiveObject;
 pub use conversation::{
-    ConversationBodyReference, ConversationEvent, ConversationExport, ConversationManifest,
-    ConversationMedia, ConversationPrefix, ConversationReadLimits, RawConversationCapture,
-    RawConversationFormat,
+    ConversationBodyReference, ConversationEvent, ConversationManifest, ConversationMedia,
+    ConversationPrefix, RawConversationCapture, RawConversationFormat,
 };
+#[cfg(test)]
+pub use conversation::{ConversationExport, ConversationReadLimits};
 pub use download::ArchiveDownload;
 #[cfg(test)]
 use download::{validate_download_range, verified_download_stream};

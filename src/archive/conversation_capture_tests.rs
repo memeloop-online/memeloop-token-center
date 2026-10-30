@@ -39,17 +39,7 @@ async fn conversation_stream_reads_large_opaque_event_without_document_budget() 
         raw_captures: Vec::new(),
         gaps: Vec::new(),
     };
-    let object = store
-        .put_conversation_manifest(
-            &manifest,
-            ConversationReadLimits {
-                max_events: 1,
-                max_object_bytes: 65536,
-                max_total_bytes: 65536,
-            },
-        )
-        .await
-        .unwrap();
+    let object = store.put_conversation_manifest(&manifest).await.unwrap();
     let lines: Vec<Bytes> = store
         .stream_conversation_export(tenant, &object)
         .await

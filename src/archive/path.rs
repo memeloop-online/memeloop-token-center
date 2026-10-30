@@ -97,8 +97,11 @@ pub(super) fn is_conversation_root_location(location: &str) -> bool {
 
 pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
     let mut segments = location.split('/');
-    if segments.next() != Some("tenants") || segments.next().is_none() {
+    if segments.next() != Some("tenants") {
         return false;
+    }
+    if segments.next().is_none() {
+        return true;
     }
     matches!(
         segments.next(),

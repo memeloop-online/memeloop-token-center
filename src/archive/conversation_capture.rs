@@ -6,20 +6,11 @@ use uuid::Uuid;
 
 use super::{
     ArchiveStore, CasArchiveObject, ConversationEvent, ConversationManifest, ConversationMedia,
-    ConversationPrefix, ConversationReadLimits, RawConversationCapture, RawConversationFormat,
-    path::archive_path,
+    ConversationPrefix, RawConversationCapture, RawConversationFormat, path::archive_path,
 };
 use crate::{conversation::ConversationHints, error::AppError};
 
 const MAX_OBJECT_BYTES: usize = 128 * 1024 * 1024;
-
-fn limits() -> ConversationReadLimits {
-    ConversationReadLimits {
-        max_events: 1_000_000,
-        max_object_bytes: MAX_OBJECT_BYTES,
-        max_total_bytes: 4 * 1024 * 1024 * 1024,
-    }
-}
 
 fn request_root(tenant_id: Uuid, request_id: Uuid) -> String {
     format!("tenants/{tenant_id}/conversations/v1/requests/{request_id}.json")
@@ -177,7 +168,7 @@ impl ArchiveStore {
             raw_captures,
             gaps,
         };
-        let object = self.put_conversation_manifest(&manifest, limits()).await?;
+        let object = self.put_conversation_manifest(&manifest).await?;
         self.publish_request_conversation(tenant_id, request_id, &object)
             .await?;
         Ok(object)

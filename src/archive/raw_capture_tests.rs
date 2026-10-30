@@ -70,4 +70,11 @@ async fn durable_raw_roots_are_idempotent_and_reject_changed_bytes() {
     assert!(store.delete(&root).await.is_err());
     assert!(store.put(&root, Bytes::from_static(b"{}")).await.is_err());
     assert!(store.start_writer(&root).await.is_err());
+    assert!(store.delete_prefix("tenants").await.is_err());
+    assert!(
+        store
+            .delete_prefix(&format!("tenants/{tenant}/raw"))
+            .await
+            .is_err()
+    );
 }

@@ -81,12 +81,14 @@ pub(super) struct PrefixNode {
     pub(super) event: CasArchiveObject,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Serialize)]
 pub struct ConversationExport {
     pub manifest: ConversationManifest,
     pub events: Vec<ConversationEvent>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug)]
 pub struct ConversationReadLimits {
     pub max_events: usize,
@@ -101,11 +103,13 @@ pub struct ConversationBodyReference {
     pub chars: u64,
 }
 
+#[cfg(test)]
 struct ReadBudget {
     limits: ConversationReadLimits,
     consumed: u64,
 }
 
+#[cfg(test)]
 impl ReadBudget {
     fn charge(&mut self, bytes: u64) -> Result<(), AppError> {
         self.consumed = self
@@ -322,7 +326,6 @@ impl ArchiveStore {
     pub async fn put_conversation_manifest(
         &self,
         manifest: &ConversationManifest,
-        _limits: ConversationReadLimits,
     ) -> Result<CasArchiveObject, AppError> {
         self.validate_conversation_streaming(manifest).await?;
         let bytes = serde_json::to_vec(manifest).map_err(|_| invalid())?;
@@ -343,6 +346,7 @@ impl ArchiveStore {
         Ok(manifest)
     }
 
+    #[cfg(test)]
     pub async fn export_conversation(
         &self,
         tenant_id: Uuid,
@@ -369,6 +373,7 @@ impl ArchiveStore {
         Ok(ConversationExport { manifest, events })
     }
 
+    #[cfg(test)]
     async fn reconstruct_conversation(
         &self,
         tenant_id: Uuid,

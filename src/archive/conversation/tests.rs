@@ -172,10 +172,7 @@ async fn shared_prefix_preserves_exact_tool_json_and_branch_order() {
             root.parent_branch_id = Some("main".into());
             root.parent_event_id = Some("first".into());
         }
-        let object = store
-            .put_conversation_manifest(&root, limits())
-            .await
-            .unwrap();
+        let object = store.put_conversation_manifest(&root).await.unwrap();
         let exported = store
             .export_conversation(tenant, &object, limits())
             .await
@@ -220,10 +217,7 @@ async fn media_and_raw_sse_are_verified_and_missing_objects_fail_closed() {
         format: RawConversationFormat::Sse,
         object: raw.clone(),
     });
-    let object = store
-        .put_conversation_manifest(&root, limits())
-        .await
-        .unwrap();
+    let object = store.put_conversation_manifest(&root).await.unwrap();
     store
         .export_conversation(tenant, &object, limits())
         .await
@@ -289,10 +283,7 @@ async fn incomplete_capture_can_be_preserved_but_not_exported_as_complete_traini
         .await
         .unwrap();
     let root = manifest(tenant, Some(head));
-    let object = store
-        .put_conversation_manifest(&root, limits())
-        .await
-        .unwrap();
+    let object = store.put_conversation_manifest(&root).await.unwrap();
     assert!(
         store
             .get_conversation_manifest(tenant, &object, 65536)
@@ -317,10 +308,7 @@ async fn budgets_and_prefix_counts_bound_reads_without_silent_truncation() {
         .await
         .unwrap();
     let root = manifest(tenant, Some(head.clone()));
-    let object = store
-        .put_conversation_manifest(&root, limits())
-        .await
-        .unwrap();
+    let object = store.put_conversation_manifest(&root).await.unwrap();
     for restricted in [
         ConversationReadLimits {
             max_events: 0,
@@ -345,7 +333,7 @@ async fn budgets_and_prefix_counts_bound_reads_without_silent_truncation() {
     head.event_count += 1;
     assert!(
         store
-            .put_conversation_manifest(&manifest(tenant, Some(head)), limits())
+            .put_conversation_manifest(&manifest(tenant, Some(head)))
             .await
             .is_err()
     );
@@ -375,7 +363,7 @@ async fn duplicate_event_ids_and_unresolved_parents_prevent_manifest_publication
             .unwrap();
         assert!(
             store
-                .put_conversation_manifest(&manifest(tenant, Some(head)), limits())
+                .put_conversation_manifest(&manifest(tenant, Some(head)))
                 .await
                 .is_err()
         );
@@ -388,12 +376,7 @@ async fn unsupported_manifest_version_and_foreign_tenant_are_rejected() {
     let tenant = Uuid::now_v7();
     let mut root = manifest(tenant, None);
     root.format_version += 1;
-    assert!(
-        store
-            .put_conversation_manifest(&root, limits())
-            .await
-            .is_err()
-    );
+    assert!(store.put_conversation_manifest(&root).await.is_err());
     let object = store
         .put_conversation_json(tenant, &root, limits().max_object_bytes)
         .await
@@ -405,10 +388,7 @@ async fn unsupported_manifest_version_and_foreign_tenant_are_rejected() {
             .is_err()
     );
     root.format_version = FORMAT_VERSION;
-    let object = store
-        .put_conversation_manifest(&root, limits())
-        .await
-        .unwrap();
+    let object = store.put_conversation_manifest(&root).await.unwrap();
     assert!(
         store
             .export_conversation(Uuid::now_v7(), &object, limits())
@@ -422,10 +402,7 @@ async fn empty_or_mislabeled_branches_cannot_be_exported_as_complete() {
     let store = memory_store();
     let tenant = Uuid::now_v7();
     let root = manifest(tenant, None);
-    let object = store
-        .put_conversation_manifest(&root, limits())
-        .await
-        .unwrap();
+    let object = store.put_conversation_manifest(&root).await.unwrap();
     assert!(
         store
             .export_conversation(tenant, &object, limits())
@@ -439,25 +416,10 @@ async fn empty_or_mislabeled_branches_cannot_be_exported_as_complete() {
         .unwrap();
     let mut root = manifest(tenant, Some(head));
     root.branch_id = "different".into();
-    assert!(
-        store
-            .put_conversation_manifest(&root, limits())
-            .await
-            .is_err()
-    );
+    assert!(store.put_conversation_manifest(&root).await.is_err());
     root.branch_id = "main".into();
     root.parent_branch_id = Some("missing".into());
-    assert!(
-        store
-            .put_conversation_manifest(&root, limits())
-            .await
-            .is_err()
-    );
+    assert!(store.put_conversation_manifest(&root).await.is_err());
     root.parent_event_id = Some("first".into());
-    assert!(
-        store
-            .put_conversation_manifest(&root, limits())
-            .await
-            .is_err()
-    );
+    assert!(store.put_conversation_manifest(&root).await.is_err());
 }
