@@ -345,6 +345,10 @@ test('request detail follows terminal events and fences late responses after sel
     await page.waitForFunction(() => window.requestLifecycleFixture.held);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).waitFor();
+    // The live-added tooltip positioned itself while the modal held the scroll
+    // lock, so it only reappears after the next position recompute; revealing
+    // its trigger is the user action that triggers one.
+    await page.getByRole('button', { name: 'Live-added helper', exact: true }).scrollIntoViewIfNeeded();
     await page.getByRole('tooltip').filter({ hasText: 'Live-added background help' }).waitFor();
     assert.equal(await liveHelp.evaluate(element => !!element.closest('[inert], [aria-hidden="true"]')), false, 'new background portal regains its original accessibility on close');
     assert.deepEqual(await page.locator('#already-inert-background').evaluate(element => ({ inert: element instanceof HTMLElement && element.inert, hidden: element.getAttribute('aria-hidden') })), { inert: true, hidden: 'false' }, 'cleanup restores original attributes, not generic accessibility defaults');
