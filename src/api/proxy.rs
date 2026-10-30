@@ -1298,6 +1298,7 @@ async fn proxy_with_cancellation_guard(
         conversation,
         protocol,
         tenant_id: key.tenant_id,
+        original_response_capture: false,
         memory,
     };
     // Native streams and source-backed Responses retain their charged request
@@ -1927,6 +1928,7 @@ async fn proxy_with_cancellation_guard(
         return result;
     }
     if is_codex_route && !codex_downstream_stream {
+        let upstream = buffered_request.capture_original_response(upstream);
         let buffer_phase = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "codex_buffered_response",
@@ -2074,6 +2076,7 @@ async fn proxy_with_cancellation_guard(
     }
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
     if !is_sse {
+        let upstream = buffered_request.capture_original_response(upstream);
         return finish_non_sse_proxy_response(NonSseProxyResponseInput {
             buffered_request: &buffered_request,
             selected_driver: active_route.route.driver.as_str(),
@@ -2559,12 +2562,46 @@ struct BufferedRequest<'a> {
     conversation: Option<ProxyConversation>,
     protocol: Protocol,
     tenant_id: Uuid,
+    original_response_capture: bool,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+}
+
+impl BufferedRequest<'_> {
+    fn capture_original_response(&mut self, upstream: UpstreamResponse) -> UpstreamResponse {
+        self.original_response_capture = true;
+        let identity = crate::db::ArchiveSpoolIdentity {
+            request_id: self.request_id,
+            tenant_id: self.tenant_id,
+            reservation_id: self.reservation.id,
+        };
+        let capture = crate::response_archive_spool::ResponseArchiveProducer::begin(
+            self.state,
+            identity,
+            self.state.persistence.stream_memory.reservation(),
+        );
+        if capture.is_none() {
+            let archive = self.state.archive.clone();
+            tokio::spawn(async move {
+                if let Err(error) = archive
+                    .publish_raw_capture_failure(
+                        identity.tenant_id,
+                        identity.request_id,
+                        "response",
+                    )
+                    .await
+                {
+                    tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                        "raw response capture admission failure could not be persisted");
+                }
+            });
+        }
+        upstream.with_archive_capture(capture)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn execute_component_provider(
-    request: BufferedRequest<'_>,
+    mut request: BufferedRequest<'_>,
     driver: &str,
     base_url: &str,
     config: &Value,
@@ -2780,8 +2817,9 @@ async fn execute_component_provider(
     else {
         return finish_component_provider_failure(&request, None, "provider_configuration").await;
     };
+    let upstream = request.capture_original_response(upstream.into());
     let upstream_body = match read_bounded_upstream(
-        upstream.into(),
+        upstream,
         maximum.min(MAX_PROXY_RESPONSE_BODY),
         &request.memory,
         request.memory_admission_wait,
@@ -3319,17 +3357,19 @@ async fn finish_buffered_request_before_deadline(
             "runtime terminal was not durable before the client response returned"
         );
     }
-    persistence::capture(
-        request.state,
-        crate::db::ArchiveSpoolIdentity {
-            request_id,
-            tenant_id: request.tenant_id,
-            reservation_id: request.reservation.id,
-        },
-        crate::response_archive_spool::BufferedArchivePurpose::Response,
-        body.clone(),
-        request.memory.clone(),
-    );
+    if !request.original_response_capture {
+        persistence::capture(
+            request.state,
+            crate::db::ArchiveSpoolIdentity {
+                request_id,
+                tenant_id: request.tenant_id,
+                reservation_id: request.reservation.id,
+            },
+            crate::response_archive_spool::BufferedArchivePurpose::Response,
+            body.clone(),
+            request.memory.clone(),
+        );
+    }
     if let Some(identity) = request.session_preference {
         request
             .state

@@ -10,6 +10,7 @@ on:
       - src/api/proxy/persistence.rs
       - src/api/proxy.rs
       - src/api/proxy/streaming.rs
+      - src/api/proxy/upstream_response.rs
       - src/api/proxy/tests/archive_terminal.rs
       - src/api/proxy/tests/gateway_persistence.rs
       - src/response_archive_spool/**

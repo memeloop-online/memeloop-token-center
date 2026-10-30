@@ -261,6 +261,46 @@ impl UpstreamResponse {
         }
     }
 
+    pub(super) fn with_archive_capture(
+        self,
+        capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
+    ) -> Self {
+        let parts = self.into_parts();
+        let captured = stream::unfold(
+            (parts.stream, capture),
+            |(mut upstream, mut capture)| async move {
+                match upstream.next().await {
+                    Some(chunk) => {
+                        match &chunk {
+                            Ok(bytes) => {
+                                if let Some(writer) = capture.as_mut()
+                                    && !writer.append(vec![bytes.clone()])
+                                {
+                                    drop(capture.take());
+                                }
+                            }
+                            Err(_) => drop(capture.take()),
+                        }
+                        Some((chunk, (upstream, capture)))
+                    }
+                    None => {
+                        if let Some(writer) = capture {
+                            drop(writer.seal());
+                        }
+                        None
+                    }
+                }
+            },
+        );
+        Self::Prefetched {
+            status: parts.status,
+            headers: parts.headers,
+            version: parts.version,
+            content_length: parts.content_length,
+            stream: Box::pin(captured),
+        }
+    }
+
     pub(super) fn from_prefetched_parts(
         mut parts: UpstreamResponseParts,
         prefetched: Vec<Bytes>,

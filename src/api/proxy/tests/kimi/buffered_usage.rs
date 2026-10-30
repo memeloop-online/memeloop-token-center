@@ -78,6 +78,7 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         }),
         protocol: Protocol::OpenAiChat,
         tenant_id: key.tenant_id,
+        original_response_capture: false,
         memory: fixture.state.proxy_memory_budget.reservation(),
     };
     let mut attempt = UpstreamAttemptGuard::new(

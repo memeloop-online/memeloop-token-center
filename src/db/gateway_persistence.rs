@@ -668,15 +668,6 @@ impl Database {
                 if let Err(error) = database.publish_proxy_started_event(identity).await {
                     tracing::warn!(%request_id, reason = error.diagnostic_category(), "request started event omitted");
                 }
-                let retained =
-                    crate::api::proxy::archive_retention::prepare_json_body_if_valid(&body);
-                let body = retained.as_ref().map_or_else(
-                    || body.clone(),
-                    |retained| {
-                        crate::api::proxy::archive_retention::encode_json_body(&body, retained)
-                    },
-                );
-                drop(retained);
                 database
                     .capture_deferred_request_archive(identity, &body, &pepper, compression_enabled)
                     .await

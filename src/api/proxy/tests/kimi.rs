@@ -167,6 +167,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 conversation: None,
                 protocol,
                 tenant_id: key.tenant_id,
+                original_response_capture: false,
                 memory: fixture.state.proxy_memory_budget.reservation(),
             };
             let response = finish_buffered_request_with_upstream_attribution_and_response_object(
