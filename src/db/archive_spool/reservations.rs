@@ -102,6 +102,15 @@ impl Database {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn reserve_deferred_archive_capacity(
+        &self,
+        archive: &crate::response_archive_spool::BufferedArchive<'_>,
+    ) -> Result<Option<ArchiveBudgetReservation>, AppError> {
+        self.reserve_buffered_archive_capacity_inner(archive, false)
+            .await
+    }
+
     async fn reserve_buffered_archive_capacity_inner(
         &self,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
