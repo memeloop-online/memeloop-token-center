@@ -264,9 +264,6 @@ impl Fixture {
             (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
             (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
         ] {
-            // Terminal projection has already completed the request. Use the
-            // deferred writer's matching-gap fence instead of recapturing it
-            // through the pre-terminal compatibility helper.
             let archive = BufferedArchive::new(
                 self.identity,
                 purpose,
@@ -275,13 +272,17 @@ impl Fixture {
                 self.state.config.archive_spool_compression_enabled,
             )
             .unwrap();
+            let mut transaction = self.state.db.begin_write_transaction().await.unwrap();
             assert!(
                 self.state
                     .db
-                    .capture_deferred_archive(&archive)
+                    .capture_buffered_archive_body_in_transaction(
+                        &mut transaction, unix_millis(), &archive, None,
+                    )
                     .await
                     .unwrap()
             );
+            transaction.commit().await.unwrap();
         }
     }
 

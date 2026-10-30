@@ -1121,8 +1121,7 @@ pub(crate) async fn archive_session_body(
         body.set_media_locator(turn_index, part_index, locator.clone());
         uploaded_media.insert(hash, locator);
     }
-    let (atoms, nodes) = body.into_prefix();
-    let media = body.media_locators(&atoms);
+    let (atoms, nodes, media) = body.into_archive_parts();
     if !state
         .db
         .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
