@@ -80,7 +80,7 @@ export function providerEditShape(variant: string | null) {
       network_scope: 'public',
       reservation_token_bounds: Object.fromEntries(models.map((model, index) => [model, variant === 'retry-only' && index === 0 ? 1_000_000_000 : 64000])),
       transport_policy: variant === 'retry-only'
-        ? { candidate_attempts: 3, connect_attempts: 4, connect_retry_delay_millis: 150, failover_deadline_millis: 300000, shared_probe_attempts: 4, version: 1 }
+        ? { candidate_attempts: 3, connect_attempts: 4, connect_retry_delay_millis: 150, shared_probe_attempts: 4, version: 1 }
         : variant === 'csil'
           ? { connect_attempts: 2, connect_timeout_millis: 10000, memory_admission_wait_millis: 12000,
             dispatch_max_in_flight: 2, dispatch_max_queued: 0, dispatch_queue_timeout_millis: 15000,
