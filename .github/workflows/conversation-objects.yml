@@ -9,6 +9,7 @@ on:
       - src/api/session_reading.rs
       - src/api/proxy/persistence.rs
       - src/api/proxy/tests/archive_terminal.rs
+      - src/api/proxy/tests/gateway_persistence.rs
       - src/response_archive_spool/**
       - .github/workflows/conversation-objects.yml
   workflow_dispatch:

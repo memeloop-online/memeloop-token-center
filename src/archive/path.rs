@@ -77,12 +77,33 @@ pub(super) fn is_any_v1_cas_location(location: &str) -> bool {
     )
 }
 
+pub(super) fn is_conversation_root_location(location: &str) -> bool {
+    let mut segments = location.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next()
+        ),
+        (
+            Some("tenants"),
+            Some(_),
+            Some("raw" | "conversations"),
+            Some("v1")
+        )
+    )
+}
+
 pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
     let mut segments = location.split('/');
     if segments.next() != Some("tenants") || segments.next().is_none() {
         return false;
     }
-    matches!(segments.next(), None | Some("cas"))
+    matches!(
+        segments.next(),
+        None | Some("cas" | "raw" | "conversations")
+    )
 }
 
 pub(super) fn archive_path(location: &str) -> Result<Path, AppError> {

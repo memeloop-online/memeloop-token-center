@@ -35,7 +35,9 @@ pub struct StagedArchiveObject {
 
 impl ArchiveStore {
     pub async fn start_writer(&self, location: &str) -> Result<ArchiveWriter, AppError> {
-        if super::path::is_any_v1_cas_location(location) {
+        if super::path::is_any_v1_cas_location(location)
+            || super::path::is_conversation_root_location(location)
+        {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));

@@ -6,6 +6,65 @@ use super::{ConversationReadLimits, tests::memory_store};
 use crate::conversation::ConversationHints;
 
 #[tokio::test]
+async fn conversation_stream_reads_large_opaque_event_without_document_budget() {
+    let store = memory_store();
+    let tenant = Uuid::now_v7();
+    let document = serde_json::json!({"role":"tool", "content":"工具".repeat(350000)}).to_string();
+    let event = super::ConversationEvent {
+        event_id: "tool-1".into(),
+        request_id: Some("request-1".into()),
+        branch_id: "main".into(),
+        parent_event_id: None,
+        agent_id: None,
+        parent_agent_id: None,
+        origin: "response".into(),
+        role: Some("tool".into()),
+        kind: "tool_result".into(),
+        document: serde_json::value::RawValue::from_string(document).unwrap(),
+        media: Vec::new(),
+        gaps: Vec::new(),
+    };
+    let head = store
+        .append_conversation_event(tenant, None, &event, 65536)
+        .await
+        .unwrap();
+    let manifest = super::ConversationManifest {
+        format_version: 1,
+        tenant_id: tenant,
+        session_id: "session".into(),
+        branch_id: "main".into(),
+        parent_branch_id: None,
+        parent_event_id: None,
+        head: Some(head),
+        raw_captures: Vec::new(),
+        gaps: Vec::new(),
+    };
+    let object = store
+        .put_conversation_manifest(
+            &manifest,
+            ConversationReadLimits {
+                max_events: 1,
+                max_object_bytes: 65536,
+                max_total_bytes: 65536,
+            },
+        )
+        .await
+        .unwrap();
+    let lines: Vec<Bytes> = store
+        .stream_conversation_export(tenant, &object)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(lines.len(), 3);
+    assert!(lines.iter().all(|line| line.len() < 65536));
+    let entry: serde_json::Value = serde_json::from_slice(&lines[1]).unwrap();
+    assert_eq!(entry["ordinal"], 0);
+    assert!(entry["object"]["size_bytes"].as_u64().unwrap() > 2 * 1024 * 1024);
+}
+
+#[tokio::test]
 async fn missing_response_is_not_fabricated_and_late_capture_preserves_prefix() {
     let store = memory_store();
     let tenant = Uuid::now_v7();

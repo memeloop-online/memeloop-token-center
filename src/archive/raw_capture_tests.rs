@@ -66,4 +66,8 @@ async fn durable_raw_roots_are_idempotent_and_reject_changed_bytes() {
             .unwrap(),
         Some(original)
     );
+    let root = format!("tenants/{tenant}/raw/v1/{request}/response.json");
+    assert!(store.delete(&root).await.is_err());
+    assert!(store.put(&root, Bytes::from_static(b"{}")).await.is_err());
+    assert!(store.start_writer(&root).await.is_err());
 }
