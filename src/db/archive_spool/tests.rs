@@ -613,8 +613,13 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
         "request_records",
         "request_record_locators",
         "request_events",
+        "request_archive_spools",
+        "request_archive_spool_chunks",
     ] {
-        let column = if table == "request_events" {
+        let column = if matches!(
+            table,
+            "request_events" | "request_archive_spools" | "request_archive_spool_chunks"
+        ) {
             "request_id"
         } else {
             "id"
@@ -644,6 +649,23 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
         reservation.id.to_string()
     );
     assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
+    // Durable request capture is uploadable before settlement, including
+    // recovery after admission commits but its acknowledgement is lost.
+    let retained = budget(&db).await;
+    let task = db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("committed request capture is uploadable before settlement");
+    assert_eq!(task.identity.request_id, request_id);
+    assert_eq!(task.identity.tenant_id, key.tenant_id);
+    assert_eq!(task.identity.reservation_id, reservation.id);
+    assert_eq!(task.purpose, BufferedArchivePurpose::Request);
+    assert!(!task.successful_terminal);
+    assert_eq!(task.byte_count, body.len() as i64);
+    assert_eq!(task.chunk_count, 1);
+    assert!(retained > 0);
+    assert_eq!(budget(&db).await, retained);
     assert!(
         db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
             .await

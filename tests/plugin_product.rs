@@ -7,6 +7,7 @@ use std::{
 
 use memeloop_token_center::{
     db::Database,
+    error::AppError,
     plugin::{PluginRuntime, memeloop::token_center::types::RequestContext},
     provider::ProviderCatalog,
 };
@@ -810,19 +811,26 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
     );
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await.clone())
         .expect("load normalize trap fixture");
-    assert!(
-        runtime
-            .normalize_provider_response(
-                "normalize-trap-provider",
-                context(),
-                200,
-                &BTreeMap::new(),
-                b"{}",
-            )
-            .expect_err("normalize trap must reject the response")
-            .to_string()
-            .contains("normalize-trap")
-    );
+    let error = runtime
+        .normalize_provider_response(
+            "normalize-trap-provider",
+            context(),
+            200,
+            &BTreeMap::new(),
+            b"normalize-response-secret",
+        )
+        .expect_err("normalize trap must reject the response");
+    assert!(matches!(
+        &error,
+        AppError::Upstream {
+            code: "plugin_execution_failed",
+            ..
+        }
+    ));
+    let text = error.to_string();
+    assert!(!text.contains("normalize-trap"));
+    assert!(!text.contains("normalize-response-secret"));
+    assert!(!text.contains(plugins.to_str().unwrap()));
 
     fs::remove_dir_all(&plugins).unwrap();
     fs::create_dir(&plugins).unwrap();
@@ -834,32 +842,32 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
     );
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
         .expect("load oversize fixture");
-    assert!(
-        runtime
-            .normalize_provider_response(
-                "oversize-provider",
-                context(),
-                200,
-                &BTreeMap::new(),
-                b"nine-byte",
-            )
-            .expect_err("oversize upstream response must be rejected")
-            .to_string()
-            .contains("declared limit")
-    );
-    assert!(
-        runtime
-            .normalize_provider_response(
-                "oversize-provider",
-                context(),
-                200,
-                &BTreeMap::new(),
-                b"{}",
-            )
-            .expect_err("oversize normalized body must be rejected")
-            .to_string()
-            .contains("declared limit")
-    );
+    let error = runtime
+        .normalize_provider_response(
+            "oversize-provider",
+            context(),
+            200,
+            &BTreeMap::new(),
+            b"nine-byte",
+        )
+        .expect_err("oversize upstream response must be rejected");
+    assert!(matches!(
+        error,
+        AppError::Upstream {
+            code: "plugin_upstream_response_exceeds_its_declared_limit",
+            ..
+        }
+    ));
+    let error = runtime
+        .normalize_provider_response("oversize-provider", context(), 200, &BTreeMap::new(), b"{}")
+        .expect_err("oversize normalized body must be rejected");
+    assert!(matches!(
+        error,
+        AppError::Upstream {
+            code: "plugin_normalized_response_body_exceeds_its_declared_limit",
+            ..
+        }
+    ));
 }
 
 #[cfg(all(

@@ -2,7 +2,8 @@ use super::*;
 use crate::{
     AppState,
     config::Config,
-    response_archive_spool::{self, BufferedArchivePurpose},
+    db::test_support::PostgresTestDatabase,
+    response_archive_spool::{self, BufferedArchive, BufferedArchivePurpose},
 };
 use bytes::Bytes;
 
@@ -200,6 +201,10 @@ impl Fixture {
     async fn claim(&self) -> Uuid {
         sqlx::query("UPDATE conversation_projection_outbox SET terminal_lease_expires_at = 0 WHERE request_id = $1")
             .bind(self.request_id.to_string()).execute(&self.state.db.pool).await.unwrap();
+        self.claim_ready().await
+    }
+
+    async fn claim_ready(&self) -> Uuid {
         let owner = Uuid::now_v7();
         assert!(
             self.state
@@ -259,12 +264,33 @@ impl Fixture {
             (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
             (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
         ] {
-            assert!(response_archive_spool::capture_buffered(&self.state, self.identity, purpose, body).await);
+            // Terminal projection has already completed the request. Use the
+            // deferred writer's matching-gap fence instead of recapturing it
+            // through the pre-terminal compatibility helper.
+            let archive = BufferedArchive::new(
+                self.identity,
+                purpose,
+                &body,
+                self.state.config.key_pepper.as_bytes(),
+                self.state.config.archive_spool_compression_enabled,
+            )
+            .unwrap();
+            assert!(
+                self.state
+                    .db
+                    .capture_deferred_archive(&archive)
+                    .await
+                    .unwrap()
+            );
         }
     }
 
     async fn assert_completed(&self, assistant: bool) {
         let owner = self.claim().await;
+        self.assert_completed_by(owner, assistant).await;
+    }
+
+    async fn assert_completed_by(&self, owner: Uuid, assistant: bool) {
         assert!(
             crate::worker::archive_session_body(&self.state, owner, self.request_id)
                 .await
@@ -304,6 +330,150 @@ impl Fixture {
             .bind(self.request_id.to_string()).fetch_one(&self.state.db.pool).await.unwrap();
         assert_eq!(events, 1);
     }
+}
+
+async fn pending_archive_wake_contract(database_url: String) {
+    for bind_before_defer in [true, false] {
+        let fixture = Fixture::new(database_url.clone(), false).await;
+        let owner = fixture.claim_ready().await;
+        let pending = fixture
+            .state
+            .db
+            .session_body_locators(fixture.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.pending);
+        fixture.capture().await;
+        if bind_before_defer {
+            // The worker already read pending; both bind wakes now encounter
+            // its active claim and must leave that claim intact.
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+            let stored_owner: String = sqlx::query_scalar(
+                "SELECT terminal_lease_owner FROM conversation_projection_outbox WHERE request_id = $1",
+            )
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+            assert_eq!(stored_owner, owner.to_string());
+            fixture
+                .state
+                .db
+                .defer_pending_session_body_archive(owner, fixture.request_id)
+                .await
+                .unwrap();
+        } else {
+            let before = unix_millis();
+            assert!(
+                !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+                    .await
+                    .unwrap()
+            );
+            let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+            assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+            assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+            assert!(
+                row.get::<Option<String>, _>("terminal_lease_owner")
+                    .is_none()
+            );
+            let expires_at = row.get::<i64, _>("terminal_lease_expires_at");
+            assert!(expires_at >= before + 5000);
+            assert!(expires_at <= unix_millis() + 5000);
+            assert!(
+                fixture
+                    .state
+                    .db
+                    .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "still-pending archives must retain their retry backoff"
+            );
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+        }
+        assert!(
+            !fixture
+                .state
+                .db
+                .session_body_locators(fixture.request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending
+        );
+        let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+        assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+        assert!(
+            row.get::<Option<String>, _>("terminal_lease_owner")
+                .is_none()
+        );
+        assert!(
+            row.get::<Option<i64>, _>("terminal_lease_expires_at")
+                .is_none()
+        );
+        // Neither claim_ready nor assert_completed_by changes lease deadlines:
+        // reclaim must succeed immediately after the real archive binds.
+        let replacement = fixture.claim_ready().await;
+        let expires_at: i64 = sqlx::query_scalar(
+            "SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        fixture
+            .state
+            .db
+            .defer_pending_session_body_archive(owner, fixture.request_id)
+            .await
+            .unwrap();
+        let row = sqlx::query("SELECT terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(
+            row.get::<String, _>("terminal_lease_owner"),
+            replacement.to_string()
+        );
+        assert_eq!(row.get::<i64, _>("terminal_lease_expires_at"), expires_at);
+        fixture.assert_completed_by(replacement, true).await;
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL AND statistics_outcome = 'session_body' AND COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) IS NOT NULL")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(receipts, 1);
+        let observations: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(observations, 1);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_pending_archive_defer_preserves_bind_wakes_and_claim_ownership() {
+    let directory = tempfile::tempdir().unwrap();
+    pending_archive_wake_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("pending-wake.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_pending_archive_defer_preserves_bind_wakes_and_claim_ownership() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("pending archive wake PostgreSQL regression must not silently skip");
+    // Projection advisory locks are database scoped, so a private schema
+    // still shares contention with other PostgreSQL regression tests.
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    pending_archive_wake_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
 }
 
 async fn readiness_contract(database_url: String) {
@@ -406,22 +576,11 @@ async fn postgres_session_body_waits_for_capture_and_both_uploads() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
-    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
-    let schema = format!("archive_readiness_{}", Uuid::now_v7().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let mut isolated = url::Url::parse(&database_url).unwrap();
-    isolated
-        .query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
-    readiness_contract(isolated.to_string()).await;
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    admin.close().await;
+    // Projection advisory locks are database scoped, so a private schema
+    // still shares contention with other PostgreSQL regression tests.
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    readiness_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
 }
 
 async fn source_contract(database_url: String) {
@@ -797,24 +956,13 @@ async fn sqlite_source_failed_state_write_retries_and_lost_writer_converges() {
 async fn postgres_source_failed_state_write_retries_and_lost_writer_converges() {
     let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
         .expect("source R2 PostgreSQL regression must not silently skip");
-    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
-    let schema = format!("source_failures_{}", Uuid::now_v7().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let mut isolated = url::Url::parse(&database_url).unwrap();
-    isolated
-        .query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
-    failed_source_metadata_contract(isolated.to_string()).await;
-    expired_live_source_writer_contract(isolated.to_string()).await;
-    lost_source_writer_contract(isolated.to_string()).await;
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    admin.close().await;
+    // Projection advisory locks are database scoped, so a private schema
+    // still shares contention with other PostgreSQL regression tests.
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    failed_source_metadata_contract(isolated.url().to_owned()).await;
+    expired_live_source_writer_contract(isolated.url().to_owned()).await;
+    lost_source_writer_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
 }
 
 #[tokio::test]
@@ -832,20 +980,9 @@ async fn postgres_source_identity_recovers_after_request_drop_and_missing_bindin
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };
-    let admin = sqlx::PgPool::connect(&database_url).await.unwrap();
-    let schema = format!("archive_source_{}", Uuid::now_v7().simple());
-    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    let mut isolated = url::Url::parse(&database_url).unwrap();
-    isolated
-        .query_pairs_mut()
-        .append_pair("options", &format!("-csearch_path={schema}"));
-    source_contract(isolated.to_string()).await;
-    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
-        .execute(&admin)
-        .await
-        .unwrap();
-    admin.close().await;
+    // Projection advisory locks are database scoped, so a private schema
+    // still shares contention with other PostgreSQL regression tests.
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    source_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
 }

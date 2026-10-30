@@ -625,6 +625,7 @@ impl RequestSpool {
         self.shared.length
     }
 
+    #[cfg(test)]
     pub(crate) fn digest(&self) -> [u8; 32] {
         self.shared.digest
     }
