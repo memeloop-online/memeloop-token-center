@@ -5541,15 +5541,11 @@ paths:
         - $ref: '#/components/parameters/ContextKeyId'
       responses:
         '200':
-          description: Verified manifest and ordered original events.
+          description: NDJSON manifest and event references with descending ordinals. Require the verified end record and EOF; a truncated stream is not a complete export.
           content:
-            application/json:
+            application/x-ndjson:
               schema:
-                type: object
-                required: [manifest, events]
-                properties:
-                  manifest: {type: object}
-                  events: {type: array, items: {type: object}}
+                type: string
         '400': {$ref: '#/components/responses/InvalidRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}

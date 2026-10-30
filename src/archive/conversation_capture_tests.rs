@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use uuid::Uuid;
 
 use super::{ConversationReadLimits, tests::memory_store};
@@ -118,6 +119,26 @@ async fn captured_raw_sse_tools_and_media_survive_independent_cache_deletion() {
         .await
         .unwrap();
     assert_eq!(exported.events.len(), 6);
+    let lines: Vec<Bytes> = store
+        .stream_conversation_export(tenant, &root)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(lines.len(), 8);
+    let first: serde_json::Value = serde_json::from_slice(&lines[0]).unwrap();
+    assert_eq!(first["record"], "manifest");
+    let ordinals: Vec<u64> = lines[1..7]
+        .iter()
+        .map(|line| {
+            let event: serde_json::Value = serde_json::from_slice(line).unwrap();
+            event["ordinal"].as_u64().unwrap()
+        })
+        .collect();
+    assert_eq!(ordinals, vec![5, 4, 3, 2, 1, 0]);
+    let end: serde_json::Value = serde_json::from_slice(lines.last().unwrap()).unwrap();
+    assert_eq!(end["verified"], true);
     assert_eq!(exported.events[0].media.len(), 1);
     assert_eq!(exported.events[0].request_id, None);
     assert!(exported.events[1].document.get().contains("call-1"));

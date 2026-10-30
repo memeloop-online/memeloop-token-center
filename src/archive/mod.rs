@@ -24,6 +24,7 @@ mod conversation;
 mod conversation_capture;
 #[cfg(test)]
 mod conversation_capture_tests;
+mod conversation_stream;
 mod download;
 mod multipart;
 mod objects;

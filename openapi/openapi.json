@@ -11760,15 +11760,8 @@
         ],
         "responses": {
           "200": {
-            "description": "Verified manifest and ordered original events.",
-            "content": {"application/json": {"schema": {
-              "type": "object",
-              "required": ["manifest", "events"],
-              "properties": {
-                "manifest": {"type": "object"},
-                "events": {"type": "array", "items": {"type": "object"}}
-              }
-            }}}
+            "description": "NDJSON manifest and event references with descending ordinals. Require the verified end record and EOF; a truncated stream is not a complete export.",
+            "content": {"application/x-ndjson": {"schema": {"type": "string"}}}
           },
           "400": {"$ref": "#/components/responses/InvalidRequest"},
           "401": {"$ref": "#/components/responses/Unauthorized"},

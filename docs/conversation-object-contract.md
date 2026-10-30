@@ -86,10 +86,15 @@ binaries and digests. Role filtering, opaque-field removal, redaction and
 training-schema conversion produce separately versioned derived artifacts;
 they never replace the sole retained original.
 
-Explicit per-object, event-count and aggregate byte limits fail closed.
-Media verification streams bytes without assembling a second binary copy;
-event JSON is bounded. These are background/read budgets, not gateway
-admission limits. Application hot reads retain the existing bounded memory
+The HTTP training export streams NDJSON: a manifest record, event references
+in descending ordinal order, then a verified end record. Consumers require
+that end record and EOF, restore ascending ordinal order per branch, and fetch
+the immutable event/media objects. Missing or corrupt objects terminate the
+stream without a success trailer. No total event or aggregate-byte limit is
+applied to this endpoint. Event verification skips opaque document strings
+through a bounded chunk reader instead of collecting whole conversations.
+Manifest publication similarly walks events without collecting their bodies.
+Application hot reads retain the existing bounded memory
 cache and otherwise read objects directly. The format does not add a DB body
 read, a new cache, a new storage backend or a DB archive wait on the frontend.
 

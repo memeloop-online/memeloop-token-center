@@ -284,25 +284,20 @@ pub(super) async fn internal_session_training(
     headers: HeaderMap,
     Path((session_id, request_id)): Path<(Uuid, Uuid)>,
     Query(query): Query<ContextQuery>,
-) -> Result<Json<crate::archive::ConversationExport>, AppError> {
+) -> Result<axum::response::Response, AppError> {
     let scope = operator_scope(&state, &headers, &query, session_id, request_id).await?;
     let reference = state
         .archive
         .request_conversation_reference(scope.tenant_id, scope.request_id)
         .await?;
-    state
+    let stream = state
         .archive
-        .export_conversation(
-            scope.tenant_id,
-            &reference,
-            crate::archive::ConversationReadLimits {
-                max_events: 1_000_000,
-                max_object_bytes: 128 * 1024 * 1024,
-                max_total_bytes: 4 * 1024 * 1024 * 1024,
-            },
-        )
-        .await
-        .map(Json)
+        .stream_conversation_export(scope.tenant_id, &reference)
+        .await?;
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|_| AppError::internal("conversation_export_response"))
 }
 
 pub(super) async fn internal_session_training_raw(

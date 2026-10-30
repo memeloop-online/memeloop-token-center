@@ -75,10 +75,10 @@ pub struct ConversationManifest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct PrefixNode {
-    format_version: u32,
-    parent: Option<ConversationPrefix>,
-    event: CasArchiveObject,
+pub(super) struct PrefixNode {
+    pub(super) format_version: u32,
+    pub(super) parent: Option<ConversationPrefix>,
+    pub(super) event: CasArchiveObject,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -121,7 +121,10 @@ fn invalid() -> AppError {
     AppError::storage("conversation_object_invalid")
 }
 
-fn validate_manifest(tenant_id: Uuid, manifest: &ConversationManifest) -> Result<(), AppError> {
+pub(super) fn validate_manifest(
+    tenant_id: Uuid,
+    manifest: &ConversationManifest,
+) -> Result<(), AppError> {
     if manifest.format_version != FORMAT_VERSION
         || manifest.tenant_id != tenant_id
         || manifest.session_id.is_empty()
@@ -188,7 +191,7 @@ fn validate_event(tenant_id: Uuid, event: &ConversationEvent) -> Result<(), AppE
     Ok(())
 }
 
-fn validate_node(
+pub(super) fn validate_node(
     tenant_id: Uuid,
     head: &ConversationPrefix,
     node: &PrefixNode,
@@ -249,7 +252,7 @@ impl ArchiveStore {
         self.put_tenant_content(tenant_id, Bytes::from(bytes)).await
     }
 
-    async fn get_conversation_json<Content: DeserializeOwned>(
+    pub(super) async fn get_conversation_json<Content: DeserializeOwned>(
         &self,
         tenant_id: Uuid,
         object: &CasArchiveObject,
@@ -279,9 +282,26 @@ impl ArchiveStore {
         for media in &event.media {
             self.verify_tenant_content(tenant_id, &media.object).await?;
         }
-        let event = self
-            .put_conversation_json(tenant_id, event, maximum)
-            .await?;
+        let metadata = serde_json::json!({
+            "event_id":event.event_id, "request_id":event.request_id,
+            "branch_id":event.branch_id, "parent_event_id":event.parent_event_id,
+            "agent_id":event.agent_id, "parent_agent_id":event.parent_agent_id,
+            "origin":event.origin, "role":event.role, "kind":event.kind,
+            "media":event.media, "gaps":event.gaps,
+        });
+        let mut metadata = serde_json::to_vec(&metadata).map_err(|_| invalid())?;
+        metadata.pop();
+        metadata.extend_from_slice(b",\"document\":");
+        let staging = format!("conversation-staging/v1/{tenant_id}/{}", Uuid::now_v7());
+        let mut writer = self.start_writer(&staging).await?;
+        writer.write(Bytes::from(metadata)).await?;
+        for chunk in event.document.get().as_bytes().chunks(65536) {
+            writer.write(Bytes::copy_from_slice(chunk)).await?;
+        }
+        writer.write(Bytes::from_static(b"}")).await?;
+        let staged = writer.finish_staged().await?;
+        let event = self.promote_staged_text_to_cas(tenant_id, &staged).await?;
+        self.delete(&staged.object_locator).await?;
         let object = self
             .put_conversation_json(
                 tenant_id,
@@ -302,19 +322,10 @@ impl ArchiveStore {
     pub async fn put_conversation_manifest(
         &self,
         manifest: &ConversationManifest,
-        limits: ConversationReadLimits,
+        _limits: ConversationReadLimits,
     ) -> Result<CasArchiveObject, AppError> {
-        let mut budget = ReadBudget {
-            limits,
-            consumed: 0,
-        };
-        self.reconstruct_conversation(manifest.tenant_id, manifest, &mut budget)
-            .await?;
+        self.validate_conversation_streaming(manifest).await?;
         let bytes = serde_json::to_vec(manifest).map_err(|_| invalid())?;
-        budget.charge(bytes.len() as u64)?;
-        if bytes.len() > limits.max_object_bytes {
-            return Err(AppError::storage("conversation_object_exceeds_read_limit"));
-        }
         self.put_tenant_content(manifest.tenant_id, Bytes::from(bytes))
             .await
     }
