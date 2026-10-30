@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "branch": "candidate/playground-hotfix-20261030",
+  "production_base": "61d426a0f0c58319d8e0940b1b3cd4e55fbc7570",
+  "candidate_sha": "5d24e0a2d2a832e34922deae027320a626370a2d",
+  "candidate_tree": "52f73fc255bb30fdc89957b1ff9407dd1a835892",
+  "delta_sha256": "9abca464c1ac44046a8de8434e7af9a1fa8d2100a25752b544533a71f1d24e42",
+  "allowed_paths": [
+    "Cargo.lock",
+    "Cargo.toml",
+    "openapi/openapi.json",
+    "openapi/openapi.yaml",
+    "src/api/api_schema.rs",
+    "src/api/operator_inference.rs",
+    "src/api/operator_inference/tests.rs",
+    "src/api/routes/control.rs",
+    "web/e2e/fixtures/operator-plugin-runtime-bindings.html",
+    "web/e2e/fixtures/operator-plugin-runtime-bindings.tsx",
+    "web/e2e/operator-plugin-component-browser-contract.test.ts",
+    "web/operator-ui-sdk/README.md",
+    "web/operator-ui-sdk/index.d.ts",
+    "web/src/plugins/OperatorPluginComponentHost.tsx"
+  ]
+}
