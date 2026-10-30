@@ -8,14 +8,53 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
+async fn deferred_capture_recovers_a_completed_request_without_a_response_locator() {
+    let (_directory, state, pool, identity) = fixture().await;
+    sqlx::query(
+        "UPDATE request_records SET completed_at = 2, response_object = NULL WHERE id = $1",
+    )
+    .bind(identity.request_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let body = Bytes::from_static(b"{\"output\":\"original delivered response\"}");
+    let archive = BufferedArchive::new(
+        identity,
+        BufferedArchivePurpose::Response,
+        &body,
+        state.config.key_pepper.as_bytes(),
+        false,
+    )
+    .unwrap();
+    assert!(state.db.capture_deferred_archive(&archive).await.unwrap());
+    assert!(
+        state
+            .db
+            .deferred_archive_is_captured(identity, BufferedArchivePurpose::Response, &body)
+            .await
+            .unwrap()
+    );
+    let completed_at: i64 =
+        sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(completed_at, 2);
+}
+
+#[tokio::test]
 async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_binding() {
     for compressed in [false, true] {
-        for (status_code, error_code) in [
+        for (status_code, error_code, early_upload) in [
             (503_i64, None),
             (502, Some("stream_incomplete")),
             (200, Some("stream_incomplete")),
             (429, None),
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|(status, error)| [(status, error, true), (status, error, false)])
+        {
             let (_dir, mut state, pool, identity) = fixture().await;
             sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) SELECT id, created_at, tenant_id, key_id FROM request_records WHERE id = $1")
                 .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
@@ -30,11 +69,22 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
             ] {
                 assert!(capture_buffered(&state, identity, purpose, body).await);
             }
-            assert!(!process_one_for_test(&state).await);
-            finish(&pool, identity).await;
-            sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, request_object = $3, input_tokens = 45, output_tokens = 67, cost_micros = 123 WHERE id = $4")
-                .bind(status_code).bind(error_code).bind(format!("gap://{}/request", identity.request_id))
-                .bind(identity.request_id.to_string()).execute(&pool).await.unwrap();
+            sqlx::query("UPDATE request_records SET request_object = $1 WHERE id = $2")
+                .bind(format!("gap://{}/request", identity.request_id))
+                .bind(identity.request_id.to_string())
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, input_tokens = 45, output_tokens = 67, cost_micros = 123 WHERE id = $3")
+                .bind(status_code).bind(error_code).bind(identity.request_id.to_string())
+                .execute(&pool).await.unwrap();
+            if !early_upload {
+                sqlx::query("UPDATE request_records SET completed_at = 2 WHERE id = $1")
+                    .bind(identity.request_id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
             let retained: i64 = sqlx::query_scalar(
                 "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
             )
@@ -42,17 +92,51 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
             .await
             .unwrap();
             assert!(retained > 0);
+            // Sealed bodies can bind on either side of settlement.
             assert!(process_one_for_test(&state).await);
             assert!(process_one_for_test(&state).await);
+            let early = sqlx::query("SELECT completed_at, request_object, response_object FROM request_records WHERE id = $1")
+                .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(
+                early.get::<Option<i64>, _>("completed_at").is_none(),
+                early_upload
+            );
+            let before_cleanup: i64 = sqlx::query_scalar(
+                "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let remaining = sqlx::query("SELECT COUNT(*) AS spool_count, SUM(cipher_bytes) AS cipher_bytes FROM (SELECT cipher_bytes FROM request_archive_spools WHERE cipher_bytes > 0 UNION ALL SELECT cipher_bytes FROM response_archive_spools WHERE cipher_bytes > 0) remaining")
+                .fetch_one(&pool).await.unwrap();
+            assert!(before_cleanup > 0 && before_cleanup <= retained);
+            assert_eq!(before_cleanup, remaining.get::<i64, _>("cipher_bytes"));
+            assert_eq!(
+                state.db.cleanup_response_archive_spools(32).await.unwrap(),
+                remaining.get::<i64, _>("spool_count") as u64
+            );
+            // Settlement preserves the already-bound locators.
+            if early_upload {
+                sqlx::query("UPDATE request_records SET completed_at = 2 WHERE id = $1")
+                    .bind(identity.request_id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
             for _ in 0..2 {
                 assert!(!process_one_for_test(&state).await);
             }
+            assert_eq!(
+                state.db.cleanup_response_archive_spools(32).await.unwrap(),
+                0
+            );
             let budget = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
                 .fetch_one(&pool).await.unwrap();
             assert_eq!(budget.get::<i64, _>("cipher_bytes"), 0);
             assert_eq!(budget.get::<i64, _>("request_cipher_bytes"), 0);
-            let row = sqlx::query("SELECT request_object, response_object, status_code, error_code, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1")
+            let row = sqlx::query("SELECT completed_at, request_object, response_object, status_code, error_code, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1")
                 .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+            assert_eq!(row.get::<i64, _>("completed_at"), 2);
             assert_eq!(row.get::<i64, _>("status_code"), status_code);
             assert_eq!(
                 row.get::<Option<String>, _>("error_code").as_deref(),
@@ -66,16 +150,17 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
                 ("response_object", response, "response"),
             ] {
                 let locator: String = row.get(column);
+                assert_eq!(locator, early.get::<String, _>(column));
                 assert!(!locator.starts_with("gap://"));
                 assert!(!locator.contains("/cas/"));
                 assert_eq!(locator.ends_with(".mtcz1"), compressed);
                 assert_eq!(state.archive.get(&locator).await.unwrap(), body);
-                let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = $2 AND state = 'bound' AND bound_locator = $3")
+                let bound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = $2 AND state = 'bound' AND bound_locator = $3 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL")
                     .bind(identity.request_id.to_string()).bind(purpose).bind(&locator)
                     .fetch_one(&pool).await.unwrap();
                 assert_eq!(bound, 1);
             }
-            let spools: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0)")
+            let spools: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL) + (SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL)")
                 .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
             assert_eq!(spools, 2);
             let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'")
@@ -172,16 +257,20 @@ async fn corrupt_or_missing_spool_chunks_never_publish_a_locator() {
 }
 
 #[tokio::test]
-async fn both_buffered_purposes_recover_exact_bytes_only_after_terminal() {
-    buffered_purposes_recover(false).await;
+async fn both_buffered_purposes_recover_exact_bytes_before_and_after_terminal() {
+    for early_upload in [true, false] {
+        buffered_purposes_recover(false, early_upload).await;
+    }
 }
 
 #[tokio::test]
 async fn compressed_objects_bind_both_purposes_and_recover_original_bytes() {
-    buffered_purposes_recover(true).await;
+    for early_upload in [true, false] {
+        buffered_purposes_recover(true, early_upload).await;
+    }
 }
 
-async fn buffered_purposes_recover(compressed: bool) {
+async fn buffered_purposes_recover(compressed: bool, early_upload: bool) {
     let (_dir, mut state, pool, identity) = fixture().await;
     std::sync::Arc::make_mut(&mut state.config).archive_object_compression_enabled = compressed;
     let request = Bytes::from_static(b"{\"messages\":[{\"content\":\"private request\"}]}");
@@ -204,14 +293,15 @@ async fn buffered_purposes_recover(compressed: bool) {
         )
         .await
     );
-    assert!(!process_one_for_test(&state).await);
     sqlx::query("UPDATE request_records SET request_object = $1 WHERE id = $2")
         .bind(format!("gap://{}/request", identity.request_id))
         .bind(identity.request_id.to_string())
         .execute(&pool)
         .await
         .unwrap();
-    finish(&pool, identity).await;
+    if !early_upload {
+        finish(&pool, identity).await;
+    }
     let permits = state.proxy_archive_stream_permits.clone();
     let held = permits
         .clone()
@@ -221,7 +311,7 @@ async fn buffered_purposes_recover(compressed: bool) {
     assert!(!process_one_for_test(&state).await);
     for table in ["request_archive_spools", "response_archive_spools"] {
         let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT state, attempts FROM {table} WHERE request_id = $1"
+            "SELECT state, attempts, lease_owner, lease_token, lease_expires_at FROM {table} WHERE request_id = $1"
         )))
         .bind(identity.request_id.to_string())
         .fetch_one(&pool)
@@ -229,38 +319,114 @@ async fn buffered_purposes_recover(compressed: bool) {
         .unwrap();
         assert_eq!(row.get::<String, _>("state"), "pending");
         assert_eq!(row.get::<i64, _>("attempts"), 0);
+        assert!(row.get::<Option<String>, _>("lease_owner").is_none());
+        assert!(row.get::<Option<String>, _>("lease_token").is_none());
+        assert!(row.get::<Option<i64>, _>("lease_expires_at").is_none());
     }
     drop(held);
     assert!(process_one_for_test(&state).await);
     assert!(process_one_for_test(&state).await);
-    let row =
-        sqlx::query("SELECT request_object, response_object FROM request_records WHERE id = $1")
-            .bind(identity.request_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let row = sqlx::query(
+        "SELECT completed_at, request_object, response_object FROM request_records WHERE id = $1",
+    )
+    .bind(identity.request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let request_locator: String = row.get("request_object");
     let response_locator: String = row.get("response_object");
+    assert_eq!(
+        row.get::<Option<i64>, _>("completed_at").is_none(),
+        early_upload
+    );
     assert_eq!(request_locator.ends_with(".mtcz1"), compressed);
     assert_eq!(response_locator.ends_with(".mtcz1"), compressed);
-    assert!(request_locator.contains(&format!("tenants/{}/cas/v1/", identity.tenant_id)));
-    assert!(response_locator.contains(&format!("tenants/{}/cas/v1/", identity.tenant_id)));
+    for locator in [&request_locator, &response_locator] {
+        assert!(!locator.starts_with("gap://"));
+        assert_eq!(
+            locator.contains(&format!("tenants/{}/cas/v1/", identity.tenant_id)),
+            !early_upload
+        );
+    }
     assert_ne!(request_locator, response_locator);
     assert_eq!(state.archive.get(&request_locator).await.unwrap(), request);
     assert_eq!(
         state.archive.get(&response_locator).await.unwrap(),
         response
     );
-    let staging_states: Vec<String> = sqlx::query_scalar(
-        "SELECT state FROM archive_staging_attempts WHERE owner_id = $1 ORDER BY purpose",
+    let staging = sqlx::query(
+        "SELECT purpose, state, bound_locator, lease_owner, lease_token, lease_expires_at FROM archive_staging_attempts WHERE owner_id = $1 ORDER BY purpose",
     )
     .bind(identity.request_id.to_string())
     .fetch_all(&pool)
     .await
     .unwrap();
+    assert_eq!(staging.len(), 2);
+    for (attempt, (purpose, locator)) in staging.iter().zip([
+        ("request", &request_locator),
+        ("response", &response_locator),
+    ]) {
+        assert_eq!(attempt.get::<String, _>("purpose"), purpose);
+        assert_eq!(
+            attempt.get::<String, _>("state"),
+            if early_upload {
+                "bound"
+            } else {
+                "cleanup_pending"
+            }
+        );
+        assert_eq!(
+            attempt.get::<Option<String>, _>("bound_locator").as_deref(),
+            early_upload.then_some(locator.as_str())
+        );
+        assert!(attempt.get::<Option<String>, _>("lease_owner").is_none());
+        assert!(attempt.get::<Option<String>, _>("lease_token").is_none());
+        assert!(attempt.get::<Option<i64>, _>("lease_expires_at").is_none());
+    }
+    let remaining: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE cipher_bytes > 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE cipher_bytes > 0)")
+        .fetch_one(&pool).await.unwrap();
+    assert!(remaining > 0 && remaining <= 2);
     assert_eq!(
-        staging_states,
-        vec!["cleanup_pending".to_owned(), "cleanup_pending".to_owned()]
+        state.db.cleanup_response_archive_spools(32).await.unwrap(),
+        remaining as u64
+    );
+    let budget = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(budget.get::<i64, _>("cipher_bytes"), 0);
+    assert_eq!(budget.get::<i64, _>("request_cipher_bytes"), 0);
+    for table in ["request_archive_spools", "response_archive_spools"] {
+        let bound: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE request_id = $1 AND state = 'bound' AND attempts = 1 AND cipher_bytes = 0 AND lease_owner IS NULL AND lease_token IS NULL AND lease_expires_at IS NULL"
+        )))
+        .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+        assert_eq!(bound, 1);
+    }
+    if early_upload {
+        // Successful settlement must not replace the legacy early-upload binding.
+        sqlx::query("UPDATE request_records SET completed_at = 2, status_code = 200 WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    assert!(!process_one_for_test(&state).await);
+    assert_eq!(
+        state.db.cleanup_response_archive_spools(32).await.unwrap(),
+        0
+    );
+    let settled = sqlx::query("SELECT completed_at, status_code, request_object, response_object FROM request_records WHERE id = $1")
+        .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(settled.get::<i64, _>("completed_at"), 2);
+    assert_eq!(settled.get::<i64, _>("status_code"), 200);
+    assert_eq!(settled.get::<String, _>("request_object"), request_locator);
+    assert_eq!(
+        settled.get::<String, _>("response_object"),
+        response_locator
+    );
+    assert_eq!(state.archive.get(&request_locator).await.unwrap(), request);
+    assert_eq!(
+        state.archive.get(&response_locator).await.unwrap(),
+        response
     );
 }
 
@@ -300,7 +466,7 @@ fn request_cipher_domain_is_distinct_and_schema71_response_aad_is_unchanged() {
         "memeloop-token-center/response-archive-spool/v1/{}/{}/{}/0",
         identity.tenant_id, identity.request_id, identity.reservation_id
     );
-    let legacy = crate::provider::seal_private_json(
+    let legacy = crate::provider::seal_envelope(
         &serde_json::json!({"bytes":"cHJpdmF0ZSBhcmNoaXZl"}),
         PEPPER,
         legacy_aad.as_bytes(),

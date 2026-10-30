@@ -568,7 +568,7 @@ async fn all_source_failures_do_not_modify_existing_prices() {
     )
     .await
     .expect_err("all unavailable sources must fail closed");
-    assert!(matches!(error, AppError::Upstream(_)));
+    assert!(matches!(error, AppError::Upstream { .. }));
     let price = database
         .model_price_view("openai/gpt-manual", "USD")
         .await

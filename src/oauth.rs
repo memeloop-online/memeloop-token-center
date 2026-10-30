@@ -1,7 +1,7 @@
 use futures_util::StreamExt;
 use uuid::Uuid;
 
-use crate::{db::Database, error::AppError, provider::seal_private_json};
+use crate::{db::Database, error::AppError, plain_json::encode_handle};
 
 mod adapter;
 pub mod authorization_code;
@@ -39,7 +39,8 @@ const MAX_OAUTH_LOGIN_STATE_BYTES: usize = 64 * 1024;
 
 pub(crate) fn validate_oauth_login_config(config: &serde_json::Value) -> Result<String, AppError> {
     let base_url = crate::provider::validate_config(config)?;
-    let bytes = serde_json::to_vec(config).map_err(|_| AppError::Internal)?;
+    let bytes = serde_json::to_vec(config)
+        .map_err(|_| AppError::internal("oauth_validate_oauth_login_config_1"))?;
     if bytes.len() > MAX_OAUTH_LOGIN_CONFIG_BYTES {
         return Err(AppError::BadRequest(
             "OAuth provider configuration exceeds the login-session limit".into(),
@@ -48,18 +49,15 @@ pub(crate) fn validate_oauth_login_config(config: &serde_json::Value) -> Result<
     Ok(base_url)
 }
 
-pub(crate) fn seal_oauth_login_state<T: serde::Serialize>(
-    state: &T,
-    key_material: &[u8],
-    aad: &[u8],
-) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(state).map_err(|_| AppError::Internal)?;
+pub(crate) fn seal_oauth_login_state<T: serde::Serialize>(state: &T) -> Result<String, AppError> {
+    let bytes = serde_json::to_vec(state)
+        .map_err(|_| AppError::internal("oauth_seal_oauth_login_state_1"))?;
     if bytes.len() > MAX_OAUTH_LOGIN_STATE_BYTES {
         return Err(AppError::BadRequest(
             "OAuth login state exceeds the session limit".into(),
         ));
     }
-    seal_private_json(state, key_material, aad)
+    encode_handle(state)
 }
 
 #[async_trait::async_trait]
@@ -140,14 +138,14 @@ async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> 
         .content_length()
         .is_some_and(|length| length > MAX_OAUTH_RESPONSE_BYTES as u64)
     {
-        return Err(AppError::Upstream("OAuth response is too large".into()));
+        return Err(AppError::upstream("oauth_response_is_too_large"));
     }
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(AppError::from)?;
         if body.len().saturating_add(chunk.len()) > MAX_OAUTH_RESPONSE_BYTES {
-            return Err(AppError::Upstream("OAuth response is too large".into()));
+            return Err(AppError::upstream("oauth_response_is_too_large"));
         }
         body.extend_from_slice(&chunk);
     }
@@ -173,10 +171,10 @@ mod tests {
     fn oauth_login_state_has_one_pre_encryption_size_limit() {
         let oversized = "x".repeat(MAX_OAUTH_LOGIN_STATE_BYTES + 1);
         assert!(matches!(
-            seal_oauth_login_state(&oversized, b"test-key", b"test-aad"),
+            seal_oauth_login_state(&oversized),
             Err(AppError::BadRequest(_))
         ));
-        assert!(seal_oauth_login_state(&"bounded", b"test-key", b"test-aad").is_ok());
+        assert!(seal_oauth_login_state(&"bounded").is_ok());
     }
 
     async fn sqlite_database() -> (tempfile::TempDir, Database) {
@@ -603,7 +601,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             error.to_string(),
-            "configured upstream is unavailable: Cursor OAuth refresh failed"
+            "configured upstream is unavailable: cursor_oauth_refresh_failed"
         );
         let rendered = format!("{error:?} {error}");
         let address = address.to_string();

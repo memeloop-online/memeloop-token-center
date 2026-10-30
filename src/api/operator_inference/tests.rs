@@ -468,21 +468,12 @@ async fn successful_inference(protocol: Protocol) {
     ] {
         assert!(!forwarded[0].headers.contains_key(name), "forwarded {name}");
     }
-    let mut archived_response = completion.clone();
-    if responses {
-        // Core archives preserve the response envelope and usage while replacing
-        // inline image bytes with the established retention marker. Delivery to
-        // the caller above preserves the original image result.
-        archived_response["output"][0]["result"] = json!({
-            "retained":false,"kind":"inline_media","original_bytes":IMAGE_FIXTURE_PNG.len()
-        });
-    }
     assert_inference_archive(
         &state,
         key.key_id,
         rows[0].request_id,
         &provider_request,
-        &archived_response,
+        &completion,
     )
     .await;
 }

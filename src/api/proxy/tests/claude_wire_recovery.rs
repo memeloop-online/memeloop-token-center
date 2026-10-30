@@ -344,8 +344,32 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{phase}/{name}");
+            let status = response.status();
             let response: Value = response.json().await.unwrap();
+            if status != StatusCode::OK {
+                let failure = json!({
+                    "phase": phase,
+                    "case": name,
+                    "status": status.as_u16(),
+                    "error_code": response.pointer("/error/code"),
+                    "error_type": response.pointer("/error/type"),
+                    "upstream_captures": captures.lock().await.len(),
+                    "finalize_observations": finalize_observations(&gateway_state),
+                });
+                if let Ok(output) = std::env::var("MTC_CLAUDE_WIRE_EVIDENCE") {
+                    std::fs::write(
+                        output,
+                        serde_json::to_vec_pretty(&json!({
+                            "synthetic_only": true,
+                            "cases": evidence,
+                            "failure": failure,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(status, StatusCode::OK, "{failure}");
+            }
             if *path == "/v1/responses" {
                 assert_eq!(response["status"], "completed");
             } else {

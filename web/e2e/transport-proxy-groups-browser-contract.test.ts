@@ -396,7 +396,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.equal(await page.locator('.transport-proxy-workspace').getByRole('button', { name: '删除', exact: true }).isEnabled(), false);
       await page.getByLabel('解绑后保留的单代理出口', { exact: true }).selectOption({ label: '主出口' });
       await page.getByRole('button', { name: '解绑并保留所选代理', exact: true }).click(); await confirm(page);
-      await page.getByText('已解除代理组绑定，账号将继续使用所选出口，不会改为直连。', { exact: true }).waitFor();
+      await page.getByText('已解除代理组绑定。账号继续使用当前所选出口。', { exact: true }).waitFor();
       await assertWorkspaceFocus(page);
       await assertSecretsAbsent(page);
       await page.locator('.transport-proxy-workspace').getByRole('button', { name: '删除', exact: true }).click(); await confirm(page);
@@ -461,7 +461,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.waitForFunction(() => Boolean(window.proxyGroupFixture.release));
       await page.clock.runFor(15_001);
-      await page.getByText(/保存结果尚未确认，关闭页面也不会取消保存/).waitFor();
+      await page.getByText(/保存结果尚未确认。关闭页面后保存仍会完成/).waitFor();
       assert.equal(await page.getByRole('button', { name: '保存代理组', exact: true }).isEnabled(), false);
       await page.evaluate(() => window.proxyGroupFixture.release?.());
       assert.equal(await page.getByText(/代理组配置已保存/).count(), 0);
@@ -474,7 +474,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.waitForFunction(() => Boolean(window.proxyGroupFixture.release));
       await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
-      await page.getByText(/关闭不会取消保存/).waitFor(); await confirm(page);
+      await page.getByText(/关闭页面后保存仍会完成/).waitFor(); await confirm(page);
       await assertAccountDirectoryReturn(page);
       await page.evaluate(() => window.proxyGroupFixture.release?.());
       await openManager(page);

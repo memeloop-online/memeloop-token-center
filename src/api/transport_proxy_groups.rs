@@ -24,7 +24,9 @@ fn response(result: Result<(StatusCode, Value), AppError>) -> axum::response::Re
     let mut response = match result {
         Ok((StatusCode::NO_CONTENT, _)) => StatusCode::NO_CONTENT.into_response(),
         Ok((status, body)) => (status, Json(body)).into_response(),
-        Err(AppError::Storage(_)) => AppError::Overloaded.into_response(),
+        Err(AppError::Storage { .. }) => {
+            AppError::capacity_error("transport_proxy_storage_unavailable").into_response()
+        }
         Err(error) => error.into_response(),
     };
     response.headers_mut().insert(

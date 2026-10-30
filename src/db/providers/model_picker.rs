@@ -128,8 +128,8 @@ impl Database {
         let explicit_accounts = uuid_list_json(filter.explicit_account_ids)?;
         let included_groups = uuid_list_json(filter.included_provider_group_ids)?;
         let excluded_groups = uuid_list_json(filter.excluded_provider_group_ids)?;
-        let public_providers =
-            serde_json::to_string(filter.public_provider_ids).map_err(|_| AppError::Internal)?;
+        let public_providers = serde_json::to_string(filter.public_provider_ids)
+            .map_err(|_| AppError::internal("model_picker_model_picker_projection_1"))?;
         let has_positive_filter = if filter.explicit_account_ids.is_empty()
             && filter.included_provider_group_ids.is_empty()
         {
@@ -190,7 +190,9 @@ impl Database {
             };
             let route_id = parse_uuid(row.try_get::<String, _>("route_id")?)?;
             let account_id = parse_uuid(account_id)?;
-            let item = items.last_mut().ok_or(AppError::Internal)?;
+            let item = items
+                .last_mut()
+                .ok_or(AppError::internal("model_picker_model_picker_projection_1"))?;
             let is_new_source = item.sources.last().is_none_or(|source| {
                 source.route_id != route_id || source.account.id != account_id.to_string()
             });
@@ -283,7 +285,10 @@ impl Database {
                 id: parse_uuid(group_id)?.to_string(),
                 label: row.try_get("provider_group_label")?,
             };
-            let source = item.sources.last_mut().ok_or(AppError::Internal)?;
+            let source = item
+                .sources
+                .last_mut()
+                .ok_or(AppError::internal("model_picker_site_1"))?;
             if source.provider_groups.last() != Some(&group) {
                 source.provider_groups.push(group);
             }
@@ -322,7 +327,7 @@ fn model_picker_sql(backend: DatabaseBackend) -> &'static str {
 
 fn uuid_list_json(values: &[Uuid]) -> Result<String, AppError> {
     serde_json::to_string(&values.iter().map(Uuid::to_string).collect::<Vec<_>>())
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("model_picker_uuid_list_json_1"))
 }
 
 fn escape_like(value: &str) -> String {
