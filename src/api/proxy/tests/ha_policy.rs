@@ -84,6 +84,7 @@ pub(super) async fn set_policy(fixture: &CodexRouteFixture, policy: Value) {
         json!({"http_protocol": null}),
         json!({"http_protocol": true}),
         json!({"candidate_attempts": 9}),
+        json!({"failover_deadline_millis": 1000}),
         json!({"retry_503": true}),
         json!({"read_timeout_millis": 2000, "request_timeout_millis": 1000}),
         json!({"connect_timeout_millis": 1000, "read_timeout_millis": 1000,
@@ -122,7 +123,7 @@ async fn versioned_policy_roundtrips_through_authorized_cas_api() {
     set_policy(
         &fixture,
         json!({"version": 1, "candidate_attempts": 8,
-        "failover_deadline_millis": 1234, "connect_timeout_millis": 1000,
+        "connect_timeout_millis": 1000,
         "read_timeout_millis": 2000, "request_timeout_millis": 3000,
         "max_sse_event_bytes": 1048576, "max_sse_framed_bytes": 1114112,
         "max_sse_terminal_hold_bytes": 1114112}),
@@ -214,14 +215,13 @@ async fn codex_dispatched_503_never_replays_despite_an_available_budget_and_stan
 }
 
 #[tokio::test]
-async fn native_compaction_waits_past_failover_and_transport_deadlines() {
+async fn native_compaction_waits_without_a_gateway_or_account_read_deadline() {
     let fixture = codex_route_fixture("compact-no-deadline").await;
     set_policy(
         &fixture,
         json!({
-            "failover_deadline_millis": 1000,
             "connect_timeout_millis": 1000,
-            "read_timeout_millis": 1000,
+            "read_timeout_millis": null,
             "request_timeout_millis": 2000
         }),
     )
