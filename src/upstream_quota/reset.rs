@@ -332,26 +332,24 @@ pub(crate) async fn confirm(
         credential,
         &account.config,
     )?;
-    let credential = &selection.credential;
-    let account_header =
-        crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
+    let dispatch_credential = &selection.credential;
+    let account_header = crate::oauth::managed::codex::account_header_value(dispatch_credential)
+        .map_err(|_| blocked())?;
     let _permit = state
         .upstream_quota
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable())?;
-    let http = tokio::time::timeout(
-        Duration::from_secs(5),
-        crate::network::client_for_codex_url_without_retries(
-            &state.http,
-            CONSUME_URL,
-            &json!({"network_scope":"public"}),
-            credential.proxy(),
-            false,
-        ),
+    // Use the existing mutation-only network factory (including its shared
+    // HTTP settings integration); do not impose another reset-specific deadline.
+    let http = crate::network::client_for_codex_url_without_retries(
+        &state.http,
+        CONSUME_URL,
+        &json!({"network_scope":"public"}),
+        dispatch_credential.proxy(),
+        false,
     )
     .await
-    .map_err(|_| temporarily_unavailable())?
     .map_err(|_| temporarily_unavailable())?;
     let claim = state
         .db
@@ -368,12 +366,19 @@ pub(crate) async fn confirm(
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
     // No automatic retry and no new redeem ID on any ambiguous outcome.
-    let result = dispatch_once(&http, credential, account_header, CONSUME_URL, &redeem).await;
+    let result = dispatch_once(
+        &http,
+        dispatch_credential,
+        account_header,
+        CONSUME_URL,
+        &redeem,
+    )
+    .await;
     drop(_permit);
     let accepted = result.is_ok();
     state
         .db
-        .finish_quota_reset(operation, accepted, result.err())
+        .finish_quota_reset(operation, accepted, result.err().as_deref())
         .await?;
     state
         .upstream_quota
@@ -387,22 +392,26 @@ pub(crate) async fn confirm(
         // exact quota-exhausted health row through the existing fenced CAS.
         // Recovery failure must never replay the paid reset or change its
         // accepted durable result.
-        match fresh_snapshot(state, account, credential, tenant).await {
-            Ok(_) => tracing::info!(
-                upstream_account_id = %account.id,
-                credential_generation = account.credential_generation,
-                trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
-                "refreshed quota evidence after an accepted reset"
-            ),
-            Err(error) => tracing::warn!(
-                upstream_account_id = %account.id,
-                credential_generation = account.credential_generation,
-                trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
-                error = %error,
-                error_code = "quota_reset_recovery_pending",
-                "accepted quota reset could not refresh supplier evidence"
-            ),
-        }
+        // Always pass the stored credential, never the request-local selected
+        // proxy credential: read_fresh owns selection and the normal quota,
+        // cache, accepted-credit settlement and health recovery implementation.
+        let snapshot = state
+            .upstream_quota
+            .read_fresh(
+                state,
+                account,
+                credential,
+                tenant,
+                QuotaReadTrigger::ResetWorkflow,
+            )
+            .await;
+        let error = snapshot
+            .error_code
+            .or(snapshot.reset_capability.credit_error_code);
+        state
+            .db
+            .record_quota_reset_readback(account, operation, actor, error)
+            .await?;
     }
     // Accepted means only supplier HTTP 2xx. It does not assert window state.
     state
@@ -456,13 +465,62 @@ pub(crate) async fn reconcile(
         .await
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn recover(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+    actor: &str,
+    operation: &str,
+    expected_updated_at: i64,
+    reason: &str,
+) -> Result<QuotaResetOperation, AppError> {
+    let tenant_id = account.tenant_id.to_string();
+    let account_id = account.id.to_string();
+    let original = state
+        .db
+        .quota_reset_operation(&tenant_id, &account_id, operation)
+        .await?;
+    if !original.manual_unlock_available || original.updated_at != expected_updated_at {
+        return Err(AppError::Conflict(
+            "only the reviewed, locked unknown operation can be recovered".into(),
+        ));
+    }
+    // GET only. No balance observation is treated as proof of non-execution.
+    let snapshot = fresh(state, account, credential, tenant).await?;
+    state
+        .db
+        .release_unknown_quota_reset(
+            account,
+            operation,
+            actor,
+            expected_updated_at,
+            reason,
+            snapshot
+                .reset_capability
+                .available_credits
+                .ok_or_else(blocked)?,
+            snapshot
+                .reset_capability
+                .applicable_credits
+                .ok_or_else(blocked)?,
+            snapshot.observed_at.ok_or_else(blocked)?,
+        )
+        .await?;
+    state
+        .db
+        .quota_reset_operation(&tenant_id, &account_id, operation)
+        .await
+}
+
 async fn dispatch_once(
     http: &reqwest::Client,
     credential: &UpstreamCredential,
     account: reqwest::header::HeaderValue,
     url: &str,
     redeem: &str,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     let request = http
         .post(url)
         .header("chatgpt-account-id", account)
@@ -472,16 +530,29 @@ async fn dispatch_once(
             crate::oauth::managed::codex::USER_AGENT,
         )
         .header("originator", crate::oauth::managed::codex::ORIGINATOR)
-        .timeout(Duration::from_secs(8))
         .json(&json!({"redeem_request_id":redeem}));
     let request = credential
         .apply(request, unix_millis())
-        .map_err(|_| "reset_dispatch_unknown")?;
-    let response = request.send().await.map_err(|_| "reset_dispatch_unknown")?;
+        .map_err(|_| "reset_prepare_credential_invalid".to_owned())?;
+    let response = request.send().await.map_err(|error| {
+        // Never retain Display/source/URL: reqwest errors may contain proxy
+        // authentication, account credentials or supplier-controlled strings.
+        let reason = match (error.is_connect(), error.is_timeout()) {
+            (true, true) => "connect_timeout",
+            (true, false) => "connect_failed",
+            (false, true) => "timeout",
+            _ if error.is_builder() => "request_invalid",
+            _ => "transport_failed",
+        };
+        format!("reset_send_{reason}")
+    })?;
     if response.status().is_success() {
         Ok(())
     } else {
-        Err("reset_supplier_response_unknown")
+        Err(format!(
+            "reset_response_http_{}",
+            response.status().as_u16()
+        ))
     }
 }
 
@@ -492,6 +563,85 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, method, path},
     };
+
+    #[test]
+    fn reset_readback_requires_stored_credential_after_sticky_proxy_failover() {
+        let account = Uuid::now_v7();
+        let proxies = ["socks5h://100.64.0.4:1080", "socks5h://100.64.0.5:1080"];
+        let groups = crate::db::TransportProxyGroups::parse(
+            &json!([{"account_id":account,"version":1,"proxies":proxies}]).to_string(),
+            b"reset-readback-regression",
+        )
+        .unwrap();
+        let stored = UpstreamCredential::OAuth {
+            access_token: "fixture-access".into(),
+            refresh_token: None,
+            expires_at: None,
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: Some(proxies[0].into()),
+            proxy_network_scope: Some(crate::network::OutboundScope::Private),
+        };
+        let first = groups
+            .select_config(account, 1, &stored, &json!({}))
+            .unwrap();
+        assert!(first.advance_after_connect_failure(&[0]).unwrap());
+        let dispatch = groups
+            .select_config(account, 1, &stored, &json!({}))
+            .unwrap();
+        assert_eq!(dispatch.credential.proxy().unwrap().0, proxies[1]);
+        // This is the former success-path failure, reproduced without sending
+        // any supplier mutation. A selected credential is not a stored base.
+        assert!(
+            groups
+                .select_config(account, 1, &dispatch.credential, &json!({}))
+                .is_err()
+        );
+        let readback = groups
+            .select_config(account, 1, &stored, &json!({}))
+            .unwrap();
+        assert_eq!(readback.credential.proxy().unwrap().0, proxies[1]);
+        assert_eq!(stored.proxy().unwrap().0, proxies[0]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_timeout_uses_existing_client_policy_and_keeps_only_safe_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/consume"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let credential = UpstreamCredential::OAuth {
+            access_token: "fixture-private-access".into(),
+            refresh_token: None,
+            expires_at: None,
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: None,
+            proxy_url: None,
+            proxy_network_scope: None,
+        };
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
+            .timeout(Duration::from_millis(40))
+            .build()
+            .unwrap();
+        let code = dispatch_once(
+            &http,
+            &credential,
+            reqwest::header::HeaderValue::from_static("fixture-private-account"),
+            &format!("{}/consume?private=fixture-query-secret", server.uri()),
+            "fixture-redeem",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, "reset_send_timeout");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
     #[tokio::test]
     async fn consumption_does_not_retry_retry_after_or_auth_errors() {
@@ -524,7 +674,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-                "reset_supplier_response_unknown"
+                format!("reset_response_http_{status}")
             );
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
@@ -568,7 +718,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            "reset_supplier_response_unknown"
+            "reset_response_http_307"
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }

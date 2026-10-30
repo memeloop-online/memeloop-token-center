@@ -204,6 +204,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(reconcile_quota_reset),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/recover",
+            post(recover_quota_reset),
+        )
+        .route(
             "/internal/v1/native-oauth-imports/capabilities",
             get(native_oauth_import_capabilities),
         )
