@@ -873,7 +873,10 @@ impl PluginRuntime {
             .find(|plugin| plugin.manifest.id == plugin_id)
             .ok_or_else(invalid)?;
         let component = plugin.component.as_ref().ok_or_else(invalid)?;
-        let engine = self.engine.as_ref().ok_or(AppError::Internal)?;
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or(AppError::internal("routing_call_group_routing_1"))?;
         let timeout = EXECUTION_LIMIT
             .min(self.execution_timeout)
             .min(Duration::from_millis(remaining_deadline_ms));
@@ -885,25 +888,32 @@ impl PluginRuntime {
                 // Routing never receives network or KV, even if another
                 // contribution in the same package declares these capabilities.
                 capabilities: Vec::new(),
-                http: self.http.as_ref().ok_or(AppError::Internal)?.clone(),
-                runtime: self.runtime.as_ref().ok_or(AppError::Internal)?.clone(),
+                http: self
+                    .http
+                    .as_ref()
+                    .ok_or(AppError::internal("routing_call_group_routing_2"))?
+                    .clone(),
+                runtime: self
+                    .runtime
+                    .as_ref()
+                    .ok_or(AppError::internal("routing_call_group_routing_3"))?
+                    .clone(),
                 kv: None,
                 limits: StoreLimitsBuilder::new()
-                    .memory_size(PLUGIN_MEMORY_BYTES)
                     .table_elements(PLUGIN_TABLE_ELEMENTS)
                     .instances(8)
                     .tables(2)
                     .memories(2)
                     .build(),
                 deadline,
-                http_body_limit: super::PLUGIN_HTTP_BODY_BYTES,
+                http_body_limit: None,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
         store.limiter(|state| &mut state.limits);
         store.set_epoch_deadline(epoch_deadline_ticks(timeout));
         store
-            .set_fuel(self.fuel.min(500_000))
+            .set_fuel(self.fuel)
             .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
         let mut linker = Linker::new(engine);
         Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)

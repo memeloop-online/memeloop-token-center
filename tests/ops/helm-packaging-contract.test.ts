@@ -29,7 +29,7 @@ interface RuntimeDeployment {
   metadata: { annotations: Record<string, string> };
   spec: { template: { metadata: { labels: Record<string, string> }; spec: {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
-    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
+    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
     initContainers: Array<{ name: string; image: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
     volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
@@ -45,11 +45,11 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       default: render('default'),
       terminalProjectionDisabled: render('default', ['--set', 'config.terminalProjectionEnabled=false']),
       terminalProjectionEnabled: render('default', ['--set', 'config.terminalProjectionEnabled=true']),
-      terminalProjectionAll: render('terminal-projection-all', ['--set', 'config.terminalProjectionEnabled=true', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
+      terminalProjectionAll: render('terminal-projection-all', ['--set', 'config.terminalProjectionEnabled=true', '--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
       runtime: render('runtime', runtimeFlags),
       runtimeReaders: render('runtime-readers', runtimeFlags.slice(0, 4)),
       runtimeCreated: render('runtime-created', ['--set', 'plugins.runtimeInventory.enabled=true', '--set', 'plugins.runtimeInventory.persistence.create=true', '--set', 'plugins.runtimeInventory.persistence.storageClass=reviewed-rwx']),
-      runtimeAll: render('runtime-all', [...runtimeFlags, '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
+      runtimeAll: render('runtime-all', [...runtimeFlags, '--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
       dev: render('dev', ['--values', join(chart, 'values-dev.yaml')]),
       observed: render('observed', ['--set', 'serviceMonitor.enabled=true', '--set', 'roles.gateway.autoscaling.enabled=true']),
       gatewayMetrics: render('gateway-metrics', ['--show-only', 'templates/servicemonitor.yaml', '--set', 'serviceMonitor.enabled=true', '--set', 'roles.control.enabled=false']),
@@ -79,7 +79,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       recreate: render('recreate', ['--set', 'deploymentStrategy=Recreate']),
       archiveReadyBoundary: render('archive-ready-boundary', ['--set', 'config.s3.readinessDeadlineMillis=5001', '--set', 'probes.readiness.timeoutSeconds=8']),
       proxyMemory: render('proxy-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.requests.memory=512Mi', '--set', 'roles.gateway.resources.limits.memory=768Mi']),
-      fractionalMemory: render('fractional-memory', ['--set', 'roles.gateway.resources.limits.memory=0.75Gi']),
+      fractionalMemory: render('fractional-memory', ['--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.gateway.resources.limits.memory=0.75Gi']),
       maximumBodyMemory: render('maximum-body-memory', ['--set', 'config.responsesBodyMaxBytes=67108864', '--set', 'config.proxyMemoryBudgetBytes=1073741824', '--set', 'roles.gateway.resources.requests.memory=1Gi', '--set', 'roles.gateway.resources.limits.memory=1280Mi']),
     };
     const has = (key: string, needle: string): void => assert.ok(output[key]!.includes(needle), `${key} render lacks ${needle}`);
@@ -154,18 +154,24 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
 
     has('default', 'kind: NetworkPolicy'); has('default', 'kind: PodDisruptionBudget');
-    count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
+    count('default', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "2147483648"/, 3);
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
+    count('dev', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 1);
     const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
-    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 2Gi/);
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 8Gi/);
     assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_PATH'));
     assert.ok(!output.default!.includes('responses-request-spool'));
     const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
+    const defaultMemory: Record<string, string[]> = { gateway: ['512Mi', '8Gi'], control: ['128Mi', '256Mi'], worker: ['192Mi', '384Mi'] };
     for (const deployment of deployments) {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+      const expectedMemory = defaultMemory[role!];
+      assert.ok(expectedMemory, `${role}: expected default role`);
+      const resources = deployment.spec.template.spec.containers[0]!.resources;
+      assert.deepEqual([resources.requests.memory, resources.limits.memory], expectedMemory, `${role}: default memory request and limit`);
       assert.equal(deployment.metadata.annotations['argocd.argoproj.io/sync-wave'], role === 'gateway' || role === 'control' ? '1' : '0');
       const pod = deployment.spec.template.spec;
       assert.equal(pod.containers[0]!.volumeMounts?.find(item => item.name === 'responses-request-spool'), undefined, `${role}: request bodies do not get a temp directory`);
@@ -289,9 +295,10 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
     const oldSchema = spawnSync(helm, ['template', 'invalid-old-schema', chart, '--set', 'migration.schemaVersion=58'], { cwd: repository, encoding: 'utf8', shell: false });
     for (const values of [
-      ['roles.gateway.resources.limits.memory=767Mi'],
+      ['roles.gateway.resources.limits.memory=1Gi'],
+      ['roles.gateway.resources.limits.memory=2303Mi'],
       ['roles.all.enabled=true', 'roles.gateway.enabled=false', 'roles.control.enabled=false', 'roles.worker.enabled=false', 'roles.all.resources.limits.memory=767Mi'],
-      ['config.proxyMemoryBudgetBytes=1879048193'],
+      ['config.proxyMemoryBudgetBytes=1879048193', 'roles.gateway.resources.limits.memory=2Gi'],
     ]) {
       const result = spawnSync(helm, ['template', 'invalid-workload-budget', chart, ...values.flatMap((value) => ['--set', value])], { cwd: repository, encoding: 'utf8', shell: false });
       assert.notEqual(result.status, 0, `memory cross-field gate accepted ${values.join(',')}`);

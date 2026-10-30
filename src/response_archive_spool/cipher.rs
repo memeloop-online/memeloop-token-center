@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::ArchiveSpoolIdentity,
     error::AppError,
-    provider::{open_private_json, seal_private_json, seal_private_json_with_nonce},
+    provider::{open_envelope, seal_envelope, seal_envelope_with_nonce},
 };
 
 const COMPRESSED_PREFIX: &str = "zstd1.";
@@ -68,11 +68,13 @@ pub(super) fn seal_for_purpose_with_compression(
     compression_enabled: bool,
 ) -> Result<String, AppError> {
     if seq < 0 || bytes.is_empty() || bytes.len() > super::CHUNK_BYTES {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "cipher_seal_for_purpose_with_compression_1",
+        ));
     }
     let (envelope, compressed) = prepare_envelope(bytes, compression_enabled)?;
     let aad = aad(identity, seq, purpose, if compressed { 2 } else { 1 });
-    let ciphertext = seal_private_json(&envelope, pepper, aad.as_bytes())?;
+    let ciphertext = seal_envelope(&envelope, pepper, aad.as_bytes())?;
     Ok(if compressed {
         format!("{COMPRESSED_PREFIX}{ciphertext}")
     } else {
@@ -102,11 +104,13 @@ pub(super) fn seal_for_purpose_with_nonce_and_compression(
     compression_enabled: bool,
 ) -> Result<String, AppError> {
     if seq < 0 || bytes.is_empty() || bytes.len() > super::CHUNK_BYTES {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "cipher_seal_for_purpose_with_nonce_and_compression_1",
+        ));
     }
     let (envelope, compressed) = prepare_envelope(bytes, compression_enabled)?;
     let aad = aad(identity, seq, purpose, if compressed { 2 } else { 1 });
-    let ciphertext = seal_private_json_with_nonce(&envelope, pepper, aad.as_bytes(), nonce)?;
+    let ciphertext = seal_envelope_with_nonce(&envelope, pepper, aad.as_bytes(), nonce)?;
     Ok(if compressed {
         format!("{COMPRESSED_PREFIX}{ciphertext}")
     } else {
@@ -116,10 +120,12 @@ pub(super) fn seal_for_purpose_with_nonce_and_compression(
 
 fn prepare_envelope(bytes: &[u8], compression_enabled: bool) -> Result<(Envelope, bool), AppError> {
     if compression_enabled {
-        let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL).map_err(|_| AppError::Internal)?;
+        let compressed = zstd::bulk::compress(bytes, ZSTD_LEVEL)
+            .map_err(|_| AppError::internal("cipher_prepare_envelope_1"))?;
         let compressed_len = sealed_envelope_len(compressed.len(), COMPRESSED_PREFIX.len())
-            .ok_or(AppError::Internal)?;
-        let raw_len = sealed_len(bytes.len()).ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("cipher_prepare_envelope_1"))?;
+        let raw_len =
+            sealed_len(bytes.len()).ok_or(AppError::internal("cipher_prepare_envelope_2"))?;
         if compressed_len < raw_len {
             return Ok((
                 Envelope {
@@ -193,38 +199,40 @@ pub(super) fn open_for_purpose(
     if ciphertext.len() > MAX_CIPHERTEXT_BYTES
         || !(1..=super::CHUNK_BYTES as i64).contains(&expected_bytes)
     {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("cipher_open_for_purpose_1"));
     }
     let (sealed, compressed, format_version) = match ciphertext.strip_prefix(COMPRESSED_PREFIX) {
         Some(sealed) => (sealed, true, 2),
         None => (ciphertext, false, 1),
     };
     if !sealed.starts_with("v2.") {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("cipher_open_for_purpose_2"));
     }
-    let value: Envelope = open_private_json(
+    let value: Envelope = open_envelope(
         sealed,
         pepper,
         aad(identity, seq, purpose, format_version).as_bytes(),
     )?;
-    let maximum_encoded = base64_len(super::CHUNK_BYTES).ok_or(AppError::Internal)?;
+    let maximum_encoded =
+        base64_len(super::CHUNK_BYTES).ok_or(AppError::internal("cipher_open_for_purpose_3"))?;
     if value.bytes.len() > maximum_encoded {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("cipher_open_for_purpose_4"));
     }
     let payload = URL_SAFE_NO_PAD
         .decode(value.bytes)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("cipher_open_for_purpose_1"))?;
     let bytes = if compressed {
         zstd::bulk::decompress(
             &payload,
-            usize::try_from(expected_bytes).map_err(|_| AppError::Internal)?,
+            usize::try_from(expected_bytes)
+                .map_err(|_| AppError::internal("cipher_open_for_purpose_2"))?,
         )
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("cipher_open_for_purpose_3"))?
     } else {
         payload
     };
     if i64::try_from(bytes.len()).ok() != Some(expected_bytes) {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("cipher_open_for_purpose_5"));
     }
     Ok(bytes.into())
 }
@@ -379,7 +387,7 @@ mod tests {
         assert_eq!(first, seal());
         let inner = first.strip_prefix(COMPRESSED_PREFIX).unwrap();
         assert!(
-            open_private_json::<Envelope>(
+            open_envelope::<Envelope>(
                 inner,
                 PEPPER,
                 aad(
@@ -399,7 +407,7 @@ mod tests {
     fn compressed_open_rejects_output_over_the_original_chunk_bound() {
         let expanded = vec![b'b'; super::super::CHUNK_BYTES + 1];
         let compressed = zstd::bulk::compress(&expanded, ZSTD_LEVEL).unwrap();
-        let sealed = seal_private_json_with_nonce(
+        let sealed = seal_envelope_with_nonce(
             &Envelope {
                 bytes: URL_SAFE_NO_PAD.encode(compressed),
             },

@@ -471,7 +471,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
       <AnalyticsMetric {...sampling} label={t('usage.cacheRate')} labelContent={<DetailTooltip content={t('usage.cacheRateHint')}><span tabIndex={0}>{t('usage.cacheRate')}</span></DetailTooltip>} value={formatPercent(summary.cacheRate, locale)} ratio={summary.cacheRate} trend={points.map(point => point.cacheRate)} formatSample={value => formatPercent(value, locale)} />
       <AnalyticsMetric {...sampling} label={t('usage.average')} value={averageDuration.text} title={averageDuration.title} trend={points.map(point => point.averageDurationMs)} formatSample={value => { const display = formatDurationDisplay(value, locale); return display.title ?? display.text; }} />
     </section>}
-    {requests.length > 0 && <p className="request-metrics-scope">{locale === 'zh-CN' ? '仅统计当前已加载请求；背景图按接收时间展示这些记录的分布，不代表全量流量。' : 'Loaded requests only. Background charts group these records by reception time, not total traffic.'}</p>}
+    {requests.length > 0 && <p className="request-metrics-scope">{locale === 'zh-CN' ? '统计范围是当前已加载的请求。背景图按接收时间展示这些记录。' : 'These figures cover the requests loaded on this page. Background charts group them by reception time.'}</p>}
     <LoadingProgress active={loading && requests.length > 0} label={t('common.loading')} />
     {loading && requests.length === 0 ? <LoadingState label={t('common.loading')} level="page" /> : <RequestTable requests={requests} upstreamNames={new Map(upstreams.map((account) => [account.id, account.name]))} onSelect={(request) => void onSelect(request)} onOpenSession={onOpenSession} />}
     {hasOlder && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={onLoadOlder}>{loading ? t('common.loading') : t('traffic.loadOlder')}</Button></div>}
@@ -491,8 +491,8 @@ function RequestDrawer({ detail, upstreamName, accountNames, onOpenSession, onCl
     </div>
     <Button appearance="subtle" aria-expanded={technicalOpen} aria-controls={technicalId} onClick={() => setTechnicalOpen(!technicalOpen)}>{t('request.technicalDetails')}</Button>
     {technicalOpen && <section id={technicalId} className="request-technical-details" aria-label={t('request.technicalDetails')}>
-      <h3>{t('request.request')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
-      <h3>{t('request.response')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
+      <h3>{t('request.rawRequestJson')}</h3><pre>{JSON.stringify(detail.request_body, null, 2)}</pre>
+      <h3>{t('request.rawReturnJson')}</h3><pre>{JSON.stringify(detail.response_body, null, 2)}</pre>
       {detail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(detail.provenance, null, 2)}</pre></>}
       {detail.transport_diagnostics?.length ? <><h3>{locale === 'zh-CN' ? '上游传输诊断' : 'Upstream transport diagnostics'}</h3><pre>{JSON.stringify(detail.transport_diagnostics, null, 2)}</pre></> : null}
     </section>}

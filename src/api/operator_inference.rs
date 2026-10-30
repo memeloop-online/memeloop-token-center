@@ -73,13 +73,16 @@ async fn execute(
         .authenticate_key(&copied.key, state.config.key_pepper.as_bytes())
         .await?;
     drop(copied);
-    let bytes = Bytes::from(serde_json::to_vec(&body.request).map_err(|_| AppError::Internal)?);
+    let bytes = Bytes::from(
+        serde_json::to_vec(&body.request)
+            .map_err(|_| AppError::internal("operator_inference_execute_1"))?,
+    );
     let memory = state.proxy_memory_budget.reservation();
     if !memory.try_grow(
         bytes.len(),
         crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
     ) {
-        return Err(AppError::Overloaded);
+        return Err(AppError::capacity_error("operator_inference_memory"));
     }
     // Operator authorization and caller-controlled forwarding headers must not
     // enter provider requests. Normal gateway routing, policy, usage and billing

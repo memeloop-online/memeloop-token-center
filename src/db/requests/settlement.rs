@@ -146,7 +146,9 @@ impl Database {
                 enforcement_mode: EnforcementMode::from_storage(
                     row.try_get::<String, _>("enforcement_mode")?.as_str(),
                 )
-                .ok_or(AppError::Internal)?,
+                .ok_or(AppError::internal(
+                    "settlement_release_orphaned_reservations_1",
+                ))?,
                 reserved_micros: row.try_get("reserved_micros")?,
                 input_micros_per_million: 0,
                 output_micros_per_million: 0,
@@ -164,7 +166,9 @@ impl Database {
                 micros_per_unit,
             });
             if let Some(request_id) = request_id {
-                let tenant_id = request_tenant_id.ok_or(AppError::Internal)?;
+                let tenant_id = request_tenant_id.ok_or(AppError::internal(
+                    "settlement_release_orphaned_reservations_2",
+                ))?;
                 let response_object = format!("gap://{request_id}/response");
                 let delivery_started = row
                     .try_get::<Option<String>, _>("pending_error_code")?
@@ -172,13 +176,17 @@ impl Database {
                     == Some("delivery_started");
                 let input_token_ceiling = if delivery_started {
                     row.try_get::<Option<i64>, _>("pending_input_tokens")?
-                        .ok_or(AppError::Internal)?
+                        .ok_or(AppError::internal(
+                            "settlement_release_orphaned_reservations_3",
+                        ))?
                 } else {
                     reservation.reserved_tokens
                 };
                 let output_token_ceiling = if delivery_started {
                     row.try_get::<Option<i64>, _>("pending_output_tokens")?
-                        .ok_or(AppError::Internal)?
+                        .ok_or(AppError::internal(
+                            "settlement_release_orphaned_reservations_4",
+                        ))?
                 } else {
                     0
                 };
@@ -285,25 +293,31 @@ pub(crate) fn normalize_proxy_usage_with_output_limit(
     requested_service_tier: Option<&str>,
 ) -> Result<TokenUsage, AppError> {
     validate_token_usage(usage)
-        .map_err(|_| AppError::Upstream("upstream returned invalid token usage".to_owned()))?;
+        .map_err(|_| AppError::upstream("upstream_returned_invalid_token_usage"))?;
     if input_token_ceiling < 0 || output_token_limit.is_some_and(|limit| limit < 0) {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "settlement_normalize_proxy_usage_with_output_limit_1",
+        ));
     }
     let total_input = usage
         .input_tokens
         .checked_add(usage.cached_input_tokens)
         .and_then(|tokens| tokens.checked_add(usage.cache_write_tokens))
-        .ok_or_else(|| AppError::Upstream("upstream returned invalid token usage".to_owned()))?;
+        .ok_or_else(|| AppError::upstream("upstream_returned_invalid_token_usage"))?;
     if total_input > input_token_ceiling
         || output_token_limit.is_some_and(|limit| usage.output_tokens > limit)
     {
-        return Err(AppError::Upstream(
-            "upstream returned invalid token usage".to_owned(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new()
+                .stage("settlement_normalize_proxy_usage_with_output_limit"),
         ));
     }
 
     if let Some(requested) = requested_service_tier {
-        validate_service_tier(requested).map_err(|_| AppError::Internal)?;
+        validate_service_tier(requested).map_err(|_| {
+            AppError::internal("settlement_normalize_proxy_usage_with_output_limit_1")
+        })?;
     }
     let reported = usage.service_tier.as_deref();
     let tier_matches = match requested_service_tier {
@@ -321,8 +335,10 @@ pub(crate) fn normalize_proxy_usage_with_output_limit(
         Some(requested) => reported.is_none() || reported == Some(requested),
     };
     if !tier_matches {
-        return Err(AppError::Upstream(
-            "upstream returned an unrequested service tier".to_owned(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new()
+                .stage("settlement_normalize_proxy_usage_with_output_limit"),
         ));
     }
     let mut normalized = usage.clone();
@@ -370,7 +386,9 @@ pub(crate) fn reservation_ceiling_amounts(
     output_token_ceiling: i64,
 ) -> Result<(i64, i64), AppError> {
     if input_token_ceiling < 0 || output_token_ceiling < 0 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "settlement_reservation_ceiling_amounts_1",
+        ));
     }
     let maximum_input_price = price
         .tiers
@@ -420,7 +438,7 @@ fn usage_contract_amounts(
     // financial hold. Do not price hypothetical usage or apply prepaid budget
     // arithmetic; only validate the token contract needed by finalization.
     if input_token_ceiling < 0 || output_token_ceiling < 0 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("settlement_usage_contract_amounts_1"));
     }
     let tokens = input_token_ceiling
         .checked_add(output_token_ceiling)
@@ -465,7 +483,8 @@ pub(crate) async fn reserve_usage_with_id_in_transaction(
         output_token_ceiling,
         now,
         id,
-        serde_json::to_string(price).map_err(|_| AppError::Internal)?,
+        serde_json::to_string(price)
+            .map_err(|_| AppError::internal("settlement_reserve_usage_with_id_in_transaction_1"))?,
     )
     .await
 }
@@ -543,7 +562,9 @@ pub(crate) async fn reserve_metered_usage_with_id_in_transaction(
             reserved_units: unit_ceiling,
             billing_unit: &price.billing_unit,
             micros_per_unit: price.micros_per_unit,
-            price_snapshot_json: serde_json::to_string(price).map_err(|_| AppError::Internal)?,
+            price_snapshot_json: serde_json::to_string(price).map_err(|_| {
+                AppError::internal("settlement_reserve_metered_usage_with_id_in_transaction_1")
+            })?,
             input_micros_per_million: 0,
             output_micros_per_million: 0,
             price_tiers: Vec::new(),
@@ -675,9 +696,10 @@ async fn reserve_usage_contract_with_id_in_transaction(
         let Some(configured_budget) = configured_budget else {
             continue;
         };
-        let budget_micros = decimal_to_micros(
-            Decimal::from_str_exact(configured_budget).map_err(|_| AppError::Internal)?,
-        )?;
+        let budget_micros =
+            decimal_to_micros(Decimal::from_str_exact(configured_budget).map_err(|_| {
+                AppError::internal("settlement_reserve_usage_contract_with_id_in_transaction_1")
+            })?)?;
         if settled
             .saturating_add(active_reserved)
             .saturating_add(reserved_micros)
@@ -907,12 +929,16 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
             retry_after_seconds: Some(retry_after_until(rate_window_start + 60_000, now)),
         });
     }
-    let (settled_lifetime_micros, active_reserved) = budget_state.ok_or(AppError::Internal)?;
+    let (settled_lifetime_micros, active_reserved) = budget_state.ok_or(AppError::internal(
+        "settlement_resize_usage_reservation_in_transaction_1",
+    ))?;
     let adjusted_active_reserved = active_reserved
         .checked_sub(old_micros)
         .filter(|amount| *amount >= 0)
         .and_then(|amount| amount.checked_add(reserved_micros))
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal(
+            "settlement_resize_usage_reservation_in_transaction_2",
+        ))?;
     let daily_settled = if key.policy.daily_budget.is_some() {
         key_budget_daily_settled(tx, key.key_id, now).await?
     } else {
@@ -947,7 +973,8 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
             continue;
         };
         let budget_micros = decimal_to_micros(
-            Decimal::from_str_exact(configured_budget).map_err(|_| AppError::Internal)?,
+            Decimal::from_str_exact(configured_budget)
+                .map_err(|_| AppError::internal("settlement_site_1"))?,
         )?;
         if settled.saturating_add(adjusted_active_reserved) > budget_micros {
             return Err(AppError::LimitExceeded {
@@ -959,7 +986,9 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
     if tpm_window_applied {
         let token_delta = reserved_tokens
             .checked_sub(old_tokens)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal(
+                "settlement_resize_usage_reservation_in_transaction_3",
+            ))?;
         let rate_updated = sqlx::query(
             "UPDATE rate_limit_windows SET tokens = tokens + $1
              WHERE key_id = $2 AND window_start = $3
@@ -980,7 +1009,7 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
     }
     let micros_delta = reserved_micros
         .checked_sub(old_micros)
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("settlement_site_1"))?;
     let balance_updated = sqlx::query(
         "UPDATE credit_accounts
          SET available_micros = available_micros - $1,
@@ -1014,7 +1043,7 @@ pub(crate) async fn resize_usage_reservation_in_transaction(
     .execute(&mut **tx)
     .await?;
     if budget_updated.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("settlement_site_2"));
     }
     let reservation_updated = sqlx::query(
         "UPDATE usage_reservations SET reserved_micros = $1, reserved_tokens = $2
@@ -1046,7 +1075,8 @@ async fn replace_reservation_price_in_transaction(
     reservation: &UsageReservation,
     price: &ModelPrice,
 ) -> Result<UsageReservation, AppError> {
-    let snapshot = serde_json::to_string(price).map_err(|_| AppError::Internal)?;
+    let snapshot = serde_json::to_string(price)
+        .map_err(|_| AppError::internal("settlement_replace_reservation_price_in_transaction_1"))?;
     let updated = sqlx::query("UPDATE usage_reservations SET price_id = $1, price_snapshot_json = $2 WHERE id = $3 AND account_id = $4 AND key_id = $5 AND status = 'reserved'")
         .bind(price.id.to_string()).bind(snapshot).bind(reservation.id.to_string())
         .bind(reservation.account_id.to_string()).bind(reservation.key_id.to_string())
@@ -1089,7 +1119,9 @@ pub(super) async fn settle_terminal_usage_in_transaction(
             Some(
                 units
                     .checked_mul(metered.micros_per_unit)
-                    .ok_or(AppError::Internal)?,
+                    .ok_or(AppError::internal(
+                        "settlement_settle_terminal_usage_in_transaction_1",
+                    ))?,
             )
         }
         None => None,
@@ -1110,7 +1142,9 @@ pub(crate) async fn settle_metered_usage_in_transaction(
     }
     let actual_micros = billed_units
         .checked_mul(reservation.micros_per_unit)
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal(
+            "settlement_settle_metered_usage_in_transaction_1",
+        ))?;
     settle_token_usage_with_explicit_charge(
         tx,
         &reservation.reservation,
@@ -1202,7 +1236,11 @@ async fn settle_token_usage_with_explicit_charge(
     validate_token_usage(usage)?;
     let calculated_micros = match forced_actual_micros {
         Some(forced) if forced >= 0 => forced,
-        Some(_) => return Err(AppError::Internal),
+        Some(_) => {
+            return Err(AppError::internal(
+                "settlement_settle_token_usage_with_explicit_charge_1",
+            ));
+        }
         None => price_token_usage(reservation, usage)?,
     };
     if lock_projection && reservation.enforcement_mode.enforces_prepaid_limits() {
@@ -1292,7 +1330,8 @@ async fn settle_token_usage_with_explicit_charge(
             .await?;
     let available_micros: i64 = settlement_context.try_get("available_micros")?;
     let policy_json: String = settlement_context.try_get("policy_json")?;
-    let policy: KeyPolicy = serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?;
+    let policy: KeyPolicy = serde_json::from_str(&policy_json)
+        .map_err(|_| AppError::internal("settlement_settle_token_usage_with_explicit_charge_1"))?;
     let mut maximum_charge = available_micros
         .max(0)
         .saturating_add(reservation.reserved_micros);
@@ -1318,7 +1357,8 @@ async fn settle_token_usage_with_explicit_charge(
             continue;
         };
         let budget_micros = decimal_to_micros(
-            Decimal::from_str_exact(configured_budget).map_err(|_| AppError::Internal)?,
+            Decimal::from_str_exact(configured_budget)
+                .map_err(|_| AppError::internal("settlement_site_2"))?,
         )?;
         maximum_charge = maximum_charge.min(
             budget_micros
@@ -1376,7 +1416,7 @@ async fn settle_token_usage_with_explicit_charge(
     .execute(&mut **tx)
     .await?;
     if budget_state.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("settlement_site_3"));
     }
     sqlx::query(
         "INSERT INTO key_budget_daily_rollups (key_id, day_bucket, settled_micros) VALUES ($1, $2, $3) ON CONFLICT(key_id, day_bucket) DO UPDATE SET settled_micros = key_budget_daily_rollups.settled_micros + excluded.settled_micros",
@@ -1432,7 +1472,7 @@ async fn settle_token_usage_with_explicit_charge(
     .execute(&mut **tx)
     .await?;
     if usage_ledger.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("settlement_site_4"));
     }
     sqlx::query(
         "INSERT INTO key_budget_usage_events (usage_entry_id, reservation_id, key_id, account_id, amount_micros, settled_at) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -1593,5 +1633,5 @@ pub(crate) fn price_token_usage(
     ]
     .into_iter()
     .try_fold(0_i64, i64::checked_add)
-    .ok_or(AppError::Internal)
+    .ok_or(AppError::internal("settlement_price_token_usage_1"))
 }

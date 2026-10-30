@@ -9,7 +9,8 @@ pub(super) async fn assert_unknown_request(
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let row = sqlx::query(
-                "SELECT q.completed_at, q.status_code, r.status AS reservation_status, r.actual_micros, \
+                "SELECT q.completed_at, q.status_code, q.usage_basis, q.terminal_cause_code, \
+                 r.status AS reservation_status, r.actual_micros, \
                  p.state, p.unknown_reason, p.receipt_id, p.receipt_digest, p.cost_micros, \
                  o.status_code AS operational_status, o.error_code AS operational_error, \
                  o.completed_at AS operational_completed, o.stage AS operational_stage, \
@@ -27,12 +28,26 @@ pub(super) async fn assert_unknown_request(
             .fetch_one(&pool)
             .await
             .unwrap();
+            assert_eq!(
+                row.get::<Option<i64>, _>("completed_at"),
+                None,
+                "unknown request was financially completed: status={:?}, usage_basis={:?}, \
+                 cause={:?}, reservation_status={}, actual_micros={:?}, settlement_state={}, \
+                 financial_receipt_present={}, ledger_count={}",
+                row.get::<Option<i64>, _>("status_code"),
+                row.get::<Option<String>, _>("usage_basis"),
+                row.get::<Option<String>, _>("terminal_cause_code"),
+                row.get::<String, _>("reservation_status"),
+                row.get::<Option<i64>, _>("actual_micros"),
+                row.get::<String, _>("state"),
+                row.get::<Option<String>, _>("receipt_id").is_some(),
+                row.get::<i64, _>("ledger_count"),
+            );
             if row.get::<Option<String>, _>("unknown_reason").as_deref()
                 == Some("authoritative_usage_unavailable")
                 && fixture.state.proxy_lifecycles.active() == active_owners
                 && row.get::<Option<i64>, _>("operational_completed").is_some()
             {
-                assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
                 assert_eq!(row.get::<Option<i64>, _>("status_code"), None);
                 assert_eq!(row.get::<String, _>("reservation_status"), "reserved");
                 assert_eq!(row.get::<Option<i64>, _>("actual_micros"), None);

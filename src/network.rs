@@ -81,7 +81,8 @@ pub async fn client_for_url(
         && addresses.iter().all(|address| address.ip().is_loopback());
     validate_addresses(&addresses, scope, test_loopback)?;
     validate_transport_security(url.scheme(), &addresses, scope, test_loopback)?;
-    crate::build_pinned_http_client(host_name, &addresses).map_err(|_| AppError::Internal)
+    crate::build_pinned_http_client(host_name, &addresses)
+        .map_err(|_| AppError::internal("network_client_for_url_1"))
 }
 
 /// Return a one-operation client that preserves the ordinary URL validation
@@ -102,7 +103,8 @@ pub(crate) async fn client_for_url_no_retry(
         .map(|host| (host, addresses.as_slice()))
         .into_iter()
         .collect();
-    crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
+    crate::build_no_retry_http_client(None, &pins)
+        .map_err(|_| AppError::internal("network_client_for_url_no_retry_1"))
 }
 
 fn validated_literal_client(
@@ -252,7 +254,8 @@ pub(crate) async fn client_for_oauth_url_no_retry(
                 .into(),
         ));
     }
-    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+    crate::build_no_retry_http_client(Some(proxy_url), &[])
+        .map_err(|_| AppError::internal("network_client_for_oauth_url_no_retry_1"))
 }
 
 async fn config_url_client(
@@ -331,7 +334,7 @@ async fn config_url_client(
     } else {
         crate::build_explicit_proxy_http_client(proxy_url, &pins)
     }
-    .map_err(|_| AppError::Internal)
+    .map_err(|_| AppError::internal("network_config_url_client_1"))
 }
 
 /// Validate the fixed native Codex target and its remote-DNS proxy without
@@ -499,7 +502,8 @@ pub(crate) async fn client_for_codex_oauth_url(
             ));
         }
     }
-    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+    crate::build_no_retry_http_client(Some(proxy_url), &[])
+        .map_err(|_| AppError::internal("network_client_for_codex_oauth_url_1"))
 }
 
 async fn codex_client_for_url(
@@ -523,7 +527,7 @@ async fn codex_client_for_url(
     } else {
         crate::build_explicit_proxy_http_client(proxy_url, &[])
     }
-    .map_err(|_| AppError::Internal)
+    .map_err(|_| AppError::internal("network_codex_client_for_url_1"))
 }
 
 async fn pinned_no_retry_public_client(
@@ -538,7 +542,8 @@ async fn pinned_no_retry_public_client(
         .map(|host| (host, addresses.as_slice()))
         .into_iter()
         .collect();
-    crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
+    crate::build_no_retry_http_client(None, &pins)
+        .map_err(|_| AppError::internal("network_pinned_no_retry_public_client_1"))
 }
 
 pub(crate) async fn validate_managed_codex_proxy(value: &str) -> Result<(), AppError> {
@@ -787,7 +792,7 @@ pub(crate) fn preparation_failure_category(error: &AppError) -> &'static str {
             "dns_resolution"
         }
         AppError::BadRequest(_) => "destination_rejected",
-        AppError::Internal => "client_build",
+        AppError::Internal { .. } => "client_build",
         _ => "preparation_failed",
     }
 }
@@ -1060,9 +1065,22 @@ mod tests {
         let secret = "https://user:secret@example.test/?token=secret";
         for (error, expected) in [
             (AppError::BadRequest(secret.into()), "destination_rejected"),
-            (AppError::Upstream(secret.into()), "preparation_failed"),
-            (AppError::Storage(secret.into()), "preparation_failed"),
-            (AppError::Internal, "client_build"),
+            (
+                AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new()
+                        .stage("network_preparation_labels_never_include_free_text"),
+                ),
+                "preparation_failed",
+            ),
+            (
+                AppError::storage("local_storage_failed"),
+                "preparation_failed",
+            ),
+            (
+                AppError::internal("network_preparation_labels_never_include_free_text_1"),
+                "client_build",
+            ),
             (
                 AppError::BadRequest(DNS_TIMEOUT_MESSAGE.into()),
                 "dns_timeout",

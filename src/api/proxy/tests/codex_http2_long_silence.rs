@@ -9,7 +9,7 @@ use std::{
 };
 
 const CREATED: &[u8] = b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-usage-contract\"}}\n\n";
-const PROGRESS: &str = "event: response.in_progress";
+const PROGRESS: &str = ": keep-alive\n\n";
 const HEARTBEAT_BOUND: Duration = Duration::from_secs(25);
 const SILENCE: Duration = Duration::from_secs(310);
 
@@ -166,6 +166,7 @@ fn assert_terminal(rendered: &str) {
     assert!(!rendered.contains("response.failed"));
     assert!(!rendered.contains("response.incomplete"));
     assert!(!rendered.contains("event: error"));
+    assert!(!rendered.contains("event: response.in_progress"));
 }
 
 fn record_evidence(evidence: Value) {

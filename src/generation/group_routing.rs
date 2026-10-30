@@ -68,13 +68,11 @@ pub(crate) async fn prepare_route_for_protocol(
             break;
         }
     }
-    let native =
-        native.ok_or_else(|| AppError::Upstream(format!("{protocol} route is not configured")))?;
+    let native = native.ok_or_else(|| AppError::upstream("route_is_not_configured"))?;
     if !state.plugins.has_group_routing_hooks() {
         return Ok(native);
     }
-    let mut attempt_budget = MediaAttemptBudget::from_primary(&native, request_id)?;
-    attempt_budget.arm();
+    let attempt_budget = MediaAttemptBudget::from_primary(&native, request_id)?;
     let deadline = attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     crate::group_routing::prepare(
         state,
@@ -102,9 +100,7 @@ pub(crate) async fn prepare_route_for_protocol(
             return Ok(route);
         }
     }
-    Err(AppError::Upstream(format!(
-        "{protocol} candidates are unavailable"
-    )))
+    Err(AppError::upstream("candidates_are_unavailable"))
 }
 
 pub(crate) async fn admit(

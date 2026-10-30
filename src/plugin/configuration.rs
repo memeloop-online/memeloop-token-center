@@ -59,7 +59,13 @@ impl PluginRuntime {
         self.resolve_snapshot_with(
             tenant_id,
             || async {
-                let database = &self.kv.as_ref().ok_or(AppError::Internal)?.database;
+                let database = &self
+                    .kv
+                    .as_ref()
+                    .ok_or(AppError::internal(
+                        "configuration_resolved_traffic_snapshot_1",
+                    ))?
+                    .database;
                 database.plugin_configuration_layers(tenant_id).await
             },
             Instant::now,
@@ -113,12 +119,12 @@ impl PluginRuntime {
                 cache.read_generation = cache
                     .read_generation
                     .checked_add(1)
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("configuration_resolve_snapshot_with_1"))?;
                 (cache.epoch.clone(), cache.read_generation, started)
             };
             let layers = tokio::time::timeout(PLUGIN_CONFIGURATION_CACHE_TTL, read())
                 .await
-                .map_err(|_| AppError::Storage("plugin configuration read timed out".into()))??;
+                .map_err(|_| AppError::storage("plugin_configuration_read_timed_out"))??;
             let mut snapshot = ResolvedTrafficSnapshot {
                 tenant_id,
                 values: BTreeMap::new(),
@@ -148,7 +154,7 @@ impl PluginRuntime {
                 plugin
                     .configuration_validator
                     .as_ref()
-                    .ok_or(AppError::Internal)?
+                    .ok_or(AppError::internal("configuration_resolve_snapshot_with_2"))?
                     .validate(&value)?;
                 let revision = match stored {
                     Some(row) => ResolvedConfigurationRevision {
