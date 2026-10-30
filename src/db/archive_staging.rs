@@ -34,7 +34,7 @@ impl Database {
         if staging.is_empty() {
             let (atoms, nodes, media) = body.into_archive_parts();
             return self
-                .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
+                .prepare_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
                 .await;
         }
         let mut transaction = self.begin_write_transaction().await?;
@@ -126,7 +126,7 @@ impl Database {
                 &mut transaction,
                 lease_owner,
                 request_id,
-                &atoms,
+                atoms,
                 &nodes,
                 &media,
             )

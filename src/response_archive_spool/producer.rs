@@ -905,16 +905,14 @@ async fn run_response_archive_writer(
     #[cfg(test)]
     pause_begin_for_test(&state).await;
     let mut writer = loop {
-        if !active.load(Ordering::Acquire) {
-            return Ok(writer_interrupted(identity, "abandoned_before_begin"));
-        }
         state.db.refresh_closed_persistence_pool();
         match ResponseArchiveWriter::begin_inner(state.clone(), identity).await {
             Ok(writer) => break writer,
             Err(error)
-                if error.diagnostic_category() == "database_operation_failed"
-                    || error.diagnostic_category() == "database_pool_exhausted"
-                    || matches!(error, AppError::DatabaseUnavailable(_)) =>
+                if active.load(Ordering::Acquire)
+                    && (error.diagnostic_category() == "database_operation_failed"
+                        || error.diagnostic_category() == "database_pool_exhausted"
+                        || matches!(&error, AppError::DatabaseUnavailable(_))) =>
             {
                 tracing::warn!(
                     request_id = %identity.request_id,

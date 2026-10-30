@@ -1465,7 +1465,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
     let mut projection_a = tokio::spawn(async move {
         assert!(
             projection_database
-                .prepare_session_body_archive(projector_a, request_a, &atoms_a, &nodes_a, &[])
+                .prepare_session_body_archive(projector_a, request_a, atoms_a, &nodes_a, &[])
                 .await?
         );
         projection_database
@@ -1592,7 +1592,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                         .into_prefix();
                 assert!(
                     database
-                        .prepare_session_body_archive(projector_b, request_b, &atoms, &nodes, &[])
+                        .prepare_session_body_archive(projector_b, request_b, atoms, &nodes, &[])
                         .await?
                 );
                 database
