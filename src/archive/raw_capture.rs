@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use object_store::{PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload};
 use uuid::Uuid;
 
 use super::{ArchiveStore, CasArchiveObject, path::archive_path};
