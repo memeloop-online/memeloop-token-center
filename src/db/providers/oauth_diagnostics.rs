@@ -312,6 +312,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn received_result_survives_pool_timeout_before_durable_staging() {
+        let (database, directory, account) = setup().await;
+        let key = "pool-timeout-stage-recovery";
+        claim(&database, &account, key).await;
+        database
+            .mark_upstream_oauth_refresh_request_started(account.id, key)
+            .await
+            .unwrap();
+        // A separate one-connection process pool reproduces worker/control
+        // pool exhaustion without changing any application-wide timeouts.
+        let mut writer = database.clone();
+        writer.pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(25))
+            .connect(&format!(
+                "sqlite://{}",
+                directory.path().join("diagnostics.db").display()
+            ))
+            .await
+            .unwrap();
+        let held = writer.pool.acquire().await.unwrap();
+        let account_id = account.id;
+        let finish = tokio::spawn(async move {
+            writer
+                .finish_upstream_oauth_refresh(
+                    account_id,
+                    credential(unix_millis() + 900_000),
+                    key,
+                    PEPPER,
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !finish.is_finished(),
+            "pool timeouts must retain the received rotated token for local retry"
+        );
+        drop(held);
+        let installed = tokio::time::timeout(std::time::Duration::from_secs(10), finish)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(installed.credential_generation, 2);
+        let replay = database
+            .claim_upstream_oauth_refresh(account_id, key, PEPPER)
+            .await
+            .unwrap();
+        assert!(matches!(replay, ClaimUpstreamOAuthRefreshResult::Replay(_)));
+        let statuses = database
+            .upstream_oauth_refresh_statuses(&[installed])
+            .await
+            .unwrap();
+        assert!(!statuses[&account_id].automatic_refresh_paused);
+        assert!(!statuses[&account_id].reauthorization_required);
+    }
+
+    #[tokio::test]
     async fn kimi_received_result_survives_a_temporary_local_stage_failure() {
         let (database, directory, account) = setup().await;
         claim(&database, &account, "kimi-stage-recovery").await;
@@ -336,7 +394,7 @@ mod tests {
         let account_id = account.id;
         let finish = tokio::spawn(async move {
             writer
-                .finish_kimi_oauth_refresh(
+                .finish_upstream_oauth_refresh(
                     account_id,
                     credential(unix_millis() + 900_000),
                     "kimi-stage-recovery",

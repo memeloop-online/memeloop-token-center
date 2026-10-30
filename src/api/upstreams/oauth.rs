@@ -943,31 +943,41 @@ pub(crate) async fn refresh_managed_upstream_oauth(
     account_id: Uuid,
     idempotency_key: &str,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
-    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, None).await
+    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, None, None).await
 }
 
 pub(crate) async fn refresh_managed_upstream_oauth_for_worker(
     state: &AppState,
     account_id: Uuid,
     idempotency_key: &str,
+    expected_generation: i64,
     blocking: &crate::worker::BlockingTasks,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
-    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, Some(blocking)).await
+    refresh_managed_upstream_oauth_impl(
+        state,
+        account_id,
+        idempotency_key,
+        Some(expected_generation),
+        Some(blocking),
+    )
+    .await
 }
 
 async fn refresh_managed_upstream_oauth_impl(
     state: &AppState,
     account_id: Uuid,
     idempotency_key: &str,
+    expected_generation: Option<i64>,
     blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
     let pinned = state.clone().pin_application_plugins().await?;
     let state = &pinned;
     let claim = match state
         .db
-        .claim_upstream_oauth_refresh(
+        .claim_upstream_oauth_refresh_for_generation(
             account_id,
             idempotency_key,
+            expected_generation,
             state.config.key_pepper.as_bytes(),
         )
         .await?
@@ -1157,27 +1167,15 @@ async fn refresh_managed_upstream_oauth_impl(
     // A successful authorization-server refresh may have invalidated the old
     // refresh token. Finalize retries therefore stay local; on exhaustion the
     // encrypted pending result and lease remain for exact same-key recovery.
-    let finalized = if driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
-        state
-            .db
-            .finish_kimi_oauth_refresh(
-                account_id,
-                refreshed,
-                idempotency_key,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await
-    } else {
-        state
-            .db
-            .finish_upstream_oauth_refresh(
-                account_id,
-                refreshed,
-                idempotency_key,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await
-    };
+    let finalized = state
+        .db
+        .finish_upstream_oauth_refresh(
+            account_id,
+            refreshed,
+            idempotency_key,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await;
     let account = match finalized {
         Ok(account) => account,
         Err(error) => {

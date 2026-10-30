@@ -126,13 +126,22 @@ unconsumed credential eligible for the next worker pass. Failure to persist
 this transition leaves the marker in place. An ordinary total timeout, a
 received HTTP rejection or a disconnect after POST does not release it.
 
-A complete Kimi result is sealed once and retained for up to seven local
-staging/finalization attempts, with 100ms, 500ms, 1s, 2s, 4s and 8s backoff.
-Only storage/internal failures are retried. Every attempt reuses the same
-ciphertext and existing generation/claim fences, and never calls the provider.
-Other providers keep their original three-attempt behavior. An exhausted local
-failure emits a secret-free error with account ID, generation, stage and error
-category so it can be alerted separately from remote rejection.
+All managed OAuth providers use the same local result installation path. A
+complete result is sealed once and retained for up to seven local staging and
+finalization attempts, with 100ms, 500ms, 1s, 2s, 4s and 8s backoff. Transient
+database unavailability and pool exhaustion join storage/internal failures in
+this bounded local retry. Confirmed storage-full errors, claim conflicts and
+provider rejections are not retried by this loop. Every attempt reuses the same
+ciphertext and generation/claim fences, and never calls the provider. An
+exhausted failure emits a secret-free error with account ID, generation, stage
+and error category so it can be alerted separately from remote rejection.
+
+The existing worker resumes a saved pending result using its original persisted
+idempotency key, including results from manual refresh or worker takeover. It
+does not manufacture a new key to retry a saved result. Before a new remote
+exchange, its selected generation must still match the locked account row;
+manual authorization installed after selection is preserved. Unknown remote
+outcomes without saved results remain excluded from automatic scheduling.
 
 These are bounded protections, not a guarantee against losing an unstaged
 response during a process crash or a prolonged database outage. Already staged
