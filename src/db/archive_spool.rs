@@ -66,6 +66,7 @@ pub(crate) struct ArchiveSpoolChunk {
     pub byte_count: i64,
 }
 
+#[cfg(test)]
 pub(crate) async fn insert_request_archive_gap_in_transaction(
     tx: &mut Transaction<'_, Any>,
     now: i64,

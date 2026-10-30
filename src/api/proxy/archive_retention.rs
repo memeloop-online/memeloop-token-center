@@ -1,6 +1,7 @@
 use axum::body::Bytes;
 use serde_json::{Value, json};
 
+#[cfg(test)]
 pub(crate) fn encode_json_body(original: &Bytes, retained: &Value) -> Bytes {
     serde_json::to_vec(&retained)
         .map(Bytes::from)
@@ -14,6 +15,7 @@ pub(crate) fn encode_json_body(original: &Bytes, retained: &Value) -> Bytes {
 /// Codex and other provider fields stay in that archive; the conversation
 /// record written later in CNPG handles those fields. Objects already stored
 /// with `retained: false` stay unchanged.
+#[cfg(test)]
 pub(crate) fn prepare_json_body_if_valid(original: &Bytes) -> Option<Value> {
     is_ambiguous_json(original).then(|| metadata_only_value("ambiguous_json", original.len()))
 }
@@ -116,6 +118,7 @@ fn metadata_only_value(kind: &str, original_bytes: usize) -> Value {
     })
 }
 
+#[cfg(test)]
 fn metadata_only_body(kind: &str, original_bytes: usize) -> Bytes {
     serde_json::to_vec(&metadata_only_value(kind, original_bytes))
         .map(Bytes::from)
