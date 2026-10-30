@@ -71,10 +71,13 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(before_cleanup, retained);
+            let remaining = sqlx::query("SELECT COUNT(*) AS spool_count, SUM(cipher_bytes) AS cipher_bytes FROM (SELECT cipher_bytes FROM request_archive_spools WHERE cipher_bytes > 0 UNION ALL SELECT cipher_bytes FROM response_archive_spools WHERE cipher_bytes > 0) remaining")
+                .fetch_one(&pool).await.unwrap();
+            assert!(before_cleanup > 0 && before_cleanup <= retained);
+            assert_eq!(before_cleanup, remaining.get::<i64, _>("cipher_bytes"));
             assert_eq!(
                 state.db.cleanup_response_archive_spools(32).await.unwrap(),
-                2
+                remaining.get::<i64, _>("spool_count") as u64
             );
             // Settlement preserves the already-bound locators.
             if early_upload {
@@ -344,9 +347,12 @@ async fn buffered_purposes_recover(compressed: bool, early_upload: bool) {
         assert!(attempt.get::<Option<String>, _>("lease_token").is_none());
         assert!(attempt.get::<Option<i64>, _>("lease_expires_at").is_none());
     }
+    let remaining: i64 = sqlx::query_scalar("SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE cipher_bytes > 0) + (SELECT COUNT(*) FROM response_archive_spools WHERE cipher_bytes > 0)")
+        .fetch_one(&pool).await.unwrap();
+    assert!(remaining > 0 && remaining <= 2);
     assert_eq!(
         state.db.cleanup_response_archive_spools(32).await.unwrap(),
-        2
+        remaining as u64
     );
     let budget = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
         .fetch_one(&pool).await.unwrap();

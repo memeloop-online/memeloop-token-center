@@ -62,11 +62,9 @@ test('wreq-util is the authenticated release with only its reviewed zstd constra
     assert.deepEqual(inventory(patched), upstream, 'unreviewed upstream source or metadata difference');
     const cargo = readFileSync(resolve(repository, 'Cargo.toml'), 'utf8');
     assert.match(cargo, /^zstd = "0\.14\.3"$/m);
-    assert.match(cargo.split('[patch.crates-io]')[1]!, /^wreq-util = \{ path = "vendor\/wreq-util" \}$/m);
+    assert.doesNotMatch(cargo, /^wreq(?:-util|-proto)?\s*=/m);
     const lock = readFileSync(resolve(repository, 'Cargo.lock'), 'utf8');
-    const util = lockEntry(lock, 'wreq-util');
-    assert.match(util, /\nversion = "3\.0\.0-rc\.14"\n/);
-    assert(!util.includes('source =') && !util.includes('checksum ='));
+    assert.doesNotMatch(lock, /^name = "wreq(?:-util|-proto|-rt)?"$/m);
     for (const [name, version, checksum] of [
       ['zstd', '0.14.3', 'db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70'],
       ['zstd-safe', '8.2.0', 'ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b'],

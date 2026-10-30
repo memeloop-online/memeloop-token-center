@@ -935,8 +935,8 @@ impl Database {
                 .fetch_optional(&self.pool)
                 .await?;
                 if terminal_open.is_some_and(|projected_at| projected_at.is_none()) {
-                    self.release_conversation_projection_lease(request_id, lease_owner)
-                        .await?;
+                    self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                        .await;
                     return Ok(false);
                 }
                 let inline: String = prepare.try_get("request_json")?;
@@ -1262,8 +1262,8 @@ impl Database {
             }
             Ok(false) => {
                 transaction.rollback().await?;
-                self.release_conversation_projection_lease(request_id, lease_owner)
-                    .await?;
+                self.try_schedule_rolled_back_conversation_retry(request_id, lease_owner)
+                    .await;
                 Ok(false)
             }
             Err(error) => {
@@ -3114,17 +3114,22 @@ async fn materialize_conversation_content_with_statement_error(
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
         for atom in atom_batch {
+            let encoded_length = crate::gateway_body::memory::json_encoded_length(&atom.content)?;
+            let mut encoded = Vec::with_capacity(encoded_length);
+            serde_json::to_writer(&mut encoded, &atom.content).map_err(|_| {
+                AppError::internal(
+                    "conversations_materialize_conversation_content_with_statement_er",
+                )
+            })?;
+            let encoded =
+                String::from_utf8(encoded).expect("serialized conversation JSON is UTF-8");
             query = query
                 .bind(tenant_id)
                 .bind(&atom.content_hash)
                 .bind(&atom.instance_hash)
                 .bind(&atom.role)
                 .bind(&atom.kind)
-                .bind(serde_json::to_string(&atom.content).map_err(|_| {
-                    AppError::internal(
-                        "conversations_materialize_conversation_content_with_statement_er",
-                    )
-                })?)
+                .bind(encoded)
                 .bind(observed_at);
         }
         query.execute(&mut **transaction).await?;
