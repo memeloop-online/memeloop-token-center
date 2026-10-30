@@ -227,6 +227,9 @@ paths:
         from a service token. The selected key's normal gateway model grants,
         routing policy, expiry, rate limits, balance and billing apply. Its secret
         and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
         Requires an active key with a stored copyable credential. Only JSON
         completions are supported; stream=true is rejected.
       security: [{ serviceBearer: [] }]
@@ -243,6 +246,7 @@ paths:
               required: [key_id, request]
               properties:
                 key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
                 request:
                   type: object
                   additionalProperties: true
@@ -272,6 +276,9 @@ paths:
         from a service token. The selected key's normal gateway model grants,
         routing policy, expiry, rate limits, balance and billing apply. Its secret
         and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
         Requires an active key with a stored copyable credential. Only JSON
         messages are supported; stream=true is rejected.
       security: [{ serviceBearer: [] }]
@@ -288,6 +295,7 @@ paths:
               required: [key_id, request]
               properties:
                 key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
                 request:
                   type: object
                   additionalProperties: true
@@ -301,6 +309,55 @@ paths:
               schema: { type: object, additionalProperties: true }
         '400':
           description: Invalid JSON Messages request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /internal/v1/inference/responses:
+    post:
+      tags: [Client credentials]
+      operationId: operatorResponse
+      summary: Run inference using an explicitly authorized billing credential
+      description: |
+        Requires the same keys:write scope and tenant authorization as copying the
+        selected existing key. Does not mint a credential or infer a user identity
+        from a service token. The selected key's normal gateway model grants,
+        routing policy, expiry, rate limits, balance and billing apply. Its secret
+        and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
+        Requires an active key with a stored copyable credential. Only JSON
+        Responses are supported; stream=true is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key_id, request]
+              properties:
+                key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
+                request:
+                  type: object
+                  additionalProperties: true
+                  properties:
+                    stream: { type: boolean, const: false }
+      responses:
+        '200':
+          description: OpenAI Responses result including image generation output, billed to the selected key
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: Invalid JSON Responses request
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -7532,6 +7589,26 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    OperatorInferenceConversation:
+      type: [object, 'null']
+      additionalProperties: false
+      required: [id]
+      description: Gateway-owned session and turn identifiers; consumed before forwarding the inference request.
+      properties:
+        id: { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+        turn_id:
+          oneOf:
+            - { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+            - { type: 'null' }
+        parent_turn_id:
+          oneOf:
+            - { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+            - { type: 'null' }
+    OperatorInferenceConversationIdentifier:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[A-Za-z0-9._:-]+$'
     SessionContextItem:
       type: object
       required: [node_id, depth, role, kind, phase, text, text_complete, source_chars, content_cursor, text_cursor]
