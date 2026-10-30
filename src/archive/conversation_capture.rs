@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use bytes::Bytes;
-use object_store::{PutMode, PutOptions, PutPayload};
+use object_store::{GetOptions, PutMode, PutOptions, PutPayload, UpdateVersion};
 use serde_json::value::RawValue;
 use uuid::Uuid;
 
@@ -32,15 +32,18 @@ impl ArchiveStore {
         request_id: Uuid,
         hints: &ConversationHints,
         request: Bytes,
-        response: Bytes,
+        response: Option<Bytes>,
         response_complete: bool,
     ) -> Result<CasArchiveObject, AppError> {
         let raw_request = self.put_tenant_content(tenant_id, request.clone()).await?;
-        let raw_response = self.put_tenant_content(tenant_id, response.clone()).await?;
         self.publish_raw_capture(tenant_id, request_id, "request", &raw_request)
             .await?;
-        self.publish_raw_capture(tenant_id, request_id, "response", &raw_response)
-            .await?;
+        let mut raw_captures = vec![RawConversationCapture {
+            request_id: request_id.to_string(),
+            side: "request".into(),
+            format: RawConversationFormat::Json,
+            object: raw_request,
+        }];
         let branch = hints.branch_id.as_deref().unwrap_or("main");
         let mut head = None;
         let mut gaps = Vec::new();
@@ -102,51 +105,63 @@ impl ArchiveStore {
             }
             Err(_) => gaps.push("request_json_invalid".into()),
         }
-        let response_format;
-        if let Ok(document) = serde_json::from_slice::<Box<RawValue>>(&response) {
-            response_format = RawConversationFormat::Json;
-            head = Some(
-                self.append_captured_document(
-                    tenant_id, request_id, branch, hints, head, "response", "document", document,
-                )
-                .await?,
-            );
-        } else {
-            response_format = RawConversationFormat::Sse;
-            let text = std::str::from_utf8(&response)
-                .map_err(|_| AppError::storage("conversation_response_encoding_invalid"))?;
-            let mut data = Vec::new();
-            let mut frames = Vec::new();
-            for line in text.lines().chain(std::iter::once("")) {
-                if line.is_empty() {
-                    if !data.is_empty() {
-                        frames.push(data.join("\n"));
+        if let Some(response) = response {
+            let raw_response = self.put_tenant_content(tenant_id, response.clone()).await?;
+            self.publish_raw_capture(tenant_id, request_id, "response", &raw_response)
+                .await?;
+            let response_format;
+            if let Ok(document) = serde_json::from_slice::<Box<RawValue>>(&response) {
+                response_format = RawConversationFormat::Json;
+                head = Some(
+                    self.append_captured_document(
+                        tenant_id, request_id, branch, hints, head, "response", "document",
+                        document,
+                    )
+                    .await?,
+                );
+            } else if let Ok(text) = std::str::from_utf8(&response) {
+                response_format = RawConversationFormat::Sse;
+                let mut data = Vec::new();
+                let mut frame_count = 0_u64;
+                for line in text.lines().chain(std::iter::once("")) {
+                    if line.is_empty() && !data.is_empty() {
+                        let frame = data.join("\n");
                         data.clear();
+                        if frame.trim() == "[DONE]" {
+                            continue;
+                        }
+                        frame_count += 1;
+                        match RawValue::from_string(frame) {
+                            Ok(document) => {
+                                head = Some(
+                                    self.append_captured_document(
+                                        tenant_id, request_id, branch, hints, head, "response",
+                                        "sse_data", document,
+                                    )
+                                    .await?,
+                                );
+                            }
+                            Err(_) => gaps.push("response_event_json_invalid".into()),
+                        }
+                    } else if let Some(value) = line.strip_prefix("data:") {
+                        data.push(value.strip_prefix(' ').unwrap_or(value));
                     }
-                } else if let Some(value) = line.strip_prefix("data:") {
-                    data.push(value.strip_prefix(' ').unwrap_or(value));
                 }
-            }
-            if frames.is_empty() {
-                gaps.push("response_events_missing".into());
-            }
-            for frame in frames {
-                if frame.trim() == "[DONE]" {
-                    continue;
+                if frame_count == 0 {
+                    gaps.push("response_events_missing".into());
                 }
-                match RawValue::from_string(frame) {
-                    Ok(document) => {
-                        head = Some(
-                            self.append_captured_document(
-                                tenant_id, request_id, branch, hints, head, "response", "sse_data",
-                                document,
-                            )
-                            .await?,
-                        );
-                    }
-                    Err(_) => gaps.push("response_event_json_invalid".into()),
-                }
+            } else {
+                response_format = RawConversationFormat::Binary;
+                gaps.push("response_encoding_invalid".into());
             }
+            raw_captures.push(RawConversationCapture {
+                request_id: request_id.to_string(),
+                side: "response".into(),
+                format: response_format,
+                object: raw_response,
+            });
+        } else {
+            gaps.push("response_missing".into());
         }
         let manifest = ConversationManifest {
             format_version: 1,
@@ -159,20 +174,7 @@ impl ArchiveStore {
             parent_branch_id: None,
             parent_event_id: None,
             head,
-            raw_captures: vec![
-                RawConversationCapture {
-                    request_id: request_id.to_string(),
-                    side: "request".into(),
-                    format: RawConversationFormat::Json,
-                    object: raw_request,
-                },
-                RawConversationCapture {
-                    request_id: request_id.to_string(),
-                    side: "response".into(),
-                    format: response_format,
-                    object: raw_response,
-                },
-            ],
+            raw_captures,
             gaps,
         };
         let object = self.put_conversation_manifest(&manifest, limits()).await?;
@@ -245,7 +247,8 @@ impl ArchiveStore {
         request_id: Uuid,
         manifest: &CasArchiveObject,
     ) -> Result<(), AppError> {
-        self.get_conversation_manifest(tenant_id, manifest, MAX_OBJECT_BYTES)
+        let next = self
+            .get_conversation_manifest(tenant_id, manifest, MAX_OBJECT_BYTES)
             .await?;
         let encoded = serde_json::to_vec(manifest)
             .map_err(|_| AppError::internal("conversation_root_encode"))?;
@@ -253,7 +256,7 @@ impl ArchiveStore {
             .inner
             .put_opts(
                 &archive_path(&request_root(tenant_id, request_id))?,
-                PutPayload::from_bytes(Bytes::from(encoded)),
+                PutPayload::from_bytes(Bytes::from(encoded.clone())),
                 PutOptions {
                     mode: PutMode::Create,
                     ..Default::default()
@@ -264,15 +267,66 @@ impl ArchiveStore {
             Ok(_) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. }) => {
                 let existing = self
-                    .request_conversation_reference(tenant_id, request_id)
+                    .inner
+                    .get_opts(
+                        &archive_path(&request_root(tenant_id, request_id))?,
+                        GetOptions::default(),
+                    )
                     .await?;
-                if existing == *manifest {
-                    Ok(())
-                } else {
-                    Err(AppError::Conflict(
-                        "conversation root content conflict".into(),
-                    ))
+                if existing.meta.size > 4096 {
+                    return Err(AppError::storage("conversation_root_invalid"));
                 }
+                let version = UpdateVersion {
+                    e_tag: existing.meta.e_tag.clone(),
+                    version: existing.meta.version.clone(),
+                };
+                let reference: CasArchiveObject = serde_json::from_slice(&existing.bytes().await?)
+                    .map_err(|_| AppError::storage("conversation_root_invalid"))?;
+                if reference == *manifest {
+                    return Ok(());
+                }
+                let previous = self
+                    .get_conversation_manifest(tenant_id, &reference, MAX_OBJECT_BYTES)
+                    .await?;
+                let preserves_raw = previous.raw_captures.iter().all(|old| {
+                    next.raw_captures.iter().any(|new| {
+                        old.request_id == new.request_id
+                            && old.side == new.side
+                            && old.object == new.object
+                    })
+                });
+                if previous.gaps.is_empty()
+                    || previous.session_id != next.session_id
+                    || previous.branch_id != next.branch_id
+                    || previous.parent_branch_id != next.parent_branch_id
+                    || previous.parent_event_id != next.parent_event_id
+                    || !preserves_raw
+                    || next.gaps.iter().any(|gap| !previous.gaps.contains(gap))
+                    || next.raw_captures.len() < previous.raw_captures.len()
+                    || !self
+                        .conversation_has_prefix(
+                            tenant_id,
+                            next.head.clone(),
+                            &previous.head,
+                            MAX_OBJECT_BYTES,
+                        )
+                        .await?
+                {
+                    return Err(AppError::Conflict(
+                        "conversation root content conflict".into(),
+                    ));
+                }
+                self.inner
+                    .put_opts(
+                        &archive_path(&request_root(tenant_id, request_id))?,
+                        PutPayload::from_bytes(Bytes::from(encoded)),
+                        PutOptions {
+                            mode: PutMode::Update(version),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                Ok(())
             }
             Err(error) => Err(error.into()),
         }

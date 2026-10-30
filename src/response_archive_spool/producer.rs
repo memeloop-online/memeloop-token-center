@@ -502,14 +502,10 @@ async fn fence_failed_capture(
 ) -> Result<(), AppError> {
     #[cfg(test)]
     super::fence_probe::observe(state).await;
-    let result = observe_writer_database(identity, "response_spool_failed_fence", 0, async {
-        state
-            .db
-            .fail_response_archive_spool(identity, "capture_failed")
-            .await
-            .map(|()| true)
-    })
-    .await;
+    let result = state
+        .archive
+        .publish_raw_capture_failure(identity.tenant_id, identity.request_id, "response")
+        .await;
     if let Err(error) = &result {
         tracing::warn!(
             request_id = %identity.request_id,
@@ -518,7 +514,7 @@ async fn fence_failed_capture(
             "failed response archive acknowledgement could not be fenced"
         );
     }
-    result.map(|_| ())
+    result
 }
 
 impl ResponseArchiveProducer {

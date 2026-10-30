@@ -213,6 +213,29 @@ fn validate_node(
 }
 
 impl ArchiveStore {
+    pub(super) async fn conversation_has_prefix(
+        &self,
+        tenant_id: Uuid,
+        mut head: Option<ConversationPrefix>,
+        prefix: &Option<ConversationPrefix>,
+        maximum: usize,
+    ) -> Result<bool, AppError> {
+        let Some(prefix) = prefix else {
+            return Ok(true);
+        };
+        while let Some(current) = head {
+            if current.event_count <= prefix.event_count {
+                return Ok(current == *prefix);
+            }
+            let node: PrefixNode = self
+                .get_conversation_json(tenant_id, &current.object, maximum)
+                .await?;
+            validate_node(tenant_id, &current, &node)?;
+            head = node.parent;
+        }
+        Ok(false)
+    }
+
     async fn put_conversation_json(
         &self,
         tenant_id: Uuid,

@@ -108,7 +108,7 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
         .await
         .unwrap();
     drain_archive_capture(&fixture).await;
-    let failed = sqlx::query("UPDATE request_archive_spools SET state = 'gap', last_error_code = 'capture_failed' WHERE EXISTS (SELECT 1 FROM response_archive_spools s WHERE s.request_id = request_archive_spools.request_id AND s.tenant_id = request_archive_spools.tenant_id AND s.reservation_id = request_archive_spools.reservation_id)")
+    let failed = sqlx::query("UPDATE request_archive_spools SET state = 'gap', last_error_code = 'capture_failed' WHERE EXISTS (SELECT 1 FROM request_records r WHERE r.id = request_archive_spools.request_id AND r.tenant_id = request_archive_spools.tenant_id AND r.reservation_id = request_archive_spools.reservation_id)")
         .execute(&pool).await.unwrap();
     assert_eq!(failed.rows_affected(), 1);
     wait_for_request_settlement(&fixture, 1).await;
@@ -122,7 +122,7 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
     assert_eq!(rows[0].cost, "0.000005");
     assert_eq!(
         rows[0].archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Gap
     );
     let refs = fixture
         .state
@@ -137,13 +137,13 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
     assert!(refs.request_archive_reason.is_some());
     assert_eq!(
         refs.response_archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Bound
     );
     assert!(refs.response_archive_reason.is_none());
     let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
     assert!(detail.archive.request.reason.is_some());
     assert!(detail.archive.response.reason.is_none());
-    assert!(!detail.archive.response.complete);
+    assert!(detail.archive.response.complete);
     drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
@@ -201,7 +201,6 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         serde_json::from_slice::<Value>(&delivered).unwrap()["output"][0]["content"][0]["text"],
         "response survives optional spool rejection"
     );
-    drain_archive_capture(&fixture).await;
     let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
         .fetch_one(&pool)
         .await
@@ -273,23 +272,40 @@ async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
         assert!(!text.contains("private provider detail"));
         if expected_gap {
             let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-            let state = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    if let Some(state) =
-                        sqlx::query_scalar::<_, String>("SELECT state FROM response_archive_spools")
+                    let row: Option<(String, String)> =
+                        sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
                             .fetch_optional(&pool)
                             .await
+                            .unwrap();
+                    if let Some((tenant, request)) = row {
+                        let tenant = Uuid::parse_str(&tenant).unwrap();
+                        let request = Uuid::parse_str(&request).unwrap();
+                        if fixture
+                            .state
+                            .archive
+                            .raw_capture_failed(tenant, request, "response")
+                            .await
                             .unwrap()
-                        && state == "gap"
-                    {
-                        break state;
+                        {
+                            assert!(
+                                fixture
+                                    .state
+                                    .archive
+                                    .raw_capture_reference(tenant, request, "response")
+                                    .await
+                                    .unwrap()
+                                    .is_none()
+                            );
+                            break;
+                        }
                     }
                     tokio::task::yield_now().await;
                 }
             })
             .await
             .expect("owned writer must durably fence the incomplete capture");
-            assert_eq!(state, "gap");
             pool.close().await;
         }
         upstream.verify().await;
@@ -391,30 +407,54 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
             release.send(()).unwrap();
             probe
         });
-        let (state, gap_reason): (String, Option<String>) =
-            tokio::time::timeout(std::time::Duration::from_secs(1), async {
-                loop {
-                    let row: Option<(String, Option<String>)> = sqlx::query_as(
-                        "SELECT state, last_error_code FROM response_archive_spools",
-                    )
-                    .fetch_optional(&pool)
-                    .await
-                    .unwrap();
-                    if let Some(row) = row
-                        && matches!(row.0.as_str(), "pending" | "gap")
-                    {
-                        break row;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let row: Option<(String, String)> =
+                    sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
+                        .fetch_optional(&pool)
+                        .await
+                        .unwrap();
+                if let Some((tenant, request)) = row {
+                    let tenant = Uuid::parse_str(&tenant).unwrap();
+                    let request = Uuid::parse_str(&request).unwrap();
+                    let reference = fixture
+                        .state
+                        .archive
+                        .raw_capture_reference(tenant, request, "response")
+                        .await
+                        .unwrap();
+                    if fail_append {
+                        if fixture
+                            .state
+                            .archive
+                            .raw_capture_failed(tenant, request, "response")
+                            .await
+                            .unwrap()
+                        {
+                            assert!(reference.is_none());
+                            break;
+                        }
+                    } else if let Some(reference) = reference {
+                        let captured = fixture
+                            .state
+                            .archive
+                            .get_tenant_content(tenant, &reference, 1024 * 1024)
+                            .await
+                            .unwrap();
+                        assert_eq!(captured.as_ref(), payload.as_bytes());
+                        break;
                     }
-                    tokio::task::yield_now().await;
                 }
-            })
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the owned writer must eventually seal or fence the capture");
+        let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+            .fetch_one(&pool)
             .await
-            .expect("the owned writer must eventually seal or fence the capture");
-        assert_eq!(state, if fail_append { "gap" } else { "pending" });
-        assert_eq!(
-            gap_reason.as_deref(),
-            fail_append.then_some("capture_failed")
-        );
+            .unwrap();
+        assert_eq!(chunks, 0);
         if let Some(probe) = fence_probe {
             assert_eq!(probe.calls(), 1);
         }

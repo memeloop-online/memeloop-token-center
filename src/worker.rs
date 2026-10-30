@@ -989,6 +989,13 @@ pub(crate) async fn archive_session_body(
             .await?;
         locators.response = Some(response.object_locator);
         locators.pending = false;
+    } else if state
+        .archive
+        .raw_capture_failed(tenant_id, request_id, "response")
+        .await?
+    {
+        locators.response = None;
+        locators.pending = false;
     }
     if let Some(request) = state
         .archive
@@ -1066,11 +1073,9 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
-    // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
-    // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
     let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
         Some(locator) => match load_raw_document(state, &locator).await {
-            Ok(bytes) => bytes,
+            Ok(bytes) => Some(bytes),
             Err(_) => {
                 state
                     .db
@@ -1079,15 +1084,11 @@ pub(crate) async fn archive_session_body(
                 return Ok(false);
             }
         },
-        None => {
-            state
-                .db
-                .defer_session_body_archive(lease_owner, request_id)
-                .await?;
-            return Ok(false);
-        }
+        None => None,
     };
-    let return_document = crate::conversation::raw_return_document(&return_bytes)
+    let return_document = return_bytes
+        .as_deref()
+        .and_then(crate::conversation::raw_return_document)
         .unwrap_or_else(|| serde_json::json!({}));
     state
         .archive

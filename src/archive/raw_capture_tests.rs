@@ -20,6 +20,22 @@ async fn durable_raw_roots_are_idempotent_and_reject_changed_bytes() {
             .is_none()
     );
     store
+        .publish_raw_capture_failure(tenant, request, "response")
+        .await
+        .unwrap();
+    assert!(
+        store
+            .raw_capture_failed(tenant, request, "response")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .raw_capture_failed(Uuid::now_v7(), request, "response")
+            .await
+            .unwrap()
+    );
+    store
         .publish_raw_capture(tenant, request, "response", &original)
         .await
         .unwrap();

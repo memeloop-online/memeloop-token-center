@@ -13,6 +13,46 @@ fn root(tenant: Uuid, request: Uuid, side: &str) -> Result<String, AppError> {
 }
 
 impl ArchiveStore {
+    pub async fn publish_raw_capture_failure(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        side: &str,
+    ) -> Result<(), AppError> {
+        let key = format!("{}.failed", root(tenant, request, side)?);
+        match self
+            .inner
+            .put_opts(
+                &archive_path(&key)?,
+                PutPayload::from_bytes(Bytes::from_static(
+                    br#"{"format_version":1,"reason":"capture_failed"}"#,
+                )),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub async fn raw_capture_failed(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        side: &str,
+    ) -> Result<bool, AppError> {
+        let key = format!("{}.failed", root(tenant, request, side)?);
+        match self.inner.head(&archive_path(&key)?).await {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn publish_raw_capture(
         &self,
         tenant: Uuid,
