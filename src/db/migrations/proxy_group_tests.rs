@@ -84,6 +84,11 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&125));
     assert!(versions.contains(&126));
     for statement in [
+        "DROP TABLE network_proxy_attempt_signals",
+        "DROP TABLE network_proxy_selection_policies",
+        "DROP TABLE network_proxy_group_members",
+        "DROP TABLE network_proxies",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN members_normalized",
         "DROP TABLE session_generated_titles",
         "DROP TABLE session_response_summaries",
         "DROP VIEW model_route_eligible_upstream_accounts",
@@ -287,7 +292,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 148
             ]
         );
     }

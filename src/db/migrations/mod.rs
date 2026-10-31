@@ -758,6 +758,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "retire unused failover deadline config",
         sql: include_str!("../../../migrations/sqlite/0144_retire_failover_deadline.sql"),
     },
+    Migration {
+        version: 148,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0148_network_proxies.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1494,6 +1499,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 144,
         name: "retire unused failover deadline config",
         sql: include_str!("../../../migrations/postgres/0144_retire_failover_deadline.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0148_network_proxies.sql"),
     },
 ];
 

@@ -104,6 +104,16 @@
           },
           "description": "Independent group-routing-plugin WIT world. Requires a component; host validates this contribution's configuration schema and default."
         },
+        "network_proxy_strategy": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["version", "schema", "default"],
+          "properties": {
+            "version": { "const": "network-proxy-strategy-v1" },
+            "schema": { "type": "object" },
+            "default": { "type": "object" }
+          }
+        },
         "request_rewrite": {
           "type": "boolean",
           "default": false,

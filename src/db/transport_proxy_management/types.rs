@@ -5,6 +5,12 @@ pub(crate) struct Member {
     pub id: Uuid,
     pub label: String,
     pub proxy_url: String,
+    #[serde(default = "initial_proxy_version")]
+    pub version: i64,
+}
+
+fn initial_proxy_version() -> i64 {
+    1
 }
 
 #[derive(Deserialize)]
@@ -20,6 +26,7 @@ pub(crate) struct MemberInput {
 pub(crate) struct CreateGroup {
     pub tenant_external_id: String,
     pub name: String,
+    #[serde(alias = "proxy_ids", deserialize_with = "deserialize_member_inputs")]
     pub members: Vec<MemberInput>,
     #[serde(default)]
     pub probe_url: Option<String>,
@@ -33,12 +40,43 @@ pub(crate) struct UpdateGroup {
     pub tenant_external_id: String,
     pub expected_version: i64,
     pub name: String,
+    #[serde(alias = "proxy_ids", deserialize_with = "deserialize_member_inputs")]
     pub members: Vec<MemberInput>,
     pub replacement_member_id: Option<Uuid>,
     #[serde(default)]
     pub probe_url: Option<String>,
     #[serde(default)]
     pub probe_attempts: Option<u8>,
+}
+
+fn deserialize_member_inputs<'input, Deserializer>(
+    deserializer: Deserializer,
+) -> Result<Vec<MemberInput>, Deserializer::Error>
+where
+    Deserializer: serde::Deserializer<'input>,
+{
+    let values = Vec::<Value>::deserialize(deserializer)?;
+    let references = values.first().is_some_and(Value::is_string);
+    values
+        .into_iter()
+        .map(|value| {
+            if value.is_string() != references {
+                return Err(serde::de::Error::custom(
+                    "members and proxy_ids must not be mixed",
+                ));
+            }
+            if references {
+                let id = serde_json::from_value::<Uuid>(value).map_err(serde::de::Error::custom)?;
+                Ok(MemberInput {
+                    id: Some(id),
+                    label: String::new(),
+                    proxy_url: None,
+                })
+            } else {
+                serde_json::from_value(value).map_err(serde::de::Error::custom)
+            }
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -151,6 +189,7 @@ pub(super) fn members(
             id,
             label: item.label,
             proxy_url,
+            version: old.map(|member| member.version).unwrap_or(1),
         });
     }
     Ok(output)
@@ -183,8 +222,12 @@ pub(crate) fn probe_settings(
     Ok((url, attempts))
 }
 
-pub(super) fn view(row: &AnyRow, tenant_external_id: &str, key: &[u8]) -> Result<Value, AppError> {
-    let members = open_members(row, key)?.into_iter().map(|member| {
+pub(super) fn view(
+    row: &AnyRow,
+    tenant_external_id: &str,
+    members: Vec<Member>,
+) -> Result<Value, AppError> {
+    let members = members.into_iter().map(|member| {
         let parsed = url::Url::parse(&member.proxy_url).map_err(|_| AppError::internal("types_view_1"))?;
         Ok(serde_json::json!({"id":member.id,"label":member.label,"scheme":parsed.scheme(),"host":parsed.host_str(),"port":parsed.port().unwrap_or(1080),"remote_dns":true,"has_auth":!parsed.username().is_empty() || parsed.password().is_some()}))
     }).collect::<Result<Vec<_>, AppError>>()?;

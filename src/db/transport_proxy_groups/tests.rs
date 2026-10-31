@@ -539,7 +539,14 @@ async fn delayed_postgres_bootstrap_loads_managed_cache_without_blocking_cached_
     isolated_url.set_port(Some(address.port())).unwrap();
     let cached_account_id = Uuid::new_v4();
     let runtime = Arc::new(groups(cached_account_id, 1));
-    runtime.start(isolated_url.as_str()).unwrap();
+    runtime
+        .start(
+            isolated_url.as_str(),
+            crate::plugin::PluginRuntime::default(),
+            #[cfg(feature = "experimental-plugin-revisions")]
+            None,
+        )
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), receive)
         .await
         .unwrap()

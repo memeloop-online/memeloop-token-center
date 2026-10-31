@@ -106,9 +106,12 @@ PUT 更新完整成员列表；无 `id` 的项为新增成员并要求 `proxy_ur
 
 已绑定组允许重命名、修改标签、增加/移除成员、替换 URL 和调整候选顺序。
 保留 ID 和 URL 均未改变的健康成员选择。移除或替换已绑定组的任意成员时，
-PUT 必须额外传 `replacement_member_id`，指向提交列表中已有 ID 的成员；
-仅当本 Pod 当前选择无法保留时才使用它。缺失/非法替代成员返回 400。
-新增成员 ID 由服务端生成；若要用全新成员替代，可先添加并取得 ID，再提交移除。
+PUT 可省略 `replacement_member_id`：服务端先为新增成员生成 ID，再以最终提交
+列表的第一个成员作为回退。支持一次提交替换所有旧成员，无需分两次保存。
+已有客户端仍可显式指定最终列表中存在的成员 ID；非法替代成员返回 400。
+仅当当前选择无法保留时才使用回退；ID 和 URL 均未改变的当前选择继续保留。
+账号的 initial 成员若 ID 和 URL 均未改变则保留，否则更新为回退成员；
+initial 的更新不会覆盖仍合法的当前选中成员。最终成员列表为空仍返回 400。
 组版本、所有绑定账号的 credential generation / transport revision 和基础代理
 原子更新；账号 binding_version 不变。新请求等待对应快照，在途请求保留原客户端。
 不要求先解绑，不触发 OAuth token 刷新。已绑定组的整体 DELETE 仍返回
@@ -232,3 +235,48 @@ DELETE 解绑请求必须显式选择保留的单代理成员，不提供 DIRECT
 CAS 冲突、绑定原子性及墓碑、禁止 DIRECT、后台配置生效与旧版本拒绝、健康
 选择保持、未知送达不重放，以及 SQLite/PostgreSQL 迁移和重放。
 所有 build/test 在 GHA 执行；不修改生产账号、代理或 Secret，不创建重复 PR。
+
+## 正规网络代理实体与策略（迁移 148）
+
+代理地址由 `network_proxies` 保存，分组只保存有序成员引用。与主线一致，数据库
+保存可直接读取的配置；管理 API 不返回用户名、密码或完整认证 URL。
+`GET/POST /internal/v1/transport-proxies`、`GET/PUT/DELETE /transport-proxies/{id}`
+沿用全局服务凭据的 `providers:write` 权限和租户边界。更新/删除必须提供
+`tenant_external_id`、`expected_version`；更新不传 `proxy_url` 时保留地址。
+仍被组或手动策略引用的代理不能删除。地址、名称或探测配置更新会在同一事务内
+更新引用组版本和账号配置 revision、凭据代次及持久化选择；在途请求保留捕获的旧快照。
+
+组接口支持 `proxy_ids` 或原有 `members`，两者互斥。原有 UI 的成员替换仍一次保存，
+无需先添加再删除。旧成员在后台首次加载或管理访问时事务性转为实体，保留 UUID、
+顺序、地址和原来的探测禁用状态；冲突整体回滚。旧分组探测配置编辑通过同一事务
+同步成员实体；仅将现有实体加入分组不会禁用该实体的独立探测。
+
+`GET/PUT /internal/v1/upstreams/{account_id}/transport-proxy-selection` 管理互斥策略：
+
+- `manual`：提供 `proxy_id`，无需建组，健康变化不会更换出口。
+- `auto`：提供 `group_id`、`expected_group_version` 和可选 `config`。后台综合独立
+  探测和实际传输样本，应用恢复次数、改善阈值与最短驻留期；全差时保留可尝试出口。
+- `plugin`：提供上述组字段、`plugin_id`、`plugin_version` 和 `config`。使用独立
+  `network-proxy-strategy-v1` contribution；插件只在后台执行，不能访问凭据、网络
+  或 KV，输出候选身份和版本必须来自当前租户快照。失败保留当前出口并报告 stale。
+
+策略写入必须同时提供 `tenant_external_id`、`expected_selection_version`、
+`expected_binding_version`、`expected_credential_generation`、`expected_updated_at`。
+写入返回 202；`desired` 是已保存配置，`applied` 是本进程已应用快照。后者仅在
+策略、绑定、凭据和配置 revision 均匹配时返回，否则是 `pending`。不能将其视为
+全 Pod 共识。策略发现及 schema/default 使用 `GET /transport-proxy-strategies`。
+
+每个代理都有独立探测，未绑定也可运行。新建默认 `https://openai.com/`、60 秒、
+2 次，支持显式禁用；目标必须为不含认证和 fragment 的 HTTP(S) URL。
+`POST /transport-proxies/{id}/probe` 带租户和 `expected_version` 返回 202，合并后台
+待探测标记；请求不等待结果。任何目标 HTTP 响应都表示连通；旧版本任务不能覆盖新配置。
+后台探测去重只承诺进程范围，不声称跨 Pod 租约。
+
+`GET /transport-proxies/{id}/observations?tenant_external_id=...&start=...&end=...`
+要求 `requests:read`，时间为毫秒且窗口最多31天。响应区分 `active_health`、
+`request_outcomes` 和 `traffic`。实际结果仅覆盖已记录且带代理版本的 Codex attempts；
+供应商错误与连接失败分开，取消/未知不进入传输成功率分母，无样本返回 null。
+应用载荷字节不等同于网卡或供应商计费字节。主动探测与客户结果分别保存。
+
+客户转发继续读取已有内存快照，不增加请求中的 DB 查询、探测、插件执行或等待队列。
+并发建议及默认公平路由/并发采样由其他主题负责。本 PR 不修改生产 CSIL 出口。

@@ -78,6 +78,7 @@ mod self_service;
 mod session_reading;
 mod session_titles;
 pub(crate) use session_titles::process_one as process_session_title;
+mod network_proxies;
 mod sessions;
 mod sse;
 pub mod startup;
