@@ -243,7 +243,7 @@ impl ArchiveStore {
         Ok(false)
     }
 
-    async fn put_conversation_json(
+    pub(super) async fn put_conversation_json(
         &self,
         tenant_id: Uuid,
         value: &impl Serialize,
