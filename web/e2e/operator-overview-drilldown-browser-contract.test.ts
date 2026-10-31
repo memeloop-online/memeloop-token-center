@@ -195,7 +195,7 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     await page.getByRole('button', { name: 'Add condition', exact: true }).click();
     await page.getByLabel('Field', { exact: true }).selectOption('protocol');
     await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
-    await page.waitForFunction(() => window.overviewDrilldownFixture.requestQueryBodies.length === 1);
+    await page.waitForFunction(() => window.overviewDrilldownFixture.requestQueryBodies.length >= 2);
     await page.getByRole('button', { name: 'Open details for drilled-model', exact: true }).click();
     const drawerOrigin = page.locator('.request-diagnostic-session');
     await drawerOrigin.waitFor();

@@ -10,6 +10,7 @@ import type { TaskFixtureCall } from './session-tasks-state.js';
 import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/sessionViews.css';
+import '../../src/sessionReplay.css';
 import '../../src/operator/operator.css';
 
 window.analyzeCalls = [];
