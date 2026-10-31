@@ -143,7 +143,7 @@ pub(super) fn record_preparation_failure(state: &AppState, failure: PreparationF
             }),
         )
         .await
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("probe_record_preparation_failure_1"))?
     });
 }
 
@@ -879,7 +879,7 @@ impl UpstreamAttemptGuard {
             queue.submit(4096, async move {
                 tokio::time::timeout(std::time::Duration::from_secs(2), completion)
                     .await
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("probe_complete_1"))?;
                 Ok(())
             });
         }
@@ -990,7 +990,7 @@ impl Drop for UpstreamAttemptGuard {
             queue.submit(4096, async move {
                 tokio::time::timeout(std::time::Duration::from_secs(2), completion)
                     .await
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("probe_drop_1"))?;
                 Ok(())
             });
         }
@@ -1155,7 +1155,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 state.routing_persistence.submit(4096, async move {
                     tokio::time::timeout(std::time::Duration::from_millis(250), diagnostic)
                         .await
-                        .map_err(|_| AppError::Internal)?
+                        .map_err(|_| AppError::internal("probe_site_1"))?
                 });
             } else if let Err(error) = diagnostic.await {
                 state.routing_persistence.record_failure_gap();

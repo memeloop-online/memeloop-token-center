@@ -13,9 +13,7 @@ pub(super) fn tenant_cas_location(
     compressed: bool,
 ) -> Result<String, AppError> {
     if !is_lower_hex_digest(digest) {
-        return Err(AppError::Storage(
-            "archive content digest is invalid".into(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     Ok(format!(
         "tenants/{tenant_id}/cas/v1/blake3/{}/{}{}",

@@ -54,7 +54,8 @@ fn conflict() -> AppError {
 }
 
 fn digest(value: &Value) -> Result<String, AppError> {
-    let bytes = serde_json::to_vec(value).map_err(|_| AppError::Internal)?;
+    let bytes =
+        serde_json::to_vec(value).map_err(|_| AppError::internal("pending_settlement_digest_1"))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
@@ -187,13 +188,24 @@ impl Database {
         &self,
         claim: &PendingProxySettlementClaim,
     ) -> Result<(), AppError> {
+        let mut transaction = self.begin_write_transaction().await?;
+        sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4")
+            .bind(claim.request_id.to_string()).bind(claim.tenant_id.to_string())
+            .bind(claim.key_id.to_string()).bind(claim.reservation_id.to_string())
+            .execute(&mut *transaction).await?;
         let marked = sqlx::query("UPDATE pending_proxy_settlements SET unknown_reason = 'authoritative_usage_unavailable', updated_at = $7 WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND reservation_id = $4 AND fence = $5 AND contract_digest = $6 AND state = 'pending'")
             .bind(claim.request_id.to_string()).bind(claim.tenant_id.to_string()).bind(claim.key_id.to_string())
             .bind(claim.reservation_id.to_string()).bind(claim.fence.to_string()).bind(&claim.contract_digest)
-            .bind(unix_millis()).execute(&self.pool).await?;
+            .bind(unix_millis()).execute(&mut *transaction).await?;
         if marked.rows_affected() != 1 {
             return Err(conflict());
         }
+        super::terminal_projection::enqueue_unknown_terminal_projection_in_transaction(
+            &mut transaction,
+            &claim.request_id.to_string(),
+        )
+        .await?;
+        transaction.commit().await?;
         Ok(())
     }
 

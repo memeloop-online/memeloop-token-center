@@ -3,32 +3,19 @@ use super::*;
 
 pub(crate) struct RequestAttemptBudget {
     max_attempts: usize,
-    deadline_window: Option<std::time::Duration>,
-    deadline: Option<tokio::time::Instant>,
     pub(in crate::api::proxy) version: u32,
 }
 
 impl RequestAttemptBudget {
-    pub(crate) fn arm(&mut self) {
-        if self.deadline.is_none() {
-            self.deadline = self
-                .deadline_window
-                .map(|window| tokio::time::Instant::now() + window);
-        }
-    }
-
     pub(crate) fn recovery_wait_deadline(
         &self,
         health: crate::config::UpstreamHealthConfig,
     ) -> tokio::time::Instant {
-        // Reuse the existing configured cooldown + one probe lease, frozen
-        // once with this request; never extend its original network budget.
         let millis = health
             .unavailable_cooldown_millis
             .saturating_add(health.probe_lease_millis)
             .max(0) as u64;
-        let cap = tokio::time::Instant::now() + std::time::Duration::from_millis(millis);
-        self.deadline.map_or(cap, |deadline| deadline.min(cap))
+        tokio::time::Instant::now() + std::time::Duration::from_millis(millis)
     }
     pub(crate) fn from_primary(
         route: &ResolvedUpstream,
@@ -37,22 +24,16 @@ impl RequestAttemptBudget {
         if !codex_transport::is_driver(&route.driver) {
             let budget = Self {
                 max_attempts: PROXY_ROUTING_POLICY.max_attempts(),
-                deadline_window: None,
-                deadline: None,
                 version: 1,
             };
-            budget.record_snapshot(route, request_id, "host_default", None);
+            budget.record_snapshot(route, request_id, "host_default");
             return Ok(budget);
         }
         let policy =
             crate::provider::CodexTransportPolicy::parse(route.config.get("transport_policy"))
                 .map_err(|_| AppError::BadRequest("invalid Codex transport policy".into()))?;
-        // The stored failover clock is not a dispatch gate. A forward ends when
-        // the upstream answers, the client cancels, or the socket fails.
         let budget = Self {
             max_attempts: policy.candidate_attempts,
-            deadline_window: None,
-            deadline: None,
             version: policy.version,
         };
         budget.record_snapshot(
@@ -63,20 +44,13 @@ impl RequestAttemptBudget {
             } else {
                 "codex_default"
             },
-            Some(policy.failover_deadline_millis),
         );
         Ok(budget)
     }
 
     // Only explicit scalar fields cross the logging boundary. In particular,
     // never record route/config/credential Debug output or provider strings.
-    fn record_snapshot(
-        &self,
-        route: &ResolvedUpstream,
-        request_id: Uuid,
-        source: &'static str,
-        deadline_millis: Option<u64>,
-    ) {
+    fn record_snapshot(&self, route: &ResolvedUpstream, request_id: Uuid, source: &'static str) {
         tracing::info!(
             %request_id,
             route_id = %route.route_id,
@@ -87,8 +61,6 @@ impl RequestAttemptBudget {
             policy_source = source,
             policy_version = self.version,
             candidate_attempts = self.max_attempts,
-            failover_deadline_enabled = false,
-            failover_deadline_millis = deadline_millis.unwrap_or(0),
             "proxy request attempt budget frozen"
         );
     }
@@ -104,12 +76,11 @@ impl RequestAttemptBudget {
     pub(in crate::api::proxy) async fn send<F>(
         &self,
         send: F,
-        wait_for_compaction: bool,
+        _wait_for_compaction: bool,
     ) -> Result<ProxyRouteResponse, ProxySendError>
     where
         F: std::future::Future<Output = Result<ProxyRouteResponse, ProxySendError>>,
     {
-        let _ = (wait_for_compaction, self.deadline);
         send.await
     }
 }
@@ -158,15 +129,14 @@ mod tests {
 
     #[test]
     fn snapshot_logs_effective_budgets_and_only_allowlisted_fields() {
-        for (driver, policy, source, attempts, deadline) in [
-            ("http_json", None, "host_default", 3, 0),
-            (codex_transport::DRIVER, None, "codex_default", 3, 300_000),
+        for (driver, policy, source, attempts) in [
+            ("http_json", None, "host_default", 3),
+            (codex_transport::DRIVER, None, "codex_default", 3),
             (
                 codex_transport::DRIVER,
-                Some(json!({"candidate_attempts": 2, "failover_deadline_millis": 1000})),
+                Some(json!({"candidate_attempts": 2})),
                 "account_transport_policy",
                 2,
-                1000,
             ),
         ] {
             let log = LogBuffer::default();
@@ -181,16 +151,12 @@ mod tests {
                     RequestAttemptBudget::from_primary(&route(driver, policy), Uuid::from_u128(3))
                         .unwrap();
                 assert_eq!(budget.max_attempts, attempts);
-                assert!(budget.deadline_window.is_none());
-                assert!(budget.deadline.is_none());
             });
             let bytes = log.0.lock().unwrap();
             let event: Value = serde_json::from_slice(&bytes).unwrap();
             let fields = &event["fields"];
             assert_eq!(fields["policy_source"], source);
             assert_eq!(fields["candidate_attempts"], attempts);
-            assert_eq!(fields["failover_deadline_millis"], deadline);
-            assert_eq!(fields["failover_deadline_enabled"], false);
             assert_eq!(fields["policy_version"], 1);
             assert_eq!(fields["transport_revision"], 42);
             assert_eq!(fields["credential_generation"], 7);
@@ -201,7 +167,7 @@ mod tests {
                 Uuid::from_u128(2).to_string()
             );
             assert_eq!(fields["stage"], "request_attempt_budget_snapshot");
-            assert_eq!(fields.as_object().unwrap().len(), 12);
+            assert_eq!(fields.as_object().unwrap().len(), 10);
             assert!(!String::from_utf8_lossy(&bytes).contains("do-not-log"));
         }
     }
@@ -210,12 +176,10 @@ mod tests {
     async fn later_account_policy_does_not_replenish_the_frozen_budget() {
         let mut primary = route(
             codex_transport::DRIVER,
-            Some(json!({"candidate_attempts": 1, "failover_deadline_millis": 1000})),
+            Some(json!({"candidate_attempts": 1})),
         );
-        let mut budget = RequestAttemptBudget::from_primary(&primary, Uuid::from_u128(3)).unwrap();
-        budget.arm();
-        primary.config["transport_policy"] =
-            json!({"candidate_attempts": 8, "failover_deadline_millis": 300000});
+        let budget = RequestAttemptBudget::from_primary(&primary, Uuid::from_u128(3)).unwrap();
+        primary.config["transport_policy"] = json!({"candidate_attempts": 8});
         assert_eq!(
             budget.terminal_reason(1),
             Some("upstream_attempts_exhausted")
@@ -228,42 +192,28 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recovery_wait_uses_configured_health_cap_without_extending_network_deadline() {
+    async fn recovery_wait_uses_configured_health_cap() {
         let now = tokio::time::Instant::now();
         let mut health = crate::config::UpstreamHealthConfig::DEFAULT;
         health.unavailable_cooldown_millis = 100;
         health.probe_lease_millis = 200;
         let budget = RequestAttemptBudget {
             max_attempts: 2,
-            deadline_window: Some(std::time::Duration::from_millis(250)),
-            deadline: Some(now + std::time::Duration::from_millis(250)),
             version: 1,
         };
         assert_eq!(
             budget.recovery_wait_deadline(health),
-            now + std::time::Duration::from_millis(250)
-        );
-        let unbounded = RequestAttemptBudget {
-            deadline_window: None,
-            deadline: None,
-            ..budget
-        };
-        assert_eq!(
-            unbounded.recovery_wait_deadline(health),
             now + std::time::Duration::from_millis(300)
         );
     }
 
     #[tokio::test(start_paused = true)]
-    async fn absolute_deadline_and_attempt_limit_cannot_be_reset_by_failover() {
-        let mut budget = RequestAttemptBudget {
+    async fn elapsed_time_does_not_reset_or_exhaust_attempt_limit() {
+        let budget = RequestAttemptBudget {
             max_attempts: 2,
-            deadline_window: Some(std::time::Duration::from_secs(1)),
-            deadline: None,
             version: 1,
         };
         assert_eq!(budget.terminal_reason(1), None);
-        budget.arm();
         assert_eq!(budget.terminal_reason(1), None);
         assert_eq!(
             budget.terminal_reason(2),
@@ -295,17 +245,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn ordinary_dispatched_send_outlives_selection_without_replenishing_budget() {
-        let mut budget = RequestAttemptBudget::from_primary(
+        let budget = RequestAttemptBudget::from_primary(
             &route(codex_transport::DRIVER, None),
             Uuid::from_u128(6),
         )
         .unwrap();
-        budget.arm();
         let started = tokio::time::Instant::now();
         let result = budget
             .send(
                 async {
-                    tokio::time::sleep(std::time::Duration::from_secs(310)).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(1_300)).await;
                     Err(ProxySendError::NonRetryableTransport(
                         TransportFailureKind::Http2Reset,
                     ))
@@ -319,7 +268,7 @@ mod tests {
                 TransportFailureKind::Http2Reset
             ))
         );
-        assert_eq!(started.elapsed(), std::time::Duration::from_secs(310));
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(1_300));
         assert_eq!(budget.terminal_reason(1), None);
         let result = budget
             .send(
@@ -341,12 +290,11 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn dispatched_send_remains_cancellable_after_selection_deadline() {
-        let mut budget = RequestAttemptBudget::from_primary(
+        let budget = RequestAttemptBudget::from_primary(
             &route(codex_transport::DRIVER, None),
             Uuid::from_u128(7),
         )
         .unwrap();
-        budget.arm();
         let (dropped, mut observed) = tokio::sync::oneshot::channel::<()>();
         let send = budget.send(
             async move {
@@ -369,28 +317,13 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn deadline_is_frozen_early_but_starts_only_when_armed() {
-        let mut budget = RequestAttemptBudget::from_primary(
-            &route(
-                codex_transport::DRIVER,
-                Some(json!({"failover_deadline_millis": 1000})),
-            ),
+    async fn quiet_time_does_not_create_a_request_deadline() {
+        let budget = RequestAttemptBudget::from_primary(
+            &route(codex_transport::DRIVER, None),
             Uuid::from_u128(5),
         )
         .unwrap();
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
-        assert_eq!(budget.terminal_reason(0), None);
-
-        budget.arm();
-        assert!(budget.deadline.is_none());
-        tokio::time::advance(std::time::Duration::from_millis(500)).await;
-        budget.arm();
-        assert!(
-            budget.deadline.is_none(),
-            "a stored failover clock is not armed"
-        );
-        assert_eq!(budget.terminal_reason(0), None);
-        tokio::time::advance(std::time::Duration::from_millis(500)).await;
+        tokio::time::advance(std::time::Duration::from_secs(1_300)).await;
         assert_eq!(budget.terminal_reason(0), None);
     }
 }

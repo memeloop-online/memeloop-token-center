@@ -88,6 +88,19 @@ test('visible traffic summary has no fabricated rate or latency without terminal
   assert.equal(unknown.successRate, null);
 });
 
+test('a recorded open stage stays in the running count', () => {
+  const summary = summarizeVisibleRequests([
+    { ...request(null, null), in_flight_stage: 'upstream_response_headers' },
+    { ...request(null, null), in_flight_stage: 'upstream_response_body' },
+    { ...request(null, null), in_flight_stage: 'response_delivery' },
+  ]);
+  assert.equal(summary.requests, 3);
+  assert.equal(summary.running, 3);
+  assert.equal(summary.unknown, 0);
+  assert.equal(summary.failed, 0);
+  assert.equal(summary.successful, 0);
+});
+
 test('finished-request rate includes disconnected and interrupted outcomes but not delivery or unknown history', () => {
   const summary = summarizeVisibleRequests([
     request(200, 100),

@@ -8,7 +8,7 @@ import { useAnchoredPopover } from './useAnchoredPopover.js';
 import { DetailTooltip } from './design-system';
 import { RequestStatus } from './RequestStatus';
 import { unnamedSessionName } from './sessionTitles.js';
-import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestFailed, requestIsPending, requestSettlementPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
+import { averageRequestOutputTps, generationRequestOutputTps, nonCachedRequestInput, requestCostCopy, requestCredentialLabel, requestDisplayedCost, requestDurationTooltip, requestFailed, requestIsPending, requestSettlementPending, requestUsageCopy, requestUsageIsActual } from './requestTablePresentation';
 import { requestCompletedAt, requestErrorCopy, requestFailureCause, requestStatusCopy } from './requestStatusPresentation';
 import { credentialDisplayName, principalDisplayName } from './identityPresentation.js';
 
@@ -250,7 +250,11 @@ export function RequestDiagnostics({
   const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
   const duration = formatDurationDisplay(request.duration_ms, locale);
   const completedAt = requestCompletedAt(request);
-  const timingDetails = `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)} · ${t('request.completedAt')}: ${completedAt == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(completedAt).toLocaleString(locale)} · ${t('request.duration')}: ${duration.title ?? missing}`;
+  const timingDetails = [
+    `${t('request.receivedAt')}: ${new Date(request.created_at).toLocaleString(locale)}`,
+    `${t('request.completedAt')}: ${completedAt == null ? (pending ? (zh ? '尚未结束' : 'Still running') : missing) : new Date(completedAt).toLocaleString(locale)}`,
+    requestDurationTooltip(request, locale) || `${t('request.duration')}: ${duration.title ?? missing}`,
+  ].join(' · ');
   const cost = currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: missing };
   const costCopy = requestCostCopy(request, locale);
   const settlement = <DetailTooltip content={costCopy.hint}><span tabIndex={0}>{costCopy.label}</span></DetailTooltip>;
@@ -340,7 +344,7 @@ export function RequestTable({
             const cost = pending ? { text: '—', title: copy.pendingUsage } : currencyForRequest ? formatCurrencyDisplay(requestDisplayedCost(request), currencyForRequest, locale) : { text: '—' };
             const costCopy = requestCostCopy(request, locale);
             const duration = formatDurationDisplay(request.duration_ms, locale);
-            const durationDetails = [duration.title, durationSummary].filter(Boolean).join(' · ');
+            const durationDetails = [requestDurationTooltip(request, locale) || duration.title, durationSummary].filter(Boolean).join(' · ');
             const durationValue = <span className="request-duration-info" aria-label={durationDetails ? [duration.text, durationDetails].join(' · ') : undefined} tabIndex={durationDetails ? 0 : undefined}>{duration.text}</span>;
             const credential = requestCredentialLabel(request, credentialAlias);
             const credentialLabel = 'label' in credential ? credential.label : t(credential.key);

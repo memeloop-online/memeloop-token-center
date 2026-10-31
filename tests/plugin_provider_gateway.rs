@@ -163,7 +163,7 @@ async fn oauth_only_provider_rejects_raw_oauth_on_the_direct_creation_api() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"]["code"], "invalid_request");
     assert!(
-        error["error"]["message"]
+        error["error"]["message_en"]
             .as_str()
             .is_some_and(|message| message.contains("authorization flow"))
     );
@@ -459,6 +459,9 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         .unwrap();
     assert_eq!(exact_account.summary.total_requests, 2);
 
+    let inspection = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
     for request in requests {
         let refs = state
             .db
@@ -466,9 +469,30 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .await
             .unwrap();
         let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-        assert!(refs.request_object.starts_with(&cas_prefix));
+        assert_eq!(
+            refs.request_object,
+            format!(
+                "staging/proxy/{0}/request/{0}/body.json",
+                request.request_id
+            )
+        );
         let response_object = refs.response_object.as_deref().unwrap();
-        assert!(response_object.starts_with(&cas_prefix));
+        assert!(
+            response_object.starts_with(&cas_prefix)
+                || response_object
+                    .starts_with(&format!("staging/proxy/{}/response/", request.request_id))
+        );
+        let bound: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM response_archive_spools s JOIN request_records r ON r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id WHERE r.id = $1 AND r.key_id = $2 AND r.tenant_id = $3 AND s.state = 'bound' AND s.bound_locator = $4 AND r.response_object = $4",
+        )
+        .bind(request.request_id.to_string())
+        .bind(key.key_id.to_string())
+        .bind(key.tenant_id.to_string())
+        .bind(response_object)
+        .fetch_one(&inspection)
+        .await
+        .unwrap();
+        assert_eq!(bound, 1);
         let archived_request = state
             .archive
             .get_bounded(&refs.request_object, 1024 * 1024)
@@ -479,7 +503,15 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .get_bounded(response_object, 1024 * 1024)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&archived_request).contains("requested-model"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&archived_request).unwrap(),
+            json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "canonical"}],
+                "stream": false,
+                "max_tokens": 32
+            })
+        );
         assert_eq!(
             serde_json::from_slice::<Value>(&archived_response).unwrap()["choices"][0]["message"]["content"],
             "normalized by component"
@@ -492,6 +524,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         assert!(!combined.contains("component-api-secret"));
         assert!(!combined.contains("component-api-secret-rotated"));
     }
+    inspection.close().await;
 }
 
 #[tokio::test]
@@ -587,9 +620,10 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut pending = request_ids.to_vec();
+    let mut archive_events_pending = request_ids.to_vec();
     let mut financial_pending = request_ids.to_vec();
     let mut stream = response.into_body().into_data_stream();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut buffered = String::new();
         while let Some(chunk) = stream.next().await {
             buffered.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
@@ -611,21 +645,34 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
                 else {
                     continue;
                 };
-                if event["event_kind"] == "archive_bound" && event["archive_state"] == "bound" {
+                if event["event_kind"] == "archive_bound" {
+                    archive_events_pending.retain(|candidate| *candidate != request_id);
+                }
+                if event["archive_state"] == "bound" {
                     pending.retain(|candidate| *candidate != request_id);
                 }
                 if event["event_kind"] == "finished" {
                     financial_pending.retain(|candidate| *candidate != request_id);
                 }
-                if pending.is_empty() && financial_pending.is_empty() {
+                if pending.is_empty()
+                    && archive_events_pending.is_empty()
+                    && financial_pending.is_empty()
+                {
                     return;
                 }
             }
         }
     })
-    .await
-    .expect("plugin requests reached financial completion and bound archives");
+    .await;
+    assert!(
+        result.is_ok(),
+        "plugin completion barrier: unbound={pending:?}, missing_archive_events={archive_events_pending:?}, missing_financial_events={financial_pending:?}"
+    );
     assert!(pending.is_empty(), "missing archive bindings: {pending:?}");
+    assert!(
+        archive_events_pending.is_empty(),
+        "missing archive events: {archive_events_pending:?}"
+    );
     assert!(
         financial_pending.is_empty(),
         "missing financial completions: {financial_pending:?}"

@@ -97,7 +97,13 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|id| id.parse().map_err(|_| AppError::Internal))
+            .map(|id| {
+                id.parse().map_err(|_| {
+                    AppError::internal(
+                        "model_catalog_list_codex_model_catalog_refresh_candidates_1",
+                    )
+                })
+            })
             .collect()
     }
 
@@ -343,8 +349,9 @@ impl Database {
                     })
                 })
                 .collect::<Vec<_>>();
-            let models_json =
-                serde_json::to_string(&model_values).map_err(|_| AppError::Internal)?;
+            let models_json = serde_json::to_string(&model_values).map_err(|_| {
+                AppError::internal("model_catalog_replace_upstream_model_catalog_1")
+            })?;
             let insert_sql = match self.backend {
                 DatabaseBackend::PostgreSql => {
                     "INSERT INTO upstream_models (snapshot_id, tenant_id, upstream_account_id, model_id, protocol, context_window, reservation_token_bound, reservation_bound_source, created_at) SELECT $2, $3, $4, model.model_id, model.protocol, model.context_window, model.reservation_token_bound, model.reservation_bound_source, $5 FROM jsonb_to_recordset(CAST($1 AS jsonb)) AS model(model_id TEXT, protocol TEXT, context_window BIGINT, reservation_token_bound BIGINT, reservation_bound_source TEXT)"
@@ -420,16 +427,18 @@ impl Database {
         record_group_catalog_evidence(&mut transaction, &tenant_id, account_id, now).await?;
 
         if driver == "openai-codex" {
-            let mut config: Value =
-                serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
-            let object = config.as_object_mut().ok_or(AppError::Internal)?;
+            let mut config: Value = serde_json::from_str(&config_json)
+                .map_err(|_| AppError::internal("model_catalog_site_1"))?;
+            let object = config
+                .as_object_mut()
+                .ok_or(AppError::internal("model_catalog_site_1"))?;
             let mut limits = models
                 .iter()
                 .map(|model| {
                     model
                         .reservation_token_bound
                         .map(|limit| (model.model_id.clone(), Value::from(limit)))
-                        .ok_or(AppError::Internal)
+                        .ok_or(AppError::internal("model_catalog_site_2"))
                 })
                 .collect::<Result<serde_json::Map<String, Value>, AppError>>()?;
             if limits.is_empty() {
@@ -469,7 +478,8 @@ impl Database {
             }
             object.remove("output_token_limits");
             object.insert("reservation_token_bounds".to_owned(), Value::Object(limits));
-            let next_config = serde_json::to_string(&config).map_err(|_| AppError::Internal)?;
+            let next_config = serde_json::to_string(&config)
+                .map_err(|_| AppError::internal("model_catalog_site_2"))?;
             sqlx::query(
                 "UPDATE upstream_accounts SET config_json = $1, updated_at = $2 WHERE id = $3 AND tenant_id = $4 AND credential_generation = $5",
             )
@@ -530,7 +540,9 @@ impl Database {
                 | "invalid_response"
                 | "codex_no_trusted_models"
         ) {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "model_catalog_record_upstream_model_catalog_failure_1",
+            ));
         }
         let mut transaction = self.begin_write_transaction().await?;
         let account_sql = match self.backend {
@@ -707,8 +719,8 @@ impl Database {
             return Ok(AggregatedUpstreamModelCatalogView::default());
         }
 
-        let account_ids_json =
-            serde_json::to_string(&account_ids).map_err(|_| AppError::Internal)?;
+        let account_ids_json = serde_json::to_string(&account_ids)
+            .map_err(|_| AppError::internal("model_catalog_aggregate_upstream_models_1"))?;
         let states_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT a.id, a.credential_generation, s.credential_generation AS state_generation, s.status, s.last_error_code, s.current_snapshot_id, s.expires_at, snapshot.credential_generation AS snapshot_generation FROM upstream_accounts a LEFT JOIN upstream_model_catalog_state s ON s.upstream_account_id = a.id LEFT JOIN upstream_model_catalog_snapshots snapshot ON snapshot.id = s.current_snapshot_id AND snapshot.upstream_account_id = a.id WHERE a.id IN (SELECT selected.item FROM jsonb_array_elements_text(CAST($1 AS jsonb)) AS selected(item))"
@@ -861,7 +873,7 @@ impl Database {
 
 fn uuid_list_json(values: &[Uuid]) -> Result<String, AppError> {
     serde_json::to_string(&values.iter().map(Uuid::to_string).collect::<Vec<String>>())
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("model_catalog_uuid_list_json_1"))
 }
 
 fn escape_like(value: &str) -> String {
