@@ -275,6 +275,7 @@ jobs:
         run: |
           cargo test --locked --all-features --lib request_history -- --nocapture
           cargo test --locked --all-features --lib request_history_real_services_acceptance -- --ignored --nocapture
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Verify pinned Claude privacy component through the host ABI
         id: claude_component
         env:
@@ -360,7 +361,6 @@ jobs:
           "$RUNNER_TEMP/preferred-tools/wasm-tools" component new .plugin-examples/plugin-sources/soonest-reset/target/wasm32-unknown-unknown/release/mtc_soonest_reset.wasm \
             -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Verify the H2 binding build without the default features
         run: cargo test --locked --no-default-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
       - name: Run documentation tests
