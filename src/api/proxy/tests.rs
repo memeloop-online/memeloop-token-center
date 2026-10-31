@@ -5493,7 +5493,7 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
         "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
     );
     let (endpoint, terminal_tx, upstream) =
-        gated_completed_sse_upstream_endpoint(prefix, terminal).await;
+        gated_completed_sse_upstream_endpoint(prefix.clone(), terminal.clone()).await;
 
     let response = send_codex_route_to_endpoint(
         &fixture,
@@ -5527,27 +5527,14 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
 
     // The extra prefix frame occupies the one-slot downstream channel while
     // the provider terminal is captured and sealed. Waiting for the durable
-    // spool state proves the completed usage is already authoritative before
+    // original CAS root proves EOF was consumed before
     // the later receiver drop; no scheduler delay is part of this boundary.
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let state: Option<String> = sqlx::query_scalar(
-                "SELECT state FROM response_archive_spools WHERE request_id = $1",
-            )
-            .bind(request_id.to_string())
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-            if state.as_deref() == Some("pending") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the provider terminal must be sealed before downstream cancellation");
-    pool.close().await;
+    cancellation::assert_original_response(
+        &fixture,
+        request_id,
+        format!("{prefix}{terminal}").as_bytes(),
+    )
+    .await;
     drop(body);
 
     wait_for_request_settlement(&fixture, 1).await;

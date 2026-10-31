@@ -381,7 +381,22 @@ async function oversizeChat(url: string, key: string, bytes: number): Promise<[n
 async function waitForRequestErrors(url: string, key: string, errorCode: string, minimum: number): Promise<number> { const deadline = performance.now() + 20_000; while (performance.now() < deadline) { const values = await apiJson(url, "GET", `/self/v1/requests?${new URLSearchParams({ status: "error", error_code: errorCode, limit: "100" })}`, key); if (Array.isArray(values) && values.length >= minimum) return values.length; await delay(200); } return 0; }
 
 function walkFiles(root: string, current = root): string[] { return readdirSync(current, { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? walkFiles(root, resolve(current, entry.name)) : [resolve(current, entry.name)]); }
-function archiveInventory(root: string): Record<string, number> { return Object.fromEntries(walkFiles(root).map((path) => [relative(root, path).replaceAll("\\", "/"), statSync(path).size])); }
+function archiveInventory(root: string): Record<string, number> {
+  const inventory: Record<string, number> = {};
+  for (const path of walkFiles(root)) {
+    const locator = relative(root, path).replaceAll("\\", "/");
+    const metadata = statSync(path, { throwIfNoEntry: false });
+    if (!metadata) {
+      // Projection spills are intentionally deleted after immutable CAS
+      // publication, and may disappear between readdir and stat. Missing
+      // durable archive objects remain a harness failure.
+      if (locator.startsWith("conversation-staging/v1/")) continue;
+      throw new HarnessFailure(`archive object disappeared during inventory: ${locator}`);
+    }
+    inventory[locator] = metadata.size;
+  }
+  return inventory;
+}
 function expectedMockAssetSha256(total: number): string { const hash = createHash("sha256"); hash.update(MP4_PREFIX); let remaining = total - MP4_PREFIX.length; const block = Buffer.alloc(MIB, "x"); while (remaining) { const take = Math.min(remaining, block.length); hash.update(block.subarray(0, take)); remaining -= take; } return hash.digest("hex"); }
 
 async function streamDownloadToHash(url: string, path: string, key: string, range?: string, timeoutMs = 180_000, chunkDelayMs = 0): Promise<Obj> { const target = new URL(path, url); const headers: Record<string, string> = { authorization: `Bearer ${key}`, connection: "close" }; if (range) headers.range = range; return await new Promise<Obj>((resolveResponse, rejectResponse) => { let settled = false; const reject = (error: Error): void => { if (!settled) { settled = true; rejectResponse(error); } }; const request = requestForURL(target, { headers }, (response) => { void (async () => { const hash = createHash("sha256"); let received = 0; let maximum = 0; try { for await (const raw of response) { const chunk = Buffer.from(raw); hash.update(chunk); received += chunk.length; maximum = Math.max(maximum, chunk.length); if (chunkDelayMs) await delay(chunkDelayMs); } if (settled) return; settled = true; resolveResponse({ status: response.statusCode ?? 0, bytes_received: received, sha256: hash.digest("hex"), maximum_sink_chunk_bytes: maximum, headers: responseHeaders(response) }); } catch (error) { reject(error instanceof Error ? error : new HarnessFailure(String(error))); } })(); }); request.setTimeout(timeoutMs, () => request.destroy(new HarnessFailure(`asset download timed out after ${timeoutMs} ms`))); request.once("error", reject); request.end(); }); }

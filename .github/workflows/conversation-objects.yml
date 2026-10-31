@@ -96,6 +96,9 @@ jobs:
       - run: cargo test --locked --lib codex_retry_streaming_failure_is_redacted_and_records_failed_terminal
       - run: cargo test --locked --lib codex_failed_then_bare_secret_event_is_redacted_for_delivery_and_preserved_in_raw_archive
       - run: cargo test --locked --lib downstream_disconnect_records_unknown_without_waiting_for_stalled_upstream
+      - run: cargo test --locked --lib completed_provider_usage_survives_a_later_downstream_disconnect
+      - run: cargo test --locked --lib real_http2_downstream_reset_and_tcp_close_cancel_once_and_release_permits
+      - run: cargo test --locked --lib native_tls_socks_h1_h2_stream_tool_cancel_and_compact_contract
       - run: cargo test --locked --lib native_codex_ambiguous_transport_after_request_bytes_is_not_replayed
       - run: cargo test --locked --lib api::proxy::tests::upstream_error_details
       - run: cargo test --locked --lib sqlite_semantic_payload_recovers_without_source_or_duplicate_finance
