@@ -148,6 +148,53 @@ async fn read_response(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<
     response
 }
 
+fn response_body(response: &[u8]) -> Vec<u8> {
+    let header_end = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .expect("complete response headers");
+    let headers = std::str::from_utf8(&response[..header_end]).unwrap();
+    let mut body = &response[header_end + 4..];
+    let mut content_length = None;
+    let mut chunked = false;
+    for line in headers.lines().skip(1) {
+        let (name, value) = line.split_once(':').unwrap();
+        if name.eq_ignore_ascii_case("content-length") {
+            assert!(content_length.is_none(), "duplicate Content-Length");
+            content_length = Some(value.trim().parse::<usize>().unwrap());
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            assert!(!chunked, "duplicate Transfer-Encoding");
+            assert!(value.trim().eq_ignore_ascii_case("chunked"));
+            chunked = true;
+        }
+    }
+    if !chunked {
+        assert_eq!(body.len(), content_length.expect("framed response body"));
+        return body.to_vec();
+    }
+    assert!(content_length.is_none(), "ambiguous response framing");
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = body
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")
+            .expect("complete chunk size");
+        let size = std::str::from_utf8(&body[..line_end]).unwrap();
+        let size = usize::from_str_radix(size.split(';').next().unwrap(), 16).unwrap();
+        body = &body[line_end + 2..];
+        if size == 0 {
+            // This handler emits no trailers. Require the terminating blank
+            // line and reject any bytes beyond the complete response.
+            assert_eq!(body, b"\r\n", "complete chunk terminator");
+            return decoded;
+        }
+        assert!(body.len() >= 2 && size <= body.len() - 2, "complete chunk");
+        decoded.extend_from_slice(&body[..size]);
+        assert_eq!(&body[size..size + 2], b"\r\n");
+        body = &body[size + 2..];
+    }
+}
+
 fn assert_rejection(response: &[u8]) {
     let response = std::str::from_utf8(response).unwrap();
     assert!(response.starts_with("HTTP/1.1 413"), "{response}");
@@ -187,7 +234,7 @@ async fn http1_completed_upload_half_close_preserves_pending_response() {
     release.notify_one();
     let response = read_response(&mut socket).await;
     assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
-    assert!(response.ends_with(b"ok"), "{response:?}");
+    assert_eq!(response_body(&response), b"ok");
     assert_eq!(server.reached_handler.load(Ordering::Relaxed), 1);
     assert_eq!(server.state.gateway_body_reads.load(Ordering::Acquire), 0);
     server.stop().await;
