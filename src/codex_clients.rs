@@ -10,6 +10,8 @@ use crate::provider::{CodexTransportPolicy, ResolvedUpstream};
 
 #[derive(Hash, PartialEq, Eq)]
 struct ClientKey {
+    control: bool,
+    settings_revision: u64,
     account_id: uuid::Uuid,
     revision: i64,
     selection_generation: i64,
@@ -35,6 +37,8 @@ impl ClientKey {
         policy: CodexTransportPolicy,
     ) -> Self {
         Self {
+            control: false,
+            settings_revision: 0,
             account_id,
             revision,
             selection_generation: 0,
@@ -55,6 +59,7 @@ fn proxy_fingerprint(credential: &crate::provider::UpstreamCredential) -> [u8; 3
 
 #[derive(Default)]
 pub(crate) struct CodexClients {
+    http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     clients: Mutex<VecDeque<(ClientKey, CachedClient)>>,
     dispatch: dispatch::DispatchLanes,
     #[cfg(test)]
@@ -85,6 +90,42 @@ impl ClientSnapshot {
 }
 
 impl CodexClients {
+    pub(crate) fn control_snapshot(
+        &self,
+        account_id: uuid::Uuid,
+        revision: i64,
+        policy: CodexTransportPolicy,
+        proxy_url: Option<&str>,
+    ) -> Result<reqwest::Client, &'static str> {
+        self.client(
+            ClientKey {
+                control: true,
+                settings_revision: 0,
+                account_id,
+                revision,
+                selection_generation: 0,
+                proxy_fingerprint: Sha256::digest(proxy_url.unwrap_or("").as_bytes()).into(),
+                timeouts: [
+                    policy.connect_timeout_millis.unwrap_or(0),
+                    policy.read_timeout_millis.unwrap_or(0),
+                    policy.request_timeout_millis,
+                ],
+                http_protocol: policy.http_protocol,
+            },
+            policy,
+            proxy_url,
+        )
+    }
+
+    pub(crate) fn with_http_clients(
+        http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
+    ) -> Self {
+        Self {
+            http_clients,
+            ..Self::default()
+        }
+    }
+
     pub(crate) async fn acquire_dispatch(
         &self,
         route: &ResolvedUpstream,
@@ -157,10 +198,12 @@ impl CodexClients {
 
     fn client_snapshot(
         &self,
-        key: ClientKey,
+        mut key: ClientKey,
         policy: CodexTransportPolicy,
         proxy_url: Option<&str>,
     ) -> Result<ClientSnapshot, &'static str> {
+        let settings = self.http_clients.snapshot();
+        key.settings_revision = settings.document.revision;
         let mut clients = self
             .clients
             .lock()
@@ -176,10 +219,23 @@ impl CodexClients {
             clients.push_back(entry);
             return Ok(snapshot);
         }
-        let client = crate::build_codex_http_client_with_proxy(policy, proxy_url)
-            .map_err(|_| "transport_client_unavailable")?;
+        let client = crate::simple_http::configured_codex_builder(
+            &settings,
+            policy,
+            crate::simple_http::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+            proxy_url,
+        )
+        .and_then(|builder| builder.build())
+        .map_err(|_| "transport_client_unavailable")?;
         // Eviction never changes clients already held by in-flight requests.
-        clients.retain(|(cached, _)| cached.account_id != key.account_id);
+        clients.retain(|(cached, _)| {
+            cached.account_id != key.account_id
+                || cached.control != key.control
+                || (cached.settings_revision == key.settings_revision
+                    && cached.revision == key.revision
+                    && cached.http_protocol == key.http_protocol
+                    && cached.timeouts == key.timeouts)
+        });
         if clients.len() >= 64 {
             clients.pop_front();
         }
