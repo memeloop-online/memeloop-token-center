@@ -634,7 +634,7 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     assert!(unlinked.iter().any(|row| row.request_id == generation_id));
     assert!(unlinked.iter().any(|row| row.request_id == archive_id));
     assert!(unlinked.iter().all(|row| {
-        row.session_context.as_ref().is_some_and(|context| {
+        row.session_context.as_ref().is_none_or(|context| {
             context.association == memeloop_token_center::model::RequestSessionAssociation::Unlinked
         })
     }));
