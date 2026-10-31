@@ -297,7 +297,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             to_created_at: Some(to),
             ..Default::default()
         };
-        let expected = database.global_operator_stats_filtered(filter).await?;
+        let expected = database.source_history_stats(None, &filter).await?;
         let actual = client
             .statistics(&HistoryQuery {
                 from_created_at: Some(from),

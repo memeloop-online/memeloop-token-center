@@ -36,6 +36,14 @@ pub(crate) async fn statistics_if_enabled(
     let Some(client) = state.db.history_reader().await? else {
         return Ok(None);
     };
+    let query = query_from_stats_filter(scope, filter)?;
+    Ok(Some(client.statistics(&query).await?))
+}
+
+pub(crate) fn query_from_stats_filter(
+    scope: HistoryScope,
+    filter: &crate::db::StatsFilter,
+) -> Result<HistoryQuery, HistoryError> {
     let filter = RequestListFilter {
         from_created_at: filter.from_created_at,
         to_created_at: filter.to_created_at,
@@ -55,8 +63,7 @@ pub(crate) async fn statistics_if_enabled(
         limit: 500,
         ..RequestListFilter::default()
     };
-    let query = query_from_request_filter(scope, &filter)?;
-    Ok(Some(client.statistics(&query).await?))
+    query_from_request_filter(scope, &filter)
 }
 
 pub fn query_from_request_filter(

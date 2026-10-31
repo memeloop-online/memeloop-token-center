@@ -123,6 +123,8 @@ impl Database {
             ("request_egress_attempts", None),
             ("generation_stats_facts", None),
             ("request_stats_facts", None),
+            ("terminal_projection_outbox", None),
+            ("upstream_accounts", None),
             ("session_archive_correlations", None),
             ("key_records", None),
             ("principals", None),
@@ -142,6 +144,9 @@ impl Database {
                         "generation_stats_facts" => {
                             format!("source = 'generation' AND request_id = {record}.job_id")
                         }
+                        "upstream_accounts" => format!(
+                            "request_id IN (SELECT id FROM request_records WHERE upstream_account_id = {record}.id UNION ALL SELECT id FROM generation_jobs WHERE upstream_account_id = {record}.id)"
+                        ),
                         "key_records" => format!("key_id = {record}.id"),
                         "principals" => format!(
                             "key_id IN (SELECT id FROM key_records WHERE principal_id = {record}.id)"
@@ -451,7 +456,18 @@ impl Database {
                 .await?;
             archive.view = serde_json::from_value(payload.clone())?;
             let fact = self.history_analysis_fact(&identity).await?;
-            serde_json::json!({"archive": archive, "fact": fact})
+            {
+                let upstream_name: Option<String> =
+                    if let Some(upstream) = payload["upstream_account_id"].as_str() {
+                        sqlx::query_scalar("SELECT name FROM upstream_accounts WHERE id = $1")
+                            .bind(upstream)
+                            .fetch_optional(&self.pool)
+                            .await?
+                    } else {
+                        None
+                    };
+                serde_json::json!({"archive": archive, "fact": fact, "upstream_name": upstream_name})
+            }
         } else {
             Value::Null
         };
@@ -471,10 +487,10 @@ impl Database {
     ) -> Result<Value, HistoryError> {
         let sql = match identity.source.as_str() {
             "native" => {
-                "SELECT status_class, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_ms, cost_micros, currency FROM request_stats_facts WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+                "SELECT status_class, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_ms, cost_micros, currency, CAST(NULL AS TEXT) AS modality FROM request_stats_facts WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
             }
             "generation" => {
-                "SELECT status_class, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, billed_units AS generation_units, duration_ms, cost_micros, currency FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+                "SELECT status_class, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, billed_units AS generation_units, duration_ms, cost_micros, currency, modality FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
             }
             _ => return Ok(Value::Null),
         };
@@ -503,7 +519,7 @@ impl Database {
                 serde_json::to_value(row.try_get::<Option<i64>, _>(name)?)?,
             );
         }
-        for name in ["status_class", "currency"] {
+        for name in ["status_class", "currency", "modality"] {
             fact.insert(
                 name.into(),
                 serde_json::to_value(row.try_get::<Option<String>, _>(name)?)?,

@@ -273,6 +273,25 @@ impl Database {
         tenant_id: Option<Uuid>,
         filter: &UsageAnalysisFilter,
     ) -> Result<UsageAnalysisTrendsResponse, AppError> {
+        if self.history_reader().await?.is_some() {
+            let response = self
+                .aggregate_usage_analysis_projection(
+                    tenant_id,
+                    filter,
+                    UsageAnalysisProjection::Trends,
+                )
+                .await?;
+            return Ok(UsageAnalysisTrendsResponse {
+                from_created_at: response.from_created_at,
+                to_created_at: response.to_created_at,
+                granularity: response.granularity,
+                time_zone: response.time_zone,
+                p95_is_approximate: response.p95_is_approximate,
+                p95_method: response.p95_method,
+                summary: response.summary,
+                time_series: response.time_series,
+            });
+        }
         let range = validate_usage_analysis_filter(filter)?;
         let mut snapshot = UsageAnalysisSnapshot::begin(self).await?;
         let mut projections = self
@@ -320,6 +339,24 @@ impl Database {
         filter: &UsageAnalysisFilter,
         projection: UsageAnalysisProjection,
     ) -> Result<UsageAnalysisResponse, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let range = validate_usage_analysis_filter_with_limits(filter, false)?;
+            let scope = match tenant_id {
+                Some(id) if id.is_nil() => crate::request_history::HistoryScope::EmptyTenant,
+                Some(id) => crate::request_history::HistoryScope::Tenant(id),
+                None => crate::request_history::HistoryScope::GlobalOperator,
+            };
+            return Ok(client
+                .usage(
+                    scope,
+                    filter,
+                    projection,
+                    range.from_created_at,
+                    range.to_created_at,
+                    range.granularity.as_str(),
+                )
+                .await?);
+        }
         let range = validate_usage_analysis_filter(filter)?;
         let tenant_scoped = tenant_id.is_some();
         let mut snapshot = UsageAnalysisSnapshot::begin(self).await?;
@@ -776,6 +813,13 @@ fn inclusive_fact_bounds(from_created_at: i128, to_exclusive: i128) -> (i64, i64
 fn validate_usage_analysis_filter(
     filter: &UsageAnalysisFilter,
 ) -> Result<ValidatedUsageAnalysisRange, AppError> {
+    validate_usage_analysis_filter_with_limits(filter, true)
+}
+
+fn validate_usage_analysis_filter_with_limits(
+    filter: &UsageAnalysisFilter,
+    bounded: bool,
+) -> Result<ValidatedUsageAnalysisRange, AppError> {
     const HOUR_RANGE_LIMIT: i64 = 31 * 86_400_000;
     let requested = filter.granularity.as_deref().unwrap_or("auto");
     if !matches!(requested, "auto" | "hour" | "day") {
@@ -799,13 +843,13 @@ fn validate_usage_analysis_filter(
         ));
     }
     let range = to.saturating_sub(from);
-    if range > MAX_STATS_RANGE_MILLIS {
+    if bounded && range > MAX_STATS_RANGE_MILLIS {
         return Err(AppError::BadRequest(
             "usage analysis range must not exceed 93 days".into(),
         ));
     }
     let granularity = match requested {
-        "hour" if range > HOUR_RANGE_LIMIT => {
+        "hour" if bounded && range > HOUR_RANGE_LIMIT => {
             return Err(AppError::BadRequest(
                 "hour granularity range must not exceed 31 days".into(),
             ));

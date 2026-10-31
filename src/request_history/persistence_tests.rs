@@ -247,6 +247,8 @@ async fn request_history_real_services_acceptance() {
             .bind(Uuid::now_v7().to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(Uuid::now_v7().to_string())
             .execute(&database.pool).await.unwrap();
     }
+    sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) SELECT id, created_at, tenant_id, key_id FROM request_records WHERE created_at = 1")
+        .execute(&database.pool).await.unwrap();
     crate::request_history::migration::drain(&database, &client, 1)
         .await
         .unwrap();
