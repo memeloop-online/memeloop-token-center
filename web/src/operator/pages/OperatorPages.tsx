@@ -3,7 +3,6 @@ import { RequestTable } from '../../components';
 import { LoadingProgress, LoadingState, PageLoadingRegion } from '../../design-system';
 import { useI18n } from '../../i18n';
 import type { OperatorMonitoringSnapshot, RequestView, TypedFilterAst, UpstreamAccount, UsageAnalysisSessionBucket, UsageAnalysisTimeBucket } from '../../types';
-import { GenerationWorkspace } from '../GenerationWorkspace';
 import { MonitoringSnapshot } from '../MonitoringSnapshot';
 import { OverviewUpstreamQuota } from '../OverviewUpstreamQuota';
 import { OverviewTrends, useOverviewTrendResource } from '../OverviewTrends';
@@ -101,8 +100,4 @@ export function UsagePage({ token, tenant, onOpenSession }: OperatorPageProps & 
       : upstreamMetadataError && <div className="notice error" role="alert">{t('usage.upstreams')}: {upstreamMetadataError}</div>}
     <UsageAnalysis token={token} tenant={tenant} upstreams={upstreams} onOpenSession={onOpenSession} />
   </PageLoadingRegion>;
-}
-
-export function GenerationsPage({ token, tenant, writeTenant }: OperatorPageProps) {
-  return <GenerationWorkspace token={token} tenant={tenant} writeTenant={writeTenant} />;
 }

@@ -63,10 +63,8 @@ impl TransportProxyGroups {
             let generation: i64 = row.try_get("credential_generation")?;
             let members: Vec<Member> = if group_id.is_some() {
                 active += 1;
-                open_private_json(
+                crate::db::transport_proxy_management::decode_members(
                     &row.try_get::<String, _>("members_ciphertext")?,
-                    &self.key,
-                    b"mtc/transport-proxy-members/v1",
                 )?
             } else {
                 Vec::new()

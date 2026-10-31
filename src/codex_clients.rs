@@ -10,6 +10,8 @@ use crate::provider::{CodexTransportPolicy, ResolvedUpstream};
 
 #[derive(Hash, PartialEq, Eq)]
 struct ClientKey {
+    control: bool,
+    settings_revision: u64,
     account_id: uuid::Uuid,
     revision: i64,
     selection_generation: i64,
@@ -35,14 +37,16 @@ impl ClientKey {
         policy: CodexTransportPolicy,
     ) -> Self {
         Self {
+            control: false,
+            settings_revision: 0,
             account_id,
             revision,
             selection_generation: 0,
             proxy_fingerprint: proxy_fingerprint(credential),
             http_protocol: policy.http_protocol,
             timeouts: [
-                policy.connect_timeout_millis,
-                policy.read_timeout_millis,
+                policy.connect_timeout_millis.unwrap_or(0),
+                policy.read_timeout_millis.unwrap_or(0),
                 policy.request_timeout_millis,
             ],
         }
@@ -55,20 +59,21 @@ fn proxy_fingerprint(credential: &crate::provider::UpstreamCredential) -> [u8; 3
 
 #[derive(Default)]
 pub(crate) struct CodexClients {
+    http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     clients: Mutex<VecDeque<(ClientKey, CachedClient)>>,
     dispatch: dispatch::DispatchLanes,
     #[cfg(test)]
-    test_client: Mutex<Option<wreq::Client>>,
+    test_client: Mutex<Option<reqwest::Client>>,
 }
 
 #[derive(Clone)]
 struct CachedClient {
-    client: wreq::Client,
+    client: reqwest::Client,
     instance_id: uuid::Uuid,
 }
 
 pub(crate) struct ClientSnapshot {
-    pub(crate) client: wreq::Client,
+    pub(crate) client: reqwest::Client,
     pub(crate) instance_id: uuid::Uuid,
     pub(crate) cache_hit: bool,
     proxy_fingerprint: Option<[u8; 32]>,
@@ -85,6 +90,42 @@ impl ClientSnapshot {
 }
 
 impl CodexClients {
+    pub(crate) fn control_snapshot(
+        &self,
+        account_id: uuid::Uuid,
+        revision: i64,
+        policy: CodexTransportPolicy,
+        proxy_url: Option<&str>,
+    ) -> Result<reqwest::Client, &'static str> {
+        self.client(
+            ClientKey {
+                control: true,
+                settings_revision: 0,
+                account_id,
+                revision,
+                selection_generation: 0,
+                proxy_fingerprint: Sha256::digest(proxy_url.unwrap_or("").as_bytes()).into(),
+                timeouts: [
+                    policy.connect_timeout_millis.unwrap_or(0),
+                    policy.read_timeout_millis.unwrap_or(0),
+                    policy.request_timeout_millis,
+                ],
+                http_protocol: policy.http_protocol,
+            },
+            policy,
+            proxy_url,
+        )
+    }
+
+    pub(crate) fn with_http_clients(
+        http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
+    ) -> Self {
+        Self {
+            http_clients,
+            ..Self::default()
+        }
+    }
+
     pub(crate) async fn acquire_dispatch(
         &self,
         route: &ResolvedUpstream,
@@ -97,7 +138,7 @@ impl CodexClients {
         &self,
         route: &ResolvedUpstream,
         selection_generation: i64,
-    ) -> Result<wreq::Client, &'static str> {
+    ) -> Result<reqwest::Client, &'static str> {
         self.transport_snapshot_with_diagnostics(route, selection_generation)
             .map(|snapshot| snapshot.client)
     }
@@ -124,11 +165,11 @@ impl CodexClients {
         let policy = CodexTransportPolicy::parse(route.config.get("transport_policy"))?;
         let mut key = ClientKey::new(route, policy);
         key.selection_generation = selection_generation;
-        self.client_snapshot(key, policy)
+        self.client_snapshot(key, policy, route.credential.proxy().map(|(url, _)| url))
     }
 
     #[cfg(test)]
-    pub(crate) fn install_test_client(&self, client: wreq::Client) {
+    pub(crate) fn install_test_client(&self, client: reqwest::Client) {
         *self.test_client.lock().unwrap() = Some(client);
     }
 
@@ -138,27 +179,31 @@ impl CodexClients {
         account: &crate::provider::UpstreamAccountView,
         credential: &crate::provider::UpstreamCredential,
         selection_generation: i64,
-    ) -> Result<wreq::Client, &'static str> {
+    ) -> Result<reqwest::Client, &'static str> {
         let policy = CodexTransportPolicy::parse(account.config.get("transport_policy"))?;
         let mut key = ClientKey::for_account(account.id, account.updated_at, credential, policy);
         key.selection_generation = selection_generation;
-        self.client(key, policy)
+        self.client(key, policy, credential.proxy().map(|(url, _)| url))
     }
 
     fn client(
         &self,
         key: ClientKey,
         policy: CodexTransportPolicy,
-    ) -> Result<wreq::Client, &'static str> {
-        self.client_snapshot(key, policy)
+        proxy_url: Option<&str>,
+    ) -> Result<reqwest::Client, &'static str> {
+        self.client_snapshot(key, policy, proxy_url)
             .map(|snapshot| snapshot.client)
     }
 
     fn client_snapshot(
         &self,
-        key: ClientKey,
+        mut key: ClientKey,
         policy: CodexTransportPolicy,
+        proxy_url: Option<&str>,
     ) -> Result<ClientSnapshot, &'static str> {
+        let settings = self.http_clients.snapshot();
+        key.settings_revision = settings.document.revision;
         let mut clients = self
             .clients
             .lock()
@@ -174,10 +219,23 @@ impl CodexClients {
             clients.push_back(entry);
             return Ok(snapshot);
         }
-        let client = crate::build_codex_http_client_with_policy(policy)
-            .map_err(|_| "transport_client_unavailable")?;
+        let client = crate::simple_http::configured_codex_builder(
+            &settings,
+            policy,
+            crate::simple_http::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+            proxy_url,
+        )
+        .and_then(|builder| builder.build())
+        .map_err(|_| "transport_client_unavailable")?;
         // Eviction never changes clients already held by in-flight requests.
-        clients.retain(|(cached, _)| cached.account_id != key.account_id);
+        clients.retain(|(cached, _)| {
+            cached.account_id != key.account_id
+                || cached.control != key.control
+                || (cached.settings_revision == key.settings_revision
+                    && cached.revision == key.revision
+                    && cached.http_protocol == key.http_protocol
+                    && cached.timeouts == key.timeouts)
+        });
         if clients.len() >= 64 {
             clients.pop_front();
         }
@@ -257,22 +315,25 @@ mod tests {
                         });
                     }
                 });
-                let client =
-                    crate::build_codex_http_client_with_policy(CodexTransportPolicy::default())
-                        .unwrap();
+                let proxy_url = format!("socks5h://{address}");
+                let client = crate::codex_http_client_builder_with_proxy(
+                    CodexTransportPolicy::default(),
+                    crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+                    use_proxy.then_some(proxy_url.as_str()),
+                )
+                .unwrap()
+                .http2_prior_knowledge()
+                .build()
+                .unwrap();
                 let target = if use_proxy {
                     "http://reset.example.test/v1/responses".to_owned()
                 } else {
                     format!("http://{address}/v1/responses")
                 };
-                let mut request = client
+                let request = client
                     .post(target)
                     .version(http::Version::HTTP_2)
                     .body("synthetic generation");
-                if use_proxy {
-                    request =
-                        request.proxy(wreq::Proxy::all(format!("socks5h://{address}")).unwrap());
-                }
                 let result =
                     tokio::time::timeout(std::time::Duration::from_secs(5), request.send()).await;
                 server.abort();
@@ -280,11 +341,27 @@ mod tests {
                 let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
                 let mut observed = None;
                 while let Some(current) = source {
-                    if let Some(http2) = current.downcast_ref::<http2::Error>() {
-                        observed = Some((http2.is_reset(), http2.is_remote(), http2.reason()));
+                    if let Some(frame) = current.downcast_ref::<http2::Error>() {
+                        observed = Some((frame.is_reset(), frame.is_remote(), frame.reason()));
                         break;
                     }
-                    source = current.source();
+                    if let Some(frame) = current.downcast_ref::<h2::Error>() {
+                        observed = Some((
+                            frame.is_reset(),
+                            frame.is_remote(),
+                            frame
+                                .reason()
+                                .map(|reason| http2::Reason::from(u32::from(reason))),
+                        ));
+                        break;
+                    }
+                    source = match current
+                        .downcast_ref::<std::io::Error>()
+                        .and_then(std::io::Error::get_ref)
+                    {
+                        Some(inner) => Some(inner),
+                        None => current.source(),
+                    };
                 }
                 assert_eq!(observed, Some((true, true, Some(reason))));
                 assert_eq!(connections.load(Ordering::SeqCst), 1);
@@ -306,10 +383,10 @@ mod tests {
             )
         };
         for id in 0..64 {
-            clients.client(key(id), policy).unwrap();
+            clients.client(key(id), policy, None).unwrap();
         }
-        clients.client(key(0), policy).unwrap();
-        clients.client(key(64), policy).unwrap();
+        clients.client(key(0), policy, None).unwrap();
+        clients.client(key(64), policy, None).unwrap();
         let cache = clients.clients.lock().unwrap();
         assert_eq!(cache.len(), 64);
         assert!(cache.iter().any(|(cached, _)| cached == &key(0)));
@@ -385,7 +462,6 @@ mod tests {
                 let client = clients.transport_snapshot(&route, 0).unwrap();
                 let response = client
                     .get("http://keepalive.example.test/")
-                    .proxy(wreq::Proxy::all(&proxy).unwrap())
                     .send()
                     .await
                     .unwrap();
@@ -497,7 +573,7 @@ mod tests {
         assert!(first != ClientKey::new(&route, policy));
         route.transport_revision -= 1;
         let changed = CodexTransportPolicy {
-            connect_timeout_millis: 1000,
+            connect_timeout_millis: Some(1000),
             ..policy
         };
         assert!(first != ClientKey::new(&route, changed));
@@ -521,29 +597,29 @@ mod tests {
             ClientKey::for_account(account_id, 7, &UpstreamCredential::None, policy)
         };
         let initial = clients
-            .client_snapshot(key(account, policy), policy)
+            .client_snapshot(key(account, policy), policy, None)
             .unwrap();
         let other = clients
-            .client_snapshot(key(unrelated, policy), policy)
+            .client_snapshot(key(unrelated, policy), policy, None)
             .unwrap();
         let h1 = CodexTransportPolicy {
             http_protocol: crate::provider::CodexHttpProtocol::Http1Only,
             ..policy
         };
-        let changed = clients.client_snapshot(key(account, h1), h1).unwrap();
+        let changed = clients.client_snapshot(key(account, h1), h1, None).unwrap();
         assert!(!changed.cache_hit);
         assert_ne!(initial.instance_id, changed.instance_id);
-        let reused = clients.client_snapshot(key(account, h1), h1).unwrap();
+        let reused = clients.client_snapshot(key(account, h1), h1, None).unwrap();
         assert!(reused.cache_hit);
         assert_eq!(changed.instance_id, reused.instance_id);
         let rollback = clients
-            .client_snapshot(key(account, policy), policy)
+            .client_snapshot(key(account, policy), policy, None)
             .unwrap();
         assert!(!rollback.cache_hit);
         assert_ne!(rollback.instance_id, changed.instance_id);
         assert_ne!(rollback.instance_id, initial.instance_id);
         let still_other = clients
-            .client_snapshot(key(unrelated, policy), policy)
+            .client_snapshot(key(unrelated, policy), policy, None)
             .unwrap();
         assert!(still_other.cache_hit);
         assert_eq!(other.instance_id, still_other.instance_id);

@@ -3,6 +3,8 @@ import { Button, Disclosure, Select } from './design-system';
 import { useI18n } from './i18n.js';
 import { SessionContextDisclosure, SessionUserText } from './SessionContextContent.js';
 import { prependContextPage, type SessionContextItem, type SessionContextLoader, type SessionContextPage, type SessionResponseSummary } from './sessionContextReader.js';
+import { SessionDialogueEntries } from './sessionReplayViews.js';
+import type { SessionDialogueTurn } from './sessionReplayProjection.js';
 import type { LogicalSessionDetail } from './types.js';
 
 const loaderIdentities = new WeakMap<SessionContextLoader, number>();
@@ -20,9 +22,11 @@ export function DeferredSessionDetails({ label, children }: { label: string; chi
   </Disclosure>;
 }
 
-function RequestContext({ requestId, loader, hiddenUsers, onItems, contextAnswers = true }: {
+function RequestContext({ requestId, loader, hiddenUsers, onItems, contextAnswers = true, preferDialogue = false }: {
   requestId: string; loader: SessionContextLoader; hiddenUsers?: Set<string>;
   onItems?: (requestId: string, items: SessionContextItem[]) => void; contextAnswers?: boolean;
+  /** The newest leaf is the cleaned dialogue. Earlier observations keep their own retained path. */
+  preferDialogue?: boolean;
 }) {
   const { t } = useI18n();
   const [page, setPage] = useState<SessionContextPage>();
@@ -31,6 +35,18 @@ function RequestContext({ requestId, loader, hiddenUsers, onItems, contextAnswer
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
   const [response, setResponse] = useState<SessionResponseSummary>();
+  const [dialogue, setDialogue] = useState<SessionDialogueTurn[] | null | undefined>(preferDialogue && loader.dialogue ? undefined : null);
+  useEffect(() => {
+    if (!preferDialogue || !loader.dialogue) { setDialogue(null); return; }
+    const controller = new AbortController();
+    setDialogue(undefined);
+    void loader.dialogue(requestId, controller.signal).then((turns) => {
+      if (!controller.signal.aborted) setDialogue(turns);
+    }).catch(() => {
+      if (!controller.signal.aborted) setDialogue(null);
+    });
+    return () => controller.abort();
+  }, [loader, requestId, preferDialogue]);
   useEffect(() => {
     if (page) onItems?.(requestId, page.items);
   }, [page, requestId, onItems]);
@@ -71,6 +87,9 @@ function RequestContext({ requestId, loader, hiddenUsers, onItems, contextAnswer
     return () => { controller.abort(); clearTimeout(timer); };
   }, [page?.response, loader, requestId]);
   const items = page?.items ?? [];
+  const waitingForDialogue = preferDialogue && Boolean(loader.dialogue) && dialogue === undefined;
+  const dialogueTurns = dialogue ?? [];
+  const dialogueReadable = dialogueTurns.some((turn) => turn.parts.some((part) => part.kind === 'tool_call' || part.kind === 'tool_result' || Boolean(part.text) || Boolean(part.media_type)));
   const users = items.filter((item) => item.role === 'user' && ['message', 'agent_message'].includes(item.kind) && !hiddenUsers?.has(item.node_id));
   const tools = items.filter((item) => !['message', 'agent_message'].includes(item.kind) || item.role === 'tool');
   // One visible answer per retained user turn. Explicit final markers take
@@ -85,11 +104,16 @@ function RequestContext({ requestId, loader, hiddenUsers, onItems, contextAnswer
     }
   }
   flush();
-  return <div aria-busy={loading}>
-    {loading && <p role="status">{t('common.loading')}</p>}
+  return <div aria-busy={loading || waitingForDialogue}>
+    {(loading || waitingForDialogue) && <p role="status">{t('common.loading')}</p>}
     {failed && <div role="status"><p>{t('sessionReplay.contentFailed')}</p><Button disabled={loading} onClick={() => setRetry((value) => value + 1)}>{t('common.retry')}</Button></div>}
     {page?.next_cursor && !failed && <Button appearance="secondary" disabled={loading} onClick={() => setCursor(page.next_cursor!)}>{t('sessionReplay.contextEarlier')}</Button>}
-    <div className="session-context-columns">
+    {!waitingForDialogue && dialogueReadable && <>
+      <SessionDialogueEntries requestId={requestId} turns={dialogueTurns} />
+      {response && ['pending', 'running'].includes(response.state) && <p role="status">{t('sessionReplay.responsePreparing')}</p>}
+      {response?.state === 'unavailable' && <p role="status">{t('sessionReplay.responseUnavailable')}</p>}
+    </>}
+    {!waitingForDialogue && !dialogueReadable && <div className="session-context-columns">
       <section aria-label={t('sessionReplay.agentOutput')}>
         {contextAnswers && answers.map((item) => <article className="session-replay-entry" key={item.node_id}><div className="session-context-message">{item.text}</div></article>)}
         {response?.state === 'ready' && response.text !== null && <article className="session-replay-entry">
@@ -111,7 +135,7 @@ function RequestContext({ requestId, loader, hiddenUsers, onItems, contextAnswer
                 <SessionContextDisclosure item={item} requestId={requestId} loader={loader} textOnly label={t('sessionReplay.fullMessage')} /></>}
         </article>)}
       </aside>
-    </div>
+    </div>}
     <DeferredSessionDetails label={t('sessionReplay.responseDetails')}>
       {items.filter((item) => !tools.includes(item)).map((item) =>
         <SessionContextDisclosure key={item.node_id} item={item} requestId={requestId} loader={loader} textOnly
@@ -145,7 +169,7 @@ function ContextWindow({ requests, loader }: {
     return <section key={request.request_id} className="session-context-turn" data-request-id={request.request_id}>
       <h4><time dateTime={new Date(request.created_at).toISOString()}>{new Date(request.created_at).toLocaleString(locale)}</time></h4>
       <RequestContext requestId={request.request_id} loader={loader} hiddenUsers={hiddenUsers}
-        onItems={onItems} contextAnswers={index === 0} />
+        onItems={onItems} contextAnswers={index === 0} preferDialogue={index === 0} />
     </section>;
   })}</>;
 }
@@ -161,8 +185,8 @@ export function SessionContextPanel({ detail, loader }: {
   const selected = requests.find((request) => request.request_id === selection);
   const start = Math.max(0, requests.findIndex((request) => request.request_id === anchor));
   const window = requests.slice(start, start + REQUEST_WINDOW);
-  return <section className="session-replay" aria-label={t('sessionReplay.title')}>
-    <header className="session-replay-heading"><h3>{t('sessionReplay.content')}</h3>
+  return <section className="session-replay" aria-label={t('sessionReplay.sessionBody')}>
+    <header className="session-replay-heading"><h3>{t('sessionReplay.sessionBody')}</h3>
       <Select aria-label={t('sessionReplay.contextObservation')} value={selected?.request_id ?? ''}
         onChange={(event) => setSelection(event.target.value || undefined)}>
         <option value="">{t('sessionReplay.conversationHistory')}</option>
@@ -172,7 +196,7 @@ export function SessionContextPanel({ detail, loader }: {
       </Select>
     </header>
     <p className="mtc-secondary-text">{t('sessionReplay.contextScope')}</p>
-    {selected ? <RequestContext key={`${loaderIdentity(loader)}:${selected.request_id}`} requestId={selected.request_id} loader={loader} />
+    {selected ? <RequestContext key={`${loaderIdentity(loader)}:${selected.request_id}`} requestId={selected.request_id} loader={loader} preferDialogue />
       : <>
         <div className="session-replay-heading">
           <Button appearance="secondary" disabled={start + REQUEST_WINDOW >= requests.length}

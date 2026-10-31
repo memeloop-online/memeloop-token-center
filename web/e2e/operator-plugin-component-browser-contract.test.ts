@@ -73,3 +73,96 @@ test('an installed runtime module renders without rebuilding MTC and failures st
     assert.equal(moduleLoads, 1);
   } finally { await browser.close(); await server.close(); }
 });
+
+test('plugin activation shares the complete React DOM and JSX runtimes with host hooks and portals', { timeout: 60_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    return test.skip('Chromium is required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    const pageErrors: string[] = [];
+    const consoleErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
+    page.on('console', message => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
+    });
+    await page.route('**/ui-assets/plugins/**', route => route.fulfill({
+      contentType: 'text/javascript; charset=utf-8',
+      body: `
+        function componentLibrary(loadExternal) {
+          const React = loadExternal('react');
+          const ReactDOM = loadExternal('react-dom');
+          const JSX = loadExternal('react/jsx-runtime');
+          const Context = React.createContext('missing');
+          const PortalCounter = React.memo(function PortalCounter() {
+            const value = React.useContext(Context);
+            const [count, setCount] = React.useState(0);
+            return JSX.jsx('button', {
+              type: 'button',
+              onClick: () => ReactDOM.flushSync(() => setCount(current => current + 1)),
+              children: 'Portal ' + value + ' ' + count,
+            });
+          });
+          return React.memo(function Workspace() {
+            return JSX.jsx(Context.Provider, { value: 'shared', children:
+              JSX.jsxs(JSX.Fragment, { children: [
+                JSX.jsx('div', { 'data-testid': 'runtime-single-instance', children: 'Shared runtime' }),
+                ReactDOM.createPortal(JSX.jsx(PortalCounter, {}), document.getElementById('portal-target')),
+              ] }),
+            });
+          });
+        }
+        export function activateOperatorUi(host) {
+          const expected = window.__operatorRuntimeBindingsFixture;
+          if (!Object.isFrozen(host)) throw new Error('Plugin activation host must be frozen');
+          // Vite may wrap a CommonJS namespace separately at each import site.
+          // Every export, including the default module instance, must stay shared.
+          for (const name of ['React', 'ReactDOM', 'ReactJSXRuntime']) {
+            for (const key of Object.keys(expected[name])) {
+              if (host[name]?.[key] !== expected[name][key]) {
+                throw new Error('Plugin runtime must share host export ' + name + '.' + key);
+              }
+            }
+          }
+          const externals = {
+            react: host.React, 'react-dom': host.ReactDOM, 'react/jsx-runtime': host.ReactJSXRuntime,
+          };
+          // Evaluate the bundled library only after activation supplies externals.
+          const Workspace = componentLibrary(name => {
+            if (!Object.hasOwn(externals, name)) throw new Error('Unknown runtime external');
+            return externals[name];
+          });
+          return host.defineOperatorUiPackage({
+            apiVersion: 'operator-ui-package-v1', pluginId: 'runtime-bindings',
+            compatiblePluginVersions: ['1.0.0'], components: { workspace: Workspace },
+          });
+        }
+      `,
+    }));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-plugin-runtime-bindings.html`);
+    const ready = page.getByTestId('runtime-single-instance');
+    try {
+      await ready.or(page.getByRole('alert')).first().waitFor();
+      assert.equal(await ready.count(), 1, 'the plugin must render instead of its error boundary');
+    } catch (cause) {
+      throw new Error(JSON.stringify({
+        message: 'Runtime binding fixture failed to render',
+        pageErrors,
+        consoleErrors,
+        body: await page.locator('body').innerText(),
+      }), { cause });
+    }
+    assert.equal(await page.getByTestId('runtime-single-instance').innerText(), 'Shared runtime');
+    const portal = page.locator('#portal-target').getByRole('button', { name: 'Portal shared 0', exact: true });
+    await portal.click();
+    await page.locator('#portal-target').getByRole('button', { name: 'Portal shared 1', exact: true }).waitFor();
+    assert.equal(await page.locator('#root #portal-target').count(), 0, 'the portal renders outside the plugin root');
+    assert.deepEqual(pageErrors, []);
+  } finally { await browser.close(); await server.close(); }
+});

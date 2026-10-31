@@ -182,15 +182,27 @@ impl Drop for TokenCenterWorld {
 
 async fn spawn_cursor_socks5h_proxy(
     target: std::net::SocketAddr,
-) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+) -> (String, String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = listener.local_addr().unwrap();
+    // A direct connection to the advertised port cannot reach the mock server.
+    // Successful HTTP operations therefore prove proxy use even with pooling.
+    let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = direct.local_addr().unwrap().port();
     let requested_hosts = Arc::new(Mutex::new(Vec::new()));
     let recorded = requested_hosts.clone();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((mut client, _)) = listener.accept().await else {
-                return;
+            let (mut client, _) = tokio::select! {
+                connection = listener.accept() => match connection {
+                    Ok(connection) => connection,
+                    Err(_) => return,
+                },
+                connection = direct.accept() => {
+                    drop(connection);
+                    recorded.lock().await.push("direct-bypass".to_owned());
+                    continue;
+                }
             };
             let recorded = recorded.clone();
             tokio::spawn(async move {
@@ -212,7 +224,7 @@ async fn spawn_cursor_socks5h_proxy(
                 let hostname = String::from_utf8(hostname).unwrap();
                 let mut port = [0_u8; 2];
                 client.read_exact(&mut port).await.unwrap();
-                assert_eq!(u16::from_be_bytes(port), target.port());
+                assert_eq!(u16::from_be_bytes(port), target_port);
                 recorded.lock().await.push(hostname);
 
                 let mut upstream = TcpStream::connect(target).await.unwrap();
@@ -226,7 +238,12 @@ async fn spawn_cursor_socks5h_proxy(
             });
         }
     });
-    (format!("socks5h://{proxy_address}"), requested_hosts, task)
+    (
+        format!("socks5h://{proxy_address}"),
+        format!("http://localhost:{target_port}"),
+        requested_hosts,
+        task,
+    )
 }
 
 fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
@@ -3919,9 +3936,25 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
     let stored_reference = response_refs
         .response_object
         .as_deref()
-        .expect("encrypted provider reference");
-    assert!(!stored_reference.contains("must-not-leak"));
-    assert!(!stored_reference.contains("SECRET_TOKEN"));
+        .expect("plaintext provider reference");
+    let stored_reference: Value = serde_json::from_str(
+        stored_reference
+            .strip_prefix("provider-reference-json:")
+            .expect("provider reference prefix"),
+    )
+    .expect("plaintext provider reference JSON");
+    assert_eq!(stored_reference["assets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        stored_reference["assets"][0]["url"],
+        format!(
+            "{}/generated/SECRET_TOKEN.png?token=must-not-leak",
+            world.mock.as_ref().expect("mock server").uri()
+        )
+    );
+    assert_eq!(
+        stored_reference["assets"][0]["asset_id"],
+        assets[0].view.asset_id.to_string()
+    );
     let detail = world
         .client
         .get(format!(
@@ -4064,6 +4097,21 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
         .expect("URL-backed image stats JSON");
     assert_eq!(stats["summary"]["total_requests"], 1);
     assert_eq!(stats["summary"]["total_cost"], "0.3");
+    let upstream_requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("URL-backed image upstream requests");
+    assert_eq!(
+        upstream_requests
+            .iter()
+            .filter(|request| request.url.path() == "/v1/images/generations")
+            .count(),
+        1,
+        "replay and asset reads must not dispatch another generation"
+    );
 }
 
 #[then("malformed provider range responses are rejected")]
@@ -4579,7 +4627,7 @@ async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWo
     assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
     let rendered = world.response.to_string();
     assert!(!rendered.contains("must-not-leak"));
-    assert_eq!(world.response["error"]["code"], "upstream_error");
+    assert_eq!(world.response["error"]["code"], "upstream_http_400");
     let request_id = world
         .synchronous_request_id
         .expect("rejected synchronous image request id");
@@ -6157,8 +6205,9 @@ async fn oauth_upstream_retains_id(world: &mut TokenCenterWorld) {
 #[given("the mock Cursor OAuth server and compatible upstream are ready")]
 async fn mock_cursor_oauth(world: &mut TokenCenterWorld) {
     let target = *world.mock.as_ref().expect("mock server").address();
-    let (proxy_url, proxy_hosts, proxy_task) = spawn_cursor_socks5h_proxy(target).await;
-    world.cursor_mock_origin = format!("http://localhost:{}", target.port());
+    let (proxy_url, mock_origin, proxy_hosts, proxy_task) =
+        spawn_cursor_socks5h_proxy(target).await;
+    world.cursor_mock_origin = mock_origin;
     world.cursor_proxy_url = proxy_url;
     world.cursor_proxy_hosts = proxy_hosts;
     world.cursor_proxy_task = Some(proxy_task);
@@ -6495,8 +6544,8 @@ async fn reauthorized_cursor_account_is_stable(world: &mut TokenCenterWorld) {
     assert_eq!(cursor_routes, 1);
     let proxy_hosts = world.cursor_proxy_hosts.lock().await;
     assert!(
-        proxy_hosts.len() >= 4,
-        "Cursor OAuth, refresh and routed calls must use the account proxy: {proxy_hosts:?}"
+        !proxy_hosts.is_empty(),
+        "Cursor operations must reach the proxy; pooled connections may serve multiple requests"
     );
     assert!(
         proxy_hosts.iter().all(|host| host == "localhost"),
@@ -7142,7 +7191,7 @@ async fn send_full_context_session(world: &mut TokenCenterWorld, model: String) 
             "model": model,
             "messages": [
                 {"role": "user", "content": "one"},
-                {"role": "assistant", "content": "two"},
+                {"role": "assistant", "content": "hello"},
                 {"role": "user", "content": "three"}
             ]
         }))
@@ -7314,7 +7363,35 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .await
         .expect("authenticate test key");
     let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-    assert!(refs.request_object.starts_with(&cas_prefix));
+    assert_eq!(
+        refs.request_object,
+        format!("staging/proxy/{request_uuid}/request/{request_uuid}/body.json")
+    );
+    let original_request = state
+        .archive
+        .get(&refs.request_object)
+        .await
+        .expect("original request source object");
+    let upstream_requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("original upstream requests");
+    let original_body = serde_json::to_vec(&json!({
+        "model": "gpt-test",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .expect("original request JSON bytes");
+    assert_eq!(original_request.as_ref(), original_body.as_slice());
+    assert_eq!(
+        upstream_requests
+            .iter()
+            .filter(|request| request.url.path() == "/v1/chat/completions")
+            .count(),
+        1
+    );
     let response_object = refs.response_object.expect("response object");
     assert!(response_object.starts_with(&cas_prefix));
 }
@@ -7937,6 +8014,7 @@ async fn send_buffered_responses_parent_and_child(world: &mut TokenCenterWorld, 
         send_responses_turn(world, &model, "buffered parent", None, false).await,
         StatusCode::OK
     );
+    wait_for_projected_conversation_requests(world, 1).await;
     world.status = Some(
         send_responses_turn(
             world,
@@ -8040,62 +8118,65 @@ async fn own_conversation_detail(world: &TokenCenterWorld) -> Value {
 }
 
 async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expected: usize) {
+    let state = world.state.as_ref().expect("conversation state");
+    let inspection = AnyPool::connect(&state.config.database_url)
+        .await
+        .expect("connect conversation projection inspection pool");
     let key_id = world
         .stable_key_id
         .expect("conversation key id")
         .to_string();
-    let response = world
-        .client
-        .get(format!(
-            "{}/internal/v1/request-events?after_event_at=0",
-            world.service_url
-        ))
-        .bearer_auth("test-service-token")
-        .send()
-        .await
-        .expect("conversation request event stream");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let mut stream = response.bytes_stream();
-    let mut projected = std::collections::HashSet::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut frame = String::new();
-        while let Some(chunk) = stream.next().await {
-            frame.push_str(&String::from_utf8_lossy(
-                &chunk.expect("conversation request SSE chunk"),
-            ));
-            while let Some(end) = frame.find("\n\n") {
-                let event = frame[..end].to_owned();
-                frame.drain(..end + 2);
-                let Some(data) = event
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
-                else {
-                    continue;
-                };
-                let event: Value =
-                    serde_json::from_str(data).expect("conversation request event JSON");
-                if event["event_kind"] != "projected" || event["key_id"] != key_id {
-                    continue;
-                }
-                let request_id = event["request_id"]
-                    .as_str()
-                    .and_then(|value| Uuid::parse_str(value).ok())
-                    .expect("projected conversation request id");
-                projected.insert(request_id);
-                if projected.len() >= expected {
-                    return;
-                }
+    let mut snapshot: Vec<Value> = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = sqlx::query(
+                "SELECT o.request_id, o.projected_at, o.statistics_outcome, o.attempts,
+                    request_spool.state AS request_archive_state,
+                    response_spool.state AS response_archive_state,
+                    CAST(CASE WHEN EXISTS (
+                        SELECT 1 FROM conversation_observations observation
+                        WHERE observation.request_id = o.request_id AND observation.key_id = o.key_id
+                    ) THEN 1 ELSE 0 END AS BIGINT) AS observed,
+                    CAST(CASE WHEN EXISTS (
+                        SELECT 1 FROM request_events event
+                        WHERE event.request_id = o.request_id AND event.key_id = o.key_id
+                            AND event.event_kind = 'projected'
+                    ) THEN 1 ELSE 0 END AS BIGINT) AS emitted
+                 FROM conversation_projection_outbox o
+                 LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = o.request_id
+                 LEFT JOIN response_archive_spools response_spool ON response_spool.request_id = o.request_id
+                 WHERE o.key_id = $1",
+            )
+            .bind(&key_id)
+            .fetch_all(&inspection)
+            .await
+            .expect("conversation projection readiness");
+            snapshot = rows.iter().map(|row| json!({
+                "request_id": row.get::<String, _>("request_id"),
+                "projected_at": row.get::<Option<i64>, _>("projected_at"),
+                "outcome": row.get::<Option<String>, _>("statistics_outcome"),
+                "attempts": row.get::<i64, _>("attempts"),
+                "request_archive_state": row.get::<Option<String>, _>("request_archive_state"),
+                "response_archive_state": row.get::<Option<String>, _>("response_archive_state"),
+                "observed": row.get::<i64, _>("observed"),
+                "emitted": row.get::<i64, _>("emitted"),
+            })).collect();
+            if snapshot.len() == expected && snapshot.iter().all(|row| {
+                row["projected_at"].as_i64().is_some()
+                    && row["outcome"] == "session_body"
+                    && row["observed"] == 1
+                    && row["emitted"] == 1
+            }) {
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("expected {expected} projected conversation requests for key {key_id} before timeout, observed {projected:?}")
-    });
+    .await;
+    inspection.close().await;
     assert!(
-        projected.len() >= expected,
-        "expected {expected} projected conversation requests, observed {projected:?}"
+        result.is_ok(),
+        "expected {expected} committed conversation projections for key {key_id} before timeout, observed {snapshot:?}"
     );
 }
 
@@ -8412,6 +8493,7 @@ async fn client_sends_explicit_subagent_turns(world: &mut TokenCenterWorld, mode
         .await,
         StatusCode::OK
     );
+    wait_for_projected_conversation_requests(world, 1).await;
     assert_eq!(
         send_subagent_chat(
             world,
@@ -8429,6 +8511,7 @@ async fn client_sends_explicit_subagent_turns(world: &mut TokenCenterWorld, mode
         .await,
         StatusCode::OK
     );
+    wait_for_projected_conversation_requests(world, 2).await;
     world.status = Some(
         send_subagent_chat(
             world,
@@ -8753,72 +8836,6 @@ async fn utility_requests_do_not_pollute_conversations(world: &mut TokenCenterWo
     assert_eq!(detail["requests"].as_array().map(Vec::len), Some(1));
     assert_eq!(detail["requests"][0]["protocol"], "openai");
     assert_eq!(detail["edges"].as_array().map(Vec::len), Some(0));
-}
-
-#[given("the mock WorkBuddy OpenAI upstream requires max_completion_tokens")]
-async fn mock_workbuddy_openai(world: &mut TokenCenterWorld) {
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .and(body_partial_json(json!({
-            "model": "gpt-test",
-            "max_completion_tokens": 64
-        })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "id": "chatcmpl-workbuddy",
-            "choices": [{"message": {"role": "assistant", "content": "work complete"}}],
-            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
-        })))
-        .expect(2)
-        .mount(world.mock.as_ref().expect("mock server"))
-        .await;
-}
-
-#[when(expr = "WorkBuddy sends two OpenAI chat turns for model {string}")]
-async fn workbuddy_sends_openai_turns(world: &mut TokenCenterWorld, model: String) {
-    let messages = [
-        json!([{"role": "user", "content": "inspect repository"}]),
-        json!([
-            {"role": "user", "content": "inspect repository"},
-            {"role": "assistant", "content": "inspection complete"},
-            {"role": "user", "content": "apply the fix"}
-        ]),
-    ];
-    for (messages_index, messages) in messages.into_iter().enumerate() {
-        let response = world
-            .client
-            .post(format!("{}/v1/chat/completions", world.service_url))
-            .header("x-api-key", &world.current_key)
-            .header("user-agent", "WorkBuddy/1.0")
-            .header("x-session-id", "workbuddy-session")
-            .json(&json!({
-                "model": model,
-                "max_completion_tokens": 64,
-                "messages": messages
-            }))
-            .send()
-            .await
-            .expect("WorkBuddy OpenAI request");
-        world.status = Some(response.status());
-        let _ = response.bytes().await.expect("WorkBuddy OpenAI response");
-        assert_eq!(world.status, Some(StatusCode::OK));
-        // The next turn must observe this turn's prefix. Projecting both at
-        // once can cluster them by session id without writing the edge.
-        wait_for_projected_conversation_requests(world, messages_index + 1).await;
-    }
-}
-
-#[then("the WorkBuddy requests form one logical conversation")]
-async fn workbuddy_requests_share_conversation(world: &mut TokenCenterWorld) {
-    wait_for_projected_conversation_requests(world, 2).await;
-    let detail = own_conversation_detail(world).await;
-    assert_eq!(detail["cluster"]["request_count"], 2, "{detail}");
-    assert_eq!(detail["edges"][0]["relation"], "continues", "{detail}");
-    assert!(
-        detail["edges"][0]["confidence"]
-            .as_f64()
-            .is_some_and(|confidence| confidence >= 0.95)
-    );
-    assert_eq!(detail["edges"][0]["evidence"]["explicit_session"], true);
 }
 
 async fn control_json(

@@ -6,7 +6,6 @@ use sqlx::AnyPool;
 use super::{Entry, Snapshot, TransportProxyGroups};
 use crate::db::unix_millis;
 
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_INTERVAL: Duration = Duration::from_secs(60);
 
 enum ProbeOutcome {
@@ -67,8 +66,11 @@ impl TransportProxyGroups {
             let attempts = entry.probe_attempts.load(Ordering::Acquire).clamp(1, 8);
             let pool = pool.clone();
             let account_id = entry.group.account_id;
+            let http = self
+                .http_clients
+                .handle(crate::http_settings::HttpPurpose::Probe);
             tokio::spawn(async move {
-                let outcome = probe_current_member(&entry, &url, attempts).await;
+                let outcome = probe_current_member(&http, &entry, &url, attempts).await;
                 entry
                     .last_probe_millis
                     .store(unix_millis().max(0) as u64, Ordering::Release);
@@ -100,7 +102,12 @@ impl TransportProxyGroups {
     }
 }
 
-async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> ProbeOutcome {
+async fn probe_current_member(
+    http: &dyn crate::http_settings::HttpClientSource,
+    entry: &Entry,
+    target: &str,
+    attempts: u8,
+) -> ProbeOutcome {
     let state = entry.state.load(Ordering::Acquire);
     let proxy = if state == 0 {
         entry.group.proxies.first().cloned()
@@ -113,14 +120,14 @@ async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> Prob
     };
     if state == 0 {
         for _ in 0..attempts {
-            if proxy_reaches(&proxy, target).await {
+            if proxy_reaches(http, &proxy, target).await {
                 return ProbeOutcome::Reachable;
             }
         }
         return ProbeOutcome::Unreachable;
     }
     for _ in 0..attempts {
-        if proxy_reaches(&proxy, target).await {
+        if proxy_reaches(http, &proxy, target).await {
             return ProbeOutcome::Reachable;
         }
     }
@@ -131,25 +138,17 @@ async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> Prob
 /// Any HTTP response means the proxy reached the configured address. Only a
 /// failed socket, tunnel, DNS, or TLS handshake counts as unreachable. This
 /// client carries no customer body and does not call the Responses API.
-async fn proxy_reaches(proxy_url: &str, target: &str) -> bool {
-    let Ok(proxy) = wreq::Proxy::all(proxy_url) else {
-        return false;
-    };
-    // Only the independent probe has a clock. A blackholed exit must finish
-    // probing so later requests can use a reachable member.
-    let builder = wreq::Client::builder()
-        .connect_timeout(PROBE_TIMEOUT)
-        .timeout(PROBE_TIMEOUT)
-        .redirect(wreq::redirect::Policy::none())
-        .retry(wreq::retry::Policy::never())
-        .no_proxy()
-        .proxy(proxy)
-        .tcp_keepalive(None::<Duration>)
-        .tcp_keepalive_interval(None::<Duration>)
-        .tcp_keepalive_retries(None::<u32>);
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-    let builder = builder.tcp_user_timeout(None::<Duration>);
-    let Ok(client) = builder.build() else {
+async fn proxy_reaches(
+    http: &dyn crate::http_settings::HttpClientSource,
+    proxy_url: &str,
+    target: &str,
+) -> bool {
+    let Ok(client) = http.http_client(crate::http_settings::ClientOptions {
+        purpose: Some(crate::http_settings::HttpPurpose::Probe),
+        proxy_url: Some(proxy_url),
+        no_retry: true,
+        ..Default::default()
+    }) else {
         return false;
     };
     match client.get(target).send().await {
@@ -161,12 +160,13 @@ async fn proxy_reaches(proxy_url: &str, target: &str) -> bool {
             true
         }
         Err(error) => {
+            let class = crate::simple_http::classify_transport(&error);
             tracing::debug!(
-                connect = error.is_connect(),
-                proxy_connect = error.is_proxy_connect(),
-                dns = error.is_dns(),
-                tls = error.is_tls(),
-                timed_out = error.is_timeout(),
+                connect = class.connect,
+                proxy_connect = class.proxy_connect,
+                dns = class.dns,
+                tls = class.tls,
+                timed_out = class.timeout,
                 "independent proxy probe did not reach the configured address"
             );
             false
@@ -180,11 +180,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn blackholed_independent_probe_finishes_without_timing_out_a_customer() {
+        let factory = std::sync::Arc::new(crate::http_settings::HttpClientFactory::default());
+        factory.publish(
+            serde_json::from_value(serde_json::json!({
+                "revision": 1,
+                "settings": {"purposes": {"probe": {"request_timeout_ms": 10000}}}
+            }))
+            .unwrap(),
+        );
+        let http = factory.handle(crate::http_settings::HttpPurpose::Probe);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy = format!("socks5h://{}", listener.local_addr().unwrap());
-        let probe = tokio::spawn(async move { proxy_reaches(&proxy, "https://example.com").await });
+        let probe =
+            tokio::spawn(async move { proxy_reaches(&http, &proxy, "https://example.com").await });
         let (_silent_socket, _) = listener.accept().await.unwrap();
-        tokio::time::advance(PROBE_TIMEOUT).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
         assert!(!probe.await.unwrap());
     }
 }

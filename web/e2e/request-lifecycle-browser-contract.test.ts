@@ -46,7 +46,7 @@ test('low-volume terminal events reconcile operational money without opening det
           assert.match(settled, amount === '0' ? /0/ : /2[.,]50?/);
           assert.doesNotMatch(settled, /—|999/);
           assert.match(await row.locator('[data-outcome="cancelled"]').innerText(), /499/);
-          assert.match(await row.locator('.request-status-cause').innerText(), locale === 'en' ? /The client disconnected/ : /客户端断开了连接/);
+          assert.match(await row.locator('.request-status-cause').innerText(), locale === 'en' ? /The client disconnected/ : /客户端断开/);
           assert.doesNotMatch(await row.locator('.request-token-total').innerText(), /—/);
           assert.equal(await page.getByRole('dialog').count(), 0);
           assert.equal(await page.evaluate(() => window.requestLifecycleFixture.queryCalls), queries);
@@ -165,7 +165,7 @@ test('operational completion preserves bilingual outcomes and unknown costs acro
         const outcome = mode === '499' ? 'cancelled' : mode === '502' ? 'failed' : 'completed';
         const label = mode === '499' ? (locale === 'en' ? 'Client disconnected' : '客户端断开')
           : mode === '502' ? (locale === 'en' ? 'Failed' : '失败') : (locale === 'en' ? 'Completed' : '已完成');
-        const reason = mode === '499' ? (locale === 'en' ? 'The client disconnected' : '客户端断开了连接')
+        const reason = mode === '499' ? (locale === 'en' ? 'The client disconnected' : '客户端断开')
           : mode === '502' ? (locale === 'en' ? 'The upstream connection was reset' : '上游连接被重置') : null;
         await row.locator(`[data-outcome="${outcome}"]`).waitFor();
         assert.ok((await row.locator(`[data-outcome="${outcome}"]`).innerText()).startsWith(label));
@@ -179,7 +179,7 @@ test('operational completion preserves bilingual outcomes and unknown costs acro
           assert.equal(await cost.getAttribute('aria-label'), locale === 'en' ? 'Awaiting settlement' : '待结算');
           assert.match(await row.locator('.request-token-total').innerText(), /—/);
           await cost.focus();
-          await page.getByRole('tooltip').filter({ hasText: locale === 'en' ? 'does not mean zero cost' : '不代表费用为零' }).waitFor();
+          await page.getByRole('tooltip').filter({ hasText: locale === 'en' ? 'Cost awaits confirmation' : '费用待确认' }).waitFor();
         }
         if (reason) {
           await row.locator('.request-outcome').focus();
@@ -250,7 +250,7 @@ test('request error details distinguish active delivery from recorded terminal f
         assert.doesNotMatch(text, /The request failed|delivery_started/);
         assert.equal(await drawer.getByText('Error', { exact: true }).count(), 0, 'a progress marker must not create an error detail row');
       } else {
-        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'No specific cause was captured at the time';
+        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'This record has no stored cause';
         assert.equal(text.split(cause).length - 1, 1);
         assert.doesNotMatch(text, /upstream_transport_connection_reset|upstream_stream/);
         await drawer.locator('.request-outcome').focus();
@@ -345,6 +345,10 @@ test('request detail follows terminal events and fences late responses after sel
     await page.waitForFunction(() => window.requestLifecycleFixture.held);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).waitFor();
+    // The live-added tooltip positioned itself while the modal held the scroll
+    // lock, so it only reappears after the next position recompute; revealing
+    // its trigger is the user action that triggers one.
+    await page.getByRole('button', { name: 'Live-added helper', exact: true }).scrollIntoViewIfNeeded();
     await page.getByRole('tooltip').filter({ hasText: 'Live-added background help' }).waitFor();
     assert.equal(await liveHelp.evaluate(element => !!element.closest('[inert], [aria-hidden="true"]')), false, 'new background portal regains its original accessibility on close');
     assert.deepEqual(await page.locator('#already-inert-background').evaluate(element => ({ inert: element instanceof HTMLElement && element.inert, hidden: element.getAttribute('aria-hidden') })), { inert: true, hidden: 'false' }, 'cleanup restores original attributes, not generic accessibility defaults');
@@ -568,9 +572,9 @@ test('typed failure diagnostic replaces the repeated unknown cause in list and d
   const browser = await chromium.launch({ headless: true });
   try {
     for (const [locale, param, reason, prefix, close, label] of [
-      ['zh-CN', 'downstream', '客户端在响应交付完成前断开了连接', '已记录原因', '关闭', '失败'],
+      ['zh-CN', 'downstream', '上游已经开始返回，客户端在收完之前断开', '已记录原因', '关闭', '失败'],
       ['zh-CN', 'supplier', '上游服务在响应开始时返回了错误状态', '已记录原因', '关闭', '失败'],
-      ['en', 'downstream', 'The client disconnected before response delivery completed', 'Recorded cause', 'Close', 'Failed'],
+      ['en', 'downstream', 'The upstream had started returning, and the client disconnected before the response finished', 'Recorded cause', 'Close', 'Failed'],
       ['en', 'supplier', 'The upstream service returned an error status at the start of its response', 'Recorded cause', 'Close', 'Failed'],
     ] as const) {
       const page = await browser.newPage();

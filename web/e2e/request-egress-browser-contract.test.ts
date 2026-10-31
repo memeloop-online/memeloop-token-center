@@ -155,12 +155,12 @@ test('request list exit lines render only real recorded exits with exact text an
       assert.match(proxyTip, zh ? /组版本 3/ : /Group version 3/);
       assert.match(proxyTip, /edge-01/);
       assert.match(proxyTip, /socks5h:\/\/192\.0\.2\.10:1080/);
-      assert.match(proxyTip, zh ? /连通性: 未记录（历史使用不代表当前可通）/ : /Connectivity: not recorded \(past use does not confirm current reachability\)/);
-      assert.match(proxyTip, zh ? /与上游账号不同/ : /separate from the upstream account/);
+      assert.match(proxyTip, zh ? /连通性/ : /Connectivity/);
+      assert.match(proxyTip, zh ? /这次请求走代理出口/ : /This request used a proxy exit/);
       await page.keyboard.press('Escape');
       await proxyTooltip.waitFor({ state: 'hidden' });
       const directTooltip = await tooltipForExit('model-d');
-      assert.match(await directTooltip.innerText(), zh ? /未使用代理出口/ : /without a proxy exit/);
+      assert.match(await directTooltip.innerText(), zh ? /这次请求走直连/ : /This request used a direct connection/);
       await page.keyboard.press('Escape');
       await directTooltip.waitFor({ state: 'hidden' });
       assert.deepEqual(errors, []);

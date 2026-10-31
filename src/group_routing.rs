@@ -94,7 +94,8 @@ fn transient_health_scope(
     config: &serde_json::Value,
 ) -> Result<TransientHealthScope, AppError> {
     let window_ms = transient_health_window_ms(config)?;
-    let config = serde_json::to_vec(config).map_err(|_| AppError::Internal)?;
+    let config = serde_json::to_vec(config)
+        .map_err(|_| AppError::internal("group_routing_transient_health_scope_1"))?;
     let mut hasher = blake3::Hasher::new();
     hash_scope_field(&mut hasher, b"group-routing-v2-transient-health-scope-v1");
     hash_scope_field(&mut hasher, tenant_id.as_bytes());
@@ -632,7 +633,7 @@ async fn prepare_inner(
             ),
         )
         .await
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("group_routing_site_1"))
         .and_then(|result| result);
         match result {
             Ok(mut plan) => {
@@ -648,8 +649,10 @@ async fn prepare_inner(
                         .expect("validated exact candidate permutation")
                         .clone();
                     let key = (
-                        Uuid::parse_str(&directive.route_id).map_err(|_| AppError::Internal)?,
-                        Uuid::parse_str(&directive.account_id).map_err(|_| AppError::Internal)?,
+                        Uuid::parse_str(&directive.route_id)
+                            .map_err(|_| AppError::internal("group_routing_site_2"))?,
+                        Uuid::parse_str(&directive.account_id)
+                            .map_err(|_| AppError::internal("group_routing_site_3"))?,
                         directive.generation as i64,
                     );
                     ranks.insert(key, bucket_rank + position);

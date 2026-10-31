@@ -85,6 +85,48 @@ async function nextPaint(page: import('playwright').Page) {
   await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 }
 
+test('credential route access retries incomplete catalogs and finds models beyond the first page', { timeout: 60_000 }, async () => {
+  const executablePath = await localChromiumExecutable();
+  if (!executablePath) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    return test.skip('Chromium is required');
+  }
+  const server = await createServer({ root: webRoot, configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer!.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-credential-workspace.html?scenario=client-form&route-pages&route-page-failure`);
+    await page.getByText('Research workspace', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'More actions', exact: true }).click();
+    await page.getByRole('menuitem', { name: 'Edit', exact: true }).click();
+    const editor = page.locator('.inline-editor .routing-editor');
+    await editor.getByRole('button', { name: 'Individual model grants (1)', exact: true }).click();
+    const input = editor.getByRole('combobox', { name: 'Specific routes', exact: true });
+    await input.fill('gpt-6-astra');
+    await editor.getByRole('alert').first().waitFor();
+    assert.equal(await page.getByText('No matches', { exact: true }).count(), 0, 'a failed second page is not a search miss');
+    await page.evaluate(() => { document.documentElement.dataset.routeCatalogAvailable = 'true'; });
+    await editor.getByRole('button', { name: 'Retry', exact: true }).first().click();
+    await editor.locator('.selection-chip').filter({ hasText: 'Spark disabled' }).waitFor();
+    await input.fill('gpt-6-astra');
+    const astra = page.getByRole('option').filter({ hasText: 'gpt-6-astra' });
+    await astra.waitFor();
+    assert.match(await astra.innerText(), /Personal Kimi/, 'the older model identifies its account');
+    const routeCalls = (await calls(page)).filter(path => path.startsWith('/internal/v1/model-routes'));
+    assert.equal(routeCalls.length, 7, 'first page, four automatic 503 attempts, then a complete two-page retry; searching does not refetch');
+    await astra.click();
+    await input.press('Escape');
+    await editor.getByRole('button', { name: 'Save', exact: true }).click();
+    await page.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing')));
+    const saved = await page.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing'))!);
+    assert.deepEqual(JSON.parse(saved.body!).route_ids, ['00000000-0000-4000-8000-000000000004', '00000000-0000-4000-8000-000000000006'], 'adding an older model preserves the existing disabled grant');
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('credential workspaces isolate loads and preserve issued service plaintext', { timeout: 120_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {

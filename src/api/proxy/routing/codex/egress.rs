@@ -23,8 +23,6 @@ struct Observation {
     completed: AtomicBool,
     final_response: AtomicBool,
     pending: Mutex<Pending>,
-    #[cfg(feature = "h2-attempt-binding")]
-    binding: Option<wreq_proto::ext::H2AttemptObserver>,
 }
 
 #[derive(Default)]
@@ -48,21 +46,6 @@ impl Observation {
         attempt.completed = self.completed.load(Ordering::Relaxed);
         attempt.final_response = self.final_response.load(Ordering::Relaxed);
         attempt.response_body_complete = self.response_body_complete.load(Ordering::Relaxed);
-        #[cfg(feature = "h2-attempt-binding")]
-        {
-            attempt.connection_binding = self
-                .binding
-                .as_ref()
-                .and_then(|observer| observer.snapshot())
-                .map(|binding| {
-                    serde_json::json!({
-                        "connection_id": binding.connection_id,
-                        "stream_id": binding.stream_id,
-                        "stream_ordinal": binding.stream_ordinal,
-                        "scope": "process_local_connection_not_wire_delivery"
-                    })
-                });
-        }
         attempt
     }
 
@@ -112,10 +95,8 @@ impl AttemptRecorder {
         identity: send_diagnostics::TransportIdentity,
         context: CodexAttemptContext,
         request_body: send_diagnostics::BodyConsumption,
-        http2_evidence: &send_diagnostics::Http2AttemptEvidence,
+        _http2_evidence: &send_diagnostics::Http2AttemptEvidence,
     ) -> Option<Self> {
-        #[cfg(not(feature = "h2-attempt-binding"))]
-        let _ = http2_evidence;
         let Some(selected) = selected else {
             state.routing_persistence.record_failure_gap();
             return None;
@@ -163,8 +144,6 @@ impl AttemptRecorder {
             completed: AtomicBool::new(false),
             final_response: AtomicBool::new(false),
             pending: Mutex::new(Pending::default()),
-            #[cfg(feature = "h2-attempt-binding")]
-            binding: http2_evidence.binding_observer(),
         }));
         recorder.0.submit();
         Some(recorder)

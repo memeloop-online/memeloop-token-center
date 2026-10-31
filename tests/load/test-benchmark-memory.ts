@@ -12,7 +12,7 @@ import { DatabaseSync } from "node:sqlite";
 import { FirstSoakFailureEvidence, readSoakFailureClassification } from "./benchmark-soak-diagnostics.ts";
 
 const benchmarkEntry = resolve(import.meta.dirname, "./benchmark-memory.ts");
-const serviceEntry = resolve(import.meta.dirname, "../../src/lib.rs");
+const factoryEntry = resolve(import.meta.dirname, "../../src/http_settings/factory.rs");
 
 test("memory roles use a real owner-private journal directory rather than the production default", () => {
   const temporary = mkdtempSync(resolve(tmpdir(), "mtc-memory-spool-"));
@@ -31,14 +31,11 @@ test("memory roles use a real owner-private journal directory rather than the pr
   }
 });
 
-test("memory mock keep-alive lifetime exceeds the gateway idle pool", () => {
+test("memory mock does not retire connections behind the configurable gateway pool", () => {
   const server = createMockServer();
-  const source = readFileSync(serviceEntry, "utf8");
-  const baseBuilder = /fn base_http_client_builder\(\)[\s\S]+?(?=pub\(crate\) fn build_http_client)/u.exec(source)?.[0];
-  assert.ok(baseBuilder, "generic HTTP client builder must remain discoverable");
-  const idleSeconds = Number(/pool_idle_timeout\(Duration::from_secs\((\d+)\)\)/u.exec(baseBuilder)?.[1]);
-  assert.ok(Number.isFinite(idleSeconds) && idleSeconds > 0, "generic idle timeout must remain explicit");
-  assert.ok(server.keepAliveTimeout > idleSeconds * 1_000, "mock upstream must outlive every idle pooled connection");
+  const source = readFileSync(factoryEntry, "utf8");
+  assert.match(source, /\.pool_idle_timeout\(\s*effective\s*\.pool_idle_timeout_ms\s*\.value\s*\.map\(Duration::from_millis\)/u);
+  assert.equal(server.keepAliveTimeout, 0, "mock must not impose an idle deadline on an unlimited configured pool");
   assert.ok(server.keepAliveTimeoutBuffer > 0, "mock keep-alive retirement must retain a positive scheduling buffer");
   assert.ok(server.headersTimeout > server.keepAliveTimeout + server.keepAliveTimeoutBuffer, "header deadline must not retire a keep-alive socket first");
   assert.ok(server.requestTimeout > server.headersTimeout, "complete-request deadline must contain the header deadline");

@@ -1,7 +1,12 @@
 use super::super::*;
 
 pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
+    state.metrics.start_upstream_concurrency(state.db.clone());
     let authenticated = Router::new()
+        .route(
+            "/internal/v1/system-settings/http",
+            get(super::super::http_settings::get).put(super::super::http_settings::put),
+        )
         .route(
             "/internal/v1/api-schema",
             get(super::super::api_schema::discover),
@@ -13,6 +18,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/inference/chat/completions",
             post(super::super::operator_inference::chat_completions),
+        )
+        .route(
+            "/internal/v1/inference/responses",
+            post(super::super::operator_inference::responses),
         )
         .route(
             "/internal/v1/transport-proxy-groups/access",
@@ -263,6 +272,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/stats", get(internal_stats))
         .route(
+            "/internal/v1/upstream-concurrency",
+            get(monitoring_snapshot::internal_upstream_concurrency),
+        )
+        .route(
             "/internal/v1/monitoring-snapshot",
             get(monitoring_snapshot::internal_monitoring_snapshot),
         )
@@ -283,6 +296,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/sessions/{session_id}/requests/{request_id}/context",
             get(internal_session_context),
+        )
+        .route(
+            "/internal/v1/sessions/{session_id}/requests/{request_id}/dialogue",
+            get(internal_session_dialogue),
         )
         .route(
             "/internal/v1/sessions/{session_id}/requests/{request_id}/context/content",

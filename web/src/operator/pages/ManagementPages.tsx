@@ -84,6 +84,7 @@ import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields,
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource } from '../hooks/useOperatorResource';
 import { loadModelPricePages } from '../pricingLoading';
+import { loadModelRoutePages } from '../modelRouteLoading';
 import { CredentialPolicySummary } from '../CredentialPolicySummary';
 import { PricingTable } from '../PricingTable';
 import { enumLabel, IssuedCredential, messageOf, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
@@ -1286,8 +1287,6 @@ function RouteFields({ token, tenant, draft, existingSelection, upstreams, provi
 }
 
 function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers, renderModelRouteActions }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[]; renderModelRouteActions?: (route: ModelRouteView) => ReactNode }) {
-  const routePageSize = 100;
-  const maximumFocusedRoutePages = 100;
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
@@ -1327,28 +1326,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       // The table is the route page's primary content. Credential choices are
       // only used by an opened create/edit form, so never put their paged
       // read on this critical path.
-      const nextRoutes: ModelRouteView[] = [];
-      const visitedCursors = new Set<string>();
-      let beforeCreatedAt: number | undefined;
-      let beforeId: string | undefined;
-      for (let pageIndex = 0; pageIndex < maximumFocusedRoutePages; pageIndex += 1) {
-        const routeQuery = new URLSearchParams({ limit: String(routePageSize) });
-        if (beforeCreatedAt !== undefined && beforeId) {
-          routeQuery.set('before_created_at', String(beforeCreatedAt));
-          routeQuery.set('before_id', beforeId);
-        }
-        const page = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant, routeQuery.toString())}`, loadToken, { signal: controller.signal });
-        nextRoutes.push(...page);
-        if (!requestedFocusRouteId || page.some((route) => route.id === requestedFocusRouteId) || page.length < routePageSize) break;
-        const last = page.at(-1);
-        if (!last || !Number.isSafeInteger(last.created_at) || !last.id) throw new Error(t('providerCatalog.routesIncomplete'));
-        const cursor = `${last.created_at}\u0000${last.id}`;
-        if (visitedCursors.has(cursor)) throw new Error(t('providerCatalog.routesIncomplete'));
-        visitedCursors.add(cursor);
-        beforeCreatedAt = last.created_at;
-        beforeId = last.id;
-        if (pageIndex === maximumFocusedRoutePages - 1) throw new Error(t('providerCatalog.routesIncomplete'));
-      }
+      const nextRoutes = await loadModelRoutePages(loadTenant, controller.signal, (path, signal) => apiRead<ModelRouteView[]>(path, loadToken, { signal }), t('providerCatalog.routesIncomplete'), { focusRouteId: requestedFocusRouteId || undefined, firstPageOnly: !requestedFocusRouteId });
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       setRoutes(nextRoutes); setError('');
     }
@@ -1552,6 +1530,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [keyListState, setKeyListState] = useState<KeyListLoadState>('idle');
   const [keyError, setKeyError] = useState('');
   const [routeError, setRouteError] = useState('');
+  const [routesLoading, setRoutesLoading] = useState(false);
   const [secret, setSecret] = useState<{ value: string; kind: 'issued' | 'revealed'; alias?: string; displayId: string; scopeGeneration: number }>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -1618,57 +1597,25 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const loadRoutes = async (loadToken: string, loadTenant: string, currentScopeGeneration: number) => {
     routeRequest.current?.controller.abort();
     routeRequest.current = undefined;
-    if (!shouldLoadCredentialRoutes(loadTenant)) { setRoutes([]); setRouteError(''); return; }
+    if (!shouldLoadCredentialRoutes(loadTenant)) { setRoutes([]); setRouteError(''); setRoutesLoading(false); return; }
     const request = {
       generation: ++routeRequestGeneration.current,
       scopeGeneration: currentScopeGeneration,
       controller: new AbortController(),
     };
     routeRequest.current = request;
-    setRouteError('');
-    // The route list endpoint is keyset-paginated (newest first, one hundred
-    // rows per read at most). Grant resolution needs the complete catalog, so
-    // walk every cursor page instead of treating the first page as the full
-    // directory.
-    const ownsActiveRequest = () => {
-      const active = routeRequest.current;
-      return Boolean(active && active.generation === request.generation && active.scopeGeneration === request.scopeGeneration && scopeGeneration.current === request.scopeGeneration && scopeRef.current.token === loadToken && scopeRef.current.tenant === loadTenant);
-    };
-    const routePageSize = 100;
+    setRouteError(''); setRoutesLoading(true);
     try {
-      const nextRoutes: ModelRouteView[] = [];
-      const visitedCursors = new Set<string>();
-      let beforeCreatedAt: number | undefined;
-      let beforeId: string | undefined;
-      // Termination is the API's own end-of-pagination signal: a short page
-      // means the catalog is exhausted. A repeated or malformed cursor is an
-      // invalid server response, not a reason to cap the route count.
-      while (true) {
-        const routeQuery = new URLSearchParams({ limit: String(routePageSize) });
-        if (beforeCreatedAt !== undefined && beforeId) {
-          routeQuery.set('before_created_at', String(beforeCreatedAt));
-          routeQuery.set('before_id', beforeId);
-        }
-        const page = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant, routeQuery.toString())}`, loadToken, { signal: request.controller.signal });
-        if (request.controller.signal.aborted || !ownsActiveRequest()) return;
-        nextRoutes.push(...page);
-        if (page.length < routePageSize) break;
-        const last = page.at(-1);
-        if (!last || !Number.isSafeInteger(last.created_at) || !last.id) {
-          throw new Error(t('providerCatalog.routesIncomplete'));
-        }
-        const cursor = `${last.created_at}\0${last.id}`;
-        if (visitedCursors.has(cursor)) throw new Error(t('providerCatalog.routesIncomplete'));
-        visitedCursors.add(cursor);
-        beforeCreatedAt = last.created_at; beforeId = last.id;
-      }
-      if (!ownsActiveRequest()) return;
+      const nextRoutes = await loadModelRoutePages(loadTenant, request.controller.signal, (path, signal) => apiRead<ModelRouteView[]>(path, loadToken, { signal }), t('providerCatalog.routesIncomplete'));
+      const active = routeRequest.current;
+      if (!active || active.generation !== request.generation || active.scopeGeneration !== request.scopeGeneration || scopeGeneration.current !== request.scopeGeneration || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       routeRequest.current = undefined;
-      setRoutes(nextRoutes); setRouteError('');
+      setRoutes(nextRoutes); setRouteError(''); setRoutesLoading(false);
     } catch (reason) {
-      if (request.controller.signal.aborted || !ownsActiveRequest()) return;
+      const active = routeRequest.current;
+      if (request.controller.signal.aborted || !active || active.generation !== request.generation || active.scopeGeneration !== request.scopeGeneration || scopeGeneration.current !== request.scopeGeneration || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       routeRequest.current = undefined;
-      setRouteError(messageOf(reason, t('common.requestFailed')));
+      setRouteError(messageOf(reason, t('common.requestFailed'))); setRoutesLoading(false);
     }
   };
   const load = async () => {
@@ -1676,7 +1623,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     if (!loadToken) {
       keyRequest.current?.controller.abort(); keyRequest.current = undefined;
       routeRequest.current?.controller.abort(); routeRequest.current = undefined;
-      setValues([]); setRoutes([]); setNextCursor(undefined); setKeyListState('idle'); setKeyError(''); setRouteError('');
+      setValues([]); setRoutes([]); setNextCursor(undefined); setKeyListState('idle'); setKeyError(''); setRouteError(''); setRoutesLoading(false);
       return;
     }
     const request = startKeyRequest('initial-loading');
@@ -1990,7 +1937,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       {(error || routeError || routeGroups.error) && <div className="notice error" role="alert">{error || routeError || routeGroups.error}</div>}
       {activeCredential && credentialEditor(activeCredential)}
       <div hidden={workspace?.kind !== 'create'}>
-      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, alias: { 'ui:help': t('credentials.aliasHelp') } }} formContext={{ principalField, authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
+      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, alias: { 'ui:help': t('credentials.aliasHelp') } }} formContext={{ principalField, authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} routesLoading={routesLoading} routesError={routeError} onRetryRoutes={() => void loadRoutes(token, tenant, scopeGeneration.current)} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
         if (!writeTenant) return;
         const operation = beginSecretOperation();
         if (!operation) return;

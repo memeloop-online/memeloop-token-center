@@ -98,13 +98,13 @@ impl Default for TerminalFrames {
 pub(super) fn invalid_terminal_failure(protocol: Protocol) -> Bytes {
     match protocol {
         Protocol::OpenAiResponses | Protocol::OpenAiResponsesCompact => {
-            crate::api::sse::safe_failure_event()
+            crate::api::sse::safe_failure_event("upstream_incomplete_response", "invalid_terminal")
         }
         Protocol::AnthropicMessages => Bytes::from_static(
-            b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"upstream stream did not complete\"}}\n\n",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"code\":\"upstream_incomplete_response\",\"message\":\"上游响应流没有完整结束。失败阶段 invalid_terminal。\",\"message_en\":\"upstream stream did not complete. failure stage invalid_terminal.\"}}\n\n".as_bytes(),
         ),
         _ => Bytes::from_static(
-            b"data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream stream did not complete\"}}\n\n",
+            "data: {\"error\":{\"code\":\"upstream_incomplete_response\",\"message\":\"上游响应流没有完整结束。失败阶段 invalid_terminal。\",\"message_en\":\"upstream stream did not complete. failure stage invalid_terminal.\",\"type\":\"upstream_error\"}}\n\n".as_bytes(),
         ),
     }
 }
@@ -129,7 +129,13 @@ pub(super) fn downstream_stream_failure(
         {
             Ok(Bytes::new())
         } else {
-            Ok(crate::api::sse::safe_failure_event())
+            let code = sanitizer
+                .map(crate::api::sse::ResponsesStreamingSanitizer::last_rejection_code)
+                .unwrap_or("upstream_incomplete_response");
+            let stage = sanitizer
+                .map(crate::api::sse::ResponsesStreamingSanitizer::last_rejection_stage)
+                .unwrap_or("unknown");
+            Ok(crate::api::sse::safe_failure_event(code, stage))
         }
     } else {
         Err(std::io::Error::other(message))

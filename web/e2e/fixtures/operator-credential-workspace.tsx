@@ -275,13 +275,21 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       const stuckPage = Array.from({ length: 100 }, (_, index) => ({ id: `00000000-0000-4000-8000-${String(index + 100).padStart(12, '0')}`, public_model: `Stuck model ${index + 1}`, upstream_model: 'kimi-stuck', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'], created_at: 30_000 - index }));
       return json(stuckPage);
     }
-    if (url.pathname === '/internal/v1/model-routes') return json([
-      { id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] },
-      { id: '00000000-0000-4000-8000-000000000003', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-team'] },
-      { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
-      { id: '00000000-0000-4000-8000-000000000005', public_model: 'Empty route', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
-      ...Array.from({ length: 7 }, (_, index) => ({ id: `00000000-0000-4000-8000-00000000001${index}`, public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] })),
-    ]);
+    if (url.pathname === '/internal/v1/model-routes') {
+      const olderRoutes = [
+        { id: '00000000-0000-4000-8000-000000000001', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] },
+        { id: '00000000-0000-4000-8000-000000000003', public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-team'] },
+        { id: '00000000-0000-4000-8000-000000000004', public_model: 'Spark disabled', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
+        { id: '00000000-0000-4000-8000-000000000005', public_model: 'Empty route', enabled: true, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: [] },
+        ...Array.from({ length: 7 }, (_, index) => ({ id: `00000000-0000-4000-8000-00000000001${index}`, public_model: 'Research model', upstream_model: 'kimi-research', protocol: 'openai', enabled: false, tenant_external_id: 'tenant-a', candidate_upstream_account_ids: ['account-personal'] })),
+      ];
+      if (!parameters.has('route-pages')) return json(olderRoutes);
+      if (!url.searchParams.has('before_id')) return json(Array.from({ length: 100 }, (_, index) => ({
+        ...olderRoutes[0], id: `new-route-${String(100 - index).padStart(3, '0')}`, public_model: `Recent model ${index}`, created_at: 2_000 - index,
+      })));
+      if (parameters.has('route-page-failure') && document.documentElement.dataset.routeCatalogAvailable !== 'true') return json({ error: { message: 'route catalog unavailable' } }, 503);
+      return json([...olderRoutes, { ...olderRoutes[0], id: '00000000-0000-4000-8000-000000000006', public_model: 'gpt-6-astra' }]);
+    }
     if (url.pathname === '/internal/v1/keys' && method === 'POST') {
       if (parameters.has('duplicate-alias')) return json({ error: { message: 'fixture duplicate alias' } }, 409);
       return json({ key_id: 'key-created', key: 'mtc_fixture_created' });

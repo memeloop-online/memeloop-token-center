@@ -15,4 +15,9 @@ components:
 - The source-vendored `rust_decimal` crate. Its MIT license is included as
   `third-party-licenses/rust_decimal-LICENSE`.
 
+- The source-vendored `wreq-util` 3.0.0-rc.14 crate, with only its zstd
+  dependency constraint updated. Its Apache-2.0 license is included as
+  `third-party-licenses/wreq-util-LICENSE`. The authenticated upstream archive
+  and manifest patch are documented in `vendor/wreq-util/MEMELOOP-FORK.md`.
+
 These notices do not replace or modify the licenses of any dependency.
