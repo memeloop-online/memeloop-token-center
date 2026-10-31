@@ -796,11 +796,11 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
           parentNav={selectedParent ? <p className="session-parent-nav"><Button appearance="transparent" className="table-link"
             onClick={() => openSessionIdentity(selectedParent.identity)}>{t('sessions.rel.backToParent', { name: selectedParent.label })}</Button></p> : undefined}
           taskRelations={selected && !visibleDetail.unlinked && sessionIdentityUuid.test(visibleDetail.session_id)
-            ? <SessionRelationships key={`${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`} token={token} tenant={tenant}
+            ? <SessionRelationships key={`relationships:${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`} token={token} tenant={tenant}
                 identity={{ key_id: selected.key_id, session_id: visibleDetail.session_id }}
                 onOpenSession={openSessionIdentity} />
             : undefined}
-          titleAction={selected && !visibleDetail.unlinked ? <SessionTitleAction key={`${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`}
+          titleAction={selected && !visibleDetail.unlinked ? <SessionTitleAction key={`title:${scopeKey}\0${selected.key_id}\0${visibleDetail.session_id}`}
             token={token} tenant={tenant} keyId={selected.key_id} sessionId={visibleDetail.session_id}
             onTitle={(title) => {
               const target = selected;

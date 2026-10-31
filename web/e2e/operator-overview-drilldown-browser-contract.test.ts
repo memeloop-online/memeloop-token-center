@@ -97,6 +97,9 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     const pageErrors: string[] = [];
     page.on('pageerror', error => pageErrors.push(error.message));
+    page.on('console', message => {
+      if (message.type() === 'error' && message.text().includes('same key')) pageErrors.push(message.text());
+    });
     const readyDetail = async () => {
       await page.locator('.session-detail-region .session-detail').waitFor();
       await page.getByRole('button', { name: 'Rename', exact: true }).waitFor();
