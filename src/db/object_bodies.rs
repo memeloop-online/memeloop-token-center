@@ -85,19 +85,28 @@ impl Database {
             .await?;
         let statement = match side {
             "request" => {
-                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND completed_at IS NOT NULL AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')"
+                "UPDATE request_records SET request_object = $1 WHERE id = $2 AND tenant_id = $3 AND (request_object IS NULL OR request_object = '' OR request_object = $1 OR request_object = 'gap://' || id || '/request' OR request_object = 'staging/proxy/' || id || '/request/' || id || '/body.json')"
             }
             "response" => {
-                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND completed_at IS NOT NULL AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response')"
+                "UPDATE request_records SET response_object = $1 WHERE id = $2 AND tenant_id = $3 AND (response_object IS NULL OR response_object = '' OR response_object = $1 OR response_object = 'gap://' || id || '/response')"
             }
             _ => return Err(AppError::BadRequest("invalid raw archive side".into())),
         };
+        let mut transaction = self.begin_write_transaction().await?;
         let changed = sqlx::query(statement)
             .bind(&object.object_locator)
             .bind(request_id.to_string())
             .bind(tenant_id.to_string())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
+        if changed.rows_affected() == 1 {
+            super::requests::conversations::wake_session_body_archive_in_transaction(
+                &mut transaction,
+                request_id,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(changed.rows_affected() == 1)
     }
 
@@ -251,6 +260,53 @@ pub(super) fn text_slice(text: &str, offset: i64, limit: i64) -> Result<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn raw_capture_wakes_projection_before_financial_completion() {
+        let state =
+            crate::AppState::initialize(crate::config::Config::for_test("sqlite::memory:".into()))
+                .await
+                .unwrap();
+        let pool = &state.db.pool;
+        let identity = crate::db::ArchiveSpoolIdentity {
+            request_id: Uuid::now_v7(),
+            tenant_id: Uuid::now_v7(),
+            reservation_id: Uuid::now_v7(),
+        };
+        sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, response_object, reservation_id) VALUES ($1, $2, $3, 1, 'openai', 'test', 0, 0, 0, 'gap://' || $1 || '/request', 'gap://' || $1 || '/response', $4)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(identity.reservation_id.to_string()).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, observed_at, request_json, hints_json, lease_expires_at) VALUES ($1, $2, $3, $4, 1, '{}', '{}', 9223372036854775807)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(pool).await.unwrap();
+        let object = state
+            .archive
+            .put_tenant_content(
+                identity.tenant_id,
+                Bytes::from_static(br#"{"original":"body"}"#),
+            )
+            .await
+            .unwrap();
+        for side in ["request", "response"] {
+            state
+                .archive
+                .publish_raw_capture(identity.tenant_id, identity.request_id, side, &object)
+                .await
+                .unwrap();
+            assert!(
+                state
+                    .db
+                    .bind_raw_capture(identity.tenant_id, identity.request_id, side, &object)
+                    .await
+                    .unwrap()
+            );
+        }
+        let row = sqlx::query("SELECT r.completed_at, r.response_object, o.lease_expires_at FROM request_records r JOIN conversation_projection_outbox o ON o.request_id = r.id WHERE r.id = $1").bind(identity.request_id.to_string()).fetch_one(pool).await.unwrap();
+        assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
+        assert_eq!(
+            row.get::<String, _>("response_object"),
+            object.object_locator
+        );
+        assert_eq!(row.get::<Option<i64>, _>("lease_expires_at"), None);
+    }
 
     #[tokio::test]
     async fn reference_only_writer_reader_round_trip_and_fail_closed_legacy() {

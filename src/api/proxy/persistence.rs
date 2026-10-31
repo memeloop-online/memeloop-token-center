@@ -143,11 +143,27 @@ impl Persistence {
 }
 
 pub(super) fn record_capture_failure(state: &AppState, identity: crate::db::ArchiveSpoolIdentity) {
-    let archive = state.archive.clone();
-    state.persistence.submit(0, async move {
-        archive
-            .publish_raw_capture_failure(identity.tenant_id, identity.request_id, "response")
-            .await
+    let background = state.clone();
+    state.persistence.archives.fetch_add(1, Ordering::Release);
+    tokio::spawn(async move {
+        loop {
+            match background
+                .archive
+                .publish_raw_capture_failure(identity.tenant_id, identity.request_id, "response")
+                .await
+            {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                        "raw response capture admission failure awaits durable evidence");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+        background
+            .persistence
+            .archives
+            .fetch_sub(1, Ordering::Release);
     });
 }
 
