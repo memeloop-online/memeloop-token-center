@@ -23,7 +23,7 @@ impl Database {
             return Ok(refs);
         }
 
-        for side in ["request", "response"] {
+        for side in ["response", "request"] {
             let (locator, state, reason) = if let Some(object) = archive
                 .raw_capture_reference(tenant_id, request_id, side)
                 .await?
@@ -302,6 +302,20 @@ mod tests {
                     .await
                     .unwrap()
             );
+            if side == "response" {
+                let owner = Uuid::now_v7();
+                sqlx::query("UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = 9223372036854775807 WHERE request_id = $2")
+                    .bind(owner.to_string()).bind(identity.request_id.to_string()).execute(pool).await.unwrap();
+                assert!(
+                    !crate::worker::archive_session_body(&state, owner, identity.request_id)
+                        .await
+                        .unwrap()
+                );
+                let row = sqlx::query("SELECT projected_at, semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+                    .bind(identity.request_id.to_string()).fetch_one(pool).await.unwrap();
+                assert_eq!(row.get::<Option<i64>, _>("projected_at"), None);
+                assert_eq!(row.get::<Option<String>, _>("semantic_snapshot_json"), None);
+            }
         }
         let row = sqlx::query("SELECT r.completed_at, r.response_object, o.lease_expires_at FROM request_records r JOIN conversation_projection_outbox o ON o.request_id = r.id WHERE r.id = $1").bind(identity.request_id.to_string()).fetch_one(pool).await.unwrap();
         assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
@@ -310,6 +324,53 @@ mod tests {
             object.object_locator
         );
         assert_eq!(row.get::<Option<i64>, _>("lease_expires_at"), None);
+    }
+
+    #[tokio::test]
+    async fn training_export_crosses_former_turn_limit_and_rejects_missing_ancestors() {
+        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let tenant = Uuid::now_v7();
+        let tenant_string = tenant.to_string();
+        let document = r#"{"role":"user","parts":[{"type":"text","text":"完整对话"}]}"#;
+        let reference = database
+            .store_body_reference(tenant, document.into())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, 'atom', 'instance', 'user', 'message', $2, 1)")
+            .bind(&tenant_string).bind(reference).execute(&database.pool).await.unwrap();
+        const TURNS: usize = 4101;
+        for start in (1..=TURNS).step_by(100) {
+            let mut insert = sqlx::QueryBuilder::<sqlx::Any>::new(
+                "INSERT INTO context_nodes (tenant_id, node_hash, parent_hash, atom_hash, depth, created_at) ",
+            );
+            insert.push_values(start..=(start + 99).min(TURNS), |mut row, depth| {
+                row.push_bind(tenant_string.clone())
+                    .push_bind(format!("node-{depth}"))
+                    .push_bind((depth > 1).then(|| format!("node-{}", depth - 1)))
+                    .push_bind("atom")
+                    .push_bind(depth as i64)
+                    .push_bind(1_i64);
+            });
+            insert.build().execute(&database.pool).await.unwrap();
+        }
+        let leaf = format!("node-{TURNS}");
+        let turns = database
+            .export_training_dialogue(tenant, &leaf)
+            .await
+            .unwrap();
+        assert_eq!(turns.len(), TURNS);
+        assert!(turns.iter().all(|turn| turn.parts[0]["text"] == "完整对话"));
+        sqlx::query("DELETE FROM context_nodes WHERE tenant_id = $1 AND node_hash = 'node-2048'")
+            .bind(tenant_string)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .export_training_dialogue(tenant, &leaf)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

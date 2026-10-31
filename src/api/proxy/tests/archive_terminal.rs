@@ -641,67 +641,73 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
 }
 
 #[tokio::test]
-async fn discarded_rejection_reader_finishes_original_capture_with_bounded_backpressure() {
-    let state = AppState::initialize(crate::config::Config::for_test("sqlite::memory:".into()))
+async fn consumed_and_discarded_readers_retain_full_capture_with_bounded_backpressure() {
+    for consume_tail in [false, true] {
+        let state = AppState::initialize(crate::config::Config::for_test("sqlite::memory:".into()))
+            .await
+            .unwrap();
+        let identity = crate::db::ArchiveSpoolIdentity {
+            tenant_id: Uuid::now_v7(),
+            request_id: Uuid::now_v7(),
+            reservation_id: Uuid::now_v7(),
+        };
+        let prefix = Bytes::from_static(b"private original prefix");
+        let tail = Bytes::from(vec![b'x'; 4 * 1024 * 1024]);
+        let mut expected = blake3::Hasher::new();
+        expected.update(&prefix);
+        expected.update(&tail);
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::FORBIDDEN,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_11,
+            content_length: None,
+            stream: Box::pin(futures_util::stream::iter([Ok(prefix.clone()), Ok(tail)])),
+        }
+        .with_archive_capture(
+            crate::response_archive_spool::ResponseArchiveProducer::begin(
+                &state,
+                identity,
+                state.persistence.stream_memory.reservation(),
+            ),
+        );
+        let mut reader = response.bytes_stream();
+        assert_eq!(reader.next().await.unwrap().unwrap(), prefix);
+        if consume_tail {
+            assert_eq!(reader.next().await.unwrap().unwrap().len(), 4 * 1024 * 1024);
+            assert!(reader.next().await.is_none());
+        }
+        drop(reader);
+        let reference = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(reference) = state
+                    .archive
+                    .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                    .await
+                    .unwrap()
+                {
+                    break reference;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
-        .unwrap();
-    let identity = crate::db::ArchiveSpoolIdentity {
-        tenant_id: Uuid::now_v7(),
-        request_id: Uuid::now_v7(),
-        reservation_id: Uuid::now_v7(),
-    };
-    let prefix = Bytes::from_static(b"private original prefix");
-    let tail = Bytes::from(vec![b'x'; 4 * 1024 * 1024]);
-    let mut expected = blake3::Hasher::new();
-    expected.update(&prefix);
-    expected.update(&tail);
-    let response = UpstreamResponse::Prefetched {
-        status: StatusCode::FORBIDDEN,
-        headers: HeaderMap::new(),
-        version: http::Version::HTTP_11,
-        content_length: None,
-        stream: Box::pin(futures_util::stream::iter([Ok(prefix.clone()), Ok(tail)])),
-    }
-    .with_archive_capture(
-        crate::response_archive_spool::ResponseArchiveProducer::begin(
-            &state,
-            identity,
-            state.persistence.stream_memory.reservation(),
-        ),
-    );
-    let mut reader = response.bytes_stream();
-    assert_eq!(reader.next().await.unwrap().unwrap(), prefix);
-    drop(reader);
-    let reference = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            if let Some(reference) = state
+        .expect("discarded reader must retain the entire upstream capture");
+        assert_eq!(reference.size_bytes, prefix.len() as u64 + 4 * 1024 * 1024);
+        assert_eq!(
+            reference.blake3_digest,
+            expected.finalize().to_hex().to_string()
+        );
+        state
+            .archive
+            .verify_tenant_content(identity.tenant_id, &reference)
+            .await
+            .unwrap();
+        assert!(
+            !state
                 .archive
-                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
                 .await
                 .unwrap()
-            {
-                break reference;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("discarded reader must retain the entire upstream capture");
-    assert_eq!(reference.size_bytes, prefix.len() as u64 + 4 * 1024 * 1024);
-    assert_eq!(
-        reference.blake3_digest,
-        expected.finalize().to_hex().to_string()
-    );
-    state
-        .archive
-        .verify_tenant_content(identity.tenant_id, &reference)
-        .await
-        .unwrap();
-    assert!(
-        !state
-            .archive
-            .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
-            .await
-            .unwrap()
-    );
+        );
+    }
 }

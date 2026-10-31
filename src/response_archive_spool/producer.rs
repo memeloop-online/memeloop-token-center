@@ -965,10 +965,17 @@ async fn run_response_archive_writer(
         .await?;
     state.archive.delete(&staged.object_locator).await?;
     state.db.refresh_closed_persistence_pool();
-    state
+    if let Err(error) = state
         .db
         .bind_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
-        .await?;
+        .await
+    {
+        // The immutable root is already the durable authority. The body
+        // worker retries relational binding from that root; a metadata outage
+        // must not relabel this complete original as a failed capture.
+        tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+            "raw response root awaits relational projection");
+    }
     Ok(WriterOutcome::Sealed)
 }
 

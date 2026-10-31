@@ -1,4 +1,5 @@
 use std::{
+    future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -58,9 +59,21 @@ pub(super) async fn rejected_response_terminal_cause(
 // The delivery reader may reject an oversized/non-JSON error or stop after a
 // terminal event. Keep ownership of its original, deadline-bearing stream so
 // that dropping that reader cannot turn the retained original into a prefix.
+type CaptureAppend = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Option<crate::response_archive_spool::ResponseArchiveProducer>,
+                    Bytes,
+                ),
+            > + Send,
+    >,
+>;
+
 struct CapturedUpstream {
     upstream: Option<UpstreamByteStream>,
     capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
+    pending: Option<CaptureAppend>,
 }
 
 impl Stream for CapturedUpstream {
@@ -68,45 +81,67 @@ impl Stream for CapturedUpstream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let Some(upstream) = this.upstream.as_mut() else {
-            return Poll::Ready(None);
-        };
-        match upstream.as_mut().poll_next(cx) {
-            Poll::Ready(Some(chunk)) => {
-                match &chunk {
-                    Ok(bytes) => {
-                        if let Some(writer) = this.capture.as_mut()
-                            && !writer.append(vec![bytes.clone()])
-                        {
-                            this.capture.take();
-                        }
-                    }
-                    Err(_) => {
-                        this.capture.take();
-                    }
-                }
-                Poll::Ready(Some(chunk))
+        loop {
+            if let Some(pending) = this.pending.as_mut() {
+                let (writer, bytes) = match pending.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(value) => value,
+                };
+                this.pending.take();
+                this.capture = writer;
+                return Poll::Ready(Some(Ok(bytes)));
             }
-            Poll::Ready(None) => {
-                this.upstream.take();
-                if let Some(writer) = this.capture.take() {
-                    drop(writer.seal());
+            let Some(upstream) = this.upstream.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match upstream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    let Some(mut writer) = this.capture.take() else {
+                        return Poll::Ready(Some(Ok(bytes)));
+                    };
+                    // The bounded queue applies backpressure to this one
+                    // upstream chunk. A fast or large response must never
+                    // turn into a missing archive merely because the upload
+                    // queue temporarily filled.
+                    this.pending = Some(Box::pin(async move {
+                        let retained = writer.append_background(bytes.clone()).await;
+                        (retained.then_some(writer), bytes)
+                    }));
                 }
-                Poll::Ready(None)
+                Poll::Ready(Some(Err(error))) => {
+                    this.capture.take();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => {
+                    this.upstream.take();
+                    if let Some(writer) = this.capture.take() {
+                        drop(writer.seal());
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl Drop for CapturedUpstream {
     fn drop(&mut self) {
-        let (Some(mut upstream), Some(mut writer)) = (self.upstream.take(), self.capture.take())
-        else {
+        let Some(mut upstream) = self.upstream.take() else {
             return;
         };
+        let pending = self.pending.take();
+        let capture = self.capture.take();
+        if pending.is_none() && capture.is_none() {
+            return;
+        }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
+                let capture = match pending {
+                    Some(pending) => pending.await.0,
+                    None => capture,
+                };
+                let Some(mut writer) = capture else { return };
                 while let Some(chunk) = upstream.next().await {
                     match chunk {
                         Ok(bytes) => {
@@ -340,6 +375,7 @@ impl UpstreamResponse {
         let captured = CapturedUpstream {
             upstream: Some(parts.stream),
             capture,
+            pending: None,
         };
         Self::Prefetched {
             status: parts.status,

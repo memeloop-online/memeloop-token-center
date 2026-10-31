@@ -1009,7 +1009,12 @@ pub(crate) async fn archive_session_body(
         locators.request = request.object_locator;
         locators.source_identity = None;
     }
-    if locators.pending {
+    let request_capture_pending = locators.request == format!("gap://{request_id}/request")
+        && !state
+            .archive
+            .raw_capture_failed(tenant_id, request_id, "request")
+            .await?;
+    if locators.pending || request_capture_pending {
         state
             .db
             .defer_pending_session_body_archive(lease_owner, request_id)

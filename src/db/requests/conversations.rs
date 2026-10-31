@@ -819,35 +819,58 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
-    /// 训练导出只读 CNPG 里的会话正文。不打开、不列出对象存储。
+    /// Walk relational prefix metadata and restore each tenant CAS body.
     pub async fn export_training_dialogue(
         &self,
         tenant_id: Uuid,
         leaf_node_hash: &str,
     ) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS ( \
-                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2 \
-                UNION ALL \
-                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n \
-                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash \
-                WHERE c.depth > 0 AND c.depth < 4096 \
-            ) \
-            SELECT a.content_json FROM chain c \
-            JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash \
-            ORDER BY c.depth ASC LIMIT 4096",
+        use futures_util::TryStreamExt as _;
+
+        let mut rows = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2
+                UNION
+                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n
+                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash
+                WHERE c.depth > 1 AND n.depth = c.depth - 1
+            )
+            SELECT c.node_hash, c.parent_hash, c.depth, a.content_json FROM chain c
+            LEFT JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash
+            ORDER BY c.depth ASC",
         )
         .bind(tenant_id.to_string())
         .bind(leaf_node_hash)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut turns = Vec::with_capacity(rows.len());
-        for row in rows {
-            let reference: String = row.try_get("content_json")?;
-            let content = self.read_body_reference(tenant_id, &reference).await?;
+        .fetch(&self.pool);
+        let mut turns = Vec::new();
+        let mut previous = None;
+        while let Some(row) = rows.try_next().await? {
+            let parent: Option<String> = row.try_get("parent_hash")?;
+            let depth: i64 = row.try_get("depth")?;
+            if depth
+                != i64::try_from(turns.len())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1)
+                || parent != previous
+            {
+                return Err(AppError::storage("conversation_prefix_incomplete"));
+            }
+            let reference: Option<String> = row.try_get("content_json")?;
+            let content = self
+                .read_body_reference(
+                    tenant_id,
+                    reference
+                        .as_deref()
+                        .ok_or_else(|| AppError::storage("conversation_body_missing"))?,
+                )
+                .await?;
             let value = serde_json::from_str(&content)
                 .map_err(|_| AppError::internal("conversations_export_training_dialogue_1"))?;
             turns.push(value);
+            previous = Some(row.try_get::<String, _>("node_hash")?);
+        }
+        if previous.as_deref() != Some(leaf_node_hash) {
+            return Err(AppError::storage("conversation_prefix_incomplete"));
         }
         Ok(crate::conversation::training_dialogue(&turns))
     }
