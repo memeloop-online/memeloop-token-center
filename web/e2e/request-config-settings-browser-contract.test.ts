@@ -74,34 +74,44 @@ test('HTTP settings save full documents, preserve inheritance and drafts, and ex
     assert.equal(body?.settings.purposes.codex?.read_timeout_ms, null);
     assert.equal(body?.settings.purposes.oauth?.request_timeout_ms, 90000);
     assert.equal(body?.settings.defaults.read_timeout_ms, 15000);
+    assert.deepEqual((body?.settings.defaults as Record<string, unknown>).future_default, { retain: true });
+    assert.equal((body?.settings.purposes.codex as Record<string, unknown>).future_purpose_field, 'retain');
+    assert.equal((body?.settings.purposes as Record<string, { request_timeout_ms?: number }>).future_purpose.request_timeout_ms, 1200);
     await page.screenshot({ path: `${artifacts}/disabled-override-zh-1440.png`, fullPage: true });
 
     await purpose.getByRole('button', { name: '清除覆盖', exact: true }).click();
     await card.getByText('当前实例生效版本：9').waitFor();
     assert.equal(await page.evaluate(() => 'codex' in ((window as FixtureWindow).requestConfigFixture.lastBody?.settings.purposes ?? {})), false);
     assert.equal(await read.inputValue(), '');
-    await purpose.getByText('实际生效：15000 毫秒').waitFor();
+    await purpose.getByText('配置解析：15000 毫秒').waitFor();
 
     await read.fill('1');
     await page.evaluate(() => { (window as FixtureWindow).requestConfigFixture.delaySave = true; });
     await purpose.getByRole('button', { name: '保存覆盖', exact: true }).click();
     assert.equal(await read.inputValue(), '1');
-    await purpose.getByText('实际生效：15000 毫秒').waitFor();
+    await purpose.getByText('配置解析：15000 毫秒').waitFor();
     await page.screenshot({ path: `${artifacts}/saving-zh-1440.png`, fullPage: true });
     await page.evaluate(() => { const fixture = (window as FixtureWindow).requestConfigFixture; fixture.delaySave = false; fixture.releaseSave(); });
     await card.getByText('当前实例生效版本：10').waitFor();
-    await purpose.getByText('实际生效：1 毫秒').waitFor();
+    await purpose.getByText('配置解析：1 毫秒').waitFor();
 
     const defaults = card.locator('.request-config-scope').first();
     await defaults.locator('#request-config-default-read_timeout_ms').fill('25000');
     await defaults.locator('#request-config-default-pool_max_idle_per_host').fill('0');
+    const defaultRequest = defaults.locator('.request-config-row').filter({ has: page.locator('#request-config-default-request_timeout_ms') });
+    await defaultRequest.getByRole('checkbox', { name: '不设限' }).check();
     await defaults.getByRole('button', { name: '保存默认' }).click();
     await card.getByText('当前实例生效版本：11').waitFor();
-    await purpose.getByText('实际生效：1 毫秒').waitFor();
-    await purpose.getByText('实际生效：0 条').waitFor();
+    const defaultBody = await page.evaluate(() => (window as FixtureWindow).requestConfigFixture.lastBody);
+    assert.equal(defaultBody?.settings.defaults.request_timeout_ms, null);
+    assert.deepEqual((defaultBody?.settings.defaults as Record<string, unknown>).future_default, { retain: true });
+    await defaultRequest.getByText('全局默认', { exact: true }).waitFor();
+    await defaultRequest.getByText('配置解析：不额外限制', { exact: true }).waitFor();
+    await purpose.getByText('配置解析：1 毫秒').waitFor();
+    await purpose.getByText('配置解析：0 条').waitFor();
     await purpose.getByRole('button', { name: '清除覆盖', exact: true }).click();
     await card.getByText('当前实例生效版本：12').waitFor();
-    await purpose.getByText('实际生效：25000 毫秒').waitFor();
+    await purpose.getByText('配置解析：25000 毫秒').waitFor();
 
     await read.fill('0');
     assert.equal(await purpose.getByRole('button', { name: '保存覆盖', exact: true }).isDisabled(), true);

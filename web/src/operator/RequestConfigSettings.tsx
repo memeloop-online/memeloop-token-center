@@ -101,7 +101,7 @@ export function RequestConfigSettings({ token }: { token: string }) {
     const contractScope: RequestConfigScope = scope === defaultScope ? { scope: 'default' } : { scope: 'purpose', purpose: scope as RequestConfigPurpose };
     setSavingScope(scope); setError(''); setMessage('');
     try {
-      const next = await saveRequestConfig(token, contractScope, values, snapshot);
+      const next = await saveRequestConfig(token, contractScope, values, snapshot, cleared);
       if (!current()) return;
       setSnapshot(next);
       setMessage(translate.current(cleared ? 'settings.requestConfigCleared' : 'settings.requestConfigSaved'));

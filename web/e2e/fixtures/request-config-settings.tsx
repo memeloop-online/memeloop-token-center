@@ -27,8 +27,12 @@ const control = {
   lastBody: null as { expected_revision: number; settings: HttpSettings } | null,
   releaseSave: () => {},
   state: withEffective(7, {
-    defaults: { connect_timeout_ms: 30000, read_timeout_ms: 15000 },
-    purposes: { codex: { connect_timeout_ms: 60000 }, oauth: { request_timeout_ms: 90000 } },
+    defaults: { connect_timeout_ms: 30000, read_timeout_ms: 15000, future_default: { retain: true } } as HttpSettings['defaults'],
+    purposes: {
+      codex: { connect_timeout_ms: 60000, future_purpose_field: 'retain' } as HttpSettings['defaults'],
+      oauth: { request_timeout_ms: 90000 },
+      future_purpose: { request_timeout_ms: 1200 },
+    } as HttpSettings['purposes'],
   }),
 };
 Object.assign(window, { requestConfigFixture: control });
