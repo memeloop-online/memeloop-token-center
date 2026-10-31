@@ -213,6 +213,14 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        ports: ["8123:8123"]
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s --health-timeout 3s --health-retries 20
       postgres:
         image: postgres:16-alpine
         env:
@@ -259,6 +267,14 @@ jobs:
       - name: Verify durable archive RSS harness contract
         run: node --test tests/load/test-durable-archive-memory.ts
       - run: cargo fmt --all -- --check
+      - name: Verify request history capture, replay, migration and isolated ClickHouse reads
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+          MTC_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+          MTC_REQUEST_HISTORY_URL: http://127.0.0.1:8123
+        run: |
+          cargo test --locked --all-features --lib request_history -- --nocapture
+          cargo test --locked --all-features --lib request_history_real_services_acceptance -- --ignored --nocapture
       - name: Verify pinned Claude privacy component through the host ABI
         id: claude_component
         env:
