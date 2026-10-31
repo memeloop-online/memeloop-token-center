@@ -8,7 +8,7 @@ use crate::{AppState, config::Config, db::ArchiveSpoolIdentity};
 const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
-async fn deferred_capture_recovers_a_completed_request_without_a_response_locator() {
+async fn object_capture_recovers_a_completed_request_without_a_response_locator() {
     let (_directory, state, pool, identity) = fixture().await;
     sqlx::query(
         "UPDATE request_records SET completed_at = 2, response_object = NULL WHERE id = $1",
@@ -18,22 +18,33 @@ async fn deferred_capture_recovers_a_completed_request_without_a_response_locato
     .await
     .unwrap();
     let body = Bytes::from_static(b"{\"output\":\"original delivered response\"}");
-    let archive = BufferedArchive::new(
+    let mut archive = ResponseArchiveProducer::begin(
+        &state,
         identity,
-        BufferedArchivePurpose::Response,
-        &body,
-        state.config.key_pepper.as_bytes(),
-        false,
+        state.persistence.stream_memory.reservation(),
     )
     .unwrap();
-    assert!(state.db.capture_deferred_archive(&archive).await.unwrap());
-    assert!(
+    assert!(archive.append(vec![body.clone()]));
+    archive.seal().unwrap().wait().await;
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
         state
-            .db
-            .deferred_archive_is_captured(identity, BufferedArchivePurpose::Response, &body)
+            .archive
+            .get_tenant_content(identity.tenant_id, &reference, 1024)
             .await
-            .unwrap()
+            .unwrap(),
+        body
     );
+    let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(chunks, 0);
     let completed_at: i64 =
         sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id = $1")
             .bind(identity.request_id.to_string())

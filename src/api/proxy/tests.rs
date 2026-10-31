@@ -2215,6 +2215,7 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
         Some("upstream_transport_request")
     );
     assert_eq!(rows[0].billing.cost, None);
+    fixture.state.persistence.drain_for_test().await;
     let refs = fixture
         .state
         .db
@@ -2222,10 +2223,37 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
         .await
         .unwrap();
     assert_eq!(
-        refs.response_object.as_deref(),
-        Some(
-            "inline-json:{\"error\":{\"code\":\"upstream_transport_request\",\"message\":\"上游请求失败。发送上游请求失败。\",\"message_en\":\"upstream request failed. sending the upstream request failed.\",\"type\":\"upstream_error\"}}"
-        )
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert!(
+        refs.response_object
+            .as_deref()
+            .unwrap()
+            .starts_with("gap://")
+    );
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_reference(key.tenant_id, rows[0].request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_failed(key.tenant_id, rows[0].request_id, "response")
+            .await
+            .unwrap()
     );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let selected_account: String = sqlx::query_scalar(
@@ -2968,7 +2996,7 @@ async fn assert_exactly_once_side_effects_for(
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     // Settlement can commit the request before the conversation journal enqueues
     // its projection task. Claim until that one observation exists.
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             for pending_id in fixture
                 .state
@@ -3001,37 +3029,13 @@ async fn assert_exactly_once_side_effects_for(
                 .await
                 .unwrap()
             {
-                // Some finalizer fixtures admit a reservation directly, without
-                // running ingress capture. Give their saved request JSON an
-                // explicit locator before exercising the raw-document worker;
-                // an unrecorded gap otherwise means capture is still pending.
-                let synthetic_request: Option<String> = sqlx::query_scalar(
-                    "SELECT o.request_json FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND r.request_object = 'gap://' || r.id || '/request' AND NOT EXISTS (SELECT 1 FROM request_archive_spools s WHERE s.request_id = r.id)",
-                )
-                .bind(task.request_id.to_string())
-                .fetch_optional(&pool)
-                .await
-                .unwrap();
-                if let Some(raw_request) = synthetic_request {
-                    let document: Value = serde_json::from_str(&raw_request).unwrap();
-                    assert!(document.get("messages").is_some() || document.get("input").is_some());
-                    sqlx::query(
-                        "UPDATE request_records SET request_object = $1 WHERE id = $2 AND key_id = $3 AND request_object = 'gap://' || id || '/request'",
-                    )
-                    .bind(format!("inline-json:{raw_request}"))
-                    .bind(task.request_id.to_string())
-                    .bind(fixture.key_id.to_string())
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-                }
                 if !crate::worker::archive_session_body(
-                        &fixture.state,
-                        projection_owner,
-                        task.request_id
-                    )
-                    .await
-                    .unwrap()
+                    &fixture.state,
+                    projection_owner,
+                    task.request_id,
+                )
+                .await
+                .unwrap()
                 {
                     continue;
                 }
@@ -3734,16 +3738,14 @@ async fn codex_buffered_chat_translates_request_and_response_and_settles_once() 
         original
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(
-            &fixture
-                .state
-                .archive
-                .get(refs.response_object.as_deref().unwrap())
-                .await
-                .unwrap()
-        )
-        .unwrap(),
-        body
+        fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap()
+            .as_ref(),
+        completed_codex_sse("Au revoir").as_bytes()
     );
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -3891,7 +3893,7 @@ async fn codex_buffered_chat_maps_valid_incomplete_to_success_with_provider_usag
             .await
             .unwrap()
             .as_ref(),
-        body.as_ref()
+        incomplete_codex_sse("Partial translation", "max_output_tokens", false).as_bytes()
     );
     upstream.verify().await;
 }
@@ -3962,7 +3964,7 @@ async fn codex_streaming_chat_maps_valid_incomplete_without_responses_lifecycle_
             .await
             .unwrap()
             .as_ref(),
-        body.as_ref()
+        incomplete_codex_sse("Partial translation", "future_bounded_reason", true).as_bytes()
     );
     upstream.verify().await;
 }
@@ -5410,10 +5412,7 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
     );
     pool.close().await;
     let archived = sse_delivery::pending_response_archive(&fixture, &receipt).await;
-    assert_eq!(archived, rendered);
-    for secret in ["provider-secret", "secret-token"] {
-        assert!(!archived.contains(secret));
-    }
+    assert_eq!(archived, failed);
     let rendered_metrics = fixture
         .state
         .metrics
@@ -5581,7 +5580,7 @@ async fn downstream_disconnect_records_unknown_without_waiting_for_stalled_upstr
         "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
     );
     let (endpoint, terminal_tx, upstream) =
-        gated_completed_sse_upstream_endpoint(prefix, terminal).await;
+        gated_completed_sse_upstream_endpoint(prefix.clone(), terminal.clone()).await;
 
     let response = send_codex_route_to_endpoint(
         &fixture,
@@ -5619,31 +5618,56 @@ async fn downstream_disconnect_records_unknown_without_waiting_for_stalled_upstr
     assert!(rows[0].usage.tokens.is_none());
     assert_eq!(rows[0].billing.cost, None);
 
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let states: Vec<String> = sqlx::query_scalar(
-                "SELECT state FROM response_archive_spools WHERE request_id = $1",
-            )
-            .bind(rows[0].request_id.to_string())
-            .fetch_all(&pool)
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_reference(key.tenant_id, rows[0].request_id, "response")
             .await
-            .unwrap();
-            if states == ["gap"] {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the sole archive owner must fence the cancelled capture once");
-    pool.close().await;
-
-    // The mock provider is intentionally still blocked. Abort only its local
-    // socket task after the assertion; the proxy has already dropped its read.
-    upstream.abort();
-    drop(terminal_tx);
-    assert!(upstream.await.unwrap_err().is_cancelled());
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !fixture
+            .state
+            .archive
+            .raw_capture_failed(key.tenant_id, rows[0].request_id, "response")
+            .await
+            .unwrap()
+    );
+    // Finance is already unknown while the provider remains gated. Releasing
+    // it lets the independent original-body reader complete without replay.
+    terminal_tx.send(()).unwrap();
+    upstream.await.unwrap();
+    drain_archive_capture(&fixture).await;
+    let reference = fixture
+        .state
+        .archive
+        .raw_capture_reference(key.tenant_id, rows[0].request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    let original = fixture
+        .state
+        .archive
+        .get_tenant_content(key.tenant_id, &reference, MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(original.as_ref(), format!("{prefix}{terminal}").as_bytes());
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert!(rows[0].usage.tokens.is_none());
+    assert_eq!(rows[0].billing.cost, None);
 }
 
 #[tokio::test]

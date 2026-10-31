@@ -212,7 +212,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         );
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let _dispatch_permit = dispatch_permit;
-        let archive_memory = background_state.persistence.stream_memory.reservation();
         let request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
@@ -235,17 +234,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Some(upstream_account_id),
                 Some(credential_generation),
             ));
+            // The request owner attached the raw capture at response headers,
+            // before protocol checks or translation can stop delivery.
             let mut upstream_stream = upstream.bytes_stream();
-            let spool_identity = crate::db::ArchiveSpoolIdentity {
-                request_id,
-                tenant_id,
-                reservation_id: reservation.id,
-            };
-            let mut archive_sender = crate::response_archive_spool::ResponseArchiveProducer::begin(
-                &background_state,
-                spool_identity,
-                archive_memory,
-            );
             let mut usage_capture = Vec::new();
             let mut capture_memory = background_state
                 .metrics
@@ -326,14 +317,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 waits.body_chunk();
                             }
                             downstream_closed_observed |= downstream_closed;
-                            if downstream_closed {
-                                drop(archive_sender.take());
-                            }
                             next
                         }
                         StreamPoll::Upstream(DownstreamAwarePoll::DownstreamClosed) => {
                             transport_error = Some("downstream_disconnected");
-                            drop(archive_sender.take());
                             break;
                         }
                         StreamPoll::ProgressHeartbeat => {
@@ -361,7 +348,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
                                 Err(_) => transport_error = Some("downstream_backpressure"),
                             }
-                            drop(archive_sender.take());
                             break;
                         }
                     }
@@ -390,7 +376,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 downstream_closed_observed || body_sender.is_closed(),
                                 error_code,
                             ));
-                            drop(archive_sender.take());
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
                                 body_sender.send(downstream_stream_failure(
@@ -419,7 +404,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     downstream_closed_observed || body_sender.is_closed(),
                                     "upstream_response_memory_capacity",
                                 ));
-                                drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
                                     body_sender.send(downstream_stream_failure(
@@ -440,7 +424,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 downstream_ready_bytes.saturating_add(raw_chunk_len);
                             if downstream_ready_bytes > sse_framing_limits.terminal_hold_bytes {
                                 transport_error = Some("downstream_disconnected");
-                                drop(archive_sender.take());
                                 break;
                             }
                         }
@@ -462,7 +445,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     downstream_closed_observed || body_sender.is_closed(),
                                     "upstream_response_too_large",
                                 ));
-                                drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
                                     body_sender.send(downstream_stream_failure(
@@ -499,7 +481,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                                     || body_sender.is_closed(),
                                                 error_code,
                                             ));
-                                        drop(archive_sender.take());
                                         let _ = tokio::time::timeout(
                                             MAX_DOWNSTREAM_SEND_WAIT,
                                             body_sender.send(downstream_stream_failure(
@@ -543,7 +524,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             );
                             if downstream_closed_observed && !terminal_evidence_pending {
                                 transport_error = Some("downstream_disconnected");
-                                drop(archive_sender.take());
                                 break;
                             }
                             continue;
@@ -570,7 +550,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     downstream_closed_observed || body_sender.is_closed(),
                                     rejection.error_code(),
                                 ));
-                                drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
                                     body_sender.send(downstream_stream_failure(
@@ -601,7 +580,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                                     || body_sender.is_closed(),
                                                 error_code,
                                             ));
-                                        drop(archive_sender.take());
                                         let _ = tokio::time::timeout(
                                             MAX_DOWNSTREAM_SEND_WAIT,
                                             body_sender.send(downstream_stream_failure(
@@ -624,30 +602,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         let observed_ms = diagnostic_context.elapsed_millis_at(Instant::now());
                         for frame in &delivery_frames {
                             output_timing.observe(&frame.bytes, frame.terminal, observed_ms);
-                        }
-                        if let Some(spool) = archive_sender.as_mut() {
-                            let mut archive_failed = false;
-                            for frame in &delivery_frames {
-                                let Some(_retention_memory) =
-                                    request_memory.try_reserve_archive_json_transform(&frame.bytes)
-                                else {
-                                    archive_failed = true;
-                                    break;
-                                };
-                                if !spool.append(vec![
-                                    super::archive_retention::sse_frame_with_limits(
-                                        &frame.bytes,
-                                        sse_framing_limits,
-                                    ),
-                                ]) {
-                                    archive_failed = true;
-                                    break;
-                                }
-                            }
-                            if archive_failed {
-                                tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
-                                drop(archive_sender.take());
-                            }
                         }
                         // A successful Responses terminal is held privately
                         // until EOF validates its tail. Once the receiver is
@@ -703,7 +657,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             }
                         }
                         if transport_error.is_some() {
-                            drop(archive_sender.take());
                             if resume_pending_delivery_after_send_disconnect(
                                 &mut transport_error,
                                 &mut downstream_closed_observed,
@@ -733,7 +686,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         }
                         if downstream_closed_observed {
                             transport_error = Some("downstream_disconnected");
-                            drop(archive_sender.take());
                             break;
                         }
                         if codex_responses_progress_heartbeat
@@ -756,7 +708,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             downstream_closed_observed || body_sender.is_closed(),
                             error_code,
                         ));
-                        drop(archive_sender.take());
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,
                             body_sender.send(downstream_stream_failure(
@@ -780,9 +731,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             if let Some(phase) = first_byte.take() {
                 phase.finish("no_bytes", Some(status.as_u16()), Some(0));
             }
-            if transport_error.is_some() {
-                drop(archive_sender.take());
-            }
             let local_response_boundary =
                 transport_error.is_some_and(buffered_upstream::is_local_response_boundary);
             let sse_summary = sse_capture.map(|capture| {
@@ -798,28 +746,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 sse_summary.as_ref().map(|summary| &summary.outcome),
                 Some(ResponsesSseOutcome::Incomplete)
             );
-            if incomplete {
-                // A partial SSE event is not a deliverable response and must
-                // not leave a complete-looking archive prefix behind.
-                drop(archive_sender.take());
-            }
-            // Success terminals and EOF transfer the bounded capture to its
-            // owned writer. The terminal frame does not wait for database
-            // drain; the writer keeps the row capturing until seal commits.
+            // The original upstream owner drains and seals independently of
+            // delivery sanitization, downstream cancellation and financial ACK.
             let terminal_delivery_phase =
                 proxy_diagnostics::Phase::new(diagnostic_context, "terminal_delivery");
-            let archive_settlement: Option<
-                crate::response_archive_spool::ResponseArchiveSettlement,
-            > = match archive_sender.take() {
-                Some(spool) => spool.seal(),
-                None => None,
-            };
-            drop(archive_settlement);
-            // A spawned writer exclusively fences its failed/abandoned
-            // capture, including a begin that commits after cancellation.
-            // No writer means memory admission failed before any spool SQL;
-            // the request already has its gap locator. Do not duplicate the
-            // fence or put its database wait ahead of terminal delivery.
             let failed = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),
                 Some(ResponsesSseOutcome::Failed)

@@ -892,6 +892,16 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                 break false;
                             }
                         };
+                        if success {
+                            database
+                                .publish_request_source(
+                                    identity,
+                                    &key,
+                                    source.length,
+                                    source.digest,
+                                )
+                                .await;
+                        }
                         let permit = if success {
                             database.try_request_source_completion()
                         } else {

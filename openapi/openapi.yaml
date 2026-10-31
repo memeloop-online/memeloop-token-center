@@ -5624,12 +5624,72 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Retained prefix path is incomplete or inconsistent. }
 
+  /internal/v1/sessions/{session_id}/requests/{request_id}/training:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionTrainingArchive
+      summary: Export verified conversation events and durable raw and media references
+      description: Reads immutable tenant archive objects. Incomplete captures or missing media fail rather than being labelled complete training data. Raw JSON and SSE can be streamed separately without a document size limit.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+      responses:
+        '200':
+          description: NDJSON manifest and event references with descending ordinals. Require the verified end record and EOF; a truncated stream is not a complete export.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {description: 'Archive is incomplete, inconsistent or unavailable.'}
+
+  /internal/v1/sessions/{session_id}/requests/{request_id}/training/raw/{side}:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionTrainingRaw
+      summary: Stream the exact retained raw request or response
+      description: Rechecks session ownership and streams the durable object with byte and BLAKE3 verification. Consumers must read to EOF and verify x-content-blake3 and x-content-bytes. This endpoint does not certify that a partial upstream response is a complete dialogue.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+        - name: side
+          in: path
+          required: true
+          schema: {type: string, enum: [request, response]}
+      responses:
+        '200':
+          description: Exact JSON or SSE bytes, never an evictable cache reference.
+          headers:
+            x-content-blake3:
+              schema: {type: string}
+            x-content-bytes:
+              schema: {type: string}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {description: Archive is inconsistent or unavailable.}
+
   /internal/v1/sessions/{session_id}/requests/{request_id}/dialogue:
     get:
       tags: [Operator traffic]
       operationId: getOperatorSessionDialogue
       summary: Read the cleaned session dialogue stored for this request
-      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      description: Returns cleaned dialogue from immutable archive bodies through tenant-scoped context metadata. This presentation is not the byte-exact raw training archive and does not return object locators.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:

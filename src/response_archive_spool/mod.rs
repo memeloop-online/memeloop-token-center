@@ -15,6 +15,9 @@ use std::{
 
 use crate::error::AppError;
 
+pub(crate) use producer::ResponseArchiveProducer;
+#[cfg(test)]
+pub(crate) use producer::ResponseArchiveSettlement;
 #[cfg(test)]
 pub(crate) use producer::capture_buffered;
 #[cfg(test)]
@@ -30,7 +33,6 @@ pub(crate) use producer::pause_next_request_preseal_for_test;
 #[cfg(test)]
 pub(crate) use producer::scoped_request_preseal_pause_for_test;
 pub(crate) use producer::{BufferedArchive, PreparedArchiveBatch};
-pub(crate) use producer::{ResponseArchiveProducer, ResponseArchiveSettlement};
 pub(crate) use upload::run;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,7 +66,7 @@ pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
 // with only the legacy writer's one-chunk ciphertext transient above it.
 const CAPTURE_QUEUE_CHUNKS: usize = 3;
 pub(crate) const CAPTURE_DATABASE_BATCH_CHUNKS: usize = CAPTURE_QUEUE_CHUNKS + 1;
-const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5;
+const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5 + crate::archive::ARCHIVE_MULTIPART_PART_BYTES;
 
 struct OwnedTask<T: Send + 'static> {
     task: Option<tokio::task::JoinHandle<Result<T, AppError>>>,

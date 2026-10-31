@@ -52,7 +52,25 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         })
         .await
         .unwrap();
-    let request = BufferedRequest {
+    let request_body = Bytes::from(
+        serde_json::to_vec(
+            &json!({"model":fixture.model,"messages":[{"role":"user","content":"test cached input"}]}),
+        )
+        .unwrap(),
+    );
+    let raw_request = fixture
+        .state
+        .archive
+        .put_tenant_content(key.tenant_id, request_body.clone())
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .publish_raw_capture(key.tenant_id, request_id, "request", &raw_request)
+        .await
+        .unwrap();
+    let mut request = BufferedRequest {
         session_preference: None,
         state: &fixture.state,
         reservation,
@@ -64,20 +82,14 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         requested_service_tier: None,
         conversation: Some(ProxyConversation {
             key: key.clone(),
-            request_body: ConversationBody::InMemory(Bytes::from(
-                serde_json::to_vec(
-                    &json!({"model":fixture.model,"messages":[{"role":"user","content":"test cached input"}]}),
-                )
-                .unwrap(),
-            )),
+            request_body: ConversationBody::InMemory(request_body),
             hints: crate::conversation::ConversationHints::default(),
             client_name: None,
-            projection_admission: std::sync::Mutex::new(
-                ConversationProjectionAdmission::Deferred,
-            ),
+            projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
         }),
         protocol: Protocol::OpenAiChat,
         tenant_id: key.tenant_id,
+        original_response_capture: false,
         memory: fixture.state.proxy_memory_budget.reservation(),
     };
     let mut attempt = UpstreamAttemptGuard::new(
@@ -97,12 +109,13 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         .send()
         .await
         .unwrap();
+    let captured = request.capture_original_response(raw.into());
     // Exercise the production buffered finalizer and its real reservation,
     // accounting, and archive path without relaxing Kimi's fixed network origin.
     let response = finish_non_sse_proxy_response(NonSseProxyResponseInput {
         buffered_request: &request,
         selected_driver: crate::oauth::managed::kimi::PROVIDER_DRIVER,
-        upstream: raw.into(),
+        upstream: captured,
         status: StatusCode::OK,
         content_type: Some(HeaderValue::from_static("application/json")),
         protocol: Protocol::OpenAiChat,

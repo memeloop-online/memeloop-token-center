@@ -328,6 +328,7 @@ async fn admitted_invalid_dispatch_policy_finishes_as_configuration_error_withou
         conversation: None,
         protocol: Protocol::OpenAiResponses,
         tenant_id: key.tenant_id,
+        original_response_capture: false,
         memory: fixture.state.proxy_memory_budget.reservation(),
     };
     let response = lifecycle::finish_dispatch_failure(

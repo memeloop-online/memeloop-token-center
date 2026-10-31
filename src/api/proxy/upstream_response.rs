@@ -1,10 +1,14 @@
-use std::pin::Pin;
+use std::{
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use http::{HeaderMap, StatusCode, Version};
 
-pub(super) type UpstreamByteStream =
+pub(in crate::api) type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, &'static str>> + Send + 'static>>;
 
 pub(super) const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_read_error";
@@ -50,6 +54,108 @@ pub(super) async fn rejected_response_terminal_cause(
         .await
         .ok()
         .flatten()
+}
+
+// The delivery reader may reject an oversized/non-JSON error or stop after a
+// terminal event. Keep ownership of its original, deadline-bearing stream so
+// that dropping that reader cannot turn the retained original into a prefix.
+type CaptureAppend = Pin<
+    Box<
+        dyn Future<
+                Output = (
+                    Option<crate::response_archive_spool::ResponseArchiveProducer>,
+                    Bytes,
+                ),
+            > + Send,
+    >,
+>;
+
+struct CapturedUpstream {
+    upstream: Option<UpstreamByteStream>,
+    capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
+    pending: Option<CaptureAppend>,
+}
+
+impl Stream for CapturedUpstream {
+    type Item = Result<Bytes, &'static str>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(pending) = this.pending.as_mut() {
+                let (writer, bytes) = match pending.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(value) => value,
+                };
+                this.pending.take();
+                this.capture = writer;
+                return Poll::Ready(Some(Ok(bytes)));
+            }
+            let Some(upstream) = this.upstream.as_mut() else {
+                return Poll::Ready(None);
+            };
+            match upstream.as_mut().poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => {
+                    let Some(mut writer) = this.capture.take() else {
+                        return Poll::Ready(Some(Ok(bytes)));
+                    };
+                    // The bounded queue applies backpressure to this one
+                    // upstream chunk. A fast or large response must never
+                    // turn into a missing archive merely because the upload
+                    // queue temporarily filled.
+                    this.pending = Some(Box::pin(async move {
+                        let retained = writer.append_with_backpressure(bytes.clone()).await;
+                        (retained.then_some(writer), bytes)
+                    }));
+                }
+                Poll::Ready(Some(Err(error))) => {
+                    this.capture.take();
+                    return Poll::Ready(Some(Err(error)));
+                }
+                Poll::Ready(None) => {
+                    this.upstream.take();
+                    if let Some(writer) = this.capture.take() {
+                        drop(writer.seal());
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl Drop for CapturedUpstream {
+    fn drop(&mut self) {
+        let Some(mut upstream) = self.upstream.take() else {
+            return;
+        };
+        let pending = self.pending.take();
+        let capture = self.capture.take();
+        if pending.is_none() && capture.is_none() {
+            return;
+        }
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let capture = match pending {
+                    Some(pending) => pending.await.0,
+                    None => capture,
+                };
+                let Some(mut writer) = capture else { return };
+                while let Some(chunk) = upstream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if !writer.append_with_backpressure(bytes).await {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                drop(writer.seal());
+            });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -182,7 +288,7 @@ pub(super) struct UpstreamResponseParts {
 }
 
 /// A small response surface. Native Codex and every other upstream use reqwest.
-pub(super) enum UpstreamResponse {
+pub(in crate::api) enum UpstreamResponse {
     Reqwest(reqwest::Response),
     Codex(reqwest::Response),
     Prefetched {
@@ -238,7 +344,7 @@ impl UpstreamResponse {
         }
     }
 
-    pub(super) fn content_length(&self) -> Option<u64> {
+    pub(in crate::api) fn content_length(&self) -> Option<u64> {
         match self {
             Self::Reqwest(response) => response.content_length(),
             Self::Codex(response) => response.content_length(),
@@ -258,6 +364,25 @@ impl UpstreamResponse {
             version,
             content_length,
             stream,
+        }
+    }
+
+    pub(in crate::api) fn with_archive_capture(
+        self,
+        capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
+    ) -> Self {
+        let parts = self.into_parts();
+        let captured = CapturedUpstream {
+            upstream: Some(parts.stream),
+            capture,
+            pending: None,
+        };
+        Self::Prefetched {
+            status: parts.status,
+            headers: parts.headers,
+            version: parts.version,
+            content_length: parts.content_length,
+            stream: Box::pin(captured),
         }
     }
 
@@ -283,7 +408,7 @@ impl UpstreamResponse {
     /// starts only after response headers have arrived. The absolute deadline
     /// is created before `send()` and is deliberately carried into the body;
     /// it is never restarted at the header/body boundary.
-    pub(super) fn with_body_timeouts(
+    pub(in crate::api) fn with_body_timeouts(
         self,
         request_deadline: tokio::time::Instant,
         read_timeout: std::time::Duration,
@@ -346,7 +471,7 @@ impl UpstreamResponse {
         }
     }
 
-    pub(super) fn bytes_stream(self) -> UpstreamByteStream {
+    pub(in crate::api) fn bytes_stream(self) -> UpstreamByteStream {
         match self {
             Self::Reqwest(response) => Box::pin(response.bytes_stream().map(|chunk| {
                 chunk.map_err(|error| {

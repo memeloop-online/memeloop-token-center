@@ -133,11 +133,6 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             if updated.rows_affected() == 1 {
-                // Old enqueue implementations could recreate this consumed
-                // payload on a completed replay. It is no longer recovery
-                // input once the matching retained path has been verified.
-                sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3")
-                    .bind(&request).bind(&tenant).bind(&key).execute(&mut *tx).await?;
                 compacted += 1;
             }
             tx.commit().await?;
@@ -436,7 +431,6 @@ mod receipt_tests {
                 ConversationProjectionEnqueueInput {
                     request_id: Uuid::from_u128(index),
                     key: &key,
-                    request_json: &body,
                     hints: &hints,
                     client_name: Some("Codex"),
                     upstream_response_id: None,
@@ -580,11 +574,9 @@ mod receipt_tests {
         let key = key(&db, "receipt").await;
         let request = Uuid::now_v7();
         let hints = ConversationHints::default();
-        let empty = serde_json::json!({});
         let enqueue = |client_name| ConversationProjectionEnqueueInput {
             request_id: request,
             key: &key,
-            request_json: &empty,
             hints: &hints,
             client_name,
             upstream_response_id: None,

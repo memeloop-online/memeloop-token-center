@@ -120,7 +120,6 @@ async fn contract(fixture: Fixture) {
         ConversationProjectionEnqueueInput {
             request_id,
             key: &fixture.key,
-            request_json: &serde_json::json!({}),
             hints: &hints,
             client_name: Some("Codex"),
             upstream_response_id: None,

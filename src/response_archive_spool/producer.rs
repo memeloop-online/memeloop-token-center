@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(test)]
 use tracing::Instrument;
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
@@ -410,6 +411,7 @@ fn take_append_failure_for_test(state: &AppState) -> bool {
 }
 
 pub(crate) struct ResponseArchiveProducer {
+    #[cfg(test)]
     identity: ArchiveSpoolIdentity,
     #[cfg(test)]
     state: AppState,
@@ -460,6 +462,7 @@ impl ResponseArchiveSettlement {
     }
 }
 
+#[cfg(test)]
 pub(super) struct ResponseArchiveWriter {
     state: AppState,
     identity: ArchiveSpoolIdentity,
@@ -471,6 +474,7 @@ pub(super) struct ResponseArchiveWriter {
     max_append_wait: std::time::Duration,
 }
 
+#[cfg(test)]
 impl Drop for ResponseArchiveWriter {
     fn drop(&mut self) {
         tracing::info!(request_id = %self.identity.request_id, phase = "response_spool_writer_summary",
@@ -500,14 +504,10 @@ async fn fence_failed_capture(
 ) -> Result<(), AppError> {
     #[cfg(test)]
     super::fence_probe::observe(state).await;
-    let result = observe_writer_database(identity, "response_spool_failed_fence", 0, async {
-        state
-            .db
-            .fail_response_archive_spool(identity, "capture_failed")
-            .await
-            .map(|()| true)
-    })
-    .await;
+    let result = state
+        .archive
+        .publish_raw_capture_failure(identity.tenant_id, identity.request_id, "response")
+        .await;
     if let Err(error) = &result {
         tracing::warn!(
             request_id = %identity.request_id,
@@ -516,7 +516,7 @@ async fn fence_failed_capture(
             "failed response archive acknowledgement could not be fenced"
         );
     }
-    result.map(|_| ())
+    result
 }
 
 impl ResponseArchiveProducer {
@@ -593,6 +593,7 @@ impl ResponseArchiveProducer {
             Some(active.clone()),
         );
         Some(Self {
+            #[cfg(test)]
             identity,
             #[cfg(test)]
             state: state.clone(),
@@ -614,6 +615,7 @@ impl ResponseArchiveProducer {
         ResponseArchiveWriter::begin_inner(state.clone(), identity).await
     }
 
+    #[cfg(test)]
     pub(crate) fn append(&mut self, chunks: Vec<Bytes>) -> bool {
         if !self.active.load(Ordering::Acquire) {
             self.abandon("writer_inactive");
@@ -663,6 +665,43 @@ impl ResponseArchiveProducer {
         true
     }
 
+    /// Await the bounded queue for both live reads and detached original-body
+    /// drains. Queue saturation is backpressure, not a body truncation policy.
+    pub(crate) async fn append_with_backpressure(&mut self, chunk: Bytes) -> bool {
+        #[cfg(test)]
+        if take_append_failure_for_test(&self.state) {
+            self.abandon("injected_append_failure");
+            return false;
+        }
+        let mut remaining = chunk.as_ref();
+        while !remaining.is_empty() {
+            if !self.active.load(Ordering::Acquire) {
+                return false;
+            }
+            let take = remaining.len().min(super::CHUNK_BYTES - self.pending.len());
+            self.pending.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if self.pending.len() == super::CHUNK_BYTES {
+                let Some(sender) = self.sender.clone() else {
+                    return false;
+                };
+                let Ok(permit) = sender.reserve().await else {
+                    return false;
+                };
+                let Ok(memory) = self.chunk_memory.clone().acquire_owned().await else {
+                    return false;
+                };
+                permit.send(QueuedArchiveChunk {
+                    bytes: Bytes::from(std::mem::take(&mut self.pending)),
+                    _memory: Some(memory),
+                });
+                self.pending = Vec::with_capacity(super::CHUNK_BYTES);
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
     fn abandon(&mut self, reason: &'static str) {
         tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_producer", outcome = reason, "response capture abandoned");
         self.active.store(false, Ordering::Release);
@@ -706,6 +745,7 @@ impl ResponseArchiveProducer {
     }
 }
 
+#[cfg(test)]
 impl ResponseArchiveWriter {
     async fn begin_inner(
         state: AppState,
@@ -820,14 +860,6 @@ impl ResponseArchiveWriter {
         Ok(())
     }
 
-    async fn append_chunk(&mut self, bytes: Bytes) -> Result<(), AppError> {
-        self.append_chunks(vec![QueuedArchiveChunk {
-            bytes,
-            _memory: None,
-        }])
-        .await
-    }
-
     #[cfg(test)]
     pub(super) async fn append_for_test(&mut self, chunks: Vec<Bytes>) -> Result<(), AppError> {
         let mut buffered = Vec::with_capacity(super::CHUNK_BYTES);
@@ -904,42 +936,20 @@ async fn run_response_archive_writer(
 ) -> Result<WriterOutcome, AppError> {
     #[cfg(test)]
     pause_begin_for_test(&state).await;
-    let mut writer = loop {
-        state.db.refresh_closed_persistence_pool();
-        match ResponseArchiveWriter::begin_inner(state.clone(), identity).await {
-            Ok(writer) => break writer,
-            Err(error)
-                if active.load(Ordering::Acquire)
-                    && (error.diagnostic_category() == "database_operation_failed"
-                        || error.diagnostic_category() == "database_pool_exhausted"
-                        || matches!(&error, AppError::DatabaseUnavailable(_))) =>
-            {
-                tracing::warn!(
-                    request_id = %identity.request_id,
-                    error_category = error.diagnostic_category(),
-                    "response archive retains queued bytes while begin recovers"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let staging = format!(
+        "raw-capture-staging/{}/{}/{}",
+        identity.tenant_id,
+        identity.request_id,
+        uuid::Uuid::now_v7()
+    );
+    let mut writer = state.archive.start_writer(&staging).await?;
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
     while let Some(first) = receiver.recv().await {
         if !active.load(Ordering::Acquire) {
             return Ok(writer_interrupted(identity, "abandoned_before_append"));
         }
-        let mut batch = Vec::with_capacity(super::CAPTURE_DATABASE_BATCH_CHUNKS);
-        batch.push(first);
-        while batch.len() < super::CAPTURE_DATABASE_BATCH_CHUNKS {
-            match receiver.try_recv() {
-                Ok(chunk) => batch.push(chunk),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-        writer.append_chunks(batch).await?;
+        writer.write(first.bytes).await?;
     }
     let Ok(tail) = terminal.await else {
         return Ok(writer_interrupted(identity, "terminal_sender_dropped"));
@@ -948,12 +958,33 @@ async fn run_response_archive_writer(
         return Ok(writer_interrupted(identity, "abandoned_before_tail"));
     }
     if !tail.is_empty() {
-        writer.append_chunk(tail).await?;
+        writer.write(tail).await?;
     }
     if !active.load(Ordering::Acquire) {
         return Ok(writer_interrupted(identity, "abandoned_before_seal"));
     }
-    writer.seal_inner().await?;
+    let staged = writer.finish_staged().await?;
+    let object = state
+        .archive
+        .promote_staged_text_to_cas(identity.tenant_id, &staged)
+        .await?;
+    state
+        .archive
+        .publish_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
+        .await?;
+    state.archive.delete(&staged.object_locator).await?;
+    state.db.refresh_closed_persistence_pool();
+    if let Err(error) = state
+        .db
+        .bind_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
+        .await
+    {
+        // The immutable root is already the durable authority. The body
+        // worker retries relational binding from that root; a metadata outage
+        // must not relabel this complete original as a failed capture.
+        tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+            "raw response root awaits relational projection");
+    }
     Ok(WriterOutcome::Sealed)
 }
 
@@ -980,6 +1011,7 @@ fn writer_interrupted(identity: ArchiveSpoolIdentity, reason: &'static str) -> W
     WriterOutcome::Abandoned
 }
 
+#[cfg(test)]
 async fn observe_writer_database(
     identity: ArchiveSpoolIdentity,
     phase: &'static str,

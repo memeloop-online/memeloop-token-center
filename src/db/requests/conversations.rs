@@ -26,8 +26,8 @@ const MAX_CONVERSATION_FINGERPRINT_JSON_BYTES: usize = 70_000;
 // PostgreSQL's much larger protocol limit.
 const CONVERSATION_INSERT_BATCH_BIND_LIMIT: usize = 900;
 const SEMANTIC_ATOM_INSERT_BIND_COUNT: usize = 7;
-// The worker cgroup limit is 384Mi. A full session's raw JSON is at most
-// 128MiB; keep each insert batch far below the rest of that budget.
+// The worker streams body objects; SQL insert batches contain references and
+// stay below the worker's memory budget.
 const CONVERSATION_INSERT_BATCH_BYTES: usize = 256 * 1024;
 const CONTEXT_NODE_INSERT_BIND_COUNT: usize = 6;
 const EXPLICIT_SESSION_LOCK_SEED: i64 = 734_627_102_948_338;
@@ -101,8 +101,6 @@ pub(crate) struct SessionBodyLocators {
 pub(crate) struct ConversationProjectionEnqueueInput<'a> {
     pub(crate) request_id: Uuid,
     pub(crate) key: &'a AuthenticatedKey,
-    /// 结算时已经收好的对话字段。不是带填充的原始请求 JSON。
-    pub(crate) request_json: &'a serde_json::Value,
     pub(crate) hints: &'a ConversationHints,
     pub(crate) client_name: Option<&'a str>,
     pub(crate) upstream_response_id: Option<&'a str>,
@@ -125,22 +123,9 @@ const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
 const SESSION_BODY_REBUILD_OUTCOME: &str = "session_body";
-const SESSION_BODY_INLINE_REQUEST_LIMIT: usize = 1024 * 1024;
-
-fn inline_session_request(value: &serde_json::Value) -> String {
-    let Ok(encoded) = serde_json::to_string(value) else {
-        return "{}".to_owned();
-    };
-    if encoded.len() > SESSION_BODY_INLINE_REQUEST_LIMIT {
-        "{}".to_owned()
-    } else {
-        encoded
-    }
-}
-
 /// 网关结算只把请求身份放进队列。
 /// 不在这里解析原始请求 JSON 或原始返回 JSON。
-/// 会话正文归档由 worker 读取这两个 locator 之后写入 CNPG。
+/// 会话正文由 worker 读取 locator 后存入对象归档。
 pub(crate) async fn enqueue_conversation_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     input: ConversationProjectionEnqueueInput<'_>,
@@ -148,22 +133,13 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let ConversationProjectionEnqueueInput {
         request_id,
         key,
-        request_json,
         hints,
         client_name,
         upstream_response_id,
         observed_at,
     } = input;
-    // 这里不解析对象存储里的原始请求 JSON。只留下结算时已经收好的对话字段，
-    // 供 locator 仍是 gap:// 时归档。超过上限的内容仍留给对象存储。
-    //
-    // The raw request body never lands in PostgreSQL: object storage owns it, and
-    // this row only carries the bounded conversation fields the projection needs
-    // while the locator is still `gap://`. An earlier revision persisted the full
-    // body into `conversation_semantic_payloads` for every request, which grew the
-    // database by roughly a gigabyte per hour of Codex traffic.
     let payload: Option<(String, String)> = None;
-    let request_json = inline_session_request(request_json);
+    let request_json = "{}";
     let semantic_snapshot = {
         let snapshot = ConversationSemanticSnapshot {
             leaf: None,
@@ -192,7 +168,7 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     .bind(key.tenant_id.to_string())
     .bind(key.key_id.to_string())
     .bind(key.principal_id.to_string())
-    .bind(&request_json)
+    .bind(request_json)
     .bind(&hints_json)
     .bind(client_name)
     .bind(upstream_response_id)
@@ -440,7 +416,6 @@ impl Database {
             ConversationProjectionEnqueueInput {
                 request_id: claim.request_id,
                 key: conversation.key,
-                request_json: conversation.request_json,
                 hints: conversation.hints,
                 client_name: conversation.client_name,
                 upstream_response_id: conversation.upstream_response_id,
@@ -463,6 +438,9 @@ impl Database {
     ) -> Result<(), AppError> {
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
+        let atoms = self
+            .archive_atom_bodies(parse_uuid(tenant_id.to_owned())?, &atoms)
+            .await?;
         let mut transaction = self.begin_write_transaction().await?;
         let result = materialize_conversation_content_with_statement_error(
             &mut transaction,
@@ -701,31 +679,43 @@ impl Database {
         Ok(())
     }
 
-    /// locator 是 gap:// 时，用结算时已经收好的对话字段。不读对象存储。
-    pub async fn session_body_inline_request(
-        &self,
-        lease_owner: Uuid,
-        request_id: Uuid,
-    ) -> Result<Option<String>, AppError> {
-        let now = unix_millis();
-        let row = sqlx::query(
-            "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
-        )
-        .bind(request_id.to_string())
-        .bind(lease_owner.to_string())
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.and_then(|row| row.try_get("request_json").ok()))
-    }
-
-    /// 把已经整理好的会话正文写入 CNPG。媒体 locator 记在 `conversation_media_parts`。
-    /// 不读取对象存储，也不碰 `generation_assets`。
+    /// 先持久化对象，再把正文引用及媒体 locator 写入投影元数据。
     pub async fn prepare_session_body_archive(
         &self,
         lease_owner: Uuid,
         request_id: Uuid,
         atoms: Vec<SemanticAtom>,
+        nodes: &[PrefixNode],
+        media: &[crate::conversation::SessionMediaLocator],
+    ) -> Result<bool, AppError> {
+        let tenant_id: Option<String> = sqlx::query_scalar(
+            "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(tenant_id) = tenant_id else {
+            return Ok(false);
+        };
+        let archived_atoms = self
+            .archive_atom_bodies(parse_uuid(tenant_id)?, atoms)
+            .await?;
+        self.prepare_archived_session_body_archive(
+            lease_owner,
+            request_id,
+            archived_atoms,
+            nodes,
+            media,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_archived_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        archived_atoms: Vec<SemanticAtom>,
         nodes: &[PrefixNode],
         media: &[crate::conversation::SessionMediaLocator],
     ) -> Result<bool, AppError> {
@@ -735,7 +725,7 @@ impl Database {
                 &mut transaction,
                 lease_owner,
                 request_id,
-                atoms,
+                archived_atoms,
                 nodes,
                 media,
             )
@@ -847,34 +837,58 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
-    /// 训练导出只读 CNPG 里的会话正文。不打开、不列出对象存储。
+    /// Walk relational prefix metadata and restore each tenant CAS body.
     pub async fn export_training_dialogue(
         &self,
         tenant_id: Uuid,
         leaf_node_hash: &str,
     ) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS ( \
-                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2 \
-                UNION ALL \
-                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n \
-                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash \
-                WHERE c.depth > 0 AND c.depth < 4096 \
-            ) \
-            SELECT a.content_json FROM chain c \
-            JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash \
-            ORDER BY c.depth ASC LIMIT 4096",
+        use futures_util::TryStreamExt as _;
+
+        let mut rows = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2
+                UNION
+                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n
+                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash
+                WHERE c.depth > 1 AND n.depth = c.depth - 1
+            )
+            SELECT c.node_hash, c.parent_hash, c.depth, a.content_json FROM chain c
+            LEFT JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash
+            ORDER BY c.depth ASC",
         )
         .bind(tenant_id.to_string())
         .bind(leaf_node_hash)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut turns = Vec::with_capacity(rows.len());
-        for row in rows {
-            let content: String = row.try_get("content_json")?;
+        .fetch(&self.pool);
+        let mut turns = Vec::new();
+        let mut previous = None;
+        while let Some(row) = rows.try_next().await? {
+            let parent: Option<String> = row.try_get("parent_hash")?;
+            let depth: i64 = row.try_get("depth")?;
+            if depth
+                != i64::try_from(turns.len())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1)
+                || parent != previous
+            {
+                return Err(AppError::storage("conversation_prefix_incomplete"));
+            }
+            let reference: Option<String> = row.try_get("content_json")?;
+            let content = self
+                .read_body_reference(
+                    tenant_id,
+                    reference
+                        .as_deref()
+                        .ok_or_else(|| AppError::storage("conversation_body_missing"))?,
+                )
+                .await?;
             let value = serde_json::from_str(&content)
                 .map_err(|_| AppError::internal("conversations_export_training_dialogue_1"))?;
             turns.push(value);
+            previous = Some(row.try_get::<String, _>("node_hash")?);
+        }
+        if previous.as_deref() != Some(leaf_node_hash) {
+            return Err(AppError::storage("conversation_prefix_incomplete"));
         }
         Ok(crate::conversation::training_dialogue(&turns))
     }
@@ -1424,10 +1438,11 @@ impl Database {
 
         let tenant_id = key.tenant_id.to_string();
         if !content_materialized {
+            let archived_atoms = self.archive_atom_bodies(key.tenant_id, &atoms).await?;
             materialize_conversation_content_in_transaction(
                 transaction,
                 &tenant_id,
-                &atoms,
+                &archived_atoms,
                 &nodes,
                 now,
             )
@@ -2920,6 +2935,7 @@ impl Database {
         }
         let mut transaction = self.begin_write_transaction().await?;
         let result = insert_streamed_conversation_content(
+            self,
             &mut transaction,
             tenant_id,
             request_json,
@@ -2947,6 +2963,7 @@ impl Database {
 }
 
 async fn insert_streamed_conversation_content(
+    database: &Database,
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
     request_json: String,
@@ -2979,6 +2996,9 @@ async fn insert_streamed_conversation_content(
             );
             break;
         };
+        let content_json = database
+            .store_body_reference(parse_uuid(tenant_id.to_owned())?, content_json)
+            .await?;
         drop(content);
         depth += 1;
         let node_hash = crate::conversation::digest_parts(parent.as_deref(), &content_hash);
