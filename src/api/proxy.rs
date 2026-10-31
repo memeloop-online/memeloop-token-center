@@ -32,6 +32,10 @@ pub(in crate::api) mod codex_transport;
 
 pub(crate) mod archive_retention;
 mod buffered_upstream;
+mod independent_probe;
+pub(in crate::api) use independent_probe::IndependentProbeTarget;
+mod supplier_quota;
+use supplier_quota::{observe_quota_body, publish_supplier_quota};
 mod chat_sse_usage;
 mod conversation_hints;
 mod lifecycle;
@@ -326,34 +330,8 @@ async fn next_sendable_proxy_route(
         }
         let (next_input_token_ceiling, next_output_token_ceiling, next_output_token_limit) =
             candidate_reservation_bounds(&planned, original_body_length, output_choice_count)?;
-        // A customer request is not a health sample and does not take a probe
-        // lease. Quota exhaustion is the provider's own deadline, so it still
-        // removes this account from the attempt.
-        if state
-            .db
-            .customer_attempt_blocked_by_quota(
-                planned.route.account_id,
-                planned.route.credential_generation,
-                planned.route.transport_revision,
-            )
-            .await?
-        {
-            tracing::warn!(
-                %request_id,
-                upstream_account_id = %planned.route.account_id,
-                candidate_rank = rank,
-                outbound_attempt,
-                admission_reason = "quota_exhausted",
-                stage = "upstream_admission_skip",
-                "proxy skipped an exhausted upstream before sending"
-            );
-            state.metrics.observe_upstream_health(
-                UpstreamHealthEvent::Skipped,
-                UpstreamHealthReason::Unavailable,
-            );
-            failover_reason = Some(UpstreamHealthReason::Unavailable);
-            continue;
-        }
+        // Scoped quota and legacy account quota were consumed by the existing
+        // candidate snapshot. Customer forwarding never starts a probe.
         let admission = UpstreamAttemptAdmission::Observed;
         return prepare_admitted_proxy_route(AdmittedProxyRouteInput {
             request,
@@ -909,18 +887,23 @@ pub(in crate::api) async fn proxy_with_pinned_account(
     pinned_route: Uuid,
     pinned_account: Uuid,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    target: IndependentProbeTarget,
 ) -> Result<Response, AppError> {
-    proxy_with_identity(
-        state,
-        headers,
-        body,
-        protocol,
-        key,
-        Some(pinned_route),
-        memory,
-        Some(pinned_account),
-    )
-    .await
+    independent_probe::TARGET
+        .scope(
+            target,
+            proxy_with_identity(
+                state,
+                headers,
+                body,
+                protocol,
+                key,
+                Some(pinned_route),
+                memory,
+                Some(pinned_account),
+            ),
+        )
+        .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1040,7 +1023,7 @@ async fn proxy_with_cancellation_guard(
         proxy_diagnostics::Phase::new(diagnostic_context, "authorized_candidate_query");
     let mut candidates = state
         .db
-        .list_authorized_upstream_candidates_with_hint(
+        .list_upstream_candidates_for_dispatch(
             key.key_id,
             key.tenant_id,
             &model,
@@ -1053,6 +1036,7 @@ async fn proxy_with_cancellation_guard(
                 // its stable seed is still passed to group_routing::prepare.
                 selection_seed: request_id,
             },
+            pinned_account.is_some(),
         )
         .await?;
     candidate_query.finish("completed", None, None);
@@ -1502,6 +1486,7 @@ async fn proxy_with_cancellation_guard(
             cancellation.record_dispatch_failure(&response);
             return Ok(response);
         }
+        IndependentProbeTarget::before_send(&active_route.route)?;
         let result = attempt_budget
             .send(
                 send_proxy_route(
@@ -1521,14 +1506,46 @@ async fn proxy_with_cancellation_guard(
             cancellation.response_headers_received();
             note_in_flight_stage(&buffered_request, "upstream_response_body").await;
         }
+        if let Ok(response) = &result {
+            IndependentProbeTarget::response(response.response.status());
+        }
         let (result, rate_limit) = match result {
             Ok(mut result)
                 if active_route.is_codex()
                     && result.response.status() == StatusCode::TOO_MANY_REQUESTS =>
             {
-                let (response, kind) = routing::classify_rate_limit(result.response).await;
+                let observed_at = unix_millis();
+                let (response, kind, evidence) =
+                    routing::classify_supplier_quota(result.response).await;
+                publish_supplier_quota(
+                    &state,
+                    &active_route.route,
+                    request_id,
+                    observed_at,
+                    evidence,
+                );
                 result.response = response;
                 (Ok(result), Some(kind))
+            }
+            Ok(mut result) if result.response.status() == StatusCode::TOO_MANY_REQUESTS => {
+                let observed_at = unix_millis();
+                let evidence =
+                    routing::quota_evidence(result.response.headers(), None, observed_at);
+                publish_supplier_quota(
+                    &state,
+                    &active_route.route,
+                    request_id,
+                    observed_at,
+                    evidence,
+                );
+                result.response = observe_quota_body(
+                    result.response,
+                    &state,
+                    &active_route.route,
+                    request_id,
+                    observed_at,
+                );
+                (Ok(result), None)
             }
             result => (result, None),
         };
@@ -1644,6 +1661,20 @@ async fn proxy_with_cancellation_guard(
             // A candidate transition is different: release before selection
             // can wait on health/database admission, then rejoin the new lane.
             drop(dispatch_permit.take());
+            if let Ok(result) = result
+                && result.response.status() == StatusCode::TOO_MANY_REQUESTS
+                && !active_route.is_codex()
+            {
+                // The original response would otherwise be dropped during
+                // failover. Let the existing bounded reader observe its
+                // structured evidence off the customer path; never re-POST.
+                state
+                    .routing_persistence
+                    .submit(upstream_error::MAX_ERROR_BYTES, async move {
+                        let _ = upstream_error::read_rejection(result.response).await;
+                        Ok(())
+                    });
+            }
             next_failover_reason = Some(reason);
             continue;
         }

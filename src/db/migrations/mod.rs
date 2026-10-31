@@ -763,6 +763,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "live request owner lease observation index",
         sql: include_str!("../../../migrations/common/0146_request_live_owner_index.sql"),
     },
+    Migration {
+        version: 149,
+        name: "scoped supplier availability and independent probe provenance",
+        sql: include_str!("../../../migrations/common/0149_scoped_supplier_availability.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1504,6 +1509,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 146,
         name: "live request owner lease observation index",
         sql: include_str!("../../../migrations/common/0146_request_live_owner_index.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "scoped supplier availability and independent probe provenance",
+        sql: include_str!("../../../migrations/common/0149_scoped_supplier_availability.sql"),
     },
 ];
 

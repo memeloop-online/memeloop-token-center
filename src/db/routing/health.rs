@@ -761,6 +761,7 @@ impl Database {
 
     /// Provider quota exhaustion is not a transport probe. Customer forwarding
     /// still has to leave that account alone until its deadline.
+    #[cfg(test)]
     pub(crate) async fn customer_attempt_blocked_by_quota(
         &self,
         upstream_account_id: Uuid,
@@ -1300,11 +1301,7 @@ impl Database {
         .bind(success_epoch.to_string())
         .execute(&self.pool)
         .await?;
-        let recovered = result.rows_affected() == 1;
-        if recovered {
-            self.note_service_available(upstream_account_id).await;
-        }
-        Ok(recovered)
+        Ok(result.rows_affected() == 1)
     }
 
     #[cfg(test)]
@@ -1438,11 +1435,7 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        let recovered = result.rows_affected() == 1;
-        if recovered {
-            self.note_service_available(upstream_account_id).await;
-        }
-        Ok(recovered)
+        Ok(result.rows_affected() == 1)
     }
 
     #[cfg(test)]
@@ -2395,7 +2388,7 @@ mod tests {
         .fetch_one(&database.pool)
         .await
         .unwrap();
-        assert_eq!(status, "healthy");
+        assert_eq!(status, "unhealthy");
         assert!(
             database
                 .claim_upstream_account_attempt(account_id, 1)

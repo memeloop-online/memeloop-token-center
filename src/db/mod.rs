@@ -111,7 +111,8 @@ mod time;
 mod upstream_account_availability;
 pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
-mod upstream_service_probes;
+pub(crate) mod upstream_service_probes;
+pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
 mod usage_analysis;
 mod validation;
 
