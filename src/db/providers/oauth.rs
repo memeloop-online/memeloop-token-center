@@ -833,6 +833,24 @@ impl Database {
         idempotency_key: &str,
         key_material: &[u8],
     ) -> Result<ClaimUpstreamOAuthRefreshResult, AppError> {
+        self.claim_upstream_oauth_refresh_for_generation(
+            account_id,
+            idempotency_key,
+            None,
+            key_material,
+        )
+        .await
+    }
+
+    /// Worker selection is a snapshot. Do not dispatch against authorization
+    /// installed after that snapshot by a manual refresh or reauthorization.
+    pub(crate) async fn claim_upstream_oauth_refresh_for_generation(
+        &self,
+        account_id: Uuid,
+        idempotency_key: &str,
+        expected_generation: Option<i64>,
+        key_material: &[u8],
+    ) -> Result<ClaimUpstreamOAuthRefreshResult, AppError> {
         validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
         let idempotency_key = idempotency_key.trim();
         let now = unix_millis();
@@ -937,6 +955,11 @@ impl Database {
             ));
         }
         let generation: i64 = account.try_get("credential_generation")?;
+        if expected_generation.is_some_and(|expected| expected != generation) {
+            return Err(AppError::Conflict(
+                "OAuth credential changed after automatic refresh was scheduled".into(),
+            ));
+        }
         let (driver, refresh_url) = oauth_refresh_lifecycle_from_row(&account)?;
         let lease_expires_at = now.saturating_add(UPSTREAM_OAUTH_REFRESH_LEASE_MILLIS);
         let leased = sqlx::query(
@@ -1084,23 +1107,6 @@ impl Database {
             credential,
             idempotency_key,
             key_material,
-            &[std::time::Duration::ZERO, std::time::Duration::ZERO],
-        )
-        .await
-    }
-
-    pub(crate) async fn finish_kimi_oauth_refresh(
-        &self,
-        account_id: Uuid,
-        credential: UpstreamCredential,
-        idempotency_key: &str,
-        key_material: &[u8],
-    ) -> Result<UpstreamAccountView, AppError> {
-        self.finish_upstream_oauth_refresh_with_retry_delays(
-            account_id,
-            credential,
-            idempotency_key,
-            key_material,
             &[
                 std::time::Duration::from_millis(100),
                 std::time::Duration::from_millis(500),
@@ -1140,10 +1146,7 @@ impl Database {
                 Ok(view) => return Ok(view),
                 Err(error)
                     if attempt < retry_delays.len()
-                        && matches!(
-                            error,
-                            AppError::Internal { .. } | AppError::Storage { .. }
-                        ) =>
+                        && retryable_oauth_local_persistence_failure(&error) =>
                 {
                     if retry_delays[attempt].is_zero() {
                         tokio::task::yield_now().await;
@@ -1389,6 +1392,22 @@ impl Database {
         }
         oauth_refresh_lifecycle_from_row(&row)
     }
+    /// Recover a saved result (including manual/takeover attempts) with the
+    /// original key. A fresh key cannot install another attempt's pending token.
+    pub(crate) async fn upstream_oauth_refresh_recovery_key(
+        &self,
+        account_id: Uuid,
+        generation: i64,
+    ) -> Result<Option<String>, AppError> {
+        Ok(sqlx::query_scalar(
+            "SELECT idempotency_key FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 AND (pending_credential_ciphertext IS NOT NULL OR request_started_at IS NULL)",
+        )
+        .bind(account_id.to_string())
+        .bind(generation)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn list_managed_oauth_refresh_candidates(
         &self,
         refresh_before: i64,
@@ -1564,6 +1583,22 @@ impl Database {
     }
 }
 
+// These failures can occur before staging a returned, rotated refresh token.
+// Retrying is strictly local and bounded; authorization-server POSTs stay fenced.
+fn retryable_oauth_local_persistence_failure(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Internal { .. }
+            | AppError::Storage { .. }
+            | AppError::Overloaded
+            | AppError::Capacity {
+                code: "database_pool_exhausted",
+                ..
+            }
+            | AppError::DatabaseUnavailable(crate::error::DatabaseFailure::Unavailable)
+    )
+}
+
 fn upstream_credential_rotation_request_hash(
     account_id: Uuid,
     credential: &UpstreamCredential,
@@ -1627,6 +1662,32 @@ mod tests {
         AppState, api,
         config::{Config, RuntimeRole},
     };
+
+    #[test]
+    fn local_retry_tracks_transient_sqlx_classes_without_retrying_fences() {
+        for error in [
+            AppError::from(sqlx::Error::PoolTimedOut),
+            AppError::from(sqlx::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
+            AppError::internal("oauth_local_retry_fixture"),
+            AppError::storage("oauth_local_retry_fixture"),
+        ] {
+            assert!(retryable_oauth_local_persistence_failure(&error));
+        }
+        for error in [
+            AppError::DatabaseUnavailable(crate::error::DatabaseFailure::StorageFull),
+            AppError::capacity_error("unrelated_resource_exhausted"),
+            AppError::Conflict("credential generation superseded".into()),
+            AppError::BadRequest("claim missing".into()),
+            AppError::OAuthRefresh(crate::oauth::OAuthRefreshFailure::new(
+                crate::oauth::OAuthRefreshFailureKind::InvalidGrant,
+                Some(400),
+            )),
+        ] {
+            assert!(!retryable_oauth_local_persistence_failure(&error));
+        }
+    }
 
     mod http1_request {
         include!(concat!(
