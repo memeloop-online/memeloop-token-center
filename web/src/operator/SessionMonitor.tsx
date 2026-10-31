@@ -118,7 +118,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const [detailScope, setDetailScope] = useState('');
   const [selected, setSelected] = useState<LogicalSessionSummary>();
   const [returnOrigin, setReturnOrigin] = useState<SessionRequestOrigin>();
-  const listReturn = useRef<{ element: HTMLElement; scrollY: number }>();
+  const listReturn = useRef<{ element: HTMLElement; scrollY: number } | undefined>(undefined);
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [nextCursor, setNextCursor] = useState<LogicalSessionCursor | null>(null);

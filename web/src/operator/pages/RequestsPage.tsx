@@ -88,7 +88,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
   const selectedRequestId = useRef<string | undefined>(undefined);
-  const pendingRequestReturn = useRef<SessionRequestOrigin>();
+  const pendingRequestReturn = useRef<SessionRequestOrigin | undefined>(undefined);
   // State mirror of the open detail so the protection effect reruns on
   // selection changes; a ref alone would not trigger React.
   const [selectedRequest, setSelectedRequest] = useState<string | undefined>(undefined);
