@@ -99,6 +99,7 @@ jobs:
       - run: cargo test --locked --lib sqlite_semantic_payload_recovers_without_source_or_duplicate_finance
       - run: cargo test --locked --lib api::audio::tests
       - run: cargo test --locked --lib api::proxy::tests::kimi
+      - run: cargo test --locked --lib saturated_request_archive_does_not_change_sse_or_exactly_once_settlement
       - name: RustFS fixture diagnostics
         if: always()
         run: |

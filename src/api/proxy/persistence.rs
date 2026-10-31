@@ -210,6 +210,15 @@ pub(crate) fn capture(
                                 .archive
                                 .promote_staged_text_to_cas(identity.tenant_id, &staged)
                                 .await?;
+                            background
+                                .archive
+                                .publish_raw_capture(
+                                    identity.tenant_id,
+                                    identity.request_id,
+                                    purpose.as_str(),
+                                    &reference,
+                                )
+                                .await?;
                             background.archive.delete(&staged.object_locator).await?;
                             reference
                         });
