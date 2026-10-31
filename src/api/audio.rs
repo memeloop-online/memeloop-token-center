@@ -260,19 +260,12 @@ pub(super) async fn create_audio_transcription(
                 started.elapsed(),
             );
             let upstream_status = upstream.status();
-            let capture = crate::response_archive_spool::ResponseArchiveProducer::begin_original(
-                &state, identity,
-            )
-            .await;
-            if capture.is_none() {
-                super::proxy::persistence::record_capture_failure(&state, identity);
-            }
             // Parsing, rate-limit observation and safe delivery may stop early.
             // The same original-body reader owns the bounded archive and drains
             // the remaining supplier bytes under this absolute audio deadline.
             let upstream = super::proxy::upstream_response::UpstreamResponse::from(upstream)
                 .with_body_timeouts(deadline, SYNCHRONOUS_AUDIO_DEADLINE)
-                .with_archive_capture(capture);
+                .with_original_archive_capture(&state, identity);
             if upstream_status == StatusCode::TOO_MANY_REQUESTS {
                 let kind = match tokio::time::timeout_at(
                     deadline,

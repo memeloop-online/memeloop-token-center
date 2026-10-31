@@ -162,6 +162,9 @@ fn plugin_initialization_error(error: crate::error::AppError) -> InitializationE
 impl AppState {
     pub async fn drain_proxy_tasks(&self) {
         self.proxy_lifecycles.wait_for_idle().await;
+        // Header-only captures may still be waiting for their first body and
+        // writer admission. Let them progress before taking every writer slot.
+        self.persistence.drain().await;
         let _archives = self
             .proxy_archive_stream_permits
             .acquire_many(PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)

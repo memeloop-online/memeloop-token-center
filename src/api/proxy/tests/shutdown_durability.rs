@@ -42,7 +42,8 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
         .expect(1)
         .mount(&upstream)
         .await;
-    let jobs = fixture.state.persistence.hold_jobs_for_test().await;
+    let (archive_entered, release_archive) =
+        crate::response_archive_spool::pause_next_begin_ack_for_test(&fixture.state);
     let endpoint = upstream.uri();
     let app = router_for_role(fixture.state.clone(), RuntimeRole::Gateway).layer(
         axum::middleware::from_fn(move |request: Request<Body>, next: axum::middleware::Next| {
@@ -106,10 +107,14 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
         serde_json::from_slice::<Value>(&delivered).unwrap()["id"],
         "resp-codex"
     );
+    archive_entered.await.unwrap();
     assert_eq!(
-        fixture.state.persistence.pending_archives_for_test(),
-        1,
-        "HTTP 200 must already have registered its original request capture"
+        fixture
+            .state
+            .proxy_archive_stream_permits
+            .available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY - 1,
+        "HTTP 200 must already own its original response writer"
     );
 
     // Retire every other shutdown owner first. Only buffered capture is left;
@@ -128,7 +133,7 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
         .await
         .unwrap(),
         0,
-        "capture cannot create a spool while all jobs are held"
+        "new captures use immutable CAS instead of legacy spools"
     );
     assert!(
         tokio::process::Command::new("kill")
@@ -143,7 +148,7 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
         !process.is_finished(),
         "SIGTERM must retain the buffered writer"
     );
-    drop(jobs);
+    release_archive.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), process)
         .await
         .expect("durable capture must release shutdown")
@@ -353,9 +358,9 @@ async fn stopped_http_server_drains_stream_archive_and_receipt_without_blocking_
     let request_id =
         Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
     let finalization = streaming::finalization_test_gate::install(request_id);
-    archive_entered.await.unwrap();
     stop.send(()).unwrap();
     release_body.send(()).unwrap();
+    archive_entered.await.unwrap();
     let delivered = tokio::time::timeout(Duration::from_secs(5), response.bytes())
         .await
         .expect("HTTP delivery must not wait for archive or settlement")
@@ -414,14 +419,42 @@ async fn stopped_http_server_drains_stream_archive_and_receipt_without_blocking_
     }
     assert_eq!(receipt.get::<i64, _>("input_tokens"), 3);
     assert_eq!(receipt.get::<i64, _>("output_tokens"), 2);
-    let spool =
-        sqlx::query("SELECT state, byte_count FROM response_archive_spools WHERE request_id = $1")
+    let tenant_id: String =
+        sqlx::query_scalar("SELECT tenant_id FROM request_records WHERE id = $1")
             .bind(request_id.to_string())
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(spool.get::<String, _>("state"), "pending");
-    assert_eq!(spool.get::<i64, _>("byte_count"), original.len() as i64);
+    let tenant_id = Uuid::parse_str(&tenant_id).unwrap();
+    let object = fixture
+        .state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(object.size_bytes, original.len() as u64);
+    assert_eq!(
+        object.blake3_digest,
+        blake3::hash(&original).to_hex().to_string()
+    );
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get_tenant_content(tenant_id, &object, original.len())
+            .await
+            .unwrap()
+            .as_ref(),
+        original.as_slice()
+    );
+    let spools: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(spools, 0);
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     let objects =
         sqlx::query("SELECT request_object, response_object FROM request_records WHERE id = $1")

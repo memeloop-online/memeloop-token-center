@@ -2584,14 +2584,7 @@ impl BufferedRequest<'_> {
             tenant_id: self.tenant_id,
             reservation_id: self.reservation.id,
         };
-        let capture = crate::response_archive_spool::ResponseArchiveProducer::begin_original(
-            self.state, identity,
-        )
-        .await;
-        if capture.is_none() {
-            persistence::record_capture_failure(self.state, identity);
-        }
-        upstream.with_archive_capture(capture)
+        upstream.with_original_archive_capture(self.state, identity)
     }
 }
 

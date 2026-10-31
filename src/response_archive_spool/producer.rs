@@ -533,34 +533,45 @@ impl Drop for OriginalAdmission {
 }
 
 impl ResponseArchiveProducer {
+    #[cfg(test)]
     pub(crate) async fn begin_original(
         state: &AppState,
         identity: ArchiveSpoolIdentity,
     ) -> Option<Self> {
+        Self::admit_original(state, identity).await
+    }
+
+    pub(crate) fn admit_original(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+    ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
+        let state = state.clone();
         let mut admission = OriginalAdmission {
             state: Some(state.clone()),
             identity,
         };
-        // Keep the supplier stream unpolled while a bounded writer is busy.
-        // Accepted originals must not disappear merely because another
-        // response still owns the upload envelope.
-        let archive_permit = state
-            .proxy_archive_stream_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .ok()?;
-        let memory = state
-            .persistence
-            .stream_memory
-            .temporary_wait(
-                super::CAPTURE_MEMORY_BYTES,
-                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-            )
-            .await?;
-        let producer = Self::begin_admitted(state, identity, memory, archive_permit);
-        admission.state = None;
-        Some(producer)
+        async move {
+            // Keep the supplier stream unpolled while a bounded writer is busy.
+            // Accepted originals must not disappear merely because another
+            // response still owns the upload envelope.
+            let archive_permit = state
+                .proxy_archive_stream_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .ok()?;
+            let memory = state
+                .persistence
+                .stream_memory
+                .temporary_wait(
+                    super::CAPTURE_MEMORY_BYTES,
+                    crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+                )
+                .await?;
+            let producer = Self::begin_admitted(&state, identity, memory, archive_permit);
+            admission.state = None;
+            Some(producer)
+        }
     }
 
     #[cfg(test)]

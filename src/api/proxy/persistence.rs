@@ -18,6 +18,16 @@ pub(crate) struct Persistence {
     archives_idle: tokio::sync::Notify,
 }
 
+pub(crate) struct ArchiveActivity(Arc<Persistence>);
+
+impl Drop for ArchiveActivity {
+    fn drop(&mut self) {
+        if self.0.archives.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.archives_idle.notify_waiters();
+        }
+    }
+}
+
 impl Default for Persistence {
     fn default() -> Self {
         Self {
@@ -36,6 +46,11 @@ impl Default for Persistence {
 }
 
 impl Persistence {
+    pub(crate) fn register_archive(self: &Arc<Self>) -> ArchiveActivity {
+        self.archives.fetch_add(1, Ordering::Release);
+        ArchiveActivity(self.clone())
+    }
+
     pub(crate) fn record_capacity_gap(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }

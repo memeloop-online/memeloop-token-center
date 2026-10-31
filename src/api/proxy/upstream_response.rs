@@ -64,15 +64,19 @@ type CaptureAppend = Pin<
         dyn Future<
                 Output = (
                     Option<crate::response_archive_spool::ResponseArchiveProducer>,
-                    Bytes,
+                    Option<Bytes>,
                 ),
             > + Send,
     >,
+>;
+type CaptureAdmission = Pin<
+    Box<dyn Future<Output = Option<crate::response_archive_spool::ResponseArchiveProducer>> + Send>,
 >;
 
 struct CapturedUpstream {
     upstream: Option<UpstreamByteStream>,
     capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
+    admission: Option<CaptureAdmission>,
     pending: Option<CaptureAppend>,
 }
 
@@ -89,33 +93,56 @@ impl Stream for CapturedUpstream {
                 };
                 this.pending.take();
                 this.capture = writer;
-                return Poll::Ready(Some(Ok(bytes)));
+                return Poll::Ready(bytes.map(Ok));
             }
             let Some(upstream) = this.upstream.as_mut() else {
                 return Poll::Ready(None);
             };
             match upstream.as_mut().poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    let Some(mut writer) = this.capture.take() else {
+                    let writer = this.capture.take();
+                    let admission = this.admission.take();
+                    if writer.is_none() && admission.is_none() {
                         return Poll::Ready(Some(Ok(bytes)));
-                    };
+                    }
                     // The bounded queue applies backpressure to this one
                     // upstream chunk. A fast or large response must never
                     // turn into a missing archive merely because the upload
                     // queue temporarily filled.
                     this.pending = Some(Box::pin(async move {
+                        let writer = match admission {
+                            Some(admission) => admission.await,
+                            None => writer,
+                        };
+                        let Some(mut writer) = writer else {
+                            return (None, Some(bytes));
+                        };
                         let retained = writer.append_with_backpressure(bytes.clone()).await;
-                        (retained.then_some(writer), bytes)
+                        (retained.then_some(writer), Some(bytes))
                     }));
                 }
                 Poll::Ready(Some(Err(error))) => {
+                    this.upstream.take();
                     this.capture.take();
+                    this.admission.take();
                     return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(None) => {
                     this.upstream.take();
                     if let Some(writer) = this.capture.take() {
                         drop(writer.seal());
+                    }
+                    if let Some(admission) = this.admission.take() {
+                        // A genuinely empty supplier body still has an exact
+                        // immutable original, acquired without holding a large
+                        // upload envelope during header-only silence.
+                        this.pending = Some(Box::pin(async move {
+                            if let Some(writer) = admission.await {
+                                drop(writer.seal());
+                            }
+                            (None, None)
+                        }));
+                        continue;
                     }
                     return Poll::Ready(None);
                 }
@@ -127,32 +154,26 @@ impl Stream for CapturedUpstream {
 
 impl Drop for CapturedUpstream {
     fn drop(&mut self) {
-        let Some(mut upstream) = self.upstream.take() else {
-            return;
-        };
+        let upstream = self.upstream.take();
         let pending = self.pending.take();
         let capture = self.capture.take();
-        if pending.is_none() && capture.is_none() {
+        let admission = self.admission.take();
+        if pending.is_none() && capture.is_none() && admission.is_none() {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let capture = match pending {
-                    Some(pending) => pending.await.0,
-                    None => capture,
+                let mut reader = CapturedUpstream {
+                    upstream,
+                    pending,
+                    capture,
+                    admission,
                 };
-                let Some(mut writer) = capture else { return };
-                while let Some(chunk) = upstream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if !writer.append_with_backpressure(bytes).await {
-                                return;
-                            }
-                        }
-                        Err(_) => return,
+                while let Some(chunk) = reader.next().await {
+                    if chunk.is_err() {
+                        break;
                     }
                 }
-                drop(writer.seal());
             });
         }
     }
@@ -367,6 +388,7 @@ impl UpstreamResponse {
         }
     }
 
+    #[cfg(test)]
     pub(in crate::api) fn with_archive_capture(
         self,
         capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
@@ -375,6 +397,7 @@ impl UpstreamResponse {
         let captured = CapturedUpstream {
             upstream: Some(parts.stream),
             capture,
+            admission: None,
             pending: None,
         };
         Self::Prefetched {
@@ -383,6 +406,35 @@ impl UpstreamResponse {
             version: parts.version,
             content_length: parts.content_length,
             stream: Box::pin(captured),
+        }
+    }
+
+    pub(in crate::api) fn with_original_archive_capture(
+        self,
+        state: &crate::AppState,
+        identity: crate::db::ArchiveSpoolIdentity,
+    ) -> Self {
+        let parts = self.into_parts();
+        // Register before returning headers. The waiting capture must remain
+        // owned during shutdown even before it needs an upload envelope.
+        let activity = state.persistence.register_archive();
+        let admission =
+            crate::response_archive_spool::ResponseArchiveProducer::admit_original(state, identity);
+        Self::Prefetched {
+            status: parts.status,
+            headers: parts.headers,
+            version: parts.version,
+            content_length: parts.content_length,
+            stream: Box::pin(CapturedUpstream {
+                upstream: Some(parts.stream),
+                capture: None,
+                pending: None,
+                admission: Some(Box::pin(async move {
+                    let producer = admission.await;
+                    drop(activity);
+                    producer
+                })),
+            }),
         }
     }
 

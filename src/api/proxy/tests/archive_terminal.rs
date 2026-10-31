@@ -1,6 +1,90 @@
 use super::*;
 
 #[tokio::test]
+async fn original_capture_owns_silent_and_empty_bodies_through_shutdown() {
+    for empty in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("lazy-original.db").display()
+        )))
+        .await
+        .unwrap();
+        let identity = crate::db::ArchiveSpoolIdentity {
+            tenant_id: Uuid::now_v7(),
+            request_id: Uuid::now_v7(),
+            reservation_id: Uuid::now_v7(),
+        };
+        let expected = if empty {
+            Bytes::new()
+        } else {
+            Bytes::from_static(b"body after silent headers")
+        };
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let response =
+            UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                version: http::Version::HTTP_11,
+                content_length: None,
+                stream: Box::pin(futures_util::stream::unfold(
+                    receiver,
+                    |mut receiver| async move {
+                        receiver.recv().await.map(|bytes| (Ok(bytes), receiver))
+                    },
+                )),
+            }
+            .with_original_archive_capture(&state, identity);
+        assert_eq!(
+            state.proxy_archive_stream_permits.available_permits(),
+            crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+        );
+        assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+        assert_eq!(state.persistence.pending_archives_for_test(), 1);
+        // Dropping before the first poll must retain the original, including
+        // a genuinely empty upstream response, and keep shutdown waiting.
+        drop(response);
+        let mut drain = Box::pin(state.drain_proxy_tasks());
+        assert!(futures_util::poll!(&mut drain).is_pending());
+        if !empty {
+            sender.send(expected.clone()).await.unwrap();
+        }
+        drop(sender);
+        tokio::time::timeout(Duration::from_secs(10), drain)
+            .await
+            .unwrap();
+        let object = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.size_bytes, expected.len() as u64);
+        assert_eq!(
+            object.blake3_digest,
+            blake3::hash(&expected).to_hex().to_string()
+        );
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &object, expected.len())
+                .await
+                .unwrap(),
+            expected
+        );
+        assert!(
+            !state
+                .archive
+                .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+        );
+        assert_eq!(state.persistence.pending_archives_for_test(), 0);
+        assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+    }
+}
+
+#[tokio::test]
 async fn original_capture_waits_for_bounded_writers_without_losing_overlapping_bodies() {
     use crate::response_archive_spool::ResponseArchiveProducer;
     let directory = tempfile::tempdir().unwrap();
