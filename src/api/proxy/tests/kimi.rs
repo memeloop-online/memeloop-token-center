@@ -141,13 +141,15 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 }));
             }
             let (retained, rejection) = read_safe_proxy_rejection(
-                request.capture_original_response(UpstreamResponse::Prefetched {
-                    status: parts.status,
-                    headers: parts.headers,
-                    version: parts.version,
-                    content_length: parts.content_length,
-                    stream: parts.stream,
-                }),
+                request
+                    .capture_original_response(UpstreamResponse::Prefetched {
+                        status: parts.status,
+                        headers: parts.headers,
+                        version: parts.version,
+                        content_length: parts.content_length,
+                        stream: parts.stream,
+                    })
+                    .await,
                 protocol,
                 false,
                 crate::oauth::managed::kimi::PROVIDER_DRIVER,

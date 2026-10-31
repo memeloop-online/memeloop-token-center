@@ -109,7 +109,7 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         .send()
         .await
         .unwrap();
-    let captured = request.capture_original_response(raw.into());
+    let captured = request.capture_original_response(raw.into()).await;
     // Exercise the production buffered finalizer and its real reservation,
     // accounting, and archive path without relaxing Kimi's fixed network origin.
     let response = finish_non_sse_proxy_response(NonSseProxyResponseInput {

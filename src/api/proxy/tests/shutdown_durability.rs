@@ -109,7 +109,7 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
     assert_eq!(
         fixture.state.persistence.pending_archives_for_test(),
         1,
-        "HTTP 200 must already have registered its buffered capture"
+        "HTTP 200 must already have registered its original request capture"
     );
 
     // Retire every other shutdown owner first. Only buffered capture is left;
@@ -169,27 +169,41 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
         tenant_id: Uuid::parse_str(&receipt.get::<String, _>("tenant_id")).unwrap(),
         reservation_id: Uuid::parse_str(&receipt.get::<String, _>("reservation_id")).unwrap(),
     };
-    assert!(
-        fixture
+    let original_response = completed_codex_sse("buffered shutdown durability");
+    for (side, expected) in [
+        ("request", request.as_slice()),
+        ("response", original_response.as_bytes()),
+    ] {
+        let object = fixture
             .state
-            .db
-            .deferred_archive_is_captured(
-                identity,
-                crate::response_archive_spool::BufferedArchivePurpose::Response,
-                &delivered,
-            )
+            .archive
+            .raw_capture_reference(identity.tenant_id, request_id, side)
             .await
-            .unwrap(),
-        "shutdown must complete only after exact delivered bytes are durably captured"
-    );
-    let spool =
-        sqlx::query("SELECT state, byte_count FROM response_archive_spools WHERE request_id = $1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(object.size_bytes, expected.len() as u64);
+        assert_eq!(
+            object.blake3_digest,
+            blake3::hash(expected).to_hex().to_string()
+        );
+        assert_eq!(
+            fixture
+                .state
+                .archive
+                .get_tenant_content(identity.tenant_id, &object, expected.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+    }
+    let spools: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
             .bind(request_id.to_string())
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(spool.get::<String, _>("state"), "pending");
-    assert_eq!(spool.get::<i64, _>("byte_count"), delivered.len() as i64);
+    assert_eq!(spools, 0, "new captures stay in durable CAS after shutdown");
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     let objects =
         sqlx::query("SELECT request_object, response_object FROM request_records WHERE id = $1")
@@ -199,7 +213,7 @@ async fn buffered_http_200_sigterm_waits_for_durable_capture_before_exit() {
             .unwrap();
     for (column, expected) in [
         ("request_object", request.as_slice()),
-        ("response_object", delivered.as_ref()),
+        ("response_object", original_response.as_bytes()),
     ] {
         let bytes = fixture
             .state
