@@ -165,7 +165,9 @@ impl AppState {
             .acquire_many(PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
             .await
             .expect("proxy archive admission remains open during shutdown");
+        self.persistence.drain().await;
         self.pending_terminals.drain().await;
+        self.early_requests.drain().await;
         self.responses_request_spool.drain_uploads().await;
         self.db.drain_gateway_persistence().await;
     }
