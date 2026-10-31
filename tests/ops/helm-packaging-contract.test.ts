@@ -24,6 +24,50 @@ const runtimeFlags = [
   '--set', 'plugins.runtimeInventory.registrySecrets[0].keys[1]=password',
 ];
 
+test('dedicated RustFS is isolated and archive routing requires explicit cutover', () => {
+  const render = (flags: string[] = []): any[] => parseAllDocuments(run(helm, ['template', 'rustfs-test', chart, '--namespace', 'token-center', ...flags])).map(document => document.toJSON()).filter(Boolean);
+  const flags = ['--values', join(chart, 'values-rustfs-test.yaml')];
+  assert.equal(render().some(document => document.metadata?.name?.endsWith('-rustfs')), false);
+  const prepared = render(flags);
+  const storage = prepared.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(storage.spec.replicas, 1);
+  assert.equal(storage.spec.strategy.type, 'Recreate');
+  assert.equal(storage.spec.template.spec.automountServiceAccountToken, false);
+  assert.equal(storage.spec.template.spec.securityContext.runAsUser, 10001);
+  assert.equal(storage.spec.template.spec.containers[0].image, 'rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2');
+  assert.deepEqual(storage.spec.template.spec.volumes.find((volume: any) => volume.name === 'tmp').emptyDir, {});
+  assert.equal(storage.spec.template.spec.volumes.some((volume: any) => volume.name === 'logs'), false);
+  assert.equal(storage.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'RUSTFS_OBS_LOG_DIRECTORY').value, '');
+  const tuned = render([...flags, '--set', 'rustfs.terminationGracePeriodSeconds=180', '--set', 'rustfs.probes.readiness.timeoutSeconds=7']);
+  const tunedStorage = tuned.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(tunedStorage.spec.template.spec.terminationGracePeriodSeconds, 180);
+  assert.equal(tunedStorage.spec.template.spec.containers[0].readinessProbe.timeoutSeconds, 7);
+  assert.throws(() => render([...flags, '--set', 'rustfs.probes.startup.periodSeconds=0']));
+  const claim = prepared.find(document => document.kind === 'PersistentVolumeClaim' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(claim.spec.storageClassName, 'longhorn-large-single');
+  assert.equal(claim.metadata.annotations['helm.sh/resource-policy'], 'keep');
+  const service = prepared.find(document => document.kind === 'Service' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(service.spec.type, 'ClusterIP');
+  assert.deepEqual(service.spec.selector, storage.spec.selector.matchLabels);
+  assert.equal(service.spec.ports.length, 1);
+  const policy = prepared.find(document => document.kind === 'NetworkPolicy' && document.metadata.name.endsWith('-rustfs'));
+  assert.deepEqual(policy.spec.egress, []);
+  for (const document of prepared.filter(document => document.kind === 'Deployment' && document !== storage)) {
+    assert.equal(document.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'MTC_S3_ENDPOINT').value, '');
+  }
+  const connected = render([...flags, '--set', 'rustfs.connectArchive=true']);
+  for (const document of connected.filter(document => document.kind === 'Deployment' && !document.metadata.name.endsWith('-rustfs'))) {
+    const environment = document.spec.template.spec.containers[0].env;
+    assert.equal(environment.find((entry: any) => entry.name === 'MTC_S3_ENDPOINT').value, 'http://rustfs-test-memeloop-token-center-rustfs:9000');
+    assert.equal(environment.find((entry: any) => entry.name === 'MTC_S3_ALLOW_HTTP').value, 'true');
+  }
+  assert.equal(render([...flags, '--set', 'rustfs.persistence.existingClaim=retained-archive']).some(document => document.kind === 'PersistentVolumeClaim' && document.metadata.name.endsWith('-rustfs')), false);
+  assert.throws(() => render(['--set', 'rustfs.connectArchive=true']));
+  const pinned = render([...flags, '--set-string', `rustfs.image.digest=${reviewed}`]);
+  assert.equal(pinned.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs')).spec.template.spec.containers[0].image, `rustfs/rustfs@${reviewed}`);
+  if (process.env.KUBECONFORM_BIN) run(process.env.KUBECONFORM_BIN, ['-strict', '-summary', '-ignore-missing-schemas'], { input: run(helm, ['template', 'rustfs-test', chart, ...flags]), stdio: ['pipe', 'pipe', 'pipe'] });
+});
+
 interface RuntimeDeployment {
   kind: string;
   metadata: { annotations: Record<string, string> };
