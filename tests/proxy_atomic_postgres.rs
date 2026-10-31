@@ -23,6 +23,30 @@ use uuid::Uuid;
 #[path = "support/postgres_isolation.rs"]
 mod postgres_isolation;
 
+async fn attach_fixture_archive(database: Database, database_url: &str) -> Database {
+    let config = memeloop_token_center::config::Config::for_test(database_url.to_owned());
+    let archive = memeloop_token_center::archive::ArchiveStore::from_config(&config)
+        .await
+        .unwrap();
+    database.with_archive(archive)
+}
+
+async fn prepare_fixture_projection(
+    database: &Database,
+    owner: Uuid,
+    request_id: Uuid,
+    body: &serde_json::Value,
+) {
+    let atoms = extract_atoms(body);
+    let nodes = memeloop_token_center::conversation::build_prefix(&atoms);
+    assert!(
+        database
+            .prepare_session_body_archive(owner, request_id, atoms, &nodes, &[])
+            .await
+            .unwrap()
+    );
+}
+
 static POSTGRES_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tokio::test]
@@ -466,6 +490,7 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
     let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
     let database_url = isolated.url().to_owned();
     let database = Database::connect_with_max(&database_url, 96).await.unwrap();
+    let database = attach_fixture_archive(database, &database_url).await;
     database.migrate().await.unwrap();
     let unique = Uuid::now_v7();
     let tenant = format!("metered-conversation-1024-{unique}");
@@ -564,6 +589,7 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
         .unwrap();
     assert_eq!(root_tasks.len(), 1);
     assert_eq!(root_tasks[0].request_id, root_request_id);
+    prepare_fixture_projection(&database, projector, root_request_id, &root_request_json).await;
     assert!(
         database
             .project_claimed_conversation_projection_task(projector, root_request_id)
@@ -619,7 +645,12 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
     let finish_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
     let finish_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
     let mut finishes = Vec::with_capacity(REQUESTS);
+    let mut request_documents = std::collections::HashMap::new();
     for (index, request_id, reservation) in admitted {
+        request_documents.insert(
+            request_id,
+            serde_json::json!({"input":[{"role":"user","content":format!("child-{index}")}]}),
+        );
         let database = database.clone();
         let key = key.clone();
         let finish_barrier = finish_barrier.clone();
@@ -707,6 +738,13 @@ async fn postgres_metered_unlimited_terminal_projection_keeps_1024_same_session_
             break;
         }
         for task in tasks {
+            prepare_fixture_projection(
+                &database,
+                projector,
+                task.request_id,
+                &request_documents[&task.request_id],
+            )
+            .await;
             assert!(
                 database
                     .project_claimed_conversation_projection_task(projector, task.request_id)
@@ -1046,6 +1084,7 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
     let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
     let database_url = isolated.url().to_owned();
     let database = Database::connect_with_max(&database_url, 16).await.unwrap();
+    let database = attach_fixture_archive(database, &database_url).await;
     database.migrate().await.unwrap();
     let inspection = PgPool::connect(&database_url).await.unwrap();
     let unique = Uuid::now_v7();
@@ -1177,7 +1216,15 @@ async fn postgres_conversation_projection_prematerializes_before_the_session_loc
     .unwrap();
 
     let projection_database = database.clone();
+    let projection_document = request_json.clone();
     let mut projection = tokio::spawn(async move {
+        prepare_fixture_projection(
+            &projection_database,
+            projector,
+            request_id,
+            &projection_document,
+        )
+        .await;
         projection_database
             .project_claimed_conversation_projection_task(projector, request_id)
             .await
@@ -1287,6 +1334,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
     let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
     let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
     let database = Database::connect_with_max(isolated.url(), 8).await.unwrap();
+    let database = attach_fixture_archive(database, isolated.url()).await;
     database.migrate().await.unwrap();
     let inspection = PgPool::connect(isolated.url()).await.unwrap();
     let unique = Uuid::now_v7();

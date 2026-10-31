@@ -968,7 +968,7 @@ async fn buffered_atomic_capture_shares_budget_and_rolls_back_all_chunks() {
             .await
             .unwrap()
     );
-    assert_eq!(budget(&db).await, request_budget * 2);
+    assert_eq!(budget(&db).await, request_budget);
     sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
         .bind(CIPHER_LIMIT)
         .execute(&db.pool)

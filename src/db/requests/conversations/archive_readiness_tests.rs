@@ -659,16 +659,37 @@ async fn source_contract(database_url: String) {
             .unwrap()
             .with_archive(fixture.state.archive.clone());
         fixture.assert_completed(true).await;
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
+        let root = fixture
+            .state
+            .archive
+            .raw_capture_reference(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.size_bytes, original.len() as u64);
+        assert_eq!(
+            root.blake3_digest,
+            blake3::hash(&original).to_hex().to_string()
+        );
+        assert_eq!(
+            fixture
+                .state
+                .archive
+                .get_tenant_content(fixture.identity.tenant_id, &root, original.len())
+                .await
+                .unwrap(),
+            original
+        );
+        let recreated: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1")
                 .bind(fixture.request_id.to_string())
                 .fetch_one(&fixture.state.db.pool)
                 .await
                 .unwrap();
-        assert_eq!(state, "bound");
-        let archived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'cleanup_pending'")
-            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
-        assert_eq!(archived, 1);
+        assert_eq!(
+            recreated, 0,
+            "immutable roots restore content without recreating retired spools"
+        );
         let chunks: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = $1",
         )

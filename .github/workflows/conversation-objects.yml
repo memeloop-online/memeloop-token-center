@@ -31,6 +31,22 @@ jobs:
   archive-contract:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+          POSTGRES_DB: memeloop_token_center_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:

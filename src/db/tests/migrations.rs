@@ -1774,7 +1774,11 @@ async fn sqlite_request_lifecycle_uses_locators_for_finish_detail_and_events() {
     assert_eq!(detail.view.status_code, Some(200));
     assert_eq!(
         detail.response_object.as_deref(),
-        Some("memory://locator-response")
+        Some(format!("gap://{request_id}/response").as_str())
+    );
+    assert_eq!(
+        detail.response_archive_state,
+        crate::model::RequestArchiveState::Pending
     );
     let located_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM request_event_locators l JOIN request_events e ON e.event_id = l.id AND e.event_at = l.created_at WHERE l.request_id = $1",
