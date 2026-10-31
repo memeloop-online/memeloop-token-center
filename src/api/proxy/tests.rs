@@ -65,6 +65,7 @@ mod routing_persistence;
 mod routing_price_snapshot;
 mod soonest_reset;
 mod source_r2;
+mod shutdown_durability;
 mod sse_delivery;
 mod upstream_error_details;
 
