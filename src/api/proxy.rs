@@ -1048,7 +1048,10 @@ async fn proxy_with_cancellation_guard(
             RouteSelectionOptions {
                 upstream_account_hint: applied.upstream_account_hint,
                 avoid_route_account,
-                selection_seed,
+                // Native weighted rendezvous balances requests, including within
+                // a session. Session affinity is opt-in through a group policy;
+                // its stable seed is still passed to group_routing::prepare.
+                selection_seed: request_id,
             },
         )
         .await?;

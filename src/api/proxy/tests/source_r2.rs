@@ -174,7 +174,6 @@ async fn postgres_source_archive_pool_locked_still_dispatches_and_reaches_eof() 
             crate::model::RequestArchiveState::Bound,
             "{endpoint}: releasing the pool must allow source persistence to finish"
         );
-        state.persistence.drain_for_test().await;
         state.db.close().await;
     }
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
