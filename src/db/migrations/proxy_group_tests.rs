@@ -184,6 +184,17 @@ async fn upgrade_contract(database: &Database) {
             .await
             .unwrap();
     }
+    for statement in [
+        "DROP VIEW request_history_source_ids",
+        "DROP TABLE request_history_backfill",
+        "DROP TABLE request_history_export",
+        "DROP TABLE request_history_state",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
     sqlx::query("DELETE FROM schema_migrations WHERE version >= 115")
         .execute(&database.pool)
         .await
