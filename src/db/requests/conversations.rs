@@ -3417,7 +3417,7 @@ mod tests {
         .unwrap();
         transaction.commit().await.unwrap();
         let atom_sql = "SELECT content_hash, instance_hash, role, kind, content_json FROM semantic_atoms WHERE tenant_id = $1 ORDER BY content_hash";
-        let expected_atoms: Vec<(String, String, String, String, String)> =
+        let mut expected_atoms: Vec<(String, String, String, String, String)> =
             sqlx::query_as(atom_sql)
                 .bind(&tenant)
                 .fetch_all(&db.pool)
@@ -3428,6 +3428,12 @@ mod tests {
             .fetch_all(&db.pool)
             .await
             .unwrap();
+        for atom in &mut expected_atoms {
+            atom.4 = db
+                .read_body_reference(Uuid::parse_str(&tenant).unwrap(), &atom.4)
+                .await
+                .unwrap();
+        }
         assert_eq!(owned_atoms, expected_atoms);
         let node_sql = "SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 ORDER BY depth";
         let expected_nodes: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(node_sql)

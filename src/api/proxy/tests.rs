@@ -4143,7 +4143,8 @@ async fn codex_buffered_responses_rejects_malformed_incomplete_output_with_obser
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(
-            ResponseTemplate::new(200).set_body_raw(malformed.into_bytes(), "text/event-stream"),
+            ResponseTemplate::new(200)
+                .set_body_raw(malformed.clone().into_bytes(), "text/event-stream"),
         )
         .expect(1)
         .mount(&upstream)
@@ -4194,7 +4195,7 @@ async fn codex_buffered_responses_rejects_malformed_incomplete_output_with_obser
             .get(refs.response_object.as_deref().unwrap())
             .await
             .unwrap(),
-        delivered.as_ref()
+        malformed.as_bytes()
     );
     upstream.verify().await;
 }
@@ -4292,7 +4293,7 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
         })))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_raw(sse.into_bytes(), "text/event-stream; charset=utf-8"),
+                .set_body_raw(sse.clone().into_bytes(), "text/event-stream; charset=utf-8"),
         )
         .expect(1)
         .mount(&upstream)
@@ -4401,17 +4402,17 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
     )
     .unwrap();
     assert_eq!(archived_request, original);
-    let archived_response: Value = serde_json::from_slice(
-        &fixture
-            .state
-            .archive
-            .get(refs.response_object.as_deref().unwrap())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(archived_response, body);
-    assert!(!archived_response.to_string().contains("response.completed"));
+    let archived_response = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(archived_response.as_ref(), sse.as_bytes());
+    assert_eq!(
+        blake3::hash(&archived_response),
+        blake3::hash(sse.as_bytes())
+    );
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);

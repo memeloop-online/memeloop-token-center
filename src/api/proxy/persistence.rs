@@ -94,15 +94,6 @@ impl Persistence {
     }
 
     #[cfg(test)]
-    pub(crate) async fn hold_jobs_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.jobs
-            .clone()
-            .acquire_many_owned(JOBS as u32)
-            .await
-            .unwrap()
-    }
-
-    #[cfg(test)]
     pub(crate) fn pending_archives_for_test(&self) -> u64 {
         self.archives.load(Ordering::Acquire)
     }

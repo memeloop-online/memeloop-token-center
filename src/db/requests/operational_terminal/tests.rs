@@ -297,9 +297,14 @@ impl Fixture {
         ];
         for detail in details {
             assert_eq!(detail.view.status_code, Some(terminal.status_code));
+            let expected_response = if terminal.response_object.starts_with("gap://") {
+                format!("gap://{}/response", self.claim.request_id)
+            } else {
+                terminal.response_object.clone()
+            };
             assert_eq!(
                 detail.response_object.as_deref(),
-                Some(terminal.response_object.as_str())
+                Some(expected_response.as_str())
             );
             assert_eq!(
                 detail.view.operational_terminal.unwrap().financial_state,

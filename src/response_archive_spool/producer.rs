@@ -524,6 +524,12 @@ struct OriginalAdmission {
     identity: ArchiveSpoolIdentity,
 }
 
+impl OriginalAdmission {
+    fn disarm(mut self) {
+        self.state.take();
+    }
+}
+
 impl Drop for OriginalAdmission {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
@@ -546,7 +552,7 @@ impl ResponseArchiveProducer {
         identity: ArchiveSpoolIdentity,
     ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
         let state = state.clone();
-        let mut admission = OriginalAdmission {
+        let admission = OriginalAdmission {
             state: Some(state.clone()),
             identity,
         };
@@ -569,7 +575,7 @@ impl ResponseArchiveProducer {
                 )
                 .await?;
             let producer = Self::begin_admitted(&state, identity, memory, archive_permit);
-            admission.state = None;
+            admission.disarm();
             Some(producer)
         }
     }

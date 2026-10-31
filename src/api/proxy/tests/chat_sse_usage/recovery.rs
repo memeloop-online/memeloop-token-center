@@ -66,18 +66,16 @@ async fn chat_done_is_a_hard_same_chunk_terminal_for_delivery_archive_and_settle
         }]),
         None,
     );
-    let (uri, upstream) = fragmented_sse_upstream(vec![
-        [
-            chat_content("chatcmpl-done-hard-stop"),
-            chat_finish("chatcmpl-done-hard-stop"),
-            chat_usage_only("chatcmpl-done-hard-stop", usage(29, 7, 36)),
-            done().to_owned(),
-            post_done,
-        ]
-        .concat()
-        .into_bytes(),
-    ])
-    .await;
+    let original = [
+        chat_content("chatcmpl-done-hard-stop"),
+        chat_finish("chatcmpl-done-hard-stop"),
+        chat_usage_only("chatcmpl-done-hard-stop", usage(29, 7, 36)),
+        done().to_owned(),
+        post_done,
+    ]
+    .concat()
+    .into_bytes();
+    let (uri, upstream) = fragmented_sse_upstream(vec![original.clone()]).await;
     let fixture = response_usage_fixture_with_uri("chat-done-hard-stop", uri, 0).await;
     let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -106,7 +104,7 @@ async fn chat_done_is_a_hard_same_chunk_terminal_for_delivery_archive_and_settle
         .unwrap();
     let response_object = refs.response_object.expect("stream response archived");
     let archived = fixture.state.archive.get(&response_object).await.unwrap();
-    assert!(!String::from_utf8_lossy(&archived).contains("must-not-arrive"));
+    assert_eq!(archived.as_ref(), original.as_slice());
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
@@ -514,7 +512,7 @@ async fn strict_chat_strips_secret_event_metadata_without_changing_settlement() 
     .concat();
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(sse.clone(), "text/event-stream"))
         .expect(1)
         .mount(&upstream)
         .await;
@@ -550,7 +548,7 @@ async fn strict_chat_strips_secret_event_metadata_without_changing_settlement() 
         .get(refs.response_object.as_deref().expect("response archive"))
         .await
         .unwrap();
-    assert!(!String::from_utf8_lossy(&archived).contains(secret));
+    assert_eq!(archived.as_ref(), sse.as_bytes());
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
     upstream.verify().await;
 }

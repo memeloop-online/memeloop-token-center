@@ -7,6 +7,58 @@ mod cache_coverage;
 mod semantic_isolation;
 mod semantic_retry;
 
+async fn fixture_originals(
+    database: &Database,
+    tenant: Uuid,
+    request_id: Uuid,
+    request: &serde_json::Value,
+    response: Option<&serde_json::Value>,
+) {
+    let archive = database.body_archive().unwrap();
+    for (side, document) in [("request", Some(request)), ("response", response)] {
+        if let Some(document) = document {
+            let object = archive
+                .put_tenant_content(
+                    tenant,
+                    bytes::Bytes::from(serde_json::to_vec(document).unwrap()),
+                )
+                .await
+                .unwrap();
+            archive
+                .publish_raw_capture(tenant, request_id, side, &object)
+                .await
+                .unwrap();
+        } else {
+            archive
+                .publish_raw_capture_failure(tenant, request_id, side)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+async fn prepare_fixture_request(database: &Database, tenant: Uuid, request_id: Uuid, owner: Uuid) {
+    let archive = database.body_archive().unwrap();
+    let object = archive
+        .raw_capture_reference(tenant, request_id, "request")
+        .await
+        .unwrap()
+        .unwrap();
+    let bytes = archive
+        .get_tenant_content(tenant, &object, object.size_bytes as usize)
+        .await
+        .unwrap();
+    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let atoms = crate::conversation::extract_atoms(&document);
+    let nodes = crate::conversation::build_prefix(&atoms);
+    assert!(
+        database
+            .prepare_session_body_archive(owner, request_id, atoms, &nodes, &[])
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn sqlite_deferred_session_body_retries_after_terminal_completion() {
     let directory = tempfile::tempdir().unwrap();
@@ -19,6 +71,7 @@ async fn sqlite_deferred_session_body_retries_after_terminal_completion() {
     let database = &state.db;
     let (key, reservation, request_id) = admitted(database, false).await;
     let request = serde_json::json!({"messages": [{"role": "user", "content": "retry this turn"}]});
+    fixture_originals(database, key.tenant_id, request_id, &request, None).await;
     let hints = ConversationHints::default();
     let mut input = finish(&key, &reservation, request_id);
     input.conversation = Some(ProxyConversationInput {
@@ -188,6 +241,9 @@ async fn sqlite_deferred_session_edges_follow_admission_when_settlement_is_rever
         (child, &child_reservation, &child_body),
         (parent, &parent_reservation, &parent_body),
     ] {
+        let response =
+            serde_json::json!({"choices":[{"message":{"role":"assistant","content":"hello"}}]});
+        fixture_originals(database, key.tenant_id, request_id, body, Some(&response)).await;
         let mut input = finish(&key, reservation, request_id);
         input.response_object =
             r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
@@ -385,6 +441,10 @@ async fn sqlite_session_body_rebuild_rewrites_only_two_locator_rows() {
         assert!(!content.contains("private_request_field"));
         assert!(!content.contains("private_response_field"));
         assert!(!content.contains("raw-provider"));
+        let content = database
+            .read_body_reference(tenant_id, &content)
+            .await
+            .unwrap();
         turns.push(serde_json::from_str(&content).unwrap());
     }
     let dialogue = crate::conversation::training_dialogue(&turns);
@@ -506,6 +566,7 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
     let (key, reservation, request_id) = admitted(database, metered).await;
     let body =
         serde_json::json!({"messages": [{"role": "user", "content": "durable conversation"}]});
+    fixture_originals(database, key.tenant_id, request_id, &body, None).await;
     let hints = ConversationHints {
         session_id: Some(request_id.to_string()),
         ..ConversationHints::default()
@@ -544,8 +605,8 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&envelope.get::<String, _>("request_json"))
             .unwrap(),
-        body,
-        "outbox keeps the reduced dialogue for a gap locator"
+        serde_json::json!({}),
+        "outbox retains bounded metadata while original dialogue remains in CAS"
     );
     assert!(envelope.get::<String, _>("semantic_snapshot_json").len() < 71_000);
     assert_eq!(envelope.get::<String, _>("lease_owner"), "terminal-v118");
@@ -572,6 +633,7 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
             .iter()
             .any(|task| task.request_id == request_id)
     );
+    prepare_fixture_request(database, key.tenant_id, request_id, conversation_owner).await;
     assert!(
         !database
             .project_claimed_conversation_projection_task(conversation_owner, request_id)
@@ -1179,6 +1241,7 @@ async fn historical(database: &Database) -> (AuthenticatedKey, UsageReservation,
     }
     let body =
         serde_json::json!({"messages": [{"role": "user", "content": "retained semantic content"}]});
+    fixture_originals(database, key.tenant_id, request_id, &body, None).await;
     let hints = ConversationHints {
         session_id: Some(request_id.to_string()),
         ..ConversationHints::default()
@@ -1279,6 +1342,7 @@ async fn postgres_terminal_prune_rebuild_and_delayed_commit_share_durable_bounda
             .len(),
         1
     );
+    prepare_fixture_request(&database, key.tenant_id, request_id, conversation_owner).await;
     assert!(
         database
             .project_claimed_conversation_projection_task(conversation_owner, request_id)
@@ -1336,6 +1400,13 @@ async fn postgres_terminal_prune_rebuild_and_delayed_commit_share_durable_bounda
             .len(),
         1
     );
+    prepare_fixture_request(
+        &database,
+        late_key.tenant_id,
+        late_id,
+        late_conversation_owner,
+    )
+    .await;
     assert!(
         database
             .project_claimed_conversation_projection_task(late_conversation_owner, late_id)
