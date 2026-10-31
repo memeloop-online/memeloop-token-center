@@ -135,8 +135,9 @@ impl ClickHouse {
                         before_created_at: snapshot.identity.created_at,
                         before_id: snapshot.identity.request_id,
                     });
-                    if !snapshot.read_model["fact"].is_object()
-                        && snapshot.identity.source != "archive"
+                    if snapshot.identity.source != "archive"
+                        && (!snapshot.read_model["fact"].is_object()
+                            || snapshot.read_model["fact"]["settled_fact"] == false)
                     {
                         continue;
                     }

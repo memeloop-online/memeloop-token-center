@@ -122,6 +122,7 @@ impl HistorySnapshot {
             "outcome": outcome,
             "filter_status": filter_status,
             "filter_cost_micros": self.filter_cost_micros,
+            "stats_filter_cost_micros": self.statistics.as_ref().and_then(|s|s.cost_micros),
             "settlement_state": payload["operational_terminal"]["financial_state"].as_str()
                 .unwrap_or("unknown"),
             "error_code": payload["error_code"],

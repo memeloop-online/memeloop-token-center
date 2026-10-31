@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS request_history_v1
     filter_status LowCardinality(String),
     stats_status LowCardinality(String),
     filter_cost_micros Nullable(Int64),
+    stats_filter_cost_micros Nullable(Int64),
     settlement_state LowCardinality(String),
     error_code Nullable(String),
     upstream_account_id Nullable(UUID),

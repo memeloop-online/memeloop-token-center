@@ -15,6 +15,8 @@ use crate::{
 #[derive(Debug, Subcommand)]
 pub enum HistoryCommand {
     Start,
+    /// Re-export every retained source after upgrading the read-model contract.
+    Refresh,
     Backfill {
         #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(i64).range(1..))]
         page_size: i64,
@@ -48,7 +50,7 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
     database.refresh_http_settings().await?;
     database.start_http_settings_refresh();
     let role = match command {
-        HistoryCommand::Start => "ADMIN",
+        HistoryCommand::Start | HistoryCommand::Refresh => "ADMIN",
         HistoryCommand::Verify | HistoryCommand::Switch => "READER",
         _ => "WRITER",
     };
@@ -63,6 +65,11 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Start => {
             client.initialize().await?;
             database.history_start().await?;
+        }
+        HistoryCommand::Refresh => {
+            client.initialize().await?;
+            database.history_start().await?;
+            database.history_refresh().await?;
         }
         HistoryCommand::Backfill { page_size } => {
             while !database.history_backfill_done().await? {
@@ -350,6 +357,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
         return Err(HistoryError::Changed);
     }
     let report = json!({
+        "read_model_version": super::READ_MODEL_VERSION,
         "revision": revision, "count": count, "sha256": format!("{:x}", hash.finalize()),
         "tenants": tenants, "daily": daily.values().collect::<Vec<_>>(),
         "request_list_payloads_equal": true, "statistics_equal": true,

@@ -325,6 +325,37 @@ async fn request_history_real_services_acceptance() {
         assert_eq!(event.usage, latest_request.usage);
         assert_eq!(event.compaction, latest_request.compaction);
     }
+    let source_to = unix_millis();
+    let source_filter = crate::db::UsageAnalysisFilter {
+        from_created_at: Some(source_to - 86_400_000),
+        to_created_at: Some(source_to),
+        ..Default::default()
+    };
+    let mut expected_projections = Vec::new();
+    for projection in [
+        crate::db::UsageAnalysisProjection::Full,
+        crate::db::UsageAnalysisProjection::Overview,
+        crate::db::UsageAnalysisProjection::Trends,
+        crate::db::UsageAnalysisProjection::Dimensions,
+        crate::db::UsageAnalysisProjection::Sessions,
+        crate::db::UsageAnalysisProjection::Heatmap,
+        crate::db::UsageAnalysisProjection::OutputRate,
+    ] {
+        expected_projections.push((
+            projection,
+            serde_json::to_value(
+                database
+                    .projected_usage_analysis(
+                        Some("history-tenant"),
+                        source_filter.clone(),
+                        projection,
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .unwrap(),
+        ));
+    }
     database.history_switch(true).await.unwrap();
     let source = database
         .source_history_list(&RequestListFilter {
@@ -433,6 +464,17 @@ async fn request_history_real_services_acceptance() {
         .await
         .unwrap();
     assert_eq!(detail.requests.len(), 3);
+    for (projection, expected) in expected_projections {
+        let actual = database
+            .projected_usage_analysis(Some("history-tenant"), source_filter.clone(), projection)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(actual).unwrap(),
+            expected,
+            "{projection:?}"
+        );
+    }
     use tower::ServiceExt;
     let app = crate::api::router(state.clone());
     let response = app
@@ -483,6 +525,121 @@ async fn request_history_real_services_acceptance() {
     .unwrap();
     assert_eq!(response["summary"]["total_requests"], 3);
     assert_eq!(response["summary"]["pending_requests"], 2);
+    let cluster = database
+        .record_conversation_observation(
+            &key,
+            request_id,
+            &serde_json::json!({"messages":[{"role":"user","content":"fixture"}]}),
+            &crate::conversation::ConversationHints {
+                session_id: Some("history-explicit".into()),
+                compaction: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    crate::request_history::migration::drain(&database, &client, 500)
+        .await
+        .unwrap();
+    for (association, count) in [("unlinked", 2), ("confirmed", 1)] {
+        let mut filtered = query.clone();
+        filtered.limit = 100;
+        filtered
+            .predicates
+            .push(crate::request_history::HistoryPredicate {
+                dimension: crate::request_history::Dimension::SessionAssociation,
+                comparison: crate::request_history::Comparison::Equals,
+                value: crate::request_history::PredicateValue::Text(association.into()),
+            });
+        assert_eq!(client.list(&filtered).await.unwrap().requests.len(), count);
+    }
+    let linked = database
+        .request_archive_refs(key.key_id, request_id)
+        .await
+        .unwrap();
+    assert_eq!(linked.view.compaction, Some(true));
+    assert_eq!(
+        linked
+            .view
+            .session_context
+            .as_ref()
+            .unwrap()
+            .session_id
+            .as_deref(),
+        Some(cluster.to_string().as_str())
+    );
+    for (zone, offset) in [("America/New_York", None), ("UTC", Some(-480))] {
+        let analysis = client
+            .session_task_activity(
+                key.tenant_id,
+                &[(key.key_id, cluster), (key.key_id, cluster)],
+                zone,
+                offset,
+            )
+            .await
+            .unwrap();
+        assert_eq!(analysis["totals"]["requests"], 1);
+        assert_eq!(analysis["totals"]["output_tokens"], 5);
+        assert_eq!(analysis["active_days"], 1);
+    }
+    let empty = client
+        .session_task_activity(key.tenant_id, &[], "UTC", None)
+        .await
+        .unwrap();
+    assert_eq!(empty["totals"]["requests"], 0);
+    sqlx::query("UPDATE request_stats_facts SET cost_micros=0 WHERE request_id=$1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    crate::request_history::migration::drain(&database, &client, 500)
+        .await
+        .unwrap();
+    let mut cost_query = query.clone();
+    cost_query
+        .predicates
+        .push(crate::request_history::HistoryPredicate {
+            dimension: crate::request_history::Dimension::CostMicros,
+            comparison: crate::request_history::Comparison::GreaterThan,
+            value: crate::request_history::PredicateValue::Integer(0),
+        });
+    assert_eq!(
+        client
+            .statistics(&cost_query)
+            .await
+            .unwrap()
+            .summary
+            .total_requests,
+        0
+    );
+    assert_eq!(client.list(&cost_query).await.unwrap().requests.len(), 1);
+    let pricing = database
+        .pricing_model_usage(
+            Some("history-tenant"),
+            crate::db::StatsFilter {
+                from_created_at: Some(0),
+                to_created_at: Some(i64::MAX),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(pricing, vec![("history-model".to_owned(), 1, 10, 5)]);
+    crate::request_history::migration::verify(&database, &client)
+        .await
+        .unwrap();
+    database
+        .history_save_verification(
+            database.history_revision().await.unwrap(),
+            &serde_json::json!({"read_model_version":1}),
+        )
+        .await
+        .unwrap();
+    assert!(database.history_switch(true).await.is_err());
+    crate::request_history::migration::verify(&database, &client)
+        .await
+        .unwrap();
     database.history_switch(false).await.unwrap();
     let ledger_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries")
         .fetch_one(&database.pool)

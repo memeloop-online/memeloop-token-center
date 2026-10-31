@@ -184,8 +184,8 @@ impl Database {
         let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
             return Ok(None);
         };
-        let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2")
-            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).fetch_optional(&self.pool).await?;
+        let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = (SELECT tenant_id FROM request_events WHERE event_id = $3)")
+            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(event_id.to_string()).fetch_optional(&self.pool).await?;
         if let Some(row) = row {
             let identity = crate::request_history::HistoryIdentity {
                 source: row.try_get("source")?,

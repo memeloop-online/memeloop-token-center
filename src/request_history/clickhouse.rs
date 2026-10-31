@@ -168,6 +168,7 @@ impl ClickHouse {
         if !response.iter().all(u8::is_ascii_whitespace) {
             return Err(HistoryError::Unavailable);
         }
+        self.execute(BoundQuery::new("ALTER TABLE request_history_v1 ADD COLUMN IF NOT EXISTS stats_filter_cost_micros Nullable(Int64)"), None).await?.error_for_status().map_err(|_|HistoryError::Unavailable)?;
         Ok(())
     }
 
@@ -230,7 +231,10 @@ impl ClickHouse {
         }
         let mut sql = query.list_sql()?;
         if statistics {
-            sql.sql = sql.sql.replace("filter_status", "stats_status");
+            sql.sql = sql
+                .sql
+                .replace("filter_status", "stats_status")
+                .replace("filter_cost_micros", "stats_filter_cost_micros");
         }
         self.rows::<Stored>(sql)
             .await?
@@ -318,7 +322,19 @@ impl ClickHouse {
             .into_iter()
             .map(|row| {
                 let snapshot: HistorySnapshot = serde_json::from_str(&row.snapshot)?;
-                if super::canonical_hash(&snapshot)? != row.snapshot_hash {
+                let allowed = match scope {
+                    HistoryScope::EmptyTenant => false,
+                    HistoryScope::Key { tenant_id, key_id } => {
+                        snapshot.identity.tenant_id == tenant_id
+                            && snapshot.identity.key_id == key_id
+                    }
+                    HistoryScope::Tenant(tenant_id) => snapshot.identity.tenant_id == tenant_id,
+                    HistoryScope::GlobalOperator => true,
+                };
+                if !allowed
+                    || snapshot.identity.source != "event"
+                    || super::canonical_hash(&snapshot)? != row.snapshot_hash
+                {
                     return Err(HistoryError::Mismatch);
                 }
                 Ok(snapshot)
@@ -342,6 +358,83 @@ impl ClickHouse {
                 )?)
             })
             .collect()
+    }
+
+    pub(crate) async fn request_snapshot(
+        &self,
+        scope: HistoryScope,
+        request_id: uuid::Uuid,
+    ) -> Result<Option<HistorySnapshot>, HistoryError> {
+        let query = HistoryQuery {
+            scope,
+            from_created_at: None,
+            to_created_at: None,
+            cursor: None,
+            limit: 1,
+            predicates: vec![super::HistoryPredicate {
+                dimension: super::Dimension::RequestId,
+                comparison: super::Comparison::Equals,
+                value: super::PredicateValue::Uuid(request_id),
+            }],
+        };
+        Ok(self.snapshots(&query).await?.into_iter().next())
+    }
+
+    pub(crate) async fn egress_summary(
+        &self,
+        scope: HistoryScope,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<crate::db::egress::RequestEgressSummary>, HistoryError> {
+        use crate::db::egress::{RequestEgressAttempt, RequestEgressSummary};
+        let query = HistoryQuery {
+            scope,
+            from_created_at: None,
+            to_created_at: None,
+            cursor: None,
+            limit: 500,
+            predicates: vec![],
+        };
+        let mut groups = std::collections::BTreeMap::<String, RequestEgressSummary>::new();
+        self.scan(query, |snapshot| {
+            let attempts: Vec<RequestEgressAttempt> =
+                serde_json::from_value(snapshot.read_model["egress_attempts"].clone())?;
+            for attempt in attempts
+                .into_iter()
+                .filter(|a| a.observed_at >= start && a.observed_at < end)
+            {
+                let key = serde_json::to_string(&attempt.selected)?;
+                let group = groups.entry(key).or_insert_with(|| RequestEgressSummary {
+                    selected: attempt.selected.clone(),
+                    recorded_attempts: 0,
+                    completed_attempts: 0,
+                    final_response_attempts: 0,
+                    request_known_attempts: 0,
+                    response_known_attempts: 0,
+                    request_payload_bytes: None,
+                    response_payload_bytes: None,
+                    measurement_basis: "application_payload_estimate",
+                    wire_bytes: None,
+                    supplier_billed_bytes: None,
+                });
+                group.recorded_attempts += 1;
+                group.completed_attempts += i64::from(attempt.completed);
+                group.final_response_attempts += i64::from(attempt.final_response);
+                if let Some(bytes) = attempt.request_payload_bytes {
+                    group.request_known_attempts += 1;
+                    group.request_payload_bytes =
+                        Some(group.request_payload_bytes.unwrap_or_default() + bytes);
+                }
+                if let Some(bytes) = attempt.response_payload_bytes {
+                    group.response_known_attempts += 1;
+                    group.response_payload_bytes =
+                        Some(group.response_payload_bytes.unwrap_or_default() + bytes);
+                }
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(groups.into_values().collect())
     }
 
     pub async fn daily(&self, query: &HistoryQuery) -> Result<Vec<DailyBucket>, HistoryError> {

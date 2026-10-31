@@ -12,7 +12,11 @@ pub use clickhouse::ClickHouse;
 pub use contract::*;
 pub use query::*;
 
+pub(crate) const READ_MODEL_VERSION: i64 = 2;
+
 pub const SCHEMA: &str = include_str!("schema.sql");
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use sessions::SessionDirectory;

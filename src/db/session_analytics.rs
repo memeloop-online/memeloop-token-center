@@ -516,7 +516,14 @@ impl Database {
             } else {
                 crate::request_history::HistoryScope::Tenant(tenant)
             };
-            return Ok(client.session_summaries(scope, &filter, None).await?);
+            return Ok(client
+                .session_summaries(
+                    scope,
+                    &filter,
+                    None,
+                    self.history_session_directory(tenant).await?,
+                )
+                .await?);
         }
         self.recent_sessions_with_candidate_first(tenant_id, filter, true)
             .await
@@ -890,7 +897,12 @@ impl Database {
                 crate::request_history::HistoryScope::Tenant(tenant)
             };
             return Ok(client
-                .session_summaries(scope, &filter, Some(identities))
+                .session_summaries(
+                    scope,
+                    &filter,
+                    Some(identities),
+                    self.history_session_directory(tenant).await?,
+                )
                 .await?);
         }
         let mut statement = "WITH requested(key_id, session_id) AS (VALUES ".to_owned();

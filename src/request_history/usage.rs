@@ -1,4 +1,7 @@
-use super::{ClickHouse, HistoryCursor, HistoryError, HistoryQuery, HistoryScope, HistorySnapshot};
+use super::{
+    ClickHouse, Dimension, HistoryCursor, HistoryError, HistoryQuery, HistoryScope,
+    HistorySnapshot, PredicateValue,
+};
 use crate::{
     db::{
         RequestListFilter, UsageAnalysisFilter, UsageAnalysisProjection,
@@ -162,11 +165,20 @@ impl Metrics {
 impl ClickHouse {
     pub(crate) async fn scan(
         &self,
+        query: HistoryQuery,
+        visit: impl FnMut(HistorySnapshot) -> Result<(), HistoryError>,
+    ) -> Result<(), HistoryError> {
+        self.scan_mode(query, false, visit).await
+    }
+
+    async fn scan_mode(
+        &self,
         mut query: HistoryQuery,
+        statistics: bool,
         mut visit: impl FnMut(HistorySnapshot) -> Result<(), HistoryError>,
     ) -> Result<(), HistoryError> {
         loop {
-            let mut page = self.snapshots(&query).await?;
+            let mut page = self.read_snapshots(&query, statistics).await?;
             page.truncate(query.limit);
             let Some(last) = page.last() else {
                 break;
@@ -187,7 +199,15 @@ impl ClickHouse {
         query: HistoryQuery,
     ) -> Result<Vec<(String, i64, i64, i64)>, HistoryError> {
         let mut models = BTreeMap::<String, (i64, i64, i64)>::new();
-        self.scan(query, |snapshot| {
+        let pending = query.predicates.iter().any(|p| {
+            p.dimension == Dimension::Status
+                && matches!(&p.value, PredicateValue::Text(value) if value == "pending")
+        });
+        self.scan_mode(query, true, |snapshot| {
+            let settled = snapshot.read_model["fact"]["settled_fact"] == true;
+            if !pending && !settled {
+                return Ok(());
+            }
             if let Some(stats) = snapshot.statistics {
                 let model = snapshot
                     .payload
@@ -203,10 +223,13 @@ impl ClickHouse {
             Ok(())
         })
         .await?;
-        Ok(models
+        let mut result: Vec<_> = models
             .into_iter()
             .map(|(model, (calls, input, output))| (model, calls, input, output))
-            .collect())
+            .collect();
+        result.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        result.truncate(100);
+        Ok(result)
     }
 
     pub(crate) async fn usage(
@@ -332,10 +355,13 @@ impl ClickHouse {
                     .as_str()
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("unlinked:{}", snapshot.identity.key_id));
-                let label = context["session_name"].as_str().unwrap_or(&id).to_owned();
+                let model = text(payload, "model");
                 let entry = sessions
                     .entry((snapshot.identity.key_id, id))
-                    .or_insert_with(|| (label, key_alias.into(), Metrics::default()));
+                    .or_insert_with(|| (model.into(), key_alias.into(), Metrics::default()));
+                if model < entry.0.as_str() {
+                    entry.0 = model.into();
+                }
                 entry.2.add(&snapshot);
             }
             if full || projection == UsageAnalysisProjection::Heatmap {
@@ -455,10 +481,14 @@ impl ClickHouse {
         response.by_session = sessions
             .into_iter()
             .map(
-                |((key_id, id), (label, key_alias, m))| UsageAnalysisSessionBucket {
+                |((key_id, id), (model, key_alias, m))| UsageAnalysisSessionBucket {
                     unlinked: id.starts_with("unlinked:"),
+                    label: if id.starts_with("unlinked:") || model.is_empty() {
+                        key_alias.clone()
+                    } else {
+                        format!("{key_alias} · {model}")
+                    },
                     id,
-                    label,
                     key_id,
                     key_alias,
                     metrics: m.finish(false, false),
@@ -473,6 +503,25 @@ impl ClickHouse {
                 .then_with(|| a.id.cmp(&b.id))
         });
         response.by_session.truncate(100);
+        if projection == UsageAnalysisProjection::OutputRate {
+            let rate = response.summary.output_rate.take();
+            response.summary = UsageAnalysisMetrics {
+                output_rate: rate,
+                ..Default::default()
+            };
+            response.time_series.retain(|row| {
+                row.metrics
+                    .output_rate
+                    .as_ref()
+                    .is_some_and(|r| r.requests > 0)
+            });
+            for row in &mut response.time_series {
+                row.metrics = UsageAnalysisMetrics {
+                    output_rate: row.metrics.output_rate.take(),
+                    ..Default::default()
+                };
+            }
+        }
         Ok(response)
     }
 }

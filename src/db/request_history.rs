@@ -106,6 +106,26 @@ impl Database {
         Ok(refs)
     }
 
+    pub(crate) async fn history_session_directory(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<crate::request_history::SessionDirectory>, HistoryError> {
+        use futures_util::TryStreamExt;
+        let mut stream=sqlx::query("SELECT p.key_id,p.cluster_id,p.updated_at,COALESCE(k.alias,'__retired_credential__') AS key_alias,title.title FROM conversation_key_clusters p JOIN conversation_clusters c ON c.id=p.cluster_id LEFT JOIN key_records k ON k.id=p.key_id AND k.tenant_id=c.tenant_id LEFT JOIN session_generated_titles title ON title.tenant_id=c.tenant_id AND title.key_id=p.key_id AND title.session_id=p.cluster_id WHERE c.tenant_id=$1 AND NOT EXISTS (SELECT 1 FROM key_records wrong WHERE wrong.id=p.key_id AND wrong.tenant_id<>c.tenant_id)")
+            .bind(tenant_id.to_string()).fetch(&self.pool);
+        let mut directory = Vec::new();
+        while let Some(row) = stream.try_next().await? {
+            directory.push(crate::request_history::SessionDirectory {
+                key_id: parse_uuid(row.try_get("key_id")?)?,
+                session_id: row.try_get("cluster_id")?,
+                updated_at: row.try_get("updated_at")?,
+                key_alias: row.try_get("key_alias")?,
+                title: row.try_get("title")?,
+            });
+        }
+        Ok(directory)
+    }
+
     pub async fn history_start(&self) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
         for (table, identity) in [
@@ -122,6 +142,7 @@ impl Database {
             ("request_archive_spools", None),
             ("response_archive_spools", None),
             ("request_egress_attempts", None),
+            ("request_upstream_transport_diagnostics", None),
             ("generation_stats_facts", None),
             ("request_stats_facts", None),
             ("terminal_projection_outbox", None),
@@ -189,6 +210,11 @@ impl Database {
                     };
                     enqueue.push_str(&format!("INSERT INTO request_history_export ({COLUMNS}) SELECT 'event', event_id, tenant_id, key_id, event_at FROM request_events WHERE {event_predicate} AND (SELECT mode FROM request_history_state WHERE id = 1) != 'off' ON CONFLICT (source, request_id) DO UPDATE SET revision = {revision}, snapshot = NULL;"));
                 }
+                if event == "UPDATE" && identity.is_none() {
+                    // A correction may move a metadata row between requests.
+                    // Both dependencies must get fresh canonical snapshots.
+                    enqueue.push_str(&enqueue.replace("NEW.", "OLD."));
+                }
                 let identity_guard = if event == "UPDATE" {
                     if let Some((_, id, created_at)) = identity {
                         let changed = format!(
@@ -216,7 +242,7 @@ impl Database {
                          CREATE TRIGGER {name} AFTER {event} ON {table} FOR EACH ROW EXECUTE FUNCTION {name}();"
                     ),
                     DatabaseBackend::Sqlite => format!(
-                        "CREATE TRIGGER IF NOT EXISTS {name} AFTER {event} ON {table} BEGIN {identity_guard} {enqueue} END;"
+                        "DROP TRIGGER IF EXISTS {name}; CREATE TRIGGER {name} AFTER {event} ON {table} BEGIN {identity_guard} {enqueue} END;"
                     ),
                 };
                 sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
@@ -230,6 +256,17 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        Ok(())
+    }
+
+    /// Reset only source checkpoints; durable pending revisions remain intact.
+    pub async fn history_refresh(&self) -> Result<(), HistoryError> {
+        let mut tx = self.begin_write_transaction().await?;
+        sqlx::query("UPDATE request_history_state SET mode = 'shadow', verified_revision = NULL, verification_json = NULL WHERE id = 1").execute(&mut *tx).await?;
+        sqlx::query("UPDATE request_history_backfill SET after_id = '', done = 0")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -417,6 +454,21 @@ impl Database {
             )))
             .fetch_one(&mut *transaction)
             .await?;
+            let report: Option<String> = sqlx::query_scalar(
+                "SELECT verification_json FROM request_history_state WHERE id = 1",
+            )
+            .fetch_one(&mut *transaction)
+            .await?;
+            if report
+                .as_deref()
+                .map(serde_json::from_str::<Value>)
+                .transpose()?
+                .as_ref()
+                .and_then(|v| v["read_model_version"].as_i64())
+                != Some(crate::request_history::READ_MODEL_VERSION)
+            {
+                return Err(HistoryError::Changed);
+            }
             let revision_sql = match self.backend {
                 DatabaseBackend::PostgreSql => {
                     "SELECT CASE WHEN is_called THEN last_value ELSE 0 END FROM request_history_export_revision_seq"
@@ -503,7 +555,15 @@ impl Database {
                 .source_request_archive_refs(identity.key_id, identity.request_id)
                 .await?;
             archive.view = serde_json::from_value(payload.clone())?;
-            let fact = self.history_analysis_fact(&identity).await?;
+            let fact = self
+                .history_analysis_fact(&identity, payload, statistics.as_ref())
+                .await?;
+            let egress_attempts = self
+                .source_request_egress_attempts(identity.request_id)
+                .await?;
+            let transport_diagnostics = self
+                .source_request_upstream_transport_diagnostics(identity.request_id)
+                .await?;
             let observation = sqlx::query("SELECT * FROM conversation_observations WHERE request_id = $1 AND key_id = $2 AND cluster_id = $3")
                 .bind(identity.request_id.to_string()).bind(identity.key_id.to_string()).bind(payload["session_context"]["session_id"].as_str()).fetch_optional(&self.pool).await?;
             let execution = observation
@@ -526,7 +586,7 @@ impl Database {
                     } else {
                         None
                     };
-                serde_json::json!({"archive": archive, "fact": fact, "upstream_name": upstream_name, "execution": execution, "structure": structure})
+                serde_json::json!({"archive": archive, "fact": fact, "upstream_name": upstream_name, "execution": execution, "structure": structure, "egress_attempts":egress_attempts, "transport_diagnostics":transport_diagnostics})
             }
         } else {
             Value::Null
@@ -544,6 +604,8 @@ impl Database {
     async fn history_analysis_fact(
         &self,
         identity: &HistoryIdentity,
+        payload: &Value,
+        statistics: Option<&HistoryStatistics>,
     ) -> Result<Value, HistoryError> {
         let sql = match identity.source.as_str() {
             "native" => {
@@ -562,6 +624,14 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
         let Some(row) = row else {
+            if payload["operational_terminal"].is_object() || !payload["completed_at"].is_null() {
+                return Ok(
+                    serde_json::json!({"settled_fact":false,"status_class":if payload["lifecycle_state"]=="succeeded" && payload["error_code"].as_str().is_none_or(str::is_empty) {"success"} else {"failure"},
+                    "input_tokens":payload["input_tokens"],"output_tokens":payload["output_tokens"],"cached_input_tokens":payload["cached_input_tokens"],"cache_write_tokens":payload["cache_write_tokens"],
+                    "generation_units":payload["usage"]["generation"]["billed_units"],"duration_ms":payload["duration_ms"],
+                    "cost_micros":statistics.and_then(|s|s.cost_micros),"currency":statistics.and_then(|s|s.currency.as_deref()),"modality":Value::Null}),
+                );
+            }
             return Ok(Value::Null);
         };
         let mut fact = serde_json::Map::new();
@@ -585,6 +655,7 @@ impl Database {
                 serde_json::to_value(row.try_get::<Option<String>, _>(name)?)?,
             );
         }
+        fact.insert("settled_fact".into(), Value::Bool(true));
         Ok(Value::Object(fact))
     }
 

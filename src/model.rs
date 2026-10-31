@@ -1130,7 +1130,7 @@ pub struct RequestDetail {
     pub egress_attempts: Option<Vec<crate::db::egress::RequestEgressAttempt>>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestTransportDiagnosticView {
     pub upstream_account_id: Uuid,
     pub route_id: Uuid,

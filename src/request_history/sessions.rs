@@ -3,12 +3,23 @@ use crate::{
     db::{ConversationDetailFilter, LogicalSessionListFilter, RequestListFilter},
     model::*,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) struct SessionDirectory {
+    pub key_id: uuid::Uuid,
+    pub session_id: String,
+    pub updated_at: i64,
+    pub key_alias: String,
+    pub title: Option<String>,
+}
 
 #[derive(Default)]
 struct Session {
     latest: Option<RequestView>,
     latest_order: Option<(i64, uuid::Uuid)>,
+    models: BTreeSet<String>,
+    names: BTreeSet<String>,
+    directory: Option<SessionDirectory>,
     active: i64,
     count: i64,
     errors: i64,
@@ -30,7 +41,13 @@ impl ClickHouse {
         scope: HistoryScope,
         filter: &LogicalSessionListFilter,
         identities: Option<&[(uuid::Uuid, String)]>,
+        directory: Vec<SessionDirectory>,
     ) -> Result<Vec<LogicalSessionSummary>, HistoryError> {
+        if filter.legacy_cursor && filter.key_id.is_none() {
+            return Err(HistoryError::Invalid(
+                "legacy session cursor requires key_id",
+            ));
+        }
         let query = crate::request_history_api::query_from_request_filter(
             scope,
             &RequestListFilter {
@@ -59,6 +76,14 @@ impl ClickHouse {
                 return Ok(());
             }
             let session = sessions.entry((snapshot.identity.key_id, id)).or_default();
+            session.models.insert(view.model.clone());
+            if let Some(name) = view
+                .session_context
+                .as_ref()
+                .and_then(|c| c.session_name.as_ref())
+            {
+                session.names.insert(name.to_lowercase());
+            }
             let active = matches!(
                 view.lifecycle_state,
                 RequestLifecycleState::Pending
@@ -108,45 +133,86 @@ impl ClickHouse {
             Ok(())
         })
         .await?;
+        for entry in directory {
+            if filter.key_id.is_some_and(|key| key != entry.key_id)
+                || identities
+                    .is_some_and(|ids| !ids.contains(&(entry.key_id, entry.session_id.clone())))
+            {
+                continue;
+            }
+            if let Some(title) = &entry.title {
+                sessions
+                    .entry((entry.key_id, entry.session_id.clone()))
+                    .or_default()
+                    .names
+                    .insert(title.to_lowercase());
+            }
+            sessions
+                .entry((entry.key_id, entry.session_id.clone()))
+                .or_default()
+                .directory = Some(entry);
+        }
         let mut result = Vec::new();
         for ((key_id, session_id), session) in sessions {
-            let Some(view) = session.latest else {
-                continue;
-            };
+            let latest = session.latest;
+            let last_activity = latest
+                .as_ref()
+                .map(|v| v.created_at)
+                .unwrap_or_default()
+                .max(
+                    session
+                        .directory
+                        .as_ref()
+                        .map(|d| d.updated_at)
+                        .unwrap_or_default(),
+                );
             let unlinked = session_id.starts_with("unlinked:");
             let last_status = if session.active > 0 {
                 "active"
-            } else if matches!(view.lifecycle_state, RequestLifecycleState::Succeeded) {
+            } else if latest
+                .as_ref()
+                .is_some_and(|v| matches!(v.lifecycle_state, RequestLifecycleState::Succeeded))
+            {
                 "success"
-            } else if matches!(
-                view.lifecycle_state,
-                RequestLifecycleState::Failed | RequestLifecycleState::Cancelled
-            ) {
+            } else if latest.as_ref().is_some_and(|v| {
+                matches!(
+                    v.lifecycle_state,
+                    RequestLifecycleState::Failed | RequestLifecycleState::Cancelled
+                )
+            }) {
                 "error"
             } else {
                 "unknown"
             };
-            if !filter.state.is_empty() && filter.state != "all" && filter.state != last_status {
+            if (filter.state == "active" && session.active == 0)
+                || (filter.state == "has_errors" && session.errors + session.archived_errors == 0)
+            {
                 continue;
             }
-            if filter.model.as_deref().is_some_and(|m| m != view.model) {
-                continue;
-            }
-            let context = view.session_context.as_ref();
-            let name = context.and_then(|c| c.session_name.clone());
-            let key_alias = view
-                .credential_identity
+            if filter
+                .model
                 .as_ref()
-                .map(|c| c.key_alias.clone())
+                .is_some_and(|m| !session.models.contains(m))
+            {
+                continue;
+            }
+            let context = latest.as_ref().and_then(|v| v.session_context.as_ref());
+            let name = context.and_then(|c| c.session_name.clone());
+            let key_alias = session
+                .directory
+                .as_ref()
+                .map(|d| d.key_alias.clone())
+                .or_else(|| {
+                    latest
+                        .as_ref()
+                        .and_then(|v| v.credential_identity.as_ref())
+                        .map(|c| c.key_alias.clone())
+                })
                 .unwrap_or_else(|| "__retired_credential__".into());
             if filter.query.as_ref().is_some_and(|q| {
                 let q = q.trim().to_lowercase();
                 !session_id.to_lowercase().starts_with(&q)
-                    && !name
-                        .as_deref()
-                        .unwrap_or_default()
-                        .to_lowercase()
-                        .starts_with(&q)
+                    && !session.names.iter().any(|name| name.starts_with(&q))
                     && !key_alias.to_lowercase().starts_with(&q)
             }) {
                 continue;
@@ -162,7 +228,7 @@ impl ClickHouse {
                 } else {
                     key.clone()
                 };
-                if (view.created_at, session_id.as_str(), key_id.to_string())
+                if (last_activity, session_id.as_str(), key_id.to_string())
                     >= (*at, id.as_str(), cursor_key)
                 {
                     continue;
@@ -180,11 +246,14 @@ impl ClickHouse {
                 unlinked,
                 key_id,
                 key_alias,
-                model: view.model,
-                upstream_model: view.upstream_model,
-                protocol: view.protocol,
+                model: latest.as_ref().map(|v| v.model.clone()).unwrap_or_default(),
+                upstream_model: latest.as_ref().and_then(|v| v.upstream_model.clone()),
+                protocol: latest
+                    .as_ref()
+                    .map(|v| v.protocol.clone())
+                    .unwrap_or_default(),
                 last_status: last_status.into(),
-                last_activity_at: view.created_at,
+                last_activity_at: last_activity,
                 active_requests: session.active,
                 requests: session.count,
                 errors: session.errors,
