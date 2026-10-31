@@ -1484,7 +1484,7 @@ async fn active_retired_provider_route_is_rejected_before_credential_or_network_
 }
 
 #[tokio::test]
-async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
+async fn default_routing_distributes_requests_within_the_same_session() {
     let first = MockServer::start().await;
     let second = MockServer::start().await;
     for upstream in [&first, &second] {
@@ -1494,8 +1494,20 @@ async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
             .mount(upstream)
             .await;
     }
-    let fixture = resilient_route_fixture("sticky", &[(first.uri(), 0), (second.uri(), 0)]).await;
-    for _ in 0..2 {
+    let fixture = resilient_route_fixture(
+        "default-session-fairness",
+        &[(first.uri(), 0), (second.uri(), 0)],
+    )
+    .await;
+    // This fixture's explicit admission limit is unrelated to scheduling;
+    // completed responses may still await their asynchronous settlement.
+    fixture
+        .state
+        .db
+        .update_key_policy(fixture.key_id, KeyPolicy::default())
+        .await
+        .unwrap();
+    for _ in 0..32 {
         let response = send_resilient_chat(&fixture, Some("logical-session-42"), false).await;
         assert_eq!(response.status(), StatusCode::OK);
         let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -1504,7 +1516,8 @@ async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
         first.received_requests().await.unwrap().len(),
         second.received_requests().await.unwrap().len(),
     ];
-    assert!(counts == [2, 0] || counts == [0, 2], "counts={counts:?}");
+    assert_eq!(counts.iter().sum::<usize>(), 32);
+    assert!(counts.iter().all(|count| *count > 0), "counts={counts:?}");
 }
 
 #[tokio::test]
