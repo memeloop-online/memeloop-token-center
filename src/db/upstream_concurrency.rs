@@ -17,10 +17,7 @@ pub(crate) struct ConcurrencySample {
 }
 
 impl Database {
-    pub(crate) async fn upstream_concurrency_samples(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<ConcurrencySample>, AppError> {
+    fn upstream_concurrency_samples_query(&self) -> String {
         // Database time matches lease renewal. One statement shares a snapshot
         // across both sources; unfinished attempt evidence is never inferred
         // from an account's configured proxy or its independent health probe.
@@ -30,7 +27,7 @@ impl Database {
             }
             DatabaseBackend::Sqlite => "CAST((julianday('now') - 2440587.5) * 86400000 AS BIGINT)",
         };
-        let query = format!(
+        format!(
             "SELECT observations.*, tenant.external_id AS tenant_external_id,
                     {now} AS sampled_at
              FROM (
@@ -62,7 +59,14 @@ impl Database {
                FROM upstream_accounts a
              ) observations JOIN tenants tenant ON tenant.id = observations.tenant_id
              ORDER BY observations.created_at DESC, observations.sample_id DESC LIMIT $1"
-        );
+        )
+    }
+
+    pub(crate) async fn upstream_concurrency_samples(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<ConcurrencySample>, AppError> {
+        let query = self.upstream_concurrency_samples_query();
         let rows = sqlx::query(sqlx::AssertSqlSafe(query))
             .bind(limit)
             .fetch_all(&self.pool)
@@ -240,3 +244,6 @@ mod tests {
         assert_observations(&database).await;
     }
 }
+
+#[cfg(test)]
+mod index_tests;
