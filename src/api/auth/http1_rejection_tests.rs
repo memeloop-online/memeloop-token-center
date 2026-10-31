@@ -13,7 +13,7 @@ use rust_decimal::Decimal;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::oneshot,
+    sync::{Notify, oneshot},
     task::JoinHandle,
 };
 
@@ -35,6 +35,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with_response_gate(None).await
+    }
+
+    async fn start_with_response_gate(gate: Option<(Arc<Notify>, Arc<Notify>)>) -> Self {
         let (state, directory) = crate::api::tests::test_state().await;
         let issued = state
             .db
@@ -70,6 +74,19 @@ impl Server {
             .layer(middleware::from_fn_with_state(
                 state.clone(),
                 authenticate_gateway_before_body,
+            ))
+            .layer(middleware::from_fn(
+                move |request: axum::extract::Request, next: middleware::Next| {
+                    let gate = gate.clone();
+                    async move {
+                        let response = next.run(request).await;
+                        if let Some((ready, release)) = gate {
+                            ready.notify_one();
+                            release.notified().await;
+                        }
+                        response
+                    }
+                },
             ))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -147,10 +164,40 @@ fn assert_rejection(response: &[u8]) {
 }
 
 #[tokio::test]
+async fn http1_completed_upload_half_close_preserves_pending_response() {
+    let ready = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let server = Server::start_with_response_gate(Some((ready.clone(), release.clone()))).await;
+    let mut socket = TcpStream::connect(server.address).await.unwrap();
+    // Keep-alive framing lets Hyper probe for EOF while the response is pending.
+    let mut request = server.headers("Content-Length: 2\r\n");
+    request.extend_from_slice(b"{}");
+    socket.write_all(&request).await.unwrap();
+    tokio::time::timeout(DEADLINE, ready.notified())
+        .await
+        .expect("production authentication and body admission must complete");
+    socket.shutdown().await.unwrap();
+    let mut byte = [0_u8; 1];
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), socket.read(&mut byte))
+            .await
+            .is_err(),
+        "a write FIN must not close the pending response or cancel its service"
+    );
+    release.notify_one();
+    let response = read_response(&mut socket).await;
+    assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    assert!(response.ends_with(b"ok"), "{response:?}");
+    assert_eq!(server.reached_handler.load(Ordering::Relaxed), 1);
+    assert_eq!(server.state.gateway_body_reads.load(Ordering::Acquire), 0);
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn http1_large_declared_and_chunked_uploads_deliver_413_and_recover() {
     let server = Server::start().await;
     server.normal_request().await;
-    for chunked in [false, true] {
+    for (chunked, half_close) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut socket = TcpStream::connect(server.address).await.unwrap();
         let size = LIMIT + 1024;
         let framing = if chunked {
@@ -160,6 +207,7 @@ async fn http1_large_declared_and_chunked_uploads_deliver_413_and_recover() {
         };
         socket.write_all(&server.headers(&framing)).await.unwrap();
         let (mut read, mut write) = socket.into_split();
+        let (response_received, wait_for_response) = oneshot::channel();
         let writer = tokio::spawn(async move {
             if chunked {
                 write.write_all(format!("{size:x}\r\n").as_bytes()).await?;
@@ -177,9 +225,20 @@ async fn http1_large_declared_and_chunked_uploads_deliver_413_and_recover() {
             if chunked {
                 write.write_all(b"\r\n0\r\n\r\n").await?;
             }
+            if !half_close {
+                // Exercise response delivery without relying on the client's
+                // write FIN to finish the rejected request's cleanup.
+                let _ = wait_for_response.await;
+            }
             write.shutdown().await
         });
-        assert_rejection(&read_response(&mut read).await);
+        let response = read_response(&mut read).await;
+        assert!(
+            !response.is_empty(),
+            "missing rejection: chunked={chunked}, half_close={half_close}"
+        );
+        assert_rejection(&response);
+        let _ = response_received.send(());
         tokio::time::timeout(DEADLINE, writer)
             .await
             .unwrap()
