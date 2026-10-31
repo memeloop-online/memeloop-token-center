@@ -8,6 +8,7 @@ mod comfyui_schema;
 pub(crate) mod group_routing;
 mod protocol;
 mod siliconflow_video_schema;
+mod tkmarket_seedance;
 mod wasu_wan;
 pub use comfyui_schema::{
     effective_parameter_schema as comfyui_parameter_schema,
@@ -474,7 +475,9 @@ async fn cancel_upstream_generation(
                 )
             }
         }
-        GenerationProtocolAdapter::SiliconFlowVideoV1 | GenerationProtocolAdapter::WasuWanV1 => {
+        GenerationProtocolAdapter::SiliconFlowVideoV1
+        | GenerationProtocolAdapter::WasuWanV1
+        | GenerationProtocolAdapter::TkmarketSeedanceV1 => {
             return Err(AppError::upstream("unsupported_generation_driver"));
         }
     };
@@ -581,7 +584,10 @@ async fn submit_attempt(
         nonce
     };
     if job.status == "submitting"
-        && GenerationProtocolAdapter::for_route(route)? == GenerationProtocolAdapter::WasuWanV1
+        && matches!(
+            GenerationProtocolAdapter::for_route(route)?,
+            GenerationProtocolAdapter::WasuWanV1 | GenerationProtocolAdapter::TkmarketSeedanceV1
+        )
     {
         return Err(AppError::upstream("wasu_wan_resubmit_rejected"));
     }
@@ -598,6 +604,13 @@ async fn submit_attempt(
         .ok_or_else(|| AppError::storage("generation_input_archive_is_invalid"))?;
     let adapter = GenerationProtocolAdapter::for_route(route)?;
     let (path, id_field) = match adapter {
+        GenerationProtocolAdapter::TkmarketSeedanceV1 => {
+            input = tkmarket_seedance::submit_body(&job.upstream_model, &Value::Object(input))?
+                .as_object()
+                .cloned()
+                .ok_or(AppError::internal("tkmarket_submit_body"))?;
+            ("/video/generations".to_owned(), "id")
+        }
         GenerationProtocolAdapter::WasuWanV1 => {
             wasu_wan::validate_input(&Value::Object(input.clone()))?;
             input.insert(
@@ -660,12 +673,17 @@ async fn submit_attempt(
             ("/video/submit".to_owned(), "requestId")
         }
     };
-    let submit_url = if adapter == GenerationProtocolAdapter::WasuWanV1 {
+    let submit_url = if adapter == GenerationProtocolAdapter::TkmarketSeedanceV1 {
+        tkmarket_seedance::url(&route.base_url, None)?
+    } else if adapter == GenerationProtocolAdapter::WasuWanV1 {
         wasu_wan::url(&route.base_url, &path)?
     } else {
         format!("{}{}", route.base_url, path)
     };
-    let outbound_http = if adapter == GenerationProtocolAdapter::WasuWanV1 {
+    let outbound_http = if matches!(
+        adapter,
+        GenerationProtocolAdapter::WasuWanV1 | GenerationProtocolAdapter::TkmarketSeedanceV1
+    ) {
         wasu_wan::submit_http(
             &state.http,
             &submit_url,
@@ -723,7 +741,9 @@ async fn submit_attempt(
         ));
     }
     let body = body?;
-    let envelope = if adapter == GenerationProtocolAdapter::WasuWanV1 {
+    let envelope = if adapter == GenerationProtocolAdapter::TkmarketSeedanceV1 {
+        tkmarket_seedance::ack(&body, &job.upstream_model)?
+    } else if adapter == GenerationProtocolAdapter::WasuWanV1 {
         wasu_wan::ack_output(&body)?
     } else {
         &body
@@ -813,6 +833,10 @@ async fn poll(
 ) -> Result<(), AppError> {
     let mut attempt = attempt::Attempt::new(state, worker_id, job, route);
     let result = match GenerationProtocolAdapter::for_route(route)? {
+        GenerationProtocolAdapter::TkmarketSeedanceV1 => {
+            tkmarket_seedance::poll(state, worker_id, job, route, upstream_job_id, &mut attempt)
+                .await
+        }
         GenerationProtocolAdapter::WasuWanV1 => {
             wasu_wan::poll(state, worker_id, job, route, upstream_job_id, &mut attempt).await
         }

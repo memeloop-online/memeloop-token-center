@@ -22,6 +22,7 @@ pub(crate) enum GenerationProtocolAdapter {
     ComfyUi,
     SiliconFlowVideoV1,
     WasuWanV1,
+    TkmarketSeedanceV1,
 }
 
 impl GenerationProtocolAdapter {
@@ -48,6 +49,21 @@ impl GenerationProtocolAdapter {
             {
                 Some(Self::WasuWanV1)
             }
+            "http-json"
+                if config.get("video_api").and_then(Value::as_str)
+                    == Some(super::tkmarket_seedance::PROFILE)
+                    && super::tkmarket_seedance::MODELS.contains(&upstream_model)
+                    && config
+                        .get("video_models")
+                        .and_then(Value::as_array)
+                        .is_some_and(|models| {
+                            models
+                                .iter()
+                                .any(|model| model.as_str() == Some(upstream_model))
+                        }) =>
+            {
+                Some(Self::TkmarketSeedanceV1)
+            }
             "http-json" if is_siliconflow_video_profile(config, upstream_model) => {
                 Some(Self::SiliconFlowVideoV1)
             }
@@ -57,7 +73,10 @@ impl GenerationProtocolAdapter {
 
     pub(crate) fn supports_modality(self, modality: &str) -> bool {
         match self {
-            Self::SeedanceV3 | Self::SiliconFlowVideoV1 | Self::WasuWanV1 => {
+            Self::SeedanceV3
+            | Self::SiliconFlowVideoV1
+            | Self::WasuWanV1
+            | Self::TkmarketSeedanceV1 => {
                 matches!(modality, "video")
             }
             Self::ComfyUi => matches!(modality, "image" | "video"),
@@ -70,7 +89,7 @@ impl GenerationProtocolAdapter {
     pub(crate) const fn catalog_modalities(self) -> &'static [&'static str] {
         match self {
             Self::SeedanceV3 => &["video"],
-            Self::WasuWanV1 => &["video"],
+            Self::WasuWanV1 | Self::TkmarketSeedanceV1 => &["video"],
             Self::ComfyUi => &["image", "video"],
             Self::SiliconFlowVideoV1 => &["image", "video"],
         }
@@ -79,6 +98,7 @@ impl GenerationProtocolAdapter {
     pub(crate) fn normalize_input(self, input: &mut Value) -> Result<(), AppError> {
         match self {
             Self::WasuWanV1 => super::wasu_wan::validate_input(input),
+            Self::TkmarketSeedanceV1 => super::tkmarket_seedance::validate_input(input),
             Self::SeedanceV3 => {
                 normalize_seedance_duration(input)?;
                 Ok(())
@@ -99,6 +119,11 @@ impl GenerationProtocolAdapter {
         input: &Value,
     ) -> Result<i64, AppError> {
         match (self, billing_unit) {
+            // No seconds/job conversion or guessed token estimate. The billing
+            // owner must supply reservation and receipt persistence together.
+            (Self::TkmarketSeedanceV1, _) => {
+                Err(super::tkmarket_seedance::settlement_unavailable())
+            }
             (Self::WasuWanV1, "second") => {
                 super::wasu_wan::validate_input(input)?;
                 Ok(5)
@@ -133,6 +158,7 @@ impl GenerationProtocolAdapter {
     pub(crate) fn parameter_schema(self, config: &Value) -> Option<Value> {
         match self {
             Self::WasuWanV1 => Some(super::wasu_wan::input_schema()),
+            Self::TkmarketSeedanceV1 => Some(super::tkmarket_seedance::input_schema()),
             Self::ComfyUi => super::comfyui_parameter_schema(config).ok(),
             Self::SiliconFlowVideoV1 => Some(super::siliconflow_video_parameter_schema()),
             Self::SeedanceV3 => None,
