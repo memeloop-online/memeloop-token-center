@@ -721,10 +721,11 @@ fn weighted_rendezvous_score(
     candidate: &RoutingCandidate,
 ) -> f64 {
     let mut digest = Sha256::new();
-    digest.update(b"memeloop-routing-rendezvous-v1");
+    // The same account may occur behind several authorized routes for one
+    // model. Those links are not extra scheduling weight for that account.
+    digest.update(b"memeloop-routing-account-rendezvous-v2");
     digest.update(key_id.as_bytes());
     digest.update(selection_seed.as_bytes());
-    digest.update(candidate.route_id.as_bytes());
     digest.update(candidate.account_id.as_bytes());
     let output = digest.finalize();
     let mut first = [0_u8; 8];
@@ -763,6 +764,32 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn duplicate_route_links_do_not_multiply_an_accounts_scheduling_weight() {
+        let account = Uuid::from_u128(101);
+        let peer = Uuid::from_u128(102);
+        for seed in 1..=256 {
+            let mut original = vec![candidate(account), candidate(peer)];
+            order_authorized_candidates(
+                &mut original,
+                Uuid::nil(),
+                Uuid::from_u128(seed),
+                None,
+                None,
+            );
+            let mut linked = vec![candidate(account), candidate(peer), candidate(account)];
+            linked[2].route_id = Uuid::from_u128(999);
+            order_authorized_candidates(
+                &mut linked,
+                Uuid::nil(),
+                Uuid::from_u128(seed),
+                None,
+                None,
+            );
+            assert_eq!(original[0].account_id, linked[0].account_id);
+        }
     }
 
     #[test]

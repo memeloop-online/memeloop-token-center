@@ -14,6 +14,21 @@ pub struct SelectedEgress {
 }
 
 impl SelectedEgress {
+    /// One address shared by several group members is one actual proxy.
+    /// Hash only the sanitized endpoint, never proxy authentication material.
+    pub(crate) fn concurrency_identity(&self) -> Option<String> {
+        if self.kind != "proxy" {
+            return None;
+        }
+        let endpoint = serde_json::to_vec(&(
+            self.scheme.as_ref()?,
+            self.host.as_ref()?.to_ascii_lowercase(),
+            self.port?,
+        ))
+        .ok()?;
+        Some(blake3::hash(&endpoint).to_hex().to_string())
+    }
+
     pub fn capture(selected_proxy_url: Option<&str>) -> Result<Self, AppError> {
         let address = selected_proxy_url
             .map(|value| {

@@ -191,3 +191,24 @@ async fn postgres_egress_attempts_preserve_retries_snapshots_and_unknown_coverag
     database.migrate().await.unwrap();
     projection_contract(&database).await;
 }
+
+#[test]
+fn concurrency_identity_aggregates_actual_endpoints_without_credentials_or_member_names() {
+    let mut first = SelectedEgress::capture(Some("http://alice:secret@localhost:8080")).unwrap();
+    let mut same = SelectedEgress::capture(Some("http://bob:other@localhost:8080")).unwrap();
+    first.member_id = Some(Uuid::from_u128(1));
+    same.member_id = Some(Uuid::from_u128(2));
+    assert_eq!(first.concurrency_identity(), same.concurrency_identity());
+    assert_ne!(
+        first.concurrency_identity(),
+        SelectedEgress::capture(Some("http://localhost:8081"))
+            .unwrap()
+            .concurrency_identity()
+    );
+    assert!(
+        SelectedEgress::capture(None)
+            .unwrap()
+            .concurrency_identity()
+            .is_none()
+    );
+}
