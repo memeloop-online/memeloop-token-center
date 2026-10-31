@@ -167,6 +167,7 @@ pub(super) fn record_capture_failure(state: &AppState, identity: crate::db::Arch
     });
 }
 
+#[cfg(test)]
 pub(super) fn capture(
     state: &AppState,
     identity: crate::db::ArchiveSpoolIdentity,

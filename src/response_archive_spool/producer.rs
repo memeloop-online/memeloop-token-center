@@ -411,6 +411,7 @@ fn take_append_failure_for_test(state: &AppState) -> bool {
 }
 
 pub(crate) struct ResponseArchiveProducer {
+    #[cfg(test)]
     identity: ArchiveSpoolIdentity,
     #[cfg(test)]
     state: AppState,
@@ -592,6 +593,7 @@ impl ResponseArchiveProducer {
             Some(active.clone()),
         );
         Some(Self {
+            #[cfg(test)]
             identity,
             #[cfg(test)]
             state: state.clone(),
