@@ -45,7 +45,7 @@ impl IndependentProbeTarget {
             .clone()
     }
 
-    pub(super) fn before_send(route: &ResolvedUpstream) -> Result<(), AppError> {
+    pub(super) fn validate_target(route: &ResolvedUpstream) -> Result<(), AppError> {
         TARGET
             .try_with(|target| {
                 if route.account_id != target.account
@@ -55,14 +55,19 @@ impl IndependentProbeTarget {
                 {
                     return Err(AppError::Forbidden);
                 }
-                target
-                    .observed
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .model = Some(route.upstream_model.clone());
                 Ok(())
             })
             .unwrap_or(Ok(()))
+    }
+
+    pub(super) fn dispatched(route: &ResolvedUpstream) {
+        let _ = TARGET.try_with(|target| {
+            target
+                .observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .model = Some(route.upstream_model.clone());
+        });
     }
 
     pub(super) fn response(status: StatusCode) {
@@ -72,15 +77,6 @@ impl IndependentProbeTarget {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .status = Some(status.as_u16());
-        });
-    }
-
-    pub(super) fn not_dispatched() {
-        let _ = TARGET.try_with(|target| {
-            *target
-                .observed
-                .lock()
-                .unwrap_or_else(|error| error.into_inner()) = ProbeObservation::default();
         });
     }
 

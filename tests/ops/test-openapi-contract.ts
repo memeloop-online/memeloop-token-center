@@ -15,6 +15,66 @@ const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const originalDocument = parse(readFileSync(`${repository}/openapi/openapi.yaml`, "utf8")) as Obj;
 const cloneDocument = (): Obj => structuredClone(originalDocument) as Obj;
 
+// Evaluate the JSON Schema keywords used by the health payload contract.
+// This validates values (including negative cases), not only document parity.
+function healthPayloadMatches(document: Obj, schema: Obj, value: any): boolean {
+  if (schema.$ref) return healthPayloadMatches(document, document.components.schemas[schema.$ref.split("/").at(-1)], value);
+  if (schema.allOf && !schema.allOf.every((part: Obj) => healthPayloadMatches(document, part, value))) return false;
+  if (schema.anyOf && !schema.anyOf.some((part: Obj) => healthPayloadMatches(document, part, value))) return false;
+  if (schema.not && healthPayloadMatches(document, schema.not, value)) return false;
+  if (schema.enum && !schema.enum.includes(value)) return false;
+  if (schema.type) {
+    const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+    const type = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+    if (!types.includes(type) && !(type === "number" && Number.isInteger(value) && types.includes("integer"))) return false;
+  }
+  if (typeof value === "number" && ((schema.minimum !== undefined && value < schema.minimum) || (schema.maximum !== undefined && value > schema.maximum))) return false;
+  if (typeof value === "string" && schema.format === "uuid" && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu.test(value)) return false;
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    if (schema.required?.some((key: string) => !(key in value))) return false;
+    if (schema.additionalProperties === false && Object.keys(value).some(key => !(key in (schema.properties ?? {})))) return false;
+    for (const [key, child] of Object.entries(schema.properties ?? {})) {
+      if (key in value && !healthPayloadMatches(document, child as Obj, value[key])) return false;
+    }
+  }
+  return true;
+}
+
+test("health GET and POST payloads validate against both published contracts", () => {
+  const jsonDocument = JSON.parse(readFileSync(`${repository}/openapi/openapi.json`, "utf8"));
+  const path = "/internal/v1/upstreams/{account_id}/health";
+  for (const name of ["UpstreamHealthResult", "UpstreamProbeAttempt", "UpstreamProbeResult"]) {
+    assert.deepEqual(jsonDocument.components.schemas[name], originalDocument.components.schemas[name]);
+  }
+  assert.deepEqual(jsonDocument.paths[path], originalDocument.paths[path]);
+  const healthy = {
+    account_id: "00000000-0000-0000-0000-000000000001", status: "healthy",
+    source: "model_probe", checked_at: 1002, started_at: 1000, trigger: "manual",
+    credential_generation: 7, transport_revision: 999, selected_model: "exact",
+    actual_model: "exact", request_id: "00000000-0000-0000-0000-000000000002",
+    error_code: null, upstream_status: 200, latency_ms: 2, status_origin: "provider",
+  };
+  const failed = { ...healthy, status: "unhealthy", error_code: "quota_exhausted", upstream_status: 429, reset_at: null, reset_source: "unknown" };
+  const skipped = { ...healthy, status: "skipped", error_code: "probe_admission_skipped", actual_model: null, upstream_status: null, status_origin: "mtc" };
+  const disabled = { account_id: healthy.account_id, status: "skipped", source: "model_probe", error_code: "probe_account_unavailable", checked_at: 1003 };
+  const legacy = { account_id: healthy.account_id, status: "unknown", source: "legacy_unverified", checked_at: 1, historical_result: { status: "healthy", error_code: null, latency_ms: 17, checked_at: 1 }, last_attempt: null };
+  for (const document of [originalDocument, jsonDocument]) {
+    const get = document.paths[path].get.responses["200"].content["application/json"].schema;
+    const post = document.paths[path].post.responses["200"].content["application/json"].schema;
+    for (const payload of [healthy, failed, skipped, disabled]) assert.ok(healthPayloadMatches(document, post, payload));
+    for (const payload of [null, legacy, { ...healthy, last_attempt: healthy }, { ...skipped, last_result: healthy }, { ...skipped, last_result: null }]) {
+      assert.ok(healthPayloadMatches(document, get, payload), JSON.stringify(payload));
+    }
+    for (const payload of [
+      { ...healthy, upstream_status: 99 },
+      { ...failed, error_code: "raw provider message" },
+      { ...healthy, credential: "must not be exposed" },
+      { ...skipped, last_result: skipped },
+      { ...healthy, last_attempt: { ...healthy, last_attempt: healthy } },
+    ]) assert.equal(healthPayloadMatches(document, get, payload), false);
+  }
+});
+
 test("statistics cache metadata matches the serialized Rust coverage contract", () => {
   const schemas = cloneDocument().components.schemas;
   assert.ok(schemas.StatisticsSummary.required.includes("cache_usage"));

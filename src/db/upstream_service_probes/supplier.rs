@@ -16,12 +16,21 @@ impl Database {
         model: &str,
     ) -> Result<Option<i64>, AppError> {
         sqlx::query_scalar(
-            "SELECT q.reset_at FROM upstream_supplier_availability q
+            "SELECT MAX(deadline) FROM (
+             SELECT q.reset_at AS deadline FROM upstream_supplier_availability q
              JOIN upstream_accounts a ON a.id = q.upstream_account_id
                AND a.credential_generation = q.credential_generation AND a.updated_at = q.transport_revision
-             WHERE a.id = $1 AND q.upstream_model = $2 AND q.reset_at > $3",
+             WHERE a.id = $1 AND q.upstream_model = $2 AND q.reset_at > $3
+               AND q.verification_after IS NULL
+             UNION ALL
+             SELECT h.cooldown_until AS deadline FROM upstream_account_health h
+             JOIN upstream_accounts a ON a.id = h.upstream_account_id
+               AND a.credential_generation = h.credential_generation AND a.updated_at = h.transport_revision
+             WHERE a.id = $1 AND h.last_failure_kind IN ('quota_exhausted', 'rate_limited')
+               AND h.cooldown_until > $3
+             ) deadlines",
         ).bind(account_id.to_string()).bind(model).bind(super::super::unix_millis())
-            .fetch_optional(&self.pool).await.map_err(Into::into)
+            .fetch_one(&self.pool).await.map_err(Into::into)
     }
 
     pub(crate) async fn store_supplier_quota(
@@ -45,25 +54,20 @@ impl Database {
                     AND excluded.failure_kind = 'rate_limited'
                     AND (upstream_supplier_availability.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.observed_at)
                  THEN upstream_supplier_availability.failure_kind ELSE excluded.failure_kind END,
-               reset_at = CASE WHEN upstream_supplier_availability.failure_kind = 'quota_exhausted'
-                    AND excluded.failure_kind = 'rate_limited'
-                    AND (upstream_supplier_availability.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.observed_at)
+               reset_at = CASE WHEN upstream_supplier_availability.reset_at > excluded.observed_at
+                    AND (excluded.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.reset_at)
                  THEN upstream_supplier_availability.reset_at ELSE excluded.reset_at END,
-               reset_source = CASE WHEN upstream_supplier_availability.failure_kind = 'quota_exhausted'
-                    AND excluded.failure_kind = 'rate_limited'
-                    AND (upstream_supplier_availability.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.observed_at)
+               reset_source = CASE WHEN upstream_supplier_availability.reset_at > excluded.observed_at
+                    AND (excluded.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.reset_at)
                  THEN upstream_supplier_availability.reset_source ELSE excluded.reset_source END,
-               observed_at = excluded.observed_at,
-               request_id = excluded.request_id
-             WHERE upstream_supplier_availability.observed_at < excluded.observed_at
-                OR (upstream_supplier_availability.observed_at = excluded.observed_at
-                    AND (
-                      (upstream_supplier_availability.failure_kind = 'rate_limited'
-                       AND excluded.failure_kind = 'quota_exhausted')
-                      OR (upstream_supplier_availability.request_id = excluded.request_id
-                          AND (excluded.failure_kind = 'quota_exhausted'
-                               OR upstream_supplier_availability.failure_kind = 'rate_limited'))
-                    ))",
+               observed_at = CASE WHEN excluded.observed_at > upstream_supplier_availability.observed_at
+                 THEN excluded.observed_at ELSE upstream_supplier_availability.observed_at END,
+               request_id = CASE WHEN excluded.observed_at >= upstream_supplier_availability.observed_at
+                 THEN excluded.request_id ELSE upstream_supplier_availability.request_id END,
+               verification_after = CASE WHEN excluded.observed_at >= upstream_supplier_availability.verification_after
+                 THEN NULL ELSE upstream_supplier_availability.verification_after END
+             WHERE upstream_supplier_availability.success_at IS NULL
+                OR excluded.observed_at >= upstream_supplier_availability.success_at",
         )
         .bind(route.account_id.to_string())
         .bind(&route.upstream_model)
@@ -91,7 +95,7 @@ impl Database {
              WHERE a.id = $1 AND a.status = 'active' AND q.upstream_model <> ''
                AND q.failure_kind <> 'available'
                AND (q.failure_kind = 'quota_exhausted' OR q.reset_at IS NOT NULL)
-               AND (q.reset_at IS NULL OR q.reset_at <= $2)
+               AND (q.reset_at IS NULL OR q.reset_at <= $2 OR q.verification_after IS NOT NULL)
              ORDER BY q.observed_at, q.upstream_model",
         )
         .bind(account_id.to_string())
@@ -99,6 +103,34 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map_err(Into::into)
+    }
+
+    /// Fresh accepted-reset readback is not exact-model success. It permits
+    /// independent verification without discarding either exclusion or timing.
+    /// Newer/concurrent failures retain their deadline; no reset POST occurs here.
+    pub(crate) async fn schedule_supplier_quota_verification(
+        &self,
+        account_id: Uuid,
+        generation: i64,
+        revision: i64,
+        observation_started_at: i64,
+    ) -> Result<(), AppError> {
+        sqlx::query(
+            "UPDATE upstream_supplier_availability SET verification_after = $4
+             WHERE upstream_account_id = $1 AND credential_generation = $2
+               AND transport_revision = $3 AND observed_at < $4
+               AND failure_kind <> 'available'
+               AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id = $1
+                 AND a.status = 'active' AND a.driver = 'openai-codex'
+                 AND a.credential_generation = $2 AND a.updated_at = $3)",
+        )
+        .bind(account_id.to_string())
+        .bind(generation)
+        .bind(revision)
+        .bind(observation_started_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     pub(crate) async fn recover_supplier_quota_from_probe(
@@ -121,15 +153,27 @@ impl Database {
         sqlx::query(
             "INSERT INTO upstream_supplier_availability
              (upstream_account_id, upstream_model, credential_generation, transport_revision,
-              failure_kind, reset_at, reset_source, observed_at, request_id)
-             SELECT id, $2, $3, $4, 'available', NULL, 'probe_success', $5, $6
+              failure_kind, reset_at, reset_source, observed_at, request_id, success_at)
+             SELECT id, $2, $3, $4, 'available', NULL, 'probe_success', $5, $6, $5
              FROM upstream_accounts WHERE id = $1 AND status = 'active'
                AND credential_generation = $3 AND updated_at = $4
              ON CONFLICT (upstream_account_id, upstream_model, credential_generation, transport_revision)
-             DO UPDATE SET failure_kind = excluded.failure_kind, reset_at = NULL,
-               reset_source = excluded.reset_source, observed_at = excluded.observed_at,
-               request_id = excluded.request_id
-             WHERE upstream_supplier_availability.observed_at < excluded.observed_at",
+             DO UPDATE SET
+               failure_kind = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
+                 THEN excluded.failure_kind ELSE upstream_supplier_availability.failure_kind END,
+               reset_at = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
+                 THEN NULL ELSE upstream_supplier_availability.reset_at END,
+               reset_source = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
+                 THEN excluded.reset_source ELSE upstream_supplier_availability.reset_source END,
+               observed_at = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
+                 THEN excluded.observed_at ELSE upstream_supplier_availability.observed_at END,
+               request_id = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
+                 THEN excluded.request_id ELSE upstream_supplier_availability.request_id END,
+               success_at = excluded.success_at,
+               verification_after = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
+                 THEN NULL ELSE upstream_supplier_availability.verification_after END
+             WHERE upstream_supplier_availability.success_at IS NULL
+                OR upstream_supplier_availability.success_at < excluded.success_at",
         )
         .bind(account_id.to_string())
         .bind(model)

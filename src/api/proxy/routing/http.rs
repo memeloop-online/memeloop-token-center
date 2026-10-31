@@ -132,6 +132,18 @@ pub(super) async fn send_reqwest_proxy_route(
     result
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static STALL_PROBE_PREPARATION: bool;
+}
+
+#[cfg(test)]
+pub(in crate::api::proxy) async fn with_stalled_probe_preparation<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    STALL_PROBE_PREPARATION.scope(true, future).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_reqwest_proxy_route_once(
     state: &AppState,
@@ -149,13 +161,23 @@ async fn send_reqwest_proxy_route_once(
         request_id,
         route,
         request_timeout,
-        network::client_for_config_url_no_retry(
-            &state.http,
-            &route.route.base_url,
-            &route.route.config,
-            transport_credential.proxy(),
-            state.config.allow_oauth_loopback,
-        ),
+        async {
+            #[cfg(test)]
+            if STALL_PROBE_PREPARATION
+                .try_with(|stall| *stall)
+                .unwrap_or(false)
+            {
+                std::future::pending::<()>().await;
+            }
+            network::client_for_config_url_no_retry(
+                &state.http,
+                &route.route.base_url,
+                &route.route.config,
+                transport_credential.proxy(),
+                state.config.allow_oauth_loopback,
+            )
+            .await
+        },
     )
     .await
 }
@@ -272,7 +294,15 @@ where
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
-    let upstream_result = send_until_request_deadline(request_deadline, request.send()).await;
+    let upstream_result = send_until_request_deadline(request_deadline, async {
+        let (client, request) = request.build_split();
+        let request = request?;
+        IndependentProbeTarget::dispatched(&route.route);
+        let response = client.execute(request).await?;
+        IndependentProbeTarget::response(response.status());
+        Ok(response)
+    })
+    .await;
     state.metrics.observe_upstream(
         &route.route.driver,
         "proxy",

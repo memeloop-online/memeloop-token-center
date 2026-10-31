@@ -83,15 +83,27 @@ impl Database {
         let checked_at: i64 = row.try_get("checked_at")?;
         let mut result = serde_json::json!({
             "account_id": account_id,
-            "status": status,
-            "error_code": error_code,
-            "latency_ms": latency_ms,
-            "source": "model_probe",
-            "checked_at": checked_at
+            "status": "unknown",
+            "source": "legacy_unverified",
+            "checked_at": checked_at,
+            "historical_result": {
+                "status": status,
+                "error_code": error_code,
+                "latency_ms": latency_ms,
+                "checked_at": checked_at
+            }
         });
         if let Some(saved) = row.try_get::<Option<String>, _>("result_json")? {
             result = serde_json::from_str(&saved)
                 .map_err(|_| AppError::internal("probe_result_json"))?;
+        }
+        // A first skipped attempt has no real result, nor historical evidence.
+        if result["source"] == "legacy_unverified" && status == "skipped" {
+            result["status"] = serde_json::json!("skipped");
+            result
+                .as_object_mut()
+                .expect("probe object")
+                .remove("historical_result");
         }
         let attempt: Option<String> = row.try_get("last_attempt_json")?;
         result["last_attempt"] = attempt

@@ -525,7 +525,10 @@ async fn send_codex_attempt_once(
                 body_consumption.clone(),
                 &http2_evidence,
             );
-            client.execute(request).await
+            IndependentProbeTarget::dispatched(&route.route);
+            let response = client.execute(request).await?;
+            IndependentProbeTarget::response(response.status());
+            Ok(response)
         }
         .await
         .map_err(|error| {

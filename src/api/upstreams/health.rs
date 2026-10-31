@@ -24,10 +24,11 @@ fn classify_probe_error(error: &AppError) -> ProbeDisposition {
     match error {
         AppError::Upstream { .. } => ProbeDisposition::Store("upstream_unavailable"),
         AppError::OAuthRefresh(_) => ProbeDisposition::Store("authentication_failed"),
-        AppError::Capacity { code, .. } => ProbeDisposition::Skip(code),
+        AppError::Capacity { .. } => ProbeDisposition::Skip("probe_admission_skipped"),
         AppError::Overloaded => ProbeDisposition::Skip("service_overloaded"),
-        AppError::Internal { code, .. } => ProbeDisposition::Skip(code),
-        AppError::Storage { code, .. } => ProbeDisposition::Skip(code),
+        AppError::Internal { .. } | AppError::Storage { .. } => {
+            ProbeDisposition::Skip("probe_state_unavailable")
+        }
         AppError::Forbidden
         | AppError::NoAuthorizedUpstreamCandidate
         | AppError::Unauthorized
@@ -189,7 +190,7 @@ pub(crate) async fn run_upstream_service_probes(
     }
 }
 
-async fn run_upstream_service_probe(
+pub(in crate::api) async fn run_upstream_service_probe(
     state: &AppState,
     account_id: Uuid,
     trigger: &str,
@@ -384,6 +385,36 @@ async fn bill_model_probe(
             ));
         }
     };
+    // Feasibility and ordering use the same currency and exact model as
+    // forwarding. Missing prices are local skips, never discovery POSTs.
+    let mut billable = Vec::new();
+    for mut candidate in catalog {
+        match state
+            .db
+            .model_price(&candidate.model_id, &key.currency)
+            .await
+        {
+            Ok(price) => {
+                candidate.input_price = Some(price.input_micros_per_million);
+                billable.push(candidate);
+            }
+            Err(AppError::UnpricedModel) => {
+                if configured.map(str::trim) == Some(candidate.model_id.as_str()) {
+                    let (mut body, store) = skipped(account_id, "probe_model_unpriced");
+                    body["selected_model"] = json!(candidate.model_id);
+                    return Err((body, store));
+                }
+            }
+            Err(error) => {
+                return Err(prepare_failed(
+                    account_id,
+                    &error,
+                    "probe_state_unavailable",
+                ));
+            }
+        }
+    }
+    catalog = billable;
     // Remove unroutable models before applying the established price/version/
     // list ordering. Explicit selections never silently fall back.
     let (model, route) = loop {

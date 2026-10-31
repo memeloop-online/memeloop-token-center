@@ -8,6 +8,8 @@ mod clock;
 mod codex;
 pub(super) mod diagnostics;
 mod http;
+#[cfg(test)]
+pub(super) use http::with_stalled_probe_preparation;
 pub(super) mod kimi;
 mod outcome;
 mod policy;

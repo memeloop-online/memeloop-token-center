@@ -1483,7 +1483,7 @@ async fn proxy_with_cancellation_guard(
             cancellation.record_dispatch_failure(&response);
             return Ok(response);
         }
-        IndependentProbeTarget::before_send(&active_route.route)?;
+        IndependentProbeTarget::validate_target(&active_route.route)?;
         let result = attempt_budget
             .send(
                 send_proxy_route(
@@ -1502,16 +1502,6 @@ async fn proxy_with_cancellation_guard(
         if result.is_ok() {
             cancellation.response_headers_received();
             note_in_flight_stage(&buffered_request, "upstream_response_body").await;
-        }
-        if let Ok(response) = &result {
-            IndependentProbeTarget::response(response.response.status());
-        } else if matches!(
-            &result,
-            Err(ProxySendError::CandidateUnavailable
-                | ProxySendError::CredentialUnavailable
-                | ProxySendError::Credential)
-        ) {
-            IndependentProbeTarget::not_dispatched();
         }
         let (result, rate_limit) = match result {
             Ok(mut result)
@@ -2715,8 +2705,16 @@ async fn execute_component_provider(
         .metrics
         .active_upstream(driver, "component_provider");
     let upstream_started = Instant::now();
-    IndependentProbeTarget::before_send(route)?;
-    let upstream_result = upstream_request.send().await;
+    IndependentProbeTarget::validate_target(route)?;
+    let upstream_result = async {
+        let (client, prepared) = upstream_request.build_split();
+        let prepared = prepared?;
+        IndependentProbeTarget::dispatched(route);
+        let response = client.execute(prepared).await?;
+        IndependentProbeTarget::response(response.status());
+        Ok::<_, reqwest::Error>(response)
+    }
+    .await;
     if let Some(conversation) = request.conversation.as_ref() {
         conversation.release_working_copies(&request.memory);
     }

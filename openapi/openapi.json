@@ -5008,7 +5008,7 @@
         ],
         "operationId": "readUpstreamProviderHealth",
         "summary": "Read the latest independent upstream service probe",
-        "description": "Returns the stored result of the periodic or manually requested service\nprobe. Customer requests do not update this result. `null` means no probe\nhas completed yet.\n",
+        "description": "Returns independently observed billed inference evidence. Customer requests\ndo not update it. A skipped latest attempt is visible with the preserved\nlast_result; otherwise last_attempt accompanies the stored result.\nLegacy rows retain historical_result with unknown status and unverified\nprovenance. null means no result or attempt has been stored.\n",
         "security": [
           {
             "serviceBearer": []
@@ -5058,7 +5058,7 @@
         ],
         "operationId": "probeUpstreamProviderHealth",
         "summary": "Probe one upstream without returning its response body",
-        "description": "Performs a bounded provider-specific read using the current credential. The\nupstream response body is never read, logged, or returned. Transport and\nauthentication failures are represented by `status: unhealthy` in a 200\nmanagement response; they are not proxy responses.\n",
+        "description": "Performs a bounded billed inference using the configured billing credential\nand an exact account/model/generation/revision pin. The default selects a\nlocally routable model priced in that credential's currency. Explicit\nunavailable selections do not fall back. Local pre-dispatch failures are\nskipped and preserve the last real result. Provider bodies may be read for\nbounded protocol/quota classification but are never returned here.\nManual recovery may bypass known quota deadlines; periodic probes wait\nunless fresh accepted-reset readback permits exact-model verification.\nDisabled accounts remain unsendable. HTTP 200 is the management response,\nnot evidence of provider success; upstream_status records original receipt.\n",
         "security": [
           {
             "serviceBearer": []
@@ -11236,43 +11236,85 @@
     },
     "/internal/v1/system-settings/http": {
       "get": {
-        "tags": ["System"],
+        "tags": [
+          "System"
+        ],
         "operationId": "getHttpSettings",
         "summary": "Read global HTTP settings and locally installed effective values",
         "description": "Global operators only. Refreshes the local snapshot from persistent system settings. Each purpose reports effective values, units and sources. No credentials or proxy URLs are returned.",
-        "security": [{"serviceBearer": []}],
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
         "x-required-scope": "providers:read",
         "x-global-operator-only": true,
         "responses": {
           "200": {
             "description": "Current installed revision. An unconfigured system has revision zero.",
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HttpSettingsView"}}}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpSettingsView"
+                }
+              }
+            }
           },
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "403": {"$ref": "#/components/responses/Forbidden"}
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
         }
       },
       "put": {
-        "tags": ["System"],
+        "tags": [
+          "System"
+        ],
         "operationId": "putHttpSettings",
         "summary": "Atomically replace global HTTP settings",
         "description": "Full-document replacement with revision comparison and a transactional audit receipt. Omitted fields inherit; explicit null disables a duration even when the parent supplies a finite value. Purpose overrides take precedence over global defaults and explicit source defaults. Removing a field clears its override. All duration defaults are unlimited. New outbound requests use the new local revision; in-flight clients retain their previous pools. Other processes refresh off the request path every five seconds and retain their last valid snapshot if storage is unavailable. TLS verification, proxy authorization, DNS pinning, redirect and non-idempotent retry rules cannot be changed here.",
-        "security": [{"serviceBearer": []}],
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
         "x-required-scope": "providers:write",
         "x-global-operator-only": true,
         "requestBody": {
           "required": true,
-          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PutHttpSettings"}}}
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutHttpSettings"
+              }
+            }
+          }
         },
         "responses": {
           "200": {
             "description": "Locally installed settings and effective values after durable commit.",
-            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HttpSettingsView"}}}
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpSettingsView"
+                }
+              }
+            }
           },
-          "400": {"$ref": "#/components/responses/InvalidRequest"},
-          "401": {"$ref": "#/components/responses/Unauthorized"},
-          "403": {"$ref": "#/components/responses/Forbidden"},
-          "409": {"$ref": "#/components/responses/Conflict"}
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
         }
       }
     },
@@ -12558,7 +12600,15 @@
             "description": "Select only the analysis needed by the current view; full preserves the complete legacy response.",
             "schema": {
               "type": "string",
-              "enum": ["full", "overview", "trends", "dimensions", "sessions", "heatmap", "output_rate"],
+              "enum": [
+                "full",
+                "overview",
+                "trends",
+                "dimensions",
+                "sessions",
+                "heatmap",
+                "output_rate"
+              ],
               "default": "full"
             }
           },
@@ -12696,7 +12746,10 @@
             "description": "full includes exact output rates; trends returns only rollup summary and time-series metrics.",
             "schema": {
               "type": "string",
-              "enum": ["full", "trends"],
+              "enum": [
+                "full",
+                "trends"
+              ],
               "default": "full"
             }
           },
@@ -20469,6 +20522,7 @@
         "required": [
           "account_id",
           "status",
+          "source",
           "checked_at"
         ],
         "properties": {
@@ -20480,7 +20534,16 @@
             "type": "string",
             "enum": [
               "healthy",
-              "unhealthy"
+              "unhealthy",
+              "skipped",
+              "unknown"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "model_probe",
+              "legacy_unverified"
             ]
           },
           "error_code": {
@@ -20489,31 +20552,222 @@
               "null"
             ],
             "enum": [
-              "credential_invalid",
-              "destination_invalid",
               "authentication_failed",
               "upstream_unavailable",
-              "connection_failed",
+              "rate_limited",
+              "quota_exhausted",
+              "service_overloaded",
+              "probe_admission_skipped",
+              "probe_state_unavailable",
+              "probe_account_unavailable",
+              "provider_retired",
+              "probe_model_unavailable",
+              "probe_billing_unavailable",
+              "probe_route_unavailable",
+              "probe_model_unpriced",
+              "supplier_quota_reset_pending",
               null
             ]
           },
           "upstream_status": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 100,
             "maximum": 599,
-            "description": "Present when an HTTP response was received; its body is discarded."
+            "description": "Original provider HTTP status at receipt; null before receipt."
           },
           "latency_ms": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
-            "minimum": 0,
-            "description": "Present when a network probe was attempted."
+            "minimum": 0
           },
           "checked_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "trigger": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "periodic",
+              "periodic_recovery"
+            ]
+          },
+          "credential_generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "transport_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "selected_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "actual_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exact target when transport dispatch began; null for local preparation failures. Does not prove supplier execution."
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status_origin": {
+            "type": "string",
+            "enum": [
+              "provider",
+              "mtc"
+            ]
+          },
+          "reset_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Provider deadline in Unix milliseconds; null means unknown."
+          },
+          "reset_source": {
+            "type": "string",
+            "enum": [
+              "retry_after",
+              "provider_reset",
+              "unknown"
+            ]
+          },
+          "historical_result": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "error_code",
+              "latency_ms",
+              "checked_at"
+            ],
+            "properties": {
+              "status": {
+                "type": "string"
+              },
+              "error_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "latency_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "checked_at": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "description": "Preserved legacy data whose independent-probe provenance cannot be established."
+          },
+          "last_attempt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamProbeAttempt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamProbeResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
+      },
+      "UpstreamProbeAttempt": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/UpstreamHealthResult"
+          },
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "healthy",
+                  "unhealthy",
+                  "skipped"
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "last_attempt"
+                  ]
+                },
+                {
+                  "required": [
+                    "last_result"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "UpstreamProbeResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/UpstreamHealthResult"
+          },
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "healthy",
+                  "unhealthy",
+                  "unknown"
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "last_attempt"
+                  ]
+                },
+                {
+                  "required": [
+                    "last_result"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
       },
       "StartCursorOAuthRequest": {
         "type": "object",
@@ -26152,7 +26406,10 @@
         }
       },
       "HttpDurationOverride": {
-        "type": ["integer", "null"],
+        "type": [
+          "integer",
+          "null"
+        ],
         "minimum": 1,
         "maximum": 9007199254740991,
         "description": "Milliseconds. Null disables the duration. Omit the containing field to inherit."
@@ -26161,10 +26418,18 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "connect_timeout_ms": {"$ref": "#/components/schemas/HttpDurationOverride"},
-          "read_timeout_ms": {"$ref": "#/components/schemas/HttpDurationOverride"},
-          "request_timeout_ms": {"$ref": "#/components/schemas/HttpDurationOverride"},
-          "pool_idle_timeout_ms": {"$ref": "#/components/schemas/HttpDurationOverride"},
+          "connect_timeout_ms": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "read_timeout_ms": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "request_timeout_ms": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "pool_idle_timeout_ms": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
           "pool_max_idle_per_host": {
             "type": "integer",
             "minimum": 0,
@@ -26177,17 +26442,31 @@
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "defaults": {"$ref": "#/components/schemas/HttpOverrides"},
+          "defaults": {
+            "$ref": "#/components/schemas/HttpOverrides"
+          },
           "purposes": {
             "type": "object",
             "additionalProperties": false,
             "properties": {
-              "general": {"$ref": "#/components/schemas/HttpOverrides"},
-              "codex": {"$ref": "#/components/schemas/HttpOverrides"},
-              "oauth": {"$ref": "#/components/schemas/HttpOverrides"},
-              "plugin": {"$ref": "#/components/schemas/HttpOverrides"},
-              "plugin_release": {"$ref": "#/components/schemas/HttpOverrides"},
-              "probe": {"$ref": "#/components/schemas/HttpOverrides"}
+              "general": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "codex": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "oauth": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "plugin": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "plugin_release": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "probe": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              }
             }
           }
         }
@@ -26195,66 +26474,152 @@
       "PutHttpSettings": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["expected_revision", "settings"],
+        "required": [
+          "expected_revision",
+          "settings"
+        ],
         "properties": {
-          "expected_revision": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
-          "settings": {"$ref": "#/components/schemas/HttpSettings"}
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "settings": {
+            "$ref": "#/components/schemas/HttpSettings"
+          }
         }
       },
       "HttpSettingSource": {
         "type": "string",
-        "enum": ["purpose_override", "global_default", "source_default"]
+        "enum": [
+          "purpose_override",
+          "global_default",
+          "source_default"
+        ]
       },
       "EffectiveHttpDuration": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["value", "source", "unit"],
+        "required": [
+          "value",
+          "source",
+          "unit"
+        ],
         "properties": {
-          "value": {"$ref": "#/components/schemas/HttpDurationOverride"},
-          "source": {"$ref": "#/components/schemas/HttpSettingSource"},
-          "unit": {"type": "string", "enum": ["milliseconds"]}
+          "value": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "source": {
+            "$ref": "#/components/schemas/HttpSettingSource"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "milliseconds"
+            ]
+          }
         }
       },
       "EffectiveHttpPoolSize": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["value", "source", "unit"],
+        "required": [
+          "value",
+          "source",
+          "unit"
+        ],
         "properties": {
-          "value": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
-          "source": {"$ref": "#/components/schemas/HttpSettingSource"},
-          "unit": {"type": "string", "enum": ["connections"]}
+          "value": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "source": {
+            "$ref": "#/components/schemas/HttpSettingSource"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "connections"
+            ]
+          }
         }
       },
       "EffectiveHttpSettings": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["connect_timeout_ms", "read_timeout_ms", "request_timeout_ms", "pool_idle_timeout_ms", "pool_max_idle_per_host"],
+        "required": [
+          "connect_timeout_ms",
+          "read_timeout_ms",
+          "request_timeout_ms",
+          "pool_idle_timeout_ms",
+          "pool_max_idle_per_host"
+        ],
         "properties": {
-          "connect_timeout_ms": {"$ref": "#/components/schemas/EffectiveHttpDuration"},
-          "read_timeout_ms": {"$ref": "#/components/schemas/EffectiveHttpDuration"},
-          "request_timeout_ms": {"$ref": "#/components/schemas/EffectiveHttpDuration"},
-          "pool_idle_timeout_ms": {"$ref": "#/components/schemas/EffectiveHttpDuration"},
-          "pool_max_idle_per_host": {"$ref": "#/components/schemas/EffectiveHttpPoolSize"}
+          "connect_timeout_ms": {
+            "$ref": "#/components/schemas/EffectiveHttpDuration"
+          },
+          "read_timeout_ms": {
+            "$ref": "#/components/schemas/EffectiveHttpDuration"
+          },
+          "request_timeout_ms": {
+            "$ref": "#/components/schemas/EffectiveHttpDuration"
+          },
+          "pool_idle_timeout_ms": {
+            "$ref": "#/components/schemas/EffectiveHttpDuration"
+          },
+          "pool_max_idle_per_host": {
+            "$ref": "#/components/schemas/EffectiveHttpPoolSize"
+          }
         }
       },
       "HttpSettingsView": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["revision", "settings", "effective"],
+        "required": [
+          "revision",
+          "settings",
+          "effective"
+        ],
         "properties": {
-          "revision": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
-          "settings": {"$ref": "#/components/schemas/HttpSettings"},
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "settings": {
+            "$ref": "#/components/schemas/HttpSettings"
+          },
           "effective": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["general", "codex", "oauth", "plugin", "plugin_release", "probe"],
+            "required": [
+              "general",
+              "codex",
+              "oauth",
+              "plugin",
+              "plugin_release",
+              "probe"
+            ],
             "properties": {
-              "general": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
-              "codex": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
-              "oauth": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
-              "plugin": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
-              "plugin_release": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
-              "probe": {"$ref": "#/components/schemas/EffectiveHttpSettings"}
+              "general": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "codex": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "oauth": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "plugin": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "plugin_release": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "probe": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              }
             }
           }
         }

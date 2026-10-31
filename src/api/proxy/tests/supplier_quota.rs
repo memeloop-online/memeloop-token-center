@@ -58,8 +58,12 @@ async fn provider429_publishes_exact_model_and_next_request_uses_alternate_witho
         .unwrap()
         .unwrap();
     assert_eq!(independent["checked_at"], 1);
-    assert_eq!(independent["status"], "unhealthy");
-    assert_eq!(independent["error_code"], "probe_fixture");
+    assert_eq!(independent["status"], "unknown");
+    assert_eq!(independent["source"], "legacy_unverified");
+    assert_eq!(
+        independent["historical_result"]["error_code"],
+        "probe_fixture"
+    );
     exhausted.verify().await;
     healthy.verify().await;
     pool.close().await;
@@ -149,6 +153,27 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
             .await
             .unwrap();
     }
+    let wrong_currency = fixture
+        .state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.into(),
+            public_model: "eur-only".into(),
+            upstream_account_id: account,
+            upstream_model: "eur-only".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO routing_grants (tenant_id,key_id,model_route_id,created_at) SELECT tenant_id,$1,id,1 FROM model_routes WHERE id=$2")
+        .bind(fixture.key_id.to_string()).bind(wrong_currency.id.to_string()).execute(&pool).await.unwrap();
+    fixture
+        .state
+        .db
+        .upsert_model_price("eur-only", "EUR", Decimal::ZERO, Decimal::ZERO)
+        .await
+        .unwrap();
     let context = fixture
         .state
         .db
@@ -174,6 +199,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
         "cheap-alias",
         "different-model",
         "upstream-0",
+        "eur-only",
     ]
     .map(|name| crate::db::DiscoveredUpstreamModel {
         model_id: name.into(),
@@ -289,6 +315,171 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     assert_eq!(reloaded["error_code"], "probe_route_unavailable");
     assert_eq!(reloaded["last_result"]["checked_at"], result["checked_at"]);
     assert_eq!(reloaded["last_result"]["actual_model"], "upstream-0");
+    // A local preparation timeout is not a dispatched probe and cannot
+    // overwrite the real result, even though it is a connection-class error.
+    config["probe_model"] = json!("upstream-0");
+    config["timeout_seconds"] = json!(1);
+    sqlx::query("UPDATE upstream_accounts SET config_json=$2 WHERE id=$1")
+        .bind(account.to_string())
+        .bind(config.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = routing::with_stalled_probe_preparation(invoke())
+        .await
+        .unwrap();
+    let undispatched: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(undispatched["status"], "skipped", "{undispatched}");
+    assert!(undispatched["actual_model"].is_null());
+    assert!(undispatched["upstream_status"].is_null());
+    let saved = fixture
+        .state
+        .db
+        .upstream_service_probe(account)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved["actual_model"], "upstream-0");
+    assert_eq!(saved["checked_at"], result["checked_at"]);
+    assert_eq!(saved["last_attempt"]["status"], "skipped");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+
+    // Legacy known reset: periodic sends nothing; explicitly requested manual
+    // recovery still sends. Neither path changes a disabled account.
+    let deadline = unix_millis() + 3_600_000;
+    sqlx::query("INSERT INTO upstream_account_health (upstream_account_id, consecutive_failures, cooldown_until, probe_lease_until, probe_lease_token, credential_generation, transport_revision, last_failure_kind, updated_at) VALUES ($1,1,$2,0,'',$3,$4,'quota_exhausted',$5) ON CONFLICT (upstream_account_id) DO UPDATE SET cooldown_until=excluded.cooldown_until, last_failure_kind=excluded.last_failure_kind, credential_generation=excluded.credential_generation, transport_revision=excluded.transport_revision")
+        .bind(account.to_string()).bind(deadline).bind(context.credential_generation).bind(context.transport_revision).bind(unix_millis())
+        .execute(&pool).await.unwrap();
+    let periodic = crate::api::upstreams::run_upstream_service_probe(
+        &fixture.state,
+        account,
+        "periodic",
+        None,
+    )
+    .await;
+    assert_eq!(periodic["status"], "skipped");
+    assert_eq!(periodic["error_code"], "supplier_quota_reset_pending");
+    assert_eq!(periodic["reset_at"], deadline);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    // Ordinary response with no timing and a shorter exhausted response must
+    // retain the provider deadline and perform zero background inference.
+    let scoped_route = ResolvedUpstream {
+        route_id: Uuid::parse_str(&route_id).unwrap(),
+        account_id: account,
+        credential_generation: context.credential_generation,
+        transport_revision: context.transport_revision,
+        driver: "http-json".into(),
+        base_url: upstream.uri(),
+        config: config.clone(),
+        upstream_model: "upstream-0".into(),
+        credential: UpstreamCredential::None,
+    };
+    for exhausted in [false, true] {
+        for reset_at in [Some(deadline), None, Some(deadline - 60_000)] {
+            fixture
+                .state
+                .db
+                .store_supplier_quota(
+                    &scoped_route,
+                    Uuid::now_v7(),
+                    unix_millis(),
+                    crate::db::SupplierQuotaEvidence {
+                        exhausted,
+                        reset_at,
+                        reset_source: if reset_at.is_some() {
+                            "retry_after"
+                        } else {
+                            "unknown"
+                        },
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let periodic = crate::api::upstreams::run_upstream_service_probe(
+            &fixture.state,
+            account,
+            "periodic",
+            None,
+        )
+        .await;
+        assert_eq!(periodic["reset_at"], deadline);
+        assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    }
+    upstream.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = invoke().await.unwrap();
+    let sent: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sent["status"], "unhealthy");
+    assert_eq!(sent["actual_model"], "upstream-0");
+    assert_eq!(sent["upstream_status"], 503);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    upstream.verify().await;
+    upstream.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/responses"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(3)))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let response = invoke().await.unwrap();
+    let timed_out: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(timed_out["status"], "unhealthy", "{timed_out}");
+    assert_eq!(timed_out["actual_model"], "upstream-0");
+    assert!(timed_out["upstream_status"].is_null());
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    config["probe_model"] = json!("eur-only");
+    sqlx::query("UPDATE upstream_accounts SET config_json=$2 WHERE id=$1")
+        .bind(account.to_string())
+        .bind(config.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = invoke().await.unwrap();
+    let unpriced: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(unpriced["status"], "skipped");
+    assert_eq!(unpriced["error_code"], "probe_model_unpriced");
+    assert_eq!(unpriced["selected_model"], "eur-only");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    sqlx::query("UPDATE upstream_accounts SET status='disabled' WHERE id=$1")
+        .bind(account.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = invoke().await.unwrap();
+    let disabled: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(disabled["error_code"], "probe_account_unavailable");
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     upstream.verify().await;
     pool.close().await;
 }

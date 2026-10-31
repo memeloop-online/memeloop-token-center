@@ -2267,9 +2267,11 @@ paths:
       operationId: readUpstreamProviderHealth
       summary: Read the latest independent upstream service probe
       description: |
-        Returns the stored result of the periodic or manually requested service
-        probe. Customer requests do not update this result. `null` means no probe
-        has completed yet.
+        Returns independently observed billed inference evidence. Customer requests
+        do not update it. A skipped latest attempt is visible with the preserved
+        last_result; otherwise last_attempt accompanies the stored result.
+        Legacy rows retain historical_result with unknown status and unverified
+        provenance. null means no result or attempt has been stored.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:read
       parameters:
@@ -2292,10 +2294,16 @@ paths:
       operationId: probeUpstreamProviderHealth
       summary: Probe one upstream without returning its response body
       description: |
-        Performs a bounded provider-specific read using the current credential. The
-        upstream response body is never read, logged, or returned. Transport and
-        authentication failures are represented by `status: unhealthy` in a 200
-        management response; they are not proxy responses.
+        Performs a bounded billed inference using the configured billing credential
+        and an exact account/model/generation/revision pin. The default selects a
+        locally routable model priced in that credential's currency. Explicit
+        unavailable selections do not fall back. Local pre-dispatch failures are
+        skipped and preserve the last real result. Provider bodies may be read for
+        bounded protocol/quota classification but are never returned here.
+        Manual recovery may bypass known quota deadlines; periodic probes wait
+        unless fresh accepted-reset readback permits exact-model verification.
+        Disabled accounts remain unsendable. HTTP 200 is the management response,
+        not evidence of provider success; upstream_status records original receipt.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       parameters:
@@ -9060,16 +9068,63 @@ components:
     UpstreamHealthResult:
       type: object
       additionalProperties: false
-      required: [account_id, status, checked_at]
+      required: [account_id, status, source, checked_at]
       properties:
         account_id: { type: string, format: uuid }
-        status: { type: string, enum: [healthy, unhealthy] }
+        status: { type: string, enum: [healthy, unhealthy, skipped, unknown] }
+        source: { type: string, enum: [model_probe, legacy_unverified] }
         error_code:
           type: [string, 'null']
-          enum: [credential_invalid, destination_invalid, authentication_failed, upstream_unavailable, connection_failed, null]
-        upstream_status: { type: integer, minimum: 100, maximum: 599, description: Present when an HTTP response was received; its body is discarded. }
-        latency_ms: { type: integer, format: int64, minimum: 0, description: Present when a network probe was attempted. }
+          enum: [authentication_failed, upstream_unavailable, rate_limited, quota_exhausted, service_overloaded, probe_admission_skipped, probe_state_unavailable, probe_account_unavailable, provider_retired, probe_model_unavailable, probe_billing_unavailable, probe_route_unavailable, probe_model_unpriced, supplier_quota_reset_pending, null]
+        upstream_status: { type: [integer, 'null'], minimum: 100, maximum: 599, description: Original provider HTTP status at receipt; null before receipt. }
+        latency_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
         checked_at: { type: integer, format: int64 }
+        started_at: { type: integer, format: int64 }
+        trigger: { type: string, enum: [manual, periodic, periodic_recovery] }
+        credential_generation: { type: integer, format: int64 }
+        transport_revision: { type: integer, format: int64 }
+        selected_model: { type: [string, 'null'] }
+        actual_model: { type: [string, 'null'], description: Exact target when transport dispatch began; null for local preparation failures. Does not prove supplier execution. }
+        request_id: { type: string, format: uuid }
+        status_origin: { type: string, enum: [provider, mtc] }
+        reset_at: { type: [integer, 'null'], format: int64, description: Provider deadline in Unix milliseconds; null means unknown. }
+        reset_source: { type: string, enum: [retry_after, provider_reset, unknown] }
+        historical_result:
+          type: object
+          additionalProperties: false
+          required: [status, error_code, latency_ms, checked_at]
+          properties:
+            status: { type: string }
+            error_code: { type: [string, 'null'] }
+            latency_ms: { type: [integer, 'null'], format: int64 }
+            checked_at: { type: integer, format: int64 }
+          description: Preserved legacy data whose independent-probe provenance cannot be established.
+        last_attempt:
+          anyOf:
+            - $ref: '#/components/schemas/UpstreamProbeAttempt'
+            - type: 'null'
+        last_result:
+          anyOf:
+            - $ref: '#/components/schemas/UpstreamProbeResult'
+            - type: 'null'
+    UpstreamProbeAttempt:
+      allOf:
+        - $ref: '#/components/schemas/UpstreamHealthResult'
+        - properties:
+            status: { enum: [healthy, unhealthy, skipped] }
+          not:
+            anyOf:
+              - required: [last_attempt]
+              - required: [last_result]
+    UpstreamProbeResult:
+      allOf:
+        - $ref: '#/components/schemas/UpstreamHealthResult'
+        - properties:
+            status: { enum: [healthy, unhealthy, unknown] }
+          not:
+            anyOf:
+              - required: [last_attempt]
+              - required: [last_result]
     StartCursorOAuthRequest:
       type: object
       additionalProperties: false

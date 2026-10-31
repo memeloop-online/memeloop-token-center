@@ -918,6 +918,24 @@ async fn read_codex(
     snapshot.observed_at = Some(observed_at);
     snapshot.stale_after = Some(observed_at + FRESH_MS);
     snapshot.finalize_reset_capability();
+    if matches!(trigger, QuotaReadTrigger::ResetWorkflow)
+        && snapshot.conclusively_allows_codex()
+        && let Err(error) = state
+            .db
+            .schedule_supplier_quota_verification(
+                account.id,
+                account.credential_generation,
+                account.updated_at,
+                observation_started_at,
+            )
+            .await
+    {
+        tracing::warn!(
+            upstream_account_id = %account.id,
+            error_category = error.diagnostic_category(),
+            "fresh reset readback could not schedule exact-model verification"
+        );
+    }
     if snapshot.conclusively_allows_codex()
         && let Some(recovery_fence) = recovery_fence
     {

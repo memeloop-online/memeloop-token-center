@@ -4,6 +4,8 @@ mod config_secret_graph;
 mod config_secret_paths;
 mod config_secrets;
 mod health;
+#[cfg(test)]
+pub(in crate::api) use health::run_upstream_service_probe;
 mod models;
 mod native_cursor_import;
 mod native_oauth_import;

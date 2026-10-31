@@ -334,9 +334,9 @@ pub(crate) async fn confirm(
         credential,
         &account.config,
     )?;
-    let credential = &selection.credential;
-    let account_header =
-        crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
+    let dispatch_credential = &selection.credential;
+    let account_header = crate::oauth::managed::codex::account_header_value(dispatch_credential)
+        .map_err(|_| blocked())?;
     let _permit = state
         .upstream_quota
         .permits
@@ -348,7 +348,7 @@ pub(crate) async fn confirm(
             &state.http,
             CONSUME_URL,
             &json!({"network_scope":"public"}),
-            credential.proxy(),
+            dispatch_credential.proxy(),
             false,
         ),
     )
@@ -370,7 +370,14 @@ pub(crate) async fn confirm(
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
     // No automatic retry and no new redeem ID on any ambiguous outcome.
-    let result = dispatch_once(&http, credential, account_header, CONSUME_URL, &redeem).await;
+    let result = dispatch_once(
+        &http,
+        dispatch_credential,
+        account_header,
+        CONSUME_URL,
+        &redeem,
+    )
+    .await;
     drop(_permit);
     let accepted = result.is_ok();
     state
@@ -389,14 +396,26 @@ pub(crate) async fn confirm(
         // exact quota-exhausted health row through the existing fenced CAS.
         // Recovery failure must never replay the paid reset or change its
         // accepted durable result.
-        match fresh_snapshot(state, account, credential, tenant).await {
-            Ok(_) => tracing::info!(
+        // read_fresh selects its own transport from the stored credential,
+        // never from the consume request's selected proxy credential.
+        let readback = state
+            .upstream_quota
+            .read_fresh(
+                state,
+                account,
+                credential,
+                tenant,
+                QuotaReadTrigger::ResetWorkflow,
+            )
+            .await;
+        match readback.error_code {
+            None => tracing::info!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
                 trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
                 "refreshed quota evidence after an accepted reset"
             ),
-            Err(error) => tracing::warn!(
+            Some(error) => tracing::warn!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
                 trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
