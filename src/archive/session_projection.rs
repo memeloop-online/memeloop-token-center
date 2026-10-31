@@ -1444,7 +1444,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut config = Config::for_test("sqlite::memory:".into());
         config.archive_backend = ArchiveBackend::Filesystem;
-        config.archive_path = Some(directory.path().to_owned());
+        config.archive_path = Some(directory.path().to_string_lossy().into_owned());
         let store = ArchiveStore::from_config(&config).await.unwrap();
         let tenant = Uuid::now_v7();
         let request = Uuid::now_v7();
