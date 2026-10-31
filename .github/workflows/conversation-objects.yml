@@ -87,6 +87,7 @@ jobs:
           test "$ready" = true
           MTC_RUSTFS_RESTORE_ONLY=1 cargo test --locked --lib rustfs_multipart_cas_promotion_and_restart_reconstruction -- --ignored
       - run: cargo test --locked --lib api::proxy::tests::archive_terminal
+      - run: cargo test --locked --lib api::proxy::tests::upstream_error_details
       - run: cargo test --locked --lib api::proxy::tests::kimi
       - name: RustFS fixture diagnostics
         if: always()

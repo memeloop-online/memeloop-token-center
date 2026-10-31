@@ -250,13 +250,13 @@ impl Snapshot {
     }
 
     pub(crate) fn with_supplier_summary(mut self, body: &[u8]) -> Self {
-        if self.status_code >= 400 && body.len() <= 2048 {
-            if let Ok(body) = std::str::from_utf8(body) {
-                let envelope = format!("inline-json:{body}");
-                if crate::supplier_error::supplier_error_from_inline_json(Some(&envelope)).is_some()
-                {
-                    self.supplier_summary = Some(envelope);
-                }
+        if self.status_code >= 400
+            && body.len() <= 2048
+            && let Ok(body) = std::str::from_utf8(body)
+        {
+            let envelope = format!("inline-json:{body}");
+            if crate::supplier_error::supplier_error_from_inline_json(Some(&envelope)).is_some() {
+                self.supplier_summary = Some(envelope);
             }
         }
         self
