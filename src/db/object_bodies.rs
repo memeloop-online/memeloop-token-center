@@ -23,7 +23,7 @@ impl Database {
             return Ok(refs);
         }
 
-        for side in ["response", "request"] {
+        for side in ["request", "response"] {
             let (locator, state, reason) = if let Some(object) = archive
                 .raw_capture_reference(tenant_id, request_id, side)
                 .await?
@@ -279,8 +279,8 @@ mod tests {
         };
         sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, response_object, reservation_id) VALUES ($1, $2, $3, 1, 'openai', 'test', 0, 0, 0, 'gap://' || $1 || '/request', 'gap://' || $1 || '/response', $4)")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(identity.reservation_id.to_string()).execute(pool).await.unwrap();
-        sqlx::query("INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, observed_at, request_json, hints_json, lease_expires_at) VALUES ($1, $2, $3, $4, 1, '{}', '{}', 9223372036854775807)")
-            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, observed_at, request_json, hints_json, lease_expires_at) VALUES ($1, $2, $3, $4, 1, '{}', $5, 9223372036854775807)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(serde_json::to_string(&crate::conversation::ConversationHints::default()).unwrap()).execute(pool).await.unwrap();
         let object = state
             .archive
             .put_tenant_content(
@@ -289,7 +289,7 @@ mod tests {
             )
             .await
             .unwrap();
-        for side in ["request", "response"] {
+        for side in ["response", "request"] {
             state
                 .archive
                 .publish_raw_capture(identity.tenant_id, identity.request_id, side, &object)
@@ -329,6 +329,7 @@ mod tests {
     #[tokio::test]
     async fn training_export_crosses_former_turn_limit_and_rejects_missing_ancestors() {
         let database = Database::connect("sqlite::memory:").await.unwrap();
+        database.migrate().await.unwrap();
         let tenant = Uuid::now_v7();
         let tenant_string = tenant.to_string();
         let document = r#"{"role":"user","parts":[{"type":"text","text":"完整对话"}]}"#;
