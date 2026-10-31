@@ -1,7 +1,6 @@
-# syntax=docker/dockerfile:1.7
-ARG NODE_IMAGE=node:24.18.0-bookworm-slim
-ARG RUST_IMAGE=rust:1.95.0-bookworm
-ARG GO_IMAGE=golang:1.27.3-bookworm
+ARG NODE_IMAGE=node:24.18.0-bookworm-slim@sha256:6f7b03f7c2c8e2e784dcf9295400527b9b1270fd37b7e9a7285cf83b6951452d
+ARG RUST_IMAGE=rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+ARG GO_IMAGE=golang:1.27.3-bookworm@sha256:05237276236793ebedaf0b87dab86add9ec9adc66ebef2dbc3107c18254cde1c
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
 FROM ${GO_IMAGE} AS cosign-builder
@@ -40,7 +39,7 @@ RUN mkdir -p src/bin tests \
     && printf 'fn main() {}\n' > src/bin/install-plugin-oci.rs \
     && printf 'fn main() {}\n' > tests/cucumber.rs \
     && printf 'fn main() {}\n' > tests/postgres.rs \
-    && cargo build --locked --release --features experimental-plugin-revisions,plugin-distribution,h2-attempt-binding --bin memeloop-token-center --bin install-plugin-oci \
+    && cargo build --locked --release --features experimental-plugin-revisions,plugin-distribution --bin memeloop-token-center --bin install-plugin-oci \
     && cargo clean --release --package memeloop-token-center \
     && rm -rf src
 COPY build.rs ./build.rs
@@ -56,7 +55,7 @@ FROM builder AS release-input
 RUN MTC_BUILD_GIT_SHA="${MTC_BUILD_GIT_SHA_INPUT}" \
     MTC_BUILD_TIMESTAMP="${MTC_BUILD_TIMESTAMP_INPUT}" \
     MTC_BUILD_TARGET="${MTC_BUILD_TARGET_INPUT}" \
-    cargo build --locked --release --features experimental-plugin-revisions,plugin-distribution,h2-attempt-binding --bin memeloop-token-center --bin install-plugin-oci \
+    cargo build --locked --release --features experimental-plugin-revisions,plugin-distribution --bin memeloop-token-center --bin install-plugin-oci \
     && install -D -m 0555 target/release/memeloop-token-center /release-input/memeloop-token-center \
     && install -D -m 0555 target/release/install-plugin-oci /release-input/install-plugin-oci \
     && install -D -m 0644 "$(gcc -print-file-name=libgcc_s.so.1)" /release-input/libgcc_s.so.1 \

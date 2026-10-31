@@ -29,7 +29,6 @@ harness = false
 [features]
 experimental-plugin-revisions = []
 default = []
-h2-attempt-binding = ["wreq-proto/h2-attempt-observer"]
 plugin-distribution = ["dep:oci-client"]
 
 [dependencies]
@@ -50,6 +49,7 @@ hkdf = "0.12"
 hmac = "0.12"
 http = "1"
 http-body-util = "0.1"
+h2 = "=0.4.16"
 http2 = "=0.5.20"
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server", "service", "tokio"] }
@@ -58,7 +58,8 @@ jsonwebtoken = { version = "10.4.0", default-features = false, features = ["aws_
 mime_guess = "2"
 object_store = { version = "0.14.1", features = ["aws"] }
 oci-client = { version = "0.17", optional = true, default-features = false, features = ["rustls-tls"] }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "multipart", "query", "rustls", "socks", "stream"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["http2", "json", "multipart", "query", "rustls-no-provider", "socks", "stream"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 regex = "1"
 rust_decimal = { version = "=1.42.1", default-features = false, features = ["serde-with-str", "std"] }
 rustix = { version = "1", features = ["fs", "time", "process"] }
@@ -66,7 +67,7 @@ semver = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs", "any", "postgres", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "any", "postgres", "sqlite"] }
 subtle = "2"
 thiserror = "2"
 tempfile = "3"
@@ -78,10 +79,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
-wasmtime = { version = "48.0.7", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
-wreq = { version = "=6.0.0-rc.31", default-features = false, features = ["prefix-symbols", "socks", "stream", "tokio-rt", "webpki-roots"] }
-wreq-util = { version = "=3.0.0-rc.14", default-features = false, features = ["emulation"] }
-wreq-proto = { version = "=0.2.6", default-features = false }
+wasmtime = { version = "48.0.8", default-features = false, features = ["component-model", "cranelift", "runtime", "std"] }
 zstd = "0.14.3"
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
@@ -92,11 +90,10 @@ tikv-jemallocator = { version = "0.7.0", features = ["profiling", "stats"] }
 pprof = { version = "0.15.0", default-features = false, features = ["prost-codec"] }
 
 [dev-dependencies]
-wreq-proto = { version = "=0.2.6", default-features = false, features = ["h2-attempt-observer"] }
 cucumber = { version = "0.23.0", features = ["macros"] }
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
-tokio-rustls = { version = "=0.26.4", default-features = false, features = ["aws_lc_rs", "tls12"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", features = ["limit", "util"] }
 wat = "1.252"
 wiremock = "0.6.5"
@@ -116,7 +113,3 @@ strip = "debuginfo"
 # feature can reach it. This source-identical, manifest-only fork removes that
 # dormant surface; see vendor/rust_decimal/MEMELOOP-FORK.md.
 rust_decimal = { path = "vendor/rust_decimal" }
-wreq-proto = { path = "vendor/wreq-proto" }
-# Keep the compatible wreq-util release while updating its zstd constraint.
-# All Rust source is unchanged; see vendor/wreq-util/MEMELOOP-FORK.md.
-wreq-util = { path = "vendor/wreq-util" }

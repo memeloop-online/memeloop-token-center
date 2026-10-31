@@ -177,6 +177,7 @@ impl Database {
                 &mut transaction,
                 &request_id,
                 deferred_conversation == 0,
+                1,
             )
             .await?;
         }
@@ -203,22 +204,61 @@ pub(super) async fn project_metered_request_fact_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     request_id: &str,
     project_session_rollups: bool,
+    direction: i64,
 ) -> Result<(), AppError> {
     lock_request_stats_projection_writer_in_transaction(transaction).await?;
     sqlx::query(
-        "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, status_class, error_code, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + excluded.requests, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
+        "INSERT INTO usage_daily_aggregates (key_id, day_bucket, model, status_class, error_code, requests, input_tokens, output_tokens, cost_micros) SELECT key_id, created_at / 86400000, model, status_class, error_code, CAST($2 AS BIGINT) * (1), CAST($2 AS BIGINT) * (CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END), CAST($2 AS BIGINT) * (CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END), CAST($2 AS BIGINT) * (cost_micros) FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(key_id, day_bucket, model, status_class, error_code) DO UPDATE SET requests = usage_daily_aggregates.requests + excluded.requests, input_tokens = usage_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = usage_daily_aggregates.output_tokens + excluded.output_tokens, cost_micros = usage_daily_aggregates.cost_micros + excluded.cost_micros",
     )
     .bind(request_id)
+    .bind(direction)
     .execute(&mut **transaction)
     .await?;
-    sqlx::query(
-        "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, cache_reported_read_tokens, cache_reported_requests, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cached_input_tokens, cache_write_tokens, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN cache_known_read_tokens ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN cache_known_input_tokens ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END, COALESCE(cache_known_read_tokens, 0), CASE WHEN cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + excluded.requests, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, cache_known_read_tokens = request_daily_aggregates.cache_known_read_tokens + excluded.cache_known_read_tokens, cache_known_input_tokens = request_daily_aggregates.cache_known_input_tokens + excluded.cache_known_input_tokens, cache_eligible_requests = request_daily_aggregates.cache_eligible_requests + excluded.cache_eligible_requests, cache_unknown_requests = COALESCE(request_daily_aggregates.cache_unknown_requests, request_daily_aggregates.requests) + excluded.cache_unknown_requests, cache_reported_read_tokens = request_daily_aggregates.cache_reported_read_tokens + excluded.cache_reported_read_tokens, cache_reported_requests = request_daily_aggregates.cache_reported_requests + excluded.cache_reported_requests, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
-    )
-    .bind(request_id)
-    .execute(&mut **transaction)
-    .await?;
+    if direction == -1 {
+        let removed = sqlx::query(
+            "UPDATE request_daily_aggregates AS aggregate SET
+                requests = aggregate.requests - 1,
+                input_tokens = aggregate.input_tokens - CASE WHEN fact.protocol = 'audio-transcription' THEN 0 ELSE fact.input_tokens END,
+                output_tokens = aggregate.output_tokens - CASE WHEN fact.protocol = 'audio-transcription' THEN 0 ELSE fact.output_tokens END,
+                cached_input_tokens = aggregate.cached_input_tokens - fact.cached_input_tokens,
+                cache_write_tokens = aggregate.cache_write_tokens - fact.cache_write_tokens,
+                cache_known_read_tokens = aggregate.cache_known_read_tokens - CASE WHEN fact.cache_known_read_tokens IS NOT NULL AND fact.cache_known_input_tokens IS NOT NULL THEN fact.cache_known_read_tokens ELSE 0 END,
+                cache_known_input_tokens = aggregate.cache_known_input_tokens - CASE WHEN fact.cache_known_read_tokens IS NOT NULL AND fact.cache_known_input_tokens IS NOT NULL THEN fact.cache_known_input_tokens ELSE 0 END,
+                cache_eligible_requests = aggregate.cache_eligible_requests - CASE WHEN fact.cache_known_read_tokens IS NOT NULL AND fact.cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END,
+                cache_unknown_requests = COALESCE(aggregate.cache_unknown_requests, aggregate.requests) - CASE WHEN fact.cache_known_read_tokens IS NOT NULL AND fact.cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END,
+                cache_reported_read_tokens = aggregate.cache_reported_read_tokens - COALESCE(fact.cache_known_read_tokens, 0),
+                cache_reported_requests = aggregate.cache_reported_requests - CASE WHEN fact.cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END,
+                duration_count = aggregate.duration_count - 1,
+                duration_sum_ms = aggregate.duration_sum_ms - fact.duration_ms,
+                cost_micros = aggregate.cost_micros - fact.cost_micros
+             FROM request_stats_facts AS fact
+             WHERE fact.request_id = $1
+               AND aggregate.tenant_id = fact.tenant_id AND aggregate.key_id = fact.key_id
+               AND aggregate.day_bucket = fact.created_at / 86400000 AND aggregate.model = fact.model
+               AND aggregate.protocol = fact.protocol AND aggregate.status_class = fact.status_class
+               AND aggregate.error_code = fact.error_code AND aggregate.upstream_account_id = fact.upstream_account_id
+               AND aggregate.model_route_id = fact.model_route_id AND aggregate.service_tier = fact.service_tier
+               AND aggregate.currency = fact.currency",
+        )
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await?;
+        if removed.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "terminal replacement aggregate is missing".into(),
+            ));
+        }
+    } else {
+        sqlx::query(
+            "INSERT INTO request_daily_aggregates (tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, requests, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, cache_known_read_tokens, cache_known_input_tokens, cache_eligible_requests, cache_unknown_requests, cache_reported_read_tokens, cache_reported_requests, duration_count, duration_sum_ms, cost_micros) SELECT tenant_id, key_id, created_at / 86400000, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency, 1, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE input_tokens END, CASE WHEN protocol = 'audio-transcription' THEN 0 ELSE output_tokens END, cached_input_tokens, cache_write_tokens, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN cache_known_read_tokens ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN cache_known_input_tokens ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN cache_known_read_tokens IS NOT NULL AND cache_known_input_tokens IS NOT NULL THEN 0 ELSE 1 END, COALESCE(cache_known_read_tokens, 0), CASE WHEN cache_known_read_tokens IS NOT NULL THEN 1 ELSE 0 END, 1, duration_ms, cost_micros FROM request_stats_facts WHERE request_id = $1 ON CONFLICT(tenant_id, key_id, day_bucket, model, protocol, status_class, error_code, upstream_account_id, model_route_id, service_tier, currency) DO UPDATE SET requests = request_daily_aggregates.requests + excluded.requests, input_tokens = request_daily_aggregates.input_tokens + excluded.input_tokens, output_tokens = request_daily_aggregates.output_tokens + excluded.output_tokens, cached_input_tokens = request_daily_aggregates.cached_input_tokens + excluded.cached_input_tokens, cache_write_tokens = request_daily_aggregates.cache_write_tokens + excluded.cache_write_tokens, cache_known_read_tokens = request_daily_aggregates.cache_known_read_tokens + excluded.cache_known_read_tokens, cache_known_input_tokens = request_daily_aggregates.cache_known_input_tokens + excluded.cache_known_input_tokens, cache_eligible_requests = request_daily_aggregates.cache_eligible_requests + excluded.cache_eligible_requests, cache_unknown_requests = COALESCE(request_daily_aggregates.cache_unknown_requests, request_daily_aggregates.requests) + excluded.cache_unknown_requests, cache_reported_read_tokens = request_daily_aggregates.cache_reported_read_tokens + excluded.cache_reported_read_tokens, cache_reported_requests = request_daily_aggregates.cache_reported_requests + excluded.cache_reported_requests, duration_count = request_daily_aggregates.duration_count + excluded.duration_count, duration_sum_ms = request_daily_aggregates.duration_sum_ms + excluded.duration_sum_ms, cost_micros = request_daily_aggregates.cost_micros + excluded.cost_micros",
+        )
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await?;
+    }
     if project_session_rollups {
-        add_request_fact_to_session_projection_in_transaction(transaction, request_id).await?;
+        add_request_fact_to_session_projection_in_transaction(transaction, request_id, direction)
+            .await?;
     }
     project_metered_request_analysis_in_transaction(
         transaction,
@@ -226,6 +266,7 @@ pub(super) async fn project_metered_request_fact_in_transaction(
         "usage_analysis_hourly",
         "hour_bucket",
         3_600_000,
+        direction,
     )
     .await?;
     project_metered_request_analysis_in_transaction(
@@ -234,6 +275,7 @@ pub(super) async fn project_metered_request_fact_in_transaction(
         "usage_analysis_daily",
         "day_bucket",
         86_400_000,
+        direction,
     )
     .await?;
     for (table, bucket_column, divisor) in [
@@ -255,7 +297,7 @@ pub(super) async fn project_metered_request_fact_in_transaction(
                    currency, units)
                SELECT tenant_id, key_id, created_at / {divisor}, model, status_class,
                       error_code, upstream_account_id, model_route_id, 'audio', billing_unit,
-                      currency, generation_units
+                      currency, CAST($2 AS BIGINT) * (generation_units)
                  FROM request_stats_facts
                 WHERE request_id = $1 AND protocol = 'audio-transcription'
                ON CONFLICT (
@@ -265,6 +307,7 @@ pub(super) async fn project_metered_request_fact_in_transaction(
         );
         sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(request_id)
+            .bind(direction)
             .execute(&mut **transaction)
             .await?;
     }
@@ -277,6 +320,7 @@ async fn project_metered_request_analysis_in_transaction(
     table: &str,
     bucket_column: &str,
     divisor: i64,
+    direction: i64,
 ) -> Result<(), AppError> {
     let statement = format!(
         r#"INSERT INTO {table} (
@@ -296,24 +340,24 @@ async fn project_metered_request_analysis_in_transaction(
                        WHEN protocol = 'audio-transcription' THEN 'audio-transcription'
                        ELSE 'openai' END,
                   status_class, error_code, upstream_account_id, model_route_id,
-                  service_tier, currency, 1,
-                  CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
-                       THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END,
-                  output_tokens, cached_input_tokens, cache_write_tokens, generation_units,
-                  1, duration_ms,
-                  CASE WHEN duration_ms <= 10 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 10 AND duration_ms <= 50 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 50 AND duration_ms <= 100 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 100 AND duration_ms <= 250 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 250 AND duration_ms <= 500 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 500 AND duration_ms <= 1000 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 1000 AND duration_ms <= 2500 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 2500 AND duration_ms <= 5000 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 5000 AND duration_ms <= 10000 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 10000 AND duration_ms <= 30000 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 30000 AND duration_ms <= 60000 THEN 1 ELSE 0 END,
-                  CASE WHEN duration_ms > 60000 THEN 1 ELSE 0 END,
-                  cost_micros
+                  service_tier, currency, CAST($2 AS BIGINT) * (1),
+                  CAST($2 AS BIGINT) * (CASE WHEN input_tokens >= cached_input_tokens + cache_write_tokens
+                       THEN input_tokens - cached_input_tokens - cache_write_tokens ELSE 0 END),
+                  CAST($2 AS BIGINT) * (output_tokens), CAST($2 AS BIGINT) * (cached_input_tokens), CAST($2 AS BIGINT) * (cache_write_tokens), CAST($2 AS BIGINT) * (generation_units),
+                  CAST($2 AS BIGINT) * (1), CAST($2 AS BIGINT) * (duration_ms),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms <= 10 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 10 AND duration_ms <= 50 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 50 AND duration_ms <= 100 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 100 AND duration_ms <= 250 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 250 AND duration_ms <= 500 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 500 AND duration_ms <= 1000 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 1000 AND duration_ms <= 2500 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 2500 AND duration_ms <= 5000 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 5000 AND duration_ms <= 10000 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 10000 AND duration_ms <= 30000 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 30000 AND duration_ms <= 60000 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (CASE WHEN duration_ms > 60000 THEN 1 ELSE 0 END),
+                  CAST($2 AS BIGINT) * (cost_micros)
              FROM request_stats_facts WHERE request_id = $1
            ON CONFLICT (tenant_id, key_id, {bucket_column}, source_kind, model, protocol,
                         status_class, error_code, upstream_account_id, model_route_id,
@@ -342,6 +386,7 @@ async fn project_metered_request_analysis_in_transaction(
     );
     sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(request_id)
+        .bind(direction)
         .execute(&mut **transaction)
         .await?;
     Ok(())

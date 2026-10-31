@@ -540,6 +540,7 @@ impl Metrics {
         self.inner.proxy_memory_rejections[stage as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_request_archive_gap(&self, reason: RequestArchiveGapReason) {
         self.inner.request_archive_gaps[reason.index()].fetch_add(1, Ordering::Relaxed);
     }
@@ -553,19 +554,21 @@ impl Metrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn proxy_memory_wait(
-        &self,
-        stage: memory_admission::Stage,
-    ) -> memory_admission::WaitGuard {
-        self.inner.memory_admission.wait(stage)
-    }
-
     pub(crate) fn observe_proxy_memory_error(
         &self,
         stage: ProxyMemoryRejectionStage,
         error: crate::error::AppError,
     ) -> crate::error::AppError {
-        if matches!(&error, crate::error::AppError::Overloaded) {
+        let memory_rejection = match &error {
+            crate::error::AppError::Overloaded => true,
+            crate::error::AppError::Capacity { code, .. } => {
+                code.starts_with("proxy_memory")
+                    || *code == "upstream_response_memory_capacity"
+                    || *code == "response_archive_too_large"
+            }
+            _ => false,
+        };
+        if memory_rejection {
             self.record_proxy_memory_rejection(stage);
         }
         error
@@ -1834,8 +1837,13 @@ mod tests {
                     metrics.observe_proxy_memory_error(stage, crate::error::AppError::Overloaded);
                 assert!(matches!(error, crate::error::AppError::Overloaded));
             }
-            let error = metrics.observe_proxy_memory_error(stage, crate::error::AppError::Internal);
-            assert!(matches!(error, crate::error::AppError::Internal));
+            let error = metrics.observe_proxy_memory_error(
+                stage,
+                crate::error::AppError::internal(
+                    "metrics_memory_rejection_stages_render_exactly_six_fixed_series",
+                ),
+            );
+            assert!(matches!(error, crate::error::AppError::Internal { .. }));
         }
         assert_eq!(
             series(&metrics),

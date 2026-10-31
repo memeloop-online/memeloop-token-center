@@ -188,15 +188,15 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const timedRow = page.locator('tbody tr').nth(3);
     assert.equal(await timedRow.locator('.request-outcome').getAttribute('data-outcome'), 'completed');
     await timedRow.locator('.request-outcome').focus();
-    await page.getByRole('tooltip').filter({ hasText: 'not client acknowledgement' }).waitFor();
+    await page.getByRole('tooltip').filter({ hasText: 'The server recorded a normal finish' }).waitFor();
     assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Generation TPS\s+32/);
     assert.match(await timedRow.locator('.request-tps-cell').innerText(), /Average TPS\s+25\.93/, 'average includes the first-output wait and remains alongside generation throughput');
     assert.match(await recordedRow.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/, 'missing generation timing does not borrow the average');
     assert.match(await historicalGapDiagnostics.locator('[data-rate="average"]').innerText(), /Average TPS\s+—/);
     assert.match(await historicalGapDiagnostics.locator('[data-rate="generation"]').innerText(), /Generation TPS\s+—/);
     await timedRow.locator('[data-rate="generation"]').focus();
-    await page.getByRole('tooltip').filter({ hasText: 'First output wait' }).waitFor();
-    assert.match(await page.getByRole('tooltip').filter({ hasText: 'First output wait' }).innerText(), /234/);
+    await page.getByRole('tooltip').filter({ hasText: 'Waiting for the upstream to start' }).waitFor();
+    assert.match(await page.getByRole('tooltip').filter({ hasText: 'Waiting for the upstream to start' }).innerText(), /234/);
     assert.match(await page.locator('tbody tr').nth(1).locator('.request-token-cell .request-value-info').getAttribute('aria-label') ?? '', /Input tokens: 160.*Output tokens: 32/);
     assert.equal((await stage('read historical table currency', () => page!.locator('tbody tr').nth(1).locator('.request-cost-cell').textContent(), history, current))?.trim(), '—', 'an explicit historical null currency must not inherit the current credential currency');
 

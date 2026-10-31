@@ -171,7 +171,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
     'unknown cost must not have matched a minimum cost of zero');
   await assertCount(requestPanel.locator('tbody tr'), 1);
   await assertContains(requestPanel.locator('tbody'), '429');
-  await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务返回了错误状态');
+  await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务在响应开始时返回了错误状态');
   assert.doesNotMatch(await requestPanel.locator('tbody').innerText(), /http_429/);
   await requestPanel.getByRole('button', { name: /请求详情$/ }).click();
   const requestDrawer = page.getByRole('dialog');
@@ -305,7 +305,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
     openAppRoute(page, 'operator', 'routes'),
     (async () => {
       await assertVisible(leaveAuthorization);
-      await assertExactText(leaveAuthorization.locator('p'), '离开授权页？授权可能尚未完成。离开不会撤销已提交的请求，其结果可能仍未确认。返回后请先检查账号状态；结果未确认时，不要重复提交。');
+      await assertExactText(leaveAuthorization.locator('p'), '离开授权页？授权可能尚未完成。已提交的请求会继续处理，结果可能仍未确认。返回后先检查账号状态。结果未确认时，先不要再提交一次。');
       assert.equal(new URL(page.url()).searchParams.get('view'), 'providers');
       await leaveAuthorization.getByRole('button', { name: '确认继续', exact: true }).click();
     })(),
@@ -643,7 +643,7 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
   await assertContains(selectedRouteGroups, '默认路由');
   await assertContains(routing, '已保存授权关联');
-  await assertContains(routing, '不代表当前可用');
+  await assertContains(routing, '能否用上，看账号和路由当时的状态');
 
   const credentialRoutingPath = `/internal/v1/keys/${seed.clientKeyId}/routing?tenant_external_id=${encodeURIComponent(tenant)}`;
   const current = await requestJson<{ route_ids: string[]; route_group_ids: string[]; grant_revision: number }>(credentialRoutingPath, { credential: seed.serviceCredential });
@@ -728,7 +728,7 @@ Then('凭据组只用于分类且不改变凭据授权或可用模型', async fu
   const routing = page.locator('.credential-active-editor .routing-editor');
   await assertVisible(routing);
   await assertContains(routing, '已保存授权关联');
-  await assertContains(routing, '不代表当前可用');
+  await assertContains(routing, '能否用上，看账号和路由当时的状态');
   await assertContains(routing, '默认路由');
   await assertNotContains(routing, '测试凭据');
   const routeGroupInput = routing.getByRole('combobox', { name: '路由组', exact: true });

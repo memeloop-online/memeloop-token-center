@@ -109,7 +109,7 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
         let started = std::time::Instant::now();
         let until = tokio::time::sleep(Duration::from_secs(310));
         tokio::pin!(until);
-        let mut progress_count = rendered.matches("event: response.in_progress").count();
+        let mut progress_count = rendered.matches(": keep-alive\n\n").count();
         let initial_progress = progress_count;
         let mut last_progress = std::time::Instant::now();
         loop {
@@ -121,7 +121,7 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
                         .expect("stream must remain open during silence")
                         .unwrap();
                     rendered.push_str(std::str::from_utf8(&chunk).unwrap());
-                    let count = rendered.matches("event: response.in_progress").count();
+                    let count = rendered.matches(": keep-alive\n\n").count();
                     if count > progress_count {
                         return count;
                     }
@@ -184,8 +184,8 @@ async fn compact(version: http::Version) {
             .unwrap(),
     )
     .unwrap();
-    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"failover_deadline_millis":1000,"connect_timeout_millis":1000,
-        "read_timeout_millis":1000,"request_timeout_millis":2000});
+    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"connect_timeout_millis":1000,
+        "request_timeout_millis":2000});
     sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
         .bind(config.to_string())
         .bind(fixture.upstream_account_id.to_string())

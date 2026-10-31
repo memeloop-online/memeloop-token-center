@@ -84,7 +84,7 @@ impl Database {
                 input.upstream_job_id,
                 input.evidence_digest,
             ))
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("reconcile_resolve_generation_quarantine_1"))?,
         )
         .to_hex()
         .to_string();
@@ -108,7 +108,7 @@ impl Database {
             .bind(input.actor_service_id.to_string()).bind(input.actor_credential_generation).fetch_optional(&mut *transaction).await?.ok_or(AppError::Forbidden)?;
         let scopes: Vec<String> =
             serde_json::from_str(&credential.try_get::<String, _>("scopes_json")?)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("reconcile_resolve_generation_quarantine_2"))?;
         crate::db::credentials::validate_service_scopes(&scopes)
             .map_err(|_| AppError::Forbidden)?;
         if !scopes.iter().any(|scope| scope == "generations:reconcile")
@@ -144,7 +144,7 @@ impl Database {
                 ));
             }
             let result = serde_json::from_str(&replay.try_get::<String, _>("result_json")?)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("reconcile_resolve_generation_quarantine_3"))?;
             transaction.commit().await?;
             return Ok(result);
         }
@@ -195,7 +195,7 @@ impl Database {
             .bind(result.resolution_id.to_string()).bind(&tenant_id).bind(input.job_id.to_string())
             .bind(&nonce).bind(input.actor_service_id.to_string()).bind(input.idempotency_hash)
             .bind(request_digest).bind(input.expected_revision).bind(input.action).bind(input.evidence_digest)
-            .bind(input.upstream_job_id).bind(serde_json::to_string(&result).map_err(|_| AppError::Internal)?)
+            .bind(input.upstream_job_id).bind(serde_json::to_string(&result).map_err(|_| AppError::internal("reconcile_site_1"))?)
             .bind(now).bind(input.actor_credential_generation).execute(&mut *transaction).await?;
         if inserted.rows_affected() != 1 {
             return Err(AppError::Conflict(
@@ -224,7 +224,7 @@ fn quarantine_view(row: &sqlx::any::AnyRow) -> Result<GenerationQuarantineView, 
     let nonce: String = row.try_get("submission_nonce")?;
     let revision = blake3::hash(
         &serde_json::to_vec(&(job_id, nonce, attempt_count, updated_at, lease_expires_at))
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("reconcile_quarantine_view_1"))?,
     )
     .to_hex()
     .to_string();

@@ -132,23 +132,22 @@ async fn probe_current_member(entry: &Entry, target: &str, attempts: u8) -> Prob
 /// failed socket, tunnel, DNS, or TLS handshake counts as unreachable. This
 /// client carries no customer body and does not call the Responses API.
 async fn proxy_reaches(proxy_url: &str, target: &str) -> bool {
-    let Ok(proxy) = wreq::Proxy::all(proxy_url) else {
+    let Ok(proxy) = reqwest::Proxy::all(proxy_url) else {
         return false;
     };
     // Only the independent probe has a clock. A blackholed exit must finish
     // probing so later requests can use a reachable member.
-    let builder = wreq::Client::builder()
+    let builder = reqwest::Client::builder()
         .connect_timeout(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
-        .redirect(wreq::redirect::Policy::none())
-        .retry(wreq::retry::Policy::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
         .no_proxy()
         .proxy(proxy)
         .tcp_keepalive(None::<Duration>)
         .tcp_keepalive_interval(None::<Duration>)
         .tcp_keepalive_retries(None::<u32>);
-    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
-    let builder = builder.tcp_user_timeout(None::<Duration>);
+    crate::simple_http::install_ring_provider();
     let Ok(client) = builder.build() else {
         return false;
     };
@@ -161,12 +160,13 @@ async fn proxy_reaches(proxy_url: &str, target: &str) -> bool {
             true
         }
         Err(error) => {
+            let class = crate::simple_http::classify_transport(&error);
             tracing::debug!(
-                connect = error.is_connect(),
-                proxy_connect = error.is_proxy_connect(),
-                dns = error.is_dns(),
-                tls = error.is_tls(),
-                timed_out = error.is_timeout(),
+                connect = class.connect,
+                proxy_connect = class.proxy_connect,
+                dns = class.dns,
+                tls = class.tls,
+                timed_out = class.timeout,
                 "independent proxy probe did not reach the configured address"
             );
             false
