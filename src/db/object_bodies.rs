@@ -328,7 +328,12 @@ mod tests {
 
     #[tokio::test]
     async fn training_export_crosses_former_turn_limit_and_rejects_missing_ancestors() {
-        let database = Database::connect("sqlite::memory:").await.unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("long-training.db").display()
+        );
+        let database = Database::connect(&database_url).await.unwrap();
         database.migrate().await.unwrap();
         let tenant = Uuid::now_v7();
         let tenant_string = tenant.to_string();
