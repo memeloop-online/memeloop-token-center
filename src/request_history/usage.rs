@@ -171,7 +171,7 @@ impl ClickHouse {
         self.scan_mode(query, false, visit).await
     }
 
-    async fn scan_mode(
+    pub(crate) async fn scan_mode(
         &self,
         mut query: HistoryQuery,
         statistics: bool,
@@ -212,7 +212,16 @@ impl ClickHouse {
                 let model = snapshot
                     .payload
                     .as_ref()
-                    .map(|p| text(p, "model"))
+                    .map(|p| {
+                        text(
+                            snapshot
+                                .read_model
+                                .get("fact")
+                                .filter(|f| f["model"].is_string())
+                                .unwrap_or(p),
+                            "model",
+                        )
+                    })
                     .unwrap_or_default()
                     .to_owned();
                 let metrics = models.entry(model).or_default();
@@ -279,13 +288,14 @@ impl ClickHouse {
                     | UsageAnalysisProjection::Dimensions
                     | UsageAnalysisProjection::OutputRate
             );
-        self.scan(query, |snapshot| {
+        self.scan_mode(query, true, |snapshot| {
             let fact = &snapshot.read_model["fact"];
             if !fact.is_object() {
                 return Ok(());
             }
             let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;
-            let raw_protocol = text(payload, "protocol");
+            let dimension = |name: &str| fact.get(name).unwrap_or(&payload[name]);
+            let raw_protocol = dimension("protocol").as_str().unwrap_or_default();
             let protocol = if snapshot.identity.source == "generation" {
                 "generation"
             } else if raw_protocol == "anthropic" || raw_protocol.starts_with("anthropic-") {
@@ -304,7 +314,9 @@ impl ClickHouse {
                     .as_deref()
                     .is_some_and(|v| (v == "success") != success)
                 || (filter.upstream_account_id == Some(UsageAnalysisUpstreamFilter::Unassigned)
-                    && !payload["upstream_account_id"].is_null())
+                    && dimension("upstream_account_id")
+                        .as_str()
+                        .is_some_and(|v| !v.is_empty()))
             {
                 return Ok(());
             }
@@ -321,23 +333,32 @@ impl ClickHouse {
                 .as_str()
                 .unwrap_or("__retired_credential__");
             if full || projection == UsageAnalysisProjection::Dimensions {
-                let upstream = payload["upstream_account_id"]
+                let upstream = dimension("upstream_account_id")
                     .as_str()
+                    .filter(|v| !v.is_empty())
                     .unwrap_or("unassigned");
-                let upstream_label = snapshot.read_model["upstream_name"]
-                    .as_str()
-                    .unwrap_or(upstream);
+                let upstream_label = snapshot.read_model["upstream_name"].as_str().unwrap_or(
+                    if upstream == "unassigned" {
+                        "Unassigned"
+                    } else {
+                        upstream
+                    },
+                );
                 let status = if success { "success" } else { "error" };
                 for (kind, id, label) in [
-                    ("model", text(payload, "model"), text(payload, "model")),
+                    (
+                        "model",
+                        dimension("model").as_str().unwrap_or_default(),
+                        dimension("model").as_str().unwrap_or_default(),
+                    ),
                     ("key", &snapshot.identity.key_id.to_string(), key_alias),
                     ("upstream", upstream, upstream_label),
                     ("protocol", protocol, protocol),
                     ("status", status, if success { "success" } else { "failed" }),
                     (
                         "error",
-                        text(payload, "error_code"),
-                        text(payload, "error_code"),
+                        dimension("error_code").as_str().unwrap_or_default(),
+                        dimension("error_code").as_str().unwrap_or_default(),
                     ),
                 ] {
                     if kind == "error" && id.is_empty() {
@@ -355,7 +376,7 @@ impl ClickHouse {
                     .as_str()
                     .map(str::to_owned)
                     .unwrap_or_else(|| format!("unlinked:{}", snapshot.identity.key_id));
-                let model = text(payload, "model");
+                let model = dimension("model").as_str().unwrap_or_default();
                 let entry = sessions
                     .entry((snapshot.identity.key_id, id))
                     .or_insert_with(|| (model.into(), key_alias.into(), Metrics::default()));
@@ -372,7 +393,9 @@ impl ClickHouse {
                 && (snapshot.identity.source == "generation" || protocol == "audio-transcription")
             {
                 let currency = text(fact, "currency");
-                let unit = payload["usage"]["generation"]["billing_unit"]
+                let unit = fact
+                    .get("billing_unit")
+                    .unwrap_or(&payload["usage"]["generation"]["billing_unit"])
                     .as_str()
                     .unwrap_or_default();
                 let modality = if protocol == "audio-transcription" {

@@ -107,6 +107,16 @@ impl HistorySnapshot {
                 _ => "other",
             }
         };
+        let fact = &self.read_model["fact"];
+        let dimension = |name: &str| fact.get(name).unwrap_or(&payload[name]).clone();
+        let uuid_dimension = |name: &str| {
+            let value = dimension(name);
+            if value.as_str().is_some_and(str::is_empty) {
+                Value::Null
+            } else {
+                value
+            }
+        };
         Ok(json!({
             "tenant_id": self.identity.tenant_id,
             "key_id": self.identity.key_id,
@@ -123,6 +133,12 @@ impl HistorySnapshot {
             "filter_status": filter_status,
             "filter_cost_micros": self.filter_cost_micros,
             "stats_filter_cost_micros": self.statistics.as_ref().and_then(|s|s.cost_micros),
+            "stats_model": dimension("model").as_str().unwrap_or_default(),
+            "stats_protocol": dimension("protocol").as_str().unwrap_or_default(),
+            "stats_error_code": dimension("error_code"),
+            "stats_upstream_account_id": uuid_dimension("upstream_account_id"),
+            "stats_route_id": uuid_dimension("route_id"),
+            "stats_duration_ms": dimension("duration_ms"),
             "settlement_state": payload["operational_terminal"]["financial_state"].as_str()
                 .unwrap_or("unknown"),
             "error_code": payload["error_code"],

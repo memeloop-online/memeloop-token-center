@@ -582,6 +582,12 @@ async fn request_history_real_services_acceptance() {
         .execute(&database.pool)
         .await
         .unwrap();
+    sqlx::query("UPDATE request_stats_facts SET upstream_account_id=$1 WHERE request_id=$2")
+        .bind(accounts[0].to_string())
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
     crate::request_history::migration::drain(&database, &client, 500)
         .await
         .unwrap();

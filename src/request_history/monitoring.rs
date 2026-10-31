@@ -20,13 +20,18 @@ impl ClickHouse {
     ) -> Result<BTreeMap<String, (MonitoringMetrics, Vec<MonitoringTerminalOutcome>)>, HistoryError>
     {
         let mut accounts = BTreeMap::<String, (Metrics, Vec<MonitoringTerminalOutcome>)>::new();
-        self.scan(query, |snapshot| {
+        self.scan_mode(query, true, |snapshot| {
             let fact = &snapshot.read_model["fact"];
             if !fact.is_object() {
                 return Ok(());
             }
             let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;
-            let Some(upstream) = payload["upstream_account_id"].as_str() else {
+            let Some(upstream) = fact
+                .get("upstream_account_id")
+                .unwrap_or(&payload["upstream_account_id"])
+                .as_str()
+                .filter(|v| !v.is_empty())
+            else {
                 return Ok(());
             };
             let account = accounts.entry(upstream.to_owned()).or_default();
@@ -47,7 +52,9 @@ impl ClickHouse {
                 }
                 .into(),
                 duration_ms: fact["duration_ms"].as_i64().unwrap_or_default(),
-                error_code: payload["error_code"]
+                error_code: fact
+                    .get("error_code")
+                    .unwrap_or(&payload["error_code"])
                     .as_str()
                     .filter(|v| !v.is_empty())
                     .map(str::to_owned),
@@ -76,7 +83,7 @@ impl ClickHouse {
         let mut pairs =
             BTreeMap::<(String, String), (Metrics, Vec<MonitoringTerminalOutcome>)>::new();
         let mut latest = None;
-        self.scan(query, |snapshot| {
+        self.scan_mode(query, true, |snapshot| {
             let fact = &snapshot.read_model["fact"];
             if !fact.is_object() {
                 return Ok(());
@@ -84,8 +91,17 @@ impl ClickHouse {
             let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;
             summary.add(&snapshot);
             latest = Some(latest.unwrap_or(0).max(snapshot.identity.created_at));
-            if let Some(upstream) = payload["upstream_account_id"].as_str() {
-                let model = payload["model"].as_str().unwrap_or_default();
+            if let Some(upstream) = fact
+                .get("upstream_account_id")
+                .unwrap_or(&payload["upstream_account_id"])
+                .as_str()
+                .filter(|v| !v.is_empty())
+            {
+                let model = fact
+                    .get("model")
+                    .unwrap_or(&payload["model"])
+                    .as_str()
+                    .unwrap_or_default();
                 let pair = pairs.entry((upstream.into(), model.into())).or_default();
                 pair.0.add(&snapshot);
                 pair.1.push(MonitoringTerminalOutcome {
@@ -104,7 +120,9 @@ impl ClickHouse {
                     }
                     .into(),
                     duration_ms: fact["duration_ms"].as_i64().unwrap_or_default(),
-                    error_code: payload["error_code"]
+                    error_code: fact
+                        .get("error_code")
+                        .unwrap_or(&payload["error_code"])
                         .as_str()
                         .filter(|v| !v.is_empty())
                         .map(str::to_owned),

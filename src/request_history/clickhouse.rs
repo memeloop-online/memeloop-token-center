@@ -168,7 +168,30 @@ impl ClickHouse {
         if !response.iter().all(u8::is_ascii_whitespace) {
             return Err(HistoryError::Unavailable);
         }
-        self.execute(BoundQuery::new("ALTER TABLE request_history_v1 ADD COLUMN IF NOT EXISTS stats_filter_cost_micros Nullable(Int64)"), None).await?.error_for_status().map_err(|_|HistoryError::Unavailable)?;
+        for column in [
+            "stats_filter_cost_micros Nullable(Int64)",
+            "stats_model String",
+            "stats_protocol LowCardinality(String)",
+            "stats_error_code Nullable(String)",
+            "stats_upstream_account_id Nullable(UUID)",
+            "stats_route_id Nullable(UUID)",
+            "stats_duration_ms Nullable(Int64)",
+        ] {
+            let response = self
+                .execute(
+                    BoundQuery::new(&format!(
+                        "ALTER TABLE request_history_v1 ADD COLUMN IF NOT EXISTS {column}"
+                    )),
+                    None,
+                )
+                .await?
+                .bytes()
+                .await
+                .map_err(|_| HistoryError::Unavailable)?;
+            if !response.iter().all(u8::is_ascii_whitespace) {
+                return Err(HistoryError::Unavailable);
+            }
+        }
         Ok(())
     }
 
@@ -235,6 +258,16 @@ impl ClickHouse {
                 .sql
                 .replace("filter_status", "stats_status")
                 .replace("filter_cost_micros", "stats_filter_cost_micros");
+            for dimension in [
+                "model",
+                "protocol",
+                "error_code",
+                "upstream_account_id",
+                "route_id",
+                "duration_ms",
+            ] {
+                sql.sql = sql.sql.replace(dimension, &format!("stats_{dimension}"));
+            }
         }
         self.rows::<Stored>(sql)
             .await?

@@ -11,6 +11,7 @@ pub(crate) struct SessionDirectory {
     pub updated_at: i64,
     pub key_alias: String,
     pub title: Option<String>,
+    pub names: Vec<String>,
 }
 
 #[derive(Default)]
@@ -148,7 +149,11 @@ impl ClickHouse {
                     .insert(title.to_lowercase());
             }
             let identity = (entry.key_id, entry.session_id.clone());
-            sessions.entry(identity).or_default().directory = Some(entry);
+            let session = sessions.entry(identity).or_default();
+            session
+                .names
+                .extend(entry.names.iter().map(|v| v.to_lowercase()));
+            session.directory = Some(entry);
         }
         let mut result = Vec::new();
         for ((key_id, session_id), session) in sessions {
@@ -195,7 +200,11 @@ impl ClickHouse {
                 continue;
             }
             let context = latest.as_ref().and_then(|v| v.session_context.as_ref());
-            let name = context.and_then(|c| c.session_name.clone());
+            let name = session
+                .directory
+                .as_ref()
+                .and_then(|d| d.title.clone())
+                .or_else(|| context.and_then(|c| c.session_name.clone()));
             let key_alias = session
                 .directory
                 .as_ref()

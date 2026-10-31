@@ -121,7 +121,25 @@ impl Database {
                 updated_at: row.try_get("updated_at")?,
                 key_alias: row.try_get("key_alias")?,
                 title: row.try_get("title")?,
+                names: Vec::new(),
             });
+        }
+        drop(stream);
+        let indexes = directory
+            .iter()
+            .enumerate()
+            .map(|(index, d)| ((d.key_id.to_string(), d.session_id.clone()), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut names=sqlx::query("SELECT o.key_id,o.cluster_id,o.session_name FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE c.tenant_id=$1 AND o.session_name IS NOT NULL")
+            .bind(tenant_id.to_string()).fetch(&self.pool);
+        while let Some(row) = names.try_next().await? {
+            let identity = (
+                row.try_get::<String, _>("key_id")?,
+                row.try_get::<String, _>("cluster_id")?,
+            );
+            if let Some(index) = indexes.get(&identity) {
+                directory[*index].names.push(row.try_get("session_name")?);
+            }
         }
         Ok(directory)
     }
@@ -577,15 +595,19 @@ impl Database {
                 .transpose()?
                 .flatten();
             {
-                let upstream_name: Option<String> =
-                    if let Some(upstream) = payload["upstream_account_id"].as_str() {
-                        sqlx::query_scalar("SELECT name FROM upstream_accounts WHERE id = $1")
-                            .bind(upstream)
-                            .fetch_optional(&self.pool)
-                            .await?
-                    } else {
-                        None
-                    };
+                let upstream_name: Option<String> = if let Some(upstream) = fact
+                    .get("upstream_account_id")
+                    .unwrap_or(&payload["upstream_account_id"])
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                {
+                    sqlx::query_scalar("SELECT name FROM upstream_accounts WHERE id = $1")
+                        .bind(upstream)
+                        .fetch_optional(&self.pool)
+                        .await?
+                } else {
+                    None
+                };
                 serde_json::json!({"archive": archive, "fact": fact, "upstream_name": upstream_name, "execution": execution, "structure": structure, "egress_attempts":egress_attempts, "transport_diagnostics":transport_diagnostics})
             }
         } else {
@@ -609,10 +631,10 @@ impl Database {
     ) -> Result<Value, HistoryError> {
         let sql = match identity.source.as_str() {
             "native" => {
-                "SELECT status_class, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_ms, cost_micros, currency, CAST(NULL AS TEXT) AS modality FROM request_stats_facts WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+                "SELECT model,protocol,error_code,upstream_account_id,model_route_id AS route_id,billing_unit,status_class, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_ms, cost_micros, currency, CAST(NULL AS TEXT) AS modality FROM request_stats_facts WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
             }
             "generation" => {
-                "SELECT status_class, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, billed_units AS generation_units, duration_ms, cost_micros, currency, modality FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+                "SELECT model,CAST('generation' AS TEXT) AS protocol,error_code,upstream_account_id,model_route_id AS route_id,billing_unit,status_class, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, billed_units AS generation_units, duration_ms, cost_micros, currency, modality FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
             }
             _ => return Ok(Value::Null),
         };
@@ -649,7 +671,17 @@ impl Database {
                 serde_json::to_value(row.try_get::<Option<i64>, _>(name)?)?,
             );
         }
-        for name in ["status_class", "currency", "modality"] {
+        for name in [
+            "status_class",
+            "currency",
+            "modality",
+            "model",
+            "protocol",
+            "error_code",
+            "upstream_account_id",
+            "route_id",
+            "billing_unit",
+        ] {
             fact.insert(
                 name.into(),
                 serde_json::to_value(row.try_get::<Option<String>, _>(name)?)?,
