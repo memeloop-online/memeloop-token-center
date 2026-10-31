@@ -52,27 +52,14 @@ fn record_preparation_failure(
 /// the immutable route snapshot so a later candidate cannot refresh an
 /// already-dispatched attempt's deadline.
 fn configured_timeout(config: &Value) -> Result<RequestTimeout, ProxySendError> {
-    let seconds = match config.get("timeout_seconds") {
-        None => {
-            return Ok(RequestTimeout {
-                duration: None,
-                deadline: None,
-            });
-        }
-        Some(value) => value
-            .as_u64()
-            .or_else(|| {
-                value
-                    .as_f64()
-                    .filter(|seconds| {
-                        seconds.fract() == 0.0 && *seconds > 0.0 && *seconds < u64::MAX as f64
-                    })
-                    .map(|seconds| seconds as u64)
-            })
-            .filter(|seconds| *seconds > 0)
-            .ok_or(ProxySendError::CandidateUnavailable)?,
+    let duration = crate::api::traffic::configured_http_timeout(config)
+        .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let Some(duration) = duration else {
+        return Ok(RequestTimeout {
+            duration: None,
+            deadline: None,
+        });
     };
-    let duration = std::time::Duration::from_secs(seconds);
     let deadline = tokio::time::Instant::now()
         .checked_add(duration)
         .ok_or(ProxySendError::CandidateUnavailable)?;

@@ -556,6 +556,7 @@ mod tests {
             let budget = policy();
             let session = ReadSession::testing(budget);
             let result = get_codex_json(
+                &crate::codex_clients::CodexClients::default(),
                 crate::provider::CodexTransportPolicy::default(),
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,

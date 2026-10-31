@@ -3,6 +3,10 @@ use super::super::*;
 pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
     let authenticated = Router::new()
         .route(
+            "/internal/v1/system-settings/http",
+            get(super::super::http_settings::get).put(super::super::http_settings::put),
+        )
+        .route(
             "/internal/v1/api-schema",
             get(super::super::api_schema::discover),
         )

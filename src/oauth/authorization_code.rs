@@ -271,7 +271,7 @@ fn fragment_manual_code(pasted: &str, state: &str) -> Result<String, AppError> {
 /// Google owns both this fixed HTTPS endpoint and the returned account id.
 /// Never use a display email, Cloud project, or decoded/unverified JWT as identity.
 pub(crate) async fn bind_google_identity(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &mut UpstreamCredential,
 ) -> Result<(), AppError> {
     let identity = read_google_identity(http, credential, GOOGLE_USERINFO, false).await?;
@@ -290,13 +290,13 @@ pub(crate) async fn bind_google_identity(
 }
 
 async fn read_google_identity(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     endpoint: &str,
     test_loopback: bool,
 ) -> Result<GoogleIdentity, AppError> {
     let http = network::client_for_config_url_no_retry(
-        http,
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
         endpoint,
         &json!({"network_scope":"public"}),
         credential.proxy(),
@@ -304,11 +304,7 @@ async fn read_google_identity(
     )
     .await?;
     let response = credential
-        .apply(
-            http.get(endpoint)
-                .timeout(std::time::Duration::from_secs(20)),
-            crate::db::unix_millis(),
-        )?
+        .apply(http.get(endpoint), crate::db::unix_millis())?
         .send()
         .await
         .map_err(|_| AppError::upstream("google_account_identity_request_failed"))?;
@@ -337,7 +333,7 @@ async fn read_google_identity(
 /// account id. Mirrors the Google path: bounded body, provider network scope,
 /// and only the declared pointer is read.
 pub(crate) async fn bind_declared_identity(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &mut UpstreamCredential,
     contribution: &OAuthIdentityContribution,
     provider_config: &Value,
@@ -348,7 +344,7 @@ pub(crate) async fn bind_declared_identity(
 }
 
 async fn bind_declared_identity_with_transport(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &mut UpstreamCredential,
     contribution: &OAuthIdentityContribution,
     provider_config: &Value,
@@ -356,7 +352,7 @@ async fn bind_declared_identity_with_transport(
 ) -> Result<(), AppError> {
     contribution.headers.validate()?;
     let http = network::client_for_config_url_no_retry(
-        http,
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
         &contribution.url,
         provider_config,
         credential.proxy(),
@@ -365,10 +361,7 @@ async fn bind_declared_identity_with_transport(
     .await?;
     let response = credential
         .apply(
-            contribution.headers.apply(
-                http.get(&contribution.url)
-                    .timeout(std::time::Duration::from_secs(20)),
-            )?,
+            contribution.headers.apply(http.get(&contribution.url))?,
             crate::db::unix_millis(),
         )?
         .send()
@@ -757,7 +750,7 @@ pub async fn start(
 #[allow(clippy::too_many_arguments)]
 pub async fn complete(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     token: &str,
     callback_url: &str,
     required_tenant: Option<&str>,
@@ -976,7 +969,7 @@ pub async fn complete(
 }
 
 pub async fn refresh(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     current: &UpstreamCredential,
     active_adapter: &OAuthAdapterContribution,
     now: i64,
@@ -1092,7 +1085,7 @@ fn credential_with_state(
 
 #[allow(clippy::too_many_arguments)]
 async fn token_request(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -1119,7 +1112,7 @@ async fn token_request(
 
 #[allow(clippy::too_many_arguments)]
 async fn prepare_token_request(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -1127,12 +1120,16 @@ async fn prepare_token_request(
     encoding: OAuthTokenEncoding,
     allow_test_loopback: bool,
 ) -> Result<(reqwest::Client, reqwest::Request), AppError> {
-    let http =
-        network::client_for_config_url_no_retry(http, endpoint, config, proxy, allow_test_loopback)
-            .await?;
+    let http = network::client_for_config_url_no_retry(
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
+        endpoint,
+        config,
+        proxy,
+        allow_test_loopback,
+    )
+    .await?;
     let request = http
         .post(endpoint)
-        .timeout(std::time::Duration::from_secs(20))
         .header(reqwest::header::ACCEPT, "application/json");
     let request = match encoding {
         OAuthTokenEncoding::Form => request

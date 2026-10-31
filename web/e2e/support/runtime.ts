@@ -536,17 +536,9 @@ async function seedThroughHttp(): Promise<SeedState> {
     },
   });
 
-  await requestJson('/v1/chat/completions', {
-    method: 'POST', credential: client.key,
-    body: {
-      model,
-      messages: [{ role: 'user', content: 'Create one observable browser test request.' }],
-      max_tokens: 32,
-    },
-  });
-  // This is browser workflow coverage, not SQLite write-concurrency coverage.
-  // Sequential traffic prevents a temporary SQLite finalizer from outliving a slow shared runner.
-  for (let requestNumber = 2; requestNumber <= 50; requestNumber += 1) {
+  // Response delivery precedes background financial acknowledgement. Wait for
+  // each seed's concurrency reservation before issuing the next non-idempotent POST.
+  for (let requestNumber = 1; requestNumber <= 50; requestNumber += 1) {
     await requestJson('/v1/chat/completions', {
       method: 'POST', credential: client.key,
       body: {
@@ -555,6 +547,12 @@ async function seedThroughHttp(): Promise<SeedState> {
         max_tokens: 32,
       },
     });
+    await eventually(async () => {
+      const limits = await requestJson<{ concurrency: { active: number } }>(
+        '/self/v1/key/limits', { credential: client.key },
+      );
+      assert.equal(limits.concurrency.active, 0, 'seed concurrency reservation is still pending');
+    }, 30_000, 'seed request did not release its concurrency reservation');
   }
   const failed = await fetch(new URL('/v1/chat/completions', baseURL), {
     method: 'POST',

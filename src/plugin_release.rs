@@ -1,7 +1,7 @@
 //! GitHub release metadata is untrusted discovery data. A resolved reference
 //! still needs explicit operator trust confirmation and ordinary OCI signature
 //! verification before it can become an installation or execution authority.
-use std::{net::SocketAddr, time::Duration};
+use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,11 +12,7 @@ use crate::{
     plugin::CosignKeylessIdentity,
 };
 
-const MAX_RELEASE_BYTES: usize = 64 * 1024;
 const MAX_REDIRECTS: usize = 4;
-const RELEASE_TIMEOUT: Duration = Duration::from_secs(60);
-static RELEASE_FETCH_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -107,9 +103,6 @@ fn allowed_redirect(url: &Url) -> bool {
 }
 
 fn parse_release(bytes: &[u8], original: &Url) -> Result<ResolvedPluginRelease, AppError> {
-    if bytes.len() > MAX_RELEASE_BYTES {
-        return Err(invalid_release());
-    }
     let descriptor: PluginReleaseDescriptor =
         serde_json::from_slice(bytes).map_err(|_| invalid_release())?;
     let (source, digest) = descriptor
@@ -150,17 +143,16 @@ fn parse_release(bytes: &[u8], original: &Url) -> Result<ResolvedPluginRelease, 
 }
 
 pub async fn resolve_github_release(
+    http: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     proxy: Option<ReleaseProxy<'_>>,
 ) -> Result<ResolvedPluginRelease, AppError> {
     let original = validate_github_release_url(value)?;
-    let _permit = RELEASE_FETCH_PERMITS
-        .try_acquire()
-        .map_err(|_| AppError::capacity_error("plugin_release_fetch_capacity"))?;
-    download_release(original, |url| request_release(url, proxy.as_ref())).await
+    download_release(original, |url| request_release(http, url, proxy.as_ref())).await
 }
 
 async fn request_release(
+    http: &dyn crate::http_settings::HttpClientSource,
     current: Url,
     proxy: Option<&ReleaseProxy<'_>>,
 ) -> Result<reqwest::Response, AppError> {
@@ -180,34 +172,30 @@ async fn request_release(
     {
         return Err(invalid_release());
     }
-    let mut builder = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(RELEASE_TIMEOUT);
-    if let Some(proxy) = proxy {
+    let endpoint = if let Some(proxy) = proxy {
         crate::network::checked_installer_proxy_url(proxy.url).map_err(|_| invalid_release())?;
         let mut endpoint = Url::parse(proxy.url).map_err(|_| invalid_release())?;
         let address = proxy.addresses.first().ok_or_else(invalid_release)?;
         endpoint
             .set_ip_host(address.ip())
             .map_err(|_| invalid_release())?;
-        let mut configured =
-            reqwest::Proxy::all(endpoint.as_str()).map_err(|_| invalid_release())?;
         match (proxy.username, proxy.password) {
-            (Some(username), Some(password)) => {
-                configured = configured.basic_auth(username, password)
-            }
-            (None, None) => (),
+            (Some(_), Some(_)) | (None, None) => (),
             _ => return Err(invalid_release()),
         }
-        builder = builder.proxy(configured);
+        Some(endpoint)
     } else {
-        // Pin the address checked above; TLS still authenticates host.
-        builder = builder.resolve_to_addrs(host, &addresses);
-    }
-    let client = builder
-        .build()
+        None
+    };
+    let pins = [(host, addresses.as_slice())];
+    let client = http
+        .http_client(crate::http_settings::ClientOptions {
+            purpose: Some(crate::http_settings::HttpPurpose::PluginRelease),
+            proxy_url: endpoint.as_ref().map(Url::as_str),
+            proxy_auth: proxy.and_then(|proxy| proxy.username.zip(proxy.password)),
+            pins: if proxy.is_none() { &pins } else { &[] },
+            no_retry: true,
+        })
         .map_err(|_| download_failure(PluginReleaseDownloadFailure::Client))?;
     let response = client
         .get(current)
@@ -230,7 +218,7 @@ where
     F: FnMut(Url) -> Fut,
     Fut: std::future::Future<Output = Result<reqwest::Response, AppError>>,
 {
-    tokio::time::timeout(RELEASE_TIMEOUT, async {
+    async {
         let mut current = original.clone();
         for hop in 0..=MAX_REDIRECTS {
             let mut response = request(current.clone()).await?;
@@ -257,12 +245,6 @@ where
                 );
                 return Err(download_failure(PluginReleaseDownloadFailure::RemoteHttp));
             }
-            if response
-                .content_length()
-                .is_some_and(|size| size > MAX_RELEASE_BYTES as u64)
-            {
-                return Err(invalid_release());
-            }
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|error| {
                 download_failure(if error.is_timeout() {
@@ -271,17 +253,13 @@ where
                     PluginReleaseDownloadFailure::Body
                 })
             })? {
-                if bytes.len() + chunk.len() > MAX_RELEASE_BYTES {
-                    return Err(invalid_release());
-                }
                 bytes.extend_from_slice(&chunk);
             }
             return parse_release(&bytes, &original);
         }
         Err(invalid_release())
-    })
+    }
     .await
-    .map_err(|_| download_failure(PluginReleaseDownloadFailure::Timeout))?
 }
 
 fn download_failure(failure: PluginReleaseDownloadFailure) -> AppError {
@@ -386,9 +364,7 @@ mod tests {
         server.verify().await;
         server.reset().await;
         Mock::given(method("GET"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(vec![b' '; MAX_RELEASE_BYTES + 1]),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b' '; 64 * 1024 + 1]))
             .expect(1)
             .mount(&server)
             .await;
@@ -527,21 +503,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn release_total_deadline_is_a_gateway_timeout() {
-        use axum::response::IntoResponse;
+    async fn release_has_no_implicit_total_deadline() {
         let original = validate_github_release_url(
             "https://github.com/owner/repo/releases/download/v1/release.json",
         )
         .unwrap();
-        let error = download_release(original, |_| std::future::pending())
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(error.diagnostic_category(), "plugin_release_timeout");
-        assert_eq!(
-            error.into_response().status(),
-            axum::http::StatusCode::GATEWAY_TIMEOUT
-        );
+        let task = tokio::spawn(download_release(original, |_| std::future::pending()));
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert!(!task.is_finished());
+        task.abort();
     }
 
     #[test]

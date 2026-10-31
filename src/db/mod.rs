@@ -62,6 +62,7 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
@@ -252,6 +253,7 @@ pub use usage_analysis::{
 
 #[derive(Clone)]
 pub struct Database {
+    pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
     archive: Option<crate::archive::ArchiveStore>,
     pool_role: &'static str,
@@ -665,6 +667,7 @@ impl Database {
             archive: Some(crate::archive::ArchiveStore::memory_for_test()),
             #[cfg(not(test))]
             archive: None,
+            http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
                 database_url.as_ref(),
                 backend,
@@ -739,6 +742,7 @@ impl Database {
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
             archive: self.archive.clone(),
+            http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
             pool: self
