@@ -392,7 +392,6 @@ async fn recovery_contract(database_url: &str) {
                 .read_body_reference(key.tenant_id, &restored)
                 .await
                 .unwrap()
-                .0
         )
         .unwrap(),
         crate::conversation::extract_atoms(&body)[0].content
