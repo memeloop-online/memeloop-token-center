@@ -23,7 +23,7 @@ function withEffective(revision: number, settings: HttpSettings): RequestConfigS
 }
 
 const control = {
-  failLoad: false, unavailable: false, forbidden: false, delaySave: false, failSave: false, conflict: false, writes: 0,
+  failLoad: false, unavailable: false, forbidden: false, delaySave: false, failSave: false, conflict: false, reads: 0, writes: 0,
   lastBody: null as { expected_revision: number; settings: HttpSettings } | null,
   releaseSave: () => {},
   state: withEffective(7, {
@@ -54,6 +54,7 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
     }
     if (control.failLoad) return Response.json({ error: { message: 'Store unavailable' } }, { status: 503 });
     if (control.unavailable) return Response.json({ error: { message: 'Unknown route' } }, { status: 404 });
+    control.reads += 1;
     return Response.json(control.state);
   }
   if (url.pathname.endsWith('/model-picker-options')) return Response.json({ contract_version: 'model_picker_projection_v1', generated_at: Date.now(), data: [], next_cursor: null });

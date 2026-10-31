@@ -33,6 +33,7 @@ export function RequestConfigSettings({ token }: { token: string }) {
   const translate = useRef(t);
   translate.current = t;
   const [snapshot, setSnapshot] = useState<RequestConfigSnapshot | null>(null);
+  const [activated, setActivated] = useState(false);
   const [drafts, setDrafts] = useState<Record<string, Drafts>>({});
   const [touched, setTouched] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
@@ -79,9 +80,10 @@ export function RequestConfigSettings({ token }: { token: string }) {
   }, [token]);
 
   useEffect(() => {
+    if (!activated) { setLoading(false); return; }
     void load();
     return () => { loadSequence.current += 1; };
-  }, [load]);
+  }, [activated, load]);
 
   const rowError = useCallback((field: RequestConfigFieldMeta, text: string | undefined): string => {
     if (text === undefined) return '';
@@ -209,6 +211,10 @@ export function RequestConfigSettings({ token }: { token: string }) {
       </div>
       {snapshot && <span className="status ok">{t('settings.requestConfigRevision', { revision: snapshot.revision })}</span>}
     </div>
+    {!activated ? <div className="request-config-scope">
+      <p className="muted">{t('settings.requestConfigLoadHint')}</p>
+      <div className="button-row"><Button appearance="secondary" onClick={() => setActivated(true)}>{t('settings.requestConfigLoadAction')}</Button></div>
+    </div> : <>
     {error && <div className="notice error" role="alert">{error}</div>}
     {conflict && <Button onClick={() => void load()}>{t('settings.requestConfigReload')}</Button>}
     {message && <div className="notice success" role="status">{message}</div>}
@@ -237,5 +243,6 @@ export function RequestConfigSettings({ token }: { token: string }) {
               </Disclosure>)}
             </section>
           </>}
+    </>}
   </article>;
 }

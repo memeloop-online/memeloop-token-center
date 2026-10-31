@@ -31,7 +31,7 @@ test('HTTP inputs distinguish inheritance, disabled deadlines and JS-safe intege
   }
 });
 
-type FixtureControl = { failLoad: boolean; unavailable: boolean; forbidden: boolean; delaySave: boolean; failSave: boolean; conflict: boolean; releaseSave: () => void; lastBody: { expected_revision: number; settings: HttpSettings } | null };
+type FixtureControl = { failLoad: boolean; unavailable: boolean; forbidden: boolean; delaySave: boolean; failSave: boolean; conflict: boolean; reads: number; releaseSave: () => void; lastBody: { expected_revision: number; settings: HttpSettings } | null };
 type FixtureWindow = Window & typeof globalThis & { requestConfigFixture: FixtureControl };
 
 test('HTTP settings save full documents, preserve inheritance and drafts, and expose active revisions', { timeout: 120_000 }, async (context) => {
@@ -51,6 +51,9 @@ test('HTTP settings save full documents, preserve inheritance and drafts, and ex
     page.setDefaultTimeout(8_000);
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/request-config-settings.html`);
     const card = page.locator('.request-config');
+    await card.getByRole('button', { name: '查看 HTTP 设置', exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => (window as FixtureWindow).requestConfigFixture.reads), 0);
+    await card.getByRole('button', { name: '查看 HTTP 设置', exact: true }).click();
     await card.getByText('当前实例生效版本：7').waitFor();
     await card.getByRole('button', { name: 'Codex 请求', exact: true }).click();
     const purpose = card.locator('.request-config-purpose').filter({ has: page.locator('#request-config-codex-read_timeout_ms') });
@@ -140,6 +143,7 @@ test('HTTP settings save full documents, preserve inheritance and drafts, and ex
     }
     await page.evaluate(() => { (window as FixtureWindow).requestConfigFixture.forbidden = true; });
     await page.getByRole('button', { name: 'Reload settings' }).click();
+    await card.getByRole('button', { name: '查看 HTTP 设置', exact: true }).click();
     await card.getByText(/需要具有对应读取或写入权限的全局服务凭据/).waitFor();
     await page.screenshot({ path: `${artifacts}/permission-zh-390.png`, fullPage: true });
     await page.evaluate(() => { const fixture = (window as FixtureWindow).requestConfigFixture; fixture.forbidden = false; fixture.failLoad = true; });
