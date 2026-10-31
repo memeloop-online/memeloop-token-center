@@ -67,6 +67,9 @@ pub(crate) const CAPTURE_INSERT_BATCH_CHUNKS: usize = 16;
 const CAPTURE_QUEUE_CHUNKS: usize = 3;
 pub(crate) const CAPTURE_DATABASE_BATCH_CHUNKS: usize = CAPTURE_QUEUE_CHUNKS + 1;
 const CAPTURE_MEMORY_BYTES: usize = CHUNK_BYTES * 5 + crate::archive::ARCHIVE_MULTIPART_PART_BYTES;
+pub(crate) const RAW_STREAM_MEMORY_BYTES: usize = CAPTURE_MEMORY_BYTES
+    * crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT
+    * crate::PROXY_ARCHIVE_STREAM_CONCURRENCY;
 
 struct OwnedTask<T: Send + 'static> {
     task: Option<tokio::task::JoinHandle<Result<T, AppError>>>,

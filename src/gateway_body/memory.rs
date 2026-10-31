@@ -71,6 +71,24 @@ impl ProxyMemoryBudget {
         })
     }
 
+    /// Wait for a fixed streaming envelope without retaining another body
+    /// buffer. Cancellation releases the pending semaphore acquisition.
+    pub(crate) async fn temporary_wait(
+        &self,
+        bytes: usize,
+        weight: usize,
+    ) -> Option<Arc<ProxyMemoryReservation>> {
+        let weighted = bytes.checked_mul(weight)?;
+        let units = u32::try_from(weighted.div_ceil(UNIT_BYTES)).ok()?;
+        if units as usize > self.capacity / UNIT_BYTES {
+            return None;
+        }
+        let permit = self.permits.clone().acquire_many_owned(units).await.ok()?;
+        let reservation = self.reservation();
+        *reservation.held.lock().ok()? = (weighted, Some(permit));
+        Some(reservation)
+    }
+
     pub(crate) fn snapshot(&self) -> (usize, usize, usize, usize) {
         let lifecycle_limit = self.capacity / UNIT_BYTES * UNIT_BYTES;
         let retained_limit = self.capacity / 4 / UNIT_BYTES * UNIT_BYTES;

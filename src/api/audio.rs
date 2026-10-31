@@ -186,7 +186,6 @@ pub(super) async fn create_audio_transcription(
     let deadline = tokio::time::Instant::now() + SYNCHRONOUS_AUDIO_DEADLINE;
     let worker = tokio::spawn(async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
-        let capture_memory = resources.memory.clone();
         let result = async move {
             let started = Instant::now();
             let mut attempt = match crate::generation::group_routing::admit(
@@ -261,11 +260,10 @@ pub(super) async fn create_audio_transcription(
                 started.elapsed(),
             );
             let upstream_status = upstream.status();
-            let capture = crate::response_archive_spool::ResponseArchiveProducer::begin(
-                &state,
-                identity,
-                capture_memory,
-            );
+            let capture = crate::response_archive_spool::ResponseArchiveProducer::begin_original(
+                &state, identity,
+            )
+            .await;
             if capture.is_none() {
                 super::proxy::persistence::record_capture_failure(&state, identity);
             }

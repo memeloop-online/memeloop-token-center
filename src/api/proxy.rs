@@ -1771,7 +1771,7 @@ async fn proxy_with_cancellation_guard(
     }
     // Capture before any delivery/validation branch can discard a supplier
     // response, including successful envelopes rejected by local boundaries.
-    let upstream = buffered_request.capture_original_response(upstream);
+    let upstream = buffered_request.capture_original_response(upstream).await;
     let (upstream, rejection) = read_safe_proxy_rejection(
         upstream,
         protocol,
@@ -2577,18 +2577,17 @@ struct BufferedRequest<'a> {
 }
 
 impl BufferedRequest<'_> {
-    fn capture_original_response(&mut self, upstream: UpstreamResponse) -> UpstreamResponse {
+    async fn capture_original_response(&mut self, upstream: UpstreamResponse) -> UpstreamResponse {
         self.original_response_capture = true;
         let identity = crate::db::ArchiveSpoolIdentity {
             request_id: self.request_id,
             tenant_id: self.tenant_id,
             reservation_id: self.reservation.id,
         };
-        let capture = crate::response_archive_spool::ResponseArchiveProducer::begin(
-            self.state,
-            identity,
-            self.state.persistence.stream_memory.reservation(),
-        );
+        let capture = crate::response_archive_spool::ResponseArchiveProducer::begin_original(
+            self.state, identity,
+        )
+        .await;
         if capture.is_none() {
             persistence::record_capture_failure(self.state, identity);
         }
@@ -2744,7 +2743,7 @@ async fn execute_component_provider(
         }
     };
     let upstream_status = upstream.status();
-    let upstream = request.capture_original_response(upstream.into());
+    let upstream = request.capture_original_response(upstream.into()).await;
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
         if let Some(attempt) = upstream_attempt.as_mut() {
             let terminal = if upstream_status == StatusCode::TOO_MANY_REQUESTS {

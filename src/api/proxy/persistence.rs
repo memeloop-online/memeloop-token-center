@@ -20,7 +20,9 @@ pub(crate) struct Persistence {
 impl Default for Persistence {
     fn default() -> Self {
         Self {
-            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(16 * 1024 * 1024),
+            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(
+                crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES as u32,
+            ),
             jobs: Arc::new(tokio::sync::Semaphore::new(JOBS)),
             bytes: Arc::new(tokio::sync::Semaphore::new(BYTES)),
             accepted: AtomicU64::new(0),

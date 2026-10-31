@@ -519,7 +519,51 @@ async fn fence_failed_capture(
     result
 }
 
+struct OriginalAdmission {
+    state: Option<AppState>,
+    identity: ArchiveSpoolIdentity,
+}
+
+impl Drop for OriginalAdmission {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            crate::api::proxy::persistence::record_capture_failure(&state, self.identity);
+        }
+    }
+}
+
 impl ResponseArchiveProducer {
+    pub(crate) async fn begin_original(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+    ) -> Option<Self> {
+        let mut admission = OriginalAdmission {
+            state: Some(state.clone()),
+            identity,
+        };
+        // Keep the supplier stream unpolled while a bounded writer is busy.
+        // Accepted originals must not disappear merely because another
+        // response still owns the upload envelope.
+        let archive_permit = state
+            .proxy_archive_stream_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .ok()?;
+        let memory = state
+            .persistence
+            .stream_memory
+            .temporary_wait(
+                super::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            )
+            .await?;
+        let producer = Self::begin_admitted(state, identity, memory, archive_permit);
+        admission.state = None;
+        Some(producer)
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin(
         state: &AppState,
         identity: ArchiveSpoolIdentity,
@@ -543,6 +587,20 @@ impl ResponseArchiveProducer {
             tracing::warn!(request_id = %identity.request_id, stage = "response_spool_memory_admission", "proxy archive gap");
             return None;
         }
+        Some(Self::begin_admitted(
+            state,
+            identity,
+            memory,
+            archive_permit,
+        ))
+    }
+
+    fn begin_admitted(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+        memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+        archive_permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
         let queue_memory = Arc::new(CaptureQueueMemory {
             reservation: memory,
         });
@@ -592,7 +650,7 @@ impl ResponseArchiveProducer {
             "response_spool_writer",
             Some(active.clone()),
         );
-        Some(Self {
+        Self {
             #[cfg(test)]
             identity,
             #[cfg(test)]
@@ -604,7 +662,7 @@ impl ResponseArchiveProducer {
             writer,
             active,
             _queue_memory: queue_memory,
-        })
+        }
     }
 
     #[cfg(test)]
