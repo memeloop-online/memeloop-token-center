@@ -266,7 +266,20 @@ async fn admit_authenticated_gateway_body(
         .get::<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>()
         .cloned();
     if audio_request {
+        let request_id = request
+            .extensions()
+            .get::<crate::gateway_body::request_spool::RequestBodyObjectKey>()
+            .and_then(|key| uuid::Uuid::parse_str(&key.0).ok())
+            .unwrap_or_else(uuid::Uuid::now_v7);
+        let raw_request = request
+            .extensions()
+            .get::<crate::gateway_body::RawAudioRequestBody>()
+            .ok_or(AppError::internal("audio_original_request_missing"))?
+            .0
+            .clone();
         request.extensions_mut().insert(AudioRequestResources {
+            request_id,
+            raw_request,
             lifecycle: std::sync::Arc::new(media_lifecycle_permit.take().ok_or(
                 AppError::internal("auth_admit_authenticated_gateway_body_1"),
             )?),
@@ -402,6 +415,8 @@ where
 
 #[derive(Clone)]
 pub(super) struct AudioRequestResources {
+    pub(super) request_id: uuid::Uuid,
+    pub(super) raw_request: bytes::Bytes,
     pub(super) lifecycle: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
     pub(super) memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 }

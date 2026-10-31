@@ -14,7 +14,13 @@ pub(crate) use routing::{
 pub(crate) async fn classify_media_rate_limit(
     response: reqwest::Response,
 ) -> crate::db::UpstreamFailureKind {
-    let (response, kind) = routing::classify_rate_limit(response.into()).await;
+    classify_archived_media_rate_limit(response.into()).await
+}
+
+pub(in crate::api) async fn classify_archived_media_rate_limit(
+    response: upstream_response::UpstreamResponse,
+) -> crate::db::UpstreamFailureKind {
+    let (response, kind) = routing::classify_rate_limit(response).await;
     drop(response);
     kind
 }
@@ -42,7 +48,7 @@ mod sse_capture;
 mod streaming;
 mod transport_protocol;
 mod upstream_error;
-mod upstream_response;
+pub(in crate::api) mod upstream_response;
 
 #[cfg(test)]
 use crate::db::UpstreamFailureKind;

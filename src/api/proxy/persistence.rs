@@ -142,7 +142,7 @@ impl Persistence {
     }
 }
 
-pub(super) fn record_capture_failure(state: &AppState, identity: crate::db::ArchiveSpoolIdentity) {
+pub(crate) fn record_capture_failure(state: &AppState, identity: crate::db::ArchiveSpoolIdentity) {
     let background = state.clone();
     state.persistence.archives.fetch_add(1, Ordering::Release);
     tokio::spawn(async move {
@@ -167,8 +167,7 @@ pub(super) fn record_capture_failure(state: &AppState, identity: crate::db::Arch
     });
 }
 
-#[cfg(test)]
-pub(super) fn capture(
+pub(crate) fn capture(
     state: &AppState,
     identity: crate::db::ArchiveSpoolIdentity,
     purpose: crate::response_archive_spool::BufferedArchivePurpose,
@@ -195,12 +194,25 @@ pub(super) fn capture(
                 let reference = match &durable {
                     Some(reference) => reference,
                     None => {
-                        durable = Some(
-                            background
+                        durable = Some({
+                            let staging = format!(
+                                "raw-capture-staging/{}/{}/{}",
+                                identity.tenant_id,
+                                identity.request_id,
+                                Uuid::now_v7()
+                            );
+                            let mut writer = background.archive.start_writer(&staging).await?;
+                            for chunk in body.chunks(crate::response_archive_spool::CHUNK_BYTES) {
+                                writer.write(Bytes::copy_from_slice(chunk)).await?;
+                            }
+                            let staged = writer.finish_staged().await?;
+                            let reference = background
                                 .archive
-                                .put_tenant_content(identity.tenant_id, body.clone())
-                                .await?,
-                        );
+                                .promote_staged_text_to_cas(identity.tenant_id, &staged)
+                                .await?;
+                            background.archive.delete(&staged.object_locator).await?;
+                            reference
+                        });
                         durable
                             .as_ref()
                             .expect("archive reference was just persisted")

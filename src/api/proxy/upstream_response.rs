@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use http::{HeaderMap, StatusCode, Version};
 
-pub(super) type UpstreamByteStream =
+pub(in crate::api) type UpstreamByteStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, &'static str>> + Send + 'static>>;
 
 pub(super) const UPSTREAM_STREAM_ERROR: &str = "upstream_stream_read_error";
@@ -288,7 +288,7 @@ pub(super) struct UpstreamResponseParts {
 }
 
 /// A small response surface. Native Codex and every other upstream use reqwest.
-pub(super) enum UpstreamResponse {
+pub(in crate::api) enum UpstreamResponse {
     Reqwest(reqwest::Response),
     Codex(reqwest::Response),
     Prefetched {
@@ -344,7 +344,7 @@ impl UpstreamResponse {
         }
     }
 
-    pub(super) fn content_length(&self) -> Option<u64> {
+    pub(in crate::api) fn content_length(&self) -> Option<u64> {
         match self {
             Self::Reqwest(response) => response.content_length(),
             Self::Codex(response) => response.content_length(),
@@ -367,7 +367,7 @@ impl UpstreamResponse {
         }
     }
 
-    pub(super) fn with_archive_capture(
+    pub(in crate::api) fn with_archive_capture(
         self,
         capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
     ) -> Self {
@@ -408,7 +408,7 @@ impl UpstreamResponse {
     /// starts only after response headers have arrived. The absolute deadline
     /// is created before `send()` and is deliberately carried into the body;
     /// it is never restarted at the header/body boundary.
-    pub(super) fn with_body_timeouts(
+    pub(in crate::api) fn with_body_timeouts(
         self,
         request_deadline: tokio::time::Instant,
         read_timeout: std::time::Duration,
@@ -471,7 +471,7 @@ impl UpstreamResponse {
         }
     }
 
-    pub(super) fn bytes_stream(self) -> UpstreamByteStream {
+    pub(in crate::api) fn bytes_stream(self) -> UpstreamByteStream {
         match self {
             Self::Reqwest(response) => Box::pin(response.bytes_stream().map(|chunk| {
                 chunk.map_err(|error| {
