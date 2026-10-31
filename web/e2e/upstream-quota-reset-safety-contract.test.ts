@@ -28,5 +28,5 @@ test('reset confirmation remains memory-only, scope-bound and non-retrying', () 
   assert.match(source, /setError\('status-unavailable'\)/);
   assert.match(source, /operation\.state === 'prepared' && secret\.current/);
   assert.doesNotMatch(source, /attempted|setAttempted/);
-  assert.match(source, /disabled=\{busy \|\| !capability\.prepare_available\}/);
+  assert.match(source, /disabled=\{busy \|\| !capability\.prepare_available \|\| error === 'status-unavailable'\}/);
 });
