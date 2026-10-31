@@ -6,6 +6,7 @@ import { useI18n } from '../../i18n';
 import { ModelPicker } from '../../ModelPicker';
 import type { FilterAssistantSettings } from '../../types';
 import { assistantRouteCatalog, type ModelPickerProjectionItem, type ModelPickerProjectionPage } from '../modelCatalog';
+import { RequestConfigSettings } from '../RequestConfigSettings';
 import { messageOf } from '../scope/operatorShared';
 import './systemSettings.css';
 
@@ -38,7 +39,9 @@ async function loadAssistantRouteCatalog(token: string, tenant: string): Promise
  * fetches nor displays a client or upstream credential secret.
  */
 export function SystemSettingsPage({ token, tenant }: { token: string; tenant: string; writeTenant?: string }) {
-  return <AssistantSettings key={JSON.stringify([token, tenant])} token={token} tenant={tenant} />;
+  const scopeKey = JSON.stringify([token, tenant]);
+  return <><AssistantSettings key={scopeKey} token={token} tenant={tenant} />
+    <div className="system-settings"><RequestConfigSettings key={token} token={token} /></div></>;
 }
 
 function AssistantSettings({ token, tenant }: { token: string; tenant: string }) {
