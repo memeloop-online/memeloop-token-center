@@ -613,6 +613,7 @@ impl ResponseArchiveProducer {
         ResponseArchiveWriter::begin_inner(state.clone(), identity).await
     }
 
+    #[cfg(test)]
     pub(crate) fn append(&mut self, chunks: Vec<Bytes>) -> bool {
         if !self.active.load(Ordering::Acquire) {
             self.abandon("writer_inactive");
@@ -662,9 +663,14 @@ impl ResponseArchiveProducer {
         true
     }
 
-    /// A detached original-body drain has no client delivery deadline. Await
-    /// the existing bounded queue instead of abandoning a large remaining body.
-    pub(crate) async fn append_background(&mut self, chunk: Bytes) -> bool {
+    /// Await the bounded queue for both live reads and detached original-body
+    /// drains. Queue saturation is backpressure, not a body truncation policy.
+    pub(crate) async fn append_with_backpressure(&mut self, chunk: Bytes) -> bool {
+        #[cfg(test)]
+        if take_append_failure_for_test(&self.state) {
+            self.abandon("injected_append_failure");
+            return false;
+        }
         let mut remaining = chunk.as_ref();
         while !remaining.is_empty() {
             if !self.active.load(Ordering::Acquire) {
@@ -693,6 +699,7 @@ impl ResponseArchiveProducer {
         true
     }
 
+    #[cfg(test)]
     fn abandon(&mut self, reason: &'static str) {
         tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_producer", outcome = reason, "response capture abandoned");
         self.active.store(false, Ordering::Release);

@@ -87,6 +87,10 @@ jobs:
           test "$ready" = true
           MTC_RUSTFS_RESTORE_ONLY=1 cargo test --locked --lib rustfs_multipart_cas_promotion_and_restart_reconstruction -- --ignored
       - run: cargo test --locked --lib api::proxy::tests::archive_terminal
+      - run: cargo test --locked --lib codex_retry_streaming_failure_is_redacted_and_records_failed_terminal
+      - run: cargo test --locked --lib codex_failed_then_bare_secret_event_is_redacted_for_delivery_and_preserved_in_raw_archive
+      - run: cargo test --locked --lib downstream_disconnect_records_unknown_without_waiting_for_stalled_upstream
+      - run: cargo test --locked --lib native_codex_ambiguous_transport_after_request_bytes_is_not_replayed
       - run: cargo test --locked --lib api::proxy::tests::upstream_error_details
       - run: cargo test --locked --lib api::proxy::tests::kimi
       - name: RustFS fixture diagnostics

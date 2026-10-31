@@ -3351,16 +3351,16 @@ async fn finish_buffered_request_before_deadline(
         );
     }
     if !request.original_response_capture {
-        persistence::capture(
+        // Local transport/validation errors are delivery artifacts, not
+        // supplier responses. Preserve their safe summary separately and
+        // retain explicit evidence that no original response was received.
+        persistence::record_capture_failure(
             request.state,
             crate::db::ArchiveSpoolIdentity {
                 request_id,
                 tenant_id: request.tenant_id,
                 reservation_id: request.reservation.id,
             },
-            crate::response_archive_spool::BufferedArchivePurpose::Response,
-            body.clone(),
-            request.memory.clone(),
         );
     }
     if let Some(identity) = request.session_preference {

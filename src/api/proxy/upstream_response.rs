@@ -104,7 +104,7 @@ impl Stream for CapturedUpstream {
                     // turn into a missing archive merely because the upload
                     // queue temporarily filled.
                     this.pending = Some(Box::pin(async move {
-                        let retained = writer.append_background(bytes.clone()).await;
+                        let retained = writer.append_with_backpressure(bytes.clone()).await;
                         (retained.then_some(writer), bytes)
                     }));
                 }
@@ -145,7 +145,7 @@ impl Drop for CapturedUpstream {
                 while let Some(chunk) = upstream.next().await {
                     match chunk {
                         Ok(bytes) => {
-                            if !writer.append_background(bytes).await {
+                            if !writer.append_with_backpressure(bytes).await {
                                 return;
                             }
                         }
