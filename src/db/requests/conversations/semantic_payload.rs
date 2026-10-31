@@ -517,8 +517,8 @@ mod receipt_tests {
         .await
         .unwrap();
         assert_eq!(
-            compacted_payload, 0,
-            "completed receipt drops its reduced dialogue"
+            compacted_payload, 1,
+            "completed receipt retains its legacy dialogue until verified migration"
         );
         let payloads: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM conversation_semantic_payloads")
@@ -526,8 +526,8 @@ mod receipt_tests {
                 .await
                 .unwrap();
         assert_eq!(
-            payloads, 34,
-            "pending rows keep the reduced dialogue for retry"
+            payloads, 35,
+            "receipt compaction cannot delete unverified historical source payloads"
         );
         let unchanged: String = sqlx::query_scalar(
             "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",

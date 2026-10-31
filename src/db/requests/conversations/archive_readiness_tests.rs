@@ -97,7 +97,16 @@ impl Fixture {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("gap://{request_id}/request"));
         let response_locator = if source.is_some() {
-            r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#.to_owned()
+            let object = state.archive.put_tenant_content(
+                key.tenant_id,
+                Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#),
+            ).await.unwrap();
+            state
+                .archive
+                .publish_raw_capture(key.tenant_id, request_id, "response", &object)
+                .await
+                .unwrap();
+            object.object_locator
         } else {
             format!("gap://{request_id}/response")
         };
@@ -538,6 +547,28 @@ async fn sqlite_final_archive_gap_keeps_request_turn() {
     )
     .await;
     fixture.capture().await;
+    // This fixture knows the original request. Persist those exact bytes;
+    // the empty SQL outbox cannot stand in for a missing original.
+    let object = fixture
+        .state
+        .archive
+        .put_tenant_content(
+            fixture.identity.tenant_id,
+            Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .publish_raw_capture(
+            fixture.identity.tenant_id,
+            fixture.request_id,
+            "request",
+            &object,
+        )
+        .await
+        .unwrap();
     sqlx::query("UPDATE request_archive_spools SET state = 'gap' WHERE request_id = $1")
         .bind(fixture.request_id.to_string())
         .execute(&fixture.state.db.pool)
@@ -623,7 +654,10 @@ async fn source_contract(database_url: String) {
             .execute(&fixture.state.db.pool)
             .await
             .unwrap();
-        fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+        fixture.state.db = Database::connect_with_max(&database_url, 4)
+            .await
+            .unwrap()
+            .with_archive(fixture.state.archive.clone());
         fixture.assert_completed(true).await;
         let state: String =
             sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
