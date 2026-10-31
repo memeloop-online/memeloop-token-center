@@ -76,9 +76,9 @@ impl Database {
         account: Uuid,
         external: &str,
     ) -> Result<Value, AppError> {
-        let row = sqlx::query("SELECT a.id, a.config_json, a.credential_generation, a.updated_at AS account_updated_at, COALESCE(b.version, 0) AS binding_version, p.version, p.mode, p.proxy_id, p.group_id, p.plugin_id, p.plugin_version, p.config_json FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN transport_proxy_bindings b ON b.account_id = a.id LEFT JOIN network_proxy_selection_policies p ON p.account_id = a.id WHERE a.id = $1 AND t.external_id = $2")
+        let row = sqlx::query("SELECT a.id, a.config_json AS account_config_json, a.credential_generation, a.updated_at AS account_updated_at, COALESCE(b.version, 0) AS binding_version, p.version, p.mode, p.proxy_id, p.group_id, p.plugin_id, p.plugin_version, p.config_json AS policy_config_json FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN transport_proxy_bindings b ON b.account_id = a.id LEFT JOIN network_proxy_selection_policies p ON p.account_id = a.id WHERE a.id = $1 AND t.external_id = $2")
             .bind(account.to_string()).bind(external).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;
-        let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
+        let config: Value = serde_json::from_str(&row.try_get::<String, _>("account_config_json")?)
             .map_err(|_| invalid())?;
         let configuration_revision = config
             .get(CONFIG_KEY)
@@ -93,7 +93,7 @@ impl Database {
             "desired": {"mode": row.try_get::<Option<String>, _>("mode")?.unwrap_or_else(|| "legacy".into()),
                 "proxy_id": row.try_get::<Option<String>, _>("proxy_id")?, "group_id": row.try_get::<Option<String>, _>("group_id")?,
                 "plugin_id": row.try_get::<Option<String>, _>("plugin_id")?, "plugin_version": row.try_get::<Option<String>, _>("plugin_version")?,
-                "config": serde_json::from_str::<Value>(&row.try_get::<Option<String>, _>("config_json")?.unwrap_or_else(|| "{}".into())).map_err(|_| invalid())?}}),
+                "config": serde_json::from_str::<Value>(&row.try_get::<Option<String>, _>("policy_config_json")?.unwrap_or_else(|| "{}".into())).map_err(|_| invalid())?}}),
         )
     }
 
