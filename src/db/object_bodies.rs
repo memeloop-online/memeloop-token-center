@@ -263,10 +263,14 @@ mod tests {
 
     #[tokio::test]
     async fn raw_capture_wakes_projection_before_financial_completion() {
-        let state =
-            crate::AppState::initialize(crate::config::Config::for_test("sqlite::memory:".into()))
-                .await
-                .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let database_url = format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("raw-wake.db").display()
+        );
+        let state = crate::AppState::initialize(crate::config::Config::for_test(database_url))
+            .await
+            .unwrap();
         let pool = &state.db.pool;
         let identity = crate::db::ArchiveSpoolIdentity {
             request_id: Uuid::now_v7(),
