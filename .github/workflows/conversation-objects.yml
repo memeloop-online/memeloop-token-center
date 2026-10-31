@@ -69,6 +69,8 @@ jobs:
       - run: cargo test --locked --lib archive::supplier_summary
       - run: cargo test --locked --lib archive::raw_capture
       - run: cargo test --locked --lib db::object_bodies
+      - run: cargo test --locked --lib db::archive_spool
+      - run: cargo test --locked --lib response_archive_spool::tests
       - run: cargo test --locked --lib buffered_archive_waits_off_frontend
       - run: cargo test --locked --lib object_capture_recovers_a_completed_request
       - name: Verify RustFS multipart CAS and restart restoration
@@ -95,6 +97,8 @@ jobs:
       - run: cargo test --locked --lib api::proxy::tests::archive_terminal
       - run: cargo test --locked --lib sixty_five_small_streams_keep_activity_and_settle_once
       - run: cargo test --locked --lib api::proxy::tests::shutdown_durability
+      - run: cargo test --locked --lib buffered_text_response_survives_total_archive_failure_with_durable_pending_bodies
+      - run: cargo test --locked --lib streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
       - run: cargo test --locked --lib codex_retry_streaming_failure_is_redacted_and_records_failed_terminal
       - run: cargo test --locked --lib codex_failed_then_bare_secret_event_is_redacted_for_delivery_and_preserved_in_raw_archive
       - run: cargo test --locked --lib downstream_disconnect_records_unknown_without_waiting_for_stalled_upstream

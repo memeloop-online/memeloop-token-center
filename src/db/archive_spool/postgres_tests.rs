@@ -286,41 +286,42 @@ async fn postgres_response_writer_does_not_block_streaming_on_the_budget_lock() 
     let settlement = producer
         .seal()
         .expect("terminal handoff must not wait for the writer's budget lock");
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock' AND query LIKE 'UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes +%'",
-            )
-            .bind(&application_name)
-            .fetch_one(&fixture.admin)
-            .await
-            .unwrap();
-            if waiting == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the owned writer must independently wait at the real budget barrier");
-
-    budget_holder.commit().await.unwrap();
     tokio::time::timeout(Duration::from_secs(5), settlement.wait())
         .await
-        .expect("the supervised writer must finish after the budget barrier is released");
-    let row = sqlx::query(
-        "SELECT state, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1",
-    )
-    .bind(fixture.id.request_id.to_string())
-    .fetch_one(&fixture.db.pool)
-    .await
-    .unwrap();
-    assert_eq!(row.get::<String, _>("state"), "pending");
-    assert_eq!(row.get::<i64, _>("chunk_count"), 2);
+        .expect("CAS writer must finish while the legacy SQL budget remains locked");
+    let object = state
+        .archive
+        .raw_capture_reference(fixture.id.tenant_id, fixture.id.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    let expected = [
+        vec![b'x'; crate::response_archive_spool::CHUNK_BYTES],
+        b"tail".to_vec(),
+    ]
+    .concat();
+    assert_eq!(object.size_bytes, expected.len() as u64);
     assert_eq!(
-        row.get::<i64, _>("byte_count"),
-        crate::response_archive_spool::CHUNK_BYTES as i64 + 4
+        object.blake3_digest,
+        blake3::hash(&expected).to_hex().to_string()
     );
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(fixture.id.tenant_id, &object, expected.len())
+            .await
+            .unwrap()
+            .as_ref(),
+        expected.as_slice()
+    );
+    let spools: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(fixture.id.request_id.to_string())
+            .fetch_one(&fixture.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(spools, 0);
+    budget_holder.commit().await.unwrap();
     state.db.close().await;
     fixture.finish().await;
 }
@@ -744,14 +745,20 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
     );
     assert_eq!(terminal.get::<i64, _>("status_code"), 200);
     assert_eq!(terminal.get::<i64, _>("cost_micros"), 123);
-    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     let outstanding: i64 = sqlx::query_scalar(
         "SELECT request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
     )
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(outstanding, 0);
+    assert_eq!(outstanding, retained);
     fixture.finish().await;
 }
 use crate::archive_staging::{
@@ -1428,15 +1435,16 @@ async fn postgres_complete_cancelled_inside_commit_keeps_atomic_binding() {
     .await
     .unwrap();
     assert_eq!(bound, locator);
+    let retained = budget(&fixture.db).await;
     assert_eq!(
         fixture
             .db
             .cleanup_response_archive_spools(32)
             .await
             .unwrap(),
-        1
+        0
     );
-    assert_eq!(budget(&fixture.db).await, 0);
+    assert_eq!(budget(&fixture.db).await, retained);
     fixture.finish().await;
 }
 

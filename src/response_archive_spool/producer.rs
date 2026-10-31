@@ -1017,7 +1017,23 @@ async fn run_response_archive_writer(
         identity.request_id,
         uuid::Uuid::now_v7()
     );
-    let mut writer = state.archive.start_writer(&staging).await?;
+    let mut writer = loop {
+        if !active.load(Ordering::Acquire) {
+            return Ok(writer_interrupted(
+                identity,
+                "abandoned_before_storage_admission",
+            ));
+        }
+        match state.archive.start_writer(&staging).await {
+            Ok(writer) => break writer,
+            Err(error @ AppError::Storage { .. }) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    "accepted original awaits object storage admission");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
     while let Some(first) = receiver.recv().await {
@@ -1039,15 +1055,40 @@ async fn run_response_archive_writer(
         return Ok(writer_interrupted(identity, "abandoned_before_seal"));
     }
     let staged = writer.finish_staged().await?;
-    let object = state
-        .archive
-        .promote_staged_text_to_cas(identity.tenant_id, &staged)
-        .await?;
-    state
-        .archive
-        .publish_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
-        .await?;
-    state.archive.delete(&staged.object_locator).await?;
+    let object = loop {
+        match state
+            .archive
+            .promote_staged_text_to_cas(identity.tenant_id, &staged)
+            .await
+        {
+            Ok(object) => break object,
+            Err(error @ AppError::Storage { .. }) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    "sealed original awaits immutable CAS promotion");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    loop {
+        match state
+            .archive
+            .publish_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
+            .await
+        {
+            Ok(()) => break,
+            Err(error @ AppError::Storage { .. }) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    "immutable original awaits durable root publication");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if let Err(error) = state.archive.delete(&staged.object_locator).await {
+        tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+            "complete original retains its temporary staging object for cleanup");
+    }
     state.db.refresh_closed_persistence_pool();
     if let Err(error) = state
         .db
