@@ -182,10 +182,9 @@ pub(super) const RECENT_SESSIONS_FIRST_PAGE_SQL: &str = r#"WITH completed_candid
            SELECT recent.key_id, recent.session_id,
                   (SELECT latest.id FROM request_records latest
                     WHERE latest.conversation_cluster_id IS NOT NULL
-                      AND (latest.key_id, latest.conversation_cluster_id) >=
-                          (recent.key_id, recent.session_id)
-                      AND (latest.key_id, latest.conversation_cluster_id) <=
-                          (recent.key_id, recent.session_id)
+                      AND latest.key_id = recent.key_id
+                      AND latest.conversation_cluster_id >= recent.session_id
+                      AND latest.conversation_cluster_id <= recent.session_id
                     ORDER BY latest.key_id ASC,
                              latest.conversation_cluster_id ASC,
                              latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -629,10 +628,9 @@ impl Database {
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
                             WHERE latest.conversation_cluster_id IS NOT NULL
-                              AND (latest.key_id, latest.conversation_cluster_id) >=
-                                  (recent.key_id, recent.session_id)
-                              AND (latest.key_id, latest.conversation_cluster_id) <=
-                                  (recent.key_id, recent.session_id)
+                              AND latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id >= recent.session_id
+                              AND latest.conversation_cluster_id <= recent.session_id
                             ORDER BY latest.key_id ASC,
                                      latest.conversation_cluster_id ASC,
                                      latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -936,10 +934,9 @@ impl Database {
                    SELECT recent.key_id, recent.session_id,
                           (SELECT latest.id FROM request_records latest
                             WHERE latest.conversation_cluster_id IS NOT NULL
-                              AND (latest.key_id, latest.conversation_cluster_id) >=
-                                  (recent.key_id, recent.session_id)
-                              AND (latest.key_id, latest.conversation_cluster_id) <=
-                                  (recent.key_id, recent.session_id)
+                              AND latest.key_id = recent.key_id
+                              AND latest.conversation_cluster_id >= recent.session_id
+                              AND latest.conversation_cluster_id <= recent.session_id
                             ORDER BY latest.key_id ASC,
                                      latest.conversation_cluster_id ASC,
                                      latest.created_at DESC, latest.id DESC LIMIT 1) AS request_id,
@@ -1119,7 +1116,10 @@ impl Database {
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
-                           FROM request_records r
+                           FROM (SELECT * FROM request_records
+                                  WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                                    AND (created_at < $2 OR (created_at = $2 AND id < $3))
+                                  ORDER BY created_at DESC, id DESC LIMIT $4) r
                            LEFT JOIN request_archive_spools request_spool
                              ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id
                             AND request_spool.reservation_id = r.reservation_id
@@ -1139,8 +1139,10 @@ impl Database {
                                      THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'session_archive',
                                 'archive_unlinked', source, external_request_id
-                           FROM session_archive_unlinked_requests
-                          WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                           FROM (SELECT * FROM session_archive_unlinked_requests
+                                  WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                                    AND (source_started_at < $2 OR (source_started_at = $2 AND archive_request_id < $3))
+                                  ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $4) archive_page
                      ) activity
                     WHERE created_at < $2 OR (created_at = $2 AND id < $3)
                     ORDER BY created_at DESC, id DESC LIMIT $4"#,
@@ -1164,7 +1166,9 @@ impl Database {
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
-                           FROM request_records r
+                           FROM (SELECT * FROM request_records
+                                  WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                                  ORDER BY created_at DESC, id DESC LIMIT $2) r
                            LEFT JOIN request_archive_spools request_spool
                              ON request_spool.request_id = r.id AND request_spool.tenant_id = r.tenant_id
                             AND request_spool.reservation_id = r.reservation_id
@@ -1184,8 +1188,9 @@ impl Database {
                                      THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'session_archive',
                                 'archive_unlinked', source, external_request_id
-                           FROM session_archive_unlinked_requests
-                          WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                           FROM (SELECT * FROM session_archive_unlinked_requests
+                                  WHERE key_id = $1 AND conversation_cluster_id IS NULL
+                                  ORDER BY source_started_at DESC, archive_request_id DESC LIMIT $2) archive_page
                      ) activity
                     ORDER BY created_at DESC, id DESC LIMIT $2"#,
             )
