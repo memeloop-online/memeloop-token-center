@@ -58,6 +58,7 @@ async fn stopped_http_server_drains_stream_archive_and_receipt_without_blocking_
         .expect("HTTP delivery must not wait for archive or settlement")
         .unwrap();
     assert_eq!(delivered.as_ref(), original.as_slice());
+    assert!(String::from_utf8_lossy(&delivered).contains("response.completed"));
     finalization.entered.notified().await;
     drained.await.unwrap();
     assert!(!process.is_finished());
@@ -92,7 +93,7 @@ async fn stopped_http_server_drains_stream_archive_and_receipt_without_blocking_
     upstream.await.unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let receipt = sqlx::query(
-        "SELECT state, receipt_id, receipt_digest, cost_micros FROM pending_proxy_settlements WHERE request_id = $1",
+        "SELECT p.state, p.receipt_id, p.receipt_digest, p.cost_micros, p.status_code AS financial_status, p.error_code AS financial_error, o.status_code AS operational_status, o.error_code AS operational_error, r.status_code AS request_status, NULLIF(r.error_code, '') AS request_error, r.input_tokens, r.output_tokens FROM pending_proxy_settlements p JOIN proxy_operational_terminals o ON o.request_id = p.request_id JOIN request_records r ON r.id = p.request_id WHERE p.request_id = $1",
     )
     .bind(request_id.to_string())
     .fetch_one(&pool)
@@ -102,6 +103,14 @@ async fn stopped_http_server_drains_stream_archive_and_receipt_without_blocking_
     assert!(receipt.get::<Option<String>, _>("receipt_id").is_some());
     assert!(receipt.get::<Option<String>, _>("receipt_digest").is_some());
     assert!(receipt.get::<Option<i64>, _>("cost_micros").is_some());
+    for status in ["financial_status", "operational_status", "request_status"] {
+        assert_eq!(receipt.get::<i64, _>(status), 200, "{status}");
+    }
+    for error in ["financial_error", "operational_error", "request_error"] {
+        assert_eq!(receipt.get::<Option<String>, _>(error), None, "{error}");
+    }
+    assert_eq!(receipt.get::<i64, _>("input_tokens"), 3);
+    assert_eq!(receipt.get::<i64, _>("output_tokens"), 2);
     let spool =
         sqlx::query("SELECT state, byte_count FROM response_archive_spools WHERE request_id = $1")
             .bind(request_id.to_string())
