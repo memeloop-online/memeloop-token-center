@@ -1,4 +1,6 @@
-use std::{ffi::OsString, os::unix::fs::PermissionsExt, sync::Mutex};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{ffi::OsString, sync::Mutex};
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -8,6 +10,18 @@ use wiremock::{
 };
 
 use super::*;
+
+fn private_permission_bits(path: &std::path::Path) -> std::io::Result<u32> {
+    #[cfg(unix)]
+    {
+        Ok(std::fs::metadata(path)?.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(0)
+    }
+}
 
 #[test]
 fn cosign_proxy_environment_is_explicit_and_has_no_bypass() {
@@ -213,18 +227,12 @@ impl CosignRunner for PolicyCosignRunner {
             arguments: command.arguments.clone(),
             environment: command.environment.clone(),
             current_directory: command.current_directory.clone(),
-            current_directory_mode: std::fs::metadata(&command.current_directory)?
-                .permissions()
-                .mode()
-                & 0o777,
+            current_directory_mode: private_permission_bits(&command.current_directory)?,
             docker_config: std::fs::read(&docker_config_path)?,
-            docker_config_mode: std::fs::metadata(&docker_config_path)?.permissions().mode()
-                & 0o777,
+            docker_config_mode: private_permission_bits(&docker_config_path)?,
             key_mode: key_path
                 .as_ref()
-                .map(|path| {
-                    std::fs::metadata(path).map(|metadata| metadata.permissions().mode() & 0o777)
-                })
+                .map(|path| private_permission_bits(path))
                 .transpose()?,
             key_path: key_path.clone(),
         };
@@ -616,8 +624,27 @@ async fn official_cosign_contract_accepts_rotated_key_and_keeps_private_auth_out
     assert_eq!(invocations.len(), 3, "version, wrong key, trusted key");
     let mut temporary_paths = Vec::new();
     for invocation in &invocations {
-        assert_eq!(invocation.docker_config_mode, 0o600);
-        assert_eq!(invocation.current_directory_mode, 0o700);
+        #[cfg(unix)]
+        {
+            assert_eq!(invocation.docker_config_mode, 0o600);
+            assert_eq!(invocation.current_directory_mode, 0o700);
+        }
+        #[cfg(windows)]
+        {
+            assert!(
+                crate::windows_dir::is_restricted_to_current_user(&invocation.current_directory)
+                    .unwrap()
+            );
+            assert!(
+                crate::windows_dir::is_restricted_to_current_user(
+                    &invocation
+                        .current_directory
+                        .join("docker")
+                        .join("config.json")
+                )
+                .unwrap()
+            );
+        }
         assert!(
             !format!("{:?}{:?}", invocation.arguments, invocation.environment)
                 .contains(registry_password)
@@ -633,7 +660,10 @@ async fn official_cosign_contract_accepts_rotated_key_and_keeps_private_auth_out
         assert!(!config_text.contains("installer"));
         assert!(!config_text.contains(registry_password));
         if let Some(path) = &invocation.key_path {
+            #[cfg(unix)]
             assert_eq!(invocation.key_mode, Some(0o600));
+            #[cfg(windows)]
+            assert!(crate::windows_dir::is_restricted_to_current_user(path).unwrap());
             temporary_paths.push(path.clone());
         }
         temporary_paths.push(invocation.current_directory.clone());
@@ -865,8 +895,9 @@ async fn system_executor_kills_on_timeout_and_rejects_oversized_output() {
 #[test]
 fn cosign_binary_and_version_are_fixed_security_constants() {
     assert_eq!(COSIGN_VERIFIER_FILENAME, "cosign");
-    assert_eq!(COSIGN_VERIFIER_VERSION, "v3.1.3-mtc.4");
-    assert!(cosign_version_matches(br#"{"gitVersion":"v3.1.3-mtc.4"}"#));
+    assert_eq!(COSIGN_VERIFIER_VERSION, "v3.1.4");
+    assert!(cosign_version_matches(br#"{"gitVersion":"v3.1.4"}"#));
+    assert!(!cosign_version_matches(br#"{"gitVersion":"v3.1.3-mtc.4"}"#));
     assert!(!cosign_version_matches(br#"{"gitVersion":"v3.1.3-mtc.3"}"#));
     assert!(!cosign_version_matches(br#"{"gitVersion":"v3.1.3-mtc.1"}"#));
     assert!(!cosign_version_matches(br#"{"gitVersion":"v3.1.3"}"#));

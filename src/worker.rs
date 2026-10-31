@@ -24,6 +24,39 @@ const OAUTH_REFRESH_AHEAD_MILLIS: i64 = 5 * 60 * 1_000;
 const CODEX_MODEL_CATALOG_RETRY_MILLIS: i64 = 60 * 60 * 1_000;
 const PROJECTION_BATCH_LIMIT: i64 = 32;
 
+async fn compact_conversation_receipts(state: AppState, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cursor = None;
+    let mut next_pass = tokio::time::Instant::now();
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { break; }
+            }
+            _ = ticker.tick() => {
+                if *shutdown.borrow() { break; }
+                if tokio::time::Instant::now() < next_pass { continue; }
+                match state.db.compact_completed_conversation_receipts(cursor.as_deref()).await {
+                    Ok((next, compacted)) => {
+                        cursor = next;
+                        if compacted > 0 {
+                            tracing::info!(compacted, "worker compacted completed conversation receipts");
+                        }
+                        if cursor.is_none() {
+                            next_pass = tokio::time::Instant::now() + Duration::from_secs(24 * 60 * 60);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "worker failed to compact completed conversation receipts");
+                        next_pass = tokio::time::Instant::now() + Duration::from_secs(60);
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn refresh_expiring_oauth(
     state: &AppState,
     account_id: Uuid,
@@ -164,6 +197,12 @@ pub async fn run_until_shutdown_with_oauth_stop(
         crate::response_archive_spool::run(spool_state, spool_shutdown).await;
         "response_spool"
     });
+    let receipt_state = state.clone();
+    let receipt_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        compact_conversation_receipts(receipt_state, receipt_shutdown).await;
+        "conversation_receipts"
+    });
 
     // No spawn-per-tick: generation remains single-flight and OAuth remains serial.
     let quota_state = state.clone();
@@ -171,6 +210,12 @@ pub async fn run_until_shutdown_with_oauth_stop(
     roles.spawn(async move {
         crate::upstream_quota::observations::run(quota_state, quota_shutdown).await;
         "quota_observations"
+    });
+    let probe_state = state.clone();
+    let probe_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        crate::api::run_upstream_service_probes(probe_state, probe_shutdown).await;
+        "upstream_service_probes"
     });
 
     macro_rules! periodic {
@@ -286,6 +331,18 @@ pub async fn run_until_shutdown_with_oauth_stop(
                     tracing::error!(%error, "worker failed to release orphaned usage reservations");
                 }
             }
+            match state.db.close_expired_proxy_owners(100).await {
+                Ok(closed) if closed > 0 => {
+                    tracing::warn!(
+                        closed,
+                        "worker closed proxy requests whose owner lease expired"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to close expired proxy owners");
+                }
+            }
         }
     );
     periodic!(
@@ -330,6 +387,24 @@ pub async fn run_until_shutdown_with_oauth_stop(
         PROJECTION_INTERVAL,
         async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
             process_conversation_projection_batch(state, Uuid::now_v7()).await;
+        }
+    );
+    periodic!(
+        "session_titles",
+        Duration::from_secs(5),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = api::process_session_title(state).await {
+                tracing::error!(%error, "worker failed to claim or update a session title");
+            }
+        }
+    );
+    periodic!(
+        "session_response_reading",
+        Duration::from_secs(1),
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            if let Err(error) = crate::session_response_worker::process_one(state).await {
+                tracing::error!(%error, "worker failed to update session response reading projection");
+            }
         }
     );
     periodic!(
@@ -509,7 +584,9 @@ async fn refresh_plugin_service_data(
                 .unwrap_or(Err(
                     crate::plugin::service_data::PluginServiceDataCollectionFailure {
                         code: crate::db::PluginServiceDataRefreshErrorCode::ComponentExecution,
-                        error: crate::error::AppError::Internal,
+                        error: Box::new(crate::error::AppError::internal(
+                            "worker_refresh_plugin_service_data_1",
+                        )),
                     },
                 ))
         } else {
@@ -836,7 +913,19 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
     }
 }
 
+const SESSION_BODY_ARCHIVE_READ_LIMIT: usize = 128 * 1024 * 1024;
+
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
+    if let Err(error) = state
+        .db
+        .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT)
+        .await
+    {
+        state
+            .metrics
+            .observe_background_projection(BackgroundProjectionKind::Conversation, false);
+        tracing::error!(%error, "worker 未能把已有原始请求 JSON 和原始返回 JSON 的会话正文重新排队");
+    }
     let tasks = match state
         .db
         .claim_conversation_projection_tasks(lease_owner, PROJECTION_BATCH_LIMIT)
@@ -847,16 +936,12 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
             state
                 .metrics
                 .observe_background_projection(BackgroundProjectionKind::Conversation, false);
-            tracing::error!(%error, "worker failed to claim conversation projection tasks");
+            tracing::error!(%error, "worker 未能领取会话正文归档任务");
             return;
         }
     };
     for task in tasks {
-        match state
-            .db
-            .project_claimed_conversation_projection_task(lease_owner, task.request_id)
-            .await
-        {
+        match archive_session_body(state, lease_owner, task.request_id).await {
             Ok(true) => state
                 .metrics
                 .observe_background_projection(BackgroundProjectionKind::Conversation, true),
@@ -868,10 +953,231 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
                 tracing::error!(
                     %error,
                     request_id = %task.request_id,
-                    "worker failed to project conversation task"
+                    "会话正文归档没有写完，客户端请求已经结束"
                 );
             }
         }
+    }
+}
+
+/// 读取原始请求 JSON 和原始返回 JSON 的 locator，整理会话正文并写入 CNPG。
+/// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
+pub(crate) async fn archive_session_body(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+) -> Result<bool, AppError> {
+    let Some(locators) = state.db.session_body_locators(request_id).await? else {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_request_locator",
+        )
+        .await;
+    };
+    if locators.pending {
+        state
+            .db
+            .defer_pending_session_body_archive(lease_owner, request_id)
+            .await?;
+        return Ok(false);
+    }
+    let request_bytes = match load_raw_document(state, &locators.request).await {
+        Ok(bytes) => {
+            if let Some(identity) = locators.source_identity
+                && !locators.source_recorded
+            {
+                state
+                    .db
+                    .record_request_source(
+                        identity,
+                        &locators.request,
+                        bytes.len(),
+                        *blake3::hash(&bytes).as_bytes(),
+                        true,
+                    )
+                    .await?;
+            }
+            bytes
+        }
+        Err(_) => {
+            let retry = if let Some(identity) = locators.source_identity {
+                state
+                    .archive
+                    .source_object_exists(&locators.request)
+                    .await?
+                    || (!locators.source_failed
+                        && !state
+                            .db
+                            .recover_request_source(identity, &locators.request)
+                            .await?)
+            } else {
+                !missing_raw_document(&locators.request)
+            };
+            if retry {
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
+            let inline = state
+                .db
+                .session_body_inline_request(lease_owner, request_id)
+                .await?;
+            match inline {
+                Some(json) if json != "{}" && !json.is_empty() => bytes::Bytes::from(json),
+                _ => {
+                    return skip_session_body(
+                        state,
+                        lease_owner,
+                        request_id,
+                        "session_body_skipped_missing_request_locator",
+                    )
+                    .await;
+                }
+            }
+        }
+    };
+    let Ok(mut request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes)
+    else {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_archive_unreadable",
+        )
+        .await;
+    };
+    drop(request_bytes);
+    // locator 读出来的占位文档没有对话字段时，改用结算时留下的缩减请求 JSON。
+    if request_document.get("messages").is_none()
+        && request_document.get("input").is_none()
+        && let Some(json) = state
+            .db
+            .session_body_inline_request(lease_owner, request_id)
+            .await?
+        && json != "{}"
+        && !json.is_empty()
+        && let Ok(fallback) = serde_json::from_str::<serde_json::Value>(&json)
+        && (fallback.get("messages").is_some() || fallback.get("input").is_some())
+    {
+        request_document = fallback;
+    }
+    // Release the request JSON (including unused schemas/private fields) before
+    // loading/parsing the response. Public text moves into the body.
+    let mut body = crate::conversation::SessionBody::from_request_document(request_document);
+    // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
+    // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
+    let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
+        Some(locator) => match load_raw_document(state, &locator).await {
+            Ok(bytes) => bytes,
+            Err(_) if missing_raw_document(&locator) => bytes::Bytes::from_static(b"{}"),
+            Err(_) => {
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
+        },
+        None => bytes::Bytes::from_static(b"{}"),
+    };
+    let return_document = crate::conversation::raw_return_document(&return_bytes)
+        .unwrap_or_else(|| serde_json::json!({}));
+    drop(return_bytes);
+    body.append_return_document(return_document);
+    let pending_media = body.take_media_bytes();
+    let mut media_staging = Vec::new();
+    let mut uploaded_media = std::collections::HashMap::new();
+    for (turn_index, part_index, bytes) in pending_media {
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        if let Some(locator) = uploaded_media.get(&hash) {
+            body.set_media_locator(turn_index, part_index, String::clone(locator));
+            continue;
+        }
+        let attempt = crate::proxy_lifecycle::begin_proxy_archive_attempt(
+            &state.db,
+            request_id,
+            crate::archive_staging::ArchiveStagingPurpose::Media,
+        )
+        .await?;
+        let locator = crate::archive_staging::conversation_media_locator(attempt.lease.key, &hash)?;
+        media_staging.push(attempt.lease);
+        {
+            let upload = state.archive.put(&locator, bytes::Bytes::from(bytes));
+            tokio::pin!(upload);
+            let mut heartbeat = tokio::time::interval(Duration::from_millis(
+                crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
+            ));
+            loop {
+                tokio::select! {
+                    result = &mut upload => {
+                        result?;
+                        break;
+                    }
+                    _ = heartbeat.tick() => {
+                        for lease in &mut media_staging {
+                            if !state.db.heartbeat_archive_staging_write(lease).await? {
+                                return Err(AppError::Conflict("session media staging writer was fenced".into()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        body.set_media_locator(turn_index, part_index, locator.clone());
+        uploaded_media.insert(hash, locator);
+    }
+    if !state
+        .db
+        .prepare_staged_session_body_archive(lease_owner, request_id, body, &media_staging)
+        .await?
+    {
+        return Ok(false);
+    }
+    state
+        .db
+        .project_claimed_conversation_projection_task(lease_owner, request_id)
+        .await
+}
+
+async fn skip_session_body(
+    state: &AppState,
+    lease_owner: Uuid,
+    request_id: Uuid,
+    reason: &'static str,
+) -> Result<bool, AppError> {
+    tracing::warn!(%request_id, reason, "会话正文归档跳过这条请求");
+    state
+        .db
+        .skip_session_body_archive(lease_owner, request_id, reason)
+        .await?;
+    Ok(false)
+}
+
+fn missing_raw_document(locator: &str) -> bool {
+    locator.is_empty()
+        || locator.starts_with("gap://")
+        || locator.starts_with("metadata-only-json:")
+        || locator.starts_with("provider-reference-json:")
+}
+
+async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
+    if missing_raw_document(locator) {
+        return Err("session_body_skipped_archive_unreadable");
+    }
+    if let Some(inline) = locator.strip_prefix("inline-json:") {
+        return Ok(bytes::Bytes::copy_from_slice(inline.as_bytes()));
+    }
+    match state
+        .archive
+        .get_bounded(locator, SESSION_BODY_ARCHIVE_READ_LIMIT)
+        .await
+    {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => Err("session_body_skipped_archive_unreadable"),
     }
 }
 

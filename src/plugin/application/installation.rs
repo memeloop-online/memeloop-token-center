@@ -22,6 +22,10 @@ static INSTALL_STORAGE_PERMITS: LazyLock<Arc<tokio::sync::Semaphore>> =
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstallPolicy {
+    #[serde(skip)]
+    network_snapshot_key: Option<String>,
+    #[serde(skip)]
+    ephemeral_proxy_credentials: Option<(String, String)>,
     #[serde(default)]
     egress_proxy: Option<String>,
     #[serde(default)]
@@ -51,8 +55,16 @@ struct CredentialFiles {
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallPluginRequest {
+    #[serde(default)]
     pub inventory_id: String,
+    #[serde(default)]
     pub packages: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_resolution_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_descriptor_sha256: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub(crate) network: Option<crate::db::plugin_installer_network::InstallerNetworkInput>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +77,7 @@ pub struct ApproveInstallationRequest {
 pub struct InstallationRecord {
     pub id: String,
     pub inventory_id: String,
+    pub base_revision: Option<i64>,
     pub actor: String,
     #[serde(skip)]
     pub(crate) attempt_id: String,
@@ -103,6 +116,114 @@ pub struct PluginAuditEntry {
 }
 
 impl ApplicationPlugins {
+    pub(crate) async fn installation_base_snapshot(
+        &self,
+    ) -> Result<(i64, Option<PreinstalledInventory>), AppError> {
+        self.refresh_inventory().await?;
+        let Some(head) = self.db.optional_application_plugin_head().await? else {
+            return Ok((0, None));
+        };
+        let entry = self
+            .inventory
+            .read()
+            .await
+            .get(&head.inventory_id)
+            .cloned()
+            .ok_or(AppError::Forbidden)?;
+        if entry.grants.values().any(|versions| versions.len() != 1) {
+            return Err(AppError::Conflict(
+                "retained plugins require one exact approved identity".into(),
+            ));
+        }
+        Ok((head.revision, Some(entry)))
+    }
+
+    async fn verify_installation_base(
+        &self,
+        resolution: &crate::db::plugin_release_resolutions::PluginReleaseResolution,
+    ) -> Result<(), AppError> {
+        let revision = self
+            .db
+            .optional_application_plugin_head()
+            .await?
+            .map(|head| head.revision)
+            .unwrap_or(0);
+        if revision != resolution.base_revision {
+            return Err(AppError::Conflict(
+                "plugin runtime revision changed; resolve the release again".into(),
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) async fn deployment_installer_network(
+        &self,
+    ) -> Result<Option<crate::db::plugin_installer_network::InstallerNetworkInput>, AppError> {
+        let policy = self.install_policy().await?;
+        let Some(url) = policy.egress_proxy else {
+            return Ok(None);
+        };
+        async fn secret(path: Option<PathBuf>) -> Result<Option<String>, AppError> {
+            let Some(path) = path else {
+                return Ok(None);
+            };
+            let file = tokio::fs::File::open(path)
+                .await
+                .map_err(|_| AppError::internal("installation_secret_1"))?;
+            let mut bytes = Vec::new();
+            file.take(258)
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|_| AppError::internal("installation_secret_2"))?;
+            if bytes.len() > 257 {
+                return Err(AppError::Forbidden);
+            }
+            let value = std::str::from_utf8(&bytes)
+                .map_err(|_| AppError::Forbidden)?
+                .trim_end_matches(['\r', '\n']);
+            if value.is_empty() || value.len() > 255 || value.chars().any(char::is_control) {
+                return Err(AppError::Forbidden);
+            }
+            Ok(Some(value.to_owned()))
+        }
+        Ok(Some(
+            crate::db::plugin_installer_network::InstallerNetworkInput::Custom {
+                url,
+                username: secret(policy.egress_proxy_username_file).await?,
+                password: secret(policy.egress_proxy_password_file).await?,
+            },
+        ))
+    }
+
+    pub fn with_installer_network_key(mut self, key: &[u8]) -> Self {
+        self.installer_network_key = Some(key.to_vec());
+        self
+    }
+
+    async fn installation_release_policy(
+        &self,
+        key_hash: &str,
+        actor: &str,
+        policy: &mut InstallPolicy,
+    ) -> Result<Option<crate::db::plugin_release_resolutions::PluginReleaseResolution>, AppError>
+    {
+        let resolution = self
+            .db
+            .installation_plugin_release_resolution(key_hash, actor)
+            .await?;
+        if let Some(resolution) = &resolution {
+            self.verify_installation_base(resolution).await?;
+            let release = &resolution.release;
+            // Operator confirmation authorizes exactly this source, immutable
+            // artifact and signer for this installation. Never mutate host policy.
+            policy.allowed_sources = BTreeSet::from([release.source.clone()]);
+            policy.cosign_public_keys.clear();
+            policy.cosign_keyless = Some(release.descriptor.signer.clone());
+            policy.source_keyless.clear();
+            policy.source_credentials.clear();
+        }
+        Ok(resolution)
+    }
+
     pub fn with_installation_policy_file(
         mut self,
         path: Option<PathBuf>,
@@ -127,12 +248,12 @@ impl ApplicationPlugins {
             .ok_or(AppError::NotFound)?;
         let file = tokio::fs::File::open(path)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_install_policy_1"))?;
         let mut bytes = Vec::new();
         file.take(65537)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_install_policy_2"))?;
         if bytes.len() > 65536 {
             return Err(AppError::Forbidden);
         }
@@ -144,7 +265,6 @@ impl ApplicationPlugins {
         }
         if !policy.egress_credentials_valid()
             || !policy.plugin_root.is_absolute()
-            || policy.allowed_sources.is_empty()
             || !policy.signer_policy_valid()
             || policy.cosign_public_keys.len() > 8
             || policy
@@ -186,6 +306,9 @@ impl ApplicationPlugins {
                 InstallPluginRequest {
                     inventory_id: record.inventory_id.clone(),
                     packages: record.packages,
+                    release_resolution_id: None,
+                    release_descriptor_sha256: None,
+                    network: None,
                 },
                 "retry",
                 &record.actor,
@@ -207,13 +330,48 @@ impl ApplicationPlugins {
 
     async fn install_internal(
         self: &Arc<Self>,
-        input: InstallPluginRequest,
+        mut input: InstallPluginRequest,
         key: &str,
         actor: &str,
         existing_hash: Option<&str>,
     ) -> Result<InstallationRecord, AppError> {
-        validate_inventory_id(&input.inventory_id)?;
         validate_operation(0, key)?;
+        let key_hash = match existing_hash {
+            Some(hash) => hash.to_owned(),
+            None => {
+                super::super::plugin_configuration_schema_digest(&json!({"actor":actor,"key":key}))?
+            }
+        };
+        match (
+            &input.release_resolution_id,
+            &input.release_descriptor_sha256,
+        ) {
+            (Some(id), Some(digest)) => {
+                if !input.packages.is_empty() {
+                    return Err(AppError::BadRequest(
+                        "release installation cannot include extra packages".into(),
+                    ));
+                }
+                let resolution = self
+                    .db
+                    .confirm_plugin_release_resolution(id, digest, actor, &key_hash)
+                    .await?;
+                input.packages = vec![resolution.release.descriptor.reference];
+            }
+            (None, None) => (),
+            _ => {
+                return Err(AppError::BadRequest(
+                    "release resolution and digest confirmation are required together".into(),
+                ));
+            }
+        }
+        // Retry reconstructs the same request from the frozen installation.
+        input.release_resolution_id = None;
+        input.release_descriptor_sha256 = None;
+        if input.inventory_id.is_empty() {
+            input.inventory_id = format!("install-{}", &key_hash[..54]);
+        }
+        validate_inventory_id(&input.inventory_id)?;
         if input.packages.is_empty() || input.packages.len() > 16 {
             return Err(AppError::BadRequest(
                 "install one to sixteen packages per complete inventory".into(),
@@ -238,12 +396,6 @@ impl ApplicationPlugins {
             }
         }
         let hash = super::super::plugin_configuration_schema_digest(&json!(&input))?;
-        let key_hash = match existing_hash {
-            Some(hash) => hash.to_owned(),
-            None => {
-                super::super::plugin_configuration_schema_digest(&json!({"actor":actor,"key":key}))?
-            }
-        };
         if let Some(replay) = self
             .db
             .replay_plugin_installation(&key_hash, &hash, actor)
@@ -251,7 +403,29 @@ impl ApplicationPlugins {
         {
             return Ok(replay);
         }
-        let policy = self.install_policy().await?;
+        let mut policy = self.install_policy().await?;
+        let resolution = self
+            .installation_release_policy(&key_hash, actor, &mut policy)
+            .await?;
+        if let Some(resolution) = &resolution
+            && input.packages != vec![resolution.release.descriptor.reference.clone()]
+        {
+            return Err(AppError::Forbidden);
+        }
+        if let Some(network_key) = &self.installer_network_key
+            && self
+                .db
+                .installer_network_snapshot_exists(&key_hash, actor)
+                .await?
+        {
+            let frozen = self
+                .db
+                .load_installer_network(&key_hash, actor, network_key)
+                .await?;
+            // Credentials stay in RAM and use the installer's anonymous stdin.
+            policy.network_snapshot_key = Some(key_hash.clone());
+            apply_frozen_installer_network(&frozen, &mut policy)?;
+        }
         self.reclaim_unreferenced_installation_attempts().await?;
         if self
             .inventory
@@ -278,7 +452,7 @@ impl ApplicationPlugins {
         let permit = INSTALL_PERMITS
             .clone()
             .try_acquire_owned()
-            .map_err(|_| AppError::Overloaded)?;
+            .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?;
         let (record, run) = self
             .db
             .begin_plugin_installation(
@@ -332,14 +506,19 @@ impl ApplicationPlugins {
         let inventory_root = policy
             .plugin_root
             .join(inventory_attempt_storage_id(attempt_id)?);
+        let record = self.db.plugin_installation(operation_id).await?;
+        let resolution = self
+            .db
+            .installation_plugin_release_resolution(&record.idempotency_hash, &record.actor)
+            .await?;
         let (trust, mut checkpoints) = bounded_install_phase(STORAGE_DEADLINE, async {
             let trust = trust_digest(policy).await?;
             tokio::fs::create_dir_all(&policy.plugin_root)
                 .await
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("installation_perform_install_1"))?;
             let parent = tokio::fs::symlink_metadata(&policy.plugin_root)
                 .await
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("installation_perform_install_2"))?;
             if !parent.is_dir() || parent.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -350,18 +529,21 @@ impl ApplicationPlugins {
                 INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
             )
             .await
-            .map_err(|_| AppError::Overloaded)?
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+            .map_err(|_| AppError::internal("installation_perform_install_3"))?;
             tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 claim_inventory_root(&claim_root, &owner)
             })
             .await
-            .map_err(|_| AppError::Internal)??;
+            .map_err(|_| AppError::internal("installation_perform_install_4"))??;
             let checkpoints = self.db.plugin_installation(operation_id).await?.checkpoints;
             Ok((trust, checkpoints))
         })
         .await?;
+        if let Some(resolution) = &resolution {
+            self.verify_installation_base(resolution).await?;
+        }
         for reference in &input.packages {
             bounded_install_phase(PACKAGE_DEADLINE, async {
                 if let Some(checkpoint) = checkpoints.get(reference)
@@ -370,14 +552,18 @@ impl ApplicationPlugins {
                     return Ok(());
                 }
                 let mut command = crate::plugin_runtime_companions::plugin_installer_command()
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("installation_perform_install_5"))?;
                 command
                     .arg(reference)
                     .arg("--plugin-dir")
                     .arg(&policy.plugin_root)
                     .arg("--publication-attempt-id")
                     .arg(attempt_id)
-                    .stdin(Stdio::null())
+                    .stdin(if policy.ephemeral_proxy_credentials.is_some() {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
                     .stdout(Stdio::null())
                     .stderr(Stdio::piped())
                     .kill_on_drop(true);
@@ -391,9 +577,30 @@ impl ApplicationPlugins {
                 }
                 let mut child = command.spawn().map_err(|_| {
                     tracing::warn!(stage = "installer_spawn", "plugin installation failed");
-                    AppError::Internal
+                    AppError::internal("installation_perform_install_1")
                 })?;
-                let mut stderr = child.stderr.take().ok_or(AppError::Internal)?;
+                if let Some((username, password)) = &policy.ephemeral_proxy_credentials {
+                    use tokio::io::AsyncWriteExt;
+                    let mut stdin = child
+                        .stdin
+                        .take()
+                        .ok_or(AppError::internal("installation_perform_install_2"))?;
+                    let payload =
+                        serde_json::to_vec(&json!({"username":username,"password":password}))
+                            .map_err(|_| AppError::internal("installation_perform_install_6"))?;
+                    stdin
+                        .write_all(&payload)
+                        .await
+                        .map_err(|_| AppError::internal("installation_perform_install_7"))?;
+                    stdin
+                        .shutdown()
+                        .await
+                        .map_err(|_| AppError::internal("installation_perform_install_8"))?;
+                }
+                let mut stderr = child
+                    .stderr
+                    .take()
+                    .ok_or(AppError::internal("installation_perform_install_3"))?;
                 let capture = async {
                     use tokio::io::AsyncReadExt;
                     let mut captured = Vec::new();
@@ -411,7 +618,7 @@ impl ApplicationPlugins {
                 // Drain concurrently (bounded retained bytes) without an orphan
                 // task. Existing phase timeout drops/kills this owned child.
                 let (status, captured) = tokio::join!(child.wait(), capture);
-                let status = status.map_err(|_| AppError::Internal)?;
+                let status = status.map_err(|_| AppError::internal("installation_site_1"))?;
                 if !status.success() {
                     log_installer_diagnostics(&captured.unwrap_or_default());
                     tracing::warn!(
@@ -419,7 +626,7 @@ impl ApplicationPlugins {
                         exit_code = status.code(),
                         "plugin installation failed"
                     );
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("installation_perform_install_4"));
                 }
                 let checkpoint = package_checkpoint(&inventory_root, reference, &trust).await?;
                 checkpoints.insert(reference.clone(), checkpoint);
@@ -431,11 +638,37 @@ impl ApplicationPlugins {
             .await?;
         }
         bounded_install_phase(STORAGE_DEADLINE, async {
+            // Install into this fresh attempt before copying the base. Only IDs
+            // from successfully signature-verified packages may replace grants;
+            // release metadata and the requested repository name are not IDs.
+            let retained = retained_after_verified_packages(
+                resolution
+                    .as_ref()
+                    .and_then(|value| value.retained.as_ref()),
+                &input.packages,
+                &checkpoints,
+                &inventory_root,
+                &trust,
+            )
+            .await?;
+            if let Some(retained) = &retained {
+                super::retained_installation::retain_approved_installations(
+                    retained,
+                    &inventory_root,
+                )
+                .await?;
+            }
             let runtime = self.review_runtime(inventory_root).await?;
+            if let Some(retained) = &retained {
+                super::retained_installation::verify_retained_grants(retained, &runtime)?;
+            }
+            if let Some(resolution) = &resolution {
+                self.verify_installation_base(resolution).await?;
+            }
             let digest = review_digest(&runtime, &trust)?;
             let review = json!({"plugins":runtime.manifests()});
             if serde_json::to_vec(&review)
-                .map_err(|_| AppError::Internal)?
+                .map_err(|_| AppError::internal("installation_site_2"))?
                 .len()
                 > 4 * 1024 * 1024
             {
@@ -462,11 +695,12 @@ impl ApplicationPlugins {
             INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
         )
         .await
-        .map_err(|_| AppError::Overloaded)?
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+        .map_err(|_| AppError::internal("installation_review_runtime_1"))?;
         let task = tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let metadata = std::fs::symlink_metadata(&root).map_err(|_| AppError::Internal)?;
+            let metadata = std::fs::symlink_metadata(&root)
+                .map_err(|_| AppError::internal("installation_review_runtime_2"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -474,8 +708,8 @@ impl ApplicationPlugins {
         });
         tokio::time::timeout(COMPILATION_DEADLINE, task)
             .await
-            .map_err(|_| AppError::Overloaded)?
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+            .map_err(|_| AppError::internal("installation_review_runtime_3"))?
     }
 
     pub async fn approve_installation(
@@ -493,7 +727,17 @@ impl ApplicationPlugins {
         if record.status == "registered" {
             return Ok(());
         }
-        let policy = self.install_policy().await?;
+        let mut policy = self.install_policy().await?;
+        let resolution = self
+            .installation_release_policy(&record.idempotency_hash, &record.actor, &mut policy)
+            .await?;
+        if self
+            .db
+            .installer_network_snapshot_exists(&record.idempotency_hash, &record.actor)
+            .await?
+        {
+            policy.network_snapshot_key = Some(record.idempotency_hash.clone());
+        }
         // Recheck source policy on approval; installing before a trust-policy
         // change does not grandfather an artifact into execution authority.
         if record.packages.iter().any(|reference| {
@@ -521,16 +765,29 @@ impl ApplicationPlugins {
                 ));
             }
         }
+        let retained = retained_after_verified_packages(
+            resolution
+                .as_ref()
+                .and_then(|value| value.retained.as_ref()),
+            &record.packages,
+            &record.checkpoints,
+            &root,
+            &trust,
+        )
+        .await?;
+        if let Some(retained) = &retained {
+            super::retained_installation::verify_retained_grants(retained, &runtime)?;
+        }
         runtime.validate_stored_configurations().await?;
         let identities = runtime.package_identities();
-        let grants = runtime
+        let mut grants = runtime
             .manifests()
             .into_iter()
             .map(|manifest| {
                 let identity = identities
                     .get(&manifest.id)
                     .cloned()
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("installation_approve_installation_1"))?;
                 Ok((
                     manifest.id.clone(),
                     vec![PluginGrant {
@@ -542,6 +799,15 @@ impl ApplicationPlugins {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, AppError>>()?;
+        if let Some(resolution) = &resolution {
+            if let Some(retained) = &retained {
+                // Preserve other exact approvals; replacements need fresh approval.
+                for (id, versions) in &retained.grants {
+                    grants.insert(id.clone(), versions.clone());
+                }
+            }
+            self.verify_installation_base(resolution).await?;
+        }
         let entry = PreinstalledInventory { root, grants };
         let path = self.inventory_file.clone().ok_or(AppError::Forbidden)?;
         append_inventory_file(&path, &record.inventory_id, &entry).await?;
@@ -577,7 +843,9 @@ impl ApplicationPlugins {
             )
         })
         .await
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| {
+            AppError::internal("installation_reclaim_unreferenced_installation_attempts_1")
+        })?
     }
 }
 
@@ -609,7 +877,8 @@ fn reclaim_installation_attempt_roots(
         if reclaimed >= ATTEMPT_RECLAMATION_LIMIT {
             break;
         }
-        let entry = entry.map_err(|_| AppError::Internal)?;
+        let entry = entry
+            .map_err(|_| AppError::internal("installation_reclaim_installation_attempt_roots_1"))?;
         let entry_name = entry.file_name();
         let (attempt_id, root, recovery_entry) =
             if let Some(attempt_id) = inventory_attempt_id(&entry_name) {
@@ -680,7 +949,9 @@ fn allow_missing_plugin_root<T>(result: std::io::Result<T>) -> Result<Option<T>,
     match result {
         Ok(value) => Ok(Some(value)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(_) => Err(AppError::Internal),
+        Err(_) => Err(AppError::internal(
+            "installation_allow_missing_plugin_root_1",
+        )),
     }
 }
 
@@ -690,7 +961,7 @@ async fn bounded_install_phase<T>(
 ) -> Result<T, AppError> {
     tokio::time::timeout(deadline, work)
         .await
-        .map_err(|_| AppError::Overloaded)?
+        .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
 }
 
 async fn run_with_lease<T, R: std::future::Future<Output = Result<(), AppError>>>(
@@ -705,7 +976,7 @@ async fn run_with_lease<T, R: std::future::Future<Output = Result<(), AppError>>
             result = &mut work => return result,
             _ = renewal.tick() => {
                 tokio::time::timeout(Duration::from_secs(10), renew())
-                    .await.map_err(|_| AppError::Overloaded)??;
+                    .await.map_err(|_| AppError::capacity_error("plugin_installation_capacity"))??;
             }
         }
     }
@@ -761,9 +1032,12 @@ impl InstallPolicy {
             return Err(AppError::Forbidden);
         }
         if let Some(proxy) = &self.egress_proxy {
-            crate::network::validate_install_egress_proxy(proxy)
+            crate::network::validate_frozen_installer_proxy(proxy)
                 .map_err(|_| AppError::Forbidden)?;
             command.arg("--egress-proxy").arg(proxy);
+        }
+        if self.ephemeral_proxy_credentials.is_some() {
+            command.arg("--egress-proxy-credentials-stdin");
         }
         if let (Some(username), Some(password)) = (
             &self.egress_proxy_username_file,
@@ -775,6 +1049,11 @@ impl InstallPolicy {
         Ok(())
     }
     fn signer_policy_valid(&self) -> bool {
+        if self.allowed_sources.is_empty() {
+            return self.cosign_public_keys.is_empty()
+                && self.cosign_keyless.is_none()
+                && self.source_keyless.is_empty();
+        }
         if self.source_keyless.is_empty() {
             return self.cosign_public_keys.is_empty() != self.cosign_keyless.is_none()
                 && self
@@ -982,27 +1261,29 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
     let parent = root.parent().ok_or(AppError::Forbidden)?;
     let name = root.file_name().ok_or(AppError::Forbidden)?;
     let temporary = parent.join(format!(".mtc-inventory-claim-{}", uuid::Uuid::now_v7()));
-    std::fs::create_dir(&temporary).map_err(|_| AppError::Internal)?;
+    std::fs::create_dir(&temporary)
+        .map_err(|_| AppError::internal("installation_claim_inventory_root_1"))?;
     let marker = temporary.join(".mtc-install-owner");
     let result = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&marker)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_2"))?;
         file.write_all(owner.as_bytes())
-            .map_err(|_| AppError::Internal)?;
-        file.sync_all().map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_3"))?;
+        file.sync_all()
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_4"))?;
         std::fs::File::open(&temporary)
             .and_then(|file| file.sync_all())
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_5"))?;
         crate::plugin_publication::reserve_directory_name(root, owner.as_bytes()).map_err(
             |error| {
                 crate::plugin_publication::report_io("inventory_claim", &error);
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     AppError::Forbidden
                 } else {
-                    AppError::Internal
+                    AppError::internal("installation_claim_inventory_root_1")
                 }
             },
         )?;
@@ -1011,10 +1292,12 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
             OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("installation_claim_inventory_root_6"))?;
         match renameat_with(
             &directory,
-            temporary.file_name().ok_or(AppError::Internal)?,
+            temporary
+                .file_name()
+                .ok_or(AppError::internal("installation_claim_inventory_root_2"))?,
             &directory,
             name,
             RenameFlags::NOREPLACE,
@@ -1036,7 +1319,7 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                     .map_err(|_| AppError::Forbidden)?
                     .take(65)
                     .read_to_end(&mut existing)
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("installation_claim_inventory_root_7"))?;
                 if existing != owner.as_bytes() {
                     return Err(AppError::Forbidden);
                 }
@@ -1059,13 +1342,13 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         AppError::Forbidden
                     } else {
-                        AppError::Internal
+                        AppError::internal("installation_claim_inventory_root_3")
                     }
                 })?;
             }
             Err(error) => {
                 crate::plugin_publication::report_io("inventory_rename", &error.into());
-                return Err(AppError::Internal);
+                return Err(AppError::internal("installation_claim_inventory_root_4"));
             }
         }
         crate::plugin_publication::bind_existing_directory(root, owner.as_bytes()).map_err(
@@ -1074,13 +1357,13 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
                 if error.kind() == std::io::ErrorKind::AlreadyExists {
                     AppError::Forbidden
                 } else {
-                    AppError::Internal
+                    AppError::internal("installation_claim_inventory_root_5")
                 }
             },
         )?;
         std::fs::File::open(parent)
             .and_then(|file| file.sync_all())
-            .map_err(|_| AppError::Internal)
+            .map_err(|_| AppError::internal("installation_claim_inventory_root_8"))
     })();
     // Only files created by this invocation, never an existing inventory.
     let _ = std::fs::remove_file(marker);
@@ -1089,9 +1372,12 @@ fn claim_inventory_root(root: &std::path::Path, owner: &str) -> Result<(), AppEr
 }
 
 fn inventory_attempt_storage_id(attempt_id: &str) -> Result<String, AppError> {
-    let attempt = uuid::Uuid::parse_str(attempt_id).map_err(|_| AppError::Internal)?;
+    let attempt = uuid::Uuid::parse_str(attempt_id)
+        .map_err(|_| AppError::internal("installation_inventory_attempt_storage_id_1"))?;
     if attempt.to_string() != attempt_id {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "installation_inventory_attempt_storage_id_1",
+        ));
     }
     Ok(format!("mtc-attempt-{attempt}"))
 }
@@ -1099,6 +1385,36 @@ fn inventory_attempt_storage_id(attempt_id: &str) -> Result<String, AppError> {
 #[cfg(not(target_os = "linux"))]
 fn claim_inventory_root(_root: &std::path::Path, _owner: &str) -> Result<(), AppError> {
     Err(AppError::Forbidden)
+}
+
+/// Keep the frozen base intact for retries, including resolutions created before
+/// replacement installs were supported. Never derive exclusions from unverified
+/// release metadata or from arbitrary packages present in the attempt directory.
+async fn retained_after_verified_packages(
+    retained: Option<&PreinstalledInventory>,
+    packages: &[String],
+    checkpoints: &BTreeMap<String, PackageCheckpoint>,
+    root: &std::path::Path,
+    trust: &str,
+) -> Result<Option<PreinstalledInventory>, AppError> {
+    let Some(retained) = retained else {
+        return Ok(None);
+    };
+    if checkpoints.len() != packages.len() {
+        return Err(AppError::Forbidden);
+    }
+    let mut replacements = BTreeSet::new();
+    for reference in packages {
+        let checkpoint = checkpoints.get(reference).ok_or(AppError::Forbidden)?;
+        if !checkpoint_matches(root, reference, trust, checkpoint).await?
+            || !replacements.insert(checkpoint.plugin_id.clone())
+        {
+            return Err(AppError::Forbidden);
+        }
+    }
+    let mut retained = retained.clone();
+    retained.grants.retain(|id, _| !replacements.contains(id));
+    Ok(Some(retained))
 }
 
 async fn package_checkpoint(
@@ -1114,16 +1430,19 @@ async fn package_checkpoint(
         INSTALL_STORAGE_PERMITS.clone().acquire_owned(),
     )
     .await
-    .map_err(|_| AppError::Overloaded)?
-    .map_err(|_| AppError::Internal)?;
+    .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+    .map_err(|_| AppError::internal("installation_package_checkpoint_1"))?;
     let task = tokio::task::spawn_blocking(move || {
         let _permit = permit;
         use std::io::Read;
         let (source, digest) = reference.rsplit_once('@').ok_or(AppError::Forbidden)?;
         let mut found = None;
         let mut count = 0;
-        for entry in std::fs::read_dir(&root).map_err(|_| AppError::Internal)? {
-            let entry = entry.map_err(|_| AppError::Internal)?;
+        for entry in std::fs::read_dir(&root)
+            .map_err(|_| AppError::internal("installation_package_checkpoint_2"))?
+        {
+            let entry =
+                entry.map_err(|_| AppError::internal("installation_package_checkpoint_3"))?;
             if entry.file_name().to_string_lossy().starts_with('.') {
                 continue;
             }
@@ -1132,7 +1451,8 @@ async fn package_checkpoint(
                 return Err(AppError::Forbidden);
             }
             let path = entry.path();
-            let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::Internal)?;
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|_| AppError::internal("installation_package_checkpoint_4"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
@@ -1141,7 +1461,7 @@ async fn package_checkpoint(
                 .map_err(|_| AppError::Forbidden)?
                 .take(16385)
                 .read_to_end(&mut receipt)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("installation_package_checkpoint_5"))?;
             if receipt.len() > 16384 {
                 return Err(AppError::Forbidden);
             }
@@ -1170,8 +1490,8 @@ async fn package_checkpoint(
     });
     tokio::time::timeout(STORAGE_DEADLINE, task)
         .await
-        .map_err(|_| AppError::Overloaded)?
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::capacity_error("plugin_installation_capacity"))?
+        .map_err(|_| AppError::internal("installation_package_checkpoint_6"))?
 }
 
 async fn checkpoint_matches(
@@ -1196,13 +1516,17 @@ fn package_tree_digest(root: &std::path::Path) -> Result<String, AppError> {
     let mut total = 0;
     while let Some(relative) = pending.pop() {
         let path = root.join(&relative);
-        let metadata = std::fs::symlink_metadata(&path).map_err(|_| AppError::Internal)?;
+        let metadata = std::fs::symlink_metadata(&path)
+            .map_err(|_| AppError::internal("installation_package_tree_digest_1"))?;
         if metadata.file_type().is_symlink() || relative.as_os_str().len() > 240 {
             return Err(AppError::Forbidden);
         }
         if metadata.is_dir() {
-            for entry in std::fs::read_dir(path).map_err(|_| AppError::Internal)? {
-                let entry = entry.map_err(|_| AppError::Internal)?;
+            for entry in std::fs::read_dir(path)
+                .map_err(|_| AppError::internal("installation_package_tree_digest_2"))?
+            {
+                let entry =
+                    entry.map_err(|_| AppError::internal("installation_package_tree_digest_3"))?;
                 entries += 1;
                 if entries > 64 * 240 {
                     return Err(AppError::Forbidden);
@@ -1214,12 +1538,14 @@ fn package_tree_digest(root: &std::path::Path) -> Result<String, AppError> {
                 return Err(AppError::Forbidden);
             }
             let mut file = std::fs::File::open(path)
-                .map_err(|_| AppError::Internal)?
+                .map_err(|_| AppError::internal("installation_package_tree_digest_4"))?
                 .take(64 * 1024 * 1024 + 1);
             let mut hash = Sha256::new();
             let mut buffer = [0u8; 65536];
             loop {
-                let count = file.read(&mut buffer).map_err(|_| AppError::Internal)?;
+                let count = file
+                    .read(&mut buffer)
+                    .map_err(|_| AppError::internal("installation_package_tree_digest_5"))?;
                 if count == 0 {
                     break;
                 }
@@ -1248,38 +1574,75 @@ async fn trust_digest(policy: &InstallPolicy) -> Result<String, AppError> {
     for path in &policy.cosign_public_keys {
         let file = tokio::fs::File::open(path)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_trust_digest_1"))?;
         let mut bytes = Vec::new();
         file.take(65537)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_trust_digest_2"))?;
         if bytes.is_empty() || bytes.len() > 65536 {
             return Err(AppError::Forbidden);
         }
         keys.push(bytes);
     }
     let mut trust = json!({"sources":policy.allowed_sources,"keys":keys});
-    if let Some(proxy) = &policy.egress_proxy {
+    if let Some(snapshot) = &policy.network_snapshot_key {
+        trust["network_snapshot_key"] = json!(snapshot);
+    } else if let Some(proxy) = &policy.egress_proxy {
         trust["egress_proxy"] = json!(proxy);
     }
-    if let (Some(username), Some(password)) = (
-        &policy.egress_proxy_username_file,
-        &policy.egress_proxy_password_file,
-    ) {
+    if policy.network_snapshot_key.is_none()
+        && let (Some(username), Some(password)) = (
+            &policy.egress_proxy_username_file,
+            &policy.egress_proxy_password_file,
+        )
+    {
         trust["egress_proxy_username_file"] = json!(username);
         trust["egress_proxy_password_file"] = json!(password);
     }
     // Preserve existing public-key review digests; keyless identities are part
     // of the reviewed authority and invalidate checkpoints when changed.
     if let Some(identity) = &policy.cosign_keyless {
-        trust["keyless"] = serde_json::to_value(identity).map_err(|_| AppError::Internal)?;
+        trust["keyless"] = serde_json::to_value(identity)
+            .map_err(|_| AppError::internal("installation_trust_digest_3"))?;
     }
     if !policy.source_keyless.is_empty() {
-        trust["source_keyless"] =
-            serde_json::to_value(&policy.source_keyless).map_err(|_| AppError::Internal)?;
+        trust["source_keyless"] = serde_json::to_value(&policy.source_keyless)
+            .map_err(|_| AppError::internal("installation_trust_digest_4"))?;
     }
     super::super::plugin_configuration_schema_digest(&trust)
+}
+
+fn apply_frozen_installer_network(
+    frozen: &crate::db::plugin_installer_network::FrozenInstallerNetwork,
+    policy: &mut InstallPolicy,
+) -> Result<(), AppError> {
+    policy.egress_proxy = frozen.proxy_url.clone();
+    policy.egress_proxy_username_file = None;
+    policy.egress_proxy_password_file = None;
+    if let Some(proxy) = &mut policy.egress_proxy {
+        let mut url = url::Url::parse(proxy).map_err(|_| AppError::Forbidden)?;
+        let address = frozen.proxy_addresses.first().ok_or(AppError::Forbidden)?;
+        // Both OCI and external Cosign consume the same frozen literal proxy.
+        if url.scheme() == "https" && frozen.proxy_host.is_some() {
+            return Err(AppError::BadRequest(
+                "HTTPS installation proxies require an IP address endpoint".into(),
+            ));
+        }
+        url.set_ip_host(address.ip())
+            .map_err(|_| AppError::Forbidden)?;
+        *proxy = url.to_string();
+    }
+    policy.ephemeral_proxy_credentials = match (&frozen.username, &frozen.password) {
+        (Some(username), Some(password)) => Some((username.clone(), password.clone())),
+        (None, None) => None,
+        _ => {
+            return Err(AppError::BadRequest(
+                "proxy username and password must be supplied together".into(),
+            ));
+        }
+    };
+    Ok(())
 }
 
 pub(super) async fn append_inventory_file(
@@ -1298,29 +1661,33 @@ pub(super) async fn append_inventory_file(
             .read(true)
             .write(true)
             .open(path.with_extension("lock"))
-            .map_err(|_| AppError::Internal)?;
-        lock.try_lock().map_err(|_| AppError::Overloaded)?;
+            .map_err(|_| AppError::internal("installation_append_inventory_file_1"))?;
+        lock.try_lock()
+            .map_err(|_| AppError::capacity_error("plugin_installation_lock"))?;
         let mut bytes = Vec::new();
         std::fs::File::open(&path)
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::internal("installation_append_inventory_file_2"))?
             .take(4 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_append_inventory_file_3"))?;
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(AppError::Forbidden);
         }
         let mut inventory: BTreeMap<String, PreinstalledInventory> =
             serde_json::from_slice(&bytes).map_err(|_| AppError::Forbidden)?;
         if let Some(existing) = inventory.get(&id) {
-            if serde_json::to_value(existing).map_err(|_| AppError::Internal)?
-                == serde_json::to_value(&entry).map_err(|_| AppError::Internal)?
+            if serde_json::to_value(existing)
+                .map_err(|_| AppError::internal("installation_append_inventory_file_4"))?
+                == serde_json::to_value(&entry)
+                    .map_err(|_| AppError::internal("installation_append_inventory_file_5"))?
             {
                 return Ok(());
             }
             return Err(AppError::Conflict("inventory ID is immutable".into()));
         }
         inventory.insert(id, entry);
-        let bytes = serde_json::to_vec(&inventory).map_err(|_| AppError::Internal)?;
+        let bytes = serde_json::to_vec(&inventory)
+            .map_err(|_| AppError::internal("installation_append_inventory_file_6"))?;
         if bytes.len() > 4 * 1024 * 1024 {
             return Err(AppError::Forbidden);
         }
@@ -1330,20 +1697,23 @@ pub(super) async fn append_inventory_file(
             .write(true)
             .create_new(true)
             .open(&temporary)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_append_inventory_file_7"))?;
         let result = (|| {
             file.set_permissions(
                 std::fs::metadata(&path)
-                    .map_err(|_| AppError::Internal)?
+                    .map_err(|_| AppError::internal("installation_append_inventory_file_8"))?
                     .permissions(),
             )
-            .map_err(|_| AppError::Internal)?;
-            file.write_all(&bytes).map_err(|_| AppError::Internal)?;
-            file.sync_all().map_err(|_| AppError::Internal)?;
-            std::fs::rename(&temporary, &path).map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("installation_append_inventory_file_9"))?;
+            file.write_all(&bytes)
+                .map_err(|_| AppError::internal("installation_append_inventory_file_10"))?;
+            file.sync_all()
+                .map_err(|_| AppError::internal("installation_append_inventory_file_11"))?;
+            std::fs::rename(&temporary, &path)
+                .map_err(|_| AppError::internal("installation_append_inventory_file_12"))?;
             std::fs::File::open(parent)
                 .and_then(|file| file.sync_all())
-                .map_err(|_| AppError::Internal)
+                .map_err(|_| AppError::internal("installation_append_inventory_file_13"))
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temporary);
@@ -1351,7 +1721,7 @@ pub(super) async fn append_inventory_file(
         result
     })
     .await
-    .map_err(|_| AppError::Internal)?
+    .map_err(|_| AppError::internal("installation_append_inventory_file_14"))?
 }
 
 #[cfg(test)]
@@ -1615,6 +1985,9 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         let input = InstallPluginRequest {
             inventory_id: "worker-signers".into(),
             packages,
+            release_resolution_id: None,
+            release_descriptor_sha256: None,
+            network: None,
         };
         let (record, run) = state
             .db
@@ -1936,6 +2309,83 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
     }
 
     #[tokio::test]
+    async fn browser_installer_network_and_release_errors_are_private_and_redacted() {
+        let (_directory, state, _, _) = fixture().await;
+        let token = state.config.service_token.clone();
+        for (path, body) in [
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"http://credential-user:credential-secret@127.0.0.1:3128"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"https://proxy.example.com","username":"credential-user","password":"credential-secret"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/installer-network",
+                json!({"mode":"custom","url":"http://8.8.8.8:3128","username":"credential-user"}),
+            ),
+            (
+                "/internal/v1/plugin-runtime/release-resolutions",
+                json!({"url":"https://127.0.0.1/plugin.json","network":{"mode":"custom","url":"http://8.8.8.8:3128","password":"credential-secret"}}),
+            ),
+        ] {
+            let method = if path.ends_with("installer-network") {
+                "PUT"
+            } else {
+                "POST"
+            };
+            let response = crate::api::router_for_role(state.clone(), RuntimeRole::Control)
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("idempotency-key", "browser-invalid")
+                        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 16384)
+                .await
+                .unwrap();
+            let rendered = std::str::from_utf8(&bytes).unwrap();
+            assert!(!rendered.contains("credential-secret"));
+            assert!(!rendered.contains("credential-user"));
+            assert!(!rendered.contains("proxy.example.com"));
+        }
+        let (status, view) = call(
+            &state,
+            "PUT",
+            "/internal/v1/plugin-runtime/installer-network",
+            &token,
+            json!({"mode":"direct"}),
+            "direct",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view, json!({"mode":"direct"}));
+        let (status, view) = call(
+            &state,
+            "GET",
+            "/internal/v1/plugin-runtime/installer-network",
+            &token,
+            json!({}),
+            "remembered",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(view, json!({"mode":"direct"}));
+    }
+
+    #[tokio::test]
     async fn review_approval_publish_rollback_and_audit_are_real_control_operations() {
         let (_directory, state, record, digest) = fixture().await;
         let token = &state.config.service_token;
@@ -2011,6 +2461,7 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         .await;
         assert_eq!(status, StatusCode::OK, "{published}");
         assert_eq!(published["revision"], 2);
+        state.refresh_application_plugins().await.unwrap();
         let (status, manifests) = call(
             &state,
             "GET",
@@ -2480,7 +2931,7 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
                 std::io::ErrorKind::PermissionDenied,
                 "fixture",
             ))),
-            Err(AppError::Internal)
+            Err(AppError::Internal { .. })
         ));
     }
 
@@ -2655,6 +3106,311 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         )
         .await;
         assert!(failed.is_err(), "lost ownership must cancel work");
+    }
+
+    #[tokio::test]
+    async fn upgrade_preserves_six_packages_and_reviews_replacement_permissions() {
+        let (directory, state, _, _) = fixture().await;
+        let authority = state.application_plugins.as_ref().unwrap();
+        let base = directory.path().join("frozen-base");
+        let ids = [
+            "new-plugin",
+            "keep-a",
+            "keep-b",
+            "keep-c",
+            "keep-d",
+            "keep-e",
+            "keep-f",
+        ];
+        for id in ids {
+            let path = base.join(id);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("plugin.json"),
+                serde_json::to_vec(&json!({
+                    "id":id,"version":"1.0.0","wit_version":"0.2.0","wasm":null,
+                    "capabilities":[],"contributions":{}
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(path.join(".mtc-oci-install.json"), serde_json::to_vec(&json!({
+                "format_version":1,"source":format!("ghcr.io/example/{id}"),
+                "digest":format!("sha256:{}", "b".repeat(64)),"signature_policy":"cosign-public-key"
+            })).unwrap()).unwrap();
+            std::fs::write(path.join("asset.txt"), format!("exact original asset {id}")).unwrap();
+        }
+        let runtime = authority.review_runtime(base.clone()).await.unwrap();
+        let identities = runtime.package_identities();
+        let frozen = PreinstalledInventory {
+            root: base.clone(),
+            grants: runtime
+                .manifests()
+                .into_iter()
+                .map(|manifest| {
+                    let grant = PluginGrant {
+                        version: manifest.version.clone(),
+                        capabilities: manifest.capabilities.clone(),
+                        manifest_digest: lifecycle::manifest_digest(&manifest).unwrap(),
+                        identity: identities[&manifest.id].clone(),
+                    };
+                    (manifest.id, vec![grant])
+                })
+                .collect(),
+        };
+        let original_bytes = ids
+            .into_iter()
+            .map(|id| (id, package_tree_digest(&base.join(id)).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        let reference = format!("ghcr.io/example/new@sha256:{}", "a".repeat(64));
+        let release = serde_json::from_value(json!({
+            "release_url":"https://github.com/example/new/releases/download/v2/release.json",
+            "descriptor_sha256":format!("sha256:{}", "c".repeat(64)),
+            "source":"ghcr.io/example/new",
+            "descriptor":{"format_version":1,"reference":reference,
+                "signer":{"issuer":"https://token.actions.githubusercontent.com",
+                    "identity":"https://github.com/example/new/.github/workflows/publish.yml@refs/tags/v2"}}
+        })).unwrap();
+        let resolution = state
+            .db
+            .save_plugin_release_resolution(
+                "upgrade-resolution",
+                "bootstrap",
+                &release,
+                1,
+                Some(&frozen),
+            )
+            .await
+            .unwrap();
+        state
+            .db
+            .confirm_plugin_release_resolution(
+                &resolution.id,
+                &resolution.release.descriptor_sha256,
+                "bootstrap",
+                "upgrade-key",
+            )
+            .await
+            .unwrap();
+        let (record, run) = state
+            .db
+            .begin_plugin_installation(
+                "upgraded",
+                &json!([reference]),
+                "upgrade-request",
+                "upgrade-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(run);
+        let root = directory
+            .path()
+            .join("private-install-root")
+            .join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
+        claim_inventory_root(&root, &record.attempt_id).unwrap();
+        let path = root.join("new-plugin");
+        std::fs::create_dir_all(&path).unwrap();
+        // As in fixture(), seed successful signed-installer output. Distribution
+        // tests independently enforce real signature verification and NOREPLACE.
+        std::fs::write(path.join("plugin.json"), serde_json::to_vec(&json!({
+            "id":"new-plugin","version":"2.0.0","wit_version":"0.2.0","wasm":null,
+            "capabilities":[{"kind":"http","allowed_origins":["https://example.com"]}],"contributions":{}
+        })).unwrap()).unwrap();
+        std::fs::write(path.join(".mtc-oci-install.json"), serde_json::to_vec(&json!({
+            "format_version":1,"source":"ghcr.io/example/new","digest":format!("sha256:{}", "a".repeat(64)),"signature_policy":"cosign-keyless"
+        })).unwrap()).unwrap();
+        let mut policy = authority.install_policy().await.unwrap();
+        authority
+            .installation_release_policy("upgrade-key", "bootstrap", &mut policy)
+            .await
+            .unwrap();
+        let trust = trust_digest(&policy).await.unwrap();
+        let checkpoints = BTreeMap::from([(
+            reference.clone(),
+            package_checkpoint(&root, &reference, &trust).await.unwrap(),
+        )]);
+        state
+            .db
+            .checkpoint_plugin_installation(&record.id, &record.attempt_id, &checkpoints)
+            .await
+            .unwrap();
+        // A failed old attempt may already have a successfully verified package.
+        // Retry must keep the frozen full base, but discard that attempt's paths
+        // and checkpoints before accepting freshly verified output.
+        state
+            .db
+            .finish_plugin_installation(&record.id, &record.attempt_id, None)
+            .await
+            .unwrap();
+        assert!(!authority.inventory.read().await.contains_key("upgraded"));
+        assert_eq!(
+            state
+                .db
+                .optional_application_plugin_head()
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        let (retry, run) = state
+            .db
+            .begin_plugin_installation(
+                "upgraded",
+                &json!([reference]),
+                "upgrade-request",
+                "upgrade-key",
+                "bootstrap",
+                crate::db::unix_millis() + 270000,
+            )
+            .await
+            .unwrap();
+        assert!(run);
+        assert_eq!(record.id, retry.id);
+        assert_ne!(record.attempt_id, retry.attempt_id);
+        assert!(retry.checkpoints.is_empty());
+        let old_root = root;
+        let record = retry;
+        let root = directory
+            .path()
+            .join("private-install-root")
+            .join(inventory_attempt_storage_id(&record.attempt_id).unwrap());
+        claim_inventory_root(&root, &record.attempt_id).unwrap();
+        std::fs::create_dir(root.join("new-plugin")).unwrap();
+        for file in ["plugin.json", ".mtc-oci-install.json"] {
+            std::fs::copy(
+                old_root.join("new-plugin").join(file),
+                root.join("new-plugin").join(file),
+            )
+            .unwrap();
+        }
+        let checkpoints = BTreeMap::from([(
+            reference.clone(),
+            package_checkpoint(&root, &reference, &trust).await.unwrap(),
+        )]);
+        state
+            .db
+            .checkpoint_plugin_installation(&record.id, &record.attempt_id, &checkpoints)
+            .await
+            .unwrap();
+        // Missing/failed installation, a stale trust policy, or duplicate package
+        // IDs cannot authorize removing any frozen grant.
+        assert!(
+            retained_after_verified_packages(
+                Some(&frozen),
+                &record.packages,
+                &BTreeMap::new(),
+                &root,
+                &trust
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            retained_after_verified_packages(
+                Some(&frozen),
+                &record.packages,
+                &checkpoints,
+                &root,
+                "changed-trust"
+            )
+            .await
+            .is_err()
+        );
+        let duplicate_requests = vec![reference.clone(), reference.clone()];
+        assert!(
+            retained_after_verified_packages(
+                Some(&frozen),
+                &duplicate_requests,
+                &checkpoints,
+                &root,
+                &trust
+            )
+            .await
+            .is_err()
+        );
+        let retained = retained_after_verified_packages(
+            Some(&frozen),
+            &record.packages,
+            &checkpoints,
+            &root,
+            &trust,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(retained.grants.len(), 6);
+        assert!(!retained.grants.contains_key("new-plugin"));
+        assert_eq!(frozen.grants.len(), 7);
+        let input = InstallPluginRequest {
+            inventory_id: "upgraded".into(),
+            packages: record.packages.clone(),
+            release_resolution_id: None,
+            release_descriptor_sha256: None,
+            network: None,
+        };
+        // Resume the successfully checkpointed new package through the actual
+        // installation orchestration, with the legacy full-seven resolution.
+        let (digest, review) = authority
+            .perform_install(&record.id, &record.attempt_id, &input, &policy)
+            .await
+            .unwrap();
+        let runtime = authority.review_runtime(root.clone()).await.unwrap();
+        super::super::retained_installation::verify_retained_grants(&retained, &runtime).unwrap();
+        assert_eq!(runtime.manifests().len(), 7);
+        for id in &ids[1..] {
+            assert_eq!(
+                package_tree_digest(&root.join(id)).unwrap(),
+                original_bytes[id]
+            );
+        }
+        assert_eq!(digest, review_digest(&runtime, &trust).unwrap());
+        state
+            .db
+            .finish_plugin_installation(&record.id, &record.attempt_id, Some((&digest, &review)))
+            .await
+            .unwrap();
+        assert!(!authority.inventory.read().await.contains_key("upgraded"));
+        authority
+            .approve_installation(&record.id, &digest, "bootstrap")
+            .await
+            .unwrap();
+        let inventory = authority.inventory.read().await;
+        let approved = &inventory["upgraded"];
+        assert_eq!(approved.grants["new-plugin"][0].version, "2.0.0");
+        assert_eq!(approved.grants["new-plugin"][0].capabilities.len(), 1);
+        for id in &ids[1..] {
+            assert_eq!(
+                serde_json::to_value(&approved.grants[*id]).unwrap(),
+                serde_json::to_value(&frozen.grants[*id]).unwrap()
+            );
+        }
+        drop(inventory);
+        for id in ids {
+            assert_eq!(
+                package_tree_digest(&base.join(id)).unwrap(),
+                original_bytes[id]
+            );
+        }
+        assert_eq!(
+            state
+                .db
+                .optional_application_plugin_head()
+                .await
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+        let persisted = state
+            .db
+            .installation_plugin_release_resolution("upgrade-key", "bootstrap")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.retained.unwrap().grants.len(), 7);
     }
 
     #[tokio::test]

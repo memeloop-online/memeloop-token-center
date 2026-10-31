@@ -29,7 +29,7 @@ async fn postgres_budget_reservations_and_settlement_replays_are_serialized() {
                 alias: "budget-key".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 10_000,
+                    tokens_per_minute: Some(10_000),
                     daily_budget: Some("0.001".to_owned()),
                     weekly_budget: Some("0.001".to_owned()),
                     lifetime_budget: Some("0.001".to_owned()),
@@ -114,9 +114,9 @@ async fn postgres_long_running_reservations_enforce_authoritative_concurrency() 
                 alias: "long-task".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    requests_per_minute: 100,
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 1,
+                    requests_per_minute: Some(100),
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(1),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::ONE,
@@ -167,7 +167,7 @@ async fn postgres_long_running_reservations_enforce_authoritative_concurrency() 
     assert_eq!(rejected, 7);
     let snapshot = database.key_limit_snapshot(issued.key_id).await.unwrap();
     assert_eq!(snapshot.concurrency.active, 1);
-    assert_eq!(snapshot.concurrency.remaining, 0);
+    assert_eq!(snapshot.concurrency.remaining, Some(0));
 
     database.settle_usage(&accepted[0], 0, 100).await.unwrap();
     assert_eq!(

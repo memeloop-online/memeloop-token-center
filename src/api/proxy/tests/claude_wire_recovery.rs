@@ -58,7 +58,7 @@ async fn control(state: &AppState, action: &str, key: &str, body: Value) -> Valu
         .unwrap();
     assert!(
         response.status().is_success(),
-        "control action {action}: {}",
+        "control action {action}, operation {key}: {}",
         response.status()
     );
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -335,6 +335,7 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
             }
             _ => {}
         }
+        gateway_state.refresh_application_plugins().await.unwrap();
         for (index, (name, path, request)) in cases.iter().enumerate() {
             let response = client
                 .post(format!("{gateway}{path}"))
@@ -343,8 +344,32 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{phase}/{name}");
+            let status = response.status();
             let response: Value = response.json().await.unwrap();
+            if status != StatusCode::OK {
+                let failure = json!({
+                    "phase": phase,
+                    "case": name,
+                    "status": status.as_u16(),
+                    "error_code": response.pointer("/error/code"),
+                    "error_type": response.pointer("/error/type"),
+                    "upstream_captures": captures.lock().await.len(),
+                    "finalize_observations": finalize_observations(&gateway_state),
+                });
+                if let Ok(output) = std::env::var("MTC_CLAUDE_WIRE_EVIDENCE") {
+                    std::fs::write(
+                        output,
+                        serde_json::to_vec_pretty(&json!({
+                            "synthetic_only": true,
+                            "cases": evidence,
+                            "failure": failure,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(status, StatusCode::OK, "{failure}");
+            }
             if *path == "/v1/responses" {
                 assert_eq!(response["status"], "completed");
             } else {

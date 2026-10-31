@@ -81,7 +81,6 @@ async fn local_candidate_failures_log_only_fixed_reasons_and_preserve_dispositio
         .finish();
     let reasons = [
         CandidatePreparationFailure::ProxyGroupSelection,
-        CandidatePreparationFailure::ProxyMemberSelection,
         CandidatePreparationFailure::TransportSnapshot,
     ];
     tracing::subscriber::with_default(subscriber, || {
@@ -149,7 +148,7 @@ fn native_metadata_ows_is_removed_without_changing_the_payload_or_sensitive_mark
         let mut value = http::HeaderValue::from_str(input).unwrap();
         value.set_sensitive(true);
         downstream.insert("x-codex-turn-metadata", value);
-        let request = codex_transport::apply_wreq_wire_headers(
+        let request = codex_transport::apply_codex_wire_headers(
             client.post("http://wire.example.test/responses").body("{}"),
             &downstream,
             &credential(),
@@ -299,7 +298,15 @@ async fn strict_peer(
 async fn prepared_opaque_cache_bindings_survive_direct_and_socks_strict_h2_peer() {
     for use_proxy in [false, true] {
         let (target, proxy, connections, resets, server) = strict_peer(use_proxy).await;
-        let client = crate::build_codex_http_client().unwrap();
+        let client = crate::codex_http_client_builder_with_proxy(
+            crate::provider::CodexTransportPolicy::default(),
+            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+            use_proxy.then_some(proxy.as_str()),
+        )
+        .unwrap()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
         let config = json!({
             "base_url": codex_transport::BASE_URL,
             "network_scope": "public",
@@ -334,14 +341,11 @@ async fn prepared_opaque_cache_bindings_survive_direct_and_socks_strict_h2_peer(
                     previous = Some(plan.session_id.clone());
                 }
                 let serialized = serde_json::to_vec(&body).unwrap();
-                let mut builder = client
+                let builder = client
                     .post(&target)
                     .version(http::Version::HTTP_2)
                     .body(serialized);
-                if use_proxy {
-                    builder = builder.proxy(wreq::Proxy::all(&proxy).unwrap());
-                }
-                let request = codex_transport::apply_wreq_wire_headers(
+                let request = codex_transport::apply_codex_wire_headers(
                     builder,
                     &HeaderMap::new(),
                     &credential(),
@@ -367,15 +371,20 @@ async fn prepared_opaque_cache_bindings_survive_direct_and_socks_strict_h2_peer(
 async fn strict_h2_peer_reproduces_remote_protocol_error_for_untrimmed_field_values() {
     for use_proxy in [false, true] {
         let (target, proxy, connections, resets, server) = strict_peer(use_proxy).await;
-        let client = crate::build_codex_http_client().unwrap();
-        let mut request = client
+        let client = crate::codex_http_client_builder_with_proxy(
+            crate::provider::CodexTransportPolicy::default(),
+            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+            use_proxy.then_some(proxy.as_str()),
+        )
+        .unwrap()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+        let request = client
             .post(target)
             .version(http::Version::HTTP_2)
             .body("{}")
             .header("x-codex-turn-metadata", " metadata ");
-        if use_proxy {
-            request = request.proxy(wreq::Proxy::all(proxy).unwrap());
-        }
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), request.send())
             .await
             .unwrap()
@@ -385,7 +394,10 @@ async fn strict_h2_peer_reproduces_remote_protocol_error_for_untrimmed_field_val
         assert!(http2.is_remote());
         assert!(!http2.is_library());
         assert!(!http2.is_go_away());
-        assert_eq!(http2.reason(), Some(http2::Reason::PROTOCOL_ERROR));
+        assert_eq!(
+            http2.reason(),
+            Some(u32::from(http2::Reason::PROTOCOL_ERROR))
+        );
         assert_eq!(connections.load(Ordering::SeqCst), 1);
         assert_eq!(resets.load(Ordering::SeqCst), 1);
         server.abort();
@@ -396,7 +408,15 @@ async fn strict_h2_peer_reproduces_remote_protocol_error_for_untrimmed_field_val
 async fn native_h2_headers_and_body_length_survive_reused_multiplexed_connection() {
     for use_proxy in [false, true] {
         let (target, proxy, connections, resets, server) = strict_peer(use_proxy).await;
-        let client = crate::build_codex_http_client().unwrap();
+        let client = crate::codex_http_client_builder_with_proxy(
+            crate::provider::CodexTransportPolicy::default(),
+            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+            use_proxy.then_some(proxy.as_str()),
+        )
+        .unwrap()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
         let mut downstream = HeaderMap::new();
         for name in ["x-codex-turn-metadata", "x-client-request-id", "version"] {
             downstream.insert(name, http::HeaderValue::from_static(" \tmetadata\t "));
@@ -413,17 +433,13 @@ async fn native_h2_headers_and_body_length_survive_reused_multiplexed_connection
         let send = |size: usize, observed: bool| {
             let client = client.clone();
             let target = target.clone();
-            let proxy = proxy.clone();
             let downstream = downstream.clone();
             async move {
-                let mut builder = client
+                let builder = client
                     .post(target)
                     .version(http::Version::HTTP_2)
                     .body(Bytes::from(vec![b'x'; size]));
-                if use_proxy {
-                    builder = builder.proxy(wreq::Proxy::all(proxy).unwrap());
-                }
-                let mut request = codex_transport::apply_wreq_wire_headers(
+                let mut request = codex_transport::apply_codex_wire_headers(
                     builder,
                     &downstream,
                     &credential(),

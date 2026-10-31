@@ -18,8 +18,7 @@ mod route_types;
 
 pub(super) use crate::provider::PROXY_ROUTING_POLICY;
 pub(super) use admission::{
-    AdmittedProxyRouteInput, DeferredSharedProbe, NextSendableProxyRouteInput,
-    prepare_admitted_proxy_route,
+    AdmittedProxyRouteInput, NextSendableProxyRouteInput, prepare_admitted_proxy_route,
 };
 pub(super) use candidates::{
     CandidatePreparationSummary, candidate_reservation_bounds, exhausted_candidate_error,
@@ -44,7 +43,6 @@ pub(super) use readiness::{
     CandidateCompatibility, PreparedRouteReadiness, candidate_compatibility,
     credential_application_error, refresh_route_snapshot,
 };
-pub(crate) use recovery_wait::wait as wait_media_recovery;
 pub(super) use route_types::{
     PlannedProxyRoute, PreparedProxyRoute, ProxyRequestContext, ProxyRoutePlanInput,
     ProxyRouteResponse, ProxySendError, TransportFailureKind,
@@ -68,10 +66,7 @@ pub(super) fn plan_proxy_route(
         preparation_now,
     } = input;
     if !state.providers.is_public(&route.driver) {
-        return Err(AppError::Upstream(format!(
-            "provider driver {} is not loaded",
-            route.driver
-        )));
+        return Err(AppError::upstream("provider_driver_is_not_loaded"));
     }
     route.credential.validate(preparation_now)?;
     let _planning_memory = state
@@ -83,6 +78,7 @@ pub(super) fn plan_proxy_route(
             state
                 .metrics
                 .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
+                .name_if_overloaded("proxy_memory_route")
         })?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
@@ -223,7 +219,8 @@ pub(super) fn plan_proxy_route(
             key_id: key.key_id.to_string(),
             protocol: protocol.name().to_owned(),
             model: model.to_owned(),
-            config_json: serde_json::to_string(&route.config).map_err(|_| AppError::Internal)?,
+            config_json: serde_json::to_string(&route.config)
+                .map_err(|_| AppError::internal("routing_site_1"))?,
         };
         Some(context)
     } else {
@@ -305,7 +302,7 @@ fn configured_output_reservation_bound(
 ) -> Result<i64, AppError> {
     if let Some(bounds) = config.get("reservation_token_bounds") {
         let bounds = bounds.as_object().ok_or_else(|| {
-            AppError::Upstream("compatible upstream reservation metadata must be an object".into())
+            AppError::upstream("compatible_upstream_reservation_metadata_must_be_an_object")
         })?;
         // Generic accounts can opt in one model at a time. An absent entry
         // preserves that model's legacy admission; native Codex remains strict.
@@ -314,8 +311,10 @@ fn configured_output_reservation_bound(
         }
         return codex_transport::trusted_reservation_token_bound(config, upstream_model).map_err(
             |_| {
-                AppError::Upstream(
-                    "compatible upstream requires valid reservation metadata for its model".into(),
+                AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new()
+                        .stage("routing_configured_output_reservation_bound"),
                 )
             },
         );
@@ -388,6 +387,7 @@ pub(super) async fn materialize_proxy_route(
             state
                 .metrics
                 .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
+                .name_if_overloaded("proxy_memory_route")
         })?;
     let component_request = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
@@ -405,15 +405,19 @@ pub(super) async fn materialize_proxy_route(
     };
     let mut forwarded_body = Vec::with_capacity(encoded_length);
     serde_json::to_writer(&mut forwarded_body, &planned.forwarded_json)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("routing_materialize_proxy_route_1"))?;
     if let Some(context) = planned.wire_shim_context {
         let plugins = wire_shim_runtime(state);
         let configurations = plugins
             .resolved_traffic_configurations(
-                context.tenant_id.parse().map_err(|_| AppError::Internal)?,
+                context
+                    .tenant_id
+                    .parse()
+                    .map_err(|_| AppError::internal("routing_materialize_proxy_route_2"))?,
             )
             .await?;
-        let body = String::from_utf8(forwarded_body).map_err(|_| AppError::Internal)?;
+        let body = String::from_utf8(forwarded_body)
+            .map_err(|_| AppError::internal("routing_materialize_proxy_route_3"))?;
         let driver = planned.route.driver.clone();
         let protocol = context.protocol.clone();
         let outcome = crate::api::plugin_execution::run(
@@ -431,7 +435,7 @@ pub(super) async fn materialize_proxy_route(
             },
         )
         .await?
-        .ok_or(AppError::Internal)?;
+        .ok_or(AppError::internal("routing_materialize_proxy_route_1"))?;
         forwarded_body = outcome.request_json.into_bytes();
     }
     Ok(PreparedProxyRoute {

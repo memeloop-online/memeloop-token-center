@@ -148,6 +148,21 @@ pub(super) async fn readiness_snapshot(state: AppState) -> (StatusCode, Value) {
         })
         .await;
     let (status, mut body) = readiness_contract(database_ready, archive_ready);
+    #[cfg(feature = "experimental-plugin-revisions")]
+    let status = if let Some(authority) = &state.application_plugins {
+        let snapshot = authority.refresh_status();
+        let ready = snapshot["ready"] == true;
+        body["application_plugins"] = snapshot;
+        if ready {
+            status
+        } else {
+            body["status"] = json!("not_ready");
+            body["error"] = json!({"code": "application_plugin_snapshot_unavailable"});
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    } else {
+        status
+    };
     if !database_ready.is_ready() {
         let code = match database_ready {
             crate::metrics::DatabaseReadiness::SchemaOutdated { .. } => "database_schema_outdated",
@@ -191,8 +206,6 @@ pub(super) async fn prometheus_metrics(
             .load(std::sync::atomic::Ordering::Acquire),
         responses_request_spools: request_spool.active_files,
         responses_request_spool_used_bytes: request_spool.used_bytes,
-        responses_request_spool_limit_bytes: request_spool.limit_bytes,
-        responses_request_spool_capacity_rejections: request_spool.capacity_rejections,
         proxy_lifecycles: state.proxy_lifecycles.active(),
         proxy_archive_streams: crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
             .saturating_sub(state.proxy_archive_stream_permits.available_permits()),

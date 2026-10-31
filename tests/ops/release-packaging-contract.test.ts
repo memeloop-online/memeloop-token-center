@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { readdirSync } from 'node:fs';
 import test from 'node:test';
+import { runInNewContext } from 'node:vm';
 import { parse } from 'yaml';
 import { contains, occurrences, read, repository, run } from './contract-helpers.ts';
 
 type WorkflowStep = { id?: string; if?: string; name?: string; uses?: string; run?: string; with?: Record<string, unknown>; env?: Record<string, unknown> };
 type WorkflowJob = { if?: string; needs?: string | string[]; steps?: WorkflowStep[]; uses?: string; with?: Record<string, unknown> };
 type Workflow = {
+  on?: Record<string, unknown>;
   concurrency?: { group?: string; 'cancel-in-progress'?: boolean | string };
   jobs?: Record<string, WorkflowJob>;
 };
@@ -58,7 +60,7 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.doesNotMatch(manualMatrix, /"Dockerfile"|"Dockerfile\.plugin-installer"/);
   assert.equal(occurrences(workflow, ciMinioImage), 1);
   assert.equal(occurrences(workflow, ciMinioClientAsset), 1);
-  const minioSetup = (parse(workflow) as Workflow).jobs?.rust?.steps
+  const minioSetup = (parse(workflow) as Workflow).jobs?.['rust-suite']?.steps
     ?.find(step => step.name === 'Start MinIO and create integration-test bucket')?.run ?? '';
   assert.ok(!minioSetup.includes('public.ecr.aws'));
   assert.ok(!minioSetup.includes('apk add'));
@@ -157,7 +159,7 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.deepEqual(new Set(memoryAcceptanceNeeds), new Set(['changes', 'memory-binary']));
   assert.equal(memoryAcceptance?.uses, './.github/workflows/memory-acceptance.yml');
   assert.equal(memoryAcceptance?.with?.binary_artifact, 'memory-binary-${{ github.sha }}');
-  assert.equal(releaseInputAssembly?.if, "github.event_name == 'pull_request' && needs.changes.outputs.memory == 'true'");
+  assert.equal(releaseInputAssembly?.if, "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.memory == 'true'");
   const releaseInputAssemblyNeeds = Array.isArray(releaseInputAssembly?.needs)
     ? releaseInputAssembly.needs
     : releaseInputAssembly?.needs === undefined ? [] : [releaseInputAssembly.needs];
@@ -181,9 +183,9 @@ test('release contains only runtime images and no retired migration delivery sur
   const publish = parsed.jobs?.['publish-ghcr'];
   assert.ok(publish, 'publish-ghcr job is missing');
   assert.deepEqual(verifier?.needs, ['publish-ghcr']);
-  assert.match(
+  assert.equal(
     String(verifier?.if).replace(/\s+/g, ' ').trim(),
-    /^always\(\) && github\.event_name == 'push' && \(github\.ref == 'refs\/heads\/master' \|\| startsWith\(github\.ref, 'refs\/tags\/v'\)\) && needs\.publish-ghcr\.result == 'success'$/,
+    "always() && ((github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))) || (github.event_name == 'workflow_dispatch' && github.repository == 'memeloop-online/memeloop-token-center' && github.ref == 'refs/heads/master' && github.ref_protected == true)) && needs.publish-ghcr.result == 'success'",
     'verify-ghcr-release must not inherit skipped-ancestor propagation from publish prerequisites',
   );
   const publishSteps = publish.steps ?? [];
@@ -215,4 +217,67 @@ test('release contains only runtime images and no retired migration delivery sur
   assert.equal(cachedPluginBuild?.with?.load, true);
   for (const line of workflow.split('\n').filter((line) => /cargo (?:build|clippy|test|run|tree)(?:\s|$)/.test(line))) assert.ok(line.includes('--locked'), `Cargo command lacks --locked: ${line}`);
   run(process.execPath, ['web/scripts/verify-github-workflow-policy.mjs', '.github/workflows/ci.yml', repository]);
+});
+
+test('normal CI dispatch runs all validation and publishes only protected official master', () => {
+  const workflow = parse(read('.github/workflows/ci.yml')) as Workflow;
+  assert.ok(Object.hasOwn(workflow.on ?? {}, 'workflow_dispatch'));
+  assert.equal(workflow.on?.workflow_dispatch, null, 'dispatch must offer no gate-bypass inputs');
+  const jobs = workflow.jobs ?? {};
+  const outputs = { rust: 'true', web: 'true', migration: 'true', memory: 'true', memory_acceptance: 'true', plugin_installer: 'true', is_version_tag: 'false' };
+  const prerequisites = ['changes', 'repository-security', 'dependency-security', 'api-contract', 'packaging', 'memory-binary', 'web', 'rust', 'rust-suite', 'migration-smoke', 'memory-acceptance', 'release-input-assembly'];
+  const needs = Object.fromEntries([...prerequisites, 'publish-ghcr', 'verify-ghcr-release'].map(name => [name, { result: 'success', outputs: { ...outputs } }]));
+  const github = { event_name: 'workflow_dispatch', repository: 'memeloop-online/memeloop-token-center', ref: 'refs/heads/master', ref_protected: true };
+  const admits = (condition: string | undefined): boolean => {
+    assert.ok(condition, 'a guarded job must have a condition');
+    // These fixture expressions use GitHub's common boolean/equality subset.
+    // Bracket access preserves hyphenated GitHub job identifiers in JavaScript.
+    return runInNewContext(condition.replace(/needs\.([\w-]+)/g, 'needs["$1"]'), {
+      github, needs, always: () => true, startsWith: (value: string, prefix: string) => value.startsWith(prefix),
+    }) === true;
+  };
+  for (const name of ['publish-ghcr', 'verify-ghcr-release']) {
+    assert.equal(admits(jobs[name]?.if), true, `${name}: protected official master`);
+    for (const patch of [
+      { ref: 'refs/heads/feature' }, { ref: 'refs/tags/v0.1.3' }, { ref_protected: false },
+      { repository: 'fork/memeloop-token-center' }, { event_name: 'pull_request' },
+    ]) {
+      const original = { ...github };
+      Object.assign(github, patch);
+      assert.equal(admits(jobs[name]?.if), false, `${name}: ${JSON.stringify(patch)}`);
+      Object.assign(github, original);
+    }
+  }
+  assert.deepEqual(new Set(jobs['publish-ghcr']?.needs), new Set(prerequisites));
+  for (const name of prerequisites) {
+    for (const result of ['failure', 'cancelled', 'skipped']) {
+      needs[name]!.result = result;
+      assert.equal(admits(jobs['publish-ghcr']?.if), false, `${name}: ${result} must block full-scope dispatch`);
+    }
+    needs[name]!.result = 'success';
+  }
+  needs['publish-ghcr']!.result = 'skipped';
+  assert.equal(admits(jobs['verify-ghcr-release']?.if), false);
+  needs['publish-ghcr']!.result = 'success';
+  for (const name of ['web', 'rust', 'rust-suite', 'migration-smoke', 'memory-binary', 'memory-acceptance', 'release-input-assembly']) {
+    assert.equal(admits(jobs[name]?.if), true, `${name} must execute on dispatch`);
+  }
+  for (const name of ['Build the cached hardened plugin installer contract image', 'Build and exercise the hardened plugin installer image']) {
+    assert.equal(admits(jobs.packaging?.steps?.find(step => step.name === name)?.if), true, name);
+  }
+  assert.equal(admits(jobs.packaging?.steps?.find(step => step.name === 'Validate the unchanged plugin installer contract statically')?.if), false);
+  needs.changes!.outputs.is_version_tag = 'true';
+  assert.equal(admits(jobs['publish-github-release']?.if), false, 'dispatch cannot create a versioned GitHub release');
+  github.event_name = 'push';
+  github.ref_protected = false;
+  needs['release-input-assembly']!.result = 'skipped';
+  assert.equal(admits(jobs['publish-ghcr']?.if), true, 'existing master push behavior');
+  assert.equal(admits(jobs['verify-ghcr-release']?.if), true);
+  github.ref = 'refs/tags/v0.1.3';
+  assert.equal(admits(jobs['publish-ghcr']?.if), true, 'existing validated version-tag push behavior');
+  assert.equal(admits(jobs['verify-ghcr-release']?.if), true);
+  assert.equal(admits(jobs['publish-github-release']?.if), true);
+  needs.changes!.outputs.is_version_tag = 'false';
+  assert.equal(admits(jobs['publish-ghcr']?.if), false, 'unvalidated version tags remain blocked');
+  assert.equal(admits(jobs['publish-github-release']?.if), false);
 });

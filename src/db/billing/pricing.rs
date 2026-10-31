@@ -158,7 +158,9 @@ impl Database {
         .await?
         .into_iter()
         .next()
-        .ok_or(AppError::Internal)
+        .ok_or(AppError::internal(
+            "pricing_upsert_synced_model_price_tier_1",
+        ))
     }
 
     /// One bounded write transaction and one joined read per batch. Conditional
@@ -217,7 +219,8 @@ impl Database {
                 "cache_price_estimated": i64::from(price.cache_price_estimated),
             }));
         }
-        let input_json = serde_json::to_string(&rows).map_err(|_| AppError::Internal)?;
+        let input_json = serde_json::to_string(&rows)
+            .map_err(|_| AppError::internal("pricing_upsert_synced_model_price_tiers_1"))?;
         let input_sql = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "WITH incoming AS (SELECT * FROM jsonb_to_recordset(CAST($1 AS jsonb)) AS price(id TEXT, tier_id TEXT, model TEXT, service_tier TEXT, input_micros BIGINT, cached_micros BIGINT, cache_write_micros BIGINT, output_micros BIGINT, source TEXT, cache_price_estimated BIGINT))"
@@ -270,7 +273,8 @@ impl Database {
                 Self::MAX_LISTED_MODEL_PRICES
             )));
         }
-        let limit = i64::try_from(limit).map_err(|_| AppError::Internal)?;
+        let limit = i64::try_from(limit)
+            .map_err(|_| AppError::internal("pricing_list_model_prices_page_1"))?;
         let offset = i64::try_from(offset)
             .map_err(|_| AppError::BadRequest("model price offset is too large".into()))?;
         let rows = sqlx::query(
@@ -297,7 +301,8 @@ impl Database {
                 Self::MAX_LISTED_MODEL_PRICES
             )));
         }
-        let limit = i64::try_from(limit).map_err(|_| AppError::Internal)?;
+        let limit = i64::try_from(limit)
+            .map_err(|_| AppError::internal("pricing_list_model_prices_after_1"))?;
         let rows = sqlx::query(
             "WITH limited_prices AS (SELECT model, currency, input_micros_per_million, output_micros_per_million, source, updated_at FROM model_prices WHERE currency = $1 AND model > $2 ORDER BY model ASC LIMIT $3) SELECT p.model, p.currency, p.input_micros_per_million, p.output_micros_per_million, p.source, p.updated_at, t.service_tier AS tier_service_tier, t.input_micros_per_million AS tier_input_micros_per_million, t.cached_input_micros_per_million AS tier_cached_input_micros_per_million, t.cache_write_micros_per_million AS tier_cache_write_micros_per_million, t.output_micros_per_million AS tier_output_micros_per_million, t.source AS tier_source, t.updated_at AS tier_updated_at, t.cache_price_estimated AS tier_cache_price_estimated FROM limited_prices p LEFT JOIN model_price_tiers t ON t.model = p.model AND t.currency = p.currency ORDER BY p.model ASC, CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier",
         )
@@ -331,7 +336,8 @@ impl Database {
             if index > 0 {
                 statement.push_str(", ");
             }
-            write!(statement, "${}", index + 2).map_err(|_| AppError::Internal)?;
+            write!(statement, "${}", index + 2)
+                .map_err(|_| AppError::internal("pricing_model_price_views_for_models_1"))?;
         }
         statement.push_str(") ORDER BY p.model ASC, CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier");
         // SQL safety boundary: only monotonically generated `$N` placeholders are appended to
@@ -389,49 +395,34 @@ impl Database {
     }
 
     pub async fn model_price(&self, model: &str, currency: &str) -> Result<ModelPrice, AppError> {
-        let row = sqlx::query(
-            "SELECT id, input_micros_per_million, output_micros_per_million FROM model_prices WHERE model = $1 AND currency = $2",
-        )
-        .bind(model)
-        .bind(currency.to_uppercase())
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AppError::UnpricedModel)?;
-        let tiers = self.model_price_tiers(model, currency).await?;
-        Ok(ModelPrice {
-            id: parse_uuid(row.try_get("id")?)?,
-            input_micros_per_million: row.try_get("input_micros_per_million")?,
-            output_micros_per_million: row.try_get("output_micros_per_million")?,
-            tiers,
-        })
-    }
-
-    async fn model_price_tiers(
-        &self,
-        model: &str,
-        currency: &str,
-    ) -> Result<Vec<ModelPriceTier>, AppError> {
         let rows = sqlx::query(
-            "SELECT service_tier, input_micros_per_million, cached_input_micros_per_million, cache_write_micros_per_million, output_micros_per_million, source FROM model_price_tiers WHERE model = $1 AND currency = $2 ORDER BY CASE WHEN service_tier = 'default' THEN 0 ELSE 1 END, service_tier",
+            "SELECT p.id, p.input_micros_per_million, p.output_micros_per_million, t.service_tier, t.input_micros_per_million AS tier_input_micros_per_million, t.cached_input_micros_per_million, t.cache_write_micros_per_million, t.output_micros_per_million AS tier_output_micros_per_million, t.source FROM model_prices p LEFT JOIN model_price_tiers t ON t.model = p.model AND t.currency = p.currency WHERE p.model = $1 AND p.currency = $2 ORDER BY CASE WHEN t.service_tier = 'default' THEN 0 ELSE 1 END, t.service_tier",
         )
         .bind(model)
         .bind(currency.to_uppercase())
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(ModelPriceTier {
-                    service_tier: row.try_get("service_tier")?,
-                    input_micros_per_million: row.try_get("input_micros_per_million")?,
-                    cached_input_micros_per_million: row
-                        .try_get("cached_input_micros_per_million")?,
-                    cache_write_micros_per_million: row
-                        .try_get("cache_write_micros_per_million")?,
-                    output_micros_per_million: row.try_get("output_micros_per_million")?,
-                    source: row.try_get("source")?,
-                })
-            })
-            .collect()
+        let row = rows.first().ok_or(AppError::UnpricedModel)?;
+        let mut price = ModelPrice {
+            id: parse_uuid(row.try_get("id")?)?,
+            input_micros_per_million: row.try_get("input_micros_per_million")?,
+            output_micros_per_million: row.try_get("output_micros_per_million")?,
+            tiers: Vec::new(),
+        };
+        for row in rows {
+            let Some(service_tier) = row.try_get::<Option<String>, _>("service_tier")? else {
+                continue;
+            };
+            price.tiers.push(ModelPriceTier {
+                service_tier,
+                input_micros_per_million: row.try_get("tier_input_micros_per_million")?,
+                cached_input_micros_per_million: row.try_get("cached_input_micros_per_million")?,
+                cache_write_micros_per_million: row.try_get("cache_write_micros_per_million")?,
+                output_micros_per_million: row.try_get("tier_output_micros_per_million")?,
+                source: row.try_get("source")?,
+            });
+        }
+        Ok(price)
     }
 
     async fn model_price_view_from_base_row(
@@ -564,7 +555,9 @@ fn model_price_views_from_joined_rows(rows: Vec<AnyRow>) -> Result<Vec<ModelPric
         };
         prices
             .last_mut()
-            .ok_or(AppError::Internal)?
+            .ok_or(AppError::internal(
+                "pricing_model_price_views_from_joined_rows_1",
+            ))?
             .tiers
             .push(ModelPriceTierView {
                 service_tier,

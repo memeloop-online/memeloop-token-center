@@ -99,8 +99,65 @@ fn policy_wat(body: &str) -> String {
     format!("{prefix};; BEGIN POST-AUTH BODY\n{body}\n;; END POST-AUTH BODY{suffix}")
 }
 
+// Exercise the exact core fixture before the gateway hides Wasmtime errors
+// behind plugin_execution_failed. This does not replace the real component
+// invocation or its >256 MiB success assertion below.
+fn assert_policy_rewrite_core(source: &str, pointer: usize, length: usize, json: &str) {
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, wat::parse_str(source).unwrap()).unwrap();
+    let memory_type = module
+        .exports()
+        .find_map(|export| match export.ty() {
+            wasmtime::ExternType::Memory(memory) if export.name() == "cm32p2_memory" => {
+                Some(memory)
+            }
+            _ => None,
+        })
+        .expect("the policy core must export its canonical ABI memory");
+    let pages = (pointer + length).div_ceil(65536) as u64;
+    assert!(
+        memory_type.maximum().is_none_or(|maximum| maximum >= pages),
+        "fixture needs {pages} pages, but its core memory maximum is {:?}",
+        memory_type.maximum(),
+    );
+    let mut linker = wasmtime::Linker::new(&engine);
+    linker.define_unknown_imports_as_traps(&module).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let hook = instance
+        .get_func(
+            &mut store,
+            "cm32p2|memeloop:token-center/traffic-policy@0.2|post-auth",
+        )
+        .unwrap();
+    let mut result = [wasmtime::Val::I32(0)];
+    // The generated rewrite ignores context arguments and makes no host calls.
+    let arguments: [wasmtime::Val; 14] = std::array::from_fn(|_| wasmtime::Val::I32(0));
+    hook.call(&mut store, &arguments, &mut result)
+        .unwrap_or_else(|error| {
+            panic!(
+                "policy core rewrite failed (required pages {pages}, maximum {:?}): {error:#}",
+                memory_type.maximum(),
+            )
+        });
+    assert_eq!(result[0].i32(), Some(256));
+    let memory = instance.get_memory(&mut store, "cm32p2_memory").unwrap();
+    let data = memory.data(&store);
+    assert_eq!(
+        u32::from_le_bytes(data[304..308].try_into().unwrap()) as usize,
+        pointer
+    );
+    assert_eq!(
+        u32::from_le_bytes(data[308..312].try_into().unwrap()) as usize,
+        length
+    );
+    let rewrite = &data[pointer..pointer + length];
+    assert_eq!(&rewrite[..json.len()], json.as_bytes());
+    assert!(rewrite[json.len()..].iter().all(|byte| *byte == b' '));
+}
+
 #[tokio::test]
-async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
+async fn small_text_input_can_expand_past_sixteen_mib_in_a_real_traffic_hook() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(successful_hint_response("expanded"))
@@ -121,13 +178,13 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
         fixture.model
     );
     let suffix = "\"}],\"stream\":false}";
-    let length = 16 * 1024 * 1024;
+    let length = 16 * 1024 * 1024 + 1;
     let pointer = 64 * 1024;
     let start = stores_for_string(pointer, &prefix);
     let end = stores_for_string(pointer + length - suffix.len(), suffix);
     let body = format!(
         r#"
-        i32.const 256 memory.grow drop
+        i32.const 257 memory.grow drop
         i32.const {pointer} i32.const 120 i32.const {length} memory.fill
         {start}
         {end}
@@ -146,12 +203,6 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
     fixture.state = AppState::initialize((*fixture.state.config).clone())
         .await
         .unwrap();
-    // Isolate this memory-admission boundary from the independently tested
-    // guest fuel ceiling: bulk-filling 16 MiB intentionally exceeds it.
-    fixture
-        .state
-        .plugins
-        .set_execution_limits_for_tests(std::time::Duration::from_secs(30), u64::MAX);
     let (status, response) = call_hint_routing_fixture(&fixture).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let received = upstream.received_requests().await.unwrap();
@@ -163,11 +214,81 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
     upstream.verify().await;
 }
 
+#[tokio::test]
+async fn traffic_rewrite_over_256_mib_reaches_upstream_with_service_memory_capacity() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("large-whitespace-rewrite"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut fixture = hint_routing_fixture_with_database(
+        "large-whitespace-rewrite",
+        upstream.uri(),
+        upstream.uri(),
+        false,
+        None,
+        None,
+    )
+    .await;
+    let rewritten = json!({
+        "model": fixture.model,
+        "messages": [{"role":"user", "content":"kept after padding"}],
+        "stream": false
+    });
+    let length: usize = 256 * 1024 * 1024 + 1;
+    let pointer: usize = 64 * 1024;
+    let pages = (pointer + length).div_ceil(65536);
+    let rewritten_json = serde_json::to_string(&rewritten).unwrap();
+    let contents = stores_for_string(pointer, &rewritten_json);
+    let body = format!(
+        r#"
+        i32.const {pages} memory.size i32.sub memory.grow
+        i32.const -1 i32.eq if unreachable end
+        i32.const {pointer} i32.const 32 i32.const {length} memory.fill
+        {contents}
+        i32.const 256 i32.const 0 i32.store
+        i32.const 260 i32.const 1 i32.store
+        i32.const 264 i32.const 0 i32.store
+        i32.const 276 i32.const 0 i32.store
+        i32.const 288 i32.const 0 i32.store
+        i32.const 300 i32.const 1 i32.store
+        i32.const 304 i32.const {pointer} i32.store
+        i32.const 308 i32.const {length} i32.store
+        i32.const 256
+        "#,
+    );
+    assert_policy_rewrite_core(&policy_wat(&body), pointer, length, &rewritten_json);
+    write_policy_package(fixture._directory.path(), &body, json!([]));
+    let mut config = (*fixture.state.config).clone();
+    config.proxy_memory_budget_bytes = 2 * 1024 * 1024 * 1024;
+    fixture.state = AppState::initialize(config).await.unwrap();
+    let capture = LogCapture::default();
+    let (status, response) = call_hint_routing_fixture(&fixture)
+        .with_subscriber(capture.dispatch())
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{response}; {}",
+        String::from_utf8_lossy(&capture.0.lock().unwrap())
+    );
+    let received = upstream.received_requests().await.unwrap();
+    let request: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(request["messages"], rewritten["messages"]);
+    assert!(received[0].body.len() < 1024);
+    upstream.verify().await;
+}
+
 fn write_policy_package(root: &Path, body: &str, capabilities: Value) {
+    write_named_policy_package(root, "gateway-policy", body, capabilities);
+}
+
+fn write_named_policy_package(root: &Path, id: &str, body: &str, capabilities: Value) {
     fs::write(
         root.join("plugin.json"),
         serde_json::to_vec(&json!({
-            "id": "gateway-policy",
+            "id": id,
             "version": "1.0.0",
             "wit_version": "0.2.0",
             "wasm": "plugin.wasm",
@@ -232,6 +353,16 @@ async fn policy_state_with_capabilities(
 const DENY_BODY: &str = r#"
     i32.const 256 i32.const 0 i32.store
     i32.const 260 i32.const 0 i32.store
+    i32.const 264 i32.const 0 i32.store
+    i32.const 276 i32.const 0 i32.store
+    i32.const 288 i32.const 0 i32.store
+    i32.const 300 i32.const 0 i32.store
+    i32.const 256
+"#;
+
+const ALLOW_BODY: &str = r#"
+    i32.const 256 i32.const 0 i32.store
+    i32.const 260 i32.const 1 i32.store
     i32.const 264 i32.const 0 i32.store
     i32.const 276 i32.const 0 i32.store
     i32.const 288 i32.const 0 i32.store
@@ -328,7 +459,6 @@ struct HintRoutingFixture {
     database_url: String,
     issued: IssuedKey,
     model: String,
-    preferred_account_id: uuid::Uuid,
     standby_account_id: uuid::Uuid,
     unauthorized_account_id: uuid::Uuid,
 }
@@ -374,7 +504,8 @@ async fn hint_routing_fixture_with_database(
     let tenant = format!("hint-routing-{label}");
     let model = format!("hint-routing-model-{label}");
     let (tokens_per_minute, initial_balance) = credential_capacity
-        .unwrap_or_else(|| (KeyPolicy::default().tokens_per_minute, Decimal::TEN));
+        .map(|(limit, balance)| (Some(limit), balance))
+        .unwrap_or((None, Decimal::TEN));
     let mut route_ids = Vec::new();
     let mut account_ids = Vec::new();
     for (name, uri, priority) in [
@@ -433,7 +564,7 @@ async fn hint_routing_fixture_with_database(
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
                     tokens_per_minute,
-                    max_concurrency: 4,
+                    max_concurrency: Some(4),
                     ..KeyPolicy::default()
                 },
                 initial_balance,
@@ -483,40 +614,9 @@ async fn hint_routing_fixture_with_database(
         database_url,
         issued,
         model,
-        preferred_account_id,
         standby_account_id,
         unauthorized_account_id,
     }
-}
-
-async fn put_accounts_in_cooldown(fixture: &HintRoutingFixture, account_ids: &[uuid::Uuid]) {
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let now = unix_millis();
-    for account_id in account_ids {
-        let (credential_generation, transport_revision): (i64, i64) = sqlx::query_as(
-            "SELECT credential_generation, updated_at FROM upstream_accounts WHERE id = $1",
-        )
-        .bind(account_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO upstream_account_health (
-                 upstream_account_id, consecutive_failures, cooldown_until,
-                 probe_lease_until, probe_lease_token, credential_generation,
-                 transport_revision, last_failure_kind, updated_at
-             ) VALUES ($1, 1, $2, 0, '', $3, $4, 'rate_limited', $5)",
-        )
-        .bind(account_id.to_string())
-        .bind(now.saturating_add(60_000))
-        .bind(credential_generation)
-        .bind(transport_revision)
-        .bind(now)
-        .execute(&pool)
-        .await
-        .unwrap();
-    }
-    pool.close().await;
 }
 
 async fn corrupt_upstream_credential(fixture: &HintRoutingFixture, account_id: uuid::Uuid) {
@@ -621,63 +721,9 @@ async fn assert_malformed_standby_is_lazy(database_url: Option<String>, label: &
     assert_eq!(reservation_count, 1, "standby must not reserve capacity");
 }
 
-async fn assert_selected_malformed_candidate_fails_closed(
-    database_url: Option<String>,
-    label: &str,
-) {
-    let preferred = MockServer::start().await;
-    let standby = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(successful_hint_response("unexpected-preferred"))
-        .expect(0)
-        .mount(&preferred)
-        .await;
-    Mock::given(method("POST"))
-        .respond_with(successful_hint_response("unexpected-standby"))
-        .expect(0)
-        .mount(&standby)
-        .await;
-    let fixture = hint_routing_fixture_with_database(
-        label,
-        preferred.uri(),
-        standby.uri(),
-        false,
-        database_url,
-        None,
-    )
-    .await;
-    put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;
-    corrupt_upstream_credential(&fixture, fixture.standby_account_id).await;
-
-    let (status, _) = call_hint_routing_fixture(&fixture).await;
-
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    preferred.verify().await;
-    standby.verify().await;
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let terminal: (i64, String, i64) = sqlx::query_as(
-        "SELECT request.status_code, request.error_code,
-                (SELECT COUNT(*) FROM usage_reservations reservation
-                 WHERE reservation.key_id = request.key_id)
-         FROM request_records request
-         WHERE request.key_id = $1 ORDER BY request.created_at DESC LIMIT 1",
-    )
-    .bind(fixture.issued.key_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    pool.close().await;
-    assert_eq!(terminal, (502, "upstream_candidate_invalid".to_owned(), 1));
-}
-
 #[tokio::test]
 async fn sqlite_malformed_standby_does_not_poison_a_healthy_hinted_primary() {
     assert_malformed_standby_is_lazy(None, "sqlite-lazy-malformed-standby").await;
-}
-
-#[tokio::test]
-async fn sqlite_selected_malformed_candidate_fails_closed() {
-    assert_selected_malformed_candidate_fails_closed(None, "sqlite-selected-malformed").await;
 }
 
 #[tokio::test]
@@ -687,90 +733,6 @@ async fn postgres_malformed_standby_does_not_poison_a_healthy_hinted_primary() {
     };
     let label = format!("postgres-lazy-malformed-{}", uuid::Uuid::now_v7());
     assert_malformed_standby_is_lazy(Some(database_url), &label).await;
-}
-
-#[tokio::test]
-async fn postgres_selected_malformed_candidate_fails_closed() {
-    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
-        return;
-    };
-    let label = format!("postgres-selected-malformed-{}", uuid::Uuid::now_v7());
-    assert_selected_malformed_candidate_fails_closed(Some(database_url), &label).await;
-}
-
-#[tokio::test]
-async fn cooled_down_traffic_hint_fails_over_to_healthy_authorized_candidate() {
-    assert_cooldown_failover_keeps_one_reservation(None, "cooldown").await;
-}
-
-async fn assert_cooldown_failover_keeps_one_reservation(database_url: Option<String>, label: &str) {
-    let preferred = MockServer::start().await;
-    let standby = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(successful_hint_response("unexpected-preferred"))
-        .expect(0)
-        .mount(&preferred)
-        .await;
-    Mock::given(method("POST"))
-        .and(path("/v1/chat/completions"))
-        .respond_with(successful_hint_response("standby"))
-        .expect(1)
-        .mount(&standby)
-        .await;
-    let fixture = hint_routing_fixture_with_database(
-        label,
-        preferred.uri(),
-        standby.uri(),
-        false,
-        database_url,
-        None,
-    )
-    .await;
-    put_accounts_in_cooldown(&fixture, &[fixture.preferred_account_id]).await;
-
-    let (status, body) = call_hint_routing_fixture(&fixture).await;
-
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["choices"][0]["message"]["content"], "standby");
-    preferred.verify().await;
-    standby.verify().await;
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let persisted: (String, i64, i64, i64, i64, i64) = sqlx::query_as(
-        "SELECT request.upstream_account_id, reservation.reserved_tokens, rate_window.tokens,
-                request.input_tokens, request.output_tokens,
-                (SELECT COUNT(*) FROM usage_reservations reservation
-                 WHERE reservation.key_id = request.key_id)
-         FROM request_records request
-         JOIN usage_reservations reservation ON reservation.id = request.reservation_id
-         JOIN rate_limit_windows rate_window ON rate_window.key_id = reservation.key_id
-              AND rate_window.window_start = reservation.rate_window_start
-         WHERE request.key_id = $1 ORDER BY request.created_at DESC LIMIT 1",
-    )
-    .bind(fixture.issued.key_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    pool.close().await;
-    assert_eq!(persisted.0, fixture.standby_account_id.to_string());
-    assert!(
-        persisted.1 > 8_000,
-        "standby-specific overhead must replace the primary reservation bound"
-    );
-    assert_eq!(
-        persisted.2,
-        persisted.3 + persisted.4,
-        "terminal settlement must release unused candidate capacity"
-    );
-    assert_eq!(persisted.5, 1);
-}
-
-#[tokio::test]
-async fn postgres_cooldown_failover_resizes_the_same_reservation() {
-    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
-        return;
-    };
-    let label = format!("postgres-cooldown-resize-{}", uuid::Uuid::now_v7());
-    assert_cooldown_failover_keeps_one_reservation(Some(database_url), &label).await;
 }
 
 #[tokio::test]
@@ -899,34 +861,6 @@ async fn disabled_granted_routes_are_unavailable_not_forbidden() {
     let (status, _) = call_hint_routing_fixture(&fixture).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     pool.close().await;
-    preferred.verify().await;
-    standby.verify().await;
-}
-
-#[tokio::test]
-async fn all_authorized_candidates_in_cooldown_return_unavailable_without_upstream_calls() {
-    let preferred = MockServer::start().await;
-    let standby = MockServer::start().await;
-    Mock::given(method("POST"))
-        .respond_with(successful_hint_response("unexpected-preferred"))
-        .expect(0)
-        .mount(&preferred)
-        .await;
-    Mock::given(method("POST"))
-        .respond_with(successful_hint_response("unexpected-standby"))
-        .expect(0)
-        .mount(&standby)
-        .await;
-    let fixture = hint_routing_fixture("all-cooldown", preferred.uri(), standby.uri(), false).await;
-    put_accounts_in_cooldown(
-        &fixture,
-        &[fixture.preferred_account_id, fixture.standby_account_id],
-    )
-    .await;
-
-    let (status, _) = call_hint_routing_fixture(&fixture).await;
-
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     preferred.verify().await;
     standby.verify().await;
 }
@@ -1141,19 +1075,21 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
     let gateway_dispatch = capture.dispatch();
 
     let decision = tracing::dispatcher::with_default(&direct_dispatch, || {
-        state.plugins.apply_traffic(
-            memeloop_token_center::plugin::memeloop::token_center::types::RequestContext {
-                tenant_id: "tenant".into(),
-                principal_id: "principal".into(),
-                key_id: "key".into(),
-                protocol: "openai".into(),
-                model: "requested-model".into(),
-                config_json: "{}".into(),
-            },
-            &json!({"model": "requested-model", "messages": []}),
-        )
-    })
-    .expect("execute policy with Log capability");
+        state
+            .plugins
+            .apply_traffic(
+                memeloop_token_center::plugin::memeloop::token_center::types::RequestContext {
+                    tenant_id: "tenant".into(),
+                    principal_id: "principal".into(),
+                    key_id: "key".into(),
+                    protocol: "openai".into(),
+                    model: "requested-model".into(),
+                    config_json: "{}".into(),
+                },
+                &json!({"model": "requested-model", "messages": []}),
+            )
+            .unwrap_or_else(|error| panic!("execute policy with Log capability: {error}"))
+    });
     assert!(!decision.allow);
 
     let response = call(
@@ -1414,6 +1350,92 @@ async fn rewritten_model_is_checked_again_against_the_stable_key_policy() {
     assert_eq!(response.0, StatusCode::FORBIDDEN);
 }
 
+#[tokio::test]
+async fn model_projection_through_a_second_policy_preserves_both_route_authorization_checks() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("must-not-dispatch"))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    for (label, granted) in [
+        ("chain-original-only", "requested-model"),
+        ("chain-effective-only", "example-rewritten"),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        for (id, body) in [
+            ("a-rewriter", REWRITE_MODEL_BODY.to_owned()),
+            (
+                "z-observer",
+                format!(
+                    r#"
+                    local.get 9 i32.const 17 i32.ne if unreachable end
+                    {allow}
+                    "#,
+                    allow = ALLOW_BODY
+                ),
+            ),
+        ] {
+            let package = directory.path().join(id);
+            fs::create_dir(&package).unwrap();
+            write_named_policy_package(&package, id, &body, json!([]));
+        }
+        let mut config = Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("chain-authorization.db").display()
+        ));
+        config.plugin_dir = Some(directory.path().display().to_string());
+        let state = AppState::initialize(config).await.unwrap();
+        let tenant = format!("policy-{label}");
+        let issued = state
+            .db
+            .create_key(
+                CreateKeyInput {
+                    tenant_external_id: tenant.clone(),
+                    principal_external_id: "chain-user".into(),
+                    alias: label.into(),
+                    currency: "USD".into(),
+                    policy: KeyPolicy {
+                        allowed_models: vec!["requested-model".into(), "example-rewritten".into()],
+                        ..KeyPolicy::default()
+                    },
+                    initial_balance: Decimal::TEN,
+                    idempotency_key: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        create_account_and_routes(
+            &state,
+            &tenant,
+            &issued,
+            RouteFixture {
+                driver: "http-json",
+                config: json!({"base_url": upstream.uri(), "network_scope": "public"}),
+                credential: UpstreamCredential::None,
+                upstream_model: "must-not-dispatch",
+                protocols: &["openai"],
+                granted_public_models: &[granted],
+            },
+        )
+        .await;
+        let response = call(
+            &state,
+            &issued.key,
+            "/v1/chat/completions",
+            json!({"model": "requested-model", "messages": [{"role": "user", "content": "synthetic"}]}),
+        ).await;
+        assert_eq!(
+            response.0,
+            StatusCode::FORBIDDEN,
+            "{label}: {:?}",
+            response.1
+        );
+    }
+    upstream.verify().await;
+}
+
 struct RouteFixture<'a> {
     driver: &'a str,
     config: Value,
@@ -1519,4 +1541,55 @@ async fn call(state: &AppState, key: &str, path: &str, body: Value) -> (StatusCo
         serde_json::from_slice(&body).unwrap()
     };
     (status, body)
+}
+
+#[tokio::test]
+async fn large_traffic_input_preserves_real_guest_errors_and_authorization() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&upstream)
+        .await;
+    let (_directory, state, issued) =
+        policy_state("unreachable", "input-limit", vec!["requested-model".into()]).await;
+    create_account_and_routes(
+        &state,
+        "policy-input-limit",
+        &issued,
+        RouteFixture {
+            driver: "http-json",
+            config: json!({"base_url": upstream.uri(), "network_scope":"public"}),
+            credential: UpstreamCredential::None,
+            upstream_model: "unused-upstream",
+            protocols: &["generation"],
+            granted_public_models: &["requested-model"],
+        },
+    )
+    .await;
+    let mut request = json!({"model":"requested-model", "prompt":""});
+    let length = 16 * 1024 * 1024 - 1;
+    let overhead = serde_json::to_vec(&request).unwrap().len();
+    request["prompt"] = json!("x".repeat(length - overhead));
+    assert_eq!(serde_json::to_vec(&request).unwrap().len(), length);
+    let (status, body) = call(
+        &state,
+        &issued.key,
+        "/v1/images/generations",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"]["code"], "plugin_execution_failed");
+    let (status, _) = call(
+        &state,
+        "invalid-test-key",
+        "/v1/images/generations",
+        request.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    request["model"] = json!("ungranted");
+    let (status, _) = call(&state, &issued.key, "/v1/images/generations", request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }

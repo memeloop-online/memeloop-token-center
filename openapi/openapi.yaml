@@ -227,6 +227,9 @@ paths:
         from a service token. The selected key's normal gateway model grants,
         routing policy, expiry, rate limits, balance and billing apply. Its secret
         and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
         Requires an active key with a stored copyable credential. Only JSON
         completions are supported; stream=true is rejected.
       security: [{ serviceBearer: [] }]
@@ -243,6 +246,7 @@ paths:
               required: [key_id, request]
               properties:
                 key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
                 request:
                   type: object
                   additionalProperties: true
@@ -272,6 +276,9 @@ paths:
         from a service token. The selected key's normal gateway model grants,
         routing policy, expiry, rate limits, balance and billing apply. Its secret
         and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
         Requires an active key with a stored copyable credential. Only JSON
         messages are supported; stream=true is rejected.
       security: [{ serviceBearer: [] }]
@@ -288,6 +295,7 @@ paths:
               required: [key_id, request]
               properties:
                 key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
                 request:
                   type: object
                   additionalProperties: true
@@ -301,6 +309,55 @@ paths:
               schema: { type: object, additionalProperties: true }
         '400':
           description: Invalid JSON Messages request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /internal/v1/inference/responses:
+    post:
+      tags: [Client credentials]
+      operationId: operatorResponse
+      summary: Run inference using an explicitly authorized billing credential
+      description: |
+        Requires the same keys:write scope and tenant authorization as copying the
+        selected existing key. Does not mint a credential or infer a user identity
+        from a service token. The selected key's normal gateway model grants,
+        routing policy, expiry, rate limits, balance and billing apply. Its secret
+        and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
+        Requires an active key with a stored copyable credential. Only JSON
+        Responses are supported; stream=true is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key_id, request]
+              properties:
+                key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
+                request:
+                  type: object
+                  additionalProperties: true
+                  properties:
+                    stream: { type: boolean, const: false }
+      responses:
+        '200':
+          description: OpenAI Responses result including image generation output, billed to the selected key
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: Invalid JSON Responses request
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -1159,44 +1216,13 @@ paths:
         '500': { $ref: '#/components/responses/InternalError' }
         '503': { description: Export validation capacity or the database is unavailable; no publication occurs. }
 
-  /internal/v1/plugin-runtime/installations:
-    post:
-      tags: [System]
-      operationId: installPluginInventory
-      summary: Install new signed OCI packages into an inactive inventory for review
-      description: Requires host installation policy. The host owns storage roots, allowed repositories, Cosign trust keys and registry credential files. Only digest-pinned references and a fresh inventory ID are accepted. A durable task survives HTTP disconnect; exact retries reuse the task. Successful download does not register grants or publish a revision.
-      security: [{ serviceBearer: [] }]
-      x-required-scope: plugins:write
-      x-global-operator-only: true
-      parameters:
-        - { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 1, maxLength: 200 } }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: false
-              required: [inventory_id, packages]
-              properties:
-                inventory_id: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
-                packages:
-                  type: array
-                  minItems: 1
-                  maxItems: 16
-                  uniqueItems: true
-                  items: { type: string, maxLength: 2048, pattern: '^[^@]+@sha256:[0-9A-Fa-f]{64}$' }
-      responses:
-        '202':
-          description: Durable installation task or exact replay.
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/PluginInstallation' }
-        '400': { $ref: '#/components/responses/InvalidRequest' }
-        '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { $ref: '#/components/responses/Forbidden' }
-        '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
+  "/internal/v1/plugin-runtime/release-resolutions": {"post":{"tags":["System"],"operationId":"resolvePluginRelease","summary":"Resolve a GitHub release asset for explicit source and signer confirmation","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"responses":{"200":{"description":"Private response; credentials are never returned."},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"409":{"$ref":"#/components/responses/Conflict"},"502":{"description":"Release download dependency failure. Fixed error codes: plugin_release_dns_failed, plugin_release_connection_failed, plugin_release_request_failed, plugin_release_body_failed, plugin_release_http_failed, plugin_release_client_failed. URLs, credentials and remote bodies are never returned."},"503":{"description":"Release download capacity is exhausted (service_overloaded)."},"504":{"description":"Release download deadline exceeded (plugin_release_timeout)."}},"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["url"],"properties":{"url":{"type":"string","format":"uri","maxLength":2048},"network":{"$ref":"#/components/schemas/PluginInstallerNetworkInput"}}}}}},"parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1,"maxLength":200}}],"description":"Downloads a bounded HTTPS GitHub release JSON asset through the frozen installation network. Returns id, base_revision, release_url, descriptor_sha256, source and descriptor with reference and signer. Discovery does not authorize the signer: the operator must explicitly confirm it in the installation request. The descriptor and current approved plugin inventory are persisted; install and retry never refetch the URL. No private roots, proxy credentials or retained grants are returned."}}
+
+  "/internal/v1/plugin-runtime/installer-network": {"get":{"tags":["System"],"operationId":"getPluginInstallerNetwork","summary":"Read remembered installer network without proxy password","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"responses":{"200":{"description":"Private response; credentials are never returned."},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"409":{"$ref":"#/components/responses/Conflict"}}},"put":{"tags":["System"],"operationId":"putPluginInstallerNetwork","summary":"Remember the installation network","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"responses":{"200":{"description":"Private response; credentials are never returned."},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"409":{"$ref":"#/components/responses/Conflict"}},"requestBody":{"required":true,"content":{"application/json":{"schema":{"$ref":"#/components/schemas/PluginInstallerNetworkInput"}}}},"description":"Credentials are encrypted at rest. default freezes the deployment network; direct bypasses it. Custom HTTP or SOCKS proxy DNS is frozen to approved addresses. HTTPS proxy hostnames are rejected for the external installer; HTTPS IP endpoints are supported. An omitted password preserves the remembered password only for the same URL and username; empty clears it."}}
+
+  "/internal/v1/plugin-runtime/installer-network/groups": {"get":{"tags":["System"],"operationId":"listPluginInstallerNetworkGroups","summary":"List installation proxy groups for one tenant","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"responses":{"200":{"description":"Private response; credentials are never returned."},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"409":{"$ref":"#/components/responses/Conflict"}},"parameters":[{"name":"tenant_external_id","in":"query","required":true,"schema":{"type":"string"}}],"description":"Also requires providers:read for the tenant. Returns the existing safe transport group list with versions and member IDs; never returns proxy credentials."}}
+
+  /internal/v1/plugin-runtime/installations: {"post":{"tags":["System"],"operationId":"installPluginInventory","summary":"Install new signed OCI packages into an inactive inventory for review","description":"A normal browser install supplies release_resolution_id and release_descriptor_sha256 as explicit confirmation of the displayed source, immutable reference and exact signing identity. Its inventory ID is generated server side. The frozen resolution authorizes only this installation; host source policy is not changed. Current exact approved plugins are retained without downloading or reapproving them. The base runtime revision is checked before review, approval and publication; conflicts require a new resolution. Existing digest-pinned OCI packages and inventory_id remain the advanced interface. Full Cosign verification and a subsequent explicit capability review are required. Network credentials travel to the installer only through bounded anonymous stdin, never argv, environment or temporary files.","security":[{"serviceBearer":[]}],"x-required-scope":"plugins:write","x-global-operator-only":true,"parameters":[{"name":"Idempotency-Key","in":"header","required":true,"schema":{"type":"string","minLength":1,"maxLength":200}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"properties":{"inventory_id":{"type":"string","pattern":"^[A-Za-z0-9_-]{1,64}$"},"packages":{"type":"array","minItems":0,"maxItems":16,"uniqueItems":true,"items":{"type":"string","maxLength":2048,"pattern":"^[^@]+@sha256:[0-9A-Fa-f]{64}$"}},"release_resolution_id":{"type":"string","format":"uuid"},"release_descriptor_sha256":{"type":"string","pattern":"^sha256:[0-9a-f]{64}$"},"network":{"$ref":"#/components/schemas/PluginInstallerNetworkInput"}}}}}},"responses":{"202":{"description":"Durable installation task or exact replay.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/PluginInstallation"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"$ref":"#/components/responses/Conflict"}}}}
 
   /internal/v1/plugin-runtime/installations/{id}:
     parameters:
@@ -1376,6 +1402,42 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /internal/v1/plugin-runtime/uninstall:
+    post:
+      tags: [System]
+      operationId: uninstallApplicationPlugin
+      summary: Uninstall one active plugin using revision CAS (experimental)
+      description: Global operators only. Requires host-only MTC_PLUGIN_INVENTORY_FILE. Derives an immutable subset of the approved current inventory and publishes expected_revision plus one. Retained approvals, configuration, package cache and historical revisions are preserved. Removing the last plugin publishes a durable empty inventory, even if the removed package is unavailable. Only plugin_id and expected_revision are accepted. Exact idempotency replay is actor-bound and returns the original receipt; stale revisions and reused keys with different requests conflict without automatic rebasing.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: plugins:write
+      x-global-operator-only: true
+      x-experimental-feature: experimental-plugin-revisions
+      parameters: [{ $ref: '#/components/parameters/RequiredIdempotencyKey' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [plugin_id, expected_revision]
+              properties:
+                plugin_id: { type: string, pattern: '^[a-z0-9-]{1,64}$' }
+                expected_revision: { type: integer, format: int64, minimum: 1, maximum: 9223372036854775806 }
+      responses:
+        '200':
+          description: Original uninstall publication receipt, including exact replay.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationPluginRevision' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { description: The requested plugin is not present in the expected current plugin inventory. }
+        '409': { description: 'The current plugin revision changed, no published revision exists, or the idempotency key belongs to another request or actor.' }
+        '503': { description: 'Plugin compilation, inventory publication or storage admission is busy; retry the identical idempotent request.' }
         '500': { $ref: '#/components/responses/InternalError' }
 
   /internal/v1/plugin-runtime/rollback:
@@ -2200,6 +2262,31 @@ paths:
             Retry-After: { schema: { type: integer, minimum: 1 } }
 
   /internal/v1/upstreams/{account_id}/health:
+    get:
+      tags: [Upstream providers]
+      operationId: readUpstreamProviderHealth
+      summary: Read the latest independent upstream service probe
+      description: |
+        Returns the stored result of the periodic or manually requested service
+        probe. Customer requests do not update this result. `null` means no probe
+        has completed yet.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Stored probe, or null when none has completed.
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: '#/components/schemas/UpstreamHealthResult'
+                  - type: 'null'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
     post:
       tags: [Upstream providers]
       operationId: probeUpstreamProviderHealth
@@ -2339,6 +2426,37 @@ paths:
           description: Version, binding, in-use, or capacity conflict; see error.code.
         '503':
           description: Configuration storage temporarily unavailable.
+  /internal/v1/transport-proxy-groups/{group_id}/probe:
+    post:
+      tags: [Upstream providers]
+      operationId: probeTransportProxyGroup
+      summary: Queue an independent reachability probe for a proxy group
+      description: |
+        Marks the group's current exits for the next independent probe. The probe
+        uses its own connection and does not carry a customer request. The stored
+        verdict is visible on the group after that probe finishes.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - in: path
+          name: group_id
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/RequiredTenant'
+      responses:
+        '202':
+          description: Probe requested for the accounts currently bound in this process.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [requested_accounts]
+                properties:
+                  requested_accounts: { type: integer, minimum: 0 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
   /internal/v1/transport-proxy-groups/{group_id}:
     get:
       tags: [Upstream providers]
@@ -3619,6 +3737,42 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/filter-model-names:
+    get:
+      tags: [Routes and pricing]
+      operationId: listFilterModelNames
+      summary: Suggest distinct public model names across accounts and channels
+      description: >-
+        Name-only historical filter suggestions, including disabled and archived routes.
+        Literal case-insensitive substring search over route configuration; no account
+        availability checks or request-history scan. Response is bounded; narrow the
+        search for more names. Model filter equality remains exact and independent
+        of route and account identity.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: routes:read
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+        - name: search
+          in: query
+          schema: { type: string, maxLength: 200, default: '' }
+          description: Literal substring, not a SQL wildcard. At most 200 UTF-8 bytes and no control characters.
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50 }
+          description: Clamped to 1–100.
+      responses:
+        '200':
+          description: Distinct model names ordered by name.
+          content:
+            application/json:
+              schema:
+                type: array
+                maxItems: 100
+                uniqueItems: true
+                items: { type: string }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
   /internal/v1/model-routes:
     get:
       tags: [Routes and pricing]
@@ -5401,6 +5555,127 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /internal/v1/sessions/{session_id}/requests/{request_id}/context:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionContext
+      summary: Read one bounded page of retained semantic conversation history
+      description: Returns at most 32 prefix nodes. Tool bodies are excluded. Signed continuations bind tenant, stable key, session, request and immutable prefix leaf. Canonical semantic content is not a byte-exact archive.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+        - $ref: '#/components/parameters/ContextCursor'
+        - $ref: '#/components/parameters/ContextDetails'
+        - $ref: '#/components/parameters/ContextResponseOnly'
+      responses:
+        '200':
+          description: Chronologically ordered page with an optional earlier-page continuation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionContextPage' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Retained prefix path is incomplete or inconsistent. }
+
+  /internal/v1/sessions/{session_id}/requests/{request_id}/dialogue:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionDialogue
+      summary: Read the cleaned session dialogue stored for this request
+      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+      responses:
+        '200':
+          description: Cleaned dialogue turns for viewing and training export.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionDialogue' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /internal/v1/sessions/{session_id}/requests/{request_id}/context/content:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionContextContent
+      summary: Read one signed content or text-only character range
+      description: Requires a content or text cursor issued by the context page. At most 16384 Unicode scalar values are returned; subsequent reads recheck caller authorization. Text cursors exclude embedded tool and media content.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+        - name: cursor
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 4096 }
+      responses:
+        '200':
+          description: Bounded content with scalar offsets and an optional continuation.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionContextContent' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Retained content is incomplete or inconsistent. }
+
+  /internal/v1/sessions/{session_id}/title:
+    parameters:
+      - $ref: '#/components/parameters/ContextSessionId'
+      - $ref: '#/components/parameters/TenantFilter'
+      - $ref: '#/components/parameters/ContextKeyId'
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionTitle
+      summary: Read the generated title and generation state
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      responses:
+        '200':
+          description: Current title and background job status.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionGeneratedTitle' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      tags: [Operator traffic]
+      operationId: generateOperatorSessionTitle
+      summary: Queue title generation with the configured system assistant
+      description: Requires requests:read and filter_assistant:execute. Uses the configured model route and billing credential. Repeated requests while queued or running coalesce. Existing titles remain visible until a replacement commits. Closing the page does not cancel the background operation.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: filter_assistant:execute
+      x-additional-required-scopes: [requests:read]
+      responses:
+        '200':
+          description: Accepted or already queued title job.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionGeneratedTitle' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/requests/{request_id}/assets/{asset_id}:
     get:
       tags: [Operator traffic]
@@ -5633,16 +5908,32 @@ paths:
       operationId: getOperatorUsageAnalysis
       summary: Analyze bounded tenant or global usage from hourly or daily rollups
       description: |
-        Reads only compact terminal request and generation rollups; it never scans the raw
-        request table. `auto` selects hourly buckets through 31 days and daily buckets for
+        Reads compact terminal request and generation rollups with exact boundary facts.
+        The full and output_rate projections also read retained terminal records for exact
+        provider-reported, successful, non-compaction output rates.
+        `auto` selects hourly buckets through 31 days and daily buckets for
         longer ranges. Omitted bounds default to the last 24 hours (`auto`/`hour`) or seven
         days (`day`). The inclusive interval may not exceed 93 days, and explicit hourly
         intervals may not exceed 31 days. Bucket starts and heatmap coordinates are UTC.
         Costs are returned as a currency-keyed array and are never added across currencies.
         Duration P95 values are bounded-histogram approximations capped at 60000 ms.
+        Explicit projections retain the same response envelope. Unselected arrays are empty
+        and unselected summary metrics are zero placeholders, not usage totals.
+        overview returns summary, time_series, and generation breakdowns; trends returns
+        summary and time_series; dimensions returns by_model, by_key, by_upstream,
+        by_protocol, by_status, and errors plus summary and time_series.
+        sessions returns by_session; heatmap returns heatmap. These projections omit output_rate.
+        output_rate runs only the exact output-rate query and returns summary.output_rate
+        and time_series entries containing bucket_start and output_rate; other metrics are
+        zero placeholders. Merge rates by bucket_start, treating absent buckets as zero samples.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:
+        - name: projection
+          in: query
+          required: false
+          description: Select only the analysis needed by the current view; full preserves the complete legacy response.
+          schema: { type: string, enum: [full, overview, trends, dimensions, sessions, heatmap, output_rate], default: full }
         - $ref: '#/components/parameters/TenantFilter'
         - $ref: '#/components/parameters/FromCreatedAt'
         - $ref: '#/components/parameters/ToCreatedAt'
@@ -5692,11 +5983,18 @@ paths:
       description: |
         Uses the same tenant scope, filters, inclusive range, bucket selection, and metric
         aggregation as the complete usage-analysis resource. The response is restricted to
-        summary and time-series data and executes one business aggregation statement; it does
-        not load dimension, session, generation-breakdown, or heatmap projections.
+        summary and time-series data. The default full projection preserves exact output rates
+        and executes two business statements. Explicit projection=trends executes one rollup
+        statement and omits output_rate. Neither loads dimensions, sessions, generation
+        breakdowns, or the heatmap.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:
+        - name: projection
+          in: query
+          required: false
+          description: full includes exact output rates; trends returns only rollup summary and time-series metrics.
+          schema: { type: string, enum: [full, trends], default: full }
         - $ref: '#/components/parameters/TenantFilter'
         - $ref: '#/components/parameters/FromCreatedAt'
         - $ref: '#/components/parameters/ToCreatedAt'
@@ -6258,6 +6556,73 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /self/v1/sessions/{session_id}/requests/{request_id}/context:
+    get:
+      tags: [Self service]
+      operationId: getOwnSessionContext
+      summary: Read one bounded page of the authenticated credential's retained history
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/ContextCursor'
+        - $ref: '#/components/parameters/ContextDetails'
+        - $ref: '#/components/parameters/ContextResponseOnly'
+      responses:
+        '200':
+          description: Owned semantic context page, without tool bodies.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionContextPage' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Retained prefix path is incomplete or inconsistent. }
+
+  /self/v1/sessions/{session_id}/requests/{request_id}/dialogue:
+    get:
+      tags: [Self service]
+      operationId: getOwnSessionDialogue
+      summary: Read the cleaned session dialogue stored for this owned request
+      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+      responses:
+        '200':
+          description: Cleaned dialogue turns for this credential's request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionDialogue' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /self/v1/sessions/{session_id}/requests/{request_id}/context/content:
+    get:
+      tags: [Self service]
+      operationId: getOwnSessionContextContent
+      summary: Read one signed content range from an owned context node
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - name: cursor
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 4096 }
+      responses:
+        '200':
+          description: Owned content or text-only chunk with Unicode scalar offsets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionContextContent' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Retained content is incomplete or inconsistent. }
+
   /v1/models:
     get:
       tags: [OpenAI compatible, Anthropic compatible]
@@ -6691,6 +7056,30 @@ components:
         enum: [reused]
 
   parameters:
+    ContextResponseOnly:
+      name: response_only
+      in: query
+      description: Read only final-response preparation status and text; skip prefix nodes. An idempotent background reading job may be queued, but no archive is fetched on this HTTP path.
+      schema: { type: boolean, default: false }
+    ContextSessionId:
+      name: session_id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    ContextKeyId:
+      name: key_id
+      in: query
+      required: true
+      schema: { type: string, format: uuid }
+    ContextCursor:
+      name: cursor
+      in: query
+      schema: { type: string, minLength: 1, maxLength: 4096 }
+    ContextDetails:
+      name: details
+      in: query
+      description: Include full inline assistant message text rather than its final paragraph. Tool bodies remain excluded.
+      schema: { type: boolean, default: false }
     TenantFilter:
       name: tenant_external_id
       in: query
@@ -7244,11 +7633,125 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    OperatorInferenceConversation:
+      type: [object, 'null']
+      additionalProperties: false
+      required: [id]
+      description: Gateway-owned session and turn identifiers; consumed before forwarding the inference request.
+      properties:
+        id: { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+        turn_id:
+          oneOf:
+            - { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+            - { type: 'null' }
+        parent_turn_id:
+          oneOf:
+            - { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+            - { type: 'null' }
+    OperatorInferenceConversationIdentifier:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[A-Za-z0-9._:-]+$'
+    SessionContextItem:
+      type: object
+      required: [node_id, depth, role, kind, phase, text, text_complete, source_chars, content_cursor, text_cursor]
+      properties:
+        node_id: { type: string, pattern: '^[a-f0-9]{64}$' }
+        depth: { type: integer, format: int64, minimum: 1 }
+        role: { type: string }
+        kind: { type: string }
+        phase: { type: [string, 'null'] }
+        text: { type: [string, 'null'] }
+        text_complete: { type: boolean }
+        source_chars: { type: [integer, 'null'], format: int64, minimum: 0 }
+        content_cursor: { type: string, minLength: 1, maxLength: 4096 }
+        text_cursor: { type: [string, 'null'], minLength: 1, maxLength: 4096 }
+    SessionContextPage:
+      type: object
+      required: [contract_version, representation, request_id, session_id, items, next_cursor, response]
+      properties:
+        response: { $ref: '#/components/schemas/SessionResponseSummary' }
+        contract_version: { type: string, enum: [session_context_v1] }
+        representation: { type: string, enum: [semantic_context] }
+        request_id: { type: string, format: uuid }
+        session_id: { type: string, format: uuid }
+        items:
+          type: array
+          maxItems: 32
+          items: { $ref: '#/components/schemas/SessionContextItem' }
+        next_cursor: { type: [string, 'null'], maxLength: 4096 }
+    SessionResponseSummary:
+      type: object
+      required: [state, text, text_cursor, node_id, total_chars, error_code]
+      properties:
+        state: { type: string, enum: [pending, running, ready, unavailable] }
+        text: { type: [string, 'null'], maxLength: 16384 }
+        text_cursor: { type: [string, 'null'], maxLength: 4096 }
+        node_id: { type: [string, 'null'], pattern: '^[a-f0-9]{64}$' }
+        total_chars: { type: integer, format: int64, minimum: 0 }
+        error_code: { type: [string, 'null'] }
+    SessionContextContent:
+      type: object
+      required: [contract_version, representation, node_id, offset_chars, total_chars, content, next_cursor]
+      properties:
+        contract_version: { type: string, enum: [session_context_content_v1] }
+        representation: { type: string, enum: [semantic_context, message_text] }
+        node_id: { type: string, pattern: '^[a-f0-9]{64}$' }
+        offset_chars: { type: integer, format: int64, minimum: 0 }
+        total_chars: { type: integer, format: int64, minimum: 0 }
+        content: { type: string, maxLength: 16384 }
+        next_cursor: { type: [string, 'null'], maxLength: 4096 }
+    SessionDialogue:
+      type: object
+      additionalProperties: false
+      required: [contract_version, representation, request_id, session_id, turns]
+      properties:
+        contract_version: { type: string, enum: [session_dialogue_v1] }
+        representation: { type: string, enum: [session_body] }
+        request_id: { type: string, format: uuid }
+        session_id: { type: string, format: uuid }
+        turns:
+          type: array
+          maxItems: 4096
+          items: { $ref: '#/components/schemas/SessionDialogueTurn' }
+    SessionDialogueTurn:
+      type: object
+      additionalProperties: false
+      required: [role, origin, parts]
+      properties:
+        role: { type: string, minLength: 1, maxLength: 32 }
+        origin: { type: string, enum: [request, return] }
+        parts:
+          type: array
+          maxItems: 256
+          items: { $ref: '#/components/schemas/SessionDialoguePart' }
+    SessionDialoguePart:
+      type: object
+      additionalProperties: false
+      required: [part_index, kind, text, media_type, byte_length, call_id, tool_call_id]
+      properties:
+        part_index: { type: integer, format: int64, minimum: 0 }
+        kind: { type: string, maxLength: 64 }
+        text: { type: [string, 'null'] }
+        media_type: { type: [string, 'null'] }
+        byte_length: { type: [integer, 'null'], format: int64, minimum: 0 }
+        call_id: { type: [string, 'null'] }
+        tool_call_id: { type: [string, 'null'] }
+    SessionGeneratedTitle:
+      type: object
+      required: [title, state, error_code, updated_at]
+      properties:
+        title: { type: [string, 'null'], minLength: 1, maxLength: 80 }
+        state: { type: string, enum: [unavailable, pending, running, ready, failed, waiting_config] }
+        error_code: { type: [string, 'null'] }
+        updated_at: { type: [integer, 'null'], format: int64 }
+    PluginInstallerNetworkInput: {"oneOf":[{"type":"object","additionalProperties":false,"required":["mode"],"properties":{"mode":{"type":"string","enum":["default","direct"]}}},{"type":"object","additionalProperties":false,"required":["mode","url"],"properties":{"mode":{"type":"string","enum":["custom"]},"url":{"type":"string","maxLength":2048},"username":{"type":"string","maxLength":255},"password":{"type":"string","maxLength":255,"writeOnly":true}}},{"type":"object","additionalProperties":false,"required":["mode","tenant_external_id","group_id","group_version","member_id"],"properties":{"mode":{"type":"string","enum":["group"]},"tenant_external_id":{"type":"string"},"group_id":{"type":"string","format":"uuid"},"group_version":{"type":"integer"},"member_id":{"type":"string","format":"uuid"}}}]}
     TransportProxyGroupList: {"type":"object","required":["items"],"properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/TransportProxyGroup"}}}}
     TransportProxyMemberInput: {"type":"object","additionalProperties":false,"required":["label"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string","minLength":1,"maxLength":64},"proxy_url":{"type":"string","maxLength":2048,"writeOnly":true,"description":"Required for new members. socks5h private IP or authorized Kubernetes Service DNS; never echoed."}}}
     CreateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}}}}
     DeleteTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1}}}
-    TransportProxyGroup: {"type":"object","required":["id","tenant_external_id","name","version","members","bound_account_count","created_at","updated_at"],"properties":{"id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"integer"},"members":{"type":"array","items":{"type":"object","required":["id","label","scheme","host","port","remote_dns","has_auth"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string"},"scheme":{"const":"socks5h"},"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"remote_dns":{"const":true},"has_auth":{"type":"boolean"}}}},"bound_account_count":{"type":"integer"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}}}
+    TransportProxyGroup: {"type":"object","required":["id","tenant_external_id","name","version","members","bound_account_count","created_at","updated_at"],"properties":{"id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"integer"},"members":{"type":"array","items":{"type":"object","required":["id","label","scheme","host","port","remote_dns","has_auth"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string"},"scheme":{"const":"socks5h"},"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"remote_dns":{"const":true},"has_auth":{"type":"boolean"}}}},"bound_account_count":{"type":"integer"},"probe_url":{"type":["string","null"]},"probe_attempts":{"type":"integer"},"last_probe_status":{"type":["string","null"],"enum":["healthy","unhealthy",null]},"last_probe_checked_at":{"type":["integer","null"]},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}}}
     TransportProxyGroupBinding: {"type":"object","required":["account_id","tenant_external_id","binding_version","group_id","group_version","initial_member_id","credential_generation","updated_at","runtime"],"properties":{"account_id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"binding_version":{"type":"integer"},"group_id":{"type":["string","null"],"format":"uuid"},"group_version":{"type":["integer","null"]},"initial_member_id":{"type":["string","null"],"format":"uuid"},"credential_generation":{"type":"integer"},"updated_at":{"type":"integer"},"runtime":{"type":"object","required":["scope","configuration_state","applied_binding_version","applied_group_version","selected_member_id","observed_at"],"properties":{"scope":{"const":"this_process"},"configuration_state":{"enum":["unbound","pending","applied","unavailable"]},"applied_binding_version":{"type":["integer","null"]},"applied_group_version":{"type":["integer","null"]},"selected_member_id":{"type":["string","null"],"format":"uuid"},"observed_at":{"type":"integer"}}}}}
     UpdateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}},"expected_version":{"type":"integer","minimum":1},"replacement_member_id":{"type":"string","format":"uuid","description":"Required when removing/replacing an existing member of a bound group. Used only when a selected member no longer exists unchanged. Must identify a retained member in the submitted list."}}}
     BindTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_group_version","expected_binding_version","expected_credential_generation","expected_updated_at","group_id","initial_member_id"],"properties":{"tenant_external_id":{"type":"string"},"expected_group_version":{"type":"integer","minimum":1},"expected_binding_version":{"type":"integer","minimum":0},"expected_credential_generation":{"type":"integer","minimum":1},"expected_updated_at":{"type":"integer"},"group_id":{"type":"string","format":"uuid"},"initial_member_id":{"type":"string","format":"uuid"}}}
@@ -7309,6 +7812,7 @@ components:
       additionalProperties: false
       required: [id, inventory_id, actor, status, packages, completed_packages, review_digest, review, failure_category, created_at, updated_at]
       properties:
+        base_revision: {"type":"integer","nullable":true,"description":"Frozen current revision for additive URL installations; publication must use it as expected_revision."}
         id: { type: string, format: uuid }
         inventory_id: { type: string }
         actor: { type: string, description: Service identity or bootstrap marker; never a credential. }
@@ -10018,6 +10522,11 @@ components:
       type: object
       required: [request_id, created_at, completed_at, source_completed_at, lifecycle_state, protocol, model, upstream_account_id, route_id, status_code, duration_ms, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, cost, currency, usage, billing, error_code, archive_state, credential_identity, session_context]
       properties:
+        operational_terminal:
+          description: Independently persisted execution completion on request list/detail projections. Null or absent means no such observation is available, not proof that execution is still running. Event and historical projections may omit this field. This observation does not settle usage, release a financial hold, or authorize journal deletion.
+          oneOf:
+            - $ref: '#/components/schemas/RequestOperationalTerminal'
+            - type: 'null'
         egress:
           description: Historical selected egress for authorized self/operator request lists. Final-response attempts take precedence, otherwise the latest observation is used. Null means not recorded or not projected; never inferred from current proxy configuration.
           oneOf:
@@ -10041,7 +10550,7 @@ components:
         completed_at:
           type: [integer, 'null']
           format: int64
-          description: Terminal accounting timestamp in Unix milliseconds; null while pending or when the historical record lacks a terminal timestamp.
+          description: Terminal accounting timestamp in Unix milliseconds. May remain null after execution has failed, been cancelled, or succeeded while financial settlement is pending or unknown. Use operational_terminal.completed_at for independently recorded execution completion; historical records may lack either timestamp.
         source_completed_at:
           type: [integer, 'null']
           format: int64
@@ -10057,7 +10566,10 @@ components:
           type: [string, 'null']
           format: uuid
           description: Stable recorded route assignment; null when historical traffic has no route snapshot.
-        status_code: { type: [integer, 'null'], format: int64 }
+        status_code:
+          type: [integer, 'null']
+          format: int64
+          description: Recorded execution outcome. An independently recorded client failure or cancellation remains visible even when a later authoritative usage receipt completes financial settlement.
         duration_ms: { type: [integer, 'null'], format: int64 }
         first_output_ms:
           type: [integer, 'null']
@@ -10093,8 +10605,13 @@ components:
         error_code: { type: [string, 'null'] }
         terminal_cause_code:
           type: [string, 'null']
-          enum: [upstream_transport_timeout, upstream_transport_outer_deadline, upstream_transport_connection_reset, upstream_transport_http2_reset, upstream_transport_http2_goaway, upstream_transport_body, upstream_transport_decode, upstream_transport_request, upstream_transport_other, upstream_http2_reset, upstream_http2_goaway, upstream_read_timeout, upstream_request_timeout, upstream_stream_read_error, null]
-          description: Allowlisted transport cause recorded by the winning terminal transaction. Null when no specific cause was recorded, including historical, imported and generation records. Never inferred from a status code or keepalive.
+          enum: [gateway_pre_admission, upstream_http_status, client_disconnected, upstream_transport_timeout, upstream_transport_outer_deadline, upstream_transport_connection_reset, upstream_transport_http2_reset, upstream_transport_http2_goaway, upstream_transport_body, upstream_transport_decode, upstream_transport_request, upstream_transport_other, upstream_http2_reset, upstream_http2_goaway, upstream_read_timeout, upstream_request_timeout, upstream_stream_read_error, null]
+          description: Allowlisted cause recorded in an operational or financial terminal fact. Null when no specific cause was recorded, including historical, imported and generation records. Never inferred from a status code or keepalive.
+        failure_diagnostic:
+          description: Fixed diagnostic for a recorded allowlisted cause. Uses the recorded operational stage when available; null if the cause is unknown. Never contains arbitrary supplier messages or request contents.
+          oneOf:
+            - $ref: '#/components/schemas/RequestFailureDiagnostic'
+            - type: 'null'
         archive_state: { $ref: '#/components/schemas/RequestArchiveState' }
         credential_identity:
           description: Operator-scoped stable credential identity; null in self-service projections.
@@ -10110,6 +10627,42 @@ components:
           oneOf:
             - $ref: '#/components/schemas/RequestSessionContext'
             - type: 'null'
+    RequestOperationalTerminal:
+      type: object
+      additionalProperties: false
+      required: [completed_at, stage, financial_state]
+      properties:
+        completed_at:
+          type: integer
+          format: int64
+          description: Actual observed execution completion in Unix milliseconds, preserved across durable replay rather than replaced with the recovery time.
+        stage:
+          type: [string, 'null']
+          enum: [upstream_response_headers, upstream_response_body, response_delivery, buffered_response_ready, null]
+          description: Observed execution phase at completion; null when no phase was captured. Never reconstructed from a historical status code.
+        financial_state: { $ref: '#/components/schemas/RequestFinancialState' }
+      examples:
+        - completed_at: 1792195200000
+          stage: response_delivery
+          financial_state: unknown
+    RequestFinancialState:
+      type: string
+      enum: [pending, unknown, applied]
+      description: State of the separate settlement authority. Pending awaits an authoritative financial receipt; unknown records unavailable authoritative usage; applied acknowledges the committed financial receipt. Pending or unknown retains financial responsibility and any existing hold, and does not imply zero usage or zero cost. This is independent of the execution lifecycle and is not a journal-deletion ACK.
+    RequestFailureDiagnostic:
+      type: object
+      additionalProperties: false
+      required: [stage, source, reason]
+      properties:
+        stage:
+          type: [string, 'null']
+          enum: [pre_admission, upstream_response_headers, upstream_response_body, response_delivery, buffered_response_ready, null]
+        source:
+          type: string
+          enum: [gateway, upstream_http_response, downstream_connection, upstream]
+        reason:
+          type: string
+          enum: [gateway_pre_admission, upstream_http_status, client_disconnected, upstream_transport_timeout, upstream_transport_outer_deadline, upstream_transport_connection_reset, upstream_transport_http2_reset, upstream_transport_http2_goaway, upstream_transport_body, upstream_transport_decode, upstream_transport_request, upstream_transport_other, upstream_http2_reset, upstream_http2_goaway, upstream_read_timeout, upstream_request_timeout, upstream_stream_read_error]
     SupplierError:
       type: object
       additionalProperties: false
@@ -10124,7 +10677,7 @@ components:
     RequestLifecycleState:
       type: string
       enum: [preparing, queued, submitting, running, cancelling, pending, succeeded, failed, cancelled]
-      description: Execution lifecycle, independent from the persisted product error code.
+      description: Execution lifecycle, independent from financial settlement and the persisted product error code. Failed, cancelled, or succeeded execution can coexist with pending or unknown financial settlement.
     RequestArchiveState:
       type: string
       enum: [capturing, pending, uploading, metadata_only, bound, gap]

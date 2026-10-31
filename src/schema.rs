@@ -20,7 +20,8 @@ pub struct CompiledSchema(jsonschema::Validator);
 
 impl CompiledSchema {
     pub fn validate(&self, instance: &Value) -> Result<(), AppError> {
-        let encoded = serde_json::to_vec(instance).map_err(|_| AppError::Internal)?;
+        let encoded =
+            serde_json::to_vec(instance).map_err(|_| AppError::internal("schema_validate_1"))?;
         if encoded.len() > MAX_INSTANCE_BYTES {
             return Err(AppError::BadRequest(
                 "JSON Schema instance exceeds the 1 MiB limit".into(),
@@ -56,7 +57,7 @@ pub fn validate_definition(schema: &Value) -> Result<(), AppError> {
 
 fn inspect_definition(schema: &Value) -> Result<(), AppError> {
     if serde_json::to_vec(schema)
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("schema_inspect_definition_1"))?
         .len()
         > MAX_SCHEMA_BYTES
     {
@@ -228,6 +229,56 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn published_policy_schemas_allow_unset_rates_but_not_zero_or_fake_infinity() {
+        let standalone: Value =
+            serde_json::from_str(include_str!("../schemas/key-policy.schema.json")).unwrap();
+        let create: Value =
+            serde_json::from_str(include_str!("../schemas/key-create.schema.json")).unwrap();
+        for schema in [&standalone, &create["properties"]["policy"]] {
+            for field in [
+                "requests_per_minute",
+                "tokens_per_minute",
+                "max_concurrency",
+            ] {
+                assert!(schema["properties"][field].get("default").is_none());
+            }
+        }
+        let policy_validator = compile(&standalone).unwrap();
+        let create_validator = compile(&create).unwrap();
+        for policy in [
+            json!({}),
+            json!({"requests_per_minute": null, "tokens_per_minute": null, "max_concurrency": null}),
+            json!({"requests_per_minute": 60, "tokens_per_minute": 100000, "max_concurrency": 4}),
+        ] {
+            policy_validator.validate(&policy).unwrap();
+            create_validator
+                .validate(&json!({"principal_external_id": "member", "alias": "optional", "policy": policy}))
+                .unwrap();
+        }
+        for field in [
+            "requests_per_minute",
+            "tokens_per_minute",
+            "max_concurrency",
+        ] {
+            for invalid in [json!(0), json!(-1), json!("unlimited"), json!(1.5)] {
+                let mut policy = json!({});
+                policy[field] = invalid;
+                assert!(policy_validator.validate(&policy).is_err());
+                assert!(create_validator.validate(&json!({"principal_external_id": "member", "alias": "optional", "policy": policy})).is_err());
+            }
+        }
+        for (field, overflow) in [
+            ("requests_per_minute", 4294967296_u64),
+            ("tokens_per_minute", 9007199254740992_u64),
+            ("max_concurrency", 4294967296_u64),
+        ] {
+            let mut policy = json!({});
+            policy[field] = json!(overflow);
+            assert!(policy_validator.validate(&policy).is_err());
+        }
+    }
 
     #[test]
     fn published_routing_schemas_match_normalized_grant_contracts() {

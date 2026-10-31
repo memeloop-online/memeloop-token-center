@@ -297,7 +297,6 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         .acquire_dispatch(&route, &fixture.state.metrics)
         .await
         .expect("dispatch permit must be returned without upstream EOF");
-    wait_for_request_settlement(&fixture, 1).await;
     upstream.finish(expected_posts).await;
     let rows = fixture
         .state
@@ -310,46 +309,29 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
     if let Some(request_id) = request_id {
         assert_eq!(settled_request_id, request_id);
     }
-    assert_eq!(rows[0].status_code, Some(499));
     let expected_error = if pre_header {
         "request_cancelled"
     } else {
         "client_cancelled"
     };
-    assert_eq!(rows[0].error_code.as_deref(), Some(expected_error));
-    assert_eq!(
-        rows[0].terminal_cause_code.as_deref(),
-        if pre_header {
-            None
-        } else {
-            Some("client_disconnected")
-        }
-    );
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-    assert_eq!(rows[0].cost, "0");
-    assert_eq!(
-        rows[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::NotObserved)
-    );
-    if !pre_header {
-        assert_exactly_once_side_effects(&fixture, settled_request_id, None).await;
+    if pre_header {
+        cancellation::assert_unknown_request(&fixture, settled_request_id, 0).await;
+    } else {
+        let receipt = cancellation::assert_unknown_receipt(
+            &fixture,
+            settled_request_id,
+            499,
+            expected_error,
+            0,
+        )
+        .await;
+        assert_eq!(receipt["terminal_cause"], "client_disconnected");
     }
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    if pre_header {
-        let settlement = sqlx::query(
-            "SELECT r.status, r.actual_micros, (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id) AS reservation_count, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS fact_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",
-        ).bind(settled_request_id.to_string()).fetch_one(&pool).await.unwrap();
-        assert_eq!(settlement.get::<String, _>("status"), "settled");
-        assert_eq!(settlement.get::<i64, _>("actual_micros"), 0);
-        for field in [
-            "reservation_count",
-            "ledger_count",
-            "fact_count",
-            "event_count",
-        ] {
-            assert_eq!(settlement.get::<i64, _>(field), 1, "{field}");
-        }
-    }
+    let reservations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM usage_reservations WHERE id = (SELECT reservation_id FROM request_records WHERE id = $1)",
+    ).bind(settled_request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(reservations, 1);
     let failures: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1 AND consecutive_failures > 0",
     ).bind(fixture.upstream_account_id.to_string()).fetch_one(&pool).await.unwrap();
@@ -361,7 +343,7 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
     if reset_stream {
         assert!(
             !connection.is_finished(),
-            "cancellation must settle while the downstream HTTP/2 connection is alive"
+            "cancellation must release its owner while the downstream HTTP/2 connection is alive"
         );
         connection.abort();
     }
@@ -375,8 +357,8 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         format!(
             "MTC_CONTROLLED_HTTP2_CANCEL {}\n",
             json!({
-                "case": label, "pre_header": pre_header, "posts": expected_posts, "upstream_reset": "CANCEL", "settlements": 1,
-                "status": 499, "error_code": expected_error, "lifecycle_permit_released": true,
+                "case": label, "pre_header": pre_header, "posts": expected_posts, "upstream_reset": "CANCEL", "settlements": 0,
+                "financial_state": "unknown", "delivery_error": expected_error, "lifecycle_permit_released": true,
                 "dispatch_permit_released": true, "upstream_failures": 0
             })
         )

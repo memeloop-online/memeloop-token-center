@@ -1,6 +1,7 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     io,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 #[cfg(feature = "experimental-plugin-revisions")]
@@ -9,7 +10,7 @@ use std::{process::Stdio, time::Duration};
 #[cfg(feature = "plugin-distribution")]
 pub const COSIGN_VERIFIER_FILENAME: &str = "cosign";
 #[cfg(feature = "plugin-distribution")]
-pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.3-mtc.4";
+pub const COSIGN_VERIFIER_VERSION: &str = "v3.1.4";
 #[cfg(feature = "experimental-plugin-revisions")]
 const PLUGIN_INSTALLER_FILENAME: &str = "install-plugin-oci";
 
@@ -27,10 +28,13 @@ fn executable_regular_sibling(
 ) -> io::Result<PathBuf> {
     let candidate = directory.join(filename);
     let metadata = std::fs::symlink_metadata(&candidate)?;
-    if !metadata.is_file()
-        || metadata.file_type().is_symlink()
-        || metadata.permissions().mode() & 0o111 == 0
-    {
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(io::Error::other(format!(
+            "{description} must be an executable regular file"
+        )));
+    }
+    #[cfg(unix)]
+    if metadata.permissions().mode() & 0o111 == 0 {
         return Err(io::Error::other(format!(
             "{description} must be an executable regular file"
         )));
@@ -130,11 +134,12 @@ fn cosign_verifier_path_from(executable: &Path) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::TempDir;
 
     #[test]
-    #[cfg(feature = "plugin-distribution")]
+    #[cfg(all(unix, feature = "plugin-distribution"))]
     fn cosign_binary_is_resolved_only_as_an_executable_regular_sibling() {
         let temporary = TempDir::new().expect("temporary directory");
         let executable = temporary.path().join("install-plugin-oci");
@@ -158,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "experimental-plugin-revisions")]
+    #[cfg(all(unix, feature = "experimental-plugin-revisions"))]
     fn service_runtime_resolves_installer_and_libraries_relative_to_its_binary() {
         let temporary = TempDir::new().expect("temporary directory");
         let bin = temporary.path().join("bin");

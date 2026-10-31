@@ -240,6 +240,7 @@ async fn failover_dispatch_overload_preserves_response_archive_and_releases_old_
                 .unwrap();
         assert_eq!(body["error"]["type"], "service_overloaded");
         assert_eq!(body["error"]["code"], code);
+        cancellation::assert_single_unknown_receipt(&fixture, 503, Some(code)).await;
         let rows = fixture
             .state
             .db
@@ -248,23 +249,21 @@ async fn failover_dispatch_overload_preserves_response_archive_and_releases_old_
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status_code, Some(503));
-        assert!(rows[0].completed_at.is_some());
+        assert!(rows[0].completed_at.is_none());
         assert_eq!(rows[0].error_code.as_deref(), Some(code));
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+        assert!(rows[0].usage.tokens.is_none());
+        assert_eq!(rows[0].billing.cost, None);
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let terminal: String = sqlx::query_scalar("SELECT status FROM usage_reservations")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(terminal, "settled");
-        let attributed: String =
-            sqlx::query_scalar("SELECT upstream_account_id FROM request_records")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(attributed, fixture.upstream_account_id.to_string());
+        assert_eq!(terminal, "reserved");
+        assert_eq!(
+            rows[0].upstream_account_id,
+            Some(fixture.upstream_account_id)
+        );
         pool.close().await;
-        drain_completed_response_archive(&fixture).await;
         let refs = fixture
             .state
             .db
@@ -344,6 +343,7 @@ async fn admitted_invalid_dispatch_policy_finishes_as_configuration_error_withou
         serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "invalid_transport_policy");
     assert_eq!(body["error"]["type"], "upstream_error");
+    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db
@@ -514,7 +514,7 @@ async fn dispatch_queue_timeout_and_capacity_have_no_durable_admission_side_effe
 }
 
 #[tokio::test]
-async fn connect_retry_and_classified_400_replay_hold_one_dispatch_permit() {
+async fn classified_400_replay_holds_one_dispatch_permit() {
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -546,14 +546,11 @@ async fn connect_retry_and_classified_400_replay_hold_one_dispatch_permit() {
         .expect(2)
         .mount(&upstream)
         .await;
-    let response = routing::with_test_pre_delivery_connect_failures(
-        1,
-        send_codex_route(
-            &fixture,
-            &upstream,
-            "/v1/responses",
-            json!({"model": fixture.model, "input": "retry", "stream": false}),
-        ),
+    let response = send_codex_route(
+        &fixture,
+        &upstream,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "retry", "stream": false}),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);

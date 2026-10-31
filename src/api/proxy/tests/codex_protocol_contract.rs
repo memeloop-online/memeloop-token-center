@@ -32,6 +32,11 @@ async fn complete(post: Post) {
 }
 
 async fn settled(fixture: &CodexRouteFixture, status: i64) {
+    if status != 200 {
+        let receipt = cancellation::single_unknown_receipt(fixture).await;
+        assert_eq!(receipt["status_code"], status);
+        return;
+    }
     wait_for_request_settlement(fixture, 1).await;
     let rows = fixture
         .state
@@ -41,13 +46,8 @@ async fn settled(fixture: &CodexRouteFixture, status: i64) {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(status));
-    if status == 200 {
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
-        assert_eq!(rows[0].cost, "0.00001");
-    } else {
-        assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
-        assert_eq!(rows[0].cost, "0");
-    }
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 7));
+    assert_eq!(rows[0].cost, "0.00001");
     assert_exactly_once_side_effects(
         fixture,
         rows[0].request_id,
@@ -109,7 +109,7 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
         let started = std::time::Instant::now();
         let until = tokio::time::sleep(Duration::from_secs(310));
         tokio::pin!(until);
-        let mut progress_count = rendered.matches("event: response.in_progress").count();
+        let mut progress_count = rendered.matches(": keep-alive\n\n").count();
         let initial_progress = progress_count;
         let mut last_progress = std::time::Instant::now();
         loop {
@@ -121,7 +121,7 @@ async fn streaming(version: http::Version, cancel: bool, silence: bool) {
                         .expect("stream must remain open during silence")
                         .unwrap();
                     rendered.push_str(std::str::from_utf8(&chunk).unwrap());
-                    let count = rendered.matches("event: response.in_progress").count();
+                    let count = rendered.matches(": keep-alive\n\n").count();
                     if count > progress_count {
                         return count;
                     }
@@ -184,8 +184,8 @@ async fn compact(version: http::Version) {
             .unwrap(),
     )
     .unwrap();
-    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"failover_deadline_millis":1000,"connect_timeout_millis":1000,
-        "read_timeout_millis":1000,"request_timeout_millis":2000});
+    config["transport_policy"] = json!({"http_protocol":account_protocol(version),"connect_timeout_millis":1000,
+        "request_timeout_millis":2000});
     sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
         .bind(config.to_string())
         .bind(fixture.upstream_account_id.to_string())

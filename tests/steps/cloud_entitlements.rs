@@ -167,7 +167,7 @@ async fn stale_is_rejected(world: &mut TokenCenterWorld) {
         .authenticate_key(&world.current_key, state.config.key_pepper.as_bytes())
         .await
         .expect("stable Cloud credential");
-    assert_eq!(authenticated.policy.requests_per_minute, 300);
+    assert_eq!(authenticated.policy.requests_per_minute, Some(300));
     let view = state
         .db
         .key_view(&authenticated)

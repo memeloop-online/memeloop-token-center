@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mergeLiveRequestEvents, requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
+import { mergeLiveRequestEvents, mergeRefreshedRequestPage, requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestEvent, RequestView } from '../src/types.js';
 
 const event: RequestEvent = {
@@ -23,6 +23,32 @@ const recorded: RequestView = {
     task_kind: 'task', agent_id: 'agent', semantics_source: 'declared',
   },
 };
+
+test('retained financial events cannot replace operational outcomes or invent confirmed money', () => {
+  for (const status_code of [200, 499, 502]) {
+    for (const financial_state of ['pending', 'unknown', 'applied'] as const) {
+      const terminal: RequestView = {
+        ...recorded, status_code, completed_at: financial_state === 'applied' ? 1000 : null,
+        cost: financial_state === 'applied' ? '0' : null,
+        error_code: status_code >= 400 ? `http_${status_code}` : null,
+        operational_terminal: { completed_at: 800, stage: null, financial_state },
+      };
+      for (const event_kind of ['started', 'finished', 'projected', 'archive_bound'] as const) {
+        const replay: RequestEvent = { ...event, event_kind, completed_at: 700, cost: '99', status_code: 200 };
+        const merged = requestViewFromEvent(replay, terminal);
+        assert.deepEqual(merged, terminal);
+        assert.deepEqual(mergeLiveRequestEvents([terminal], new Map([['request', replay]])), [terminal]);
+      }
+      const archived = requestViewFromEvent({ ...event, event_kind: 'archive_bound', archive_state: 'bound' }, terminal);
+      assert.equal(archived?.archive_state, 'bound');
+      assert.equal(archived?.status_code, status_code);
+      const applied: RequestView = { ...terminal, completed_at: 1000, cost: '0',
+        operational_terminal: { completed_at: 800, stage: null, financial_state: 'applied' } };
+      const refreshed = mergeRefreshedRequestPage([terminal], { requests: [applied], next_cursor: null });
+      assert.deepEqual(mergeLiveRequestEvents(refreshed, new Map([['request', event]])), [applied]);
+    }
+  }
+});
 
 test('legacy SSE does not erase recorded routing, completion, currency, cache or session fields', () => {
   assert.deepEqual(requestViewFromEvent(event, recorded), recorded);

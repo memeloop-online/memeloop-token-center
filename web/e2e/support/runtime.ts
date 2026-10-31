@@ -76,6 +76,8 @@ export function observeSessionReadyRequests({
   const deadline = AbortSignal.timeout(30_000);
   const signal = AbortSignal.any([controller.signal, deadline]);
   const requestIds = new Set<string>();
+  const readyEventIds = new Set<string>();
+  const readyKinds = new Map<string, Set<string>>();
   let ready: SessionReadyRequests | undefined;
   let eventAt: number | undefined;
   let eventId: string | undefined;
@@ -130,9 +132,19 @@ export function observeSessionReadyRequests({
             }
             const eventSessionId = event.session_context?.session_id;
             assert.ok(eventSessionId, 'confirmed session-ready events must name their logical session');
-            assert.ok(!requestIds.has(event.request_id), `request-event stream repeated ready request ${event.request_id}`);
+            assert.ok(!readyEventIds.has(id), `request-event stream repeated ready event ${id}`);
+            const kinds = readyKinds.get(event.request_id) ?? new Set<string>();
+            assert.ok(!kinds.has(event.event_kind), `request-event stream repeated ${event.event_kind} for ready request ${event.request_id}`);
+            readyEventIds.add(id);
+            kinds.add(event.event_kind);
+            readyKinds.set(event.request_id, kinds);
             eventAt = event.event_at;
             eventId = id;
+            // Deferred statistics and conversation projection each publish a
+            // distinct committed event. Both can carry the same confirmed
+            // session when the bounded event batch is enriched after replay.
+            // Count requests once while still rejecting duplicate publications.
+            if (requestIds.has(event.request_id)) return;
             requestIds.add(event.request_id);
             if (requestIds.size !== expected || settled) return;
             // A child can commit to an isolated cluster before its declared parent, then be merged
@@ -185,10 +197,9 @@ export function observeSessionReadyRequests({
 }
 
 function matchesReadySessionEvent(event: RequestEvent, sessionName: string): boolean {
-  // Prepaid requests materialize conversation semantics in the terminal
-  // transaction, so their committed `finished` event is the barrier. Metered
-  // requests enqueue that work and emit `projected` only after the projector
-  // commits. Both paths must expose confirmed semantics before the UI reads.
+  // Legacy inline finalization and durable terminal/conversation projectors
+  // can expose confirmed semantics on finished or projected events. Distinct
+  // event kinds for one request do not represent another completed request.
   return (event.event_kind === 'finished' || event.event_kind === 'projected')
     && event.session_context?.association === 'confirmed'
     && event.session_context.session_name === sessionName;

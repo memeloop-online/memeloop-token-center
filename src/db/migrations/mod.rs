@@ -1,7 +1,11 @@
 use super::*;
 
-mod credential_plaintext;
+#[cfg(test)]
+mod archive_numbering_tests;
 mod observation_prefix;
+mod plaintext_sweep;
+#[cfg(test)]
+mod transport_policy_tests;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PartitionMaintenanceReport {
@@ -668,6 +672,92 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "verified conversation prefix reference conversion",
         sql: include_str!("../../../migrations/common/0127_conversation_prefix_storage.sql"),
     },
+    Migration {
+        version: 128,
+        name: "admitted proxy settlement recovery authority",
+        sql: include_str!("../../../migrations/common/0128_pending_proxy_settlements.sql"),
+    },
+    Migration {
+        version: 129,
+        name: "encrypted installer network preferences and frozen operations",
+        sql: include_str!("../../../migrations/common/0129_plugin_installer_network.sql"),
+    },
+    Migration {
+        version: 130,
+        name: "frozen browser plugin release resolutions",
+        sql: include_str!("../../../migrations/common/0130_plugin_release_resolutions.sql"),
+    },
+    Migration {
+        version: 131,
+        name: "bounded generated session titles",
+        sql: include_str!("../../../migrations/common/0131_session_generated_titles.sql"),
+    },
+    Migration {
+        version: 132,
+        name: "deferred session final response reading",
+        sql: include_str!("../../../migrations/common/0132_session_response_summaries.sql"),
+    },
+    Migration {
+        version: 133,
+        name: "proxy operational completion independent of financial settlement",
+        sql: include_str!("../../../migrations/common/0133_proxy_operational_terminals.sql"),
+    },
+    Migration {
+        version: 134,
+        name: "optional credential rate window ownership",
+        sql: include_str!("../../../migrations/common/0134_optional_rate_limits.sql"),
+    },
+    Migration {
+        version: 135,
+        name: "independent transport proxy reachability probe",
+        sql: include_str!("../../../migrations/common/0135_transport_proxy_probe.sql"),
+    },
+    Migration {
+        version: 136,
+        name: "independent upstream service and proxy probe results",
+        sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
+    },
+    Migration {
+        version: 137,
+        name: "recorded in-flight proxy request stage",
+        sql: include_str!("../../../migrations/common/0137_request_in_flight_stage.sql"),
+    },
+    Migration {
+        version: 138,
+        name: "会话正文归档 media purpose",
+        sql: include_str!("../../../migrations/sqlite/0138_conversation_media_archive.sql"),
+    },
+    Migration {
+        version: 139,
+        name: "archive spool plain byte count follows the chunk ceiling",
+        sql: include_str!("../../../migrations/sqlite/0139_archive_spool_plain_byte_count.sql"),
+    },
+    Migration {
+        version: 140,
+        name: "request list newest-page scan indexes",
+        sql: include_str!("../../../migrations/common/0140_request_list_scan_indexes.sql"),
+    },
+    Migration {
+        version: 141,
+        name: "usage analysis compaction probe index",
+        sql: include_str!(
+            "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
+        ),
+    },
+    Migration {
+        version: 143,
+        name: "archive spool storage accounting and ready indexes",
+        sql: concat!(
+            include_str!("../../../migrations/sqlite/0143_archive_spool_storage_accounting.sql"),
+            "\n",
+            include_str!("../../../migrations/common/0143_archive_spool_ready_indexes.sql"),
+        ),
+    },
+    Migration {
+        version: 144,
+        name: "retire unused failover deadline config",
+        sql: include_str!("../../../migrations/sqlite/0144_retire_failover_deadline.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1319,6 +1409,92 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "verified conversation prefix reference conversion",
         sql: include_str!("../../../migrations/common/0127_conversation_prefix_storage.sql"),
     },
+    Migration {
+        version: 128,
+        name: "admitted proxy settlement recovery authority",
+        sql: include_str!("../../../migrations/common/0128_pending_proxy_settlements.sql"),
+    },
+    Migration {
+        version: 129,
+        name: "encrypted installer network preferences and frozen operations",
+        sql: include_str!("../../../migrations/common/0129_plugin_installer_network.sql"),
+    },
+    Migration {
+        version: 130,
+        name: "frozen browser plugin release resolutions",
+        sql: include_str!("../../../migrations/common/0130_plugin_release_resolutions.sql"),
+    },
+    Migration {
+        version: 131,
+        name: "bounded generated session titles",
+        sql: include_str!("../../../migrations/common/0131_session_generated_titles.sql"),
+    },
+    Migration {
+        version: 132,
+        name: "deferred session final response reading",
+        sql: include_str!("../../../migrations/common/0132_session_response_summaries.sql"),
+    },
+    Migration {
+        version: 133,
+        name: "proxy operational completion independent of financial settlement",
+        sql: include_str!("../../../migrations/common/0133_proxy_operational_terminals.sql"),
+    },
+    Migration {
+        version: 134,
+        name: "optional credential rate window ownership",
+        sql: include_str!("../../../migrations/common/0134_optional_rate_limits.sql"),
+    },
+    Migration {
+        version: 135,
+        name: "independent transport proxy reachability probe",
+        sql: include_str!("../../../migrations/common/0135_transport_proxy_probe.sql"),
+    },
+    Migration {
+        version: 136,
+        name: "independent upstream service and proxy probe results",
+        sql: include_str!("../../../migrations/common/0136_independent_service_probes.sql"),
+    },
+    Migration {
+        version: 137,
+        name: "recorded in-flight proxy request stage",
+        sql: include_str!("../../../migrations/common/0137_request_in_flight_stage.sql"),
+    },
+    Migration {
+        version: 138,
+        name: "会话正文归档 media purpose",
+        sql: include_str!("../../../migrations/postgres/0138_conversation_media_archive.sql"),
+    },
+    Migration {
+        version: 139,
+        name: "archive spool plain byte count follows the chunk ceiling",
+        sql: include_str!("../../../migrations/postgres/0139_archive_spool_plain_byte_count.sql"),
+    },
+    Migration {
+        version: 140,
+        name: "request list newest-page scan indexes",
+        sql: include_str!("../../../migrations/common/0140_request_list_scan_indexes.sql"),
+    },
+    Migration {
+        version: 141,
+        name: "usage analysis compaction probe index",
+        sql: include_str!(
+            "../../../migrations/common/0141_usage_analysis_compaction_probe_index.sql"
+        ),
+    },
+    Migration {
+        version: 143,
+        name: "archive spool storage accounting and ready indexes",
+        sql: concat!(
+            include_str!("../../../migrations/postgres/0143_archive_spool_storage_accounting.sql"),
+            "\n",
+            include_str!("../../../migrations/common/0143_archive_spool_ready_indexes.sql"),
+        ),
+    },
+    Migration {
+        version: 144,
+        name: "retire unused failover deadline config",
+        sql: include_str!("../../../migrations/postgres/0144_retire_failover_deadline.sql"),
+    },
 ];
 
 impl Database {
@@ -1357,20 +1533,6 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
-        self.migrate_with_optional_credential_pepper(None).await
-    }
-
-    /// Production upgrades must supply the existing authentication pepper so
-    /// all active originals can be verified before enabling direct copy.
-    pub async fn migrate_with_credential_pepper(&self, pepper: &[u8]) -> Result<(), sqlx::Error> {
-        self.migrate_with_optional_credential_pepper(Some(pepper))
-            .await
-    }
-
-    async fn migrate_with_optional_credential_pepper(
-        &self,
-        pepper: Option<&[u8]>,
-    ) -> Result<(), sqlx::Error> {
         let mut transaction = self.pool.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SELECT pg_advisory_xact_lock(734627102948311)")
@@ -1457,15 +1619,6 @@ impl Database {
             backfill_routing_grants_from_legacy_policy(&mut transaction).await?;
         }
         apply_migration_range(&mut transaction, migrations, 44, 109).await?;
-        let needs_plaintext_upgrade =
-            sqlx::query("SELECT version FROM schema_migrations WHERE version = 110")
-                .fetch_optional(&mut *transaction)
-                .await?
-                .is_none();
-        if needs_plaintext_upgrade {
-            credential_plaintext::promote_active_plaintext(&mut transaction, self.backend, pepper)
-                .await?;
-        }
         apply_migration_range(&mut transaction, migrations, 110, i64::MAX).await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             maintain_postgres_partitions(&mut transaction).await?;

@@ -304,7 +304,14 @@ async fn bounded_read_rejects_an_object_over_the_limit() {
         .get_bounded(&location, body.len() - 1)
         .await
         .expect_err("object over limit must be rejected");
-    assert!(error.to_string().contains("read limit"));
+    assert_eq!(
+        error.diagnostic_category(),
+        "archive_object_exceeds_byte_read_limit"
+    );
+    assert_eq!(
+        error.to_string(),
+        "storage error: archive_object_exceeds_byte_read_limit"
+    );
 }
 
 #[tokio::test]

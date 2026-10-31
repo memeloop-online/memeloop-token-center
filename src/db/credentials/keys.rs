@@ -4,8 +4,8 @@ use super::super::*;
 use crate::db::routing::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
+use crate::plain_json::{decode_json, encode_json};
 
-const KEY_PROVISIONING_AAD: &[u8] = b"memeloop-token-center/key-provisioning-response/v1";
 const KEY_ROTATION_RESOURCE: &str = "key";
 const CLOUD_PRINCIPAL_PROVISIONING_PREFIX: &str = "memeloop-cloud-principal:";
 
@@ -187,7 +187,7 @@ impl Database {
             key: issued.secret.clone(),
             fingerprint: issued.fingerprint.clone(),
         };
-        let issued_key_ciphertext = seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD)?;
+        let issued_key_ciphertext = encode_json(&issued_key)?;
         sqlx::query(
             "INSERT INTO credit_accounts (id, tenant_id, principal_id, currency, available_micros, reserved_micros, created_at, updated_at) VALUES ($1, $2, $3, $4, 0, 0, $5, $6)",
         )
@@ -214,7 +214,7 @@ impl Database {
         .bind(&principal_id)
         .bind(account_id.to_string())
         .bind(currency.to_uppercase())
-        .bind(serde_json::to_string(&KeyPolicy::default()).map_err(|_| AppError::Internal)?)
+        .bind(serde_json::to_string(&KeyPolicy::default()).map_err(|_| AppError::internal("keys_site_1"))?)
         .bind(provisioning_idempotency_key)
         .bind(provisioning_request_hash)
         .bind(issued_key_ciphertext)
@@ -462,7 +462,8 @@ impl Database {
         let account_id = Uuid::now_v7();
         let key_id = Uuid::now_v7();
         let issued = crypto::issue_credential(key_id, pepper);
-        let policy_json = serde_json::to_string(&input.policy).map_err(|_| AppError::Internal)?;
+        let policy_json = serde_json::to_string(&input.policy)
+            .map_err(|_| AppError::internal("keys_create_key_with_source_1"))?;
         let initial_balance_micros = decimal_to_micros(input.initial_balance)?;
         let mut tx = self.begin_write_transaction().await?;
 
@@ -492,16 +493,12 @@ impl Database {
                     ));
                 }
                 let ciphertext: Option<String> = existing.try_get("issued_key_ciphertext")?;
-                let issued = open_private_json(
-                    ciphertext.as_deref().ok_or_else(|| {
+                let issued = decode_json(ciphertext.as_deref().ok_or_else(|| {
                         AppError::BadRequest(
                             "idempotent key provisioning response is no longer available; rotate the key"
                                 .into(),
                         )
-                    })?,
-                    pepper,
-                    KEY_PROVISIONING_AAD,
-                )?;
+                    })?)?;
                 tx.commit().await?;
                 return Ok(issued);
             }
@@ -569,7 +566,7 @@ impl Database {
             fingerprint: issued.fingerprint.clone(),
         };
         let issued_key_ciphertext = idempotency_key
-            .map(|_| seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD))
+            .map(|_| encode_json(&issued_key))
             .transpose()?;
         sqlx::query(
             "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at, creation_source) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', 1, $8, $9, $10, $11, $12, $13)",
@@ -638,7 +635,8 @@ impl Database {
         policy: KeyPolicy,
     ) -> Result<KeyPolicy, AppError> {
         validate_key_policy(&policy)?;
-        let policy_json = serde_json::to_string(&policy).map_err(|_| AppError::Internal)?;
+        let policy_json = serde_json::to_string(&policy)
+            .map_err(|_| AppError::internal("keys_update_key_policy_1"))?;
         let result = sqlx::query(
             "UPDATE key_records SET policy_json = $1, updated_at = $2 WHERE id = $3 AND status = 'active'",
         )
@@ -695,15 +693,7 @@ impl Database {
         )
         .await?
         {
-            let issued = open_rotation_replay(
-                replay,
-                KEY_ROTATION_RESOURCE,
-                key_id,
-                idempotency_key,
-                &request_hash,
-                pepper,
-                now,
-            )?;
+            let issued = open_rotation_replay(replay, now)?;
             tx.commit().await?;
             return Ok(issued);
         }
@@ -732,7 +722,8 @@ impl Database {
         .await?;
         let response = IssuedKey {
             key_id,
-            account_id: Uuid::parse_str(&account_id).map_err(|_| AppError::Internal)?,
+            account_id: Uuid::parse_str(&account_id)
+                .map_err(|_| AppError::internal("keys_rotate_key_1"))?,
             alias,
             currency,
             credential_generation: generation,
@@ -747,7 +738,6 @@ impl Database {
             key_id,
             &request_hash,
             expires_at,
-            pepper,
         )
         .await?;
         tx.commit().await?;
@@ -763,14 +753,74 @@ impl Database {
             return Err(AppError::Unauthorized);
         }
         let (secret_hash, _) = crypto::hash_credential(value, pepper);
+        let started = tokio::time::Instant::now();
+        let connection = self.pool.acquire().await;
+        let acquire_elapsed = started.elapsed();
+        if let Err(error) = &connection {
+            self.observe_key_authentication("acquire", acquire_elapsed, None, Some(error));
+        }
+        let mut connection = connection?;
+        let started = tokio::time::Instant::now();
         let row = sqlx::query(
             "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_credentials c JOIN key_records k ON k.id = c.key_id AND k.credential_generation = c.generation JOIN tenants t ON t.id = k.tenant_id AND t.status = 'active' WHERE c.secret_hash = $1 AND c.revoked_at IS NULL",
         )
         .bind(secret_hash)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or(AppError::Unauthorized)?;
+        .fetch_optional(&mut *connection)
+        .await;
+        let elapsed = started.elapsed();
+        drop(connection);
+        self.observe_key_authentication(
+            "query",
+            acquire_elapsed,
+            Some(elapsed),
+            row.as_ref().err(),
+        );
+        let row = row?.ok_or(AppError::Unauthorized)?;
         super::authenticated_key_from_row(row, value, pepper)
+    }
+
+    fn observe_key_authentication(
+        &self,
+        phase: &'static str,
+        acquire_elapsed: std::time::Duration,
+        query_elapsed: Option<std::time::Duration>,
+        error: Option<&sqlx::Error>,
+    ) {
+        let pool_size = self.pool.size();
+        let pool_idle = self.pool.num_idle();
+        let acquire_elapsed_ms = acquire_elapsed.as_millis() as u64;
+        let query_elapsed_ms = query_elapsed.map(|elapsed| elapsed.as_millis() as u64);
+        if let Some(error) = error {
+            tracing::warn!(
+                operation = "authenticate_key",
+                pool_role = self.pool_role,
+                phase,
+                outcome = "failed",
+                error_kind = crate::error::sqlx_error_kind(error),
+                acquire_elapsed_ms,
+                query_elapsed_ms,
+                pool_max = self.pool.options().get_max_connections(),
+                pool_size,
+                pool_idle,
+                pool_in_use = (pool_size as usize).saturating_sub(pool_idle),
+                acquire_timeout_ms = self.pool.options().get_acquire_timeout().as_millis() as u64,
+                "client key authentication database observation"
+            );
+        } else {
+            tracing::debug!(
+                operation = "authenticate_key",
+                pool_role = self.pool_role,
+                phase,
+                outcome = "completed",
+                acquire_elapsed_ms,
+                query_elapsed_ms,
+                pool_max = self.pool.options().get_max_connections(),
+                pool_size,
+                pool_idle,
+                pool_in_use = (pool_size as usize).saturating_sub(pool_idle),
+                "client key authentication database observation"
+            );
+        }
     }
     pub async fn key_view(&self, key: &AuthenticatedKey) -> Result<KeyView, AppError> {
         let row = sqlx::query(
@@ -820,8 +870,8 @@ impl Database {
         .await?
         .ok_or(AppError::NotFound)?;
         let policy_json: String = context.try_get("policy_json")?;
-        let policy: KeyPolicy =
-            serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?;
+        let policy: KeyPolicy = serde_json::from_str(&policy_json)
+            .map_err(|_| AppError::internal("keys_key_limit_snapshot_1"))?;
         let key_reserved_micros: i64 = context.try_get("key_reserved_micros")?;
         let settled_lifetime_micros: i64 = context.try_get("settled_lifetime_micros")?;
         let daily_settled: i64 = sqlx::query(
@@ -870,9 +920,9 @@ impl Database {
         .await?
         .try_get::<i64, _>("active")?
         .max(0) as u64;
-        let rpm_limit = u64::from(policy.requests_per_minute);
+        let rpm_limit = policy.requests_per_minute.map(u64::from);
         let tpm_limit = policy.tokens_per_minute;
-        let concurrency_limit = u64::from(policy.max_concurrency);
+        let concurrency_limit = policy.max_concurrency.map(u64::from);
         Ok(KeyLimitSnapshot {
             key_id,
             captured_at,
@@ -882,19 +932,19 @@ impl Database {
             rpm: KeyRateLimitSnapshot {
                 limit: rpm_limit,
                 used: requests_used,
-                remaining: rpm_limit.saturating_sub(requests_used),
-                reset_at: window_start + 60_000,
+                remaining: rpm_limit.map(|limit| limit.saturating_sub(requests_used)),
+                reset_at: rpm_limit.map(|_| window_start + 60_000),
             },
             tpm: KeyRateLimitSnapshot {
                 limit: tpm_limit,
                 used: tokens_used,
-                remaining: tpm_limit.saturating_sub(tokens_used),
-                reset_at: window_start + 60_000,
+                remaining: tpm_limit.map(|limit| limit.saturating_sub(tokens_used)),
+                reset_at: tpm_limit.map(|_| window_start + 60_000),
             },
             concurrency: KeyConcurrencySnapshot {
                 limit: policy.max_concurrency,
                 active,
-                remaining: concurrency_limit.saturating_sub(active),
+                remaining: concurrency_limit.map(|limit| limit.saturating_sub(active)),
             },
             daily_budget: key_budget_snapshot(
                 policy.daily_budget.as_deref(),
@@ -1111,7 +1161,7 @@ async fn require_grant_members(
             "SELECT COUNT(*) AS found FROM model_routes WHERE archived_at IS NULL AND tenant_id = "
         }
         "route_groups" => "SELECT COUNT(*) AS found FROM route_groups WHERE tenant_id = ",
-        _ => return Err(AppError::Internal),
+        _ => return Err(AppError::internal("keys_require_grant_members_1")),
     };
     let mut sql = prefix.to_owned();
     sql.push_str("$1 AND id IN (");
@@ -1158,7 +1208,9 @@ fn provisioned_cloud_credential_from_stable_row(
     let key_id = parse_uuid(row.try_get("id")?)?;
     let account_id = parse_uuid(row.try_get("account_id")?)?;
     let fingerprint: Option<String> = row.try_get("fingerprint")?;
-    let fingerprint = fingerprint.ok_or(AppError::Internal)?;
+    let fingerprint = fingerprint.ok_or(AppError::internal(
+        "keys_provisioned_cloud_credential_from_stable_row_1",
+    ))?;
     let status: String = row.try_get("status")?;
     let generation: i64 = row.try_get("credential_generation")?;
     let generation_active = row.try_get::<i64, _>("generation_active")? != 0;
@@ -1170,8 +1222,7 @@ fn provisioned_cloud_credential_from_stable_row(
         ciphertext
             .as_deref()
             .map(|ciphertext| {
-                let issued =
-                    open_private_json::<IssuedKey>(ciphertext, pepper, KEY_PROVISIONING_AAD)?;
+                let issued = decode_json::<IssuedKey>(ciphertext)?;
                 let (_, secret_fingerprint) = crypto::hash_credential(&issued.key, pepper);
                 if issued.key_id != key_id
                     || issued.account_id != account_id
@@ -1181,7 +1232,9 @@ fn provisioned_cloud_credential_from_stable_row(
                     || issued.fingerprint != fingerprint
                     || secret_fingerprint != fingerprint
                 {
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal(
+                        "keys_provisioned_cloud_credential_from_stable_row_2",
+                    ));
                 }
                 Ok(issued.key)
             })
@@ -1211,7 +1264,7 @@ fn cloud_credential_provisioning_request_hash(
         "principal_external_id": principal_external_id.trim(),
         "currency": currency.to_uppercase(),
     }))
-    .map_err(|_| AppError::Internal)?;
+    .map_err(|_| AppError::internal("keys_cloud_credential_provisioning_request_hash_1"))?;
     Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
@@ -1253,21 +1306,25 @@ fn managed_key_view(row: AnyRow) -> Result<ManagedKeyView, AppError> {
         credential_copy_available: row.try_get::<i64, _>("credential_copy_available")? != 0,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
-        policy: serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?,
+        policy: serde_json::from_str(&policy_json)
+            .map_err(|_| AppError::internal("keys_managed_key_view_1"))?,
         available_balance: micros_to_decimal_string(row.try_get("available_micros")?),
         reserved_balance: micros_to_decimal_string(row.try_get("reserved_micros")?),
     })
 }
 pub(crate) fn validate_key_policy(policy: &KeyPolicy) -> Result<(), AppError> {
-    if policy.requests_per_minute == 0
-        || policy.tokens_per_minute == 0
-        || policy.max_concurrency == 0
+    if policy.requests_per_minute == Some(0)
+        || policy.tokens_per_minute == Some(0)
+        || policy.max_concurrency == Some(0)
     {
         return Err(AppError::BadRequest(
             "RPM, TPM, and maximum concurrency must be positive".into(),
         ));
     }
-    if policy.tokens_per_minute > JSON_SAFE_INTEGER_MAX {
+    if policy
+        .tokens_per_minute
+        .is_some_and(|limit| limit > JSON_SAFE_INTEGER_MAX)
+    {
         return Err(AppError::BadRequest(format!(
             "TPM must not exceed the JSON safe integer maximum {JSON_SAFE_INTEGER_MAX}"
         )));
@@ -1326,7 +1383,7 @@ fn key_budget_snapshot(
     let limit_micros = configured
         .map(|value| {
             Decimal::from_str_exact(value)
-                .map_err(|_| AppError::Internal)
+                .map_err(|_| AppError::internal("keys_key_budget_snapshot_1"))
                 .and_then(decimal_to_micros)
         })
         .transpose()?;
@@ -1347,8 +1404,47 @@ fn key_budget_snapshot(
 }
 
 #[cfg(test)]
+#[path = "key_authentication_tests.rs"]
+mod key_authentication_tests;
+
+#[cfg(test)]
 mod tests {
     use super::super::super::*;
+
+    #[test]
+    fn optional_policy_validation_keeps_zero_and_tpm_overflow_invalid() {
+        validate_key_policy(&KeyPolicy::default()).unwrap();
+        for policy in [
+            KeyPolicy {
+                requests_per_minute: Some(0),
+                ..KeyPolicy::default()
+            },
+            KeyPolicy {
+                tokens_per_minute: Some(0),
+                ..KeyPolicy::default()
+            },
+            KeyPolicy {
+                max_concurrency: Some(0),
+                ..KeyPolicy::default()
+            },
+            KeyPolicy {
+                tokens_per_minute: Some(JSON_SAFE_INTEGER_MAX + 1),
+                ..KeyPolicy::default()
+            },
+        ] {
+            assert!(matches!(
+                validate_key_policy(&policy),
+                Err(AppError::BadRequest(_))
+            ));
+        }
+        validate_key_policy(&KeyPolicy {
+            requests_per_minute: Some(u32::MAX),
+            tokens_per_minute: Some(JSON_SAFE_INTEGER_MAX),
+            max_concurrency: Some(u32::MAX),
+            ..KeyPolicy::default()
+        })
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn direct_copy_checks_scope_tenant_hash_and_revocation() {
@@ -1407,7 +1503,7 @@ mod tests {
             database
                 .copy_key_credential(issued.key_id, pepper, None, true)
                 .await,
-            Err(AppError::Internal)
+            Err(AppError::Internal { .. })
         ));
         database
             .store_key_credential_plaintext(issued.key_id, &issued.key, pepper)
@@ -1524,7 +1620,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authenticated.account_id, issued.account_id);
-        assert_eq!(authenticated.policy.requests_per_minute, 60);
+        assert_eq!(authenticated.policy.requests_per_minute, None);
         assert_eq!(
             database
                 .copy_key_credential(issued.key_id, pepper, None, true)
@@ -1562,7 +1658,8 @@ mod tests {
         let request_hash: String = replay_row.try_get("request_hash").unwrap();
         let ciphertext: String = replay_row.try_get("response_ciphertext").unwrap();
         assert_eq!(request_hash.len(), 64);
-        assert!(!ciphertext.contains(&rotated[0].key));
+        let replay: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
+        assert_eq!(replay["key"].as_str(), Some(rotated[0].key.as_str()));
 
         sqlx::query(
             "UPDATE credential_rotation_replays SET expires_at = $1 WHERE idempotency_key = $2",
@@ -1603,7 +1700,7 @@ mod tests {
         assert_eq!(generation, 2);
     }
     #[tokio::test]
-    async fn key_provisioning_replays_one_encrypted_response_for_an_idempotency_key() {
+    async fn key_provisioning_replays_one_stored_response_for_an_idempotency_key() {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
             "sqlite://{}?mode=rwc",
@@ -1653,7 +1750,8 @@ mod tests {
                 .unwrap()
                 .try_get("issued_key_ciphertext")
                 .unwrap();
-        assert!(!ciphertext.contains(&first.key));
+        let replay: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
+        assert_eq!(replay["key"].as_str(), Some(first.key.as_str()));
 
         let other_tenant = database
             .create_key(
@@ -1690,9 +1788,9 @@ mod tests {
                     alias: "before".to_owned(),
                     currency: "USD".to_owned(),
                     policy: KeyPolicy {
-                        requests_per_minute: 3,
-                        tokens_per_minute: 1_000,
-                        max_concurrency: 1,
+                        requests_per_minute: Some(3),
+                        tokens_per_minute: Some(1_000),
+                        max_concurrency: Some(1),
                         daily_budget: Some("0.01".to_owned()),
                         weekly_budget: Some("0.02".to_owned()),
                         lifetime_budget: Some("0.03".to_owned()),
@@ -1741,13 +1839,13 @@ mod tests {
         assert_eq!(snapshot.key_id, issued.key_id);
         assert_eq!(snapshot.available_balance, "1.9999");
         assert_eq!(snapshot.reserved_balance, "0.0001");
-        assert_eq!(snapshot.rpm.limit, 3);
+        assert_eq!(snapshot.rpm.limit, Some(3));
         assert_eq!(snapshot.rpm.used, 1);
-        assert_eq!(snapshot.tpm.limit, 1_000);
+        assert_eq!(snapshot.tpm.limit, Some(1_000));
         assert_eq!(snapshot.tpm.used, 100);
-        assert_eq!(snapshot.concurrency.limit, 1);
+        assert_eq!(snapshot.concurrency.limit, Some(1));
         assert_eq!(snapshot.concurrency.active, 1);
-        assert_eq!(snapshot.concurrency.remaining, 0);
+        assert_eq!(snapshot.concurrency.remaining, Some(0));
         assert_eq!(snapshot.daily_budget.limit.as_deref(), Some("0.01"));
         assert_eq!(snapshot.daily_budget.settled, "0");
         assert_eq!(snapshot.daily_budget.reserved, "0.0001");
@@ -1763,7 +1861,7 @@ mod tests {
         database.settle_usage(&reservation, 0, 100).await.unwrap();
         let settled = database.key_limit_snapshot(issued.key_id).await.unwrap();
         assert_eq!(settled.concurrency.active, 0);
-        assert_eq!(settled.concurrency.remaining, 1);
+        assert_eq!(settled.concurrency.remaining, Some(1));
         assert_eq!(settled.daily_budget.settled, "0.0001");
         assert_eq!(settled.daily_budget.reserved, "0");
         let next = database

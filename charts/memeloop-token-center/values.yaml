@@ -39,7 +39,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 127
+  schemaVersion: 144
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -68,8 +68,10 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
-      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
+      # Request is what the scheduler reserves. The limit is higher so a burst
+      # of in-memory request bodies can allocate without pinning that RAM up front.
+      requests: { cpu: 100m, memory: 512Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: "1", memory: 8Gi, ephemeral-storage: 256Mi }
     autoscaling:
       # Size this together with config.databaseMaxConnections and the database
       # connection budget before enabling.
@@ -127,8 +129,8 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
-      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
+      requests: { cpu: 100m, memory: 512Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: "1", memory: 2Gi, ephemeral-storage: 256Mi }
     autoscaling:
       enabled: false
       minReplicas: 1
@@ -138,12 +140,6 @@ roles:
       behavior: {}
     podDisruptionBudget: { enabled: false, minAvailable: 1 }
 
-# Authenticated Responses bodies are first written to bounded node-local disk.
-# The file is request-owned and unlinked on completion, rejection, or cancellation.
-requestSpool:
-  mountPath: /var/lib/memeloop-token-center/request-spool
-  sizeLimit: 160Mi
-
 config:
   terminalProjectionEnabled: false
   # Keep the sum across replicas below the PostgreSQL/PgBouncer connection budget.
@@ -151,17 +147,13 @@ config:
   # Legacy compatibility value; proxy lifecycle admission uses the byte budget.
   proxyLifecycleConcurrency: 64
   # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
-  # this budget + 256Mi; raising body max also requires budget >= max * 12 + 1Mi.
-  proxyMemoryBudgetBytes: 536870912
+  # this budget + 256Mi. The budget is not a multiple of the maximum body.
+  proxyMemoryBudgetBytes: 2147483648
   # Count admission for readers without complete shared byte accounting.
   # Metered default text bodies use bytes; other readers retain 1..8192 permits.
   gatewayBodyReadConcurrency: 1024
-  # `/v1/responses` may exceed the normal 4 MiB gateway request. Four dedicated
-  # concurrent reads and the separate process disk-byte budget bound admission.
+  # `/v1/responses` keeps the upload in memory until the upstream response finishes.
   responsesBodyMaxBytes: 33554432
-  # Per-process bytes admitted to request spool files. Capacity saturation is
-  # a retryable 503 and remains distinct from the 413 request-size boundary.
-  responsesRequestSpoolBytes: 134217728
   # Independent multipart ceiling for `/v1/audio/transcriptions`; changing it
   # does not widen `/v1/responses` or other text endpoints.
   audioBodyMaxBytes: 26214400
@@ -243,6 +235,8 @@ plugins:
   # The existing PVC must support concurrent multi-node mounts (normally RWX)
   # and coherent POSIX locks, hard links, rename and fsync.
   runtimeInventory:
+    # Deployment provisioning is explicit: no durable claim/trust means no
+    # browser installation, never an automatic emptyDir/ConfigMap fallback.
     enabled: false
     existingClaim: ""
     persistence:
@@ -250,7 +244,11 @@ plugins:
       storageClass: ""
       size: 1Gi
     installationEnabled: false
-    # Host-owned policy.json; paths refer to the mounts documented in the guide.
+    # Host-owned policy.json must place plugin_root on durable storage: the
+    # shared runtime PVC or an independently persistent package mount.
+    # /tmp is transient extraction space and must never be the package root.
+    # Installation approvals/configurations/revision head also require a
+    # persistent external database via config.databaseUrlSecret.
     policyConfigMap: ""
     # Explicit keyless mode omits the public-key Secret; policy.json must then
     # contain an exact reviewed GitHub Actions issuer and workflow identity.

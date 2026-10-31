@@ -11,7 +11,7 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
   if (properties.additionalProperties === undefined) properties.additionalProperties = true;
   const copy: Record<string, [string, string, string, string]> = {
     network_scope: ['网络访问范围', 'Network access scope', '公网服务选择 public，私网服务选择 private；连接私网服务需要全局操作员凭据。', 'Choose public for an internet service or private for a private network service. Private destinations require a global operator credential.'],
-    reservation_token_bounds: ['模型词元预留上限', 'Model token reservation bounds', '按准确模型名称设置保守的词元预留值，用于请求预算，不代表模型输出上限。', 'Conservative token reservations per exact model name, used for request budgeting rather than model output limits.'],
+    reservation_token_bounds: ['模型词元预留上限', 'Model token reservation bounds', '按准确模型名称设置请求预算用的词元预留。模型实际输出上限以模型目录为准。', 'Token reservation per exact model name, used for the request budget. The model output limit comes from the model catalog.'],
     transport_policy: ['运行时传输策略', 'Runtime transport policy', '单位见各字段；这些设置影响该账号的所有请求。', 'Units are shown per field. These settings affect every request using this account.'],
     timeout_seconds: ['请求超时（秒）', 'Request timeout (seconds)', '设置等待上游完成请求的最长时间；不确定时保留默认值。', 'Set how long to wait for an upstream request to finish. Keep the default if unsure.'],
     provider_asset_reads_repeatable: ['生成文件可重复读取', 'Generated files allow repeated downloads', '仅在生成文件的下载地址可重复使用时启用；一次性下载地址请保持关闭。', 'Enable only when generated file URLs allow repeated downloads. Leave off for single-use URLs.'],
@@ -28,9 +28,9 @@ export function providerEditSchema(schema: RJSFSchema, locale: string): RJSFSche
   const policy = properties.properties?.transport_policy;
   if (zh && policy && typeof policy === 'object') {
     for (const [name, description] of Object.entries({
-      connect_timeout_millis: '建立连接的等待时限，必须小于请求总超时。',
-      read_timeout_millis: '收到响应头后等待首段内容，以及后续相邻内容之间允许的最长无数据时间。',
-      request_timeout_millis: '从首次发送到完整接收响应的总时限，包含系统允许的重放。',
+      connect_timeout_millis: '可选的连接建立超时。默认不设置，不施加应用层连接时限。显式取值只覆盖建立连接（含 TLS 和配置的代理），不限制响应时长。',
+      read_timeout_millis: '可选。默认不设置时，上游再安静也不会被中断。设置后，该值是每收到一个字节就重新计时的读取静默窗口；Codex 转发不把它当作绝对时限。',
+      request_timeout_millis: 'HTTP/2 保活 PING 应答超时，也是模型目录和额度读取的总预算。不对推理或压缩施加绝对时限；连接保持健康时，安静的上游响应会继续。',
       dispatch_max_in_flight: '此账号每个代理出口的可选请求并发上限。默认值 0 表示不添加派发限制，也不使用派发队列。正数会限制正在执行的请求（包括流式响应）；调低已设置的上限时，现有请求继续完成。',
       dispatch_max_queued: '仅在派发并发上限大于 0 时生效。设置可排队等待的请求数；0 表示并发满时立即拒绝新请求。',
       dispatch_queue_timeout_millis: '仅在派发并发上限大于 0 时生效。请求排队超过此时限会返回 503；该请求尚未派发或计费。',

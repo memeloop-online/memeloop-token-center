@@ -22,7 +22,7 @@ import { IdentityPage } from './pages/IdentityPage';
 import { identityCopy } from './identityCopy';
 import { transportProxyGroupCopy } from './transportProxyGroupCopy';
 import { currentProxyGroupNavigationContext, type ProxyGroupNavigationContext } from '../app/proxyGroupNavigation';
-import { LoadingState, PageLoadingRegion } from '../design-system';
+import { Button, LoadingState, PageLoadingRegion } from '../design-system';
 import {
   PluginContributionPage,
   PluginModelRouteActions,
@@ -38,11 +38,10 @@ const PricingPage = lazy(() => import('./pages/ManagementPages').then((module) =
 const ProvidersPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.ProvidersPage })));
 const RoutesPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.RoutesPage })));
 const ServiceCredentialsPage = lazy(() => import('./pages/ManagementPages').then((module) => ({ default: module.ServiceCredentialsPage })));
-const GenerationsPage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.GenerationsPage })));
 const OverviewPage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.OverviewPage })));
 const UsagePage = lazy(() => import('./pages/OperatorPages').then((module) => ({ default: module.UsagePage })));
 const PluginsPage = lazy(() => import('./pages/PluginsPage').then((module) => ({ default: module.PluginsPage })));
-const RequestsPage = lazy(() => import('./pages/RequestsPage').then((module) => ({ default: module.RequestsPage })));
+const RequestWorkspace = lazy(() => import('./RequestWorkspace').then((module) => ({ default: module.RequestWorkspace })));
 const SessionsPage = lazy(() => import('./pages/SessionsPage').then((module) => ({ default: module.SessionsPage })));
 const SystemSettingsPage = lazy(() => import('./pages/SystemSettingsPage').then((module) => ({ default: module.SystemSettingsPage })));
 const TenantManager = lazy(() => import('./TenantManager').then((module) => ({ default: module.TenantManager })));
@@ -64,7 +63,6 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
   { route: 'requests', label: 'nav.traffic', domId: 'traffic' },
   { route: 'sessions', label: 'sessions.sessionsMode', domId: 'sessions' },
   { route: 'usage', label: 'nav.usage', domId: 'usage' },
-  { route: 'generations', label: 'nav.generations', domId: 'generations' },
   { route: 'providers', label: 'nav.providers', domId: 'providers' },
   { route: 'proxy-groups', label: '', domId: 'proxy-groups' },
   { route: 'routes', label: 'nav.routes', domId: 'routes' },
@@ -76,6 +74,7 @@ const navigation: Array<{ route: OperatorRouteKey; label: string; domId: string 
 ];
 
 function pageId(route: OperatorApplicationRoute) {
+  if (route === 'generations') return 'requests';
   if (route === 'service-credentials') return 'tenants';
   return navigation.find((item) => item.route === route)?.domId ?? route;
 }
@@ -215,25 +214,30 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   const accessSettings = <OperatorAccessSettings
     credentialInput={scope.credentialInput}
     credential={scope.credential}
+    validated={scope.validated}
     authenticating={scope.authenticating}
     onCredentialInput={scope.setCredentialInput}
     onConnect={(credential) => { void scope.authenticate(credential); }}
     onClear={scope.clearCredential}
   />;
 
+  const emptyTenantScope = Boolean(scope.activeCredential && scope.validated
+    && scope.status.kind === 'ready' && !scope.tenant && scope.tenants.length === 0);
+  const globalBootstrapPage = activeRoute === 'plugins' || activeRoute === 'tenants';
   let page: ReactNode = null;
   // Pages mount only after authentication and tenant discovery have produced
-  // an exact scope. This prevents a transient empty tenant from turning a
+  // an exact scope. Only global bootstrap pages accept a confirmed empty list.
+  // This prevents a transient empty tenant from turning a
   // tenant-scoped resource request into an accidental all-tenant read.
-  if (scope.activeCredential && scope.validated && scope.tenant) {
+  if (scope.activeCredential && scope.validated && (scope.tenant || (emptyTenantScope && globalBootstrapPage))) {
     const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
         case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenRequest={openRequestById} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} /></>; break;
-        case 'requests': page = <RequestsPage {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
+        case 'requests':
+        case 'generations': page = <RequestWorkspace mode={activeRoute === 'generations' ? 'generations' : 'requests'} onModeChange={(mode) => navigate(mode)} {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
-        case 'generations': page = <GenerationsPage {...pageProps} />; break;
         case 'providers': page = <ProvidersPage {...pageProps} onOpenProxyGroups={openProxyGroups} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {
           if (!scope.tenants.some(value => value.external_id === tenant)) return;
           scope.setTenant(tenant);
@@ -249,7 +253,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
         case 'system-settings': page = <>{accessSettings}<SystemSettingsPage {...pageProps} /></>; break;
       }
       const extensions = pluginRegistry.pageExtensions.get(activeRoute);
-      if (page && extensions) {
+      if (page && extensions && scope.tenant) {
         page = <>
           <PluginPageExtensions extensions={extensions.before} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />
           {page}
@@ -268,18 +272,19 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   } else if (!scope.authenticating || activeRoute === 'system-settings') page = accessSettings;
 
   const content = <>
-    {scope.activeCredential && scope.tenants.length === 0 && <div className="console-context"><div><b>{t('operator.noTenants')}</b></div></div>}
+    {emptyTenantScope && <div className="console-context"><div><b>{t('operator.noTenants')}</b></div>{activeRoute !== 'tenants' && <Button appearance="secondary" onClick={() => void navigate('tenants')}>{t('tenants.create')}</Button>}</div>}
     {scope.activeCredential && (scope.tenants.length > 1 || activeRoute === 'credentials') && <div className="tenant-scope-switcher"><label className="tenant-picker"><span>{t('operator.tenant')}</span><select value={scope.tenant} onChange={(event) => {
       const tenant = event.target.value;
       void guardedNavigation(() => { setProxyContext({}); scope.setTenant(tenant); });
     }}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{tenantDisplayName(value.external_id, locale)}</option>)}</select></label></div>}
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => {
-      const selected = activeRoute === item.route || activeRoute === 'service-credentials' && item.route === 'tenants';
+      const selected = activeRoute === item.route || activeRoute === 'service-credentials' && item.route === 'tenants' || activeRoute === 'generations' && item.route === 'requests';
       return <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={selected} aria-controls={`operator-panel-${item.domId}`} tabIndex={selected ? 0 : -1} key={item.route} className={selected ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{item.route === 'tenants' ? identityCopy(locale).title : item.route === 'proxy-groups' ? transportProxyGroupCopy(locale).title : t(item.label)}</button>;
     })}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
+    {scope.serviceFault && <div className="notice error" role="alert">{scope.serviceFault}<Button appearance="secondary" onClick={scope.retry} disabled={scope.authenticating}>{t('common.retry')}</Button></div>}
     <section id={`operator-panel-${pageId(activeRoute)}`} role="tabpanel" aria-labelledby={showNavigation ? `operator-tab-${pageId(activeRoute)}` : undefined} tabIndex={0}>
-      {scope.authenticating && activeRoute !== 'system-settings'
+      {scope.authenticating && !scope.activeCredential && activeRoute !== 'system-settings'
         ? <LoadingState label={t('common.loading')} level="page" />
         : <Fragment key={pageScopeKey}><Suspense fallback={<LoadingState label={t('common.loading')} level="page" />}>{page}</Suspense></Fragment>}
     </section>

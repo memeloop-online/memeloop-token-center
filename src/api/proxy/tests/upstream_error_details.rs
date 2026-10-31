@@ -80,7 +80,7 @@ async fn supplier_header_and_prompt_echoes_never_reach_response_archives_or_logs
             } else {
                 assert_eq!(bytes, upstream_error::fallback_body());
             }
-            wait_for_request_settlement(&fixture, 1).await;
+            cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
             let records = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
             let refs = fixture.state.db.request_archive_refs(fixture.key_id, records[0].request_id).await.unwrap();
             let stored = refs.response_object.as_deref().unwrap().strip_prefix("inline-json:").unwrap();
@@ -228,7 +228,12 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             assert!(!String::from_utf8_lossy(&bytes).contains(canary));
         }
         assert!(delivered.get("usage").is_none());
-        wait_for_request_settlement(&fixture, 1).await;
+        cancellation::assert_single_unknown_receipt(
+            &fixture,
+            i64::from(status),
+            Some(&format!("http_{status}")),
+        )
+        .await;
         let records = fixture
             .state
             .db
@@ -247,13 +252,8 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             Some(fixture.upstream_account_id)
         );
         assert_eq!(record.route_id, Some(fixture.route_id));
-        assert_eq!(
-            record.usage_basis,
-            Some(crate::model::RequestUsageBasis::NotObserved)
-        );
-        assert_eq!(record.input_tokens, 0);
-        assert_eq!(record.output_tokens, 0);
-        assert_eq!(record.cost, "0");
+        assert!(record.usage.tokens.is_none());
+        assert_eq!(record.billing.cost, None);
         let refs = fixture
             .state
             .db
@@ -288,7 +288,6 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         assert_eq!(detail.view.supplier_error, projected);
         assert_eq!(detail.response_body, delivered);
         assert!(detail.archive.response.complete);
-        assert_exactly_once_side_effects(&fixture, record.request_id, None).await;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let spools: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1",
@@ -369,6 +368,7 @@ async fn compatible_http_402_without_safe_structured_detail_does_not_invent_a_pl
             .await
             .unwrap();
         assert_eq!(bytes, upstream_error::fallback_body());
+        cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
         let records = fixture
             .state
             .db
@@ -376,7 +376,8 @@ async fn compatible_http_402_without_safe_structured_detail_does_not_invent_a_pl
             .await
             .unwrap();
         assert_eq!(records[0].error_code.as_deref(), Some("http_402"));
-        assert_eq!(records[0].cost, "0");
+        assert_eq!(records[0].billing.cost, None);
+        assert!(records[0].usage.tokens.is_none());
         let refs = fixture
             .state
             .db
@@ -443,6 +444,7 @@ async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() 
     assert_eq!(bytes, upstream_error::fallback_body());
     release.send(()).unwrap();
     server.await.unwrap();
+    cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
     let records = fixture
         .state
         .db
@@ -451,11 +453,8 @@ async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() 
         .unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].error_code.as_deref(), Some("http_402"));
-    assert_eq!(
-        records[0].usage_basis,
-        Some(crate::model::RequestUsageBasis::NotObserved)
-    );
-    assert_eq!(records[0].cost, "0");
+    assert!(records[0].usage.tokens.is_none());
+    assert_eq!(records[0].billing.cost, None);
     let refs = fixture
         .state
         .db
@@ -517,7 +516,8 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
         ] {
             assert!(!delivered.contains(forbidden));
         }
-        wait_for_request_settlement(&fixture, 1).await;
+        let receipt =
+            cancellation::assert_single_unknown_receipt(&fixture, 502, Some("rate_limited")).await;
         let records = fixture
             .state
             .db
@@ -528,13 +528,8 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
         let record = &records[0];
         assert_eq!(record.status_code, Some(502));
         assert_eq!(record.error_code.as_deref(), Some("rate_limited"));
-        assert_eq!(
-            record.usage_basis,
-            Some(crate::model::RequestUsageBasis::NotObserved)
-        );
-        assert_eq!(record.input_tokens, 0);
-        assert_eq!(record.output_tokens, 0);
-        assert_eq!(record.cost, "0");
+        assert!(record.usage.tokens.is_none());
+        assert_eq!(record.billing.cost, None);
         let supplier = record
             .supplier_error
             .as_ref()
@@ -544,8 +539,8 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
             supplier.message,
             crate::supplier_error::SafeReason::RateLimited.message()
         );
-        assert_exactly_once_side_effects(&fixture, record.request_id, None).await;
-        drain_completed_response_archive(&fixture).await;
+        let stored = sse_delivery::pending_response_archive(&fixture, &receipt).await;
+        assert_eq!(stored, delivered);
         let refs = fixture
             .state
             .db
@@ -555,7 +550,7 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
         assert_eq!(refs.view.supplier_error, record.supplier_error);
         let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
         assert_eq!(detail.view.supplier_error, record.supplier_error);
-        assert!(detail.archive.response.complete);
+        assert_eq!(detail.view.completed_at, None);
         upstream.verify().await;
     }
 }

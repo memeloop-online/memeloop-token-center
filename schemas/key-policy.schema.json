@@ -5,9 +5,9 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "requests_per_minute": { "title": "Requests per minute", "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 60 },
-    "tokens_per_minute": { "title": "Tokens per minute", "type": "integer", "minimum": 1, "maximum": 9007199254740991, "default": 100000 },
-    "max_concurrency": { "title": "Maximum concurrency", "type": "integer", "minimum": 1, "maximum": 4294967295, "default": 4 },
+    "requests_per_minute": { "title": "Requests per minute", "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295 },
+    "tokens_per_minute": { "title": "Tokens per minute", "type": ["integer", "null"], "minimum": 1, "maximum": 9007199254740991 },
+    "max_concurrency": { "title": "Maximum concurrency", "type": ["integer", "null"], "minimum": 1, "maximum": 4294967295 },
     "enforcement_mode": {
       "title": "Enforcement mode",
       "description": "Prepaid enforces balance and policy limits synchronously. Metered unlimited records exact postpaid usage without those shared admission limits.",

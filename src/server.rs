@@ -32,6 +32,12 @@ const MAX_HTTP2_HEADER_LIST_BYTES: u32 = 64 * 1024;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_DRAIN_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
+mod rejected_upload;
+
+/// Only admission failures that can leave unread upload bytes need lingering.
+#[derive(Clone, Copy)]
+pub(crate) struct RejectedUpload;
+
 #[derive(Clone, Copy)]
 struct ServerLimits {
     max_connections: usize,
@@ -171,7 +177,27 @@ where
                     drop(stream);
                     continue;
                 };
+                let (stream, rejection) = rejected_upload::RejectionIo::new(stream);
                 let service = TowerToHyperService::new(app.clone());
+                let service = hyper::service::service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                    let service = service.clone();
+                    let rejection = rejection.clone();
+                    async move {
+                        let http1 = matches!(
+                            request.version(),
+                            hyper::Version::HTTP_10 | hyper::Version::HTTP_11
+                        );
+                        let mut response = hyper::service::Service::call(&service, request).await?;
+                        if http1 && response.extensions_mut().remove::<RejectedUpload>().is_some() {
+                            rejection.store(true, std::sync::atomic::Ordering::Relaxed);
+                            response.headers_mut().insert(
+                                hyper::header::CONNECTION,
+                                hyper::header::HeaderValue::from_static("close"),
+                            );
+                        }
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                });
                 let builder = connection_builder(limits);
                 let mut connection_shutdown = shutdown_sender.subscribe();
                 connections.spawn(async move {

@@ -191,9 +191,15 @@ async fn run() -> Result<(), &'static str> {
             .await
             .map_err(|_| "database_connect_failed")?;
             database
-                .migrate_with_credential_pepper(config.key_pepper.as_bytes())
+                .migrate()
                 .await
                 .map_err(|_| "database_migration_failed")?;
+            if let Err(error) = database
+                .convert_sealed_state(config.key_pepper.as_bytes())
+                .await
+            {
+                tracing::error!(%error, "converting sealed gateway state failed");
+            }
             info!("database schema is current");
         }
         Command::BackfillExactFailedRequestCosts {
@@ -290,16 +296,37 @@ async fn run() -> Result<(), &'static str> {
                     match initialized {
                         Ok(state) => {
                             startup.install(api::router_for_role(state.clone(), role));
-                            if role.runs_worker() {
-                                worker::run_until_shutdown_with_oauth_stop(
-                                    state,
-                                    receiver,
-                                    oauth_receiver,
-                                )
-                                .await;
-                            } else {
-                                let _ = receiver.changed().await;
+                            #[cfg(feature = "experimental-plugin-revisions")]
+                            let refresh = async {
+                                let mut ticks =
+                                    tokio::time::interval(std::time::Duration::from_secs(5));
+                                ticks.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Skip,
+                                );
+                                loop {
+                                    ticks.tick().await;
+                                    let _ = state.refresh_application_plugins().await;
+                                }
+                            };
+                            let ordinary = async {
+                                if role.runs_worker() {
+                                    worker::run_until_shutdown_with_oauth_stop(
+                                        state.clone(),
+                                        receiver,
+                                        oauth_receiver,
+                                    )
+                                    .await;
+                                } else {
+                                    let _ = receiver.changed().await;
+                                }
+                            };
+                            #[cfg(feature = "experimental-plugin-revisions")]
+                            tokio::select! {
+                                _ = ordinary => {},
+                                _ = refresh => {},
                             }
+                            #[cfg(not(feature = "experimental-plugin-revisions"))]
+                            ordinary.await;
                             return;
                         }
                         Err(error) => {

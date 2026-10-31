@@ -83,7 +83,11 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
             .await
             .unwrap();
         assert!(!String::from_utf8_lossy(&returned).contains("private-upstream-diagnostic-canary"));
-        wait_for_request_settlement(&fixture, 1).await;
+        if rejected {
+            cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
+        } else {
+            wait_for_request_settlement(&fixture, 1).await;
+        }
         let records = fixture
             .state
             .db
@@ -95,13 +99,17 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
             records[0].status_code,
             Some(i64::from(expected_status.as_u16()))
         );
-        assert_exactly_once_side_effects(
-            &fixture,
-            records[0].request_id,
-            (!rejected).then_some("resp-codex"),
-        )
-        .await;
-        assert_response_archives_omit(&fixture, "private-upstream-diagnostic-canary").await;
+        if rejected {
+            sse_delivery::assert_unknown_response_archives_omit(
+                &fixture,
+                "private-upstream-diagnostic-canary",
+            )
+            .await;
+        } else {
+            assert_exactly_once_side_effects(&fixture, records[0].request_id, Some("resp-codex"))
+                .await;
+            assert_response_archives_omit(&fixture, "private-upstream-diagnostic-canary").await;
+        }
         let requests = upstream.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let wire: Value = serde_json::from_slice(&requests[0].body).unwrap();

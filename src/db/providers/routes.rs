@@ -49,6 +49,33 @@ impl Database {
         }
     }
 
+    /// Name-only suggestions for historical filters. Availability, account and
+    /// route identity deliberately do not participate in this projection.
+    /// Reads the indexed configuration table, never the request history.
+    pub async fn list_filter_model_names(
+        &self,
+        tenant_external_id: Option<&str>,
+        search: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, AppError> {
+        let pattern = format!(
+            "%{}%",
+            search
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let names = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT r.public_model FROM model_routes r WHERE r.tenant_id IN (SELECT t.id FROM tenants t WHERE $1 = '' OR t.external_id = $1) AND LOWER(r.public_model) LIKE LOWER($2) ESCAPE '\\' ORDER BY r.public_model LIMIT $3",
+        )
+        .bind(tenant_external_id.unwrap_or_default())
+        .bind(pattern)
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(names)
+    }
+
     pub async fn list_model_routes(
         &self,
         tenant_external_id: Option<&str>,
@@ -508,8 +535,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("routes_resolve_upstream_with_hint_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;

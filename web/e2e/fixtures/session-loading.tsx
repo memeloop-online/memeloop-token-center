@@ -73,6 +73,26 @@ if (new URLSearchParams(location.search).has('titles')) {
 }
 window.fetch = async (input, init) => {
   const url = String(input);
+  const requestUrl = new URL(url, location.origin);
+  if (requestUrl.pathname.endsWith('/title')) {
+    return new Response(JSON.stringify({ title: null, state: 'unavailable', error_code: null, updated_at: null }));
+  }
+  const dialogueMatch = /\/sessions\/([^/]+)\/requests\/([^/]+)\/dialogue$/.exec(requestUrl.pathname);
+  if (dialogueMatch) {
+    return new Response(JSON.stringify({
+      contract_version: 'session_dialogue_v1', representation: 'session_body',
+      session_id: decodeURIComponent(dialogueMatch[1]!), request_id: decodeURIComponent(dialogueMatch[2]!),
+      turns: [],
+    }));
+  }
+  const contextMatch = /\/sessions\/([^/]+)\/requests\/([^/]+)\/context$/.exec(requestUrl.pathname);
+  if (contextMatch) {
+    return new Response(JSON.stringify({
+      contract_version: 'session_context_v1', representation: 'semantic_context',
+      session_id: decodeURIComponent(contextMatch[1]!), request_id: decodeURIComponent(contextMatch[2]!),
+      items: [], next_cursor: null,
+    }));
+  }
   if (url.includes('/keys?')) return new Response(JSON.stringify([]));
   const summaryBatch = url.includes('/sessions/summaries');
   if (summaryBatch && init?.method !== 'POST') {

@@ -396,7 +396,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.equal(await page.locator('.transport-proxy-workspace').getByRole('button', { name: '删除', exact: true }).isEnabled(), false);
       await page.getByLabel('解绑后保留的单代理出口', { exact: true }).selectOption({ label: '主出口' });
       await page.getByRole('button', { name: '解绑并保留所选代理', exact: true }).click(); await confirm(page);
-      await page.getByText('已解除代理组绑定，账号将继续使用所选出口，不会改为直连。', { exact: true }).waitFor();
+      await page.getByText('已解除代理组绑定。账号继续使用当前所选出口。', { exact: true }).waitFor();
       await assertWorkspaceFocus(page);
       await assertSecretsAbsent(page);
       await page.locator('.transport-proxy-workspace').getByRole('button', { name: '删除', exact: true }).click(); await confirm(page);
@@ -404,8 +404,8 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await assertWorkspaceFocus(page);
       const fixture = await page.evaluate(() => window.proxyGroupFixture);
       assert.deepEqual(fixture.writes.map(write => write.method), ['POST', 'PUT', 'PUT', 'DELETE', 'DELETE']);
-      assert.deepEqual(fixture.writes[0].body, { tenant_external_id: 'fixture', name: '研发出口组', members: [{ label: '主出口', proxy_url: privateProxySecret }] });
-      assert.deepEqual(fixture.writes[1].body, { tenant_external_id: 'fixture', name: '共享出口组', expected_version: 1, members: [{ id: 'raw-member-id-0', label: '主出口' }] });
+      assert.deepEqual(fixture.writes[0].body, { tenant_external_id: 'fixture', name: '研发出口组', probe_url: null, probe_attempts: 2, members: [{ label: '主出口', proxy_url: privateProxySecret }] });
+      assert.deepEqual(fixture.writes[1].body, { tenant_external_id: 'fixture', name: '共享出口组', expected_version: 1, probe_url: null, probe_attempts: 2, members: [{ id: 'raw-member-id-0', label: '主出口' }] });
       assert.deepEqual(fixture.writes[2].body, { tenant_external_id: 'fixture', expected_binding_version: 0, expected_credential_generation: 7, expected_updated_at: 100, group_id: 'raw-group-id', expected_group_version: 2, initial_member_id: 'raw-member-id-0' });
       assert.deepEqual(fixture.writes[3].body, { tenant_external_id: 'fixture', expected_binding_version: 1, expected_credential_generation: 8, expected_updated_at: 101, expected_group_version: 2, single_proxy_member_id: 'raw-member-id-0' });
       assert.deepEqual(fixture.writes[4].body, { tenant_external_id: 'fixture', expected_version: 2 });
@@ -461,7 +461,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.waitForFunction(() => Boolean(window.proxyGroupFixture.release));
       await page.clock.runFor(15_001);
-      await page.getByText(/保存结果尚未确认，关闭页面也不会取消保存/).waitFor();
+      await page.getByText(/保存结果尚未确认。关闭页面后保存仍会完成/).waitFor();
       assert.equal(await page.getByRole('button', { name: '保存代理组', exact: true }).isEnabled(), false);
       await page.evaluate(() => window.proxyGroupFixture.release?.());
       assert.equal(await page.getByText(/代理组配置已保存/).count(), 0);
@@ -474,7 +474,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.waitForFunction(() => Boolean(window.proxyGroupFixture.release));
       await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
-      await page.getByText(/关闭不会取消保存/).waitFor(); await confirm(page);
+      await page.getByText(/关闭页面后保存仍会完成/).waitFor(); await confirm(page);
       await assertAccountDirectoryReturn(page);
       await page.evaluate(() => window.proxyGroupFixture.release?.());
       await openManager(page);

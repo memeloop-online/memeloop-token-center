@@ -40,8 +40,8 @@ async fn metered_failure_releases_budget_and_concurrency_without_consuming_tpm()
                 alias: "metered-failure".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 1,
-                    max_concurrency: 1,
+                    tokens_per_minute: Some(1),
+                    max_concurrency: Some(1),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,
@@ -337,7 +337,7 @@ async fn concurrent_budget_reservations_and_settlement_replays_are_exact() {
                 alias: "budget-concurrency".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 10_000,
+                    tokens_per_minute: Some(10_000),
                     daily_budget: Some("0.001".to_owned()),
                     weekly_budget: Some("0.001".to_owned()),
                     lifetime_budget: Some("0.001".to_owned()),
@@ -917,7 +917,7 @@ async fn settlement_uses_cache_and_service_tier_price_snapshots() {
                 alias: "tier-pricing".to_owned(),
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
-                    tokens_per_minute: 2_000_000,
+                    tokens_per_minute: Some(2_000_000),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::from(10),

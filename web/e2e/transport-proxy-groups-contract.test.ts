@@ -16,7 +16,7 @@ test('transport proxy failures distinguish editable validation, CAS, denied and 
     for (const locale of ['zh-CN', 'en']) assert.ok(!transportProxyError(reason, locale).includes(secret));
   }
   assert.equal(transportProxyFailureKind(new TypeError(secret)), 'unknown');
-  assert.match(transportProxyError(new TypeError(secret)), /关闭页面也不会取消保存/);
+  assert.match(transportProxyError(new TypeError(secret)), /关闭页面后保存仍会完成/);
   const denied = transportProxyError(new ApiError(secret, 403, 'forbidden'));
   assert.match(denied, /请联系管理员检查访问权限/);
   assert.doesNotMatch(denied, /providers:write|当前租户的全局操作员|privateProxySecret/);
@@ -31,10 +31,12 @@ test('proxy group copy explains choices and uncertain saves without permission-s
   assert.equal(english.candidate(1), 'Network exit 1');
   assert.equal(english.groupSummary('Research', 1, 1), 'Research · 1 exit · 1 account');
   assert.equal(english.groupSummary('Research', 2, 0), 'Research · 2 exits · 0 accounts');
-  assert.match(chinese.purpose, /优先沿用当前出口/);
-  assert.match(english.purpose, /current exit stays selected/);
-  assert.match(chinese.closePending, /关闭不会取消保存/);
-  assert.match(english.closePending, /Closing does not cancel the save/);
+  assert.match(chinese.purpose, /请求继续使用当前出口/);
+  assert.match(chinese.purpose, /独立可达性探测/);
+  assert.match(english.purpose, /Requests keep the current exit/);
+  assert.match(english.purpose, /separate reachability probe/);
+  assert.match(chinese.closePending, /关闭页面后保存仍会完成/);
+  assert.match(english.closePending, /Closing the page still lets the save finish/);
   for (const copy of [chinese, english]) {
     assert.doesNotMatch(JSON.stringify(copy), /已具备代理组管理权限|全局提供商管理权限|异步读回|自动重放|验收矩阵|本轮|待交付|worklog/i);
   }

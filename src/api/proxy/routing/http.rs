@@ -1,13 +1,12 @@
 use super::*;
 use bytes::Bytes;
 
-const DEFAULT_TIMEOUT_SECONDS: u64 = 120;
 const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct RequestTimeout {
-    duration: std::time::Duration,
-    deadline: tokio::time::Instant,
+    duration: Option<std::time::Duration>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 fn log_preparation_failure(
@@ -54,7 +53,12 @@ fn record_preparation_failure(
 /// already-dispatched attempt's deadline.
 fn configured_timeout(config: &Value) -> Result<RequestTimeout, ProxySendError> {
     let seconds = match config.get("timeout_seconds") {
-        None => DEFAULT_TIMEOUT_SECONDS,
+        None => {
+            return Ok(RequestTimeout {
+                duration: None,
+                deadline: None,
+            });
+        }
         Some(value) => value
             .as_u64()
             .or_else(|| {
@@ -72,7 +76,10 @@ fn configured_timeout(config: &Value) -> Result<RequestTimeout, ProxySendError> 
     let deadline = tokio::time::Instant::now()
         .checked_add(duration)
         .ok_or(ProxySendError::CandidateUnavailable)?;
-    Ok(RequestTimeout { duration, deadline })
+    Ok(RequestTimeout {
+        duration: Some(duration),
+        deadline: Some(deadline),
+    })
 }
 
 pub(super) async fn send_reqwest_proxy_route(
@@ -113,57 +120,29 @@ pub(super) async fn send_reqwest_proxy_route(
         adapter,
     )
     .map_err(|_| ProxySendError::CandidateUnavailable)?;
-    let mut attempted = Vec::with_capacity(4);
-    loop {
-        let mut selection = state
-            .transport_proxy_groups
-            .select_config(
-                route.route.account_id,
-                route.route.credential_generation,
-                &route.route.credential,
-                &route.route.config,
-            )
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
-        if !selection
-            .select_unattempted(&attempted)
-            .map_err(|_| ProxySendError::CandidateUnavailable)?
-        {
-            return Err(ProxySendError::RetryableConnection("proxy_group_exhausted"));
-        }
-        if let Some(member) = selection.member() {
-            attempted.push(member);
-        }
-        let result = send_reqwest_proxy_route_once(
-            state,
-            headers,
-            protocol,
-            request_id,
-            route,
-            &selection.credential,
-            request_timeout,
+    let selection = state
+        .transport_proxy_groups
+        .select_config(
+            route.route.account_id,
+            route.route.credential_generation,
+            &route.route.credential,
+            &route.route.config,
         )
-        .await;
-        if advance_after_preconnect_failure(&selection, &attempted, &result)? {
-            continue;
-        }
-        return result;
+        .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let result = send_reqwest_proxy_route_once(
+        state,
+        headers,
+        protocol,
+        request_id,
+        route,
+        &selection.credential,
+        request_timeout,
+    )
+    .await;
+    if matches!(result, Err(ProxySendError::RetryableConnection(_))) {
+        selection.request_independent_probe();
     }
-}
-
-fn advance_after_preconnect_failure(
-    selection: &crate::db::ProxySelection,
-    attempted: &[usize],
-    result: &Result<ProxyRouteResponse, ProxySendError>,
-) -> Result<bool, ProxySendError> {
-    if matches!(result, Err(ProxySendError::RetryableConnection(_)))
-        && attempted.len() < selection.member_count()
-    {
-        selection
-            .advance_after_connect_failure(attempted)
-            .map_err(|_| ProxySendError::CandidateUnavailable)?;
-        return Ok(true);
-    }
-    Ok(false)
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -206,9 +185,6 @@ async fn send_reqwest_proxy_route_with_preparation<F>(
 where
     F: std::future::Future<Output = Result<reqwest::Client, AppError>>,
 {
-    // Start the route timeout before endpoint validation/DNS. The deadline is
-    // local to this attempt; the caller's frozen outer attempt budget remains
-    // authoritative when it selects a standby candidate.
     let RequestTimeout {
         duration: timeout,
         deadline: request_deadline,
@@ -226,7 +202,11 @@ where
         "upstream SSE framing policy frozen"
     );
     let outbound_base_url = route.route.base_url.clone();
-    let outbound_http = match tokio::time::timeout_at(request_deadline, preparation).await {
+    let preparation_result = match request_deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, preparation).await,
+        None => Ok(preparation.await),
+    };
+    let outbound_http = match preparation_result {
         Ok(Ok(client)) => client,
         // Endpoint validation and DNS happen before the POST leaves this
         // process, so a route-budget expiry here is safe to fail over.
@@ -242,11 +222,10 @@ where
     let target_url = network::upstream_api_url(&outbound_base_url, route.upstream_path);
     let mut request = outbound_http
         .post(target_url)
-        // Reqwest's per-request timeout covers connection/header acquisition;
-        // the absolute deadline below also covers DNS/client setup and body
-        // reads, so no phase can restart the configured attempt budget.
-        .timeout(timeout)
         .body(route.forwarded_body.clone());
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
     let accept = if ((route.responses_chat.is_some() || route.responses_anthropic.is_some())
         && route.upstream_stream)
         || (crate::provider::is_openai_compatible_http_driver(&route.route.driver)
@@ -336,11 +315,12 @@ where
             };
             Ok(ProxyRouteResponse {
                 egress_selection: None,
-                // Keep one absolute deadline from before DNS through first
-                // byte and every subsequent streaming read. The inactivity
-                // window uses the same configured scalar and resets only on
-                // actual upstream progress.
-                response: response.with_body_timeouts(request_deadline, timeout),
+                response: match (request_deadline, timeout) {
+                    (Some(deadline), Some(timeout)) => {
+                        response.with_body_timeouts(deadline, timeout)
+                    }
+                    _ => response,
+                },
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::inactive(),
                 sse_framing_limits,
@@ -351,12 +331,15 @@ where
 }
 
 async fn send_until_request_deadline<F>(
-    deadline: tokio::time::Instant,
+    deadline: Option<tokio::time::Instant>,
     send: F,
 ) -> Result<reqwest::Response, ProxySendError>
 where
     F: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
 {
+    let Some(deadline) = deadline else {
+        return send.await.map_err(classify_reqwest_send_error);
+    };
     tokio::pin!(send);
     tokio::select! {
         // A POST may have been accepted before the local deadline fired;
@@ -467,7 +450,7 @@ mod tests {
     use std::time::Duration;
 
     #[test]
-    fn generic_group_advances_only_before_delivery_and_never_revisits_members() {
+    fn generic_group_connection_failure_keeps_the_sticky_exit() {
         let account_id = Uuid::now_v7();
         let groups = crate::db::TransportProxyGroups::parse(
             &json!([{
@@ -482,39 +465,21 @@ mod tests {
             "type":"oauth", "access_token":"fixture", "proxy_url":"socks5h://10.20.30.40:1080", "proxy_network_scope":"private"
         })).unwrap();
         let selected = groups.select(account_id, 1, &credential).unwrap();
-        for error in [
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout),
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Body),
-            ProxySendError::NonRetryableTransport(TransportFailureKind::Request),
-            ProxySendError::AmbiguousResponse("upstream_invalid_response"),
-            ProxySendError::CandidateUnavailable,
-            ProxySendError::Credential,
-        ] {
-            assert!(!advance_after_preconnect_failure(&selected, &[0], &Err(error)).unwrap());
-            assert_eq!(
-                groups.select(account_id, 1, &credential).unwrap().member(),
-                Some(0)
-            );
-        }
-        assert!(
-            advance_after_preconnect_failure(
-                &selected,
-                &[0],
-                &Err(ProxySendError::RetryableConnection("connect"))
-            )
-            .unwrap()
+        selected.request_independent_probe();
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(0)
         );
-        let mut backup = groups.select(account_id, 1, &credential).unwrap();
-        assert_eq!(backup.member(), Some(1));
-        assert!(
-            !advance_after_preconnect_failure(
-                &backup,
-                &[0, 1],
-                &Err(ProxySendError::RetryableConnection("connect"))
-            )
-            .unwrap()
+        assert!(groups.advance_sticky_after_probe(account_id));
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(1)
         );
-        assert!(!backup.select_unattempted(&[0, 1]).unwrap());
+        assert!(groups.advance_sticky_after_probe(account_id));
+        assert_eq!(
+            groups.select(account_id, 1, &credential).unwrap().member(),
+            Some(0)
+        );
     }
 
     fn compact_response(status: StatusCode, body: &'static str) -> reqwest::Response {
@@ -669,23 +634,20 @@ mod tests {
 
     #[test]
     fn configured_timeout_preserves_explicit_seconds_and_rejects_invalid_values() {
-        assert_eq!(
-            configured_timeout(&json!({})).unwrap().duration,
-            Duration::from_secs(120)
-        );
+        assert_eq!(configured_timeout(&json!({})).unwrap().duration, None);
         for seconds in [1, 120, 600, 601, 900, 1261] {
             assert_eq!(
                 configured_timeout(&json!({"timeout_seconds": seconds}))
                     .unwrap()
                     .duration,
-                Duration::from_secs(seconds)
+                Some(Duration::from_secs(seconds))
             );
         }
         assert_eq!(
             configured_timeout(&json!({"timeout_seconds": 900.0}))
                 .unwrap()
                 .duration,
-            Duration::from_secs(900)
+            Some(Duration::from_secs(900))
         );
         for invalid in [
             json!(0),
@@ -703,12 +665,29 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn default_send_waits_for_real_result_after_old_deadlines() {
+        let timeout = configured_timeout(&json!({})).unwrap();
+        let started = tokio::time::Instant::now();
+        let response = send_until_request_deadline(timeout.deadline, async {
+            tokio::time::sleep(Duration::from_secs(1_300)).await;
+            Ok(compact_response(StatusCode::OK, "{}"))
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(started.elapsed(), Duration::from_secs(1_300));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn explicit_timeout_remains_frozen_across_preparation_and_elapsed_stream_time() {
         let request_timeout = configured_timeout(&json!({"timeout_seconds": 900})).unwrap();
         let started = tokio::time::Instant::now();
         tokio::time::advance(Duration::from_secs(601)).await;
-        assert_eq!(request_timeout.duration, Duration::from_secs(900));
-        assert_eq!(request_timeout.deadline, started + Duration::from_secs(900));
+        assert_eq!(request_timeout.duration, Some(Duration::from_secs(900)));
+        assert_eq!(
+            request_timeout.deadline,
+            Some(started + Duration::from_secs(900))
+        );
         let response = send_until_request_deadline(request_timeout.deadline, async {
             tokio::time::sleep(Duration::from_secs(250)).await;
             Ok(compact_response(StatusCode::OK, "{}"))
@@ -728,7 +707,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn request_deadline_timeout_is_ambiguous_and_never_replayable() {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
         let result = send_until_request_deadline(deadline, std::future::pending()).await;
         assert!(matches!(
             result,
@@ -892,14 +871,6 @@ mod tests {
         assert_eq!(diagnostic.transport_revision, 42);
         assert_eq!(diagnostic.failure_kind, "preparation");
         assert_eq!(diagnostic.failure_stage, "preparation_timeout");
-        let health_stage: String = sqlx::query_scalar(
-            "SELECT failure_stage FROM upstream_connection_failure_domains WHERE last_request_id = $1",
-        )
-        .bind(request_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(health_stage, "dns");
         assert!(
             state.routing_persistence.render_routing().contains(
                 "memeloop_token_center_routing_persistence_total{outcome=\"accepted\"} 1\n"

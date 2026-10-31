@@ -168,7 +168,7 @@ async fn authenticated_body_admission_failure_has_no_supplier_or_reservation() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].model.is_empty());
-    assert_eq!(rows[0].error_code.as_deref(), Some("service_overloaded"));
+    assert_eq!(rows[0].error_code.as_deref(), Some("proxy_memory_ingress"));
     assert!(!rows[0].billing.billable);
     assert!(rows[0].upstream_account_id.is_none());
 }
@@ -196,7 +196,7 @@ async fn admitted_upstream_failure_keeps_its_original_terminal() {
     let _ = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     fixture.state.early_requests.drain_for_test().await;
     let rows = fixture
         .state
@@ -239,27 +239,21 @@ async fn journal_recovery_projects_terminal_after_writer_replacement() {
         error_code: "no_authorized_upstream_candidate".into(),
     };
     let directory = tempfile::tempdir().unwrap();
-    let unavailable = crate::db::Database::connect(&fixture.database_url)
-        .await
-        .unwrap();
-    unavailable.close().await;
-    let previous = crate::early_request::Journal::new(directory.path().to_owned(), unavailable);
-    assert!(previous.append(terminal.clone()).await);
-    let encoded = tokio::fs::read(
-        directory
-            .path()
-            .join(format!("{}.json", terminal.request_id)),
-    )
-    .await
-    .unwrap();
-    assert!(encoded.len() <= 4096);
-    assert!(!String::from_utf8_lossy(&encoded).contains(&fixture.key));
-    drop(previous);
-    let recovered = crate::early_request::Journal::new(
+    let journal = crate::early_request::Journal::new(
         directory.path().to_owned(),
         fixture.state.db.independent_persistence_pool(),
     );
-    recovered.drain_for_test().await;
+    assert!(journal.append(terminal.clone()).await);
+    assert!(
+        tokio::fs::read_dir(directory.path())
+            .await
+            .unwrap()
+            .next_entry()
+            .await
+            .unwrap()
+            .is_none(),
+        "early terminals are recorded in the database, not a local spool"
+    );
     let rows = fixture
         .state
         .db

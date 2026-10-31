@@ -78,6 +78,8 @@ async fn contract(database: &Database) {
                 tenant_external_id: tenant.clone(),
                 name: "egress".into(),
                 members: vec![input("first", PRIMARY), input("second", BACKUP)],
+                probe_url: None,
+                probe_attempts: None,
             },
             None,
             KEY,
@@ -86,6 +88,8 @@ async fn contract(database: &Database) {
         .unwrap();
     assert_eq!(group["members"][0]["host"], "10.20.30.40");
     assert_eq!(group["members"][0]["port"], 1080);
+    assert!(group["probe_url"].is_null());
+    assert_eq!(group["probe_attempts"], 2);
     assert!(group["members"][0].get("proxy_url").is_none());
     let unrelated = database
         .create_transport_group(
@@ -93,6 +97,8 @@ async fn contract(database: &Database) {
                 tenant_external_id: tenant.clone(),
                 name: "revision-gap".into(),
                 members: vec![input("primary", PRIMARY)],
+                probe_url: None,
+                probe_attempts: None,
             },
             None,
             KEY,
@@ -270,6 +276,8 @@ async fn contract(database: &Database) {
             proxy_url: None,
         }],
         replacement_member_id: replacement,
+        probe_url: Some("https://example.com/probe".into()),
+        probe_attempts: Some(3),
     };
     assert!(
         database
@@ -288,6 +296,12 @@ async fn contract(database: &Database) {
         .update_transport_group(id, unchanged(Some(backup)), None, KEY)
         .await
         .unwrap();
+    let probed = database
+        .get_transport_group(id, &tenant, KEY)
+        .await
+        .unwrap();
+    assert_eq!(probed["probe_url"], "https://example.com/probe");
+    assert_eq!(probed["probe_attempts"], 3);
     assert!(matches!(
         database
             .update_transport_group(id, unchanged(Some(backup)), None, KEY)
@@ -486,6 +500,8 @@ async fn generic_oauth_group_contract(database: &Database) {
                 tenant_external_id: external.clone(),
                 name: "generic-egress".into(),
                 members: vec![input("primary", PRIMARY), input("backup", BACKUP)],
+                probe_url: None,
+                probe_attempts: None,
             },
             None,
             KEY,
@@ -701,6 +717,8 @@ async fn generic_oauth_group_contract(database: &Database) {
                     },
                 ],
                 replacement_member_id: None,
+                probe_url: None,
+                probe_attempts: None,
             },
             None,
             KEY,

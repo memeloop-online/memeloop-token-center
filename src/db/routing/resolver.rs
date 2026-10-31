@@ -52,8 +52,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("resolver_reload_prepared_upstream_snapshot_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -105,8 +105,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("resolver_reload_persisted_generation_upstream_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -201,14 +201,23 @@ impl Database {
             avoid_route_account,
             selection_seed,
         } = selection;
+        // Only an unhealthy probe sorts last. A healthy result and a missing
+        // probe share a rank so configured priority still chooses; excluding
+        // a non-healthy account made the probe unable to reach it again.
         let rows = sqlx::query(
              "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight,
                      a.id AS account_id, a.driver, a.updated_at AS transport_revision,
-                     a.credential_generation
+                     a.credential_generation,
+                     CAST(CASE
+                       WHEN service_probe.status = 'unhealthy' THEN 1
+                       ELSE 0
+                     END AS BIGINT) AS probe_rank
              FROM model_routes r
              JOIN model_route_eligible_upstream_accounts candidates
                ON candidates.tenant_id = r.tenant_id AND candidates.model_route_id = r.id
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
+             LEFT JOIN upstream_service_probes service_probe
+               ON service_probe.upstream_account_id = a.id
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND r.archived_at IS NULL AND a.status = 'active'
                AND (
@@ -231,6 +240,21 @@ impl Database {
         .bind(PROXY_ROUTING_POLICY.candidate_query_limit())
         .fetch_all(&self.pool)
         .await?;
+        let rows = if rows.is_empty() {
+            // An empty authorized set must not stop the request. Catalog
+            // eligibility and grants can hide every account; dispatch still
+            // needs one active upstream on this route.
+            tracing::info!(
+                event = "dispatch_candidate_fallback",
+                %tenant_id,
+                %key_id,
+                "authorized candidate set was empty; selecting a configured upstream"
+            );
+            self.fallback_dispatch_candidates(tenant_id, key_id, public_model, protocol)
+                .await?
+        } else {
+            rows
+        };
         if rows.len() > PROXY_ROUTING_POLICY.max_resolved_candidates() {
             return Err(AppError::BadRequest(
                 "authorized routing candidate set exceeds the safety limit".into(),
@@ -284,6 +308,111 @@ impl Database {
         Ok(ordered)
     }
 
+    async fn fallback_dispatch_candidates(
+        &self,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+    ) -> Result<Vec<AnyRow>, AppError> {
+        let limit = PROXY_ROUTING_POLICY.candidate_query_limit();
+        let configured = sqlx::query(
+            "SELECT r.id AS route_id, r.priority, link.scheduling_weight,
+                    a.id AS account_id, a.driver, a.updated_at AS transport_revision,
+                    a.credential_generation,
+                    CAST(CASE
+                      WHEN service_probe.status = 'unhealthy' THEN 1
+                      ELSE 0
+                    END AS BIGINT) AS probe_rank
+             FROM model_routes r
+             JOIN (
+               SELECT direct.tenant_id, direct.model_route_id, direct.upstream_account_id,
+                      direct.scheduling_weight
+               FROM model_route_upstream_accounts direct
+               UNION ALL
+               SELECT included.tenant_id, included.model_route_id, member.upstream_account_id,
+                      100 AS scheduling_weight
+               FROM model_route_included_provider_groups included
+               JOIN upstream_account_provider_groups member
+                 ON member.tenant_id = included.tenant_id
+                AND member.provider_group_id = included.provider_group_id
+             ) link
+               ON link.tenant_id = r.tenant_id AND link.model_route_id = r.id
+             JOIN upstream_accounts a
+               ON a.tenant_id = r.tenant_id AND a.id = link.upstream_account_id
+              AND a.status = 'active'
+             LEFT JOIN upstream_service_probes service_probe
+               ON service_probe.upstream_account_id = a.id
+             WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
+               AND r.enabled = 1 AND r.archived_at IS NULL
+               AND (
+                 EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $5 AND g.model_route_id = r.id)
+                 OR EXISTS (
+                   SELECT 1 FROM routing_grants g
+                   JOIN model_route_group_memberships membership
+                     ON membership.tenant_id = g.tenant_id AND membership.route_group_id = g.route_group_id
+                   WHERE g.tenant_id = r.tenant_id AND g.key_id = $5
+                     AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
+                 )
+               )
+             ORDER BY probe_rank ASC, r.priority ASC, r.id ASC, a.id ASC
+             LIMIT $4",
+        )
+        .bind(tenant_id.to_string())
+        .bind(public_model)
+        .bind(protocol)
+        .bind(limit)
+        .bind(key_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        if !configured.is_empty() {
+            return Ok(configured);
+        }
+        tracing::info!(
+            event = "dispatch_candidate_fallback",
+            %tenant_id,
+            "no configured upstream was visible; selecting any active account on the route"
+        );
+        sqlx::query(
+            "SELECT r.id AS route_id, r.priority, 100 AS scheduling_weight,
+                    a.id AS account_id, a.driver, a.updated_at AS transport_revision,
+                    a.credential_generation,
+                    CAST(CASE
+                      WHEN service_probe.status = 'unhealthy' THEN 1
+                      ELSE 0
+                    END AS BIGINT) AS probe_rank
+             FROM model_routes r
+             JOIN upstream_accounts a
+               ON a.id = r.upstream_account_id
+              AND a.tenant_id = r.tenant_id
+              AND a.status = 'active'
+             LEFT JOIN upstream_service_probes service_probe
+               ON service_probe.upstream_account_id = a.id
+             WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
+               AND r.enabled = 1 AND r.archived_at IS NULL
+               AND (
+                 EXISTS (SELECT 1 FROM routing_grants g WHERE g.tenant_id = r.tenant_id AND g.key_id = $5 AND g.model_route_id = r.id)
+                 OR EXISTS (
+                   SELECT 1 FROM routing_grants g
+                   JOIN model_route_group_memberships membership
+                     ON membership.tenant_id = g.tenant_id AND membership.route_group_id = g.route_group_id
+                   WHERE g.tenant_id = r.tenant_id AND g.key_id = $5
+                     AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
+                 )
+               )
+             ORDER BY probe_rank ASC, a.id ASC
+             LIMIT $4",
+        )
+        .bind(tenant_id.to_string())
+        .bind(public_model)
+        .bind(protocol)
+        .bind(limit)
+        .bind(key_id.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(AppError::from)
+    }
+
     /// Reads and validates one candidate immediately before request planning.
     /// A disappeared or rotated tuple is ordinary unavailability; malformed
     /// selected material remains an explicit fail-closed error.
@@ -327,7 +456,9 @@ impl Database {
         };
         let config_json: String = row.try_get("config_json")?;
         let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+            serde_json::from_str(&config_json).map_err(|_| {
+                AppError::internal("resolver_materialize_authorized_upstream_candidate_1")
+            })?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -491,13 +622,18 @@ struct RoutingCandidate {
     credential_generation: i64,
     priority: i64,
     scheduling_weight: i64,
+    probe_rank: u8,
 }
 
 impl RoutingCandidate {
     fn from_row(row: AnyRow) -> Result<Self, AppError> {
         let scheduling_weight: i64 = row.try_get("scheduling_weight")?;
         if !(1..=1_000_000).contains(&scheduling_weight) {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("resolver_from_row_1"));
+        }
+        let probe_rank: i64 = row.try_get("probe_rank")?;
+        if !(0..=2).contains(&probe_rank) {
+            return Err(AppError::internal("resolver_from_row_2"));
         }
         Ok(Self {
             route_id: parse_uuid(row.try_get("route_id")?)?,
@@ -507,6 +643,8 @@ impl RoutingCandidate {
             credential_generation: row.try_get("credential_generation")?,
             priority: row.try_get("priority")?,
             scheduling_weight,
+            probe_rank: u8::try_from(probe_rank)
+                .map_err(|_| AppError::internal("resolver_from_row_1"))?,
         })
     }
 }
@@ -530,7 +668,8 @@ impl HintDisposition {
 
 /// This boundary accepts only a mutable slice of host-authorized candidates:
 /// a policy hint can reorder, but cannot append, remove, or materialize an
-/// account. Health admission, transport validation and budget reservation
+/// account. A service probe reorders the same set and never removes an
+/// account. Cooldown admission, transport validation and budget reservation
 /// remain later host-owned checks, including for the preferred candidate.
 fn order_authorized_candidates(
     candidates: &mut [RoutingCandidate],
@@ -554,6 +693,7 @@ fn order_authorized_candidates(
         hint_rank(hint, left)
             .cmp(&hint_rank(hint, right))
             .then_with(|| avoid_rank(avoid, left).cmp(&avoid_rank(avoid, right)))
+            .then_with(|| left.probe_rank.cmp(&right.probe_rank))
             .then_with(|| left.priority.cmp(&right.priority))
             .then_with(|| {
                 weighted_rendezvous_score(key_id, selection_seed, left)
@@ -607,6 +747,7 @@ mod tests {
             credential_generation: 1,
             priority: 0,
             scheduling_weight: 100,
+            probe_rank: 0,
         }
     }
 
@@ -622,6 +763,32 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn unhealthy_probe_sorts_last_and_stays_eligible() {
+        let healthy = Uuid::from_u128(101);
+        let unknown = Uuid::from_u128(102);
+        let unhealthy = Uuid::from_u128(103);
+        let mut candidates = vec![candidate(unhealthy), candidate(unknown), candidate(healthy)];
+        candidates[0].probe_rank = 2;
+        candidates[0].priority = -100;
+        candidates[1].probe_rank = 1;
+        candidates[1].priority = -50;
+        order_authorized_candidates(
+            &mut candidates,
+            Uuid::from_u128(10),
+            Uuid::from_u128(20),
+            None,
+            None,
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.account_id)
+                .collect::<Vec<_>>(),
+            vec![healthy, unknown, unhealthy]
+        );
     }
 
     #[test]
@@ -822,5 +989,152 @@ mod tests {
         for selection in &selections {
             assert!((700..=1_350).contains(selection), "{selections:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn empty_authorized_set_still_dispatches_and_success_clears_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("fallback.db").display()
+        ))
+        .await
+        .unwrap();
+        database.migrate().await.unwrap();
+        let tenant = format!("fallback-{}", Uuid::now_v7());
+        let account = database
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: tenant,
+                    name: "fallback-account".into(),
+                    driver: "http-json".into(),
+                    config: serde_json::json!({"base_url":"http://127.0.0.1:1"}),
+                    credential: crate::provider::UpstreamCredential::None,
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                b"fallback-dispatch-test",
+            )
+            .await
+            .unwrap();
+        let tenant_id: String =
+            sqlx::query_scalar("SELECT tenant_id FROM upstream_accounts WHERE id = $1")
+                .bind(account.id.to_string())
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        let route_id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO model_routes (
+                 id, tenant_id, public_model, upstream_account_id, upstream_model,
+                 protocol, priority, enabled, created_at, updated_at
+             ) VALUES ($1, $2, 'gpt-fallback', $3, 'gpt-fallback', 'openai', 0, 1, 1, 1)",
+        )
+        .bind(route_id.to_string())
+        .bind(&tenant_id)
+        .bind(account.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO upstream_service_probes (
+                 upstream_account_id, status, error_code, latency_ms, checked_at
+             ) VALUES ($1, 'unhealthy', 'upstream_unavailable', 1, 1)",
+        )
+        .bind(account.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let tenant_external: String =
+            sqlx::query_scalar("SELECT external_id FROM tenants WHERE id = $1")
+                .bind(&tenant_id)
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        let issued = database
+            .create_key_with_routing(
+                crate::db::CreateKeyInput {
+                    tenant_external_id: tenant_external,
+                    principal_external_id: "member".into(),
+                    alias: "fallback".into(),
+                    currency: "USD".into(),
+                    policy: crate::model::KeyPolicy {
+                        allowed_models: vec!["gpt-fallback".into()],
+                        ..crate::model::KeyPolicy::default()
+                    },
+                    initial_balance: rust_decimal::Decimal::ONE,
+                    idempotency_key: None,
+                },
+                &[route_id],
+                &[],
+                b"fallback-dispatch-test",
+            )
+            .await
+            .unwrap();
+        let selection = RouteSelectionOptions {
+            upstream_account_hint: None,
+            avoid_route_account: None,
+            selection_seed: Uuid::now_v7(),
+        };
+        let tenant_uuid = Uuid::parse_str(&tenant_id).unwrap();
+        let ungranted = database
+            .list_authorized_upstream_candidates_with_hint(
+                Uuid::now_v7(),
+                tenant_uuid,
+                "gpt-fallback",
+                "openai",
+                selection,
+            )
+            .await
+            .unwrap();
+        assert!(
+            ungranted.is_empty(),
+            "a key without a grant is not a candidate"
+        );
+        let found = database
+            .list_authorized_upstream_candidates_with_hint(
+                issued.key_id,
+                tenant_uuid,
+                "gpt-fallback",
+                "openai",
+                selection,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            found.len(),
+            1,
+            "a granted route still dispatches when catalog eligibility is empty"
+        );
+        assert_eq!(found[0].account_id, account.id);
+        database.note_service_available(account.id).await;
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM upstream_service_probes WHERE upstream_account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "healthy");
+        sqlx::query("UPDATE upstream_accounts SET status = 'disabled' WHERE id = $1")
+            .bind(account.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let found = database
+            .list_authorized_upstream_candidates_with_hint(
+                issued.key_id,
+                tenant_uuid,
+                "gpt-fallback",
+                "openai",
+                selection,
+            )
+            .await
+            .unwrap();
+        assert!(
+            found.is_empty(),
+            "a disabled account is not a dispatch target"
+        );
     }
 }

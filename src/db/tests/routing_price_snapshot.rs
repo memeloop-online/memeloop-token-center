@@ -1,5 +1,134 @@
 use super::super::*;
 
+async fn single_checkout_price_snapshot(database: &Database) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    let model = Uuid::now_v7().to_string();
+    let base = database
+        .upsert_model_price(&model, "USD", Decimal::new(3, 0), Decimal::new(7, 0))
+        .await
+        .unwrap();
+    for (tier, input, cached, write, output) in [("priority", 11, 2, 4, 20), ("batch", 8, 1, 2, 9)]
+    {
+        database
+            .upsert_model_price_tier(
+                &model,
+                "USD",
+                tier,
+                Decimal::new(input, 0),
+                Decimal::new(cached, 0),
+                Decimal::new(write, 0),
+                Decimal::new(output, 0),
+                false,
+            )
+            .await
+            .unwrap();
+    }
+    database
+        .upsert_model_price(&model, "CNY", Decimal::TEN, Decimal::TEN)
+        .await
+        .unwrap();
+
+    let checkouts = Arc::new(AtomicUsize::new(0));
+    let delayed_return = Arc::new(AtomicBool::new(false));
+    let returning = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let checkout_count = checkouts.clone();
+    let return_enabled = delayed_return.clone();
+    let return_entered = returning.clone();
+    let return_release = release.clone();
+    let mut observed = database.clone();
+    observed.pool = database
+        .pool
+        .options()
+        .clone()
+        .max_connections(1)
+        .before_acquire(move |_connection, _metadata| {
+            let checkouts = checkout_count.clone();
+            Box::pin(async move {
+                checkouts.fetch_add(1, Ordering::SeqCst);
+                Ok(true)
+            })
+        })
+        .after_release(move |_connection, _metadata| {
+            let enabled = return_enabled.clone();
+            let entered = return_entered.clone();
+            let release = return_release.clone();
+            Box::pin(async move {
+                if enabled.load(Ordering::SeqCst) {
+                    entered.notify_one();
+                    release.acquire().await.unwrap().forget();
+                }
+                Ok(true)
+            })
+        })
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+    let mut warmed = observed.pool.acquire().await.unwrap();
+    warmed.return_to_pool().await;
+    checkouts.store(0, Ordering::SeqCst);
+    delayed_return.store(true, Ordering::SeqCst);
+    let result =
+        tokio::time::timeout(Duration::from_secs(6), observed.model_price(&model, "usd")).await;
+    let return_observed = tokio::time::timeout(Duration::from_secs(5), returning.notified()).await;
+    delayed_return.store(false, Ordering::SeqCst);
+    release.add_permits(1);
+    observed.pool.close().await;
+    return_observed.expect("the fixture must stall the price query's connection return");
+    let price = result
+        .expect("base and tiers must not require a second pool checkout")
+        .unwrap();
+    assert_eq!(checkouts.load(Ordering::SeqCst), 1);
+    assert_eq!(price.id, base.id);
+    assert_eq!(price.input_micros_per_million, 3_000_000);
+    assert_eq!(price.output_micros_per_million, 7_000_000);
+    assert_eq!(
+        price
+            .tiers
+            .iter()
+            .map(|tier| tier.service_tier.as_str())
+            .collect::<Vec<_>>(),
+        ["default", "batch", "priority"]
+    );
+    let priority = &price.tiers[2];
+    assert_eq!(priority.input_micros_per_million, 11_000_000);
+    assert_eq!(priority.cached_input_micros_per_million, 2_000_000);
+    assert_eq!(priority.cache_write_micros_per_million, 4_000_000);
+    assert_eq!(priority.output_micros_per_million, 20_000_000);
+    assert_eq!(priority.source, "manual");
+
+    database
+        .upsert_model_price(&model, "USD", Decimal::TEN, Decimal::TEN)
+        .await
+        .unwrap();
+    assert_eq!(price.input_micros_per_million, 3_000_000);
+    let updated = database.model_price(&model, "USD").await.unwrap();
+    assert_eq!(updated.id, price.id);
+    assert_eq!(updated.input_micros_per_million, 10_000_000);
+    assert_eq!(updated.tiers[0].input_micros_per_million, 10_000_000);
+    assert_eq!(updated.tiers[2].input_micros_per_million, 11_000_000);
+
+    sqlx::query("DELETE FROM model_price_tiers WHERE model = $1 AND currency = 'USD'")
+        .bind(&model)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let legacy = database.model_price(&model, "usd").await.unwrap();
+    assert_eq!(legacy.id, price.id);
+    assert_eq!(legacy.input_micros_per_million, 10_000_000);
+    assert!(legacy.tiers.is_empty());
+    assert!(matches!(
+        database.model_price(&model, "EUR").await,
+        Err(AppError::UnpricedModel)
+    ));
+    assert!(matches!(
+        database.model_price("missing-price-fixture", "USD").await,
+        Err(AppError::UnpricedModel)
+    ));
+}
+
 async fn optional_output_financial_contract(
     database: &Database,
     recovered_database: &Database,
@@ -17,7 +146,7 @@ async fn optional_output_financial_contract(
                 alias: unique.clone(),
                 currency: "USD".into(),
                 policy: KeyPolicy {
-                    max_concurrency: 2,
+                    max_concurrency: Some(2),
                     lifetime_budget: budget.map(|amount| Decimal::new(amount, 6).to_string()),
                     ..KeyPolicy::default()
                 },
@@ -590,6 +719,7 @@ async fn sqlite_same_amount_failover_replaces_price_snapshot_not_admission() {
     .await
     .unwrap();
     database.migrate().await.unwrap();
+    single_checkout_price_snapshot(&database).await;
     for deferred in [false, true] {
         for metered in [false, true] {
             snapshot_contract(
@@ -620,6 +750,7 @@ async fn postgres_same_amount_failover_replaces_price_snapshot_not_admission() {
         .await
         .unwrap();
     database.migrate().await.unwrap();
+    single_checkout_price_snapshot(&database).await;
     for deferred in [false, true] {
         for metered in [false, true] {
             snapshot_contract(

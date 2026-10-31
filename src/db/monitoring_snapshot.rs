@@ -222,7 +222,7 @@ impl MetricsAccumulator {
         }
         let currency: String = row.try_get("currency")?;
         if currency.is_empty() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("monitoring_snapshot_accumulate_1"));
         }
         let cost = self.costs.entry(currency).or_default();
         *cost = cost.saturating_add(row.try_get("cost_micros")?);
@@ -374,7 +374,11 @@ impl Database {
                     .entry((upstream_account_id, model))
                     .or_default()
                     .accumulate(&row)?,
-                _ => return Err(AppError::Internal),
+                _ => {
+                    return Err(AppError::internal(
+                        "monitoring_snapshot_operator_monitoring_snapshot_inner_1",
+                    ));
+                }
             }
         }
         let summary = summary.finish();
@@ -400,13 +404,8 @@ impl Database {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
-        let upstream_health = upstream_health_batch(
-            &mut snapshot,
-            &upstream_account_ids,
-            generated_at,
-            statement_counter,
-        )
-        .await?;
+        let upstream_health =
+            upstream_health_batch(&mut snapshot, &upstream_account_ids, statement_counter).await?;
         let mut outcomes = terminal_outcomes_batch(
             &mut snapshot,
             MonitoringBatchContext {
@@ -545,8 +544,9 @@ async fn terminal_outcomes_batch(
         DatabaseBackend::PostgreSql => MonitoringTerminalBatchDialect::PostgreSql,
         DatabaseBackend::Sqlite => MonitoringTerminalBatchDialect::Sqlite,
     };
-    let sql = monitoring_terminal_outcomes_batch_sql(context.scope, pairs.len(), dialect)
-        .ok_or(AppError::Internal)?;
+    let sql = monitoring_terminal_outcomes_batch_sql(context.scope, pairs.len(), dialect).ok_or(
+        AppError::internal("monitoring_snapshot_terminal_outcomes_batch_1"),
+    )?;
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for (upstream_account_id, model) in pairs {
         query = query.bind(upstream_account_id).bind(model);
@@ -565,14 +565,18 @@ async fn terminal_outcomes_batch(
         let model: String = row.try_get("model")?;
         let pair = (upstream_account_id, model);
         let Some(pair_outcomes) = outcomes.get_mut(&pair) else {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "monitoring_snapshot_terminal_outcomes_batch_1",
+            ));
         };
         let source: String = row.try_get("source")?;
         let status: String = row.try_get("status_class")?;
         if !matches!(source.as_str(), "request" | "generation")
             || !matches!(status.as_str(), "success" | "failure")
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "monitoring_snapshot_terminal_outcomes_batch_2",
+            ));
         }
         let error_code: String = row.try_get("error_code")?;
         pair_outcomes.push(MonitoringTerminalOutcome {
@@ -590,14 +594,14 @@ async fn terminal_outcomes_batch(
 async fn upstream_health_batch(
     connection: &mut AnyConnection,
     upstream_account_ids: &[String],
-    generated_at: i64,
     statement_counter: &mut MonitoringStatementCounter,
 ) -> Result<BTreeMap<String, (String, MonitoringHealth)>, AppError> {
     if upstream_account_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let sql = monitoring_upstream_health_batch_sql(upstream_account_ids.len())
-        .ok_or(AppError::Internal)?;
+    let sql = monitoring_upstream_health_batch_sql(upstream_account_ids.len()).ok_or(
+        AppError::internal("monitoring_snapshot_upstream_health_batch_1"),
+    )?;
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for upstream_account_id in upstream_account_ids {
         query = query.bind(upstream_account_id);
@@ -607,46 +611,36 @@ async fn upstream_health_batch(
     let mut health = BTreeMap::new();
     for row in rows {
         let upstream_account_id: String = row.try_get("upstream_account_id")?;
-        let value = upstream_health_from_row(&row, generated_at)?;
+        let value = upstream_health_from_row(&row)?;
         if health.insert(upstream_account_id, value).is_some() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "monitoring_snapshot_upstream_health_batch_2",
+            ));
         }
     }
     Ok(health)
 }
 
-fn upstream_health_from_row(
-    row: &AnyRow,
-    generated_at: i64,
-) -> Result<(String, MonitoringHealth), AppError> {
+fn upstream_health_from_row(row: &AnyRow) -> Result<(String, MonitoringHealth), AppError> {
     let name: String = row.try_get("name")?;
     let account_status: Option<String> = row.try_get("status")?;
-    let credential_generation: Option<i64> = row.try_get("credential_generation")?;
-    let health_generation: Option<i64> = row.try_get("health_generation")?;
-    let consecutive_failures: Option<i64> = row.try_get("consecutive_failures")?;
-    let cooldown_until: Option<i64> = row.try_get("cooldown_until")?;
-    let observed_at: Option<i64> = row.try_get("updated_at")?;
     let Some(account_status) = account_status else {
         return Ok((name, unknown_health()));
     };
-    let Some(credential_generation) = credential_generation else {
-        return Err(AppError::Internal);
-    };
+    // Candidate selection and this badge both read upstream_service_probes.
+    // No probe row is unknown. A non-healthy probe stays eligible and is only
+    // ordered after healthy and unknown accounts; the badge still shows it
+    // as unhealthy.
+    let probe_status: Option<String> = row.try_get("probe_status")?;
+    let observed_at: Option<i64> = row.try_get("probe_checked_at")?;
     let status = if account_status != "active" {
         "unhealthy"
-    } else if health_generation == Some(credential_generation) {
-        if cooldown_until.unwrap_or_default() > generated_at {
-            "unhealthy"
-        } else if consecutive_failures.unwrap_or_default() > 0 {
-            "degraded"
-        } else {
-            "healthy"
-        }
     } else {
-        // A previous credential generation cannot poison the current stable
-        // account's health. Absence of a current breaker row is healthy only
-        // because this caller already observed terminal traffic for the pair.
-        "healthy"
+        match probe_status.as_deref() {
+            Some("healthy") => "healthy",
+            Some(_) => "unhealthy",
+            None => "unknown",
+        }
     };
     Ok((
         name,
@@ -749,27 +743,19 @@ mod tests {
             .execute(&database.pool)
             .await
             .unwrap();
-            let (health_generation, consecutive_failures, cooldown_until) = match index {
-                1 => (2_i64, 1_i64, 0_i64),
-                // A stale breaker generation must not poison the rotated
-                // current credential, even if the old generation was open.
-                3 => (1_i64, 9_i64, i64::MAX),
-                _ => (2_i64, 0_i64, 0_i64),
-            };
-            sqlx::query(
-                "INSERT INTO upstream_account_health (
-                     upstream_account_id, consecutive_failures, cooldown_until,
-                     probe_lease_until, last_failure_kind, updated_at,
-                     credential_generation, transport_revision
-                 ) VALUES ($1, $2, $3, 0, '', 700, $4, 1)",
-            )
-            .bind(&upstream_account_id)
-            .bind(consecutive_failures)
-            .bind(cooldown_until)
-            .bind(health_generation)
-            .execute(&database.pool)
-            .await
-            .unwrap();
+            if index != 4 && index != 2 {
+                let probe_status = if index == 1 { "unhealthy" } else { "healthy" };
+                sqlx::query(
+                    "INSERT INTO upstream_service_probes (
+                         upstream_account_id, status, error_code, latency_ms, checked_at
+                     ) VALUES ($1, $2, '', 1, 700)",
+                )
+                .bind(&upstream_account_id)
+                .bind(probe_status)
+                .execute(&database.pool)
+                .await
+                .unwrap();
+            }
 
             if index == 4 {
                 sqlx::query(
@@ -984,8 +970,7 @@ mod tests {
                 "terminal outcome mismatch for pair {index}"
             );
             let expected_status = match index {
-                1 => "degraded",
-                2 => "unhealthy",
+                1 | 2 => "unhealthy",
                 4 => "unknown",
                 _ => "healthy",
             };
@@ -1255,7 +1240,6 @@ mod tests {
         let mut results = upstream_health_batch(
             &mut connection,
             std::slice::from_ref(&upstream_account_id),
-            3,
             &mut statements,
         )
         .await
@@ -1285,7 +1269,6 @@ mod tests {
         let mut results = upstream_health_batch(
             &mut connection,
             std::slice::from_ref(&upstream_account_id),
-            3,
             &mut statements,
         )
         .await

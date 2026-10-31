@@ -1,9 +1,9 @@
 use std::{
-    io::Write,
-    path::{Path, PathBuf},
+    collections::VecDeque,
+    path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -13,16 +13,18 @@ use tokio::sync::Notify;
 use crate::db::{Database, EarlyRequestTerminal};
 
 const MAX_RECORD_BYTES: u64 = 4096;
-const MAX_PENDING_RECORDS: usize = 16_384;
 const REPLAY_BATCH: usize = 64;
 const MAX_PENDING_WRITES: usize = 64;
 const WRITE_DEADLINE: Duration = Duration::from_millis(250);
 
 pub(crate) struct Journal {
     directory: PathBuf,
+    database: Database,
     wake: Arc<Notify>,
     writes: Arc<tokio::sync::Mutex<()>>,
     pending_writes: Arc<tokio::sync::Semaphore>,
+    deferred: Arc<Mutex<VecDeque<EarlyRequestTerminal>>>,
+    inflight: Arc<AtomicUsize>,
     written: Arc<AtomicU64>,
     replayed: AtomicU64,
     failed: AtomicU64,
@@ -32,9 +34,12 @@ impl Journal {
     pub(crate) fn new(directory: PathBuf, database: Database) -> Arc<Self> {
         let journal = Arc::new(Self {
             directory,
+            database: database.clone(),
             wake: Arc::new(Notify::new()),
             writes: Arc::new(tokio::sync::Mutex::new(())),
             pending_writes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES)),
+            deferred: Arc::new(Mutex::new(VecDeque::new())),
+            inflight: Arc::new(AtomicUsize::new(0)),
             written: Arc::new(AtomicU64::new(0)),
             replayed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -56,32 +61,37 @@ impl Journal {
 
     pub(crate) async fn append(&self, record: EarlyRequestTerminal) -> bool {
         let request_id = record.request_id;
-        let Ok(pending) = self.pending_writes.clone().try_acquire_owned() else {
+        let Ok(_pending) = self.pending_writes.clone().try_acquire_owned() else {
             return self.unavailable(request_id, "journal_queue_full");
         };
-        let directory = self.directory.clone();
         let writes = self.writes.clone();
+        // Waiting for the local writer is a lost terminal: the response must
+        // say so. A database that is busy after the writer is acquired is not.
+        // That deadline must not cancel the queueing step itself.
+        let _writer = match tokio::time::timeout(WRITE_DEADLINE, writes.lock_owned()).await {
+            Ok(writer) => writer,
+            Err(_) => return self.unavailable(request_id, "journal_write_timeout"),
+        };
+        let database = self.database.clone();
         let written = self.written.clone();
+        let deferred = self.deferred.clone();
         let wake = self.wake.clone();
-        let result = tokio::time::timeout(WRITE_DEADLINE, async move {
-            let writer = writes.lock_owned().await;
-            tokio::task::spawn_blocking(move || {
-                let _writer = writer;
-                let _pending = pending;
-                let result = write_record(&directory, &record);
-                if result.is_ok() {
-                    written.fetch_add(1, Ordering::Relaxed);
-                    wake.notify_one();
-                }
-                result
-            })
-            .await
-        })
-        .await;
-        match result {
-            Ok(Ok(Ok(()))) => true,
-            Err(_) => self.unavailable(request_id, "journal_write_timeout"),
-            _ => self.unavailable(request_id, "journal_unavailable"),
+        let queued = record.clone();
+        let write = database.record_early_request_terminal(&record);
+        tokio::pin!(write);
+        match tokio::time::timeout(WRITE_DEADLINE, &mut write).await {
+            Ok(Ok(())) => {
+                written.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            _ => {
+                deferred
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push_back(queued);
+                wake.notify_one();
+                true
+            }
         }
     }
 
@@ -102,6 +112,48 @@ impl Journal {
     }
 
     async fn replay(&self, database: &Database) {
+        let deferred = {
+            let mut queued = self
+                .deferred
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let count = queued.len().min(REPLAY_BATCH);
+            queued.drain(..count).collect::<Vec<_>>()
+        };
+        if !deferred.is_empty() {
+            self.inflight.fetch_add(deferred.len(), Ordering::AcqRel);
+        }
+        let mut pending = deferred;
+        let mut index = 0;
+        while index < pending.len() {
+            match database
+                .record_early_request_terminal(&pending[index])
+                .await
+            {
+                Ok(()) => {
+                    self.written.fetch_add(1, Ordering::Relaxed);
+                    self.inflight.fetch_sub(1, Ordering::AcqRel);
+                    index += 1;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %pending[index].request_id,
+                        error_category = error.diagnostic_category(),
+                        "early request terminal retained for replay"
+                    );
+                    let retained = pending.split_off(index);
+                    self.inflight.fetch_sub(retained.len(), Ordering::AcqRel);
+                    let mut queued = self
+                        .deferred
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    for record in retained.into_iter().rev() {
+                        queued.push_front(record);
+                    }
+                    return;
+                }
+            }
+        }
         let Ok(mut entries) = tokio::fs::read_dir(&self.directory).await else {
             return;
         };
@@ -171,7 +223,13 @@ impl Journal {
     pub(crate) async fn drain_for_test(&self) {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                self.wake.notify_one();
+                self.replay(&self.database).await;
+                let queued = self
+                    .deferred
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty()
+                    && self.inflight.load(Ordering::Acquire) == 0;
                 let mut pending = false;
                 if let Ok(mut entries) = tokio::fs::read_dir(&self.directory).await {
                     while let Ok(Some(entry)) = entries.next_entry().await {
@@ -179,7 +237,7 @@ impl Journal {
                             == Some("json");
                     }
                 }
-                if !pending {
+                if queued && !pending {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -188,49 +246,6 @@ impl Journal {
         .await
         .expect("early terminal journal drained");
     }
-}
-
-fn write_record(directory: &Path, record: &EarlyRequestTerminal) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec(record).map_err(std::io::Error::other)?;
-    if bytes.len() as u64 > MAX_RECORD_BYTES {
-        return Err(std::io::Error::other("early terminal metadata limit"));
-    }
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
-    builder.create(directory)?;
-    let mut ancestor = PathBuf::new();
-    for component in directory.components() {
-        ancestor.push(component);
-        if std::fs::symlink_metadata(&ancestor)?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(std::io::Error::other("early terminal directory symlink"));
-        }
-    }
-    if std::fs::read_dir(directory)?
-        .take(MAX_PENDING_RECORDS)
-        .count()
-        >= MAX_PENDING_RECORDS
-    {
-        return Err(std::io::Error::other("early terminal journal capacity"));
-    }
-    let path = directory.join(format!("{}.json", record.request_id));
-    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    temporary.write_all(&bytes)?;
-    temporary.as_file().sync_all()?;
-    match temporary.persist_noclobber(&path) {
-        Ok(_) => {}
-        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.error),
-    }
-    std::fs::File::open(directory)?.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

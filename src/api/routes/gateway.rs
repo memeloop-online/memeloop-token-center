@@ -38,6 +38,18 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
         .route("/self/v1/sessions", get(self_sessions))
         .route("/self/v1/sessions/{session_id}", get(self_session_detail))
         .route(
+            "/self/v1/sessions/{session_id}/requests/{request_id}/context",
+            get(self_session_context),
+        )
+        .route(
+            "/self/v1/sessions/{session_id}/requests/{request_id}/dialogue",
+            get(self_session_dialogue),
+        )
+        .route(
+            "/self/v1/sessions/{session_id}/requests/{request_id}/context/content",
+            get(self_session_context_content),
+        )
+        .route(
             "/v1/responses",
             get(negotiate_openai_responses_websocket)
                 .post(proxy_openai_responses)

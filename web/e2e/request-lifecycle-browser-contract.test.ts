@@ -5,7 +5,206 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
-declare global { interface Window { requestLifecycleFixture: { finish: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+declare global { interface Window { requestLifecycleFixture: { finish: () => void; settle: (cost: string, kind: 'finished' | 'projected' | 'archive_bound') => void; replay: () => void; hold: () => void; release: () => void; switchScope: () => void; filter: () => void; failQuery: () => void; held: boolean; queryHeld: boolean; queryCalls: number; detailCalls: number; scopeCommits: { scope: string; drawers: number }[] }; } }
+
+test('low-volume terminal events reconcile operational money without opening details or overflowing', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    for (const locale of ['en', 'zh-CN'] as const) {
+      const page = await browser.newPage();
+      await page.route('**/*', route => {
+        const url = new URL(route.request().url());
+        return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+      });
+      await page.addInitScript(locale => localStorage.setItem('mtc-locale', locale), locale);
+      for (const amount of ['0', '2.50']) {
+        for (const kind of ['finished', 'projected', 'archive_bound'] as const) {
+          await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=499`);
+          const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+          await row.locator('[data-outcome="cancelled"]').waitFor();
+          const cost = row.locator('.request-cost-cell .request-value-info');
+          assert.equal(await cost.innerText(), '—');
+          const queries = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
+          assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0);
+          await page.evaluate(({ amount, kind }) => window.requestLifecycleFixture.settle(amount, kind), { amount, kind });
+          if (kind === 'archive_bound') {
+            await page.locator('[data-request-fixture-event-kind="archive_bound"][data-request-fixture-completed-at="4000"]').waitFor();
+          }
+          await page.waitForFunction(() => {
+            const row = [...document.querySelectorAll('tbody tr')].find(row => row.textContent?.includes('model-a'));
+            return row?.querySelector('.request-cost-cell .request-value-info')?.getAttribute('aria-label') === null;
+          });
+          const settled = await cost.innerText();
+          assert.match(settled, amount === '0' ? /0/ : /2[.,]50?/);
+          assert.doesNotMatch(settled, /—|999/);
+          assert.match(await row.locator('[data-outcome="cancelled"]').innerText(), /499/);
+          assert.match(await row.locator('.request-status-cause').innerText(), locale === 'en' ? /The client disconnected/ : /客户端断开/);
+          assert.doesNotMatch(await row.locator('.request-token-total').innerText(), /—/);
+          assert.equal(await page.getByRole('dialog').count(), 0);
+          assert.equal(await page.evaluate(() => window.requestLifecycleFixture.queryCalls), queries);
+          assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
+          await page.evaluate(() => window.requestLifecycleFixture.replay());
+          await page.locator('[data-request-fixture-revision="2"]').waitFor();
+          await row.locator('[data-outcome="cancelled"]').waitFor();
+          assert.equal(await cost.innerText(), settled);
+          assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
+          assert.equal(await page.getByRole('dialog').count(), 0);
+        }
+      }
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('operational reconciliation respects pause, history, filtering and scope cancellation', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.route('**/*', route => {
+      const url = new URL(route.request().url());
+      return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+    });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const url = `${origin}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=499`;
+    const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+    const cost = row.locator('.request-cost-cell .request-value-info');
+    await page.goto(url);
+    await row.locator('[data-outcome="cancelled"]').waitFor();
+    await page.getByRole('button', { name: 'Pause updates', exact: true }).click();
+    await page.evaluate(() => { window.requestLifecycleFixture.hold(); window.requestLifecycleFixture.settle('2.50', 'finished'); });
+    await page.locator('[data-request-fixture-revision="1"]').waitFor();
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0);
+    assert.equal(await cost.innerText(), '—');
+    await page.getByRole('button', { name: 'Resume updates', exact: true }).click();
+    await page.waitForFunction(() => window.requestLifecycleFixture.held);
+    await page.getByRole('button', { name: 'Pause updates', exact: true }).click();
+    await page.evaluate(() => window.requestLifecycleFixture.release());
+    await page.waitForFunction(() => !window.requestLifecycleFixture.held);
+    assert.equal(await cost.innerText(), '—', 'a response arriving after pause cannot update the list');
+    await page.getByRole('button', { name: 'Resume updates', exact: true }).click();
+    await cost.filter({ hasText: /2[.,]50?/ }).waitFor();
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 2);
+    assert.equal(await page.getByRole('dialog').count(), 0);
+
+    await page.goto(url);
+    await row.locator('[data-outcome="cancelled"]').waitFor();
+    await page.getByRole('button', { name: 'Load older requests', exact: true }).click();
+    await page.getByRole('button', { name: 'Return to latest requests', exact: true }).waitFor();
+    const queryCalls = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
+    const requestIds = await page.locator('tbody tr').allTextContents();
+    await page.evaluate(() => window.requestLifecycleFixture.settle('2.50', 'projected'));
+    await cost.filter({ hasText: /2[.,]50?/ }).waitFor();
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.queryCalls), queryCalls);
+    assert.equal(await page.locator('tbody tr').count(), requestIds.length);
+    assert.equal(await row.locator('[data-outcome="cancelled"]').count(), 1);
+    assert.equal(await page.getByRole('button', { name: 'Return to latest requests', exact: true }).count(), 1);
+
+    await page.goto(url);
+    await row.locator('[data-outcome="cancelled"]').waitFor();
+    await page.evaluate(() => { window.requestLifecycleFixture.hold(); window.requestLifecycleFixture.settle('2.50', 'finished'); });
+    await page.waitForFunction(() => window.requestLifecycleFixture.held);
+    await page.evaluate(() => window.requestLifecycleFixture.switchScope());
+    await page.locator('[data-request-fixture-scope="tenant-b"] tbody tr').first().waitFor();
+    assert.equal(await cost.innerText(), '—');
+    await page.evaluate(() => window.requestLifecycleFixture.release());
+    await page.waitForFunction(() => !window.requestLifecycleFixture.held);
+    assert.equal(await cost.innerText(), '—', 'an old-scope response cannot apply money to a new scope');
+    assert.equal(await page.getByRole('dialog').count(), 0);
+
+    await page.goto(url);
+    await row.locator('[data-outcome="cancelled"]').waitFor();
+    await page.evaluate(() => window.requestLifecycleFixture.filter());
+    await page.waitForFunction(() => window.requestLifecycleFixture.queryHeld);
+    await page.evaluate(() => window.requestLifecycleFixture.failQuery());
+    await page.getByRole('alert').waitFor();
+    const filteredQueries = await page.evaluate(() => window.requestLifecycleFixture.queryCalls);
+    await page.evaluate(() => window.requestLifecycleFixture.settle('2.50', 'projected'));
+    await page.getByRole('button', { name: 'Refresh filtered results', exact: true }).waitFor();
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0);
+    assert.equal(await page.evaluate(() => window.requestLifecycleFixture.queryCalls), filteredQueries);
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('operational completion preserves bilingual outcomes and unknown costs across financial event replay', { timeout: 45_000 }, async (context) => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    context.skip('Chromium is not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const origin = `http://127.0.0.1:${address.port}`;
+  const browser = await chromium.launch({ headless: true });
+  try {
+    for (const locale of ['en', 'zh-CN'] as const) {
+      const page = await browser.newPage();
+      await page.route('**/*', route => {
+        const url = new URL(route.request().url());
+        return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
+      });
+      await page.addInitScript(locale => localStorage.setItem('mtc-locale', locale), locale);
+      for (const mode of ['200', '499', '502', 'zero'] as const) {
+        await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?quiet-background-help&operational=${mode}`);
+        const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
+        const outcome = mode === '499' ? 'cancelled' : mode === '502' ? 'failed' : 'completed';
+        const label = mode === '499' ? (locale === 'en' ? 'Client disconnected' : '客户端断开')
+          : mode === '502' ? (locale === 'en' ? 'Failed' : '失败') : (locale === 'en' ? 'Completed' : '已完成');
+        const reason = mode === '499' ? (locale === 'en' ? 'The client disconnected' : '客户端断开')
+          : mode === '502' ? (locale === 'en' ? 'The upstream connection was reset' : '上游连接被重置') : null;
+        await row.locator(`[data-outcome="${outcome}"]`).waitFor();
+        assert.ok((await row.locator(`[data-outcome="${outcome}"]`).innerText()).startsWith(label));
+        const cost = row.locator('.request-cost-cell .request-value-info');
+        const recordedCost = await cost.innerText();
+        if (mode === 'zero') {
+          assert.match(await cost.innerText(), /0/);
+          assert.doesNotMatch(await cost.innerText(), /—/);
+        } else {
+          assert.equal(await cost.innerText(), '—');
+          assert.equal(await cost.getAttribute('aria-label'), locale === 'en' ? 'Awaiting settlement' : '待结算');
+          assert.match(await row.locator('.request-token-total').innerText(), /—/);
+          await cost.focus();
+          await page.getByRole('tooltip').filter({ hasText: locale === 'en' ? 'Cost awaits confirmation' : '费用待确认' }).waitFor();
+        }
+        if (reason) {
+          await row.locator('.request-outcome').focus();
+          await page.getByRole('tooltip').filter({ hasText: reason }).waitFor();
+        }
+        await row.locator('.table-action').click();
+        const drawer = page.getByRole('dialog', { name: 'model-a' });
+        await drawer.locator(`[data-outcome="${outcome}"]`).waitFor();
+        if (reason) assert.ok((await drawer.innerText()).includes(reason));
+        if (mode !== 'zero') {
+          assert.equal(await drawer.getByText(locale === 'en' ? 'Awaiting settlement' : '待结算', { exact: true }).count(), 1);
+        }
+        const detailCalls = await page.evaluate(() => window.requestLifecycleFixture.detailCalls);
+        await page.evaluate(() => window.requestLifecycleFixture.finish());
+        await page.waitForFunction(count => window.requestLifecycleFixture.detailCalls > count, detailCalls);
+        await drawer.locator(`[data-outcome="${outcome}"]`).waitFor();
+        assert.equal(await row.locator(`[data-outcome="${outcome}"]`).count(), 1);
+        assert.equal(await cost.innerText(), recordedCost);
+        if (reason) assert.ok((await drawer.innerText()).includes(reason));
+        assert.doesNotMatch(await drawer.innerText(), /http_499|http_502|upstream_transport_connection_reset/);
+      }
+      await page.close();
+    }
+  } finally { await browser.close(); await server.close(); }
+});
 
 test('request error details distinguish active delivery from recorded terminal failure', { timeout: 45_000 }, async (context) => {
   if (!existsSync(chromium.executablePath())) {
@@ -51,7 +250,7 @@ test('request error details distinguish active delivery from recorded terminal f
         assert.doesNotMatch(text, /The request failed|delivery_started/);
         assert.equal(await drawer.getByText('Error', { exact: true }).count(), 0, 'a progress marker must not create an error detail row');
       } else {
-        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'No specific cause was captured at the time';
+        const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'This record has no stored cause';
         assert.equal(text.split(cause).length - 1, 1);
         assert.doesNotMatch(text, /upstream_transport_connection_reset|upstream_stream/);
         await drawer.locator('.request-outcome').focus();
@@ -146,6 +345,10 @@ test('request detail follows terminal events and fences late responses after sel
     await page.waitForFunction(() => window.requestLifecycleFixture.held);
     await page.getByRole('button', { name: 'Close', exact: true }).click();
     await page.getByRole('tooltip').filter({ hasText: 'Background scope help' }).waitFor();
+    // The live-added tooltip positioned itself while the modal held the scroll
+    // lock, so it only reappears after the next position recompute; revealing
+    // its trigger is the user action that triggers one.
+    await page.getByRole('button', { name: 'Live-added helper', exact: true }).scrollIntoViewIfNeeded();
     await page.getByRole('tooltip').filter({ hasText: 'Live-added background help' }).waitFor();
     assert.equal(await liveHelp.evaluate(element => !!element.closest('[inert], [aria-hidden="true"]')), false, 'new background portal regains its original accessibility on close');
     assert.deepEqual(await page.locator('#already-inert-background').evaluate(element => ({ inert: element instanceof HTMLElement && element.inert, hidden: element.getAttribute('aria-hidden') })), { inert: true, hidden: 'false' }, 'cleanup restores original attributes, not generic accessibility defaults');
@@ -369,9 +572,9 @@ test('typed failure diagnostic replaces the repeated unknown cause in list and d
   const browser = await chromium.launch({ headless: true });
   try {
     for (const [locale, param, reason, prefix, close, label] of [
-      ['zh-CN', 'downstream', '客户端在响应交付完成前断开了连接', '已记录原因', '关闭', '失败'],
+      ['zh-CN', 'downstream', '上游已经开始返回，客户端在收完之前断开', '已记录原因', '关闭', '失败'],
       ['zh-CN', 'supplier', '上游服务在响应开始时返回了错误状态', '已记录原因', '关闭', '失败'],
-      ['en', 'downstream', 'The client disconnected before response delivery completed', 'Recorded cause', 'Close', 'Failed'],
+      ['en', 'downstream', 'The upstream had started returning, and the client disconnected before the response finished', 'Recorded cause', 'Close', 'Failed'],
       ['en', 'supplier', 'The upstream service returned an error status at the start of its response', 'Recorded cause', 'Close', 'Failed'],
     ] as const) {
       const page = await browser.newPage();

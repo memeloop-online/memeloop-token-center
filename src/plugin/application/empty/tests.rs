@@ -125,7 +125,10 @@ async fn empty_inventory_http_registration_replay_audit_and_restart() {
             .install(
                 installation::InstallPluginRequest {
                     inventory_id: "not-empty-api".into(),
-                    packages: vec![]
+                    packages: vec![],
+                    release_resolution_id: None,
+                    release_descriptor_sha256: None,
+                    network: None,
                 },
                 "ordinary-empty-install",
                 "bootstrap",
@@ -148,6 +151,7 @@ async fn empty_inventory_http_registration_replay_audit_and_restart() {
         .unwrap();
     assert_eq!(published.revision, 1);
     let gateway = AppState::initialize((*state.config).clone()).await.unwrap();
+    gateway.refresh_application_plugins().await.unwrap();
     let pinned = gateway.pin_application_plugins().await.unwrap();
     assert!(pinned.plugins.manifests().is_empty());
     assert_eq!(
@@ -407,7 +411,10 @@ async fn empty_inventory_immutable_collision_and_install_lock_fail_closed() {
                 "bootstrap"
             )
             .await,
-        Err(AppError::Overloaded)
+        Err(AppError::Capacity {
+            code: "plugin_installation_lock",
+            ..
+        })
     ));
     assert_eq!(authority.status().await.unwrap().candidates.len(), 1);
 }

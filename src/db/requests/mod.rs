@@ -2,7 +2,9 @@ pub(crate) mod conversations;
 mod early_terminal;
 mod lifecycle;
 mod metered_projection;
+mod operational_terminal;
 pub(crate) mod owner;
+pub(crate) mod pending_settlement;
 mod pricing_stats;
 mod queries;
 mod session_routing;
@@ -31,6 +33,9 @@ pub(crate) use lifecycle::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
 };
 pub use metered_projection::MeteredUsageProjectionTask;
+pub(crate) use operational_terminal::{
+    PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck,
+};
 pub use queries::RequestListFilter;
 pub(crate) use queries::{
     request_detail_accounting_projection, request_usage_basis_from_row, search_prefix,

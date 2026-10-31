@@ -81,7 +81,8 @@ pub async fn client_for_url(
         && addresses.iter().all(|address| address.ip().is_loopback());
     validate_addresses(&addresses, scope, test_loopback)?;
     validate_transport_security(url.scheme(), &addresses, scope, test_loopback)?;
-    crate::build_pinned_http_client(host_name, &addresses).map_err(|_| AppError::Internal)
+    crate::build_pinned_http_client(host_name, &addresses)
+        .map_err(|_| AppError::internal("network_client_for_url_1"))
 }
 
 /// Return a one-operation client that preserves the ordinary URL validation
@@ -102,7 +103,8 @@ pub(crate) async fn client_for_url_no_retry(
         .map(|host| (host, addresses.as_slice()))
         .into_iter()
         .collect();
-    crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
+    crate::build_no_retry_http_client(None, &pins)
+        .map_err(|_| AppError::internal("network_client_for_url_no_retry_1"))
 }
 
 fn validated_literal_client(
@@ -252,7 +254,8 @@ pub(crate) async fn client_for_oauth_url_no_retry(
                 .into(),
         ));
     }
-    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+    crate::build_no_retry_http_client(Some(proxy_url), &[])
+        .map_err(|_| AppError::internal("network_client_for_oauth_url_no_retry_1"))
 }
 
 async fn config_url_client(
@@ -331,7 +334,7 @@ async fn config_url_client(
     } else {
         crate::build_explicit_proxy_http_client(proxy_url, &pins)
     }
-    .map_err(|_| AppError::Internal)
+    .map_err(|_| AppError::internal("network_config_url_client_1"))
 }
 
 /// Validate the fixed native Codex target and its remote-DNS proxy without
@@ -403,28 +406,6 @@ pub(crate) async fn validate_codex_transport(
         ));
     }
     Ok(())
-}
-
-/// Build a one-operation client for a fixed Codex control-plane URL.
-///
-/// A configured account proxy owns target DNS. Accounts without one connect
-/// directly to the fixed public target with an explicit no-proxy client.
-pub(crate) async fn client_for_codex_url(
-    shared_test_client: &reqwest::Client,
-    value: &str,
-    config: &Value,
-    proxy: Option<(&str, OutboundScope)>,
-    allow_test_loopback: bool,
-) -> Result<reqwest::Client, AppError> {
-    codex_client_for_url(
-        shared_test_client,
-        value,
-        config,
-        proxy,
-        allow_test_loopback,
-        false,
-    )
-    .await
 }
 
 /// Mutation-only Codex control transport with no implicit HTTP retry.
@@ -521,7 +502,8 @@ pub(crate) async fn client_for_codex_oauth_url(
             ));
         }
     }
-    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+    crate::build_no_retry_http_client(Some(proxy_url), &[])
+        .map_err(|_| AppError::internal("network_client_for_codex_oauth_url_1"))
 }
 
 async fn codex_client_for_url(
@@ -545,7 +527,7 @@ async fn codex_client_for_url(
     } else {
         crate::build_explicit_proxy_http_client(proxy_url, &[])
     }
-    .map_err(|_| AppError::Internal)
+    .map_err(|_| AppError::internal("network_codex_client_for_url_1"))
 }
 
 async fn pinned_no_retry_public_client(
@@ -560,7 +542,8 @@ async fn pinned_no_retry_public_client(
         .map(|host| (host, addresses.as_slice()))
         .into_iter()
         .collect();
-    crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
+    crate::build_no_retry_http_client(None, &pins)
+        .map_err(|_| AppError::internal("network_pinned_no_retry_public_client_1"))
 }
 
 pub(crate) async fn validate_managed_codex_proxy(value: &str) -> Result<(), AppError> {
@@ -664,6 +647,80 @@ pub(crate) fn validate_install_egress_proxy(value: &str) -> Result<(), AppError>
     Ok(())
 }
 
+/// Explicit global-operator installer proxies may be public or private. Resolve
+/// once and persist the addresses with the operation; consumers must pin these
+/// addresses, including on retry. Proxy failure must never cause direct retry.
+pub(crate) async fn validate_installer_proxy_endpoint(
+    value: &str,
+    approved_group: bool,
+) -> Result<(Option<String>, Vec<SocketAddr>), AppError> {
+    let invalid = || AppError::BadRequest("installation proxy endpoint is invalid".into());
+    let url = checked_installer_proxy_url(value)?;
+    if approved_group {
+        crate::provider::validate_codex_proxy_url(value).map_err(|_| invalid())?;
+    }
+    let (host, addresses, _) = validated_endpoint(&url, OutboundScope::Private, false).await?;
+    if approved_group
+        && addresses
+            .iter()
+            .any(|address| !is_safe_private_upstream_ip(address.ip()))
+    {
+        return Err(invalid());
+    }
+    Ok((host, addresses))
+}
+
+pub(crate) fn checked_installer_proxy_url(value: &str) -> Result<Url, AppError> {
+    let invalid = || AppError::BadRequest("installation proxy endpoint is invalid".into());
+    if value.len() > 2048
+        || value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte < 0x20)
+    {
+        return Err(invalid());
+    }
+    let url = Url::parse(value).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https" | "socks5" | "socks5h")
+        || (url.scheme() == "https" && matches!(url.host(), Some(Host::Domain(_))))
+        || url.host_str().is_none()
+        || url.port() == Some(0)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || !matches!(url.path(), "" | "/")
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.host_str().is_some_and(is_loopback_name)
+    {
+        return Err(invalid());
+    }
+    Ok(url)
+}
+
+/// An already-resolved installer proxy passed to OCI/cosign transports must
+/// use the frozen IP directly, so those transports cannot resolve it again.
+pub(crate) fn validate_frozen_installer_proxy(value: &str) -> Result<(), AppError> {
+    let url = checked_installer_proxy_url(value)?;
+    // url treats SOCKS as a non-special scheme, whose literal IPv4 host can
+    // be represented as Host::Domain. Parse the spelling as an IP explicitly.
+    let address: IpAddr = url
+        .host_str()
+        .unwrap_or("")
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .map_err(|_| {
+            AppError::BadRequest("installation proxy must use its frozen IP address".into())
+        })?;
+    validate_addresses(
+        &[SocketAddr::new(
+            address,
+            url.port_or_known_default().unwrap_or(1080),
+        )],
+        OutboundScope::Private,
+        false,
+    )
+}
+
 fn checked_proxy_url(value: &str) -> Result<Url, AppError> {
     if value.len() > 2_048 || value.trim() != value || value.bytes().any(|byte| byte < 0x20) {
         return Err(AppError::BadRequest("upstream proxy URL is invalid".into()));
@@ -735,7 +792,7 @@ pub(crate) fn preparation_failure_category(error: &AppError) -> &'static str {
             "dns_resolution"
         }
         AppError::BadRequest(_) => "destination_rejected",
-        AppError::Internal => "client_build",
+        AppError::Internal { .. } => "client_build",
         _ => "preparation_failed",
     }
 }
@@ -1008,9 +1065,22 @@ mod tests {
         let secret = "https://user:secret@example.test/?token=secret";
         for (error, expected) in [
             (AppError::BadRequest(secret.into()), "destination_rejected"),
-            (AppError::Upstream(secret.into()), "preparation_failed"),
-            (AppError::Storage(secret.into()), "preparation_failed"),
-            (AppError::Internal, "client_build"),
+            (
+                AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new()
+                        .stage("network_preparation_labels_never_include_free_text"),
+                ),
+                "preparation_failed",
+            ),
+            (
+                AppError::storage("local_storage_failed"),
+                "preparation_failed",
+            ),
+            (
+                AppError::internal("network_preparation_labels_never_include_free_text_1"),
+                "client_build",
+            ),
             (
                 AppError::BadRequest(DNS_TIMEOUT_MESSAGE.into()),
                 "dns_timeout",
@@ -1421,6 +1491,60 @@ mod tests {
         assert!(
             validate_transport_security("http", &private, OutboundScope::Private, false).is_ok(),
             "explicit private ComfyUI endpoints may use cleartext on the private network"
+        );
+    }
+
+    #[tokio::test]
+    async fn installer_proxy_public_private_and_forbidden_endpoint_contract() {
+        for value in [
+            "http://8.8.8.8:3128",
+            "https://1.1.1.1:443",
+            "socks5://8.8.4.4:1080",
+            "socks5h://10.20.30.40:1080",
+        ] {
+            let (_, addresses) = validate_installer_proxy_endpoint(value, false)
+                .await
+                .unwrap();
+            assert_eq!(addresses.len(), 1);
+            validate_frozen_installer_proxy(value).unwrap();
+        }
+        for value in [
+            "http://127.0.0.1:3128",
+            "http://169.254.169.254:3128",
+            "http://100.100.100.200:3128",
+            "http://[::1]:3128",
+            "http://[fe80::1]:3128",
+            "http://user:secret@8.8.8.8:3128",
+            "http://8.8.8.8:3128/path",
+            "http://8.8.8.8:3128?x=y",
+            "http://8.8.8.8:3128#fragment",
+            "file:///tmp/proxy",
+            "http://localhost:3128",
+            "http://8.8.8.8:0",
+        ] {
+            assert!(
+                validate_installer_proxy_endpoint(value, false)
+                    .await
+                    .is_err(),
+                "accepted {value}"
+            );
+            assert!(validate_frozen_installer_proxy(value).is_err());
+        }
+        assert!(validate_frozen_installer_proxy("https://proxy.example.org:443").is_err());
+        assert!(
+            validate_installer_proxy_endpoint("socks5h://8.8.8.8:1080", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_installer_proxy_endpoint("http://10.20.30.40:3128", true)
+                .await
+                .is_err()
+        );
+        assert!(
+            validate_installer_proxy_endpoint("socks5h://10.20.30.40:1080", true)
+                .await
+                .is_ok()
         );
     }
 

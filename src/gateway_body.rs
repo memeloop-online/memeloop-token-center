@@ -1,4 +1,5 @@
 use std::{
+    error::Error as _,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -17,7 +18,12 @@ pub(crate) mod memory;
 pub(crate) mod request_spool;
 
 #[cfg(test)]
+mod body_read_classification_tests;
+#[cfg(test)]
 mod metered_tests;
+
+#[cfg(test)]
+mod archive_source_tests;
 
 pub(crate) struct GatewayBodyReadActivity {
     active: Arc<AtomicUsize>,
@@ -39,7 +45,7 @@ impl Drop for GatewayBodyReadActivity {
 const MAX_DEFAULT_BODY: usize = 4 * 1024 * 1024;
 const MAX_IMAGE_BODY: usize = 16 * 1024 * 1024;
 pub(crate) const GATEWAY_BODY_ROUTE_CLASS_COUNT: usize = 4;
-pub(crate) const GATEWAY_BODY_REJECTION_REASON_COUNT: usize = 3;
+pub(crate) const GATEWAY_BODY_REJECTION_REASON_COUNT: usize = 4;
 
 /// Fixed route classes prevent request paths from becoming metric labels.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -79,6 +85,7 @@ pub(crate) enum GatewayBodyRejectionReason {
     DeclaredContentLengthExceedsLimit,
     BodyReadRejected,
     CapacityExhausted,
+    BodyLimitExceeded,
 }
 
 impl GatewayBodyRejectionReason {
@@ -86,6 +93,7 @@ impl GatewayBodyRejectionReason {
         Self::DeclaredContentLengthExceedsLimit,
         Self::BodyReadRejected,
         Self::CapacityExhausted,
+        Self::BodyLimitExceeded,
     ];
 
     pub(crate) const fn index(self) -> usize {
@@ -93,6 +101,7 @@ impl GatewayBodyRejectionReason {
             Self::DeclaredContentLengthExceedsLimit => 0,
             Self::BodyReadRejected => 1,
             Self::CapacityExhausted => 2,
+            Self::BodyLimitExceeded => 3,
         }
     }
 
@@ -101,6 +110,7 @@ impl GatewayBodyRejectionReason {
             Self::DeclaredContentLengthExceedsLimit => "declared_content_length_exceeds_limit",
             Self::BodyReadRejected => "body_read_rejected",
             Self::CapacityExhausted => "capacity_exhausted",
+            Self::BodyLimitExceeded => "body_limit_exceeded",
         }
     }
 }
@@ -144,7 +154,6 @@ impl GatewayBodyRejectionMetrics {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GatewayBodyAdmissionError {
     CapacityExhausted,
-    RequestSpoolCapacityExhausted,
     RequestSpoolUnavailable,
     UnsupportedEncoding,
     Timeout,
@@ -158,10 +167,7 @@ pub(crate) async fn admit_gateway_request_body(
     responses_permits: Arc<tokio::sync::Semaphore>,
     responses_maximum: usize,
 ) -> Result<Request, GatewayBodyAdmissionError> {
-    let request_spool = request_spool::RequestSpoolAdmission::new(
-        std::env::temp_dir(),
-        crate::config::DEFAULT_RESPONSES_REQUEST_SPOOL_BYTES as usize,
-    );
+    let request_spool = request_spool::RequestSpoolAdmission::new(std::env::temp_dir());
     admit_gateway_request_body_with_memory(
         request,
         permits,
@@ -296,13 +302,24 @@ async fn admit_request_body_for_route(
     {
         return Err(GatewayBodyAdmissionError::UnsupportedEncoding);
     }
-    if route_class == GatewayBodyRouteClass::Responses {
+    let source_backed = matches!(
+        parts.uri.path(),
+        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
+    );
+    if route_class == GatewayBodyRouteClass::Responses
+        || (source_backed
+            && request_spool.is_some_and(request_spool::RequestSpoolAdmission::has_durable_store))
+    {
         let read_maximum = declared_content_length
             .and_then(|length| usize::try_from(length).ok())
             .unwrap_or(maximum)
             .min(maximum);
         let declared_content_length_usize =
             declared_content_length.and_then(|length| usize::try_from(length).ok());
+        let body_key = parts
+            .extensions
+            .get::<request_spool::RequestBodyObjectKey>()
+            .map(|key| key.0.clone());
         let spool = read_with_deadline(
             deadline,
             request_spool
@@ -326,32 +343,56 @@ async fn admit_request_body_for_route(
                                     .saturating_add(value.as_bytes().len())
                             },
                         )),
+                    body_key.as_deref(),
                 ),
         )
         .await?
         .map_err(|error| match error {
-            request_spool::RequestSpoolCaptureError::CapacityExhausted => {
-                GatewayBodyAdmissionError::RequestSpoolCapacityExhausted
-            }
             request_spool::RequestSpoolCaptureError::MemoryExhausted => {
                 GatewayBodyAdmissionError::CapacityExhausted
             }
             request_spool::RequestSpoolCaptureError::Unavailable => {
                 GatewayBodyAdmissionError::RequestSpoolUnavailable
             }
-            request_spool::RequestSpoolCaptureError::TooLarge
-            | request_spool::RequestSpoolCaptureError::BodyReadRejected => rejected_body(
+            request_spool::RequestSpoolCaptureError::TooLarge => rejected_body(
+                route_class,
+                declared_content_length,
+                maximum,
+                GatewayBodyRejectionReason::BodyLimitExceeded,
+            ),
+            request_spool::RequestSpoolCaptureError::BodyReadRejected => rejected_body(
                 route_class,
                 declared_content_length,
                 maximum,
                 GatewayBodyRejectionReason::BodyReadRejected,
             ),
         })?;
+        let spool = Arc::new(spool);
+        if let Some(request_id) = body_key
+            .as_deref()
+            .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        {
+            request_spool.unwrap().register_source(request_id, &spool);
+        }
+        let body = if route_class == GatewayBodyRouteClass::Responses {
+            Body::empty()
+        } else {
+            if let Some(reservation) = reservation.as_ref()
+                && !reservation.try_grow(spool.len(), memory::REQUEST_MEMORY_WEIGHT)
+            {
+                return Err(GatewayBodyAdmissionError::CapacityExhausted);
+            }
+            let bytes = spool
+                .read_all()
+                .await
+                .map_err(|_| GatewayBodyAdmissionError::RequestSpoolUnavailable)?;
+            Body::from(spool.shared_bytes(bytes))
+        };
         if let Some(reservation) = reservation {
             parts.extensions.insert(reservation);
         }
-        parts.extensions.insert(Arc::new(spool));
-        return Ok(Request::from_parts(parts, Body::empty()));
+        parts.extensions.insert(spool);
+        return Ok(Request::from_parts(parts, body));
     }
     if let Some(reservation) = reservation {
         let read_maximum = declared_content_length
@@ -381,7 +422,7 @@ async fn admit_request_body_for_route(
                         route_class,
                         declared_content_length,
                         maximum,
-                        GatewayBodyRejectionReason::BodyReadRejected,
+                        GatewayBodyRejectionReason::BodyLimitExceeded,
                     ));
                 }
                 retained.extend_from_slice(&chunk);
@@ -398,13 +439,16 @@ async fn admit_request_body_for_route(
     }
     let bytes = read_with_deadline(deadline, to_bytes(body, maximum))
         .await?
-        .map_err(|_| {
-            rejected_body(
-                route_class,
-                declared_content_length,
-                maximum,
-                GatewayBodyRejectionReason::BodyReadRejected,
-            )
+        .map_err(|error| {
+            let reason = if error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+            {
+                GatewayBodyRejectionReason::BodyLimitExceeded
+            } else {
+                GatewayBodyRejectionReason::BodyReadRejected
+            };
+            rejected_body(route_class, declared_content_length, maximum, reason)
         })?;
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }
@@ -456,73 +500,35 @@ mod tests {
 
     use super::*;
 
-    fn test_request_spool(limit_bytes: usize) -> request_spool::RequestSpoolAdmission {
-        request_spool::RequestSpoolAdmission::new(std::env::temp_dir(), limit_bytes)
+    fn test_request_spool() -> request_spool::RequestSpoolAdmission {
+        request_spool::RequestSpoolAdmission::new(std::env::temp_dir())
     }
 
     #[tokio::test]
-    async fn declared_body_cannot_poll_without_request_spool_capacity() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    async fn chunked_responses_body_tracks_written_bytes_and_cleans_up() {
         let budget = memory::ProxyMemoryBudget::new(256 * 1024);
-        let spool = test_request_spool(64 * 1024);
-        let polls = Arc::new(AtomicUsize::new(0));
-        let observed = polls.clone();
+        let spool = test_request_spool();
         let request = Request::post("/v1/responses")
-            .header(header::CONTENT_LENGTH, (128 * 1024).to_string())
-            .body(Body::from_stream(stream::poll_fn(move |_| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from(vec![
-                    b'x';
-                    128 * 1024
-                ]))))
-            })))
-            .unwrap();
-        let result = admit_gateway_request_body_with_memory(
-            request,
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            16 * 1024 * 1024,
-            crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
-            Some(&budget),
-            &spool,
-        )
-        .await;
-        assert!(matches!(
-            result,
-            Err(GatewayBodyAdmissionError::RequestSpoolCapacityExhausted)
-        ));
-        assert_eq!(polls.load(Ordering::SeqCst), 0);
-        assert_eq!(budget.snapshot().0, 0);
-        assert_eq!(spool.snapshot().used_bytes, 0);
-    }
-
-    #[tokio::test]
-    async fn chunked_responses_body_releases_spool_bytes_after_capacity_rejection() {
-        let budget = memory::ProxyMemoryBudget::new(256 * 1024);
-        let spool = test_request_spool(16 * 1024);
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/responses")
             .body(Body::from_stream(stream::iter([
                 Ok::<_, Infallible>(Bytes::from(vec![b'x'; 16 * 1024])),
                 Ok::<_, Infallible>(Bytes::from(vec![b'x'; 16 * 1024])),
             ])))
             .unwrap();
-        let result = admit_gateway_request_body_with_memory(
+        let admitted = admit_gateway_request_body_with_memory(
             request,
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(0)),
+            Arc::new(tokio::sync::Semaphore::new(0)),
             16 * 1024 * 1024,
             crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
             Some(&budget),
             &spool,
         )
-        .await;
-        assert!(matches!(
-            result,
-            Err(GatewayBodyAdmissionError::RequestSpoolCapacityExhausted)
-        ));
-        assert!(budget.reservation().try_grow(64 * 1024, 1));
+        .await
+        .unwrap();
+        assert_eq!(spool.snapshot().used_bytes, 32 * 1024);
+        assert_eq!(spool.snapshot().active_files, 1);
+        drop(admitted);
+        assert_eq!(budget.snapshot().0, 0);
         assert_eq!(spool.snapshot().used_bytes, 0);
         assert_eq!(spool.snapshot().active_files, 0);
     }
@@ -530,7 +536,7 @@ mod tests {
     #[tokio::test]
     async fn admitted_responses_body_retains_spool_bytes_until_request_drop() {
         let budget = memory::ProxyMemoryBudget::new(48 * 1024 * 1024);
-        let spool = test_request_spool(64 * 1024 * 1024);
+        let spool = test_request_spool();
         let request = Request::builder()
             .method("POST")
             .uri("/v1/responses")
@@ -563,74 +569,6 @@ mod tests {
         assert_eq!(spool.snapshot().active_files, 0);
         assert_eq!(budget.snapshot().0, 0);
         assert!(budget.reservation().try_grow(48 * 1024 * 1024, 1));
-    }
-
-    #[tokio::test]
-    async fn concurrent_responses_captures_share_disk_budget_and_recover() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let spool = test_request_spool(64 * 1024);
-        let winner = Request::post("/v1/responses")
-            .header(header::CONTENT_LENGTH, 48 * 1024)
-            .body(Body::from(vec![b'w'; 48 * 1024]))
-            .unwrap();
-        let winner = admit_gateway_request_body_with_memory(
-            winner,
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            16 * 1024 * 1024,
-            crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
-            None,
-            &spool,
-        )
-        .await
-        .unwrap();
-        assert_eq!(spool.snapshot().used_bytes, 48 * 1024);
-
-        let polls = Arc::new(AtomicUsize::new(0));
-        let observed = polls.clone();
-        let loser = Request::post("/v1/responses")
-            .header(header::CONTENT_LENGTH, 32 * 1024)
-            .body(Body::from_stream(stream::poll_fn(move |_| {
-                observed.fetch_add(1, Ordering::SeqCst);
-                std::task::Poll::Ready(Some(Ok::<_, Infallible>(Bytes::from_static(b"x"))))
-            })))
-            .unwrap();
-        assert!(matches!(
-            admit_gateway_request_body_with_memory(
-                loser,
-                Arc::new(tokio::sync::Semaphore::new(1)),
-                Arc::new(tokio::sync::Semaphore::new(1)),
-                16 * 1024 * 1024,
-                crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
-                None,
-                &spool,
-            )
-            .await,
-            Err(GatewayBodyAdmissionError::RequestSpoolCapacityExhausted)
-        ));
-        assert_eq!(polls.load(Ordering::SeqCst), 0);
-        assert_eq!(spool.snapshot().used_bytes, 48 * 1024);
-
-        drop(winner);
-        let recovered = Request::post("/v1/responses")
-            .header(header::CONTENT_LENGTH, 32 * 1024)
-            .body(Body::from(vec![b'r'; 32 * 1024]))
-            .unwrap();
-        let recovered = admit_gateway_request_body_with_memory(
-            recovered,
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            Arc::new(tokio::sync::Semaphore::new(1)),
-            16 * 1024 * 1024,
-            crate::config::DEFAULT_AUDIO_BODY_MAX_BYTES as usize,
-            None,
-            &spool,
-        )
-        .await
-        .unwrap();
-        assert_eq!(spool.snapshot().used_bytes, 32 * 1024);
-        drop(recovered);
-        assert_eq!(spool.snapshot().used_bytes, 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -736,10 +674,7 @@ mod tests {
         const BODY_BYTES: usize = 25_788_305;
         const MAXIMUM: usize = 32 * 1024 * 1024;
         let directory = tempfile::tempdir().unwrap();
-        let spool = request_spool::RequestSpoolAdmission::new(
-            directory.path().to_owned(),
-            64 * 1024 * 1024,
-        );
+        let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
         let prefix = br#"{"model":"gpt-5.6-sol","input":""#;
         let suffix = br#""}"#;
         let mut body = Vec::with_capacity(BODY_BYTES);
@@ -779,10 +714,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn responses_spool_cancellation_releases_file_bytes_and_read_permits() {
         let directory = tempfile::tempdir().unwrap();
-        let spool = request_spool::RequestSpoolAdmission::new(
-            directory.path().to_owned(),
-            64 * 1024 * 1024,
-        );
+        let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
         let body_permits = Arc::new(tokio::sync::Semaphore::new(1));
         let responses_permits = Arc::new(tokio::sync::Semaphore::new(1));
         let (started, started_wait) = tokio::sync::oneshot::channel();

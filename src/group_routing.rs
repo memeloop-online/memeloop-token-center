@@ -2,14 +2,14 @@
 pub(crate) mod durable;
 mod quota;
 #[cfg(test)]
-pub(crate) mod test_observe_gate;
+use crate::plugin::routing::{GroupRoutingObserveInput, GroupRoutingOutcome};
 use crate::{
     AppState,
     error::AppError,
     plugin::routing::{
         GROUP_ROUTING_V2_VERSION, GroupRoutingCandidate, GroupRoutingDirective, GroupRoutingHealth,
-        GroupRoutingInput, GroupRoutingObserveInput, GroupRoutingOutcome,
-        GroupRoutingTransientPolicy, GroupRoutingTransientSignal, transient_health_window_ms,
+        GroupRoutingInput, GroupRoutingTransientPolicy, GroupRoutingTransientSignal,
+        transient_health_window_ms,
     },
     provider::AuthorizedUpstreamCandidate,
 };
@@ -24,6 +24,50 @@ type BucketMember = (
 );
 type StrategyBuckets = BTreeMap<(std::cmp::Reverse<i32>, String), Vec<BucketMember>>;
 type CandidateKey = (Uuid, Uuid, i64);
+
+/// Snapshot diagnostics deliberately exclude policy, identity and SQL data.
+/// Drop records interruption when the enclosing preparation budget expires.
+struct SnapshotPhase {
+    request_id: Uuid,
+    stage: &'static str,
+    started: std::time::Instant,
+    finished: bool,
+}
+
+impl SnapshotPhase {
+    fn new(request_id: Uuid, stage: &'static str) -> Self {
+        let phase = Self {
+            request_id,
+            stage,
+            started: std::time::Instant::now(),
+            finished: false,
+        };
+        phase.emit("started");
+        phase
+    }
+
+    fn finish(mut self, outcome: &'static str) {
+        self.emit(outcome);
+        self.finished = true;
+    }
+
+    fn emit(&self, outcome: &'static str) {
+        tracing::info!(
+            request_id = %self.request_id,
+            stage = self.stage,
+            duration_ms = self.started.elapsed().as_millis() as u64,
+            outcome,
+        );
+    }
+}
+
+impl Drop for SnapshotPhase {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emit("not_completed");
+        }
+    }
+}
 
 fn is_false(value: &bool) -> bool {
     !*value
@@ -50,7 +94,8 @@ fn transient_health_scope(
     config: &serde_json::Value,
 ) -> Result<TransientHealthScope, AppError> {
     let window_ms = transient_health_window_ms(config)?;
-    let config = serde_json::to_vec(config).map_err(|_| AppError::Internal)?;
+    let config = serde_json::to_vec(config)
+        .map_err(|_| AppError::internal("group_routing_transient_health_scope_1"))?;
     let mut hasher = blake3::Hasher::new();
     hash_scope_field(&mut hasher, b"group-routing-v2-transient-health-scope-v1");
     hash_scope_field(&mut hasher, tenant_id.as_bytes());
@@ -315,11 +360,6 @@ async fn prepare_inner(
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
 ) -> Result<(), AppError> {
-    // This runs inside the whole-stage deadline, and avoids the larger
-    // candidate/group/health join for tenants retaining native scheduling.
-    if !state.db.has_group_routing_strategies(tenant_id).await? {
-        return Ok(());
-    }
     let started = tokio::time::Instant::now();
     // Many overlapping groups must not multiply per-component execution into
     // an unbounded request stall. Only one blocking hook is ever outstanding.
@@ -341,10 +381,20 @@ async fn prepare_inner(
             )
         })
         .collect::<Vec<_>>();
+    // The authorized candidate batch already returns no bindings for native
+    // groups. A tenant-wide existence preflight would add a serial DB round
+    // trip inside the same 250ms preparation budget, without authorizing data.
+    let binding_snapshot = SnapshotPhase::new(request_id, "group_routing_candidate_snapshot");
     let bindings = state
         .db
         .candidate_group_strategies(tenant_id, &candidate_ids)
-        .await?
+        .await;
+    binding_snapshot.finish(if bindings.is_ok() {
+        "returned"
+    } else {
+        "error"
+    });
+    let bindings = bindings?
         .into_iter()
         .map(|(route, account, binding)| ((route, account, binding.generation), binding))
         .collect::<BTreeMap<_, _>>();
@@ -377,10 +427,17 @@ async fn prepare_inner(
         .iter()
         .map(|(key, scope)| (key.1, key.2, scope.id.clone()))
         .collect::<Vec<_>>();
+    let signal_snapshot = SnapshotPhase::new(request_id, "group_routing_transient_snapshot");
     let scoped_signals = state
         .db
         .group_routing_v2_transient_signals(&scoped_signal_keys)
-        .await?
+        .await;
+    signal_snapshot.finish(if scoped_signals.is_ok() {
+        "returned"
+    } else {
+        "error"
+    });
+    let scoped_signals = scoped_signals?
         .into_iter()
         .map(|entry| {
             (
@@ -429,7 +486,8 @@ async fn prepare_inner(
     let quota_observations = if quota_candidates.is_empty() {
         BTreeMap::new()
     } else {
-        match tokio::time::timeout_at(
+        let quota_snapshot = SnapshotPhase::new(request_id, "group_routing_quota_snapshot");
+        let result = tokio::time::timeout_at(
             hook_deadline,
             crate::upstream_quota::observations::routing_observations(
                 state,
@@ -438,8 +496,13 @@ async fn prepare_inner(
                 crate::db::unix_millis(),
             ),
         )
-        .await
-        {
+        .await;
+        quota_snapshot.finish(match &result {
+            Ok(Ok(_)) => "returned",
+            Ok(Err(_)) => "error",
+            Err(_) => "deadline",
+        });
+        match result {
             Ok(Ok(observations)) => observations,
             Ok(Err(error)) => {
                 tracing::warn!(%request_id, stage="group_routing_quota_fallback", reason="read_failed", error_category=error.diagnostic_category(), accounts=quota_candidates.len(), "quota observation unavailable; native order retained");
@@ -570,7 +633,7 @@ async fn prepare_inner(
             ),
         )
         .await
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("group_routing_site_1"))
         .and_then(|result| result);
         match result {
             Ok(mut plan) => {
@@ -586,8 +649,10 @@ async fn prepare_inner(
                         .expect("validated exact candidate permutation")
                         .clone();
                     let key = (
-                        Uuid::parse_str(&directive.route_id).map_err(|_| AppError::Internal)?,
-                        Uuid::parse_str(&directive.account_id).map_err(|_| AppError::Internal)?,
+                        Uuid::parse_str(&directive.route_id)
+                            .map_err(|_| AppError::internal("group_routing_site_2"))?,
+                        Uuid::parse_str(&directive.account_id)
+                            .map_err(|_| AppError::internal("group_routing_site_3"))?,
                         directive.generation as i64,
                     );
                     ranks.insert(key, bucket_rank + position);
@@ -646,6 +711,7 @@ async fn prepare_inner(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn observe_with_signal(
     state: &AppState,
     request_id: Uuid,
@@ -655,8 +721,6 @@ pub(crate) async fn observe_with_signal(
     outcome: GroupRoutingOutcome,
     transient_signal: Option<GroupRoutingTransientSignal>,
 ) -> Option<crate::plugin::routing::GroupRoutingExecutionDirective> {
-    #[cfg(test)]
-    test_observe_gate::wait(request_id).await;
     let snapshot = state.group_routing.as_ref()?;
     let policy = snapshot.policy(route, account, generation)?;
     let mut candidate = policy.candidate.clone();

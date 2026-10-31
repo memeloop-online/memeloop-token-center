@@ -127,7 +127,7 @@ When('管理员打开实时会话聚合', async function (this: DogfoodWorld) {
     const url = new URL(request.url());
     if (url.pathname === '/internal/v1/sessions') observation.sessionListRequests.push(url.toString());
     else if (url.pathname === '/internal/v1/sessions/summaries') observation.sessionSummaryRequests.push(url.toString());
-    else if (url.pathname.startsWith('/internal/v1/sessions/')) observation.detailRequests.push(url.toString());
+    else if (/^\/internal\/v1\/sessions\/[^/]+$/.test(url.pathname)) observation.detailRequests.push(url.toString());
   });
   await openAppRoute(page, 'operator', 'sessions');
   await visible(page.getByRole('heading', { name: '最近会话与未关联请求', exact: true }));
@@ -235,6 +235,10 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
   await controls.getByLabel('会话状态').selectOption('active');
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   await page.getByRole('checkbox', { name: '自动刷新', exact: true }).check();
+  const cadence = page.getByRole('slider', { name: '刷新节奏', exact: true });
+  await cadence.press('Home');
+  assert.equal(await cadence.inputValue(), '0');
+  assert.equal(await cadence.getAttribute('aria-valuetext'), '实时');
   const observation = observations.get(this)!;
   observation.baselineSessionListRequests = observation.sessionListRequests.length;
   observation.baselineSessionSummaryRequests = observation.sessionSummaryRequests.length;

@@ -3,6 +3,7 @@ import { openIndividualAuthorization } from './form-disclosure.support.js';
 import { readFile } from 'node:fs/promises';
 import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page } from 'playwright';
+import type { RequestView, SelfStats } from '../../src/types.js';
 import { emptyRequestFilters, requestsPath, statsPath, type RequestFilters } from '../../src/self/requestPaths.js';
 import { baseURL, eventually, generationMockCounts, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
@@ -11,7 +12,7 @@ import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, 
 
 const operatorGenerationCancellations = new WeakMap<DogfoodWorld, { status: number; body: { status: string } }>();
 
-async function completeSelfRequestQuery(page: Page, filters: RequestFilters, action: () => Promise<unknown>): Promise<void> {
+async function completeSelfRequestQuery(page: Page, filters: RequestFilters, action: () => Promise<unknown>): Promise<{ requests: RequestView[]; stats: SelfStats }> {
   const waitFor = (path: string) => {
     const expected = new URL(path, baseURL);
     return page.waitForResponse((response) => {
@@ -32,6 +33,7 @@ async function completeSelfRequestQuery(page: Page, filters: RequestFilters, act
     assert.equal(response.status(), 200, 'the self-service request query must succeed');
     assert.equal(await response.finished(), null, 'the self-service request query must finish before the next filter change');
   }
+  return { requests: await requests.json() as RequestView[], stats: await stats.json() as SelfStats };
 }
 
 async function rejectInvalidSelfCredential(page: Page, action: () => Promise<unknown>): Promise<void> {
@@ -84,7 +86,7 @@ Then('自助门户显示自己的 51 条请求和分页统计', async function (
   await assertExactText(metric(page, '失败'), '1');
   await assertExactText(metric(page, '词元用量'), '600');
   await assertContains(metric(page, '可用余额 (USD)'), '$');
-  await assertContains(metric(page, '本地结算'), '$');
+  await assertExactText(metric(page, '本地结算'), '—');
   await assertVisible(page.getByRole('heading', { name: 'Browser E2E credential', exact: true }));
   await assertVisible(page.getByText(model, { exact: true }).first());
   await assertCount(page.locator('.self-history tbody tr'), 5);
@@ -93,7 +95,7 @@ Then('自助门户显示自己的 51 条请求和分页统计', async function (
   await assertAttribute(page.locator('html'), 'lang', 'en');
   await assertExactText(metric(page, 'Tokens'), '600');
   await assertContains(metric(page, 'Available balance (USD)'), '$');
-  await assertContains(metric(page, 'Local settlement'), '$');
+  await assertExactText(metric(page, 'Local settlement'), '—');
   await appPreferenceControls(page).getByRole('button', { name: '中文', exact: true }).click();
   await assertAttribute(page.locator('html'), 'lang', 'zh-CN');
 });
@@ -121,20 +123,51 @@ When('下游用户筛选失败请求并打开详情', async function (this: Dogf
   await filters.getByLabel('路由 ID').fill(seed.routeId);
   await filters.getByLabel('最低费用').fill('0');
   await filters.getByLabel('最高费用').fill('1000');
-  await completeSelfRequestQuery(page, {
+  const priced = await completeSelfRequestQuery(page, {
     ...emptyRequestFilters,
     upstreamAccountId: seed.upstreamId,
     routeId: seed.routeId,
     minCost: '0',
     maxCost: '1000',
   }, () => filters.getByRole('button', { name: '应用筛选' }).click());
+  assert.equal(priced.stats.summary.total_requests, 50);
+  assert.equal(priced.stats.summary.successful_requests, 50);
+  assert.equal(priced.stats.summary.failed_requests, 0);
+  assert.ok(priced.stats.summary.total_cost !== null && Number(priced.stats.summary.total_cost) > 0,
+    'the known-only selection must retain its real positive settlement');
+  assert.equal(priced.requests.length, 50);
+  assert.ok(priced.requests.every((request) => request.status_code === 200 && request.cost !== null));
+  await assertExactText(metric(page, '总请求'), '50');
+  await assertCount(page.locator('.self-history tbody tr'), 50);
+  await assertNoCount(page.getByRole('button', { name: '按 http_429 筛选请求' }));
+  await filters.getByLabel('最低费用').fill('');
+  await filters.getByLabel('最高费用').fill('');
+  const unpriced = await completeSelfRequestQuery(page, {
+    ...emptyRequestFilters,
+    upstreamAccountId: seed.upstreamId,
+    routeId: seed.routeId,
+  }, () => filters.getByRole('button', { name: '应用筛选' }).click());
+  assert.equal(unpriced.stats.summary.total_requests, 51);
+  assert.equal(unpriced.stats.summary.successful_requests, 50);
+  assert.equal(unpriced.stats.summary.failed_requests, 1);
+  assert.equal(unpriced.stats.summary.total_cost, null);
+  assert.deepEqual(unpriced.stats.summary.costs, [],
+    'partial known USD cost must not be presented as the complete USD total');
   await assertExactText(metric(page, '总请求'), '51');
   await assertCount(page.locator('.self-history tbody tr'), 50);
-  await completeSelfRequestQuery(page, {
+  const rejected = await completeSelfRequestQuery(page, {
     ...emptyRequestFilters,
     status: 'error',
     errorCode: 'http_429',
   }, () => page.getByRole('button', { name: '按 http_429 筛选请求' }).click());
+  assert.equal(rejected.requests.length, 1);
+  assert.equal(rejected.requests[0].completed_at, null);
+  assert.equal(rejected.requests[0].cost, null);
+  assert.equal(rejected.requests[0].operational_terminal?.financial_state, 'unknown');
+  assert.equal(rejected.stats.summary.total_requests, 1);
+  assert.equal(rejected.stats.summary.failed_requests, 1);
+  assert.equal(rejected.stats.summary.total_cost, null);
+  assert.ok(!priced.requests.some((request) => request.request_id === rejected.requests[0].request_id));
   await assertValue(filters.getByLabel('状态'), 'error');
   await assertValue(filters.getByLabel('错误码'), 'http_429');
   await assertCount(page.locator('.self-history tbody tr'), 1);
@@ -683,7 +716,19 @@ Then('上游短期签名只保存在受保护引用中且不出现在公开响�
     signal: AbortSignal.timeout(1_000),
   });
   assert.equal(persistenceResponse.status, 200);
-  assert.deepEqual(await persistenceResponse.json(), { database: false, archive: false });
+  const persistence = await persistenceResponse.json() as {
+    database: boolean; archive: boolean;
+    references: Array<{ job_id: string; key_id: string; owner_matches: boolean; plaintext: boolean; public_clean: boolean }>;
+  };
+  assert.equal(persistence.database, true);
+  assert.equal(persistence.archive, false);
+  assert.deepEqual(persistence.references, [{
+    job_id: video.job_id,
+    key_id: observation.clientKeyId,
+    owner_matches: true,
+    plaintext: true,
+    public_clean: true,
+  }]);
 });
 
 Then('用户通过真实下载控件取得代理图片和视频', async function (this: DogfoodWorld) {
@@ -884,10 +929,10 @@ Then('控制台使用双游标只补齐缺失请求且正常关闭和切页均�
   const builder = requestPanel.locator('.typed-filter-builder');
   const dialog = await openTypedFilterDialog(builder);
   const modelCondition = await addTypedFilterCondition(dialog, 'model');
-  const routeCatalogResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/model-routes'
+  const modelNamesResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/filter-model-names'
     && response.request().method() === 'GET');
   const catalog = await openCatalogModelPicker(modelCondition);
-  assert.equal((await routeCatalogResponse).status(), 200);
+  assert.equal((await modelNamesResponse).status(), 200);
   await catalogModelSearch(catalog).fill(model);
   await catalog.getByRole('option').filter({ hasText: model }).first().click();
   await completeOperatorRequestQuery(page, tenant, () => dialog.getByRole('button', { name: '应用筛选', exact: true }).click());

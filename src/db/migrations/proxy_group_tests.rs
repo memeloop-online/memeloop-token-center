@@ -84,6 +84,8 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&125));
     assert!(versions.contains(&126));
     for statement in [
+        "DROP TABLE session_generated_titles",
+        "DROP TABLE session_response_summaries",
         "DROP VIEW model_route_eligible_upstream_accounts",
         "DROP TABLE model_route_group_catalog_evidence",
         "ALTER TABLE model_route_included_provider_groups DROP COLUMN catalog_policy",
@@ -102,6 +104,12 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     for statement in [
+        "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
+        "DROP TABLE proxy_operational_terminals",
+        "DROP TABLE application_plugin_release_resolutions",
+        "DROP TABLE plugin_installer_network_snapshots",
+        "DROP TABLE plugin_installer_network_preferences",
+        "DROP TABLE pending_proxy_settlements",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_token",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_expires_at",
         "ALTER TABLE request_records DROP COLUMN cache_known_input_tokens",
@@ -127,6 +135,7 @@ async fn upgrade_contract(database: &Database) {
         "DROP TABLE transport_proxy_groups",
         "DROP TABLE transport_proxy_management_audit",
         "DROP TABLE transport_proxy_management_lock",
+        "DROP TABLE upstream_service_probes",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)
@@ -157,12 +166,28 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127)",
-    )
-    .execute(&database.pool)
-    .await
-    .unwrap();
+    sqlx::query("ALTER TABLE request_records DROP COLUMN in_flight_stage")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE conversation_media_parts")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for statement in [
+        "DROP INDEX IF EXISTS session_archive_unlinked_recent_idx",
+        "DROP INDEX IF EXISTS request_egress_attempts_request_idx",
+        "DROP INDEX IF EXISTS conversation_observations_compacted_probe_idx",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM schema_migrations WHERE version >= 115")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let maximum: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
         .fetch_one(&database.pool)
         .await
@@ -217,7 +242,11 @@ async fn upgrade_contract(database: &Database) {
     .unwrap();
     assert_eq!(
         tail,
-        vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+        migrations
+            .iter()
+            .filter(|migration| migration.version >= 117)
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>()
     );
     let policy: String = sqlx::query_scalar(
         "SELECT catalog_policy FROM model_route_included_provider_groups WHERE model_route_id = $1",
@@ -256,7 +285,10 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             .collect();
         assert_eq!(
             tail,
-            vec![117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127]
+            vec![
+                117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144
+            ]
         );
     }
 }

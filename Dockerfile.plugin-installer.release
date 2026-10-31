@@ -1,15 +1,15 @@
 # syntax=docker/dockerfile:1.7
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
-# The installer, its patched Cosign companion, runtime library, and license
+# The installer, its official Cosign companion, runtime library, and license
 # material all come from the verified same-run release artifact. This image is
 # assembly-only: it never invokes Cargo, Go, or npm.
 FROM ${RUNTIME_IMAGE}
 LABEL org.opencontainers.image.title="MemeLoop Token Center OCI plugin installer" \
-      org.opencontainers.image.description="Digest-pinned OCI plugin installer with Cosign v3.1.3 security backports" \
+      org.opencontainers.image.description="Digest-pinned OCI plugin installer with official Cosign v3.1.4" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      io.memeloop.cosign.version="v3.1.3-mtc.4" \
-      io.memeloop.cosign.upstream-commit="11926fa5bbbbde47e88fc006b625a17769b743b2"
+      io.memeloop.cosign.version="v3.1.4" \
+      io.memeloop.cosign.upstream-commit="0e48502cf5ef34e2e60bbd3617aa19945712f705"
 ENV LD_LIBRARY_PATH=/usr/local/lib
 COPY --chmod=0555 --from=release-input /cosign /usr/local/bin/cosign
 COPY --chmod=0555 --from=release-input /install-plugin-oci /usr/local/bin/install-plugin-oci

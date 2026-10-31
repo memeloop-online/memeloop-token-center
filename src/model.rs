@@ -50,12 +50,12 @@ pub struct KeyPolicy {
     #[doc(hidden)]
     #[serde(default, skip_serializing)]
     pub allowed_models: Vec<String>,
-    #[serde(default = "default_rpm")]
-    pub requests_per_minute: u32,
-    #[serde(default = "default_tpm")]
-    pub tokens_per_minute: u64,
-    #[serde(default = "default_concurrency")]
-    pub max_concurrency: u32,
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
+    #[serde(default)]
+    pub tokens_per_minute: Option<u64>,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
     #[serde(default)]
     pub enforcement_mode: EnforcementMode,
     pub daily_budget: Option<String>,
@@ -68,12 +68,12 @@ pub struct KeyPolicy {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeyPolicyInput {
-    #[serde(default = "default_rpm")]
-    pub requests_per_minute: u32,
-    #[serde(default = "default_tpm")]
-    pub tokens_per_minute: u64,
-    #[serde(default = "default_concurrency")]
-    pub max_concurrency: u32,
+    #[serde(default)]
+    pub requests_per_minute: Option<u32>,
+    #[serde(default)]
+    pub tokens_per_minute: Option<u64>,
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
     #[serde(default)]
     pub enforcement_mode: EnforcementMode,
     pub daily_budget: Option<String>,
@@ -120,9 +120,9 @@ impl Default for KeyPolicy {
     fn default() -> Self {
         Self {
             allowed_models: Vec::new(),
-            requests_per_minute: default_rpm(),
-            tokens_per_minute: default_tpm(),
-            max_concurrency: default_concurrency(),
+            requests_per_minute: None,
+            tokens_per_minute: None,
+            max_concurrency: None,
             enforcement_mode: EnforcementMode::Prepaid,
             daily_budget: None,
             weekly_budget: None,
@@ -131,23 +131,62 @@ impl Default for KeyPolicy {
     }
 }
 
-fn default_rpm() -> u32 {
-    60
-}
-
-fn default_tpm() -> u64 {
-    100_000
-}
-
-fn default_concurrency() -> u32 {
-    4
-}
-
 #[cfg(test)]
 mod key_policy_contract_tests {
     use serde_json::json;
 
     use super::{EnforcementMode, KeyPolicy, KeyPolicyInput};
+
+    #[test]
+    fn optional_rate_limits_preserve_explicit_limits_without_injecting_defaults() {
+        for value in [
+            json!({}),
+            json!({
+                "requests_per_minute": null,
+                "tokens_per_minute": null,
+                "max_concurrency": null
+            }),
+        ] {
+            let policy: KeyPolicyInput = serde_json::from_value(value.clone()).unwrap();
+            let encoded = serde_json::to_value(policy).unwrap();
+            assert_eq!(
+                encoded,
+                serde_json::to_value(KeyPolicyInput::default()).unwrap()
+            );
+            let stored: KeyPolicy = serde_json::from_value(value).unwrap();
+            let encoded = serde_json::to_value(stored).unwrap();
+            assert_eq!(encoded, serde_json::to_value(KeyPolicy::default()).unwrap());
+            for field in [
+                "requests_per_minute",
+                "tokens_per_minute",
+                "max_concurrency",
+            ] {
+                assert!(encoded[field].is_null());
+            }
+        }
+        let numeric = json!({
+            "requests_per_minute": 60,
+            "tokens_per_minute": 100000,
+            "max_concurrency": 4
+        });
+        let stored: KeyPolicy = serde_json::from_value(numeric.clone()).unwrap();
+        let public: KeyPolicyInput = serde_json::from_value(numeric.clone()).unwrap();
+        assert_eq!(stored.requests_per_minute, Some(60));
+        assert_eq!(stored.tokens_per_minute, Some(100000));
+        assert_eq!(stored.max_concurrency, Some(4));
+        let encoded = serde_json::to_value(stored).unwrap();
+        assert_eq!(
+            serde_json::to_value(KeyPolicy::from(public)).unwrap(),
+            encoded
+        );
+        for field in [
+            "requests_per_minute",
+            "tokens_per_minute",
+            "max_concurrency",
+        ] {
+            assert_eq!(encoded[field], numeric[field]);
+        }
+    }
 
     #[test]
     fn public_policy_defaults_to_prepaid_and_round_trips_metered_unlimited() {
@@ -266,17 +305,17 @@ pub struct KeyAliasView {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyRateLimitSnapshot {
-    pub limit: u64,
+    pub limit: Option<u64>,
     pub used: u64,
-    pub remaining: u64,
-    pub reset_at: i64,
+    pub remaining: Option<u64>,
+    pub reset_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct KeyConcurrencySnapshot {
-    pub limit: u32,
+    pub limit: Option<u32>,
     pub active: u64,
-    pub remaining: u64,
+    pub remaining: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -603,8 +642,19 @@ pub struct EntitlementReconcileResult {
     pub replaced_entitlement_id: Option<Uuid>,
 }
 
+/// Stages a live proxy request can have recorded. Anything else, including a
+/// delivery-contract marker, is not an in-flight stage.
+pub(crate) fn recorded_in_flight_stage(value: Option<String>) -> Option<String> {
+    match value.as_deref() {
+        Some("upstream_response_headers" | "upstream_response_body" | "response_delivery") => value,
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RequestView {
+    /// Independently acknowledged execution outcome; accounting may remain unknown.
+    pub operational_terminal: Option<RequestOperationalTerminalView>,
     pub egress: Option<RequestEgressObservation>,
     pub usage_basis: Option<RequestUsageBasis>,
     /// Only an explicitly persisted context-compaction marker is true.
@@ -614,9 +664,8 @@ pub struct RequestView {
     pub generation_duration_ms: Option<i64>,
     pub request_id: Uuid,
     pub created_at: i64,
-    /// Time at which terminal accounting was committed. A missing value is a
-    /// request that is still pending (or an imported record without a native
-    /// terminal timestamp).
+    /// Time at which terminal accounting was committed. An execution may already
+    /// be terminal while this remains absent; see `operational_terminal`.
     pub completed_at: Option<i64>,
     /// Completion timestamp reported by an imported source. Native request
     /// records do not synthesize this field from their local completion time.
@@ -657,6 +706,10 @@ pub struct RequestView {
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub terminal_cause_code: Option<String>,
+    /// Stage recorded while the request was still open. Absence means no stage
+    /// was stored. A finished row may still carry the last stage; the operator
+    /// label uses it only while `status_code` is absent.
+    pub in_flight_stage: Option<String>,
     /// Fixed supplier reason reconstructed from a bounded native inline envelope.
     pub supplier_error: Option<crate::supplier_error::SupplierError>,
     /// Current durable archive workflow state. Terminal spool transitions are
@@ -672,6 +725,21 @@ pub struct RequestView {
     pub session_context: Option<RequestSessionContext>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RequestOperationalTerminalView {
+    pub completed_at: i64,
+    pub stage: Option<String>,
+    pub financial_state: RequestFinancialState,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestFinancialState {
+    Pending,
+    Unknown,
+    Applied,
+}
+
 impl Serialize for RequestView {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -680,7 +748,8 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 32)?;
+        let mut state = serializer.serialize_struct("RequestView", 34)?;
+        state.serialize_field("operational_terminal", &self.operational_terminal)?;
         state.serialize_field("egress", &self.egress)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
@@ -717,10 +786,28 @@ impl Serialize for RequestView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
-        state.serialize_field(
-            "failure_diagnostic",
-            &failure_diagnostic(self.terminal_cause_code.as_deref()),
-        )?;
+        state.serialize_field("in_flight_stage", &self.in_flight_stage)?;
+        let diagnostic = failure_diagnostic(self.terminal_cause_code.as_deref());
+        let diagnostic = diagnostic.map(|value| {
+            // An operational terminal records a phase the request reached, and
+            // that phase is finer evidence than the typed cause. A buffered
+            // request ends with "buffered_response_ready", which marks the
+            // start of finalization rather than a phase reached, so it must
+            // not overwrite the typed stage. An absent stage stays absent.
+            let stage = match self.operational_terminal.as_ref() {
+                None => value.stage,
+                Some(terminal) => match terminal.stage.as_deref() {
+                    Some("buffered_response_ready") => value.stage,
+                    other => other,
+                },
+            };
+            serde_json::json!({
+                "stage": stage,
+                "source": value.source,
+                "reason": value.reason,
+            })
+        });
+        state.serialize_field("failure_diagnostic", &diagnostic)?;
         state.serialize_field("supplier_error", &self.supplier_error)?;
         state.serialize_field("archive_state", &self.archive_state)?;
         state.serialize_field("credential_identity", &self.credential_identity)?;
@@ -926,6 +1013,8 @@ pub struct RequestEventView {
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub terminal_cause_code: Option<String>,
+    /// Current open-request stage joined from the request row when the event is read.
+    pub in_flight_stage: Option<String>,
     /// Fixed supplier reason reconstructed from a bounded native inline envelope.
     pub supplier_error: Option<crate::supplier_error::SupplierError>,
     pub archive_state: RequestArchiveState,
@@ -940,7 +1029,7 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 35)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 36)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
@@ -981,6 +1070,7 @@ impl Serialize for RequestEventView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field("in_flight_stage", &self.in_flight_stage)?;
         state.serialize_field(
             "failure_diagnostic",
             &failure_diagnostic(self.terminal_cause_code.as_deref()),
@@ -1176,6 +1266,7 @@ pub struct StatsSummary {
     pub total_requests: i64,
     pub successful_requests: i64,
     pub failed_requests: i64,
+    pub pending_requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_usage: CacheStats,
@@ -1786,11 +1877,157 @@ pub fn priced_tokens(tokens: i64, micros_per_million: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::priced_tokens;
+    use super::*;
 
     #[test]
     fn token_price_saturates_instead_of_wrapping() {
         assert_eq!(priced_tokens(i64::MAX, i64::MAX), i64::MAX);
         assert_eq!(priced_tokens(-1, i64::MAX), 0);
+    }
+
+    fn diagnostic_request(
+        cause: &str,
+        operational_terminal: Option<RequestOperationalTerminalView>,
+    ) -> RequestView {
+        let cancelled = cause == "client_disconnected";
+        RequestView {
+            operational_terminal,
+            egress: None,
+            usage_basis: None,
+            compaction: None,
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id: Uuid::nil(),
+            created_at: 1,
+            completed_at: None,
+            source_completed_at: None,
+            lifecycle_state: if cancelled {
+                RequestLifecycleState::Cancelled
+            } else {
+                RequestLifecycleState::Failed
+            },
+            protocol: "openai".into(),
+            model: "diagnostic-regression".into(),
+            upstream_model: None,
+            upstream_account_id: None,
+            route_id: None,
+            status_code: Some(if cancelled { 499 } else { 502 }),
+            duration_ms: Some(1),
+            input_tokens: 0,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            cost: "0".into(),
+            currency: None,
+            usage: RequestUsageView {
+                tokens: None,
+                generation: None,
+            },
+            billing: RequestBillingView {
+                billable: true,
+                cost: None,
+                currency: None,
+            },
+            error_code: Some(
+                if cancelled {
+                    "client_cancelled"
+                } else {
+                    "upstream_http_error"
+                }
+                .into(),
+            ),
+            terminal_cause_code: Some(cause.into()),
+            in_flight_stage: None,
+            supplier_error: None,
+            archive_state: RequestArchiveState::Gap,
+            credential_identity: None,
+            session_context: None,
+        }
+    }
+
+    #[test]
+    fn request_serialization_preserves_unknown_operational_stage_for_recorded_causes() {
+        for (cause, source) in [
+            ("client_disconnected", "downstream_connection"),
+            ("upstream_http_status", "upstream_http_response"),
+        ] {
+            let request = diagnostic_request(
+                cause,
+                Some(RequestOperationalTerminalView {
+                    completed_at: 2,
+                    stage: None,
+                    financial_state: RequestFinancialState::Unknown,
+                }),
+            );
+            let encoded = serde_json::to_value(request).unwrap();
+            assert!(encoded["operational_terminal"].is_object());
+            assert!(encoded["operational_terminal"]["stage"].is_null());
+            assert_eq!(
+                encoded["failure_diagnostic"],
+                serde_json::json!({
+                    "stage": null, "source": source, "reason": cause,
+                })
+            );
+            assert_eq!(
+                encoded["operational_terminal"]["financial_state"],
+                "unknown"
+            );
+            assert!(encoded["completed_at"].is_null());
+            assert!(encoded["input_tokens"].is_null());
+            assert!(encoded["cost"].is_null());
+        }
+    }
+
+    #[test]
+    fn request_serialization_preserves_explicit_operational_stage_over_cause_defaults() {
+        for (cause, source) in [
+            ("client_disconnected", "downstream_connection"),
+            ("upstream_http_status", "upstream_http_response"),
+        ] {
+            let request = diagnostic_request(
+                cause,
+                Some(RequestOperationalTerminalView {
+                    completed_at: 2,
+                    stage: Some("upstream_response_body".into()),
+                    financial_state: RequestFinancialState::Pending,
+                }),
+            );
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(
+                encoded["operational_terminal"]["stage"],
+                "upstream_response_body"
+            );
+            assert_eq!(
+                encoded["failure_diagnostic"],
+                serde_json::json!({
+                    "stage": "upstream_response_body", "source": source, "reason": cause,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn request_serialization_retains_legacy_cause_stage_without_operational_record() {
+        for (cause, source, stage) in [
+            (
+                "client_disconnected",
+                "downstream_connection",
+                "response_delivery",
+            ),
+            (
+                "upstream_http_status",
+                "upstream_http_response",
+                "upstream_response_headers",
+            ),
+        ] {
+            let encoded = serde_json::to_value(diagnostic_request(cause, None)).unwrap();
+            assert!(encoded["operational_terminal"].is_null());
+            assert_eq!(
+                encoded["failure_diagnostic"],
+                serde_json::json!({
+                    "stage": stage, "source": source, "reason": cause,
+                })
+            );
+        }
     }
 }

@@ -2,12 +2,13 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { Given, Then, When } from '@cucumber/cucumber';
 import type { Locator, Page, Request } from 'playwright';
+import type { RequestListResponse } from '../../src/types.js';
 import { baseURL, eventually, model, requestJson, runtime, tenant } from '../support/runtime.js';
 import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 import { openIndividualAuthorization } from './form-disclosure.support.js';
 
-import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertUsageTotalTokens, assertVisible, catalogModelSearch, connectOperator, credentialGroupObservations, groupedModel, metric, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
+import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertUsageTotalTokens, assertValue, assertVisible, catalogModelSearch, connectOperator, credentialGroupObservations, groupedModel, metric, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
 When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示产品接入方式', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.route('**/internal/v1/provider-types', async (route) => {
@@ -69,7 +70,8 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const page = this.requirePage();
   const seed = runtime.requireSeed();
 
-  const usageResponse = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?'));
+  const usageResponse = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?')
+    && new URL(response.url()).searchParams.get('projection') === 'overview');
   await openAppRoute(page, 'operator', 'usage');
   await assertUsageTotalTokens(page, await usageResponse);
   await assertNoCount(page.locator('.notice.error'));
@@ -83,6 +85,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   assert.deepEqual(requestMetricLabels, ['总词元', '本地结算 ⓘ', '缓存率', '平均延迟']);
   assert.ok(!requestMetricLabels.includes('失败') && !requestMetricLabels.includes('请求数'), 'request metrics must not retain obsolete failure or request-count cards');
   const builder = requestPanel.locator('.typed-filter-builder');
+  await assertCount(requestPanel.locator('tbody tr'), 51);
   const dialog = await openTypedFilterDialog(builder);
 
   const protocol = await addTypedFilterCondition(dialog, 'protocol');
@@ -92,16 +95,21 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   await protocol.getByLabel('值').selectOption('openai');
 
   const modelCondition = await addTypedFilterCondition(dialog, 'model');
-  const routeCatalogResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/model-routes'
+  const modelNamesResponse = page.waitForResponse((response) => new URL(response.url()).pathname === '/internal/v1/filter-model-names'
     && response.request().method() === 'GET');
   const catalog = await openCatalogModelPicker(modelCondition);
-  assert.equal((await routeCatalogResponse).status(), 200);
+  assert.equal((await modelNamesResponse).status(), 200);
   await catalogModelSearch(catalog).fill(model);
   await catalog.getByRole('option').filter({ hasText: model }).first().click();
 
   const keyAlias = await addTypedFilterCondition(dialog, 'key_alias');
   await keyAlias.getByLabel('操作符').selectOption('contains');
-  await keyAlias.getByLabel('值').fill('Browser');
+  // The alias value editor is the shared credential combobox named by the
+  // field itself; free typed text commits on blur, keeping contains semantics.
+  const keyAliasValue = keyAlias.getByLabel('客户端凭据', { exact: true });
+  await keyAliasValue.fill('Browser');
+  await keyAliasValue.blur();
+  await assertValue(keyAliasValue, 'Browser');
   const principal = await addTypedFilterCondition(dialog, 'principal');
   await principal.getByLabel('操作符').selectOption('contains');
   await principal.getByLabel('值').fill('browser-e2e');
@@ -126,9 +134,20 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
     ['principal', 'contains', 'browser-e2e'], ['route_id', 'equals', seed.routeId], ['upstream_account_id', 'equals', seed.upstreamId],
     ['cost_micros', 'greater_than_or_equal', 0], ['cost_micros', 'less_than_or_equal', 1_000_000_000],
   ]);
-  await assertCount(requestPanel.locator('tbody tr'), 51);
+  const priced = await firstFilter.json() as RequestListResponse;
+  assert.equal(priced.requests.length, 50);
+  assert.equal(priced.next_cursor, null);
+  assert.ok(priced.requests.every((request) => request.status_code === 200 && request.cost !== null),
+    'numeric cost bounds must include only the fifty financially known requests');
+  await assertCount(requestPanel.locator('tbody tr'), 50);
 
   const errorDialog = await openTypedFilterDialog(builder);
+  const costConditions = errorDialog.locator('.typed-filter-row').filter({
+    has: page.locator('[data-filter-field="cost_micros"]'),
+  });
+  assert.equal(await costConditions.count(), 2);
+  await costConditions.first().getByRole('button', { name: '删除', exact: true }).click();
+  await costConditions.first().getByRole('button', { name: '删除', exact: true }).click();
   const status = await addTypedFilterCondition(errorDialog, 'status');
   await status.getByLabel('值').selectOption('error');
   const errorCode = await addTypedFilterCondition(errorDialog, 'error_code');
@@ -138,7 +157,18 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const errorFilter = await errorFilterResponse;
   assert.equal(errorFilter.status(), 200, await errorFilter.text());
   const errorAst = (errorFilter.request().postDataJSON() as { ast: { conditions: Array<{ field: string; value: { value: string } }> } }).ast;
+  assert.deepEqual(errorAst.conditions.slice(0, -2), firstAst.conditions.slice(0, -2),
+    'error drilldown removes only the numeric cost bounds, retaining all identity filters');
   assert.deepEqual(errorAst.conditions.slice(-2).map((condition) => [condition.field, condition.value.value]), [['status', 'error'], ['error_code', 'http_429']]);
+  const rejected = await errorFilter.json() as RequestListResponse;
+  assert.equal(rejected.requests.length, 1);
+  assert.equal(rejected.next_cursor, null);
+  assert.equal(rejected.requests[0].status_code, 429);
+  assert.equal(rejected.requests[0].completed_at, null);
+  assert.equal(rejected.requests[0].cost, null);
+  assert.equal(rejected.requests[0].operational_terminal?.financial_state, 'unknown');
+  assert.ok(!priced.requests.some((request) => request.request_id === rejected.requests[0].request_id),
+    'unknown cost must not have matched a minimum cost of zero');
   await assertCount(requestPanel.locator('tbody tr'), 1);
   await assertContains(requestPanel.locator('tbody'), '429');
   await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务在响应开始时返回了错误状态');
@@ -219,11 +249,10 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
   assert.equal(await page.locator('.provider-list').isVisible(), false);
   await providerWorkspace.getByRole('button', { name: '近期可用性', exact: true }).click();
   await providerWorkspace.getByRole('button', { name: '账号设置与授权操作', exact: true }).click();
-  // The shared seed includes a routed 429. Do not make this UI assertion
-  // depend on whether its real-time breaker cooldown has already elapsed.
   const healthPath = `/internal/v1/upstreams/${seed.upstreamId}/health`;
+  let manualHealthPosts = 0;
   await page.route((url) => url.pathname === healthPath, async (route) => {
-    assert.equal(route.request().method(), 'POST');
+    if (route.request().method() === 'POST') manualHealthPosts += 1;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -231,17 +260,17 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
         account_id: seed.upstreamId,
         status: 'unhealthy',
         error_code: 'rate_limited',
-        source: 'routing_state',
+        source: 'connection_probe',
         checked_at: Date.UTC(2026, 0, 1),
-        retry_at: Date.UTC(2026, 0, 1, 0, 1),
+        latency_ms: 12,
       }),
     });
   });
-  await providerWorkspace.getByRole('button', { name: '主动健康检查' }).click();
+  await providerWorkspace.getByRole('button', { name: '运行主动健康检查', exact: true }).click();
+  assert.equal(manualHealthPosts, 1);
   const manualHealth = providerWorkspace.locator('.provider-manual-health');
   await assertContains(manualHealth, '上游限流中');
-  await assertContains(manualHealth, '最早重试时间');
-  await assertContains(manualHealth, '未发送额外探测请求');
+  await assertContains(manualHealth, 'rate_limited');
   await assertNoCount(manualHealth.locator('.status.ok'));
   const disabledProvider = page.waitForResponse((response) => {
     const url = new URL(response.url());
@@ -276,7 +305,7 @@ When('管理员维护统一上游和模型路由', async function (this: Dogfood
     openAppRoute(page, 'operator', 'routes'),
     (async () => {
       await assertVisible(leaveAuthorization);
-      await assertExactText(leaveAuthorization.locator('p'), '离开授权页？授权可能尚未完成。离开不会撤销已提交的请求，其结果可能仍未确认。返回后请先检查账号状态；结果未确认时，不要重复提交。');
+      await assertExactText(leaveAuthorization.locator('p'), '离开授权页？授权可能尚未完成。已提交的请求会继续处理，结果可能仍未确认。返回后先检查账号状态。结果未确认时，先不要再提交一次。');
       assert.equal(new URL(page.url()).searchParams.get('view'), 'providers');
       await leaveAuthorization.getByRole('button', { name: '确认继续', exact: true }).click();
     })(),
@@ -614,7 +643,7 @@ Then('提供商组参与路由候选而路由组参与凭据授权', async funct
   await page.getByRole('menuitem', { name: '路由权限', exact: true }).click();
   await assertContains(selectedRouteGroups, '默认路由');
   await assertContains(routing, '已保存授权关联');
-  await assertContains(routing, '不代表当前可用');
+  await assertContains(routing, '能否用上，看账号和路由当时的状态');
 
   const credentialRoutingPath = `/internal/v1/keys/${seed.clientKeyId}/routing?tenant_external_id=${encodeURIComponent(tenant)}`;
   const current = await requestJson<{ route_ids: string[]; route_group_ids: string[]; grant_revision: number }>(credentialRoutingPath, { credential: seed.serviceCredential });
@@ -699,7 +728,7 @@ Then('凭据组只用于分类且不改变凭据授权或可用模型', async fu
   const routing = page.locator('.credential-active-editor .routing-editor');
   await assertVisible(routing);
   await assertContains(routing, '已保存授权关联');
-  await assertContains(routing, '不代表当前可用');
+  await assertContains(routing, '能否用上，看账号和路由当时的状态');
   await assertContains(routing, '默认路由');
   await assertNotContains(routing, '测试凭据');
   const routeGroupInput = routing.getByRole('combobox', { name: '路由组', exact: true });

@@ -179,8 +179,36 @@
 .typed-filter-dialog h3 { margin: 0; }
 .typed-filter-dialog h3 { font-size: 14px; margin-bottom: 9px; }
 
-.typed-filter-panel-controls { border-bottom: 1px solid var(--picker-border); margin-bottom: 16px; padding-bottom: 2px; }
-.typed-filter-panel-controls .usage-controls { background: transparent; border: 0; margin: 0; padding: 0; }
+/* The shared period controls reuse the usage-controls chrome; inside the
+   filter dialog they drop the standalone panel background and keep only a
+   separator from the condition rows below. */
+.typed-filter-dialog .usage-controls.typed-filter-period,
+:root[data-theme='light'] .typed-filter-dialog .usage-controls.typed-filter-period {
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--picker-border);
+  margin: 0 0 6px;
+  padding: 0 0 14px;
+}
+
+.typed-filter-granularity {
+  color: var(--picker-muted);
+  display: grid;
+  font-size: var(--fontSizeBase200, 12px);
+  gap: 5px;
+  margin-top: 9px;
+  max-width: 240px;
+}
+
+.typed-filter-alias-picker {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+}
+
+.typed-filter-alias-picker .fui-Combobox { flex: 1 1 auto; min-width: 0; }
+.typed-filter-alias-error { font-size: var(--fontSizeBase200, 12px); overflow-wrap: anywhere; }
 
 .typed-filter-rows { display: grid; gap: 9px; margin: 16px 0; }
 
@@ -207,6 +235,16 @@
 .typed-filter-row select,
 .typed-filter-assistant input,
 .typed-filter-save input { min-width: 0; }
+
+/* Native datetime controls size themselves to the formatted value plus the
+   picker indicator, which overflows the row card on narrow screens; clamp
+   both the Fluent wrapper and the native input to the grid cell. */
+.typed-filter-row .typed-filter-value[data-filter-field='created_at'] .fui-Input,
+.typed-filter-row .typed-filter-value[data-filter-field='created_at'] input[type='datetime-local'] {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+}
 
 .typed-filter-row:has(.typed-filter-value + .typed-filter-value) {
   grid-template-columns: minmax(110px, .75fr) minmax(110px, .75fr) minmax(150px, 1.2fr) minmax(150px, 1.2fr) minmax(40px, auto);
@@ -263,25 +301,22 @@
 .typed-filter-row > .typed-filter-value { min-width: 0; }
 .typed-filter-model-picker { min-width: 0; position: relative; }
 .typed-filter-model-picker > button { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; width: 100%; }
-.typed-filter-model-picker small { color: var(--picker-muted); display: block; margin-top: 4px; }
-
-.typed-filter-catalog {
-  background: #0d1c20;
-  border: 1px solid #3d6971;
-  box-shadow: 0 10px 22px rgb(0 0 0 / 40%);
-  left: 0;
-  min-width: 280px;
-  padding: 8px;
-  position: absolute;
-  top: calc(100% + 4px);
-  z-index: 2;
+/* The picker's own label is the model cell's only label; match the caption
+   spacing of the sibling field/operator cells so every control in the row
+   sits on the same baseline. */
+.typed-filter-row .shared-model-picker > label { margin-bottom: 5px; }
+.typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { box-sizing: border-box; height: 32px; min-height: 32px; padding: 5px 10px; }
+.typed-filter-dialog > .panel-title { align-items: flex-start; flex-direction: row; flex-wrap: nowrap; gap: 12px; }
+.typed-filter-dialog > .panel-title > div { min-width: 0; }
+.typed-filter-dialog > .panel-title > button { flex-shrink: 0; min-width: 54px; }
+/* Full-width row hint sits below the controls so help text never shifts the
+   field/operator/value baseline or inflates the row height between columns. */
+.typed-filter-row-hint {
+  color: var(--picker-muted);
+  font-size: var(--fontSizeBase200, 12px);
+  grid-column: 1 / -1;
+  line-height: 1.4;
 }
-
-.typed-filter-catalog > input { width: 100%; }
-.typed-filter-catalog [role="listbox"] { display: grid; margin-top: 6px; max-height: 200px; overflow-y: auto; }
-.typed-filter-catalog [role="option"] { background: transparent; border: 0; border-radius: 0; color: #d7e7e9; margin: 0; padding: 7px; text-align: left; }
-.typed-filter-catalog [role="option"]:hover { background: #173139; }
-.typed-filter-catalog [role="option"] small { color: #91aab0; display: block; }
 .error-text { color: #ff9f9f; }
 
 .traffic-filters label {
@@ -391,6 +426,14 @@
   .typed-filter-row:has(.typed-filter-value + .typed-filter-value) { grid-template-columns: 1fr 1fr; }
   .typed-filter-value { grid-column: span 2; }
   .typed-filter-row-actions { grid-column: span 2; justify-content: start; }
+  .typed-filter-row .shared-model-picker > input:not([class*="fui-"]) { height: 44px; min-height: 44px; }
+  .typed-filter-row .fui-Select,
+  .typed-filter-row .fui-Select > select { min-height: 44px; }
+  .typed-filter-period .usage-presets .fui-Button,
+  .typed-filter-period .typed-filter-granularity .fui-Select,
+  .typed-filter-period .usage-custom-range .fui-Input,
+  .typed-filter-row .typed-filter-alias-picker .fui-Combobox,
+  .typed-filter-row .typed-filter-alias-picker .fui-Button { min-height: 44px; }
 }
 
 .provider-list .panel-title,
@@ -1289,6 +1332,20 @@
   grid-template-columns: 1fr 1fr;
   margin-bottom: 18px;
   padding: 3px;
+}
+
+/* The shared requests workspace switcher has three segments; the legacy
+   .segmented grid stays two-column for the older two-option switchers.
+   minmax(0, 1fr) keeps all three tabs on one row sharing space equally down
+   to 320px, and the 44px floor keeps each tab touch-friendly. */
+.request-workspace-tabs {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.request-workspace-tabs .fui-Button {
+  justify-content: center;
+  min-height: 44px;
+  min-width: 0;
 }
 
 .traffic-heading-actions {
