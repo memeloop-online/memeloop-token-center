@@ -411,7 +411,10 @@ async fn empty_inventory_immutable_collision_and_install_lock_fail_closed() {
                 "bootstrap"
             )
             .await,
-        Err(AppError::Overloaded)
+        Err(AppError::Capacity {
+            code: "plugin_installation_lock",
+            ..
+        })
     ));
     assert_eq!(authority.status().await.unwrap().candidates.len(), 1);
 }

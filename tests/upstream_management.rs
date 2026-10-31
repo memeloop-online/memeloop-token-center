@@ -2076,7 +2076,7 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
         .unwrap_err();
     assert!(matches!(
         failed,
-        memeloop_token_center::error::AppError::Internal
+        memeloop_token_center::error::AppError::Internal { .. }
     ));
     let staged: (i64, i64) = sqlx::query_as(
         "SELECT CASE WHEN request_started_at IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN pending_credential_ciphertext IS NOT NULL THEN 1 ELSE 0 END FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2",

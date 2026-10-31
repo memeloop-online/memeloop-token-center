@@ -1,5 +1,6 @@
 mod connection_limits;
 mod event_cursor;
+mod in_flight_stage;
 mod migrations;
 mod operations;
 mod proxy_lifecycle;

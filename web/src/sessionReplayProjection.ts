@@ -403,3 +403,85 @@ export function projectSessionReplay(sessionId: string, details: readonly Reques
   pairToolCalls(items, limit);
   return { sessionId, items, truncated: limit.truncated, totalItems: limit.seen, nextItemOffset: limit.seen > limit.itemOffset + items.length ? limit.itemOffset + items.length : null };
 }
+
+/** One cleaned turn stored in CNPG. `origin` names the raw document it was taken from. */
+export interface SessionDialoguePart {
+  part_index: number;
+  kind: string;
+  text: string | null;
+  media_type: string | null;
+  byte_length: number | null;
+  call_id: string | null;
+  tool_call_id: string | null;
+}
+
+export interface SessionDialogueTurn {
+  role: string;
+  origin: 'request' | 'return';
+  parts: SessionDialoguePart[];
+}
+
+/**
+ * Renders the cleaned dialogue already stored in CNPG. It does not read raw
+ * request or return documents, and it does not open object storage.
+ */
+export function projectSessionDialogue(
+  requestId: string,
+  turns: readonly SessionDialogueTurn[],
+  mediaLabel: (type: string) => string = (type) => type,
+): SessionReplayItem[] {
+  const items: SessionReplayItem[] = [];
+  for (const turn of turns) {
+    const body: ReplayBody = turn.origin === 'return' ? 'response' : 'request';
+    const texts: string[] = [];
+    for (const part of turn.parts) {
+      if (part.kind === 'tool_call') {
+        const lines = (part.text ?? '').split('\n');
+        const name = lines[0] ?? '';
+        const args = lines.slice(1).join('\n');
+        items.push({
+          kind: 'tool_call',
+          requestId,
+          body,
+          callId: part.call_id,
+          name: name.length > 0 ? name : null,
+          arguments: args.length > 0 ? args : null,
+          unknownFields: name.length > 0 ? args.length > 0 ? [] : ['arguments'] : args.length > 0 ? ['name'] : ['name', 'arguments'],
+          pairedResultRequestId: null,
+          pairing: part.call_id ? 'unpaired' : 'unknown',
+          truncated: false,
+        });
+        continue;
+      }
+      if (part.kind === 'tool_result' || turn.role === 'tool') {
+        items.push({
+          kind: 'tool_result',
+          requestId,
+          body,
+          callId: part.call_id ?? part.tool_call_id,
+          name: null,
+          output: part.text,
+          unknownFields: part.text ? [] : ['output'],
+          pairedCallRequestId: null,
+          pairing: part.call_id || part.tool_call_id ? 'unpaired' : 'unknown',
+          truncated: false,
+        });
+        continue;
+      }
+      if (part.text) texts.push(part.text);
+      else if (part.media_type) texts.push(mediaLabel(part.media_type));
+    }
+    if (texts.length > 0 && turn.role !== 'tool') {
+      items.push({
+        kind: 'message',
+        requestId,
+        body,
+        role: turn.role === 'assistant' ? 'assistant' : turn.role === 'agent' ? 'agent' : 'user',
+        text: texts.join('\n'),
+        unknown: null,
+        truncated: false,
+      });
+    }
+  }
+  return items;
+}

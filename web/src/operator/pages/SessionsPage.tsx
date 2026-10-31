@@ -108,8 +108,8 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
             {scopedSelection.detail.provenance && <span><b>{t('request.provenance')}</b>{scopedSelection.detail.provenance.unlinked ? t('request.archiveOnly') : t('request.exactArchive')} · {scopedSelection.detail.provenance.source}</span>}
           </div>
           <Disclosure title={t('request.technicalDetails')}>
-            <h3>{t('request.request')}</h3><pre>{JSON.stringify(scopedSelection.detail.request_body, null, 2)}</pre>
-            <h3>{t('request.response')}</h3><pre>{JSON.stringify(scopedSelection.detail.response_body, null, 2)}</pre>
+            <h3>{t('request.rawRequestJson')}</h3><pre>{JSON.stringify(scopedSelection.detail.request_body, null, 2)}</pre>
+            <h3>{t('request.rawReturnJson')}</h3><pre>{JSON.stringify(scopedSelection.detail.response_body, null, 2)}</pre>
             {scopedSelection.detail.provenance && <><h3>{t('request.provenance')}</h3><pre>{JSON.stringify(scopedSelection.detail.provenance, null, 2)}</pre></>}
           </Disclosure>
         </>}

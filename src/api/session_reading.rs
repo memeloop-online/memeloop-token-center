@@ -123,7 +123,7 @@ fn encode_cursor(
             scope: scope.clone(),
             position,
         })
-        .map_err(|_| AppError::Internal)?,
+        .map_err(|_| AppError::internal("session_reading_encode_cursor_1"))?,
     );
     let (tag, _) = crypto::hash_credential(&format!("{CURSOR_DOMAIN}{payload}"), pepper);
     Ok(format!("{payload}.{}", URL_SAFE_NO_PAD.encode(tag)))
@@ -230,6 +230,110 @@ pub(super) async fn self_session_context_content(
 ) -> Result<Json<ContextContent>, AppError> {
     let scope = self_scope(&state, &headers, session_id, request_id).await?;
     context_content(&state, scope, query).await.map(Json)
+}
+
+/// Cleaned dialogue already stored in CNPG. This read does not open object storage.
+#[derive(Serialize)]
+pub(super) struct SessionDialogue {
+    contract_version: &'static str,
+    representation: &'static str,
+    request_id: Uuid,
+    session_id: Uuid,
+    turns: Vec<DialogueTurn>,
+}
+
+#[derive(Serialize)]
+pub(super) struct DialogueTurn {
+    role: String,
+    origin: String,
+    parts: Vec<DialoguePart>,
+}
+
+#[derive(Serialize)]
+pub(super) struct DialoguePart {
+    part_index: i64,
+    kind: String,
+    text: Option<String>,
+    media_type: Option<String>,
+    byte_length: Option<i64>,
+    call_id: Option<String>,
+    tool_call_id: Option<String>,
+}
+
+pub(super) async fn internal_session_dialogue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, request_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<ContextQuery>,
+) -> Result<Json<SessionDialogue>, AppError> {
+    let scope = operator_scope(&state, &headers, &query, session_id, request_id).await?;
+    session_dialogue(&state, scope).await.map(Json)
+}
+
+pub(super) async fn self_session_dialogue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, request_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<SessionDialogue>, AppError> {
+    let scope = self_scope(&state, &headers, session_id, request_id).await?;
+    session_dialogue(&state, scope).await.map(Json)
+}
+
+async fn session_dialogue(
+    state: &AppState,
+    scope: SessionContextScope,
+) -> Result<SessionDialogue, AppError> {
+    let stored = match scope.leaf.as_deref() {
+        Some(leaf) if !leaf.is_empty() => {
+            state
+                .db
+                .export_training_dialogue(scope.tenant_id, leaf)
+                .await?
+        }
+        _ => Vec::new(),
+    };
+    Ok(SessionDialogue {
+        contract_version: "session_dialogue_v1",
+        representation: "session_body",
+        request_id: scope.request_id,
+        session_id: scope.session_id,
+        turns: stored.into_iter().map(dialogue_turn).collect(),
+    })
+}
+
+fn dialogue_turn(turn: crate::conversation::TrainingUtterance) -> DialogueTurn {
+    DialogueTurn {
+        role: turn.role,
+        origin: turn.origin,
+        parts: turn.parts.into_iter().map(dialogue_part).collect(),
+    }
+}
+
+fn dialogue_part(part: Value) -> DialoguePart {
+    let text = part.get("text").and_then(Value::as_str).map(str::to_owned);
+    let media_type = part
+        .get("media_type")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    DialoguePart {
+        part_index: part.get("part_index").and_then(Value::as_i64).unwrap_or(0),
+        kind: part
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        text,
+        media_type,
+        byte_length: part.get("byte_length").and_then(Value::as_i64),
+        call_id: part
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        tool_call_id: part
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    }
 }
 
 async fn context_page(

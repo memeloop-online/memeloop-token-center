@@ -824,7 +824,7 @@ impl Database {
                 statement.push_str(", ");
             }
             write!(statement, "(${}, ${})", index * 2 + 2, index * 2 + 3)
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("session_analytics_session_summaries_1"))?;
         }
         statement.push_str(
             r#"), completed AS (
@@ -927,7 +927,7 @@ impl Database {
             format_args!("${model_parameter}"),
             format_args!("${query_parameter}"),
         )
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("session_analytics_site_1"))?;
         statement.push_str(
             r#"
                ), recent AS (
@@ -1110,12 +1110,12 @@ impl Database {
             sqlx::query(
                 r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
-                          cost_micros, currency, error_code, terminal_cause_code, archive_state,
+                          cost_micros, currency, error_code, terminal_cause_code, in_flight_stage, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
-                                r.cost_micros, r.currency, r.error_code, r.terminal_cause_code,
+                                r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, r.in_flight_stage,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
@@ -1133,7 +1133,7 @@ impl Database {
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit,
-                                CAST(0 AS BIGINT), NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code,
+                                CAST(0 AS BIGINT), NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CAST(NULL AS TEXT) AS in_flight_stage,
                                 CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%'
                                            OR response_object IS NULL OR response_object LIKE 'gap://%'
                                      THEN 'gap' ELSE 'bound' END AS archive_state,
@@ -1155,12 +1155,12 @@ impl Database {
             sqlx::query(
                 r#"SELECT id, created_at, completed_at, source_completed_at, protocol, model, upstream_model, upstream_account_id, route_id, status_code, duration_ms, first_output_ms, generation_duration_ms,
                           usage_basis, input_tokens, cached_input_tokens, cache_write_tokens, output_tokens, billed_units, billing_unit,
-                          cost_micros, currency, error_code, terminal_cause_code, archive_state,
+                          cost_micros, currency, error_code, terminal_cause_code, in_flight_stage, archive_state,
                           source_kind, provenance_kind, archive_source, external_request_id
                      FROM (
                          SELECT r.id, r.created_at, r.completed_at, CAST(NULL AS BIGINT) AS source_completed_at, r.protocol, r.model, r.upstream_model, r.upstream_account_id, r.model_route_id AS route_id, r.status_code, r.duration_ms, r.first_output_ms, r.generation_duration_ms,
                                 r.usage_basis, r.input_tokens, r.cached_input_tokens, r.cache_write_tokens, r.output_tokens, r.billed_units, r.billing_unit,
-                                r.cost_micros, r.currency, r.error_code, r.terminal_cause_code,
+                                r.cost_micros, r.currency, r.error_code, r.terminal_cause_code, r.in_flight_stage,
                                 CASE WHEN request_spool.state = 'uploading' OR spool.state = 'uploading' THEN 'uploading' WHEN request_spool.state = 'pending' OR spool.state = 'pending' THEN 'pending' WHEN request_spool.state = 'capturing' OR spool.state = 'capturing' OR r.completed_at IS NULL THEN 'capturing' WHEN request_spool.state = 'gap' OR spool.state = 'gap' OR r.request_object LIKE 'gap://%' OR r.response_object IS NULL OR r.response_object LIKE 'gap://%' THEN 'gap' ELSE 'bound' END AS archive_state,
                                 'live' AS source_kind, 'native' AS provenance_kind,
                                 NULL AS archive_source, NULL AS external_request_id
@@ -1178,7 +1178,7 @@ impl Database {
                                 CAST(0 AS BIGINT) AS cached_input_tokens,
                                 CAST(0 AS BIGINT) AS cache_write_tokens, output_tokens,
                                 CAST(0 AS BIGINT) AS billed_units, CAST(NULL AS TEXT) AS billing_unit,
-                                CAST(0 AS BIGINT), NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code,
+                                CAST(0 AS BIGINT), NULL AS currency, error_code, CAST(NULL AS TEXT) AS terminal_cause_code, CAST(NULL AS TEXT) AS in_flight_stage,
                                 CASE WHEN request_object IS NULL OR request_object LIKE 'gap://%'
                                            OR response_object IS NULL OR response_object LIKE 'gap://%'
                                      THEN 'gap' ELSE 'bound' END AS archive_state,
@@ -1302,11 +1302,14 @@ impl Database {
                         billing,
                         error_code,
                         terminal_cause_code: row.try_get("terminal_cause_code")?,
+                        in_flight_stage: crate::model::recorded_in_flight_stage(
+                            row.try_get("in_flight_stage")?,
+                        ),
                         supplier_error: None,
                         archive_state: crate::model::RequestArchiveState::from_storage(
                             row.try_get::<String, _>("archive_state")?.as_str(),
                         )
-                        .ok_or(AppError::Internal)?,
+                        .ok_or(AppError::internal("session_analytics_site_1"))?,
                         credential_identity: None,
                         session_context: Some(RequestSessionContext::unlinked(None)),
                     },

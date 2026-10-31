@@ -231,7 +231,7 @@ pub(in crate::api) async fn poll_codex_oauth(
                         tenant_external_id: reference.tenant_external_id,
                     }
                 }
-                _ => return Err(AppError::Internal),
+                _ => return Err(AppError::internal("oauth_poll_codex_oauth_1")),
             };
             return codex_oauth_response(state, service, progress).await;
         }

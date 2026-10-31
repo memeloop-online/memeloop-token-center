@@ -5583,6 +5583,30 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Retained prefix path is incomplete or inconsistent. }
 
+  /internal/v1/sessions/{session_id}/requests/{request_id}/dialogue:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionDialogue
+      summary: Read the cleaned session dialogue stored for this request
+      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+      responses:
+        '200':
+          description: Cleaned dialogue turns for viewing and training export.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionDialogue' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/sessions/{session_id}/requests/{request_id}/context/content:
     get:
       tags: [Operator traffic]
@@ -6554,6 +6578,26 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Retained prefix path is incomplete or inconsistent. }
+
+  /self/v1/sessions/{session_id}/requests/{request_id}/dialogue:
+    get:
+      tags: [Self service]
+      operationId: getOwnSessionDialogue
+      summary: Read the cleaned session dialogue stored for this owned request
+      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+      responses:
+        '200':
+          description: Cleaned dialogue turns for this credential's request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionDialogue' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /self/v1/sessions/{session_id}/requests/{request_id}/context/content:
     get:
@@ -7658,6 +7702,42 @@ components:
         total_chars: { type: integer, format: int64, minimum: 0 }
         content: { type: string, maxLength: 16384 }
         next_cursor: { type: [string, 'null'], maxLength: 4096 }
+    SessionDialogue:
+      type: object
+      additionalProperties: false
+      required: [contract_version, representation, request_id, session_id, turns]
+      properties:
+        contract_version: { type: string, enum: [session_dialogue_v1] }
+        representation: { type: string, enum: [session_body] }
+        request_id: { type: string, format: uuid }
+        session_id: { type: string, format: uuid }
+        turns:
+          type: array
+          maxItems: 4096
+          items: { $ref: '#/components/schemas/SessionDialogueTurn' }
+    SessionDialogueTurn:
+      type: object
+      additionalProperties: false
+      required: [role, origin, parts]
+      properties:
+        role: { type: string, minLength: 1, maxLength: 32 }
+        origin: { type: string, enum: [request, return] }
+        parts:
+          type: array
+          maxItems: 256
+          items: { $ref: '#/components/schemas/SessionDialoguePart' }
+    SessionDialoguePart:
+      type: object
+      additionalProperties: false
+      required: [part_index, kind, text, media_type, byte_length, call_id, tool_call_id]
+      properties:
+        part_index: { type: integer, format: int64, minimum: 0 }
+        kind: { type: string, maxLength: 64 }
+        text: { type: [string, 'null'] }
+        media_type: { type: [string, 'null'] }
+        byte_length: { type: [integer, 'null'], format: int64, minimum: 0 }
+        call_id: { type: [string, 'null'] }
+        tool_call_id: { type: [string, 'null'] }
     SessionGeneratedTitle:
       type: object
       required: [title, state, error_code, updated_at]

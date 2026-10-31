@@ -10,6 +10,30 @@ fn scope() -> SessionContextScope {
     }
 }
 
+#[test]
+fn response_encoding_preserves_exact_json_bytes_and_atom_hash() {
+    for answer in [
+        String::new(),
+        "完整回答😀\r\n\n  last\t\"\\\0\u{0008}\u{000c}".into(),
+        "x".repeat(1024 * 1024),
+    ] {
+        let expected = serde_json::to_string(&serde_json::json!({
+            "role": "assistant", "type": "response_summary", "content": &answer
+        }))
+        .unwrap();
+        let encoded = encode_session_response(&answer).unwrap();
+        assert_eq!(encoded, expected);
+        assert_eq!(
+            blake3::hash(encoded.as_bytes()),
+            blake3::hash(expected.as_bytes())
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap()["content"],
+            answer
+        );
+    }
+}
+
 #[tokio::test]
 async fn response_cache_is_scoped_chunked_shared_and_lease_fenced() {
     let directory = tempfile::tempdir().unwrap();
@@ -45,7 +69,7 @@ async fn response_cache_is_scoped_chunked_shared_and_lease_fenced() {
         .await
         .unwrap()
         .unwrap();
-    db.finish_session_response(&old, Some("must not persist"), None)
+    db.finish_session_response(&old, Some("must not persist".into()), None)
         .await
         .unwrap();
     let atoms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM semantic_atoms")
@@ -57,7 +81,7 @@ async fn response_cache_is_scoped_chunked_shared_and_lease_fenced() {
         "stale completions must not create orphan text atoms"
     );
     let text = "完整回答😀\n".repeat(8_000);
-    db.finish_session_response(&current, Some(&text), None)
+    db.finish_session_response(&current, Some(text.clone()), None)
         .await
         .unwrap();
     let summary = db.session_response_summary(&scope).await.unwrap();
@@ -107,7 +131,7 @@ async fn response_cache_is_scoped_chunked_shared_and_lease_fenced() {
         .await
         .unwrap()
         .unwrap();
-    db.finish_session_response(&task, Some(&text), None)
+    db.finish_session_response(&task, Some(text.clone()), None)
         .await
         .unwrap();
     assert_eq!(

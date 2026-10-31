@@ -33,6 +33,7 @@ fn authenticated_key_from_row(
         alias: row.try_get("alias")?,
         currency: row.try_get("currency")?,
         credential_generation: row.try_get("generation")?,
-        policy: serde_json::from_str(&policy_json).map_err(|_| AppError::Internal)?,
+        policy: serde_json::from_str(&policy_json)
+            .map_err(|_| AppError::internal("credentials_mod_authenticated_key_from_row_1"))?,
     })
 }
