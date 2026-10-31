@@ -880,9 +880,10 @@ async fn late_parent_reconciliation_rejects_cycles_and_parent_conflicts_atomical
             .bind(owner.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(owner.key_id.to_string()).bind(owner.principal_id.to_string()).bind(source.session_id.to_string()).execute(&db.pool).await.unwrap();
         sqlx::query("INSERT INTO session_generated_titles (tenant_id,key_id,session_id,title,title_source,state,next_attempt_at,updated_at) VALUES ($1,$2,$3,'Source manual','manual','ready',1,1)")
             .bind(owner.tenant_id.to_string()).bind(owner.key_id.to_string()).bind(source.session_id.to_string()).execute(&db.pool).await.unwrap();
+        type RelationshipSnapshot = (String, String, String, String, String, Option<String>, i64);
         let snapshot = async || {
             let tenant = owner.tenant_id.to_string();
-            let edges: Vec<(String, String, String, String, String, Option<String>, i64)> = sqlx::query_as("SELECT key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at FROM session_relationships WHERE tenant_id=$1 ORDER BY key_id,session_id,target_key_id,target_session_id,kind")
+            let edges: Vec<RelationshipSnapshot> = sqlx::query_as("SELECT key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at FROM session_relationships WHERE tenant_id=$1 ORDER BY key_id,session_id,target_key_id,target_session_id,kind")
                 .bind(&tenant).fetch_all(&db.pool).await.unwrap();
             let observations: Vec<(String, String, String)> = sqlx::query_as("SELECT id,request_id,cluster_id FROM conversation_observations WHERE key_id=$1 ORDER BY id")
                 .bind(owner.key_id.to_string()).fetch_all(&db.pool).await.unwrap();
