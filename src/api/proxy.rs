@@ -1766,11 +1766,9 @@ async fn proxy_with_cancellation_guard(
             "Upstream rejection header structure"
         );
     }
-    let upstream = if status.is_success() {
-        upstream
-    } else {
-        buffered_request.capture_original_response(upstream)
-    };
+    // Capture before any delivery/validation branch can discard a supplier
+    // response, including successful envelopes rejected by local boundaries.
+    let upstream = buffered_request.capture_original_response(upstream);
     let (upstream, rejection) = read_safe_proxy_rejection(
         upstream,
         protocol,
@@ -1939,7 +1937,6 @@ async fn proxy_with_cancellation_guard(
         return result;
     }
     if is_codex_route && !codex_downstream_stream {
-        let upstream = buffered_request.capture_original_response(upstream);
         let buffer_phase = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "codex_buffered_response",
@@ -2087,7 +2084,6 @@ async fn proxy_with_cancellation_guard(
     }
     let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
     if !is_sse {
-        let upstream = buffered_request.capture_original_response(upstream);
         return finish_non_sse_proxy_response(NonSseProxyResponseInput {
             buffered_request: &buffered_request,
             selected_driver: active_route.route.driver.as_str(),
@@ -2732,10 +2728,11 @@ async fn execute_component_provider(
         }
     };
     let upstream_status = upstream.status();
+    let upstream = request.capture_original_response(upstream.into());
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
         if let Some(attempt) = upstream_attempt.as_mut() {
             let terminal = if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-                let (response, kind) = routing::classify_rate_limit(upstream.into()).await;
+                let (response, kind) = routing::classify_rate_limit(upstream).await;
                 drop(response);
                 UpstreamAttemptTerminal::Failed {
                     kind,
@@ -2815,7 +2812,6 @@ async fn execute_component_provider(
     else {
         return finish_component_provider_failure(&request, None, "provider_configuration").await;
     };
-    let upstream = request.capture_original_response(upstream.into());
     let upstream_body = match read_bounded_upstream(
         upstream,
         maximum.min(MAX_PROXY_RESPONSE_BODY),

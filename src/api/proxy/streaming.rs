@@ -212,7 +212,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         );
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let _dispatch_permit = dispatch_permit;
-        let archive_memory = background_state.persistence.stream_memory.reservation();
         let request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
@@ -235,20 +234,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Some(upstream_account_id),
                 Some(credential_generation),
             ));
-            let spool_identity = crate::db::ArchiveSpoolIdentity {
-                request_id,
-                tenant_id,
-                reservation_id: reservation.id,
-            };
-            let capture = crate::response_archive_spool::ResponseArchiveProducer::begin(
-                &background_state,
-                spool_identity,
-                archive_memory,
-            );
-            if capture.is_none() {
-                persistence::record_capture_failure(&background_state, spool_identity);
-            }
-            let mut upstream_stream = upstream.with_archive_capture(capture).bytes_stream();
+            // The request owner attached the raw capture at response headers,
+            // before protocol checks or translation can stop delivery.
+            let mut upstream_stream = upstream.bytes_stream();
             let mut usage_capture = Vec::new();
             let mut capture_memory = background_state
                 .metrics
