@@ -120,7 +120,7 @@ test('credential route access retries incomplete catalogs and finds models beyon
     assert.equal(routeCalls.length, 7, 'first page, four automatic 503 attempts, then a complete two-page retry; searching does not refetch');
     await astra.click();
     await input.press('Escape');
-    await editor.getByRole('button', { name: 'Save', exact: true }).click();
+    await page.locator('.inline-editor.form-panel').getByRole('button', { name: 'Save', exact: true }).click();
     await page.waitForFunction(() => window.credentialFixture.requests.some(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing')));
     const saved = await page.evaluate(() => window.credentialFixture.requests.find(request => request.method === 'PUT' && request.path.endsWith('/key-form/routing'))!);
     assert.deepEqual(JSON.parse(saved.body!).route_ids, ['00000000-0000-4000-8000-000000000004', '00000000-0000-4000-8000-000000000006'], 'adding an older model preserves the existing disabled grant');
