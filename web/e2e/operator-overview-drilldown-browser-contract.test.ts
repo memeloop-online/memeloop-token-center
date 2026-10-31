@@ -95,6 +95,16 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
   const browser = await chromium.launch({ executablePath, headless: true });
   try {
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    const pageErrors: string[] = [];
+    page.on('pageerror', error => pageErrors.push(error.message));
+    const readyDetail = async () => {
+      await page.locator('.session-detail-region .session-detail').waitFor();
+      await page.getByRole('button', { name: 'Rename', exact: true }).waitFor();
+      await page.getByText('The checklist is ready for review.', { exact: true }).waitFor();
+      assert.equal(await page.locator('.session-title-action').count(), 1, 'one title editor per selected session');
+      assert.deepEqual(pageErrors, [], 'session focus must not cause browser render errors');
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true, 'session detail fits the viewport');
+    };
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?usage-sessions=1`);
     await page.getByRole('tab', { name: 'Dimensions', exact: true }).click();
@@ -127,9 +137,10 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     const focusedCalls = await page.evaluate(() => window.overviewDrilldownFixture.calls);
     assert.equal(focusedCalls.some(call => call === 'POST /internal/v1/sessions/summaries'), true, 'known identity uses the summary endpoint');
     assert.equal(focusedCalls.some(call => call.includes('/sessions?') && call.includes('q=')), false, 'exact focus never waits for a name-search list');
-    await page.locator('.session-detail-region .session-detail').waitFor();
+    await readyDetail();
     await page.screenshot({ path: join(evidence, 'real-session-detail-mobile.png'), fullPage: true });
     await page.setViewportSize({ width: 1440, height: 900 });
+    await readyDetail();
     await page.screenshot({ path: join(evidence, 'real-session-detail-desktop.png'), fullPage: true });
 
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?initial-sessions=1`);
@@ -143,7 +154,7 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
 
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?request-session=1`);
     await page.locator('.request-table').getByRole('button', { name: 'Named Codex conversation', exact: true }).click();
-    await page.locator('.session-detail-region .session-detail').waitFor();
+    await readyDetail();
     const requestFocusCalls = await page.evaluate(() => window.overviewDrilldownFixture.calls);
     assert.equal(requestFocusCalls.includes('POST /internal/v1/sessions/summaries'), true, 'request rows carry their credential into exact summary focus');
     assert.equal(requestFocusCalls.some(call => call.includes('/sessions?') && call.includes('q=')), false);

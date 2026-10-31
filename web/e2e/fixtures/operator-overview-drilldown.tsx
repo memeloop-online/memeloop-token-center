@@ -2,6 +2,7 @@ import { createRoot } from 'react-dom/client';
 import { useEffect, useState } from 'react';
 
 import { I18nProvider } from '../../src/i18n';
+import { MtcFluentProvider } from '../../src/design-system';
 import { Operator } from '../../src/operator/Operator';
 import type { OperatorMonitoringSnapshot, OperatorUsageAnalysis, OperatorUsageAnalysisTrends, RequestDetail, RequestView, UsageAnalysisMetrics } from '../../src/types';
 import type { OperatorRouteKey } from '../../src/operator/scope/operatorRoutes';
@@ -9,6 +10,7 @@ import '../../src/styles.css';
 import '../../src/theme.css';
 import '../../src/styles/metrics.css';
 import '../../src/styles/request-table.css';
+import '../../src/sessionViews.css';
 import '../../src/operator/operator.css';
 
 declare global {
@@ -92,6 +94,9 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(source, location.origin);
   const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
   window.overviewDrilldownFixture.calls.push(`${method} ${url.pathname}${url.search}`);
+  if (url.pathname === '/internal/v1/request-events') return new Response(new ReadableStream({
+    start(controller) { controller.enqueue(new TextEncoder().encode(': fixture connected\n\n')); },
+  }), { headers: { 'Content-Type': 'text/event-stream' } });
   if (url.pathname === '/internal/v1/tenants') return json([{ external_id: tenant }]);
   if (url.pathname === '/internal/v1/plugins') return json([]);
   if (url.pathname === '/internal/v1/usage-analysis/trends') return json(usageTrends);
@@ -128,6 +133,17 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   });
   if (url.pathname === `/internal/v1/sessions/${realSession}/relationships`) return json({ relationships: [] });
   if (url.pathname === `/internal/v1/sessions/${realSession}/title`) return json({ title: 'Named Codex conversation', state: 'ready', error_code: null, updated_at: now, source: 'manual', revision: 1 });
+  if (url.pathname === `/internal/v1/sessions/${realSession}/requests/${drilledRequest.request_id}/context`) return json({
+    contract_version: 'session_context_v1', representation: 'semantic_context', session_id: realSession,
+    request_id: drilledRequest.request_id, items: [], next_cursor: null,
+  });
+  if (url.pathname === `/internal/v1/sessions/${realSession}/requests/${drilledRequest.request_id}/dialogue`) return json({
+    contract_version: 'session_dialogue_v1', representation: 'session_body', session_id: realSession,
+    request_id: drilledRequest.request_id, turns: [
+      { role: 'user', origin: 'request', parts: [{ part_index: 0, kind: 'text', text: 'Review the deployment checklist.', media_type: null, byte_length: null, call_id: null, tool_call_id: null }] },
+      { role: 'assistant', origin: 'return', parts: [{ part_index: 0, kind: 'text', text: 'The checklist is ready for review.', media_type: null, byte_length: null, call_id: null, tool_call_id: null }] },
+    ],
+  });
   if (url.pathname === '/internal/v1/requests/query' && method === 'POST') {
     const body = JSON.parse(String(init?.body ?? '{}'));
     window.overviewDrilldownFixture.requestQueryBodies.push(body);
@@ -148,4 +164,4 @@ function Fixture() {
 }
 
 localStorage.setItem('mtc.operator.service-credential.v1', credential);
-createRoot(document.getElementById('root')!).render(<I18nProvider><Fixture /></I18nProvider>);
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider><Fixture /></MtcFluentProvider></I18nProvider>);
