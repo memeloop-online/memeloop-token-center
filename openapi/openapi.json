@@ -14806,6 +14806,559 @@
           }
         }
       }
+    },
+    "/internal/v1/sessions/resolve": {
+      "post": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "resolveOperatorSessionThreads",
+        "summary": "Resolve exact Codex thread metadata without reading bodies",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionThreadResolution"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "requests:read",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionThreadResolveRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/analyze": {
+      "post": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "analyzeOperatorSessionTasks",
+        "summary": "Analyze one session, automatic subtree or selected related union",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTaskAnalysis"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "requests:read",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskAnalysisRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/self/v1/sessions/analyze": {
+      "post": {
+        "tags": [
+          "Self service"
+        ],
+        "operationId": "analyzeSelfSessionTasks",
+        "summary": "Analyze sessions within the authenticated credential",
+        "security": [
+          {
+            "clientBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTaskAnalysis"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskAnalysisRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/parents": {
+      "post": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "importOperatorSessionParents",
+        "summary": "Persist exact thread-spawn evidence and resolve all known tenant identities",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "accepted",
+                    "linked"
+                  ],
+                  "properties": {
+                    "accepted": {
+                      "type": "integer",
+                      "format": "int64",
+                      "minimum": 0
+                    },
+                    "linked": {
+                      "type": "integer",
+                      "format": "int64",
+                      "minimum": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionThreadParentsRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/titles": {
+      "post": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "generateUnnamedOperatorSessionTitles",
+        "summary": "Queue existing background title jobs for selected unnamed sessions",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "queued",
+                    "results"
+                  ],
+                  "properties": {
+                    "queued": {
+                      "type": "integer",
+                      "format": "int64",
+                      "minimum": 0
+                    },
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "key_id",
+                          "session_id",
+                          "status"
+                        ],
+                        "properties": {
+                          "key_id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "session_id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "queued",
+                              "already_queued",
+                              "named"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskTitleBatchRequest"
+              }
+            }
+          }
+        },
+        "x-additional-required-scopes": [
+          "filter_assistant:execute"
+        ]
+      }
+    },
+    "/internal/v1/sessions/{session_id}/name": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ContextSessionId"
+        },
+        {
+          "$ref": "#/components/parameters/TenantFilter"
+        },
+        {
+          "$ref": "#/components/parameters/ContextKeyId"
+        }
+      ],
+      "put": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "updateOperatorSessionName",
+        "summary": "Compare and set an explicit name, preserving manual priority",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGeneratedTitle"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskNameUpdate"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/{session_id}/relationships": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ContextSessionId"
+        },
+        {
+          "$ref": "#/components/parameters/TenantFilter"
+        },
+        {
+          "$ref": "#/components/parameters/ContextKeyId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getOperatorSessionRelationships",
+        "summary": "Read automatic parents and manual related sessions",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTaskRelationships"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "requests:read"
+      },
+      "put": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "putOperatorSessionRelationship",
+        "summary": "Persist a session association without copying accounting",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "ok"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskRelationshipChange"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "deleteOperatorSessionRelationship",
+        "summary": "Remove a manual related association",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "ok"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskRelationshipChange"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -16522,7 +17075,9 @@
           "title",
           "state",
           "error_code",
-          "updated_at"
+          "updated_at",
+          "source",
+          "revision"
         ],
         "properties": {
           "title": {
@@ -16556,6 +17111,20 @@
               "null"
             ],
             "format": "int64"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "generated",
+              "manual",
+              "codex"
+            ]
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -25922,7 +26491,8 @@
               "duration_ms",
               "cost_micros",
               "key_alias",
-              "principal"
+              "principal",
+              "session_association"
             ]
           },
           "operator": {
@@ -29611,6 +30181,485 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 32000
+          }
+        }
+      },
+      "SessionTaskIdentity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key_id",
+          "session_id"
+        ],
+        "properties": {
+          "key_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "SessionTaskAnalysisRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "identities",
+          "scope"
+        ],
+        "properties": {
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "identities": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/SessionTaskIdentity"
+            }
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "session",
+              "subtree",
+              "related"
+            ],
+            "description": "session and subtree require one root; related accepts a nonempty selected union without a task-count limit."
+          },
+          "timezone": {
+            "type": "string",
+            "default": "UTC",
+            "description": "IANA timezone; historical local calendar days honor daylight saving transitions."
+          },
+          "timezone_offset_minutes": {
+            "type": "integer",
+            "minimum": -840,
+            "maximum": 840,
+            "description": "Fixed minutes east of UTC, used only with UTC timezone. Prefer an IANA timezone for historical analysis."
+          },
+          "include_subtrees": {
+            "type": "boolean",
+            "default": false,
+            "description": "Expand automatic descendants of each selected related root. The subtree scope always expands descendants."
+          }
+        }
+      },
+      "SessionTaskUsage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "requests",
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cache_write_tokens",
+          "request_duration_sum_ms",
+          "unknown_cost_requests",
+          "costs"
+        ],
+        "properties": {
+          "requests": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cache_write_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "request_duration_sum_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Sum of request durations; overlapping requests are not wallclock work time."
+          },
+          "unknown_cost_requests": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "costs": {
+            "type": "object",
+            "description": "Known integer micros keyed by currency. Unknown costs are counted separately and must not be displayed as zero.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "SessionTaskAnalysis": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "scope",
+          "identities",
+          "timezone",
+          "first_request_at",
+          "last_request_at",
+          "calendar_span_days",
+          "active_days",
+          "totals",
+          "daily",
+          "coverage",
+          "timezone_offset_minutes",
+          "include_subtrees"
+        ],
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "session",
+              "subtree",
+              "related"
+            ]
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionTaskIdentity"
+            }
+          },
+          "timezone": {
+            "type": "string"
+          },
+          "first_request_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_request_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "calendar_span_days": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "active_days": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "totals": {
+            "$ref": "#/components/schemas/SessionTaskUsage"
+          },
+          "daily": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "day_bucket",
+                "day_start_at",
+                "usage"
+              ],
+              "properties": {
+                "day_bucket": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "day_start_at": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "usage": {
+                  "$ref": "#/components/schemas/SessionTaskUsage"
+                }
+              }
+            }
+          },
+          "coverage": {
+            "const": "completed_request_facts_and_archive_only"
+          },
+          "timezone_offset_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "include_subtrees": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SessionThreadResolveRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "explicit_session_ids"
+        ],
+        "properties": {
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "explicit_session_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      },
+      "SessionThreadResolution": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sessions"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "tenant_id",
+                "key_id",
+                "session_id",
+                "explicit_session_id",
+                "title",
+                "title_source",
+                "title_revision"
+              ],
+              "properties": {
+                "tenant_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "key_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "session_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "explicit_session_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title_source": {
+                  "type": "string"
+                },
+                "title_revision": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      },
+      "SessionTaskNameUpdate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "source",
+          "expected_revision"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "codex"
+            ]
+          },
+          "explicit_session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "expected_unnamed": {
+            "type": "boolean",
+            "default": false
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "SessionTaskRelationshipChange": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "target",
+          "kind"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/SessionTaskIdentity"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "parent",
+              "related"
+            ]
+          },
+          "evidence": {
+            "type": "string",
+            "maxLength": 512
+          }
+        }
+      },
+      "SessionTaskRelationships": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "relationships"
+        ],
+        "properties": {
+          "relationships": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key_id",
+                "session_id",
+                "target",
+                "kind",
+                "evidence"
+              ],
+              "properties": {
+                "key_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "session_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "target": {
+                  "$ref": "#/components/schemas/SessionTaskIdentity"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "parent",
+                    "related"
+                  ]
+                },
+                "evidence": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "SessionThreadParentsRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "parents"
+        ],
+        "properties": {
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "parents": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "child_thread_id",
+                "parent_thread_id",
+                "evidence"
+              ],
+              "properties": {
+                "child_thread_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "parent_thread_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "evidence": {
+                  "type": "string",
+                  "enum": [
+                    "thread_spawn_edges",
+                    "source.subagent.thread_spawn"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "SessionTaskTitleBatchRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "identities"
+        ],
+        "properties": {
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "identities": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/SessionTaskIdentity"
+            }
           }
         }
       }

@@ -970,6 +970,10 @@ fn push_typed_filters(
             }
             TypedFilterField::CreatedAt => format!("{source_alias}.created_at"),
             TypedFilterField::KeyId => format!("{source_alias}.key_id"),
+            TypedFilterField::SessionAssociation => match source {
+                RequestSourceKind::Generation => "'unlinked'".to_owned(),
+                _ => format!("(CASE WHEN {source_alias}.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END)"),
+            },
             TypedFilterField::Model => {
                 if source == RequestSourceKind::Generation {
                     format!("{source_alias}.public_model")
