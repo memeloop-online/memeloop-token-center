@@ -1,4 +1,5 @@
 import { apiRead } from './api.js';
+import type { SessionDialogueTurn } from './sessionReplayProjection.js';
 
 export interface SessionContextItem {
   node_id: string;
@@ -46,6 +47,8 @@ export interface SessionContextLoader {
   page: (requestId: string, cursor: string | undefined, details: boolean, signal: AbortSignal) => Promise<SessionContextPage>;
   content: (requestId: string, cursor: string, signal: AbortSignal) => Promise<SessionContextChunk>;
   response?: (requestId: string, signal: AbortSignal) => Promise<SessionResponseSummary>;
+  /** Cleaned dialogue stored in CNPG. Absent loaders keep the existing atom view. */
+  dialogue?: (requestId: string, signal: AbortSignal) => Promise<SessionDialogueTurn[]>;
 }
 
 type JsonObject = Record<string, unknown>;
@@ -104,6 +107,39 @@ export function validateContextChunk(value: unknown): SessionContextChunk {
   return value as unknown as SessionContextChunk;
 }
 
+/** CNPG session dialogue only. Rejects a payload that is still a raw document. */
+export function validateSessionDialogue(value: unknown, sessionId: string, requestId: string): SessionDialogueTurn[] {
+  if (!record(value) || value.contract_version !== 'session_dialogue_v1' || value.representation !== 'session_body'
+    || value.session_id !== sessionId || value.request_id !== requestId
+    || !Array.isArray(value.turns) || value.turns.length > 4096) throw invalid();
+  return value.turns.map((turn): SessionDialogueTurn => {
+    if (!record(turn) || !Array.isArray(turn.parts) || turn.parts.length > 256) throw invalid();
+    const role = turn.role;
+    const origin = turn.origin;
+    if (typeof role !== 'string' || !/^[a-z0-9_-]{1,32}$/.test(role)) throw invalid();
+    if (origin !== 'request' && origin !== 'return') throw invalid();
+    const parts = turn.parts.map((part) => {
+      if (!record(part) || !integer(part.part_index) || typeof part.kind !== 'string' || part.kind.length > 64
+        || !(part.text === null || typeof part.text === 'string')
+        || !(part.media_type === null || typeof part.media_type === 'string')
+        || !(part.byte_length === null || integer(part.byte_length))
+        || !(part.call_id === null || typeof part.call_id === 'string')
+        || !(part.tool_call_id === null || typeof part.tool_call_id === 'string')
+        || 'object_locator' in part) throw invalid();
+      return {
+        part_index: part.part_index,
+        kind: part.kind,
+        text: part.text,
+        media_type: part.media_type,
+        byte_length: part.byte_length,
+        call_id: part.call_id,
+        tool_call_id: part.tool_call_id,
+      };
+    });
+    return { role, origin, parts };
+  });
+}
+
 /** The caller provides its authorized route. No credentials enter display components. */
 export function createSessionContextLoader(sessionId: string, credential: string, path: (requestId: string, content: boolean) => string): SessionContextLoader {
   let active = 0;
@@ -151,6 +187,14 @@ export function createSessionContextLoader(sessionId: string, credential: string
         queryPath(path(requestId, true), { cursor: continuation }), credential,
         { signal, totalTimeoutMilliseconds: 15_000 },
       )));
+    },
+    async dialogue(requestId, signal) {
+      const base = path(requestId, false);
+      const target = base.replace(/\/context(?=\?|\/|$)/, '/dialogue');
+      if (target === base) throw invalid();
+      return bounded(signal, async () => validateSessionDialogue(await apiRead<unknown>(
+        target, credential, { signal, totalTimeoutMilliseconds: 15_000 },
+      ), sessionId, requestId));
     },
   };
 }

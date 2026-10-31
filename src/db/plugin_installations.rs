@@ -110,7 +110,7 @@ impl Database {
         let locked = sqlx::query("UPDATE application_plugin_install_lock SET operation_id=$1, lease_until=$2 WHERE scope='global' AND (lease_until <= $3 OR operation_id=$1)")
             .bind(&id).bind(lease_until).bind(now).execute(&mut *tx).await?.rows_affected();
         if locked != 1 {
-            return Err(AppError::Overloaded);
+            return Err(AppError::capacity_error("plugin_installation_lock"));
         }
         if sqlx::query(
             "SELECT inventory_id FROM application_plugin_candidates WHERE inventory_id=$1",
@@ -172,7 +172,9 @@ impl Database {
         attempt: &str,
         checkpoints: &std::collections::BTreeMap<String, PackageCheckpoint>,
     ) -> Result<(), AppError> {
-        let encoded = serde_json::to_string(checkpoints).map_err(|_| AppError::Internal)?;
+        let encoded = serde_json::to_string(checkpoints).map_err(|_| {
+            AppError::internal("plugin_installations_checkpoint_plugin_installation_1")
+        })?;
         if checkpoints.len() > 16 || encoded.len() > 65536 {
             return Err(AppError::Forbidden);
         }
@@ -320,7 +322,7 @@ fn installation_record(row: AnyRow) -> Result<InstallationRecord, AppError> {
     }
     let checkpoints: std::collections::BTreeMap<String, PackageCheckpoint> =
         serde_json::from_str(&row.try_get::<String, _>("checkpoints_json")?)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("plugin_installations_installation_record_1"))?;
     Ok(InstallationRecord {
         completed_packages: checkpoints.len(),
         checkpoints,
@@ -332,13 +334,13 @@ fn installation_record(row: AnyRow) -> Result<InstallationRecord, AppError> {
         idempotency_hash: row.try_get("idempotency_hash")?,
         status,
         packages: serde_json::from_str(&row.try_get::<String, _>("packages_json")?)
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("plugin_installations_installation_record_2"))?,
         review_digest: row.try_get("review_digest")?,
         review: row
             .try_get::<Option<String>, _>("review_json")?
             .map(|value| serde_json::from_str(&value))
             .transpose()
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("plugin_installations_installation_record_3"))?,
         failure_category: row.try_get("failure_category")?,
         lease_until,
         created_at: row.try_get("created_at")?,

@@ -116,7 +116,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        db.finish_session_response(&response_task, Some("Final answer"), None)
+        db.finish_session_response(&response_task, Some("Final answer".into()), None)
             .await
             .unwrap();
         let mut tx = db.begin_write_transaction().await.unwrap();

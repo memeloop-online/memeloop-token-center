@@ -194,17 +194,17 @@ impl NativeClient<'_> {
             .apply_headers(request)?
             .send()
             .await
-            .map_err(|_| AppError::Upstream("Antigravity request failed".into()))?;
+            .map_err(|_| AppError::upstream("antigravity_request_failed"))?;
         let status = response.status();
         let body = bounded_body(response, limit).await?;
         if !status.is_success() {
-            return Err(AppError::Upstream(format!(
-                "Antigravity returned HTTP {}",
-                status.as_u16()
-            )));
+            return Err(AppError::upstream_status(
+                "antigravity_returned_http",
+                status.as_u16(),
+            ));
         }
         serde_json::from_slice(&body)
-            .map_err(|_| AppError::Upstream("invalid Antigravity response".into()))
+            .map_err(|_| AppError::upstream("invalid_antigravity_response"))
     }
 
     /// Read the existing project only. Never enroll, accept terms, reset quota,
@@ -248,10 +248,11 @@ impl NativeClient<'_> {
         let models = response
             .get("models")
             .and_then(Value::as_object)
-            .ok_or_else(|| AppError::Upstream("Antigravity model catalog is invalid".into()))?;
+            .ok_or_else(|| AppError::upstream("antigravity_model_catalog_is_invalid"))?;
         if models.len() > 4096 {
-            return Err(AppError::Upstream(
-                "Antigravity model catalog is too large".into(),
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("antigravity_list_models"),
             ));
         }
         Ok(models
@@ -421,7 +422,7 @@ pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
     let candidates = response
         .get("candidates")
         .and_then(Value::as_array)
-        .ok_or_else(|| AppError::Upstream("Antigravity image response has no candidates".into()))?;
+        .ok_or_else(|| AppError::upstream("antigravity_image_response_has_no_candidates"))?;
     let mut result = ImageResponse {
         images: vec![],
         text: vec![],
@@ -450,22 +451,21 @@ pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
                     .and_then(Value::as_str)
                     .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/webp"))
                     .ok_or_else(|| {
-                        AppError::Upstream("Antigravity image MIME type is unsupported".into())
+                        AppError::upstream("antigravity_image_mime_type_is_unsupported")
                     })?;
                 let data = inline
                     .get("data")
                     .and_then(Value::as_str)
                     .filter(|data| data.len() <= IMAGE_LIMIT)
-                    .ok_or_else(|| {
-                        AppError::Upstream("Antigravity image data is invalid".into())
-                    })?;
-                let bytes = STANDARD.decode(data).map_err(|_| {
-                    AppError::Upstream("Antigravity image encoding is invalid".into())
-                })?;
+                    .ok_or_else(|| AppError::upstream("antigravity_image_data_is_invalid"))?;
+                let bytes = STANDARD
+                    .decode(data)
+                    .map_err(|_| AppError::upstream("antigravity_image_encoding_is_invalid"))?;
                 total = total.saturating_add(bytes.len());
                 if bytes.is_empty() || total > IMAGE_LIMIT || result.images.len() >= 16 {
-                    return Err(AppError::Upstream(
-                        "Antigravity image output exceeds limits".into(),
+                    return Err(AppError::upstream_with(
+                        "upstream_unavailable",
+                        crate::error::ErrorFacts::new().stage("antigravity_decode_images"),
                     ));
                 }
                 result.images.push(GeneratedImage {
@@ -476,7 +476,7 @@ pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
         }
     }
     if result.images.is_empty() {
-        return Err(AppError::Upstream("Antigravity returned no image".into()));
+        return Err(AppError::upstream("antigravity_returned_no_image"));
     }
     Ok(result)
 }
@@ -486,18 +486,19 @@ async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u
         .content_length()
         .is_some_and(|length| length > limit as u64)
     {
-        return Err(AppError::Upstream(
-            "Antigravity response exceeds limit".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("antigravity_bounded_body"),
         ));
     }
     let mut output = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| AppError::Upstream("Antigravity response interrupted".into()))?;
+        let chunk = chunk.map_err(|_| AppError::upstream("antigravity_response_interrupted"))?;
         if output.len().saturating_add(chunk.len()) > limit {
-            return Err(AppError::Upstream(
-                "Antigravity response exceeds limit".into(),
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("antigravity_bounded_body"),
             ));
         }
         output.extend_from_slice(&chunk);

@@ -187,6 +187,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         .metrics
         .active_stream(crate::metrics::ActiveStreamKind::ProxyResponse);
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(PROXY_BODY_CHANNEL_CAPACITY);
+    note_in_flight_stage(&buffered_request, "response_delivery").await;
     let background_state = state.clone();
     let pending_terminals = state.pending_terminals.clone();
     let status_code = i64::from(status.as_u16());
@@ -924,7 +925,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         );
                         tokio::time::timeout(SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT, evidence)
                             .await
-                            .map_err(|_| AppError::Internal)?
+                            .map_err(|_| AppError::internal("streaming_site_1"))?
                     });
             }
             waits.terminal(transport_error.unwrap_or("completed"));
@@ -1020,7 +1021,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 ),
             )
             .await
-            .unwrap_or(Err(AppError::Internal))
+            .unwrap_or(Err(AppError::internal("streaming_site_1")))
             {
                 Ok(FinishProxyRequestResult::Finished { .. }) => {
                     deadline_metrics.observe_proxy_lifecycle_deadline(
@@ -1057,7 +1058,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     }
     let mut response = response
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("streaming_site_2"))?;
     if !response_headers.is_empty() {
         crate::api::anthropic::append_response_headers(response.headers_mut(), &response_headers);
     }

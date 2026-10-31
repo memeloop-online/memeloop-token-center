@@ -434,7 +434,7 @@ async fn send_codex_attempt_once(
     route: &PreparedProxyRoute,
     session_id: &str,
     transport: (
-        &wreq::Client,
+        &reqwest::Client,
         &UpstreamCredential,
         send_diagnostics::TransportIdentity,
         Option<crate::db::egress::SelectedEgress>,
@@ -475,18 +475,20 @@ async fn send_codex_attempt_once(
         return Err(ProxySendError::RetryableConnection("test_injected"));
     }
     let (client, credential, transport_identity, selected_egress) = transport;
+    // Plugins do not replace this send unless one registers. None do: a package
+    // that needs its own HTTP calls host `http-request`, executed by this client.
+    if state.plugins.codex_outbound_registered() {
+        return Err(ProxySendError::CandidateUnavailable);
+    }
     loop {
-        let mut request = client.post(target_url).body(route.forwarded_body.clone());
-        let egress_path = if let Some((proxy_url, _)) = credential.proxy() {
-            let proxy =
-                wreq::Proxy::all(proxy_url).map_err(|_| ProxySendError::CandidateUnavailable)?;
-            request = request.proxy(proxy);
+        let request = client.post(target_url).body(route.forwarded_body.clone());
+        let egress_path = if credential.proxy().is_some() {
             CodexEgressPath::AccountProxy
         } else {
             CodexEgressPath::Direct
         };
         let credential_now = credential_application_now();
-        let request = codex_transport::apply_wreq_wire_headers(
+        let request = codex_transport::apply_codex_wire_headers(
             request,
             headers,
             &route.route.credential,
@@ -507,7 +509,6 @@ async fn send_codex_attempt_once(
             context,
             matches!(egress_path, CodexEgressPath::AccountProxy),
             body_consumption.clone(),
-            state.config.h2_attempt_binding_enabled,
         );
         let mut egress = None;
         let mut remote_reset = false;
@@ -515,8 +516,6 @@ async fn send_codex_attempt_once(
         async {
             let mut request = request?;
             body_consumption.attach(&mut request);
-            #[cfg(feature = "h2-attempt-binding")]
-            http2_evidence.attach_binding(&mut request);
             egress = egress::AttemptRecorder::begin(
                 state,
                 &route.route,
@@ -549,7 +548,7 @@ async fn send_codex_attempt_once(
                 selection_epoch = transport_identity.selection_epoch,
                 group_selection_version = ?transport_identity.group_selection_version,
                 request_local_selection = transport_identity.request_local_selection,
-                transport_cause = wreq_transport_cause(&error),
+                transport_cause = codex_transport_cause(&error),
                 request_body_polls = body_consumption.polls(),
                 request_body_consumed_bytes = body_consumption.bytes(),
                 body_consumption_scope = "transport_body_poll_not_wire_commit",
@@ -558,7 +557,11 @@ async fn send_codex_attempt_once(
                 stage = "codex_transport_send_failure",
                 "Codex outbound transport send failed"
             );
-            classify_wreq_send_error(error)
+            classify_codex_send_error(
+                error,
+                body_consumption.polls(),
+                body_consumption.bytes(),
+            )
         })
     })
     .await;
@@ -566,7 +569,7 @@ async fn send_codex_attempt_once(
         state.metrics.observe_upstream(
             &route.route.driver,
             "proxy",
-            upstream_result.as_ref().ok().map(wreq::Response::status),
+            upstream_result.as_ref().ok().map(reqwest::Response::status),
             upstream_started.elapsed(),
         );
         match upstream_result {
@@ -608,30 +611,35 @@ async fn send_codex_attempt_once(
     }
 }
 
-fn classify_wreq_send_error(error: wreq::Error) -> ProxySendError {
+fn classify_codex_send_error(
+    error: reqwest::Error,
+    body_polls: u64,
+    body_bytes: u64,
+) -> ProxySendError {
     if let Some(http2_failure) = upstream_response::codex_http2_failure(&error) {
         let kind = match http2_failure {
             upstream_response::CodexHttp2Failure::Reset => TransportFailureKind::Http2Reset,
             upstream_response::CodexHttp2Failure::GoAway => TransportFailureKind::Http2GoAway,
         };
         ProxySendError::NonRetryableTransport(kind)
-    } else if error.is_connect() || error.is_proxy_connect() || error.is_dns() || error.is_tls() {
-        let stage = if error.is_proxy_connect() {
-            "proxy_connect"
-        } else if error.is_dns() {
-            "dns"
-        } else if error.is_tls() {
-            "tls"
-        } else {
-            "connect"
-        };
-        ProxySendError::RetryableConnection(stage)
     } else {
+        let class = crate::simple_http::classify_transport(&error);
+        if class.pre_delivery() {
+            return ProxySendError::RetryableConnection(class.stage());
+        }
+        // reqwest surfaces a `connect_timeout` expiry as a plain request timeout,
+        // not as a connect error, so `pre_delivery()` cannot see it. With zero
+        // body polls the request body never reached the wire, so the logical
+        // request was provably not delivered; replaying it on another candidate
+        // (or another sticky exit) cannot double-charge the upstream.
+        if class.timeout && body_polls == 0 && body_bytes == 0 {
+            return ProxySendError::RetryableConnection("connect_timeout");
+        }
         // A send error after the request leaves the client is ambiguous and is
         // never replayed by this state machine.
-        let kind = if error.is_timeout() {
+        let kind = if class.timeout || error.is_timeout() {
             TransportFailureKind::Timeout
-        } else if error.is_connection_reset() {
+        } else if class.connection_reset {
             TransportFailureKind::ConnectionReset
         } else if error.is_body() {
             TransportFailureKind::Body
@@ -646,76 +654,22 @@ fn classify_wreq_send_error(error: wreq::Error) -> ProxySendError {
     }
 }
 
-fn wreq_transport_cause(error: &wreq::Error) -> &'static str {
-    if let Some(cause) = sanitized_error_source_cause(error) {
-        cause
-    } else if error.is_timeout() {
-        "transport_timeout"
-    } else if error.is_connection_reset() {
-        "connection_reset"
-    } else if error.is_dns() {
-        "dns_resolution"
-    } else if error.is_tls() {
-        "tls_failure"
-    } else {
-        "unclassified"
-    }
-}
-
-fn sanitized_error_source_cause(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
-    let mut source = Some(error);
-    let mut io_cause = None;
+/// Report the real transport cause. These messages describe a socket, TLS or
+/// HTTP failure against an upstream and carry no credential material, so the
+/// full source chain is logged instead of a masked label. Masking it hid the
+/// reason requests failed and made upstream faults undiagnosable.
+fn codex_transport_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = Vec::new();
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     for _ in 0..16 {
-        let current = source?;
-        if exact_error_label(current, "keep-alive timed out")
-            && current
-                .source()
-                .is_some_and(|cause| exact_error_label(cause, "operation timed out"))
-        {
-            return Some("http2_keepalive_timeout");
-        }
-        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
-            io_cause = io_cause.or_else(|| sanitized_io_cause(io_error.kind()));
-        }
+        let current = match source {
+            Some(current) => current,
+            None => break,
+        };
+        parts.push(current.to_string());
         source = current.source();
-        if source.is_none() {
-            break;
-        }
     }
-    io_cause
-}
-
-fn sanitized_io_cause(kind: std::io::ErrorKind) -> Option<&'static str> {
-    match kind {
-        std::io::ErrorKind::ConnectionRefused => Some("connection_refused"),
-        std::io::ErrorKind::ConnectionReset => Some("connection_reset"),
-        std::io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
-        std::io::ErrorKind::NotConnected => Some("not_connected"),
-        std::io::ErrorKind::BrokenPipe => Some("broken_pipe"),
-        std::io::ErrorKind::TimedOut => Some("transport_io_timeout"),
-        std::io::ErrorKind::UnexpectedEof => Some("unexpected_eof"),
-        _ => None,
-    }
-}
-
-fn exact_error_label(error: &dyn std::error::Error, label: &'static str) -> bool {
-    struct ExactLabel<'a> {
-        remaining: &'a str,
-    }
-
-    impl std::fmt::Write for ExactLabel<'_> {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            if let Some(remaining) = self.remaining.strip_prefix(text) {
-                self.remaining = remaining;
-                Ok(())
-            } else {
-                Err(std::fmt::Error)
-            }
-        }
-    }
-
-    let mut writer = ExactLabel { remaining: label };
-    std::fmt::write(&mut writer, format_args!("{error}")).is_ok() && writer.remaining.is_empty()
+    parts.join(" <- ")
 }
 
 fn codex_egress_failure_stage(error: &ProxySendError) -> CodexEgressFailureStage {
@@ -726,6 +680,7 @@ fn codex_egress_failure_stage(error: &ProxySendError) -> CodexEgressFailureStage
         ProxySendError::RetryableConnection("dns") => CodexEgressFailureStage::Dns,
         ProxySendError::RetryableConnection("tls") => CodexEgressFailureStage::Tls,
         ProxySendError::RetryableConnection("connect") => CodexEgressFailureStage::Connect,
+        ProxySendError::RetryableConnection("connect_timeout") => CodexEgressFailureStage::Connect,
         ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout) => {
             CodexEgressFailureStage::Timeout
         }
@@ -811,7 +766,7 @@ mod timeout_tests {
     }
 
     #[test]
-    fn transport_source_distinguishes_keepalive_from_io_and_other_timeout() {
+    fn transport_cause_reports_the_real_source_chain() {
         let keepalive = TestError {
             label: "keep-alive timed out",
             source: Some(Box::new(TestError {
@@ -820,44 +775,33 @@ mod timeout_tests {
             })),
         };
         assert_eq!(
-            sanitized_error_source_cause(&keepalive),
-            Some("http2_keepalive_timeout")
+            codex_transport_cause(&keepalive),
+            "keep-alive timed out <- operation timed out"
         );
         let read_timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "private endpoint");
-        assert_eq!(
-            sanitized_error_source_cause(&read_timeout),
-            Some("transport_io_timeout")
-        );
-        let unrelated = TestError {
-            label: "keep-alive timed out",
-            source: Some(Box::new(TestError {
-                label: "not the timeout sentinel",
-                source: None,
-            })),
-        };
-        assert_eq!(sanitized_error_source_cause(&unrelated), None);
-        assert!(!exact_error_label(
-            &unrelated,
-            "keep-alive timed out private endpoint"
-        ));
+        assert_eq!(codex_transport_cause(&read_timeout), "private endpoint");
     }
 
     #[test]
-    fn transport_source_scan_is_bounded() {
+    fn transport_cause_scan_is_bounded() {
         let mut error: Box<dyn std::error::Error + Send + Sync> = Box::new(TestError {
-            label: "keep-alive timed out",
-            source: Some(Box::new(TestError {
-                label: "operation timed out",
-                source: None,
-            })),
+            label: "root",
+            source: None,
         });
-        for _ in 0..16 {
+        for _ in 0..32 {
             error = Box::new(TestError {
                 label: "wrapper",
                 source: Some(error),
             });
         }
-        assert_eq!(sanitized_error_source_cause(error.as_ref()), None);
+        // The walk stops after a bounded number of links instead of walking an
+        // arbitrarily deep chain.
+        assert_eq!(
+            codex_transport_cause(error.as_ref())
+                .matches("wrapper")
+                .count(),
+            16
+        );
     }
 
     #[test]

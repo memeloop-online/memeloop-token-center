@@ -83,7 +83,7 @@ pub(crate) async fn sync_catalog_model_prices(
     let _permit = MODEL_PRICE_SYNC_PERMITS
         .acquire()
         .await
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("pricing_mod_sync_catalog_model_prices_1"))?;
     run_price_sync(
         db,
         http,
@@ -151,8 +151,8 @@ async fn run_price_sync(
         }
     }
     if fetched.is_empty() {
-        return Err(AppError::Upstream(
-            "all configured model price sources are unavailable".into(),
+        return Err(AppError::upstream(
+            "all_configured_model_price_sources_are_unavailable",
         ));
     }
 

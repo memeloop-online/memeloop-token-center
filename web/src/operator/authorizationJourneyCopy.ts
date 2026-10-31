@@ -8,7 +8,7 @@ export function authorizationJourneyCopy(locale: string, providerId?: string) {
       : providerId === 'anthropic-claude' ? '请使用原 Anthropic 账号登录；系统要求重新授权的身份与原账号一致。'
       : providerId === 'google-antigravity' ? '请使用原 Google 身份登录；系统要求重新授权的身份与原账号一致。' : '',
     setup: '选择提供商并登录，允许系统代表此账号调用模型。成功后会保存账号授权，供模型路由使用。',
-    network: '这里保存的网络出口会立即用于此账号后续请求及登录流程，关闭表单不会撤销已保存的代理修改。请先保存或取消代理编辑，再开始登录。',
+    network: '这里保存的网络出口会立即用于此账号后续请求及登录流程。已保存的代理修改在关闭表单后仍然生效。请先保存或取消代理编辑，再开始登录。',
     proxyEditing: '正在编辑网络代理。请先保存或取消代理编辑，再开始登录。',
     automatic: '请在提供商页面完成登录；系统会自动检测结果并保存连接，无需手动检查。',
     checking: '正在自动检测授权状态…',
@@ -27,7 +27,7 @@ export function authorizationJourneyCopy(locale: string, providerId?: string) {
     completeUnavailable: '提供商暂时无法完成授权。请关闭表单，先检查账号状态及代理连接；如仍需授权，重新打开表单后重试。',
     completeOverloaded: '服务繁忙，暂时无法确认授权结果。请关闭表单并检查账号状态；如仍需授权，稍后重新打开表单重试。',
     completeUncertain: '授权结果暂时无法确认。请关闭表单并检查账号状态；如仍需授权，重新打开表单后重试或重新开始登录。',
-    completeClosedUnknown: '关闭表单时，已发出的授权确认请求尚未返回结果，自动查询已停止。浏览器停止等待不代表服务端已取消处理。会话与授权码已保留；请先检查账号状态，再决定是否手动重试。',
+    completeClosedUnknown: '关闭表单时，授权确认请求还没有返回。自动查询已停止。服务端会继续处理已收到的请求。会话和授权码还在。请先检查账号状态，再决定是否重试。',
     completePending: '授权仍在处理中，尚未确认成功。系统会按服务端要求的间隔自动查询；请勿重复开始登录。',
     completeChecking: '正在确认此次授权结果…',
     completeLimited: '本次自动确认已达到等待时限或次数上限，结果仍未确认。会话与授权码已保留；请先检查账号状态，如仍需登录，再返回登录设置。',
@@ -43,7 +43,7 @@ export function authorizationJourneyCopy(locale: string, providerId?: string) {
       : providerId === 'anthropic-claude' ? 'Sign in with the original Anthropic account. Reauthorization requires the same provider identity.'
       : providerId === 'google-antigravity' ? 'Sign in with the original Google identity. Reauthorization requires the same provider identity.' : '',
     setup: 'Choose a provider and sign in to allow the system to call models on behalf of this account. The authorization will be saved for use by model routes.',
-    network: 'Saving the network connection takes effect immediately for subsequent account requests and login. Closing this form does not undo a saved proxy change. Save or cancel proxy editing before starting login.',
+    network: 'Saving the network connection takes effect immediately for subsequent account requests and login. A saved proxy change stays in effect after you close this form. Save or cancel proxy editing before starting login.',
     proxyEditing: 'You are editing the network proxy. Save or cancel proxy editing before starting login.',
     automatic: 'Finish signing in on the provider page. The system checks automatically and saves the connection; no manual check is needed.',
     checking: 'Checking authorization automatically…',

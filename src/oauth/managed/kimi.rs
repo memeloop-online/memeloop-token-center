@@ -917,7 +917,7 @@ mod tests {
         .unwrap();
         server.await.unwrap();
         let saved = database
-            .finish_kimi_oauth_refresh(account.id, received, "slow-body-refresh", pepper)
+            .finish_upstream_oauth_refresh(account.id, received, "slow-body-refresh", pepper)
             .await
             .unwrap();
         assert_eq!(saved.credential_generation, 2);

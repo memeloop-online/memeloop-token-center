@@ -227,6 +227,9 @@ paths:
         from a service token. The selected key's normal gateway model grants,
         routing policy, expiry, rate limits, balance and billing apply. Its secret
         and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
         Requires an active key with a stored copyable credential. Only JSON
         completions are supported; stream=true is rejected.
       security: [{ serviceBearer: [] }]
@@ -243,6 +246,7 @@ paths:
               required: [key_id, request]
               properties:
                 key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
                 request:
                   type: object
                   additionalProperties: true
@@ -272,6 +276,9 @@ paths:
         from a service token. The selected key's normal gateway model grants,
         routing policy, expiry, rate limits, balance and billing apply. Its secret
         and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
         Requires an active key with a stored copyable credential. Only JSON
         messages are supported; stream=true is rejected.
       security: [{ serviceBearer: [] }]
@@ -288,6 +295,7 @@ paths:
               required: [key_id, request]
               properties:
                 key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
                 request:
                   type: object
                   additionalProperties: true
@@ -301,6 +309,55 @@ paths:
               schema: { type: object, additionalProperties: true }
         '400':
           description: Invalid JSON Messages request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+  /internal/v1/inference/responses:
+    post:
+      tags: [Client credentials]
+      operationId: operatorResponse
+      summary: Run inference using an explicitly authorized billing credential
+      description: |
+        Requires the same keys:write scope and tenant authorization as copying the
+        selected existing key. Does not mint a credential or infer a user identity
+        from a service token. The selected key's normal gateway model grants,
+        routing policy, expiry, rate limits, balance and billing apply. Its secret
+        and the operator credential never enter the plugin request or response.
+        Optional conversation identifiers connect requests to the core session and
+        usage records; the wrapper is consumed by the gateway. Request and response
+        bodies use the normal core archive pipeline.
+        Requires an active key with a stored copyable credential. Only JSON
+        Responses are supported; stream=true is rejected.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: keys:write
+      parameters:
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [key_id, request]
+              properties:
+                key_id: { type: string, format: uuid }
+                conversation: { $ref: '#/components/schemas/OperatorInferenceConversation' }
+                request:
+                  type: object
+                  additionalProperties: true
+                  properties:
+                    stream: { type: boolean, const: false }
+      responses:
+        '200':
+          description: OpenAI Responses result including image generation output, billed to the selected key
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '400':
+          description: Invalid JSON Responses request
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ErrorResponse' }
@@ -5526,6 +5583,30 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Retained prefix path is incomplete or inconsistent. }
 
+  /internal/v1/sessions/{session_id}/requests/{request_id}/dialogue:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionDialogue
+      summary: Read the cleaned session dialogue stored for this request
+      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+      responses:
+        '200':
+          description: Cleaned dialogue turns for viewing and training export.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionDialogue' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/sessions/{session_id}/requests/{request_id}/context/content:
     get:
       tags: [Operator traffic]
@@ -6381,16 +6462,32 @@ paths:
       operationId: getOperatorUsageAnalysis
       summary: Analyze bounded tenant or global usage from hourly or daily rollups
       description: |
-        Reads only compact terminal request and generation rollups; it never scans the raw
-        request table. `auto` selects hourly buckets through 31 days and daily buckets for
+        Reads compact terminal request and generation rollups with exact boundary facts.
+        The full and output_rate projections also read retained terminal records for exact
+        provider-reported, successful, non-compaction output rates.
+        `auto` selects hourly buckets through 31 days and daily buckets for
         longer ranges. Omitted bounds default to the last 24 hours (`auto`/`hour`) or seven
         days (`day`). The inclusive interval may not exceed 93 days, and explicit hourly
         intervals may not exceed 31 days. Bucket starts and heatmap coordinates are UTC.
         Costs are returned as a currency-keyed array and are never added across currencies.
         Duration P95 values are bounded-histogram approximations capped at 60000 ms.
+        Explicit projections retain the same response envelope. Unselected arrays are empty
+        and unselected summary metrics are zero placeholders, not usage totals.
+        overview returns summary, time_series, and generation breakdowns; trends returns
+        summary and time_series; dimensions returns by_model, by_key, by_upstream,
+        by_protocol, by_status, and errors plus summary and time_series.
+        sessions returns by_session; heatmap returns heatmap. These projections omit output_rate.
+        output_rate runs only the exact output-rate query and returns summary.output_rate
+        and time_series entries containing bucket_start and output_rate; other metrics are
+        zero placeholders. Merge rates by bucket_start, treating absent buckets as zero samples.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:
+        - name: projection
+          in: query
+          required: false
+          description: Select only the analysis needed by the current view; full preserves the complete legacy response.
+          schema: { type: string, enum: [full, overview, trends, dimensions, sessions, heatmap, output_rate], default: full }
         - $ref: '#/components/parameters/TenantFilter'
         - $ref: '#/components/parameters/FromCreatedAt'
         - $ref: '#/components/parameters/ToCreatedAt'
@@ -6440,11 +6537,18 @@ paths:
       description: |
         Uses the same tenant scope, filters, inclusive range, bucket selection, and metric
         aggregation as the complete usage-analysis resource. The response is restricted to
-        summary and time-series data and executes one business aggregation statement; it does
-        not load dimension, session, generation-breakdown, or heatmap projections.
+        summary and time-series data. The default full projection preserves exact output rates
+        and executes two business statements. Explicit projection=trends executes one rollup
+        statement and omits output_rate. Neither loads dimensions, sessions, generation
+        breakdowns, or the heatmap.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:
+        - name: projection
+          in: query
+          required: false
+          description: full includes exact output rates; trends returns only rollup summary and time-series metrics.
+          schema: { type: string, enum: [full, trends], default: full }
         - $ref: '#/components/parameters/TenantFilter'
         - $ref: '#/components/parameters/FromCreatedAt'
         - $ref: '#/components/parameters/ToCreatedAt'
@@ -7028,6 +7132,26 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Retained prefix path is incomplete or inconsistent. }
+
+  /self/v1/sessions/{session_id}/requests/{request_id}/dialogue:
+    get:
+      tags: [Self service]
+      operationId: getOwnSessionDialogue
+      summary: Read the cleaned session dialogue stored for this owned request
+      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      security: [{ clientBearer: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+      responses:
+        '200':
+          description: Cleaned dialogue turns for this credential's request.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionDialogue' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /self/v1/sessions/{session_id}/requests/{request_id}/context/content:
     get:
@@ -8542,6 +8666,26 @@ components:
         }
       }
     }
+    OperatorInferenceConversation:
+      type: [object, 'null']
+      additionalProperties: false
+      required: [id]
+      description: Gateway-owned session and turn identifiers; consumed before forwarding the inference request.
+      properties:
+        id: { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+        turn_id:
+          oneOf:
+            - { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+            - { type: 'null' }
+        parent_turn_id:
+          oneOf:
+            - { $ref: '#/components/schemas/OperatorInferenceConversationIdentifier' }
+            - { type: 'null' }
+    OperatorInferenceConversationIdentifier:
+      type: string
+      minLength: 1
+      maxLength: 128
+      pattern: '^[A-Za-z0-9._:-]+$'
     SessionContextItem:
       type: object
       required: [node_id, depth, role, kind, phase, text, text_complete, source_chars, content_cursor, text_cursor]
@@ -8591,6 +8735,42 @@ components:
         total_chars: { type: integer, format: int64, minimum: 0 }
         content: { type: string, maxLength: 16384 }
         next_cursor: { type: [string, 'null'], maxLength: 4096 }
+    SessionDialogue:
+      type: object
+      additionalProperties: false
+      required: [contract_version, representation, request_id, session_id, turns]
+      properties:
+        contract_version: { type: string, enum: [session_dialogue_v1] }
+        representation: { type: string, enum: [session_body] }
+        request_id: { type: string, format: uuid }
+        session_id: { type: string, format: uuid }
+        turns:
+          type: array
+          maxItems: 4096
+          items: { $ref: '#/components/schemas/SessionDialogueTurn' }
+    SessionDialogueTurn:
+      type: object
+      additionalProperties: false
+      required: [role, origin, parts]
+      properties:
+        role: { type: string, minLength: 1, maxLength: 32 }
+        origin: { type: string, enum: [request, return] }
+        parts:
+          type: array
+          maxItems: 256
+          items: { $ref: '#/components/schemas/SessionDialoguePart' }
+    SessionDialoguePart:
+      type: object
+      additionalProperties: false
+      required: [part_index, kind, text, media_type, byte_length, call_id, tool_call_id]
+      properties:
+        part_index: { type: integer, format: int64, minimum: 0 }
+        kind: { type: string, maxLength: 64 }
+        text: { type: [string, 'null'] }
+        media_type: { type: [string, 'null'] }
+        byte_length: { type: [integer, 'null'], format: int64, minimum: 0 }
+        call_id: { type: [string, 'null'] }
+        tool_call_id: { type: [string, 'null'] }
     SessionGeneratedTitle:
       type: object
       required: [title, state, error_code, updated_at, source, revision]

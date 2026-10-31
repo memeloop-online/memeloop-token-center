@@ -37,13 +37,14 @@ impl Failure {
         }
     }
 
-    pub(super) fn wreq(error: wreq::Error) -> Self {
-        let stage = wreq_stage(
-            error.is_proxy_connect(),
-            error.is_dns(),
-            error.is_tls(),
-            error.is_connect(),
-            error.is_timeout(),
+    pub(super) fn transport(error: reqwest::Error) -> Self {
+        let class = crate::simple_http::classify_transport(&error);
+        let stage = transport_stage(
+            class.proxy_connect,
+            class.dns,
+            class.tls,
+            class.connect,
+            class.timeout,
         );
         Self {
             code: quota_transport_error_code(error.is_timeout()),
@@ -89,7 +90,13 @@ impl Failure {
     }
 }
 
-fn wreq_stage(proxy: bool, dns: bool, tls: bool, connect: bool, timeout: bool) -> &'static str {
+fn transport_stage(
+    proxy: bool,
+    dns: bool,
+    tls: bool,
+    connect: bool,
+    timeout: bool,
+) -> &'static str {
     if proxy {
         "proxy_connect"
     } else if dns {
@@ -381,7 +388,7 @@ mod tests {
             ([true; 5], "proxy_connect"),
         ] {
             assert_eq!(
-                wreq_stage(flags[0], flags[1], flags[2], flags[3], flags[4]),
+                transport_stage(flags[0], flags[1], flags[2], flags[3], flags[4]),
                 expected
             );
         }
@@ -546,14 +553,10 @@ mod tests {
                 .expect(expected_count)
                 .mount(&server)
                 .await;
-            let http = crate::build_codex_http_client_with_policy(
-                crate::provider::CodexTransportPolicy::default(),
-            )
-            .unwrap();
             let budget = policy();
             let session = ReadSession::testing(budget);
             let result = get_codex_json(
-                &http,
+                crate::provider::CodexTransportPolicy::default(),
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,
                     credential_value: http::HeaderValue::from_static("Bearer fixture-secret"),
