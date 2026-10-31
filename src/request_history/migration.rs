@@ -69,6 +69,9 @@ pub async fn command(config: &Config, command: HistoryCommand) -> Result<Value, 
         HistoryCommand::Refresh => {
             client.initialize().await?;
             database.history_start().await?;
+            // Frozen snapshots must be acknowledged before checkpoints replay
+            // every source with the upgraded read model.
+            drain(&database, &client, 500).await?;
             database.history_refresh().await?;
         }
         HistoryCommand::Backfill { page_size } => {

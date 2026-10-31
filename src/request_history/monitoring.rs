@@ -22,7 +22,7 @@ impl ClickHouse {
         let mut accounts = BTreeMap::<String, (Metrics, Vec<MonitoringTerminalOutcome>)>::new();
         self.scan_mode(query, true, |snapshot| {
             let fact = &snapshot.read_model["fact"];
-            if !fact.is_object() {
+            if !fact.is_object() || fact["settled_fact"] != true {
                 return Ok(());
             }
             let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;
@@ -62,8 +62,8 @@ impl ClickHouse {
             account.1.sort_by(|a, b| {
                 b.created_at
                     .cmp(&a.created_at)
+                    .then_with(|| a.source.cmp(&b.source))
                     .then_with(|| b.id.cmp(&a.id))
-                    .then_with(|| b.source.cmp(&a.source))
             });
             account.1.truncate(5);
             Ok(())
@@ -85,7 +85,7 @@ impl ClickHouse {
         let mut latest = None;
         self.scan_mode(query, true, |snapshot| {
             let fact = &snapshot.read_model["fact"];
-            if !fact.is_object() {
+            if !fact.is_object() || fact["settled_fact"] != true {
                 return Ok(());
             }
             let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;

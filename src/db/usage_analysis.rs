@@ -273,12 +273,23 @@ impl Database {
         tenant_id: Option<Uuid>,
         filter: &UsageAnalysisFilter,
     ) -> Result<UsageAnalysisTrendsResponse, AppError> {
-        if self.history_reader().await?.is_some() {
-            let response = self
-                .aggregate_usage_analysis_projection(
-                    tenant_id,
+        if let Some(client) = self.history_reader().await? {
+            let range = validate_usage_analysis_filter_with_limits(filter, false)?;
+            let scope = match tenant_id {
+                Some(tenant) if tenant.is_nil() => {
+                    crate::request_history::HistoryScope::EmptyTenant
+                }
+                Some(tenant) => crate::request_history::HistoryScope::Tenant(tenant),
+                None => crate::request_history::HistoryScope::GlobalOperator,
+            };
+            let response = client
+                .usage_projection(
+                    scope,
                     filter,
-                    UsageAnalysisProjection::Trends,
+                    (UsageAnalysisProjection::Trends, true),
+                    range.from_created_at,
+                    range.to_created_at,
+                    range.granularity.as_str(),
                 )
                 .await?;
             return Ok(UsageAnalysisTrendsResponse {

@@ -250,6 +250,19 @@ impl ClickHouse {
         to: i64,
         granularity: &str,
     ) -> Result<UsageAnalysisResponse, HistoryError> {
+        self.usage_projection(scope, filter, (projection, false), from, to, granularity)
+            .await
+    }
+
+    pub(crate) async fn usage_projection(
+        &self,
+        scope: HistoryScope,
+        filter: &UsageAnalysisFilter,
+        (projection, trends_output_rate): (UsageAnalysisProjection, bool),
+        from: i64,
+        to: i64,
+        granularity: &str,
+    ) -> Result<UsageAnalysisResponse, HistoryError> {
         let request_filter = RequestListFilter {
             limit: 500,
             from_created_at: Some(from),
@@ -290,7 +303,7 @@ impl ClickHouse {
             );
         self.scan_mode(query, true, |snapshot| {
             let fact = &snapshot.read_model["fact"];
-            if !fact.is_object() {
+            if !fact.is_object() || fact["settled_fact"] != true {
                 return Ok(());
             }
             let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;
@@ -413,11 +426,7 @@ impl ClickHouse {
             Ok(())
         })
         .await?;
-        let rate = full
-            || matches!(
-                projection,
-                UsageAnalysisProjection::Trends | UsageAnalysisProjection::OutputRate
-            );
+        let rate = full || trends_output_rate || projection == UsageAnalysisProjection::OutputRate;
         let mut response = UsageAnalysisResponse {
             from_created_at: from,
             to_created_at: to,

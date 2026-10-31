@@ -356,7 +356,24 @@ async fn request_history_real_services_acceptance() {
             .unwrap(),
         ));
     }
+    let expected_trends = serde_json::to_value(
+        database
+            .operator_usage_analysis_trends("history-tenant", source_filter.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
     database.history_switch(true).await.unwrap();
+    assert_eq!(
+        serde_json::to_value(
+            database
+                .operator_usage_analysis_trends("history-tenant", source_filter.clone())
+                .await
+                .unwrap()
+        )
+        .unwrap(),
+        expected_trends
+    );
     let source = database
         .source_history_list(&RequestListFilter {
             limit: 100,
@@ -569,6 +586,26 @@ async fn request_history_real_services_acceptance() {
             .as_deref(),
         Some(cluster.to_string().as_str())
     );
+    sqlx::query("INSERT INTO session_generated_titles (tenant_id,key_id,session_id,title,state,next_attempt_at,updated_at) VALUES ($1,$2,$3,'History generated title','ready',1,1) ON CONFLICT(tenant_id,key_id,session_id) DO UPDATE SET title='History generated title',state='ready'")
+        .bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(cluster.to_string()).execute(&database.pool).await.unwrap();
+    let named = database
+        .operator_recent_sessions(
+            "history-tenant",
+            crate::db::LogicalSessionListFilter {
+                limit: 100,
+                state: "all".into(),
+                query: Some("History generated".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(named.len(), 1);
+    assert_eq!(named[0].session_id, cluster.to_string());
+    assert_eq!(
+        named[0].session_name.as_deref(),
+        Some("History generated title")
+    );
     let mut accounts = Vec::new();
     for name in ["history-traffic", "history-zero"] {
         let id = Uuid::now_v7();
@@ -697,6 +734,25 @@ async fn request_history_real_services_acceptance() {
         .await
         .unwrap();
     assert_eq!(ledger_before, ledger_after);
+    sqlx::query("UPDATE request_records SET duration_ms=21 WHERE id=$1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert!(database.history_refresh().await.is_err());
+    crate::request_history::migration::drain(&database, &client, 500)
+        .await
+        .unwrap();
+    database.history_refresh().await.unwrap();
+    while !database.history_backfill_done().await.unwrap() {
+        database.history_backfill_page(1).await.unwrap();
+        crate::request_history::migration::drain(&database, &client, 500)
+            .await
+            .unwrap();
+    }
+    crate::request_history::migration::verify(&database, &client)
+        .await
+        .unwrap();
     database.close().await;
     state.db.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

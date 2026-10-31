@@ -10,14 +10,26 @@ impl Database {
     pub(crate) async fn history_reader(
         &self,
     ) -> Result<Option<crate::request_history::ClickHouse>, HistoryError> {
-        if std::env::var_os("MTC_REQUEST_HISTORY_URL").is_none() {
-            if self.history_mode().await? == "clickhouse" {
-                return Err(HistoryError::Unavailable);
-            }
+        let row =
+            sqlx::query("SELECT mode, verification_json FROM request_history_state WHERE id=1")
+                .fetch_one(&self.pool)
+                .await?;
+        if row.try_get::<String, _>("mode")? != "clickhouse" {
             return Ok(None);
         }
-        if self.history_mode().await? != "clickhouse" {
-            return Ok(None);
+        if std::env::var_os("MTC_REQUEST_HISTORY_URL").is_none() {
+            return Err(HistoryError::Unavailable);
+        }
+        let report: Option<String> = row.try_get("verification_json")?;
+        if report
+            .as_deref()
+            .map(serde_json::from_str::<Value>)
+            .transpose()?
+            .as_ref()
+            .and_then(|v| v["read_model_version"].as_i64())
+            != Some(crate::request_history::READ_MODEL_VERSION)
+        {
+            return Err(HistoryError::Changed);
         }
         crate::request_history::ClickHouse::reader_from_env(
             self.http_clients
@@ -281,6 +293,12 @@ impl Database {
     pub async fn history_refresh(&self) -> Result<(), HistoryError> {
         let mut tx = self.begin_write_transaction().await?;
         sqlx::query("UPDATE request_history_state SET mode = 'shadow', verified_revision = NULL, verification_json = NULL WHERE id = 1").execute(&mut *tx).await?;
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_history_export")
+            .fetch_one(&mut *tx)
+            .await?;
+        if pending != 0 {
+            return Err(HistoryError::Changed);
+        }
         sqlx::query("UPDATE request_history_backfill SET after_id = '', done = 0")
             .execute(&mut *tx)
             .await?;
@@ -573,9 +591,7 @@ impl Database {
                 .source_request_archive_refs(identity.key_id, identity.request_id)
                 .await?;
             archive.view = serde_json::from_value(payload.clone())?;
-            let fact = self
-                .history_analysis_fact(&identity, payload, statistics.as_ref())
-                .await?;
+            let fact = self.history_analysis_fact(&identity).await?;
             let egress_attempts = self
                 .source_request_egress_attempts(identity.request_id)
                 .await?;
@@ -626,8 +642,6 @@ impl Database {
     async fn history_analysis_fact(
         &self,
         identity: &HistoryIdentity,
-        payload: &Value,
-        statistics: Option<&HistoryStatistics>,
     ) -> Result<Value, HistoryError> {
         let sql = match identity.source.as_str() {
             "native" => {
@@ -646,14 +660,6 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
         let Some(row) = row else {
-            if payload["operational_terminal"].is_object() || !payload["completed_at"].is_null() {
-                return Ok(
-                    serde_json::json!({"settled_fact":false,"status_class":if payload["lifecycle_state"]=="succeeded" && payload["error_code"].as_str().is_none_or(str::is_empty) {"success"} else {"failure"},
-                    "input_tokens":payload["input_tokens"],"output_tokens":payload["output_tokens"],"cached_input_tokens":payload["cached_input_tokens"],"cache_write_tokens":payload["cache_write_tokens"],
-                    "generation_units":payload["usage"]["generation"]["billed_units"],"duration_ms":payload["duration_ms"],
-                    "cost_micros":statistics.and_then(|s|s.cost_micros),"currency":statistics.and_then(|s|s.currency.as_deref()),"modality":Value::Null}),
-                );
-            }
             return Ok(Value::Null);
         };
         let mut fact = serde_json::Map::new();
