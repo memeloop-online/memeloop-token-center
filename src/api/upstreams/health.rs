@@ -88,8 +88,31 @@ pub(in crate::api) async fn read_upstream_service_probe(
             .db
             .upstream_service_probe(account_id)
             .await?
+            .map(visible_probe_attempt)
             .unwrap_or(Value::Null),
     ))
+}
+
+/// Existing clients render the top-level status. A skipped latest attempt
+/// must remain visible after reload, without erasing the last real result.
+fn visible_probe_attempt(mut result: Value) -> Value {
+    let Some(attempt) = result
+        .get("last_attempt")
+        .filter(|attempt| attempt["status"] == "skipped")
+    else {
+        return result;
+    };
+    let mut visible = attempt.clone();
+    result
+        .as_object_mut()
+        .expect("probe results are objects")
+        .remove("last_attempt");
+    visible["last_result"] = if result["status"] == "skipped" {
+        Value::Null
+    } else {
+        result
+    };
+    visible
 }
 
 pub(crate) async fn run_upstream_service_probes(

@@ -264,6 +264,31 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     assert_eq!(saved["checked_at"], result["checked_at"]);
     assert_eq!(saved["actual_model"], "upstream-0");
     assert_eq!(saved["last_attempt"]["status"], "skipped");
+    let response = router_for_role(fixture.state.clone(), RuntimeRole::Control)
+        .oneshot(
+            Request::get(format!("/internal/v1/upstreams/{account}/health"))
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", fixture.state.config.service_token),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let reloaded: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reloaded["status"], "skipped",
+        "the existing status UI must not reload stale healthy"
+    );
+    assert_eq!(reloaded["error_code"], "probe_route_unavailable");
+    assert_eq!(reloaded["last_result"]["checked_at"], result["checked_at"]);
+    assert_eq!(reloaded["last_result"]["actual_model"], "upstream-0");
     upstream.verify().await;
     pool.close().await;
 }

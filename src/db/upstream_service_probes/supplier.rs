@@ -57,9 +57,13 @@ impl Database {
                request_id = excluded.request_id
              WHERE upstream_supplier_availability.observed_at < excluded.observed_at
                 OR (upstream_supplier_availability.observed_at = excluded.observed_at
-                    AND upstream_supplier_availability.request_id = excluded.request_id
-                    AND (excluded.failure_kind = 'quota_exhausted'
-                         OR upstream_supplier_availability.failure_kind = 'rate_limited'))",
+                    AND (
+                      (upstream_supplier_availability.failure_kind = 'rate_limited'
+                       AND excluded.failure_kind = 'quota_exhausted')
+                      OR (upstream_supplier_availability.request_id = excluded.request_id
+                          AND (excluded.failure_kind = 'quota_exhausted'
+                               OR upstream_supplier_availability.failure_kind = 'rate_limited'))
+                    ))",
         )
         .bind(route.account_id.to_string())
         .bind(&route.upstream_model)
@@ -86,6 +90,7 @@ impl Database {
                AND a.updated_at = q.transport_revision
              WHERE a.id = $1 AND a.status = 'active' AND q.upstream_model <> ''
                AND q.failure_kind <> 'available'
+               AND (q.failure_kind = 'quota_exhausted' OR q.reset_at IS NOT NULL)
                AND (q.reset_at IS NULL OR q.reset_at <= $2)
              ORDER BY q.observed_at, q.upstream_model",
         )

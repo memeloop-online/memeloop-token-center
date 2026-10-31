@@ -364,6 +364,51 @@ async fn scoped_evidence_contract(database: &Database) {
         .unwrap();
     assert_eq!(restored.len(), 2);
 
+    let known = SupplierQuotaEvidence {
+        exhausted: true,
+        reset_at: Some(now + 60_000),
+        reset_source: "retry_after",
+    };
+    database
+        .store_supplier_quota(&route, Uuid::now_v7(), now + 7, known)
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .supplier_quota_probe_deadline(a, "expensive")
+            .await
+            .unwrap(),
+        known.reset_at
+    );
+    assert!(
+        database
+            .supplier_quota_probe_deadline(a, "cheap")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    database
+        .store_supplier_quota(
+            &route,
+            Uuid::now_v7(),
+            now + 8,
+            SupplierQuotaEvidence {
+                exhausted: false,
+                reset_at: None,
+                reset_source: "unknown",
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .supplier_quota_probe_deadline(a, "expensive")
+            .await
+            .unwrap(),
+        known.reset_at,
+        "an ordinary rate limit without timing cannot clear known exhaustion"
+    );
+
     let mut stale = route.clone();
     stale.credential_generation -= 1;
     database
