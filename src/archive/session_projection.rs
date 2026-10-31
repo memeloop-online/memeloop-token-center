@@ -802,21 +802,6 @@ impl Context {
                             _ => gaps.push("media_base64_invalid".into()),
                         }
                     }
-                    let kind = values.get("type").and_then(Value::as_str);
-                    if matches!(
-                        kind,
-                        Some("image_url" | "input_image" | "url" | "file" | "input_file")
-                    ) && values.iter().any(|(name, value)| {
-                        matches!(name.as_str(), "url" | "image_url" | "file_url" | "file_id")
-                            && !value
-                                .as_str()
-                                .or_else(|| value.get("url").and_then(Value::as_str))
-                                .is_some_and(|text| {
-                                    text.starts_with("data:") || references.contains_key(text)
-                                })
-                    }) {
-                        gaps.push("external_media_not_captured".into());
-                    }
                     for (name, value) in values {
                         walk(
                             context,
@@ -826,6 +811,27 @@ impl Context {
                             media,
                             gaps,
                         )?;
+                    }
+                    let kind = values.get("type").and_then(Value::as_str);
+                    if matches!(
+                        kind,
+                        Some("image_url" | "input_image" | "url" | "file" | "input_file")
+                    ) && values.iter().any(|(name, value)| {
+                        if !matches!(name.as_str(), "url" | "image_url" | "file_url" | "file_id") {
+                            return false;
+                        }
+                        let location = format!("{pointer}/{name}");
+                        let location = if value.is_object() {
+                            format!("{location}/url")
+                        } else {
+                            location
+                        };
+                        // A spilled string marker only locates decoded text.
+                        // Only successfully decoded media at this exact field
+                        // proves capture; a long external URL is still a gap.
+                        !media.iter().any(|item| item.json_pointer == location)
+                    }) {
+                        gaps.push("external_media_not_captured".into());
                     }
                 }
                 _ => {}
@@ -1538,6 +1544,63 @@ mod tests {
         while let Some(chunk) = export.next().await {
             chunk.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn spilled_external_media_retains_gap_and_original_url() {
+        use base64::Engine;
+        let store = ArchiveStore::memory_for_test();
+        let tenant = Uuid::now_v7();
+        let request = Uuid::now_v7();
+        let url = format!("https://media.invalid/{}", "x".repeat(CHUNK * 2));
+        let bytes = b"retained inline image";
+        let document = serde_json::json!({"messages":[{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":url}},
+            {"type":"input_file","file_id":"file-provider-only"},
+            {"type":"image_url","image_url":{"url":format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))}}
+        ]}]});
+        let original = Bytes::from(serde_json::to_vec(&document).unwrap());
+        let locator = store
+            .put_tenant_content(tenant, original.clone())
+            .await
+            .unwrap()
+            .object_locator;
+        let prepared = store
+            .prepare_session_body_streamed(
+                tenant,
+                request,
+                ConversationHints::default(),
+                locator.clone(),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.media.len(), 1);
+        assert_eq!(
+            store
+                .get(&prepared.media[0].object_locator)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes
+        );
+        let root = store
+            .request_conversation_reference(tenant, request)
+            .await
+            .unwrap();
+        let manifest = store
+            .get_conversation_manifest(tenant, &root, 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            manifest
+                .gaps
+                .iter()
+                .any(|gap| gap == "external_media_not_captured")
+        );
+        assert_eq!(store.get(&locator).await.unwrap(), original);
     }
 
     #[tokio::test]
