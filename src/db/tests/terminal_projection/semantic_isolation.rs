@@ -29,7 +29,15 @@ async fn reclaim(database: &Database, request_id: Uuid) -> Uuid {
 }
 
 async fn recovery_contract(database_url: &str) {
-    let database = Database::connect(database_url).await.unwrap();
+    let archive = crate::archive::ArchiveStore::from_config(&crate::config::Config::for_test(
+        database_url.to_owned(),
+    ))
+    .await
+    .unwrap();
+    let database = Database::connect(database_url)
+        .await
+        .unwrap()
+        .with_archive(archive.clone());
     database.migrate().await.unwrap();
     let (key, reservation, request_id) = admitted(&database, true).await;
     let body =
@@ -162,7 +170,7 @@ async fn recovery_contract(database_url: &str) {
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&marker.get::<String, _>("request_json"))
             .unwrap(),
-        body
+        serde_json::json!({})
     );
     assert_eq!(marker.get::<String, _>("lease_owner"), "terminal-v118");
     assert_eq!(marker.get::<i64, _>("lease_expires_at"), i64::MAX);
@@ -320,7 +328,10 @@ async fn recovery_contract(database_url: &str) {
         .await
         .unwrap();
     database.pool.close().await;
-    let database = Database::connect(database_url).await.unwrap();
+    let database = Database::connect(database_url)
+        .await
+        .unwrap()
+        .with_archive(archive);
     sqlx::query("UPDATE conversation_projection_outbox SET terminal_lease_expires_at = 0 WHERE request_id = $1")
         .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
     let owner = Uuid::now_v7();
@@ -376,7 +387,14 @@ async fn recovery_contract(database_url: &str) {
             .await
             .unwrap();
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&restored).unwrap(),
+        serde_json::from_str::<serde_json::Value>(
+            &database
+                .read_body_reference(key.tenant_id, &restored)
+                .await
+                .unwrap()
+                .0
+        )
+        .unwrap(),
         crate::conversation::extract_atoms(&body)[0].content
     );
     let lifetime: i64 = sqlx::query_scalar(

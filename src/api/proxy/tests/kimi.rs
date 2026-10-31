@@ -227,9 +227,34 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                     .as_ref(),
                 body.as_bytes()
             );
+            let content = crate::api::request_detail::request_archive_content_response(
+                &fixture.state,
+                &HeaderMap::new(),
+                &refs,
+                crate::api::request_detail::RequestArchiveSide::Response,
+            )
+            .await
+            .unwrap();
+            assert_eq!(content.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(content.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                body.as_bytes()
+            );
             let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
             if let Ok(original) = serde_json::from_str::<Value>(body) {
-                assert_eq!(detail.response_body, original);
+                if body.len() <= crate::api::request_detail::MAX_ARCHIVE_DETAIL_BODY
+                    && crate::api::request_detail::json_value_structure_is_bounded(&original)
+                {
+                    assert_eq!(detail.response_body, original);
+                } else {
+                    assert_eq!(detail.response_body, Value::Null);
+                    assert!(!detail.archive.response.complete);
+                }
+            } else {
+                assert_eq!(detail.response_body, Value::String(body.clone()));
             }
             assert!(
                 !serde_json::to_string(&record.supplier_error)

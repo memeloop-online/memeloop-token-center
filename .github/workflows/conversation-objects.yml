@@ -95,6 +95,7 @@ jobs:
       - run: cargo test --locked --lib downstream_disconnect_records_unknown_without_waiting_for_stalled_upstream
       - run: cargo test --locked --lib native_codex_ambiguous_transport_after_request_bytes_is_not_replayed
       - run: cargo test --locked --lib api::proxy::tests::upstream_error_details
+      - run: cargo test --locked --lib sqlite_semantic_payload_recovers_without_source_or_duplicate_finance
       - run: cargo test --locked --lib api::audio::tests
       - run: cargo test --locked --lib api::proxy::tests::kimi
       - name: RustFS fixture diagnostics
