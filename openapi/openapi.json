@@ -26449,7 +26449,8 @@
               "duration_ms",
               "cost_micros",
               "key_alias",
-              "principal"
+              "principal",
+              "session_association"
             ]
           },
           "operator": {

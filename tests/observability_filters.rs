@@ -708,6 +708,35 @@ async fn postgres_observability_queries_use_the_same_bound_contract() {
         memeloop_token_center::model::RequestSessionAssociation::Unlinked
     );
     assert!(unlinked.session_id.is_none());
+    for (association, expected, excluded) in [
+        ("unlinked", unlinked_request, confirmed_request),
+        ("confirmed", confirmed_request, unlinked_request),
+    ] {
+        let requests = state
+            .db
+            .list_all_requests_filtered(
+                &tenant,
+                memeloop_token_center::db::RequestListFilter {
+                    limit: 100,
+                    key_id: Some(key.key_id),
+                    typed_ast: Some(TypedFilterAst {
+                        logical_operator: TypedFilterLogicalOperator::And,
+                        conditions: vec![TypedFilterCondition {
+                            field: TypedFilterField::SessionAssociation,
+                            operator: TypedFilterOperator::Equals,
+                            value: TypedFilterValue::Text(association.into()),
+                            upper: None,
+                        }],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(requests.iter().any(|row| row.request_id == expected));
+        assert!(requests.iter().all(|row| row.request_id != excluded));
+    }
+
     let filter = memeloop_token_center::db::RequestListFilter {
         limit: 10,
         route_id: Some(route_id),
