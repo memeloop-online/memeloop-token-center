@@ -201,6 +201,8 @@ async fn scoped_evidence_contract(database: &Database) {
     let br = route(database, b, "public", "expensive").await;
     grant(database, key.key_id, ar, None).await;
     grant(database, key.key_id, br, None).await;
+    let cheap_route = route(database, a, "public-cheap", "cheap").await;
+    grant(database, key.key_id, cheap_route, None).await;
     let candidates = database
         .resolve_authorized_upstream_candidates_with_hint(
             key.key_id,
@@ -235,6 +237,22 @@ async fn scoped_evidence_contract(database: &Database) {
         .unwrap();
     assert_eq!(remaining.len(), 1, "quota excludes even a hinted account");
     assert_eq!(remaining[0].account_id, b);
+    let cheap = database
+        .list_authorized_upstream_candidates_with_hint(
+            key.key_id,
+            key.tenant_id,
+            "public-cheap",
+            "openai",
+            selection(None),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        cheap.len(),
+        1,
+        "model quota must not disable the whole account"
+    );
+    assert_eq!(cheap[0].account_id, a);
     let recovery = database
         .list_upstream_candidates_for_dispatch(
             key.key_id,

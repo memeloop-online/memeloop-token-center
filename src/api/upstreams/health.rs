@@ -177,8 +177,14 @@ async fn run_upstream_service_probe(
         Err(_) => return skipped(account_id, "probe_account_unavailable").0,
     };
     let started_at = unix_millis();
-    let (mut body, _) =
-        upstream_service_probe_body(state, account_id, &account, recovery_model).await;
+    let (mut body, _) = upstream_service_probe_body(
+        state,
+        account_id,
+        &account,
+        recovery_model,
+        trigger != "manual",
+    )
+    .await;
     body["trigger"] = json!(trigger);
     body["started_at"] = json!(started_at);
     body["credential_generation"] = json!(account.credential_generation);
@@ -313,6 +319,9 @@ async fn prepare_model_probe(
     };
     let configured =
         recovery_model.or_else(|| account.config.get("probe_model").and_then(Value::as_str));
+    if select_probe_model(configured, &catalog).is_none() {
+        return Err(skipped(account_id, "probe_model_unavailable"));
+    }
     bill_model_probe(state, account_id, account, configured, catalog).await
 }
 
@@ -474,13 +483,22 @@ async fn send_model_probe(
     body["request_id"] = json!(context.request_id);
     body["selected_model"] = json!(prepared.model);
     let observation = target.observation();
-    body["actual_model"] = json!(observation.0);
-    body["upstream_status"] = json!(observation.1);
-    if body["status"] != "skipped" && observation.1.is_none() && observation.0.is_none() {
+    body["actual_model"] = json!(observation.model);
+    body["upstream_status"] = json!(observation.status);
+    if body["status"] != "skipped" && observation.status.is_none() && observation.model.is_none() {
         body["status"] = json!("skipped");
         body["error_code"] = json!("probe_admission_skipped");
     }
-    body["status_origin"] = json!(if observation.1.is_some() {
+    if let Some(quota) = observation.quota {
+        body["error_code"] = json!(if quota.exhausted {
+            "quota_exhausted"
+        } else {
+            "rate_limited"
+        });
+        body["reset_at"] = json!(quota.reset_at);
+        body["reset_source"] = json!(quota.reset_source);
+    }
+    body["status_origin"] = json!(if observation.status.is_some() {
         "provider"
     } else {
         "mtc"
@@ -493,9 +511,30 @@ async fn upstream_service_probe_body(
     account_id: Uuid,
     account: &crate::db::upstream_service_probes::ProbeAccountContext,
     recovery_model: Option<&str>,
+    periodic: bool,
 ) -> (Value, bool) {
     match prepare_model_probe(state, account_id, account, recovery_model).await {
-        Ok(prepared) => send_model_probe(state, account_id, prepared).await,
+        Ok(prepared) => {
+            if periodic {
+                match state
+                    .db
+                    .supplier_quota_probe_deadline(account_id, &prepared.model)
+                    .await
+                {
+                    Ok(Some(deadline)) => {
+                        let (mut body, store) = skipped(account_id, "supplier_quota_reset_pending");
+                        body["selected_model"] = json!(prepared.model);
+                        body["reset_at"] = json!(deadline);
+                        return (body, store);
+                    }
+                    Err(error) => {
+                        return prepare_failed(account_id, &error, "probe_state_unavailable");
+                    }
+                    Ok(None) => {}
+                }
+            }
+            send_model_probe(state, account_id, prepared).await
+        }
         Err(finished) => finished,
     }
 }

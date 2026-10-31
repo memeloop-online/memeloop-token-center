@@ -624,7 +624,7 @@ async fn gateway_component_hard_quota_survives_invalid_strategy_native_fallback(
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"vendor_answer":"must-not-send"})),
         )
-        .expect(1)
+        .expect(0)
         .mount(&upstream)
         .await;
     let label = "group-component-hard-fallback";
@@ -645,12 +645,11 @@ async fn gateway_component_hard_quota_survives_invalid_strategy_native_fallback(
         .await
         .unwrap();
     let before = health(&fixture, tenant, generation).await;
-    // The real plan always requests allow_transient_probe=true. Hard quota
-    // makes that result invalid and leaves no per-candidate policy. The core
-    // component admission gate must still run under this native fallback.
+    // The candidate snapshot excludes hard quota before a strategy or
+    // component hook can authorize an outbound request.
     let response = send_resilient_chat(&fixture, None, false).await;
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
     let after = health(&fixture, tenant, generation).await;
     assert_eq!(after.last_failure_kind, "quota_exhausted");
     assert_eq!(after.cooldown_until, before.cooldown_until);
@@ -711,7 +710,7 @@ async fn gateway_component_without_configured_strategy_still_blocks_hard_quota()
         .respond_with(
             ResponseTemplate::new(200).set_body_json(json!({"vendor_answer":"must-not-send"})),
         )
-        .expect(1)
+        .expect(0)
         .mount(&upstream)
         .await;
     let label = "component-no-strategy-hard-quota";
@@ -741,7 +740,7 @@ async fn gateway_component_without_configured_strategy_still_blocks_hard_quota()
     let before = health(&fixture, tenant, generation).await;
     let response = send_resilient_chat(&fixture, None, false).await;
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
     let after = health(&fixture, tenant, generation).await;
     assert_eq!(after.last_failure_kind, "quota_exhausted");
     assert_eq!(after.cooldown_until, before.cooldown_until);

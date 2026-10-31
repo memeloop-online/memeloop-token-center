@@ -137,6 +137,7 @@ async fn upgrade_contract(database: &Database) {
         "DROP TABLE transport_proxy_management_audit",
         "DROP TABLE transport_proxy_management_lock",
         "DROP TABLE upstream_service_probes",
+        "DROP TABLE upstream_supplier_availability",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)

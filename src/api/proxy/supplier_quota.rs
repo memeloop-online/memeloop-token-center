@@ -8,6 +8,7 @@ pub(super) fn publish_supplier_quota(
     observed_at: i64,
     evidence: crate::db::SupplierQuotaEvidence,
 ) {
+    IndependentProbeTarget::quota(evidence);
     let database = state.db.clone();
     let route = route.clone();
     state.routing_persistence.submit(4096, async move {

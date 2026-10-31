@@ -410,7 +410,7 @@ async fn image_group_hard_quota_never_sends() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(1)
+        .expect(0)
         .mount(&upstream)
         .await;
     let fixture = fixture(&upstream).await;
@@ -429,7 +429,7 @@ async fn image_group_hard_quota_never_sends() {
         .unwrap();
     let response = post(fixture.state.clone(), &fixture.credential, "hard-image").await;
     let _ = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    assert_eq!(upstream.received_requests().await.unwrap().len(), 0);
     let health = fixture
         .state
         .db

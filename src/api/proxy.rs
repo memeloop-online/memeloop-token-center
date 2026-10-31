@@ -800,10 +800,7 @@ async fn execute_component_primary(
     cancellation.prepare_dispatch(&request).await?;
     execute_component_provider(
         request,
-        &active_route.route.driver,
-        &active_route.route.base_url,
-        &active_route.route.config,
-        &active_route.route.credential,
+        &active_route.route,
         prepared,
         component_context,
         upstream_attempt,
@@ -1508,6 +1505,13 @@ async fn proxy_with_cancellation_guard(
         }
         if let Ok(response) = &result {
             IndependentProbeTarget::response(response.response.status());
+        } else if matches!(
+            &result,
+            Err(ProxySendError::CandidateUnavailable
+                | ProxySendError::CredentialUnavailable
+                | ProxySendError::Credential)
+        ) {
+            IndependentProbeTarget::not_dispatched();
         }
         let (result, rate_limit) = match result {
             Ok(mut result)
@@ -2606,14 +2610,18 @@ struct BufferedRequest<'a> {
 #[allow(clippy::too_many_arguments)]
 async fn execute_component_provider(
     request: BufferedRequest<'_>,
-    driver: &str,
-    base_url: &str,
-    config: &Value,
-    credential: &UpstreamCredential,
+    route: &ResolvedUpstream,
     prepared: PreparedProviderRequest,
     context: RequestContext,
     mut upstream_attempt: Option<UpstreamAttemptGuard>,
 ) -> Result<Response, AppError> {
+    let ResolvedUpstream {
+        driver,
+        base_url,
+        config,
+        credential,
+        ..
+    } = route;
     let target = match component_provider_url(base_url, &prepared.path) {
         Ok(target) => target,
         Err(_) => {
@@ -2707,6 +2715,7 @@ async fn execute_component_provider(
         .metrics
         .active_upstream(driver, "component_provider");
     let upstream_started = Instant::now();
+    IndependentProbeTarget::before_send(route)?;
     let upstream_result = upstream_request.send().await;
     if let Some(conversation) = request.conversation.as_ref() {
         conversation.release_working_copies(&request.memory);
@@ -2751,10 +2760,20 @@ async fn execute_component_provider(
         }
     };
     let upstream_status = upstream.status();
+    IndependentProbeTarget::response(upstream_status);
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
         if let Some(attempt) = upstream_attempt.as_mut() {
             let terminal = if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-                let (response, kind) = routing::classify_rate_limit(upstream.into()).await;
+                let observed_at = unix_millis();
+                let (response, kind, evidence) =
+                    routing::classify_supplier_quota(upstream.into()).await;
+                publish_supplier_quota(
+                    request.state,
+                    route,
+                    request.request_id,
+                    observed_at,
+                    evidence,
+                );
                 drop(response);
                 UpstreamAttemptTerminal::Failed {
                     kind,

@@ -1,5 +1,12 @@
 use super::*;
 
+#[derive(Clone, Default)]
+pub(in crate::api) struct ProbeObservation {
+    pub(in crate::api) model: Option<String>,
+    pub(in crate::api) status: Option<u16>,
+    pub(in crate::api) quota: Option<crate::db::SupplierQuotaEvidence>,
+}
+
 /// Internal-only pin, not a customer header. Also captures what actually
 /// reached transport, so an MTC rejection cannot masquerade as provider429.
 #[derive(Clone)]
@@ -8,7 +15,7 @@ pub(in crate::api) struct IndependentProbeTarget {
     model: String,
     generation: i64,
     revision: i64,
-    observed: std::sync::Arc<std::sync::Mutex<(Option<String>, Option<u16>)>>,
+    observed: std::sync::Arc<std::sync::Mutex<ProbeObservation>>,
 }
 
 tokio::task_local! {
@@ -31,7 +38,7 @@ impl IndependentProbeTarget {
         }
     }
 
-    pub(in crate::api) fn observation(&self) -> (Option<String>, Option<u16>) {
+    pub(in crate::api) fn observation(&self) -> ProbeObservation {
         self.observed
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -52,7 +59,7 @@ impl IndependentProbeTarget {
                     .observed
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .0 = Some(route.upstream_model.clone());
+                    .model = Some(route.upstream_model.clone());
                 Ok(())
             })
             .unwrap_or(Ok(()))
@@ -64,7 +71,26 @@ impl IndependentProbeTarget {
                 .observed
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .1 = Some(status.as_u16());
+                .status = Some(status.as_u16());
+        });
+    }
+
+    pub(super) fn not_dispatched() {
+        let _ = TARGET.try_with(|target| {
+            *target
+                .observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = ProbeObservation::default();
+        });
+    }
+
+    pub(super) fn quota(evidence: crate::db::SupplierQuotaEvidence) {
+        let _ = TARGET.try_with(|target| {
+            target
+                .observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .quota = Some(evidence);
         });
     }
 }
