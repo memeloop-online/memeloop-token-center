@@ -816,3 +816,214 @@ async fn late_parent_reconciliation_preserves_related_union_and_subtree_usage() 
         .unwrap();
     assert_eq!(facts, 4);
 }
+
+#[tokio::test]
+async fn late_parent_reconciliation_rejects_cycles_and_parent_conflicts_atomically() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory
+            .path()
+            .join("task-reconciliation-conflicts.db")
+            .display()
+    ))
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    for cycle in [true, false] {
+        let owner = key(&db, &format!("reconciliation-conflict-{cycle}")).await;
+        let target_thread = Uuid::now_v7();
+        let target = session(&db, &owner, target_thread).await;
+        let peer = session(&db, &owner, Uuid::now_v7()).await;
+        let root = session(&db, &owner, Uuid::now_v7()).await;
+        let source = SessionIdentity {
+            key_id: owner.key_id,
+            session_id: observe(
+                &db,
+                &owner,
+                &json!({"input":"delayed-parent child"}),
+                &ConversationHints {
+                    parent_turn_id: Some("late-conflicting-turn".into()),
+                    ..Default::default()
+                },
+                Uuid::now_v7(),
+                2,
+                true,
+            )
+            .await,
+        };
+        // A valid S -> X -> T chain, or incompatible S -> X / T -> R evidence.
+        for (from, to, kind) in [
+            (&source, &peer, "parent"),
+            (
+                if cycle { &peer } else { &target },
+                if cycle { &target } else { &root },
+                "parent",
+            ),
+            (&source, &root, "related"),
+        ] {
+            db.change_session_relationship(
+                owner.tenant_id,
+                from,
+                to,
+                kind,
+                Some("thread_spawn_edges"),
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        for identity in [&source, &target, &peer] {
+            fact(&db, owner.tenant_id, identity, 1).await;
+        }
+        sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,protocol,model,input_tokens,output_tokens,imported_at) VALUES ($1,'fixture',$2,$2,$3,$4,$5,1,'openai-responses','archive',7,9,1)")
+            .bind(owner.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(owner.key_id.to_string()).bind(owner.principal_id.to_string()).bind(source.session_id.to_string()).execute(&db.pool).await.unwrap();
+        sqlx::query("INSERT INTO session_generated_titles (tenant_id,key_id,session_id,title,title_source,state,next_attempt_at,updated_at) VALUES ($1,$2,$3,'Source manual','manual','ready',1,1)")
+            .bind(owner.tenant_id.to_string()).bind(owner.key_id.to_string()).bind(source.session_id.to_string()).execute(&db.pool).await.unwrap();
+        let snapshot = async || {
+            let tenant = owner.tenant_id.to_string();
+            let edges: Vec<(String, String, String, String, String, Option<String>, i64)> = sqlx::query_as("SELECT key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at FROM session_relationships WHERE tenant_id=$1 ORDER BY key_id,session_id,target_key_id,target_session_id,kind")
+                .bind(&tenant).fetch_all(&db.pool).await.unwrap();
+            let observations: Vec<(String, String, String)> = sqlx::query_as("SELECT id,request_id,cluster_id FROM conversation_observations WHERE key_id=$1 ORDER BY id")
+                .bind(owner.key_id.to_string()).fetch_all(&db.pool).await.unwrap();
+            let projections: Vec<(String, i64, i64)> = sqlx::query_as("SELECT cluster_id,request_count,updated_at FROM conversation_key_clusters WHERE key_id=$1 ORDER BY cluster_id")
+                .bind(owner.key_id.to_string()).fetch_all(&db.pool).await.unwrap();
+            let facts: Vec<(String, String, i64, i64)> = sqlx::query_as("SELECT request_id,session_id,input_tokens,cost_micros FROM request_stats_facts WHERE tenant_id=$1 ORDER BY request_id")
+                .bind(&tenant).fetch_all(&db.pool).await.unwrap();
+            let archives: Vec<(String, String, i64, i64)> = sqlx::query_as("SELECT archive_request_id,conversation_cluster_id,input_tokens,output_tokens FROM session_archive_unlinked_requests WHERE tenant_id=$1 ORDER BY archive_request_id")
+                .bind(&tenant).fetch_all(&db.pool).await.unwrap();
+            (edges, observations, projections, facts, archives)
+        };
+        let before = snapshot().await;
+        let mut tx = db.begin_write_transaction().await.unwrap();
+        let result = db
+            .record_conversation_observation_in_transaction(
+                &mut tx,
+                crate::db::requests::conversations::ConversationObservationInput {
+                    key: &owner,
+                    request_id: Uuid::now_v7(),
+                    request_json: &json!({"input":"parent now published"}),
+                    hints: &ConversationHints {
+                        session_id: Some(target_thread.to_string()),
+                        turn_id: Some("late-conflicting-turn".into()),
+                        ..Default::default()
+                    },
+                    client_name: Some("Codex"),
+                    upstream_response_id: None,
+                    observed_at: 3,
+                    attach_request_record: false,
+                    content_materialized: false,
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(AppError::Conflict(ref message)) if message.contains(if cycle { "parent cycle" } else { "contradictory parent evidence" }))
+        );
+        tx.rollback().await.unwrap();
+        assert_eq!(snapshot().await, before);
+        assert_eq!(
+            db.session_title(owner.tenant_id, owner.key_id, source.session_id)
+                .await
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Source manual")
+        );
+        let unresolved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_unresolved_explicit_parents WHERE tenant_id=$1",
+        )
+        .bind(owner.tenant_id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(unresolved, 1);
+        let analysis = db
+            .analyze_session_tasks(
+                owner.tenant_id,
+                &[peer],
+                "subtree",
+                None,
+                &SessionTaskOptions::default(),
+            )
+            .await
+            .unwrap();
+        // S's fact + archive and X's fact; T remains outside X's subtree.
+        assert_eq!(analysis["totals"]["requests"], 3);
+        assert_eq!(analysis["totals"]["costs"]["USD"], 14);
+        assert_eq!(analysis["totals"]["unknown_cost_requests"], 1);
+    }
+}
+
+#[tokio::test]
+async fn late_parent_reconciliation_retains_multiple_identities_of_one_parent_thread() {
+    let directory = tempfile::tempdir().unwrap();
+    let db = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("mapped-reconciliation.db").display()
+    ))
+    .await
+    .unwrap();
+    db.migrate().await.unwrap();
+    let owner = key(&db, "mapped-reconciliation").await;
+    let other = key(&db, "mapped-reconciliation").await;
+    let parent_thread = Uuid::now_v7();
+    let parent = session(&db, &owner, parent_thread).await;
+    let other_parent = session(&db, &other, parent_thread).await;
+    let target_thread = Uuid::now_v7();
+    let target = session(&db, &owner, target_thread).await;
+    let source = SessionIdentity {
+        key_id: owner.key_id,
+        session_id: observe(
+            &db,
+            &owner,
+            &json!({"input":"mapped child"}),
+            &ConversationHints {
+                parent_turn_id: Some("mapped-late-turn".into()),
+                ..Default::default()
+            },
+            Uuid::now_v7(),
+            2,
+            true,
+        )
+        .await,
+    };
+    for (from, to) in [(&source, &parent), (&target, &other_parent)] {
+        db.change_session_relationship(
+            owner.tenant_id,
+            from,
+            to,
+            "parent",
+            Some("source.subagent.thread_spawn"),
+            false,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        observe(
+            &db,
+            &owner,
+            &json!({"input":"mapped parent now published"}),
+            &ConversationHints {
+                session_id: Some(target_thread.to_string()),
+                turn_id: Some("mapped-late-turn".into()),
+                ..Default::default()
+            },
+            Uuid::now_v7(),
+            3,
+            true
+        )
+        .await,
+        target.session_id
+    );
+    let relationships = db
+        .session_relationships(owner.tenant_id, &target, None)
+        .await
+        .unwrap();
+    let edges = relationships["relationships"].as_array().unwrap();
+    assert_eq!(edges.len(), 2);
+    for identity in [&parent, &other_parent] {
+        assert!(edges.iter().any(|edge| edge["target"] == json!(identity)
+            && edge["evidence"] == "source.subagent.thread_spawn"));
+    }
+}

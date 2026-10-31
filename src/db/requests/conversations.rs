@@ -2602,6 +2602,7 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
     rows.into_iter()
         .map(|row| {
             let unlinked = row.try_get::<i64, _>("unlinked")? != 0;
+            let session_id: Option<String> = row.try_get("session_id")?;
             let source: String = row.try_get("source_kind")?;
             let billable = source == "live";
             let raw_input_tokens: i64 = row.try_get("input_tokens")?;
@@ -2711,12 +2712,12 @@ fn conversation_request_views(rows: Vec<AnyRow>) -> Result<Vec<ConversationReque
                     ))?,
                     credential_identity: None,
                     session_context: Some(RequestSessionContext {
-                        session_id: row.try_get("session_id")?,
-                        association: if unlinked {
+                        association: if session_id.is_none() {
                             RequestSessionAssociation::Unlinked
                         } else {
                             RequestSessionAssociation::Confirmed
                         },
+                        session_id,
                         session_name: row.try_get("session_name")?,
                         task_kind: row.try_get("task_kind")?,
                         agent_id: row.try_get("agent_id")?,

@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 
 /// Follow the same credential-scoped merge as observations and usage. Cached
 /// response text remains content-addressed; no archived body is copied.
@@ -18,8 +19,46 @@ pub(crate) async fn merge_session_reading_in_transaction(
         .await?;
     let relationships = sqlx::query("SELECT key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at FROM session_relationships WHERE tenant_id=$1 AND ((key_id=$2 AND session_id=$3) OR (target_key_id=$2 AND target_session_id=$3))")
         .bind(tenant).bind(key).bind(source).fetch_all(&mut **tx).await?;
+    // Collapsing two children must not combine incompatible parent evidence.
+    // Compare the surviving targets, allowing multiple exact identities of the
+    // same explicit parent thread rather than treating each credential as a parent.
+    let mut parent_sets = Vec::new();
+    for session in [source, target] {
+        let rows = sqlx::query("SELECT target_key_id,target_session_id FROM session_relationships WHERE tenant_id=$1 AND key_id=$2 AND session_id=$3 AND kind='parent'")
+            .bind(tenant).bind(key).bind(session).fetch_all(&mut **tx).await?;
+        let mut parents = BTreeSet::new();
+        for row in rows {
+            let parent_key: String = row.try_get("target_key_id")?;
+            let mut parent_session: String = row.try_get("target_session_id")?;
+            if parent_key == key && parent_session == source {
+                parent_session = target.to_owned();
+            }
+            if parent_key != key || parent_session != target {
+                parents.insert((parent_key, parent_session));
+            }
+        }
+        parent_sets.push(parents);
+    }
+    if !parent_sets[0].is_empty() && !parent_sets[1].is_empty() && parent_sets[0] != parent_sets[1]
+    {
+        let mut common_threads: Option<BTreeSet<String>> = None;
+        for (parent_key, parent_session) in parent_sets[0].union(&parent_sets[1]) {
+            let threads: BTreeSet<String> = sqlx::query_scalar::<_, String>("SELECT DISTINCT o.explicit_session_id FROM conversation_observations o JOIN conversation_clusters c ON c.id=o.cluster_id WHERE c.tenant_id=$1 AND o.key_id=$2 AND o.cluster_id=$3 AND o.explicit_session_id IS NOT NULL")
+                .bind(tenant).bind(parent_key).bind(parent_session).fetch_all(&mut **tx).await?.into_iter().collect();
+            common_threads = Some(match common_threads {
+                None => threads,
+                Some(common) => common.intersection(&threads).cloned().collect(),
+            });
+        }
+        if common_threads.is_none_or(|threads| threads.is_empty()) {
+            return Err(AppError::Conflict(
+                "contradictory parent evidence after session reconciliation".into(),
+            ));
+        }
+    }
     sqlx::query("DELETE FROM session_relationships WHERE tenant_id=$1 AND ((key_id=$2 AND session_id=$3) OR (target_key_id=$2 AND target_session_id=$3))")
         .bind(tenant).bind(key).bind(source).execute(&mut **tx).await?;
+    let mut remapped_parents = BTreeSet::new();
     for row in relationships {
         let mut from = (
             row.try_get::<String, _>("key_id")?,
@@ -41,10 +80,26 @@ pub(crate) async fn merge_session_reading_in_transaction(
         if kind == "related" && to < from {
             std::mem::swap(&mut from, &mut to);
         }
+        if kind == "parent" {
+            remapped_parents.insert((from.clone(), to.clone()));
+        }
         sqlx::query("INSERT INTO session_relationships (tenant_id,key_id,session_id,target_key_id,target_session_id,kind,evidence,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING")
             .bind(tenant).bind(from.0).bind(from.1).bind(to.0).bind(to.1).bind(kind)
             .bind(row.try_get::<Option<String>, _>("evidence")?).bind(row.try_get::<i64, _>("updated_at")?)
             .execute(&mut **tx).await?;
+    }
+    // Validate after every edge has moved: unchanged destination edges also
+    // participate in reachability (S -> X -> T must not become T -> X -> T).
+    // Any new cycle includes a remapped edge. Errors roll back the enclosing
+    // observation/fact transaction, retaining the original authoritative graph.
+    for (from, to) in remapped_parents {
+        let cycle: i64 = sqlx::query_scalar("WITH RECURSIVE ancestors(key_id,session_id) AS (SELECT $2,$3 UNION SELECT r.target_key_id,r.target_session_id FROM session_relationships r JOIN ancestors a ON r.key_id=a.key_id AND r.session_id=a.session_id WHERE r.tenant_id=$1 AND r.kind='parent') SELECT COUNT(*) FROM ancestors WHERE key_id=$4 AND session_id=$5")
+            .bind(tenant).bind(to.0).bind(to.1).bind(from.0).bind(from.1).fetch_one(&mut **tx).await?;
+        if cycle > 0 {
+            return Err(AppError::Conflict(
+                "parent cycle after session reconciliation".into(),
+            ));
+        }
     }
     sqlx::query("UPDATE session_response_summaries SET session_id = $1 WHERE tenant_id = $2 AND key_id = $3 AND session_id = $4")
         .bind(target).bind(tenant).bind(key).bind(source).execute(&mut **tx).await?;
