@@ -3,7 +3,7 @@ import { api, ApiError } from '../api';
 import { formatCountdown } from '../format';
 import { useI18n } from '../i18n';
 import { useConfirmDialog } from '../useConfirmDialog';
-import type { UpstreamQuotaSnapshot } from './upstreamQuota';
+import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import { useQuotaClock } from './useQuotaClock';
 import { Button, Field, Select } from '../design-system';
 
@@ -126,7 +126,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     working.current = true; setBusy(true); setRecoveryError(undefined);
     try {
       const response = await api<QuotaResetOperation>(path(`${encodeURIComponent(reviewed.id)}/recover`), token, {
-        method: 'POST', body: JSON.stringify({ expected_updated_at: reviewed.updated_at, reason: unlockReason }), signal: AbortSignal.timeout(20_000),
+        method: 'POST', body: JSON.stringify({ expected_updated_at: reviewed.updated_at, reason: unlockReason }), signal: AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS),
       });
       if (!current()) return;
       if (!valid(response) || response.id !== reviewed.id || response.state !== 'unknown' || response.settled_at == null) throw new Error('Invalid recovery scope');
