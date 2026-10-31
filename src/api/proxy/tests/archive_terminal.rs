@@ -648,9 +648,13 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
 #[tokio::test]
 async fn consumed_and_discarded_readers_retain_full_capture_with_bounded_backpressure() {
     for consume_tail in [false, true] {
-        let state = AppState::initialize(crate::config::Config::for_test("sqlite::memory:".into()))
-            .await
-            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("raw-reader.db").display()
+        )))
+        .await
+        .unwrap();
         let identity = crate::db::ArchiveSpoolIdentity {
             tenant_id: Uuid::now_v7(),
             request_id: Uuid::now_v7(),
