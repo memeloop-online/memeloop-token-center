@@ -412,14 +412,13 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
 
 #[tokio::test]
 async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
-    for (label, payload, expected_gap) in [
+    for (label, payload) in [
         (
             "incomplete",
             concat!(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"usable text\"}}]}\n\n",
                 "data: [DONE]\n\ndata: ",
             ),
-            true,
         ),
         (
             "failed",
@@ -428,7 +427,6 @@ async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
                 "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"fixture\"}}\n\n",
                 "data: {\"error\":{\"message\":\"private provider detail\"}}\n\n",
             ),
-            false,
         ),
     ] {
         let upstream = MockServer::start().await;
@@ -446,44 +444,51 @@ async fn incomplete_or_failed_tail_revokes_held_success_terminal() {
         assert!(!text.contains("[DONE]"));
         assert!(!text.contains("response.completed"));
         assert!(!text.contains("private provider detail"));
-        if expected_gap {
-            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let row: Option<(String, String)> =
-                        sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
-                            .fetch_optional(&pool)
-                            .await
-                            .unwrap();
-                    if let Some((tenant, request)) = row {
-                        let tenant = Uuid::parse_str(&tenant).unwrap();
-                        let request = Uuid::parse_str(&request).unwrap();
-                        if fixture
+        // Invalid SSE grammar changes delivery/normalization, not the bytes
+        // actually returned by the supplier. A normal HTTP EOF seals those
+        // bytes in both cases; a transport error is fenced separately.
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let row: Option<(String, String)> =
+                    sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
+                        .fetch_optional(&pool)
+                        .await
+                        .unwrap();
+                if let Some((tenant, request)) = row {
+                    let tenant = Uuid::parse_str(&tenant).unwrap();
+                    let request = Uuid::parse_str(&request).unwrap();
+                    if let Some(reference) = fixture
+                        .state
+                        .archive
+                        .raw_capture_reference(tenant, request, "response")
+                        .await
+                        .unwrap()
+                    {
+                        let restored = fixture
                             .state
                             .archive
-                            .raw_capture_failed(tenant, request, "response")
+                            .get_tenant_content(tenant, &reference, MAX_PROXY_RESPONSE_BODY)
                             .await
-                            .unwrap()
-                        {
-                            assert!(
-                                fixture
-                                    .state
-                                    .archive
-                                    .raw_capture_reference(tenant, request, "response")
-                                    .await
-                                    .unwrap()
-                                    .is_none()
-                            );
-                            break;
-                        }
+                            .unwrap();
+                        assert_eq!(restored.as_ref(), payload.as_bytes());
+                        assert!(
+                            !fixture
+                                .state
+                                .archive
+                                .raw_capture_failed(tenant, request, "response")
+                                .await
+                                .unwrap()
+                        );
+                        break;
                     }
-                    tokio::task::yield_now().await;
                 }
-            })
-            .await
-            .expect("owned writer must durably fence the incomplete capture");
-            pool.close().await;
-        }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("malformed supplier SSE must remain available byte-for-byte");
+        pool.close().await;
         upstream.verify().await;
     }
 }
