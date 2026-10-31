@@ -193,12 +193,12 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     navigate('sessions');
   }
 
-  function openSessionById(sessionId: string) {
+  function openSessionById(sessionId: string, keyId?: string) {
     if (isUnlinkedSession(sessionId)) {
-      openUnlinkedRequests(sessionId);
+      openUnlinkedRequests(sessionId, keyId);
       return;
     }
-    setSessionFocus({ sessionId, revision: Date.now() });
+    setSessionFocus({ sessionId, keyId, revision: Date.now() });
     navigate('sessions');
   }
 

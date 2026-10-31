@@ -85,7 +85,7 @@ export interface RequestListResponse {
 }
 
 export type TypedFilterField = 'created_at' | 'key_id' | 'model' | 'protocol' | 'status' | 'error_code'
-  | 'upstream_account_id' | 'route_id' | 'duration_ms' | 'cost_micros' | 'key_alias' | 'principal';
+  | 'upstream_account_id' | 'route_id' | 'duration_ms' | 'cost_micros' | 'key_alias' | 'principal' | 'session_association';
 export type TypedFilterOperator = 'equals' | 'not_equals' | 'contains' | 'greater_than'
   | 'greater_than_or_equal' | 'less_than' | 'less_than_or_equal' | 'between';
 export type TypedFilterValue =

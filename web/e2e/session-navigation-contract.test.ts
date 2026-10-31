@@ -19,9 +19,10 @@ test('credential buckets open request filters without inventing a session associ
   assert.equal(isUnlinkedSession(bucketId), true);
   assert.equal(isUnlinkedSession('other-bucket', true), true);
   assert.equal(isUnlinkedSession('00000000-0000-4000-8000-000000000002'), false);
-  assert.deepEqual(unlinkedRequestFilter(bucketId, keyId, source), source);
+  assert.deepEqual(unlinkedRequestFilter(bucketId, keyId, source), { ...source, conditions: [...source.conditions, { field: 'session_association', operator: 'equals', value: { type: 'text', value: 'unlinked' } }] });
   assert.deepEqual(unlinkedRequestFilter(bucketId)?.conditions, [
     { field: 'key_id', operator: 'equals', value: { type: 'uuid', value: keyId } },
+    { field: 'session_association', operator: 'equals', value: { type: 'text', value: 'unlinked' } },
   ]);
   assert.equal(JSON.stringify(unlinkedRequestFilter(bucketId, keyId, source)).includes('unlinked:'), false);
 });

@@ -9,6 +9,9 @@ import { AnalyticsMetric } from '../AnalyticsMetric';
 import { ImageGenerationQuarantine } from '../ImageGenerationQuarantine';
 import { displayTimeZone } from '../../charts/displayTimeZone';
 import { useI18n } from '../../i18n';
+import { useSessionParentLabel } from '../sessionTasks';
+import { unnamedSessionName } from '../../sessionTitles';
+import { credentialDisplayName } from '../../identityPresentation';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
 import { RequestEgressDetails } from '../RequestEgressDetails';
 import type { SessionStreamState } from '../SessionMonitor';
@@ -32,7 +35,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   streamState: SessionStreamState;
   streamError: string;
   onOpenSessions: () => void;
-  onOpenSession: (sessionId: string) => void;
+  onOpenSession: (sessionId: string, keyId?: string) => void;
   onOpenGenerations?: () => void;
   requestFocus?: { requestId: string; revision: number };
   onRequestFocusHandled?: (revision: number) => void;
@@ -425,7 +428,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     {imageReviewOpen && <section className="request-image-review" aria-label={t('quarantine.title')}>
       <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
     </section>}
-    {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={onOpenSession} onClose={closeRequestDetail} />}
+    {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={onOpenSession} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;
 }
 
@@ -448,7 +451,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   onRefreshFilteredResults: () => void;
   onSelect: (request: RequestView) => Promise<void>;
   onOpenSessions: () => void;
-  onOpenSession: (sessionId: string) => void;
+  onOpenSession: (sessionId: string, keyId?: string) => void;
   onOpenGenerations?: () => void;
   requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
   refreshPaused?: boolean;
@@ -487,12 +490,13 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   </article>;
 }
 
-function RequestDrawer({ detail, upstreamName, accountNames, onOpenSession, onClose }: { detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
+function RequestDrawer({ token, tenant, detail, upstreamName, accountNames, onOpenSession, onClose }: { token: string; tenant: string; detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string, keyId?: string) => void; onClose: () => void }) {
   const { locale, t } = useI18n();
   const [technicalOpen, setTechnicalOpen] = useState(false);
   const technicalId = useId();
+  const parent = useSessionParentLabel(tenant, token, detail.credential_identity?.key_id, detail.session_context?.association === 'confirmed' ? detail.session_context.session_id : null, session => session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credentialDisplayName(session.key_alias, t), true));
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
-    <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} />
+    <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} sessionParent={parent ? { label: parent.label, sessionId: parent.identity.session_id, keyId: parent.identity.key_id } : undefined} />
     <RequestEgressDetails attempts={detail.egress_attempts} accountNames={accountNames} />
     <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>

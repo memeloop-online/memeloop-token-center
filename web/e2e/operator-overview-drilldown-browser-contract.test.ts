@@ -107,6 +107,7 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
       ast: { logical_operator: 'and', conditions: [
         { field: 'created_at', operator: 'between', value: { type: 'timestamp', value: bucketStart }, upper: { type: 'timestamp', value: fixtureNow } },
         { field: 'key_id', operator: 'equals', value: { type: 'uuid', value: '5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650' } },
+        { field: 'session_association', operator: 'equals', value: { type: 'text', value: 'unlinked' } },
       ] },
     });
     const calls = await page.evaluate(() => window.overviewDrilldownFixture.calls);
@@ -126,6 +127,10 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     const focusedCalls = await page.evaluate(() => window.overviewDrilldownFixture.calls);
     assert.equal(focusedCalls.some(call => call === 'POST /internal/v1/sessions/summaries'), true, 'known identity uses the summary endpoint');
     assert.equal(focusedCalls.some(call => call.includes('/sessions?') && call.includes('q=')), false, 'exact focus never waits for a name-search list');
+    await page.locator('.session-detail-region .session-detail').waitFor();
+    await page.screenshot({ path: join(evidence, 'real-session-detail-mobile.png'), fullPage: true });
+    await page.setViewportSize({ width: 1440, height: 900 });
+    await page.screenshot({ path: join(evidence, 'real-session-detail-desktop.png'), fullPage: true });
 
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?initial-sessions=1`);
     await page.waitForFunction(() => window.overviewDrilldownFixture.calls.some(call => call.includes('/sessions/00000000-0000-4000-8000-000000000002?')));
@@ -135,6 +140,16 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     await page.waitForFunction(() => window.overviewDrilldownFixture.requestQueryBodies.length > 0);
     assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.route), 'requests', 'explicit aggregate selection navigates');
     assert.equal((await page.evaluate(() => window.overviewDrilldownFixture.calls)).some(call => /\/sessions\/unlinked(?::|%3A)/.test(call)), false);
+
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?request-session=1`);
+    await page.locator('.request-table').getByRole('button', { name: 'Named Codex conversation', exact: true }).click();
+    await page.locator('.session-detail-region .session-detail').waitFor();
+    const requestFocusCalls = await page.evaluate(() => window.overviewDrilldownFixture.calls);
+    assert.equal(requestFocusCalls.includes('POST /internal/v1/sessions/summaries'), true, 'request rows carry their credential into exact summary focus');
+    assert.equal(requestFocusCalls.some(call => call.includes('/sessions?') && call.includes('q=')), false);
+    assert.equal(requestFocusCalls.some(call => call.includes('/sessions/00000000-0000-4000-8000-000000000002?') && call.includes('key_id=5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650')), true);
+    await page.screenshot({ path: join(evidence, 'request-session-detail-desktop.png'), fullPage: true });
+
   } finally {
     await browser.close();
     await server.close();

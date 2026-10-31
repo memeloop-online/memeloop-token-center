@@ -17,8 +17,9 @@ export function unlinkedRequestFilter(
   return {
     logical_operator: 'and',
     conditions: [
-      ...source.conditions.filter(condition => condition.field !== 'key_id'),
+      ...source.conditions.filter(condition => condition.field !== 'key_id' && condition.field !== 'session_association'),
       { field: 'key_id', operator: 'equals', value: { type: 'uuid', value: credential } },
+      { field: 'session_association', operator: 'equals', value: { type: 'text', value: 'unlinked' } },
     ],
   };
 }

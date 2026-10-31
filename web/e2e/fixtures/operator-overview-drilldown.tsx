@@ -27,6 +27,7 @@ const tenant = 'drilldown-tenant';
 const now = Date.UTC(2026, 8, 8, 12, 0, 0);
 const bucketStart = now - 3_600_000;
 const usageSessions = new URLSearchParams(location.search).has('usage-sessions');
+const requestSession = new URLSearchParams(location.search).has('request-session');
 const initialSessions = new URLSearchParams(location.search).has('initial-sessions');
 const sessionKey = '5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650';
 const realSession = '00000000-0000-4000-8000-000000000002';
@@ -81,6 +82,8 @@ const drilledRequest: RequestView = {
   protocol: 'openai', model: 'drilled-model', status_code: 200, duration_ms: 180,
   input_tokens: 12, cached_input_tokens: 2, cache_write_tokens: 1, output_tokens: 4,
   cost: '0.001', currency: 'USD', error_code: null,
+  credential_identity: { tenant_external_id: tenant, key_id: sessionKey, key_alias: 'Codex credential', principal_external_id: 'Codex user' },
+  ...(requestSession ? { session_context: { session_id: realSession, association: 'confirmed' as const, session_name: 'Named Codex conversation', task_kind: 'interactive', agent_id: 'codex', semantics_source: 'declared' } } : {}),
 };
 const drilledRequestDetail: RequestDetail = { ...drilledRequest, request_body: { model: drilledRequest.model }, response_body: { id: 'fixture-response' }, archive_complete: true };
 
@@ -117,6 +120,14 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
       archived_only_input_tokens: 0, archived_only_output_tokens: 0, archived_only_avg_duration_ms: null,
     }],
   });
+  if (url.pathname === `/internal/v1/sessions/${realSession}`) return json({
+    session_id: realSession, cluster_id: realSession, unlinked: false,
+    requests: [{ ...drilledRequest, source: 'live', provenance: 'native', unlinked: false,
+      session_context: { session_id: realSession, association: 'confirmed', session_name: 'Named Codex conversation', task_kind: 'interactive', agent_id: 'codex', semantics_source: 'declared' } }],
+    edges: [], has_more: false, next_cursor: null, edges_truncated: false,
+  });
+  if (url.pathname === `/internal/v1/sessions/${realSession}/relationships`) return json({ relationships: [] });
+  if (url.pathname === `/internal/v1/sessions/${realSession}/title`) return json({ title: 'Named Codex conversation', state: 'ready', error_code: null, updated_at: now, source: 'manual', revision: 1 });
   if (url.pathname === '/internal/v1/requests/query' && method === 'POST') {
     const body = JSON.parse(String(init?.body ?? '{}'));
     window.overviewDrilldownFixture.requestQueryBodies.push(body);

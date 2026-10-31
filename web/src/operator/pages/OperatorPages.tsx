@@ -37,7 +37,7 @@ function OverviewMonitoringSection({ state, points, token, tenant }: { state: Re
   return <div aria-busy={state.refreshing === true}><LoadingProgress active={state.refreshing === true} label={t('common.loading')} level="page" />{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<MonitoringSnapshot snapshot={state.value} points={points} quotaSummary={<OverviewUpstreamQuota token={token} tenant={tenant} snapshot={state.value} />} /></div>;
 }
 
-function OverviewRecentRequestsSection({ state, onOpenRequest, onOpenSession }: { state: ResourceState<RequestView[]>; onOpenRequest: (requestId: string) => void; onOpenSession: (sessionId: string) => void }) {
+function OverviewRecentRequestsSection({ state, onOpenRequest, onOpenSession }: { state: ResourceState<RequestView[]>; onOpenRequest: (requestId: string) => void; onOpenSession: (sessionId: string, keyId?: string) => void }) {
   const { t } = useI18n();
   return <article className="panel operator-overview-recent" aria-busy={state.kind === 'loading' || (state.kind === 'ready' && state.refreshing === true)}><div className="panel-title"><h2>{t('self.recent')}</h2><span>{t('sessions.requests')}</span></div>
     {state.kind === 'idle' || state.kind === 'loading'
@@ -53,7 +53,7 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenRequest, onOpenS
   onRequestDrilldown: (ast: TypedFilterAst) => void;
   onOpenUsageSession: (session: UsageAnalysisSessionBucket) => void;
   onOpenRequest: (requestId: string) => void;
-  onOpenSession: (sessionId: string) => void;
+  onOpenSession: (sessionId: string, keyId?: string) => void;
 }) {
   const { t } = useI18n();
   const requestResource = useOperatorResource(

@@ -144,7 +144,7 @@ Then('同时间戳会话详情分页无重复遗漏且 USD 与 CNY 分行', asyn
       body: JSON.stringify(detailFixture(url.searchParams.has('before_request_id'))),
     });
   });
-  const firstCard = page.locator('.session-card').first();
+  const firstCard = page.locator('.session-card[data-session-association="confirmed"]').first();
   await visible(firstCard);
   await firstCard.getByRole('button', { name: /^打开 / }).click();
   const drawer = page.locator('.session-detail-region .session-detail');
