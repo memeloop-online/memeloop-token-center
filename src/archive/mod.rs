@@ -35,6 +35,7 @@ mod raw_capture_tests;
 mod readiness;
 #[cfg(test)]
 mod rustfs_contract_tests;
+mod session_projection;
 mod staging;
 mod supplier_summary;
 mod text;
@@ -54,6 +55,7 @@ pub use multipart::{ArchiveWriter, StagedArchiveObject};
 #[cfg(test)]
 use path::content_location;
 pub(crate) use path::is_tenant_cas_location;
+pub(crate) use session_projection::PreparedSessionBody;
 pub use staging::ArchiveStagingObjectStore;
 
 #[derive(Clone)]

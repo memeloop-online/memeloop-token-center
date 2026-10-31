@@ -923,8 +923,6 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
     }
 }
 
-const SESSION_BODY_ARCHIVE_READ_LIMIT: usize = 128 * 1024 * 1024;
-
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
     if let Err(error) = state
         .db
@@ -1031,25 +1029,41 @@ pub(crate) async fn archive_session_body(
             .await?;
         return Ok(false);
     }
-    let request_bytes = match load_raw_document(state, &locators.request).await {
-        Ok(bytes) => {
-            if let Some(identity) = locators.source_identity
-                && !locators.source_recorded
-            {
-                state
-                    .db
-                    .record_request_source(
-                        identity,
-                        &locators.request,
-                        bytes.len(),
-                        *blake3::hash(&bytes).as_bytes(),
-                        true,
-                    )
-                    .await?;
-            }
-            bytes
+    if missing_raw_document(&locators.request) {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_request_locator",
+        )
+        .await;
+    }
+    let prepared = match state
+        .archive
+        .prepare_session_body_streamed(
+            tenant_id,
+            request_id,
+            hints,
+            locators.request.clone(),
+            locators
+                .response
+                .clone()
+                .filter(|locator| !missing_raw_document(locator)),
+            response_complete,
+        )
+        .await
+    {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            return skip_session_body(
+                state,
+                lease_owner,
+                request_id,
+                "session_body_skipped_archive_unreadable",
+            )
+            .await;
         }
-        Err(_) => {
+        Err(error) => {
             let retry = if let Some(identity) = locators.source_identity {
                 state
                     .archive
@@ -1070,74 +1084,32 @@ pub(crate) async fn archive_session_body(
                     .await?;
                 return Ok(false);
             }
-            return skip_session_body(
-                state,
-                lease_owner,
-                request_id,
-                "session_body_skipped_missing_request_locator",
+            return Err(error);
+        }
+    };
+    if let Some(identity) = locators.source_identity
+        && !locators.source_recorded
+    {
+        state
+            .db
+            .record_request_source(
+                identity,
+                &locators.request,
+                prepared.request_size,
+                prepared.request_digest,
+                true,
             )
-            .await;
-        }
-    };
-    let Ok(request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes) else {
-        return skip_session_body(
-            state,
-            lease_owner,
-            request_id,
-            "session_body_skipped_archive_unreadable",
-        )
-        .await;
-    };
-    let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
-        Some(locator) => match load_raw_document(state, &locator).await {
-            Ok(bytes) => Some(bytes),
-            Err(_) => {
-                state
-                    .db
-                    .defer_session_body_archive(lease_owner, request_id)
-                    .await?;
-                return Ok(false);
-            }
-        },
-        None => None,
-    };
-    let return_document = return_bytes
-        .as_deref()
-        .and_then(crate::conversation::raw_return_document)
-        .unwrap_or_else(|| serde_json::json!({}));
-    state
-        .archive
-        .capture_conversation_documents(
-            tenant_id,
-            request_id,
-            &hints,
-            request_bytes,
-            return_bytes,
-            response_complete,
-        )
-        .await?;
-    let mut body = crate::conversation::SessionBody::from_request_document(request_document);
-    body.append_return_document(return_document);
-    let pending_media = body.take_media_bytes();
-    let mut uploaded_media = std::collections::HashMap::new();
-    for (turn_index, part_index, bytes) in pending_media {
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        if let Some(locator) = uploaded_media.get(&hash) {
-            body.set_media_locator(turn_index, part_index, String::clone(locator));
-            continue;
-        }
-        let locator = state
-            .archive
-            .put_tenant_content(tenant_id, bytes::Bytes::from(bytes))
-            .await?
-            .object_locator;
-        body.set_media_locator(turn_index, part_index, locator.clone());
-        uploaded_media.insert(hash, locator);
+            .await?;
     }
-    let (atoms, nodes, media) = body.into_archive_parts();
+    let crate::archive::PreparedSessionBody {
+        atoms,
+        nodes,
+        media,
+        ..
+    } = prepared;
     if !state
         .db
-        .prepare_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
+        .prepare_archived_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
         .await?
     {
         return Ok(false);
@@ -1167,23 +1139,6 @@ fn missing_raw_document(locator: &str) -> bool {
         || locator.starts_with("gap://")
         || locator.starts_with("metadata-only-json:")
         || locator.starts_with("provider-reference-json:")
-}
-
-async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
-    if missing_raw_document(locator) {
-        return Err("session_body_skipped_archive_unreadable");
-    }
-    if let Some(inline) = locator.strip_prefix("inline-json:") {
-        return Ok(bytes::Bytes::copy_from_slice(inline.as_bytes()));
-    }
-    match state
-        .archive
-        .get_bounded(locator, SESSION_BODY_ARCHIVE_READ_LIMIT)
-        .await
-    {
-        Ok(bytes) => Ok(bytes),
-        Err(_) => Err("session_body_skipped_archive_unreadable"),
-    }
 }
 
 #[cfg(test)]

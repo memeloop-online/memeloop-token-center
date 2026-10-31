@@ -26,8 +26,8 @@ const MAX_CONVERSATION_FINGERPRINT_JSON_BYTES: usize = 70_000;
 // PostgreSQL's much larger protocol limit.
 const CONVERSATION_INSERT_BATCH_BIND_LIMIT: usize = 900;
 const SEMANTIC_ATOM_INSERT_BIND_COUNT: usize = 7;
-// The worker cgroup limit is 384Mi. A full session's raw JSON is at most
-// 128MiB; keep each insert batch far below the rest of that budget.
+// The worker streams body objects; SQL insert batches contain references and
+// stay below the worker's memory budget.
 const CONVERSATION_INSERT_BATCH_BYTES: usize = 256 * 1024;
 const CONTEXT_NODE_INSERT_BIND_COUNT: usize = 6;
 const EXPLICIT_SESSION_LOCK_SEED: i64 = 734_627_102_948_338;
@@ -701,6 +701,24 @@ impl Database {
         let archived_atoms = self
             .archive_atom_bodies(parse_uuid(tenant_id)?, atoms)
             .await?;
+        self.prepare_archived_session_body_archive(
+            lease_owner,
+            request_id,
+            archived_atoms,
+            nodes,
+            media,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_archived_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        archived_atoms: Vec<SemanticAtom>,
+        nodes: &[PrefixNode],
+        media: &[crate::conversation::SessionMediaLocator],
+    ) -> Result<bool, AppError> {
         let mut transaction = self.begin_write_transaction().await?;
         let prepared = self
             .prepare_session_body_archive_in_transaction(
