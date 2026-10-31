@@ -16,6 +16,8 @@ pub enum HistoryError {
     Changed,
     #[error("request history verification mismatch")]
     Mismatch,
+    #[error("request history verification mismatch: {0}")]
+    Verification(&'static str),
     #[error(transparent)]
     Database(Box<crate::error::AppError>),
     #[error(transparent)]

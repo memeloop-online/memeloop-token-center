@@ -174,7 +174,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
         let mut target = client.snapshots(&query).await?;
         target.truncate(query.limit);
         if source.len() != target.len() {
-            return Err(HistoryError::Mismatch);
+            return Err(HistoryError::Verification("request page count"));
         }
         for (view, snapshot) in source.iter().zip(target) {
             let identity = database.history_identity_for_view(view.request_id).await?;
@@ -190,7 +190,9 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
                 || snapshot.revision > revision
                 || expected.payload != Some(serde_json::to_value(view)?)
             {
-                return Err(HistoryError::Mismatch);
+                return Err(HistoryError::Verification(
+                    "request snapshot and read model",
+                ));
             }
             count += 1;
             *tenants
@@ -227,7 +229,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
         .map(|bucket| (daily_key(&bucket), bucket))
         .collect::<BTreeMap<_, _>>();
     if daily != actual {
-        return Err(HistoryError::Mismatch);
+        return Err(HistoryError::Verification("daily aggregates"));
     }
     for ((tenant_id, key_id), (expected_count, expected_hash)) in &credentials {
         let mut scoped = HistoryQuery {
@@ -258,7 +260,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
         if actual_count != *expected_count
             || actual_hash.finalize() != expected_hash.clone().finalize()
         {
-            return Err(HistoryError::Mismatch);
+            return Err(HistoryError::Verification("credential count and hash"));
         }
         let hidden = client
             .list(&HistoryQuery {
@@ -272,7 +274,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             .iter()
             .any(|payload| !payload["credential_identity"].is_null())
         {
-            return Err(HistoryError::Mismatch);
+            return Err(HistoryError::Verification("credential redaction"));
         }
         let absent_key = HistoryQuery {
             scope: HistoryScope::Key {
@@ -283,7 +285,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             ..query.clone()
         };
         if !client.snapshots(&absent_key).await?.is_empty() {
-            return Err(HistoryError::Mismatch);
+            return Err(HistoryError::Verification("unknown credential scope"));
         }
     }
     if !client
@@ -294,7 +296,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
         .await?
         .is_empty()
     {
-        return Err(HistoryError::Mismatch);
+        return Err(HistoryError::Verification("unknown tenant scope"));
     }
     let days: std::collections::BTreeSet<_> = daily.keys().map(|key| key.0).collect();
     for day in days {
@@ -316,7 +318,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             })
             .await?;
         if serde_json::to_value(expected)? != serde_json::to_value(actual)? {
-            return Err(HistoryError::Mismatch);
+            return Err(HistoryError::Verification("source statistics"));
         }
     }
     // Event receipts have their own ascending, stable cursor and are never
@@ -333,7 +335,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             .event_snapshots(HistoryScope::GlobalOperator, event_at, event_id, 500)
             .await?;
         if source.len() != target.len() {
-            return Err(HistoryError::Mismatch);
+            return Err(HistoryError::Verification("event page count"));
         }
         for (identity, actual) in source.iter().zip(target) {
             let expected = database
@@ -343,7 +345,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
                 || actual.revision <= 0
                 || actual.revision > revision
             {
-                return Err(HistoryError::Mismatch);
+                return Err(HistoryError::Verification("event snapshot and revision"));
             }
             event_count += 1;
             event_hash.update(super::canonical_hash(&expected)?);

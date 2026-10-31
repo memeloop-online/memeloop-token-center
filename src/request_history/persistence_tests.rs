@@ -714,6 +714,16 @@ async fn request_history_real_services_acceptance() {
         .await
         .unwrap();
     assert_eq!(pricing, vec![("history-model".to_owned(), 1, 10, 5)]);
+    // This isolated fact correction intentionally bypasses production rollup
+    // maintenance. Restore it before the whole-source/rollup verification.
+    sqlx::query("UPDATE request_stats_facts SET cost_micros=17 WHERE request_id=$1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    crate::request_history::migration::drain(&database, &client, 500)
+        .await
+        .unwrap();
     crate::request_history::migration::verify(&database, &client)
         .await
         .unwrap();
