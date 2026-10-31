@@ -679,6 +679,26 @@ impl Database {
         Ok(())
     }
 
+    /// Long object streams retain their claim while an independent worker
+    /// continues to own the unfinished relational projection.
+    pub(crate) async fn renew_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+    ) -> Result<bool, AppError> {
+        let now = unix_millis();
+        let updated = sqlx::query(
+            "UPDATE conversation_projection_outbox SET terminal_lease_expires_at = CASE WHEN terminal_lease_owner IS NOT NULL THEN $1 ELSE terminal_lease_expires_at END, lease_expires_at = CASE WHEN terminal_lease_owner IS NULL THEN $1 ELSE lease_expires_at END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3 AND COALESCE(terminal_lease_expires_at, lease_expires_at) > $4",
+        )
+        .bind(now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS))
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(updated.rows_affected() == 1)
+    }
+
     /// 先持久化对象，再把正文引用及媒体 locator 写入投影元数据。
     pub async fn prepare_session_body_archive(
         &self,

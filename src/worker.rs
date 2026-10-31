@@ -1038,21 +1038,31 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     }
-    let prepared = match state
-        .archive
-        .prepare_session_body_streamed(
-            tenant_id,
-            request_id,
-            hints,
-            locators.request.clone(),
-            locators
-                .response
-                .clone()
-                .filter(|locator| !missing_raw_document(locator)),
-            response_complete,
-        )
-        .await
-    {
+    let projection = state.archive.prepare_session_body_streamed(
+        tenant_id,
+        request_id,
+        hints,
+        locators.request.clone(),
+        locators
+            .response
+            .clone()
+            .filter(|locator| !missing_raw_document(locator)),
+        response_complete,
+    );
+    tokio::pin!(projection);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.tick().await;
+    let prepared = loop {
+        tokio::select! {
+            result = &mut projection => break result,
+            _ = heartbeat.tick() => {
+                if !state.db.renew_session_body_archive(lease_owner, request_id).await? {
+                    return Ok(false);
+                }
+            }
+        }
+    };
+    let prepared = match prepared {
         Ok(Some(prepared)) => prepared,
         Ok(None) => {
             return skip_session_body(
@@ -1100,6 +1110,18 @@ pub(crate) async fn archive_session_body(
                 true,
             )
             .await?;
+    }
+    for side in ["request", "response"] {
+        if let Some(object) = state
+            .archive
+            .raw_capture_reference(tenant_id, request_id, side)
+            .await?
+        {
+            state
+                .db
+                .bind_raw_capture(tenant_id, request_id, side, &object)
+                .await?;
+        }
     }
     let crate::archive::PreparedSessionBody {
         atoms,

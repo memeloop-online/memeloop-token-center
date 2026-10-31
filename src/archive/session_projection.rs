@@ -99,6 +99,18 @@ impl<'a> Sink<'a> {
             .block_on(self.writer.as_mut().unwrap().write(data))
             .map_err(io::Error::other)
     }
+    fn finish_temporary(mut self) -> Result<super::StagedArchiveObject, AppError> {
+        self.flush_chunk().map_err(io_error)?;
+        let writer = self.writer.take().ok_or_else(invalid)?;
+        let staged = self.context.runtime.block_on(writer.finish_staged())?;
+        self.context
+            .temporary
+            .lock()
+            .unwrap()
+            .push(staged.object_locator.clone());
+        Ok(staged)
+    }
+
     fn finish(mut self) -> Result<(CasArchiveObject, u64, String), AppError> {
         self.flush_chunk().map_err(io_error)?;
         // JSON may legitimately contain an empty string.
@@ -152,6 +164,25 @@ struct Context {
     archive: ArchiveStore,
     runtime: tokio::runtime::Handle,
     tenant: Uuid,
+    temporary: std::sync::Mutex<Vec<String>>,
+}
+impl Drop for Context {
+    fn drop(&mut self) {
+        let objects = std::mem::take(self.temporary.get_mut().unwrap());
+        if objects.is_empty() {
+            return;
+        }
+        let archive = self.archive.clone();
+        self.runtime.spawn(async move {
+            // Only this projection's exact UUID staging objects are temporary.
+            // Tenant CAS and raw/conversation roots are never eviction targets.
+            for locator in objects {
+                if archive.delete(&locator).await.is_err() {
+                    tracing::warn!("temporary session projection cleanup deferred");
+                }
+            }
+        });
+    }
 }
 impl Context {
     fn reader(&self, locator: &str) -> Result<Box<dyn Read + Send>, AppError> {
@@ -181,14 +212,14 @@ impl Context {
 
 #[derive(Clone)]
 enum TextReference {
-    Object(CasArchiveObject),
+    Object(super::StagedArchiveObject),
     Concat(Vec<String>),
 }
 type References = HashMap<String, TextReference>;
 
 struct SequenceReader<'a> {
     context: &'a Context,
-    objects: std::collections::VecDeque<CasArchiveObject>,
+    objects: std::collections::VecDeque<super::StagedArchiveObject>,
     current: Option<ObjectReader>,
 }
 impl Read for SequenceReader<'_> {
@@ -207,10 +238,53 @@ impl Read for SequenceReader<'_> {
             let Some(object) = self.objects.pop_front() else {
                 return Ok(0);
             };
-            self.current = Some(self.context.content(&object).map_err(io::Error::other)?);
+            self.current = Some(
+                self.context
+                    .temporary_content(&object)
+                    .map_err(io::Error::other)?,
+            );
         }
     }
 }
+impl Context {
+    fn temporary_content(
+        &self,
+        object: &super::StagedArchiveObject,
+    ) -> Result<ObjectReader, AppError> {
+        let download = self
+            .runtime
+            .block_on(self.archive.open_stream(&object.object_locator, None))?;
+        if download.object_size != object.size_bytes {
+            return Err(invalid());
+        }
+        let expected = object.blake3_digest.clone();
+        let stream = futures_util::stream::try_unfold(
+            (download.stream, blake3::Hasher::new()),
+            move |(mut source, mut digest)| {
+                let expected = expected.clone();
+                async move {
+                    match source.next().await {
+                        Some(chunk) => {
+                            let chunk = chunk?;
+                            digest.update(&chunk);
+                            Ok(Some((chunk, (source, digest))))
+                        }
+                        None if digest.finalize().to_hex().as_str() != expected => {
+                            Err(io::Error::other("temporary projection digest mismatch"))
+                        }
+                        None => Ok(None),
+                    }
+                }
+            },
+        );
+        Ok(ObjectReader {
+            runtime: self.runtime.clone(),
+            stream: Box::pin(stream),
+            chunk: Bytes::new(),
+        })
+    }
+}
+
 impl Context {
     fn referenced_reader(
         &self,
@@ -329,7 +403,7 @@ impl<R: BufRead> Json<'_, R> {
         }
         if let Some(mut sink) = sink {
             sink.write_all(&pending).map_err(io_error)?;
-            let (object, _, _) = sink.finish()?;
+            let object = sink.finish_temporary()?;
             let marker = format!("@mtc-stream:{}@", Uuid::now_v7());
             self.references
                 .insert(marker.clone(), TextReference::Object(object));
@@ -447,6 +521,22 @@ impl Write for Escaped<'_> {
     }
 }
 
+fn find_reference<'a>(text: &'a str, references: &References) -> Option<(usize, &'a str)> {
+    let mut start = 0;
+    while let Some(position) = text[start..].find("@mtc-stream:") {
+        let position = start + position;
+        let end = text[position + 1..]
+            .find('@')
+            .map(|end| position + 1 + end + 1)?;
+        let key = &text[position..end];
+        if references.contains_key(key) {
+            return Some((position, key));
+        }
+        start = position + 1;
+    }
+    None
+}
+
 fn expand_text(
     context: &Context,
     references: &References,
@@ -455,16 +545,13 @@ fn expand_text(
 ) -> Result<(), AppError> {
     let mut remaining = text;
     while !remaining.is_empty() {
-        let found = references
-            .keys()
-            .filter_map(|key| remaining.find(key).map(|position| (position, key)))
-            .min_by_key(|(position, _)| *position);
+        let found = find_reference(remaining, references);
         let Some((position, key)) = found else {
             output.write_all(remaining.as_bytes()).map_err(io_error)?;
             break;
         };
         output
-            .write_all(remaining[..position].as_bytes())
+            .write_all(&remaining.as_bytes()[..position])
             .map_err(io_error)?;
         let mut source = context.referenced_reader(references, key)?;
         io::copy(&mut source, output).map_err(io_error)?;
@@ -484,7 +571,7 @@ fn encode(
             output.write_all(b"\"").map_err(io_error)?;
             let mut escaped = Escaped(output);
             if !references.contains_key(text)
-                && references.keys().any(|key| text.contains(key))
+                && find_reference(text, references).is_some()
                 && let Ok(nested) = serde_json::from_str::<Value>(text)
             {
                 // The existing tool normalizer encodes JSON inside a text
@@ -541,10 +628,9 @@ impl Context {
             self.tenant,
             request,
             side,
-        ))? {
-            if object.object_locator == locator {
-                return Ok(object);
-            }
+        ))? && object.object_locator == locator
+        {
+            return Ok(object);
         }
         let mut reader = self.reader(locator)?;
         let mut digest = blake3::Hasher::new();
@@ -597,23 +683,21 @@ impl Context {
         force: bool,
     ) -> Result<(), AppError> {
         if references.contains_key(text)
-            || (text.len() < CHUNK && (!force || !references.keys().any(|key| text.contains(key))))
+            || (text.len() < CHUNK && (!force || find_reference(text, references).is_none()))
         {
             return Ok(());
         }
         let mut remaining = text.as_str();
         let mut pieces = Vec::new();
         while !remaining.is_empty() {
-            let found = references
-                .keys()
-                .filter_map(|key| remaining.find(key).map(|position| (position, key.clone())))
-                .min_by_key(|(position, _)| *position);
+            let found = find_reference(remaining, references)
+                .map(|(position, key)| (position, key.to_owned()));
             let (position, key) = found.unwrap_or((remaining.len(), String::new()));
             if position != 0 {
                 let mut sink = Sink::new(self);
                 sink.write_all(&remaining.as_bytes()[..position])
                     .map_err(io_error)?;
-                let (object, _, _) = sink.finish()?;
+                let object = sink.finish_temporary()?;
                 let part = format!("@mtc-stream:{}@", Uuid::now_v7());
                 references.insert(part.clone(), TextReference::Object(object));
                 pieces.push(part);
@@ -927,6 +1011,7 @@ impl ArchiveStore {
             archive: self.clone(),
             runtime: tokio::runtime::Handle::current(),
             tenant,
+            temporary: std::sync::Mutex::new(Vec::new()),
         };
         tokio::task::spawn_blocking(move || {
             context.prepare(
@@ -1365,6 +1450,22 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(prepared.nodes, again.nodes);
+        use futures_util::TryStreamExt;
+        let prefix = super::super::path::archive_path("conversation-staging/v1").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let pending: Vec<_> = store.inner.list(Some(&prefix)).try_collect().await.unwrap();
+                if pending.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("temporary decoded text is evicted after durable CAS publication");
+        for atom in &again.atoms {
+            atom_document(&store, tenant, atom).await;
+        }
     }
 
     #[tokio::test]
