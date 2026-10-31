@@ -72,10 +72,10 @@ impl TransportProxyGroups {
                 if result.is_err() {
                     tracing::debug!(proxy_id = %id, "network proxy probe persistence deferred");
                 }
-                if let Some(runtime) = runtime.upgrade() {
-                    if let Ok(mut inflight) = runtime.entity_probe_inflight.lock() {
-                        inflight.remove(&(id, version));
-                    }
+                if let Some(runtime) = runtime.upgrade()
+                    && let Ok(mut inflight) = runtime.entity_probe_inflight.lock()
+                {
+                    inflight.remove(&(id, version));
                 }
                 drop(permit);
             });
