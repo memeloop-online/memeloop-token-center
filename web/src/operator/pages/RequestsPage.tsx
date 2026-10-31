@@ -430,9 +430,10 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   useEffect(() => {
     const origin = pendingRequestReturn.current;
-    if (!origin || !requests.some(request => request.request_id === origin.requestId)) return;
+    const requestId = origin?.requestId;
+    if (!origin || !requestId || !requests.some(request => request.request_id === requestId)) return;
     if (origin.openDetail && detail?.request_id !== origin.requestId) {
-      if (selectedRequestId.current !== origin.requestId) void openRequestDetail(origin.requestId);
+      if (selectedRequestId.current !== requestId) void openRequestDetail(requestId);
       return;
     }
     pendingRequestReturn.current = undefined;
