@@ -168,7 +168,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       await details.getByText(text.kimiIdentityUnavailable, { exact: true }).waitFor();
       assert.equal(await details.locator('.provider-account-identity time').getAttribute('datetime'), new Date(account.credential_expires_at).toISOString());
       await details.getByRole('button', { name: chinese ? '配置网络代理' : 'Configure network proxy', exact: true }).waitFor();
-      assert.equal(await details.getByText(chinese ? '授权已过期' : 'Authorization expired', { exact: true }).count(), 1, 'renaming preserves the expired authorization status');
+      assert.equal(await details.getByText(chinese ? '访问令牌已过期' : 'Access token expired', { exact: true }).count(), 1, 'renaming preserves the expired access-token status');
       const edit = details.getByRole('button', { name: chinese ? '编辑' : 'Edit', exact: true });
       assert.equal(await edit.evaluate(button => document.activeElement === button), true, 'successful save returns focus to account editing');
       await details.getByRole('button', { name: chinese ? '账号设置与授权操作' : 'Account settings and authorization', exact: true }).click();
@@ -261,7 +261,7 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       await manage.waitFor();
       assert.equal(await manage.count(), 1);
       assert.equal(await row.getByRole('button', { name: /^(编辑|Edit|查看详情|View details)$/ }).count(), 0, 'the list has one account workspace entry');
-      assert.equal(await row.getByText(chinese ? '授权已过期' : 'Authorization expired', { exact: true }).count(), 1);
+      assert.equal(await row.getByText(chinese ? '访问令牌已过期' : 'Access token expired', { exact: true }).count(), 1);
       assert.equal(await row.locator('.status.ok').count(), 0, 'active does not imply valid authorization');
       await manage.click();
       const details = page.locator('.provider-detail-workspace');
