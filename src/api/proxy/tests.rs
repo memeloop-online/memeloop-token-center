@@ -63,6 +63,7 @@ mod recovery_wait;
 mod responses_transport;
 mod routing_persistence;
 mod routing_price_snapshot;
+mod shutdown_durability;
 mod soonest_reset;
 mod source_r2;
 mod sse_delivery;

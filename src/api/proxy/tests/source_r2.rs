@@ -161,34 +161,19 @@ async fn postgres_source_archive_pool_locked_still_dispatches_and_reaches_eof() 
         assert_eq!(requests[0].status_code, Some(200));
         // This protocol's fixture is closing; keep source uploads and terminal
         // tasks alive until their owners finish, before closing its pools.
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            state.proxy_lifecycles.wait_for_idle(),
-        )
-        .await
-        .expect("bounded source fixture shutdown");
-        let archived = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let archived = state
-                    .db
-                    .request_archive_refs(issued.key_id, requests[0].request_id)
-                    .await
-                    .unwrap();
-                if archived.request_archive_state == crate::model::RequestArchiveState::Bound {
-                    break archived;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("released source upload must bind before closing its fixture");
+        tokio::time::timeout(Duration::from_secs(5), state.drain_proxy_tasks())
+            .await
+            .expect("bounded source fixture shutdown");
+        let archived = state
+            .db
+            .request_archive_refs(issued.key_id, requests[0].request_id)
+            .await
+            .unwrap();
         assert_eq!(
             archived.request_archive_state,
             crate::model::RequestArchiveState::Bound,
             "{endpoint}: releasing the pool must allow source persistence to finish"
         );
-        state.db.drain_gateway_persistence_for_test().await;
-        state.persistence.drain_for_test().await;
         state.db.close().await;
     }
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
