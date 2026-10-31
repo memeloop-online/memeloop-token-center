@@ -134,18 +134,14 @@ impl Database {
                 Some(version),
             )
         } else {
-            let row = sqlx::query("SELECT id, name, version, proxy_ciphertext FROM network_proxies WHERE id = $1 AND tenant_id = $2")
+            let row = sqlx::query("SELECT id, name, version, proxy_url FROM network_proxies WHERE id = $1 AND tenant_id = $2")
                 .bind(body.proxy_id.ok_or_else(invalid)?.to_string()).bind(&tenant_id).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
             (
                 vec![Member {
                     id: parse_uuid(row.try_get("id")?)?,
                     label: row.try_get("name")?,
                     version: row.try_get("version")?,
-                    proxy_url: open_private_json(
-                        &row.try_get::<String, _>("proxy_ciphertext")?,
-                        key,
-                        crate::db::network_proxies::PROXY_AAD,
-                    )?,
+                    proxy_url: row.try_get::<String, _>("proxy_url")?,
                 }],
                 None,
             )

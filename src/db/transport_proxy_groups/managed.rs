@@ -75,17 +75,13 @@ impl TransportProxyGroups {
                 .await?
             } else if let Some(proxy_id) = manual {
                 active += 1;
-                let proxy = sqlx::query("SELECT p.id, p.name, p.version, p.proxy_ciphertext FROM network_proxies p JOIN upstream_accounts a ON a.tenant_id = p.tenant_id WHERE p.id = $1 AND a.id = $2")
+                let proxy = sqlx::query("SELECT p.id, p.name, p.version, p.proxy_url FROM network_proxies p JOIN upstream_accounts a ON a.tenant_id = p.tenant_id WHERE p.id = $1 AND a.id = $2")
                     .bind(proxy_id).bind(account_id.to_string()).fetch_one(pool).await?;
                 vec![Member {
                     id: parse_uuid(proxy.try_get("id")?)?,
                     label: proxy.try_get("name")?,
                     version: proxy.try_get("version")?,
-                    proxy_url: open_private_json(
-                        &proxy.try_get::<String, _>("proxy_ciphertext")?,
-                        &self.key,
-                        crate::db::network_proxies::PROXY_AAD,
-                    )?,
+                    proxy_url: proxy.try_get::<String, _>("proxy_url")?,
                 }]
             } else {
                 Vec::new()

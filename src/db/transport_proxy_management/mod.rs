@@ -128,17 +128,13 @@ impl Database {
         for input in &mut inputs {
             if let Some(id) = input.id {
                 if !known.iter().any(|member| member.id == id) {
-                    let row = sqlx::query("SELECT id, name, version, proxy_ciphertext FROM network_proxies WHERE id = $1 AND tenant_id = $2")
+                    let row = sqlx::query("SELECT id, name, version, proxy_url FROM network_proxies WHERE id = $1 AND tenant_id = $2")
                         .bind(id.to_string()).bind(tenant_id).fetch_optional(&mut **tx).await?.ok_or(AppError::NotFound)?;
                     known.push(Member {
                         id,
                         label: row.try_get("name")?,
                         version: row.try_get("version")?,
-                        proxy_url: open_private_json(
-                            &row.try_get::<String, _>("proxy_ciphertext")?,
-                            key,
-                            crate::db::network_proxies::PROXY_AAD,
-                        )?,
+                        proxy_url: row.try_get::<String, _>("proxy_url")?,
                     });
                 }
                 if input.label.is_empty() && input.proxy_url.is_none() {
@@ -230,15 +226,11 @@ impl Database {
         let manual = sqlx::query("SELECT p.account_id, p.tenant_id, b.version FROM network_proxy_selection_policies p JOIN transport_proxy_bindings b ON b.account_id = p.account_id WHERE p.proxy_id = $1 AND p.mode = 'manual' ORDER BY p.account_id")
             .bind(proxy_id.to_string()).fetch_all(&mut **tx).await?;
         if !manual.is_empty() {
-            let proxy = sqlx::query("SELECT proxy_ciphertext FROM network_proxies WHERE id = $1")
+            let proxy = sqlx::query("SELECT proxy_url FROM network_proxies WHERE id = $1")
                 .bind(proxy_id.to_string())
                 .fetch_one(&mut **tx)
                 .await?;
-            let url: String = open_private_json(
-                &proxy.try_get::<String, _>("proxy_ciphertext")?,
-                key,
-                crate::db::network_proxies::PROXY_AAD,
-            )?;
+            let url: String = proxy.try_get::<String, _>("proxy_url")?;
             for account in manual {
                 let stamp = BindingStamp {
                     selection_version: revision(tx).await?,

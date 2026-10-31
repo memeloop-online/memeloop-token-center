@@ -276,12 +276,7 @@ async fn legacy_contract(database: &Database, external: &str) {
         proxy_url: PRIMARY.into(),
         version: 1,
     };
-    let ciphertext = seal_private_json(
-        &vec![member.clone()],
-        KEY,
-        b"mtc/transport-proxy-members/v1",
-    )
-    .unwrap();
+    let ciphertext = crate::plain_json::encode_json(&vec![member.clone()]).unwrap();
     sqlx::query("INSERT INTO transport_proxy_groups (id, tenant_id, name, version, members_ciphertext, created_at, updated_at) VALUES ($1,$2,$3,1,$4,$5,$5)")
         .bind(group_id.to_string()).bind(&tenant).bind(group_id.to_string()).bind(ciphertext).bind(unix_millis()).execute(&database.pool).await.unwrap();
     for _ in 0..2 {

@@ -1143,7 +1143,7 @@
         ],
         "operationId": "operatorChatCompletion",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\ncompletions are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\ncompletions are supported; stream=true is rejected.\n",
         "security": [
           {
             "serviceBearer": []
@@ -1170,6 +1170,9 @@
                   "key_id": {
                     "type": "string",
                     "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
                   },
                   "request": {
                     "type": "object",
@@ -1224,7 +1227,7 @@
         ],
         "operationId": "operatorMessages",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
         "security": [
           {
             "serviceBearer": []
@@ -1251,6 +1254,9 @@
                   "key_id": {
                     "type": "string",
                     "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
                   },
                   "request": {
                     "type": "object",
@@ -1281,6 +1287,90 @@
           },
           "400": {
             "description": "Invalid JSON Messages request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/internal/v1/inference/responses": {
+      "post": {
+        "tags": [
+          "Client credentials"
+        ],
+        "operationId": "operatorResponse",
+        "summary": "Run inference using an explicitly authorized billing credential",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nResponses are supported; stream=true is rejected.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "keys:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key_id",
+                  "request"
+                ],
+                "properties": {
+                  "key_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
+                  },
+                  "request": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                      "stream": {
+                        "type": "boolean",
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI Responses result including image generation output, billed to the selected key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON Responses request",
             "content": {
               "application/json": {
                 "schema": {
@@ -13240,7 +13330,7 @@
         ],
         "operationId": "getOperatorUsageAnalysis",
         "summary": "Analyze bounded tenant or global usage from hourly or daily rollups",
-        "description": "Reads only compact terminal request and generation rollups; it never scans the raw\nrequest table. `auto` selects hourly buckets through 31 days and daily buckets for\nlonger ranges. Omitted bounds default to the last 24 hours (`auto`/`hour`) or seven\ndays (`day`). The inclusive interval may not exceed 93 days, and explicit hourly\nintervals may not exceed 31 days. Bucket starts and heatmap coordinates are UTC.\nCosts are returned as a currency-keyed array and are never added across currencies.\nDuration P95 values are bounded-histogram approximations capped at 60000 ms.\n",
+        "description": "Reads compact terminal request and generation rollups with exact boundary facts.\nThe full and output_rate projections also read retained terminal records for exact\nprovider-reported, successful, non-compaction output rates.\n`auto` selects hourly buckets through 31 days and daily buckets for\nlonger ranges. Omitted bounds default to the last 24 hours (`auto`/`hour`) or seven\ndays (`day`). The inclusive interval may not exceed 93 days, and explicit hourly\nintervals may not exceed 31 days. Bucket starts and heatmap coordinates are UTC.\nCosts are returned as a currency-keyed array and are never added across currencies.\nDuration P95 values are bounded-histogram approximations capped at 60000 ms.\nExplicit projections retain the same response envelope. Unselected arrays are empty\nand unselected summary metrics are zero placeholders, not usage totals.\noverview returns summary, time_series, and generation breakdowns; trends returns\nsummary and time_series; dimensions returns by_model, by_key, by_upstream,\nby_protocol, by_status, and errors plus summary and time_series.\nsessions returns by_session; heatmap returns heatmap. These projections omit output_rate.\noutput_rate runs only the exact output-rate query and returns summary.output_rate\nand time_series entries containing bucket_start and output_rate; other metrics are\nzero placeholders. Merge rates by bucket_start, treating absent buckets as zero samples.\n",
         "security": [
           {
             "serviceBearer": []
@@ -13248,6 +13338,17 @@
         ],
         "x-required-scope": "requests:read",
         "parameters": [
+          {
+            "name": "projection",
+            "in": "query",
+            "required": false,
+            "description": "Select only the analysis needed by the current view; full preserves the complete legacy response.",
+            "schema": {
+              "type": "string",
+              "enum": ["full", "overview", "trends", "dimensions", "sessions", "heatmap", "output_rate"],
+              "default": "full"
+            }
+          },
           {
             "$ref": "#/components/parameters/TenantFilter"
           },
@@ -13367,7 +13468,7 @@
         ],
         "operationId": "getOperatorUsageAnalysisTrends",
         "summary": "Read the bounded summary and time-series usage projection",
-        "description": "Uses the same tenant scope, filters, inclusive range, bucket selection, and metric\naggregation as the complete usage-analysis resource. The response is restricted to\nsummary and time-series data and executes one business aggregation statement; it does\nnot load dimension, session, generation-breakdown, or heatmap projections.\n",
+        "description": "Uses the same tenant scope, filters, inclusive range, bucket selection, and metric\naggregation as the complete usage-analysis resource. The response is restricted to\nsummary and time-series data. The default full projection preserves exact output rates\nand executes two business statements. Explicit projection=trends executes one rollup\nstatement and omits output_rate. Neither loads dimensions, sessions, generation\nbreakdowns, or the heatmap.\n",
         "security": [
           {
             "serviceBearer": []
@@ -13375,6 +13476,17 @@
         ],
         "x-required-scope": "requests:read",
         "parameters": [
+          {
+            "name": "projection",
+            "in": "query",
+            "required": false,
+            "description": "full includes exact output rates; trends returns only rollup summary and time-series metrics.",
+            "schema": {
+              "type": "string",
+              "enum": ["full", "trends"],
+              "default": "full"
+            }
+          },
           {
             "$ref": "#/components/parameters/TenantFilter"
           },
@@ -16798,6 +16910,48 @@
       }
     },
     "schemas": {
+      "OperatorInferenceConversation": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": false,
+        "required": [
+          "id"
+        ],
+        "description": "Gateway-owned session and turn identifiers; consumed before forwarding the inference request.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+          },
+          "turn_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parent_turn_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "OperatorInferenceConversationIdentifier": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9._:-]+$"
+      },
       "SessionContextItem": {
         "type": "object",
         "required": [

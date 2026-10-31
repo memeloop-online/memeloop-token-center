@@ -5,10 +5,9 @@ use uuid::Uuid;
 
 use crate::{
     error::AppError,
-    provider::{open_private_json, seal_private_json},
+    plain_json::{decode_json, encode_json},
 };
 
-const CREDENTIAL_ROTATION_AAD: &str = "memeloop-token-center/credential-rotation-response/v1";
 pub(super) const CREDENTIAL_ROTATION_REPLAY_TTL_MILLIS: i64 = 24 * 60 * 60 * 1_000;
 
 pub(super) struct RotationReplay {
@@ -21,19 +20,6 @@ pub(super) fn credential_rotation_request_hash(resource_kind: &str, resource_id:
         "memeloop-token-center/credential-rotation-request/v1\0{resource_kind}\0{resource_id}"
     );
     format!("{:x}", Sha256::digest(canonical.as_bytes()))
-}
-
-fn credential_rotation_aad(
-    resource_kind: &str,
-    resource_id: Uuid,
-    idempotency_key: &str,
-    request_hash: &str,
-    expires_at: i64,
-) -> Vec<u8> {
-    format!(
-        "{CREDENTIAL_ROTATION_AAD}\0{resource_kind}\0{resource_id}\0{idempotency_key}\0{request_hash}\0{expires_at}"
-    )
-    .into_bytes()
 }
 
 pub(super) async fn claim_credential_rotation(
@@ -85,11 +71,6 @@ pub(super) async fn claim_credential_rotation(
 
 pub(super) fn open_rotation_replay<T: for<'de> Deserialize<'de>>(
     replay: RotationReplay,
-    resource_kind: &str,
-    resource_id: Uuid,
-    idempotency_key: &str,
-    request_hash: &str,
-    pepper: &[u8],
     now: i64,
 ) -> Result<T, AppError> {
     if replay.expires_at <= now {
@@ -104,14 +85,7 @@ pub(super) fn open_rotation_replay<T: for<'de> Deserialize<'de>>(
                 .into(),
         )
     })?;
-    let aad = credential_rotation_aad(
-        resource_kind,
-        resource_id,
-        idempotency_key,
-        request_hash,
-        replay.expires_at,
-    );
-    open_private_json(&ciphertext, pepper, &aad)
+    decode_json(&ciphertext)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -122,17 +96,9 @@ pub(super) async fn store_credential_rotation_response<T: Serialize>(
     resource_kind: &str,
     resource_id: Uuid,
     request_hash: &str,
-    expires_at: i64,
-    pepper: &[u8],
+    _expires_at: i64,
 ) -> Result<(), AppError> {
-    let aad = credential_rotation_aad(
-        resource_kind,
-        resource_id,
-        idempotency_key,
-        request_hash,
-        expires_at,
-    );
-    let ciphertext = seal_private_json(response, pepper, &aad)?;
+    let ciphertext = encode_json(response)?;
     let stored = sqlx::query(
         "UPDATE credential_rotation_replays SET response_ciphertext = $1 WHERE idempotency_key = $2 AND resource_kind = $3 AND resource_id = $4 AND request_hash = $5 AND response_ciphertext IS NULL",
     )

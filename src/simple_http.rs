@@ -27,8 +27,14 @@ pub(crate) fn codex_http_client_builder_with_proxy(
     proxy_url: Option<&str>,
 ) -> Result<reqwest::ClientBuilder, reqwest::Error> {
     install_ring_provider();
-    let mut builder = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(policy.connect_timeout_millis))
+    let mut builder = reqwest::Client::builder();
+    if let Some(connect_timeout) = policy.connect_timeout_millis {
+        builder = builder.connect_timeout(Duration::from_millis(connect_timeout));
+    }
+    if let Some(read_timeout) = policy.read_timeout_millis {
+        builder = builder.read_timeout(Duration::from_millis(read_timeout));
+    }
+    let mut builder = builder
         .redirect(reqwest::redirect::Policy::none())
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.
@@ -36,9 +42,16 @@ pub(crate) fn codex_http_client_builder_with_proxy(
         .no_proxy()
         .pool_max_idle_per_host(8)
         .pool_idle_timeout(Duration::from_secs(90))
-        .tcp_keepalive(None::<Duration>)
-        .tcp_keepalive_interval(None::<Duration>)
-        .tcp_keepalive_retries(None::<u32>)
+        // Keepalive is a liveness probe, not a deadline: it never interrupts a
+        // request. Large uploads pause while the proxy drains its buffer, and
+        // intermediate NAT/proxy devices silently drop a connection that goes
+        // quiet. Without SO_KEEPALIVE the gateway neither refreshes that
+        // mapping nor notices the peer is gone, so the next send (or the rest
+        // of a large body) hits a half-open socket and dies as a connection
+        // failure. Probing keeps the path warm and detects dead peers early.
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .tcp_keepalive_interval(Some(Duration::from_secs(30)))
+        .tcp_keepalive_retries(Some(3))
         .http2_keep_alive_interval(keep_alive_interval)
         .http2_keep_alive_timeout(Duration::from_millis(policy.request_timeout_millis))
         .http2_keep_alive_while_idle(false)
@@ -167,4 +180,59 @@ pub(crate) fn classify_transport(error: &reqwest::Error) -> TransportClass {
         class.connect = true;
     }
     class
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    async fn stalled_tls_request(
+        policy: CodexTransportPolicy,
+    ) -> (
+        tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("https://{}", listener.local_addr().unwrap());
+        let (hello_sent, hello_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut hello = [0_u8; 4096];
+            assert!(socket.read(&mut hello).await.unwrap() > 0);
+            hello_sent.send(()).unwrap();
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let client = build_codex_http_client_with_policy(policy).unwrap();
+        let request =
+            tokio::spawn(async move { client.post(endpoint).body("one POST").send().await });
+        hello_received.await.unwrap();
+        (request, server)
+    }
+
+    #[tokio::test]
+    async fn default_connection_survives_old_fixed_windows_and_can_be_cancelled() {
+        let (request, server) = stalled_tls_request(CodexTransportPolicy::default()).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1_300)).await;
+        tokio::task::yield_now().await;
+        assert!(!request.is_finished());
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn explicit_connection_window_still_bounds_tls_establishment() {
+        let (request, server) = stalled_tls_request(CodexTransportPolicy {
+            connect_timeout_millis: Some(1000),
+            ..CodexTransportPolicy::default()
+        })
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(1001)).await;
+        assert!(request.await.unwrap().unwrap_err().is_timeout());
+        server.abort();
+    }
 }

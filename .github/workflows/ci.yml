@@ -108,7 +108,7 @@ jobs:
         run: cargo audit --deny warnings
       - name: Reject forbidden dependency re-entry and verify vendored provenance
         run: |
-          node --test tests/ops/rust-decimal-vendor-contract.test.ts
+          node --test tests/ops/rust-decimal-vendor-contract.test.ts tests/ops/wreq-util-vendor-contract.test.ts
           default_tree="$(cargo tree --locked --target all --prefix none)"
           all_features_tree="$(cargo tree --locked --all-features --target all --prefix none)"
           for crate in rsa rkyv rkyv_derive sqlx-mysql sigstore; do
@@ -540,7 +540,7 @@ jobs:
             # cucumber's harness rejects nextest's --list probe.
             cargo test --locked --all-features --test cucumber
           else
-            cargo nextest run --locked --all-targets --all-features --test-threads=4 ${{ matrix.args }}
+            cargo nextest run --locked --all-targets --all-features --no-fail-fast --test-threads=4 ${{ matrix.args }}
           fi
 
   migration-smoke:

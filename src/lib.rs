@@ -22,6 +22,7 @@ pub mod model;
 pub mod native_cli;
 pub mod network;
 pub mod oauth;
+mod plain_json;
 pub mod plugin;
 #[cfg(feature = "plugin-distribution")]
 pub mod plugin_distribution;
@@ -72,12 +73,6 @@ use db::Database;
 use plugin::PluginRuntime;
 use provider::ProviderCatalog;
 
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// Synchronous image providers may legitimately stay silent while generating.
-// The image path has its own 2-request concurrency and 16 MiB body bounds, so
-// matching the read timeout to the overall deadline does not make it unbounded.
-const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
-const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 #[cfg(test)]
 pub(crate) use simple_http::{
     CODEX_HTTP2_KEEP_ALIVE_INTERVAL, build_codex_http_client, build_codex_http2_test_client,
@@ -188,7 +183,7 @@ impl AppState {
             .await
             .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db
-                .migrate_with_credential_pepper(config.key_pepper.as_bytes())
+                .migrate()
                 .await
                 .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db.close().await;
@@ -197,6 +192,16 @@ impl AppState {
             .await
             .map_err(|error| InitializationError::Database(error.into()))?
             .with_terminal_projection_enabled(config.terminal_projection_enabled);
+        // Runs on every process start rather than behind the migration switch:
+        // a row that still holds a sealed envelope must be rewritten before the
+        // first request reads it, and the recorded schema version keeps every
+        // later start to a single SELECT. A failure here must not stop the
+        // process: an outage is worse than a few unreadable historic rows, and
+        // the next start retries because the version marker is only written on
+        // success.
+        if let Err(error) = db.convert_sealed_state(config.key_pepper.as_bytes()).await {
+            tracing::error!(%error, "converting sealed gateway state failed; serving existing rows");
+        }
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
@@ -434,9 +439,6 @@ impl AppState {
 fn base_http_client_builder() -> reqwest::ClientBuilder {
     simple_http::install_ring_provider();
     reqwest::Client::builder()
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .read_timeout(HTTP_READ_TIMEOUT)
-        .timeout(HTTP_REQUEST_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
         // An inherited proxy would perform its own DNS lookup and bypass
         // resolve_to_addrs pinning. A future trusted proxy must be explicit.

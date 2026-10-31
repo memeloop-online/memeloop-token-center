@@ -1599,7 +1599,7 @@ fn provider_generation_asset_download(
     row: AnyRow,
     job_id: Uuid,
     asset_id: Uuid,
-    key_material: &[u8],
+    _key_material: &[u8],
 ) -> Result<GenerationAssetDownload, AppError> {
     let result_json: Option<String> = row.try_get("result_json")?;
     let reference = result_json
@@ -1612,8 +1612,7 @@ fn provider_generation_asset_download(
                 .map(str::to_owned)
         })
         .ok_or(AppError::NotFound)?;
-    let assets =
-        crate::generation::open_provider_asset_reference("job", job_id, &reference, key_material)?;
+    let assets = crate::generation::open_provider_asset_reference(&reference)?;
     let asset = assets
         .into_iter()
         .find(|asset| asset.asset_id == asset_id)

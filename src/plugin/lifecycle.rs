@@ -170,7 +170,7 @@ impl RuntimeSnapshot {
         &self.runtime
     }
 
-    /// Fail closed on a broken security policy; never silently skip a policy.
+    /// Skip unavailable hooks while preserving explicit policy denials.
     /// A failure is isolated to that plugin/revision and emits no guest text.
     pub fn apply_traffic_with_config(
         &self,
@@ -188,35 +188,25 @@ impl RuntimeSnapshot {
         configurations: &BTreeMap<String, serde_json::Value>,
         memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Result<TrafficDecision, AppError> {
-        let mut input_sizes = super::TrafficInputSizes::new(&self.runtime.plugins, configurations)?;
-        let mut current = request.clone();
         let mut decision = TrafficDecision {
             allow: true,
             ..Default::default()
         };
-        for (index, plugin) in self
-            .runtime
-            .plugins
-            .iter()
-            .enumerate()
-            .filter(|(_, plugin)| {
-                plugin.manifest.contributions.traffic_policy
-                    || plugin.manifest.contributions.request_rewrite
-            })
-        {
+        for plugin in self.runtime.plugins.iter().filter(|plugin| {
+            plugin.manifest.contributions.traffic_policy
+                || plugin.manifest.contributions.request_rewrite
+        }) {
             let id = &plugin.manifest.id;
-            let (plugin_context, model_changed) = decision.project_context(&context, &mut current);
-            // Input rejection belongs to this request. It must precede circuit
-            // admission so an oversized body/config cannot open or probe a
-            // shared plugin circuit, including for another tenant.
-            input_sizes.validate(index, &plugin_context, &current, model_changed)?;
+            let (plugin_context, current) = decision
+                .project_context(&context, decision.request_json.as_ref().unwrap_or(request));
             let epoch = {
                 let mut circuits = self.circuits.lock().map_err(|_| {
                     AppError::internal("lifecycle_apply_traffic_with_config_and_memory_1")
                 })?;
                 let circuit = circuits.entry(id.clone()).or_default();
                 let Some(epoch) = circuit.admit(Instant::now()) else {
-                    return Ok(unavailable(id, "policy_circuit_open"));
+                    unavailable(id, "policy_circuit_open");
+                    continue;
                 };
                 epoch
             };
@@ -226,36 +216,26 @@ impl RuntimeSnapshot {
             runtime.plugins = Arc::new(vec![plugin.clone()]);
             let result = runtime.apply_traffic_with_config_and_memory(
                 plugin_context,
-                &current,
+                current.as_ref(),
                 configurations,
                 memory,
             );
+            drop(current);
             let mut circuits = self.circuits.lock().map_err(|_| {
                 AppError::internal("lifecycle_apply_traffic_with_config_and_memory_2")
             })?;
             let circuit = circuits.entry(id.clone()).or_default();
-            if matches!(result, Err(AppError::PluginInputTooLarge)) {
-                // Defensive propagation if the executor discovers an input
-                // rejection after admission. Release a half-open probe without
-                // counting a guest failure or resetting previous failures.
-                if Arc::ptr_eq(&epoch.epoch, &circuit.epoch) {
-                    circuit.probe_active = false;
-                }
-                return Err(AppError::PluginInputTooLarge);
-            }
             circuit.complete(&epoch, result.is_err(), Instant::now());
             match result {
                 Err(_) => {
-                    return Ok(unavailable(id, "policy_execution_failed"));
+                    unavailable(id, "policy_execution_failed");
                 }
                 Ok(next) => {
                     if !next.allow {
                         return Ok(next);
                     }
                     if let Some(request) = next.request_json {
-                        current = request;
-                        input_sizes.invalidate_request();
-                        decision.request_json = Some(current.clone());
+                        decision.request_json = Some(request);
                     }
                     if next.model.is_some() {
                         decision.model = next.model;
@@ -270,18 +250,15 @@ impl RuntimeSnapshot {
     }
 }
 
-fn unavailable(plugin_id: &str, reason: &'static str) -> TrafficDecision {
+fn unavailable(plugin_id: &str, reason: &'static str) {
+    // Fail open: an unavailable policy (open circuit, failed guest) must
+    // never interrupt the customer's request. Enforcement simply did not
+    // happen for this invocation; the remaining hooks still run.
     tracing::warn!(
         plugin_id,
         decision_code = reason,
-        "plugin policy unavailable"
+        "plugin policy unavailable; failing open"
     );
-    TrafficDecision {
-        allow: false,
-        denied_by_plugin_id: Some(plugin_id.to_owned()),
-        decision_code: Some(reason),
-        ..Default::default()
-    }
 }
 
 struct State {

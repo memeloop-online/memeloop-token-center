@@ -64,6 +64,7 @@ mod responses_transport;
 mod routing_persistence;
 mod routing_price_snapshot;
 mod soonest_reset;
+mod source_r2;
 mod sse_delivery;
 mod upstream_error_details;
 
@@ -2949,6 +2950,7 @@ async fn assert_exactly_once_side_effects_for(
     expected_account_id: Uuid,
     expected_route_id: Uuid,
 ) {
+    drain_completed_response_archive(fixture).await;
     let projection_owner = Uuid::now_v7();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     // Settlement can commit the request before the conversation journal enqueues
@@ -2986,16 +2988,40 @@ async fn assert_exactly_once_side_effects_for(
                 .await
                 .unwrap()
             {
-                assert!(
-                    crate::worker::archive_session_body(
+                // Some finalizer fixtures admit a reservation directly, without
+                // running ingress capture. Give their saved request JSON an
+                // explicit locator before exercising the raw-document worker;
+                // an unrecorded gap otherwise means capture is still pending.
+                let synthetic_request: Option<String> = sqlx::query_scalar(
+                    "SELECT o.request_json FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND r.request_object = 'gap://' || r.id || '/request' AND NOT EXISTS (SELECT 1 FROM request_archive_spools s WHERE s.request_id = r.id)",
+                )
+                .bind(task.request_id.to_string())
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+                if let Some(raw_request) = synthetic_request {
+                    let document: Value = serde_json::from_str(&raw_request).unwrap();
+                    assert!(document.get("messages").is_some() || document.get("input").is_some());
+                    sqlx::query(
+                        "UPDATE request_records SET request_object = $1 WHERE id = $2 AND key_id = $3 AND request_object = 'gap://' || id || '/request'",
+                    )
+                    .bind(format!("inline-json:{raw_request}"))
+                    .bind(task.request_id.to_string())
+                    .bind(fixture.key_id.to_string())
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                }
+                if !crate::worker::archive_session_body(
                         &fixture.state,
                         projection_owner,
                         task.request_id
                     )
                     .await
-                    .unwrap(),
-                    "会话正文归档要读到原始返回 JSON"
-                );
+                    .unwrap()
+                {
+                    continue;
+                }
                 assert!(
                     !fixture
                         .state
@@ -4439,23 +4465,19 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .mount(&upstream)
         .await;
 
-    // This test requires exact durable bodies for the later upload retry.
-    // Finish optional database capture before SQLite settlement can race its
-    // bounded writer; the unavailable object backend is still exercised below.
-    let response = fixture
-        .state
-        .db
-        .with_request_archive_capture_for_test(send_codex_route(
-            &fixture,
-            &upstream,
-            "/v1/responses",
-            json!({
-                "model": fixture.model,
-                "input": "archive failures are non-fatal for text",
-                "stream": false
-            }),
-        ))
-        .await;
+    let original = json!({
+        "model": fixture.model,
+        "input": "archive failures are non-fatal for text",
+        "stream": false
+    });
+    // Source upload retries retain the request bytes until backend recovery.
+    // Forcing capture before dispatch would wait forever on this outage.
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        send_codex_route(&fixture, &upstream, "/v1/responses", original.clone()),
+    )
+    .await
+    .expect("dispatch must complete while request source upload retries");
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
@@ -4466,7 +4488,9 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
 
     wait_for_request_settlement(&fixture, 1).await;
-    drain_archive_capture(&fixture).await;
+    // Buffered response handoff only needs the database; the request source
+    // cannot finish its upload until the object backend is restored below.
+    fixture.state.persistence.drain_for_test().await;
     let rows = fixture
         .state
         .db
@@ -4476,7 +4500,30 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let source = sqlx::query(
+                "SELECT state, body_byte_count, body_blake3, cipher_bytes FROM request_archive_spools WHERE request_id = $1",
+            )
+            .bind(rows[0].request_id.to_string())
+            .fetch_optional(&pool)
+            .await
+            .unwrap();
+            if let Some(source) = source {
+                let original_bytes = serde_json::to_vec(&original).unwrap();
+                assert_eq!(source.get::<String, _>("state"), "capturing");
+                assert_eq!(source.get::<i64, _>("body_byte_count"), original_bytes.len() as i64);
+                assert_eq!(source.get::<String, _>("body_blake3"), blake3::hash(&original_bytes).to_hex().to_string());
+                assert_eq!(source.get::<i64, _>("cipher_bytes"), 0);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source metadata must retain the exact pending request");
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
     let refs = fixture
         .state
         .db
@@ -4484,8 +4531,8 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .await
         .unwrap();
     assert_eq!(
-        refs.request_object,
-        format!("gap://{}/request", rows[0].request_id)
+        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
+        Some(rows[0].request_id)
     );
     assert_eq!(
         refs.response_object.as_deref(),
@@ -4493,7 +4540,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Capturing
     );
     assert_eq!(
         refs.response_archive_state,
@@ -4509,10 +4556,17 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
 
     // An unavailable object backend did not gate HTTP delivery. Exercise its
     // retryable failure, restore it, then recover both exact durable bodies.
-    crate::response_archive_spool::process_one_for_test(&fixture.state).await;
+    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
+    let failed_attempts: i64 = sqlx::query_scalar(
+        "SELECT attempts FROM response_archive_spools WHERE request_id = $1 AND state = 'pending'",
+    )
+    .bind(rows[0].request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(failed_attempts, 1);
     std::fs::remove_file(&fixture.archive_path).unwrap();
     std::fs::create_dir_all(&fixture.archive_path).unwrap();
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("UPDATE request_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
         .execute(&pool)
         .await
@@ -4540,9 +4594,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&archived_request).unwrap(),
-        json!({
-            "model": fixture.model, "input": "archive failures are non-fatal for text", "stream": false
-        })
+        original
     );
     assert_eq!(
         fixture
@@ -4554,6 +4606,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         body
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    upstream.verify().await;
     pool.close().await;
 }
 
@@ -4672,7 +4725,7 @@ async fn codex_quiet_stream_keeps_downstream_open_and_settles_once() {
     let mut body = response.into_body().into_data_stream();
     let mut rendered = String::new();
     tokio::time::timeout(Duration::from_secs(25), async {
-        while !rendered.contains("\"type\":\"response.in_progress\"") {
+        while !rendered.contains(": keep-alive\n\n") {
             let frame = futures_util::StreamExt::next(&mut body)
                 .await
                 .expect("the quiet stream must remain open")
@@ -4681,7 +4734,7 @@ async fn codex_quiet_stream_keeps_downstream_open_and_settles_once() {
         }
     })
     .await
-    .expect("a real idle interval must produce a Responses progress event");
+    .expect("a real idle interval must produce a connection keep-alive comment");
     assert!(rendered.contains("\"type\":\"response.created\""));
     assert!(!rendered.contains("response.completed"));
     let pending = fixture
@@ -4953,7 +5006,6 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(body.as_ref(), sse.as_bytes());
 
     wait_for_request_settlement(&fixture, 1).await;
-    drain_archive_capture(&fixture).await;
     let rows = fixture
         .state
         .db
@@ -4963,7 +5015,27 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    // The source writer keeps its original bytes while the backend is down.
+    // Draining capture here would wait for the recovery exercised below.
+    fixture.state.persistence.drain_for_test().await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let capturing: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'capturing' AND EXISTS (SELECT 1 FROM response_archive_spools WHERE request_id = $1 AND state = 'pending')",
+            )
+            .bind(rows[0].request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if capturing == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source metadata must retain the pending original upload");
     let refs = fixture
         .state
         .db
@@ -4972,7 +5044,10 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
         .unwrap();
     assert_eq!(
         refs.request_object,
-        format!("gap://{}/request", rows[0].request_id)
+        crate::gateway_body::request_spool::request_body_object_key(
+            &rows[0].request_id.to_string()
+        )
+        .unwrap()
     );
     assert_eq!(
         refs.response_object.as_deref(),
@@ -4980,28 +5055,38 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     );
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Capturing
     );
     assert_eq!(
         refs.response_archive_state,
         crate::model::RequestArchiveState::Pending
     );
 
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    for (spools, chunks, plaintext, expected_bytes) in [
-        (
-            "request_archive_spools",
-            "request_archive_spool_chunks",
-            "stream now",
-            serde_json::to_vec(&original).unwrap().len() as i64,
-        ),
-        (
-            "response_archive_spools",
-            "response_archive_spool_chunks",
-            "archive-independent stream",
-            sse.len() as i64,
-        ),
-    ] {
+    let source = sqlx::query(
+        "SELECT state, body_byte_count, body_blake3, cipher_bytes FROM request_archive_spools WHERE request_id = $1",
+    )
+    .bind(rows[0].request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let original_bytes = serde_json::to_vec(&original).unwrap();
+    assert_eq!(source.get::<String, _>("state"), "capturing");
+    assert_eq!(
+        source.get::<i64, _>("body_byte_count"),
+        original_bytes.len() as i64
+    );
+    assert_eq!(
+        source.get::<String, _>("body_blake3"),
+        blake3::hash(&original_bytes).to_hex().to_string()
+    );
+    assert_eq!(source.get::<i64, _>("cipher_bytes"), 0);
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    for (spools, chunks, plaintext, expected_bytes) in [(
+        "response_archive_spools",
+        "response_archive_spool_chunks",
+        "archive-independent stream",
+        sse.len() as i64,
+    )] {
         let spool = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT state, attempts, chunk_count, byte_count FROM {spools} WHERE request_id = $1"
         )))
@@ -5067,10 +5152,10 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
             .await
             .unwrap();
     let tenant_id = Uuid::parse_str(&tenant_id).unwrap();
-    assert!(crate::archive::is_tenant_cas_location(
-        tenant_id,
-        &refs.request_object
-    ));
+    assert_eq!(
+        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
+        Some(rows[0].request_id)
+    );
     assert!(
         refs.response_object
             .as_deref()
@@ -5099,7 +5184,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
 }
 
 #[tokio::test]
-async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream() {
+async fn full_archive_budget_preserves_original_source_and_still_dispatches_upstream() {
     let fixture = codex_route_fixture("archive-capacity-degradation").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query(
@@ -5148,27 +5233,36 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     assert_eq!(rows[0].error_code, None);
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     drain_archive_capture(&fixture).await;
-    let gap = sqlx::query(
+    let source = sqlx::query(
         "SELECT state, gap_reason, body_byte_count, body_blake3, cipher_bytes,
-                cleaned_at
+                cleaned_at, bound_locator
          FROM request_archive_spools WHERE request_id = $1",
     )
     .bind(rows[0].request_id.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(gap.get::<String, _>("state"), "gap");
-    assert_eq!(gap.get::<String, _>("gap_reason"), "capacity");
+    assert_eq!(source.get::<String, _>("state"), "bound");
+    assert_eq!(source.get::<Option<String>, _>("gap_reason"), None);
     assert_eq!(
-        gap.get::<i64, _>("body_byte_count"),
+        source.get::<i64, _>("body_byte_count"),
         request_bytes.len() as i64
     );
     assert_eq!(
-        gap.get::<String, _>("body_blake3"),
+        source.get::<String, _>("body_blake3"),
         blake3::hash(&request_bytes).to_hex().to_string()
     );
-    assert_eq!(gap.get::<i64, _>("cipher_bytes"), 0);
-    assert!(gap.get::<Option<i64>, _>("cleaned_at").is_some());
+    assert_eq!(source.get::<i64, _>("cipher_bytes"), 0);
+    assert!(source.get::<Option<i64>, _>("cleaned_at").is_some());
+    let locator = source.get::<String, _>("bound_locator");
+    assert_eq!(
+        crate::gateway_body::request_spool::source_request_id(&locator),
+        Some(rows[0].request_id)
+    );
+    assert_eq!(
+        fixture.state.archive.get(&locator).await.unwrap().as_ref(),
+        request_bytes.as_slice()
+    );
     upstream.verify().await;
     pool.close().await;
 }

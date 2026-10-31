@@ -46,8 +46,15 @@ export function assertUnknownFinancialEvidence(row: Record<string, unknown>, rec
   }
   assert(row.reservation_status === "reserved" && row.state === "pending", "unknown must retain its original financial hold");
   assert(row.unknown_reason === "authoritative_usage_unavailable", "unknown responsibility must be annotated");
-  for (const field of ["ledger_count", "event_count", "fact_count"]) {
-    assert(row[field] === 0, `unknown must have no financial side effects: ${field}`);
+  assert(row.ledger_count === 0, "unknown must have no financial side effects: ledger_count");
+  assert(row.event_count === 1 && row.fact_count === 1, "unknown must project exactly one observed stats fact and finished event");
+  assert(row.stats_usage_basis === "not_observed", "observed stats must retain unknown provider usage");
+  for (const field of ["stats_cost_micros", "stats_input_tokens", "stats_output_tokens", "stats_cached_input_tokens", "stats_cache_write_tokens", "finished_cost_micros"]) {
+    assert(row[field] === 0, `observed stats must not fabricate billing or usage: ${field}`);
+  }
+  assert(row.stats_status_class === "failure" && row.stats_error_code === "upstream_invalid_response", "observed stats must retain the real upstream failure");
+  for (const [field, owner] of Object.entries({ stats_tenant_id: "tenant_id", stats_key_id: "key_id", finished_tenant_id: "tenant_id", finished_key_id: "key_id" })) {
+    assert(row[field] === row[owner], `observed stats must retain exact ownership: ${field}`);
   }
   assert(row.operational_status === 502 && row.operational_error === "upstream_invalid_response", "real upstream failure must remain visible");
   assert(row.operational_stage === "buffered_response_ready", "failure must retain its actual stage");
@@ -64,9 +71,20 @@ export function assertUnknownFinancialEvidence(row: Record<string, unknown>, rec
     assert(operational[field] === row[column], `operational ACK must match owned receipt: ${field}`);
   }
   assert(receipt.response_object === `inline-json:${SAFE_UPSTREAM_ERROR}` && operational.response_object === receipt.response_object, "failed response archive must contain only the safe local error");
-  assert(row.spool_state === "pending" && row.spool_plain_bytes === 512 && row.chunk_plain_bytes === 512, "unknown request archive must remain durable, not be discarded");
-  assert(typeof row.spool_cipher_bytes === "number" && Number.isSafeInteger(row.spool_cipher_bytes) && row.spool_cipher_bytes > 0, "retained request archive must have exact positive accounting");
-  return row.spool_cipher_bytes;
+  return 0;
+}
+
+export function assertUnknownArchiveEvidence(row: Record<string, unknown>, archive: string): Record<string, unknown> {
+  assert(typeof row.request_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(row.request_id), "request source must have a canonical request identity");
+  const locator = `staging/proxy/${row.request_id}/request/${row.request_id}/body.json`;
+  assert(row.spool_state === "bound" && row.request_object === locator && row.bound_locator === locator, "unknown request archive must remain durable at its exact request-bound source locator");
+  assert(row.body_byte_count === 512, "durable request source must retain its exact 512 byte length");
+  assert(typeof row.body_blake3 === "string" && /^[0-9a-f]{64}$/u.test(row.body_blake3) && row.body_blake3 !== "0".repeat(64) && row.body_blake3 === row.source_intent_digest, "durable request source must retain its staging digest");
+  assert(row.spool_cipher_bytes === 0 && row.spool_plain_bytes === 0 && row.chunk_count === 0, "bound request source must have zero encrypted spool accounting");
+  const body = readFileSync(join(archive, locator));
+  const sha256 = createHash("sha256").update(body).digest("hex");
+  assert(body.length === 512 && sha256 === planHash(inputPlan(512)), "durable source object must contain the exact original request bytes/hash");
+  return { locator, bytes: body.length, blake3: row.body_blake3, sha256 };
 }
 
 export function assertUnknownSemanticEvidence(row: Record<string, unknown>, previous?: Record<string, unknown>): Record<string, unknown> {
@@ -476,11 +494,21 @@ export async function run(binary: string, output: string): Promise<boolean> {
                   o.status_code AS operational_status, o.error_code AS operational_error,
                   o.completed_at AS operational_completed, o.stage AS operational_stage,
                   o.receipt_id AS operational_receipt_id, o.response_object AS operational_response_object,
+                  q.request_object, s.bound_locator, s.body_byte_count, s.body_blake3,
+                  a.intent_digest AS source_intent_digest,
                   s.state AS spool_state, s.byte_count AS spool_plain_bytes, s.cipher_bytes AS spool_cipher_bytes,
-                  (SELECT SUM(byte_count) FROM request_archive_spool_chunks WHERE request_id = q.id) AS chunk_plain_bytes,
+                  (SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = q.id) AS chunk_count,
                   (SELECT COUNT(*) FROM ledger_entries WHERE source = q.reservation_id) AS ledger_count,
                   (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'finished') AS event_count,
                   (SELECT COUNT(*) FROM request_stats_facts WHERE request_id = q.id) AS fact_count,
+                  t.projected_at AS stats_projected_at, t.usage_basis AS stats_usage_basis,
+                  f.tenant_id AS stats_tenant_id, f.key_id AS stats_key_id,
+                  f.status_class AS stats_status_class, f.error_code AS stats_error_code,
+                  f.cost_micros AS stats_cost_micros, f.input_tokens AS stats_input_tokens,
+                  f.output_tokens AS stats_output_tokens, f.cached_input_tokens AS stats_cached_input_tokens,
+                  f.cache_write_tokens AS stats_cache_write_tokens,
+                  finished.cost_micros AS finished_cost_micros,
+                  finished.tenant_id AS finished_tenant_id, finished.key_id AS finished_key_id,
                   (SELECT COUNT(*) FROM conversation_observations WHERE request_id = q.id) AS observation_count,
                   (SELECT COUNT(*) FROM request_events WHERE request_id = q.id AND event_kind = 'projected') AS projected_event_count,
                   k.principal_id, q.conversation_cluster_id AS request_cluster_id,
@@ -499,7 +527,11 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 LEFT JOIN proxy_operational_terminals o ON o.request_id = p.request_id AND o.fence = p.fence AND o.contract_digest = p.contract_digest
                   AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.account_id = p.account_id
                   AND o.reservation_id = p.reservation_id AND o.owner_token = p.owner_token
-                LEFT JOIN request_archive_spools s ON s.request_id = p.request_id AND s.reservation_id = p.reservation_id
+                LEFT JOIN request_archive_spools s ON s.request_id = p.request_id AND s.reservation_id = p.reservation_id AND s.tenant_id = p.tenant_id
+                LEFT JOIN archive_staging_attempts a ON a.attempt_id = q.id AND a.owner_id = q.id AND a.owner_kind = 'proxy_request' AND a.purpose = 'request'
+                LEFT JOIN terminal_projection_outbox t ON t.request_id = q.id AND t.tenant_id = q.tenant_id AND t.key_id = q.key_id AND t.reservation_id = q.reservation_id
+                LEFT JOIN request_stats_facts f ON f.request_id = q.id
+                LEFT JOIN request_events finished ON finished.request_id = q.id AND finished.event_kind = 'finished'
                 LEFT JOIN conversation_observations v ON v.request_id = q.id
                 LEFT JOIN conversation_clusters c ON c.id = v.cluster_id
                 LEFT JOIN conversation_projection_outbox x ON x.request_id = q.id
@@ -510,15 +542,18 @@ export async function run(binary: string, output: string): Promise<boolean> {
               drainEvidence.unknown = unknown ? Object.fromEntries([
                 "state", "unknown_reason", "financial_completed", "reservation_status",
                 "operational_status", "operational_error", "operational_completed", "operational_receipt_id",
-                "spool_state", "spool_plain_bytes", "spool_cipher_bytes", "chunk_plain_bytes",
+                "spool_state", "spool_plain_bytes", "spool_cipher_bytes", "chunk_count",
+                "request_object", "bound_locator", "body_byte_count", "body_blake3", "source_intent_digest",
+                "event_count", "fact_count", "stats_projected_at",
                 "observation_count", "projected_event_count", "projection_completed",
               ].map((field) => [field, unknown[field]])) : null;
               drainEvidence.durable_receipt_found = receipt !== undefined;
               if (!unknown || unknown.unknown_reason === null || !receipt || unknown.spool_state === null || unknown.spool_state === "capturing") {
                 await delay(100); continue;
               }
+              if (unknown.projection_completed === null || unknown.stats_projected_at === null) { await delay(100); continue; }
               retainedRequestCipherBytes = assertUnknownFinancialEvidence(unknown, receipt);
-              if (unknown.projection_completed === null) { await delay(100); continue; }
+              const requestArchive = assertUnknownArchiveEvidence(unknown, archive);
               const semantics = assertUnknownSemanticEvidence(unknown, previousSemantics);
               unknownEvidence = {
                 request_id: unknownRequestId, receipt_id: receipt.receipt_id, fence: unknown.fence,
@@ -527,7 +562,8 @@ export async function run(binary: string, output: string): Promise<boolean> {
                 completed_at: unknown.operational_completed, reservation_status: unknown.reservation_status,
                 reserved_micros: unknown.reserved_micros, retained_request_cipher_bytes: retainedRequestCipherBytes,
                 durable_journal: true, financial_ack: false, financial_side_effects: 0,
-                semantics,
+                observed_stats_facts: unknown.fact_count, observed_finished_events: unknown.event_count,
+                request_archive: requestArchive, semantics,
               };
             }
             const row = reader.prepare("SELECT cipher_bytes, request_cipher_bytes, (SELECT COUNT(*) FROM request_records WHERE completed_at IS NULL) AS pending_requests, (SELECT COUNT(*) FROM usage_reservations WHERE status = 'reserved') AS unsettled_reservations FROM response_archive_spool_budget WHERE singleton = 1").get();
@@ -567,22 +603,36 @@ export async function run(binary: string, output: string): Promise<boolean> {
       const callsBefore = upstreamCalls;
       const from = report.samples.length;
       const operationStarted = performance.now();
-      const entry = { name, result: undefined as unknown, upstream_calls: 0, peak_rss_mib: 0, operation_duration_ms: 0, drain_duration_ms: 0, drain: {} };
+      const entry = { name, started_at_ms: operationStarted, operation_finished_at_ms: 0, finished_at_ms: 0, result: undefined as unknown, upstream_calls: 0, operation_peak_rss_mib: 0, peak_rss_mib: 0, kernel_high_water_mib: 0, operation_duration_ms: 0, drain_duration_ms: 0, drain: {} };
       report.phases.push(entry);
       try {
         entry.result = await deadline(operation(), 60_000, name);
       } finally {
-        entry.operation_duration_ms = performance.now() - operationStarted;
+        entry.operation_finished_at_ms = performance.now();
+        entry.operation_duration_ms = entry.operation_finished_at_ms - operationStarted;
         entry.upstream_calls = upstreamCalls - callsBefore;
         sample();
         entry.peak_rss_mib = Math.max(...report.samples.slice(from).map((s: any) => s.rss_mib));
+        entry.operation_peak_rss_mib = entry.peak_rss_mib;
       }
       assert(entry.peak_rss_mib <= LIMIT_MIB, `${name}: service RSS exceeded 448 MiB (512 MiB pod minus 64 MiB headroom)`);
       const drainStarted = performance.now();
       const unknownRequestId = expectUnknown ? (entry.result as Result).requestId : undefined;
       if (expectUnknown) assert(unknownRequestId, "failed client response must identify its unknown financial responsibility");
-      entry.drain = await drain(unknownRequestId);
-      entry.drain_duration_ms = performance.now() - drainStarted;
+      try {
+        entry.drain = await drain(unknownRequestId);
+      } finally {
+        entry.finished_at_ms = performance.now();
+        entry.drain_duration_ms = entry.finished_at_ms - drainStarted;
+        sample();
+        // Background archive/projection work can peak after client delivery.
+        // Attribute those continuously collected samples to this phase too.
+        const samples = report.samples.slice(from);
+        entry.peak_rss_mib = Math.max(...samples.map((s: any) => s.rss_mib));
+        entry.kernel_high_water_mib = Math.max(...samples.map((s: any) => s.high_water_mib));
+        report.peak_rss_or_kernel_high_water_mib = Math.max(...report.samples.map((s: any) => Math.max(s.rss_mib, s.high_water_mib)));
+      }
+      assert(entry.peak_rss_mib <= LIMIT_MIB && entry.kernel_high_water_mib <= LIMIT_MIB, `${name}: service RSS or kernel VmHWM exceeded 448 MiB through archive drain`);
     };
 
     await phase("single-64MiB-buffered-response", async () => {
@@ -713,6 +763,7 @@ export async function run(binary: string, output: string): Promise<boolean> {
       }
     })(), 30_000, "unknown receipt replay");
     const replayDrain = await drain(beforeReplay.request_id, beforeReplay.semantics, beforeReplayDrain);
+    assert(JSON.stringify((replayDrain.unknown_financial_responsibility as Record<string, unknown>).request_archive) === JSON.stringify(beforeReplay.request_archive), "restart must preserve the exact durable request source and digest");
     assert(upstreamCalls === callsBeforeReplay, "unknown journal replay must not dispatch upstream");
     report.unknown_receipt_replay = { service_pid: service.pid, upstream_calls: upstreamCalls - callsBeforeReplay, drain: replayDrain };
     report.passed = true;

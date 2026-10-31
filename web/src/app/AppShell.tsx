@@ -63,7 +63,7 @@ function navigation(surface: AppSurface, locale: Locale, pluginNavigation: Plugi
     { id: 'creation', label: label(locale, 'creation'), items: [item('generations'), item('generate', 'generate', true)] },
   ];
   const sections: NavigationSection[] = [
-    { id: 'monitoring', label: label(locale, 'monitoring'), items: [item('overview'), item('requests'), item('sessions'), item('usage'), item('generations')] },
+    { id: 'monitoring', label: label(locale, 'monitoring'), items: [item('overview'), item('requests'), item('sessions'), item('usage')] },
     { id: 'traffic', label: label(locale, 'traffic'), items: [item('providers'), item('proxy-groups', 'plug'), item('routes'), item('pricing')] },
     { id: 'identity', label: label(locale, 'identity'), items: [item('tenants'), item('credentials')] },
     { id: 'system', label: label(locale, 'system'), items: [item('plugins'), item('system-settings', 'settings')] },
@@ -129,7 +129,7 @@ function AppShellContent({ surface, route, onNavigate, children, pluginNavigatio
   const mobileCloseRef = useRef<HTMLButtonElement>(null);
   const restoreMobileFocus = useRef(true);
   const previousRoute = useRef(route);
-  const navigationRoute = surface === 'operator' && route === 'service-credentials' ? 'tenants' : route;
+  const navigationRoute = surface === 'operator' && route === 'service-credentials' ? 'tenants' : surface === 'operator' && route === 'generations' ? 'requests' : route;
   const activeItem = navigationItems.find((item) => item.route === navigationRoute) ?? navigationItems[0];
   const routeErrorCopy: RouteErrorCopy = {
     eyebrow: label(locale, 'errorEyebrow'),

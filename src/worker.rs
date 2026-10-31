@@ -63,10 +63,19 @@ async fn refresh_expiring_oauth(
     generation: i64,
     blocking: &BlockingTasks,
 ) -> Result<(), AppError> {
-    let recovery_key = format!("oauth-worker-{account_id}-generation-{generation}");
-    let result =
-        api::refresh_managed_upstream_oauth_for_worker(state, account_id, &recovery_key, blocking)
-            .await;
+    let recovery_key = state
+        .db
+        .upstream_oauth_refresh_recovery_key(account_id, generation)
+        .await?
+        .unwrap_or_else(|| format!("oauth-worker-{account_id}-generation-{generation}"));
+    let result = api::refresh_managed_upstream_oauth_for_worker(
+        state,
+        account_id,
+        &recovery_key,
+        generation,
+        blocking,
+    )
+    .await;
     match result {
         Err(AppError::Conflict(message))
             if message == "OAuth refresh is already in progress for this Idempotency-Key" =>
@@ -80,6 +89,7 @@ async fn refresh_expiring_oauth(
                 state,
                 account_id,
                 &takeover_key,
+                generation,
                 blocking,
             )
             .await?;
@@ -979,13 +989,49 @@ pub(crate) async fn archive_session_body(
     if locators.pending {
         state
             .db
-            .defer_session_body_archive(lease_owner, request_id)
+            .defer_pending_session_body_archive(lease_owner, request_id)
             .await?;
         return Ok(false);
     }
     let request_bytes = match load_raw_document(state, &locators.request).await {
-        Ok(bytes) => bytes,
+        Ok(bytes) => {
+            if let Some(identity) = locators.source_identity
+                && !locators.source_recorded
+            {
+                state
+                    .db
+                    .record_request_source(
+                        identity,
+                        &locators.request,
+                        bytes.len(),
+                        *blake3::hash(&bytes).as_bytes(),
+                        true,
+                    )
+                    .await?;
+            }
+            bytes
+        }
         Err(_) => {
+            let retry = if let Some(identity) = locators.source_identity {
+                state
+                    .archive
+                    .source_object_exists(&locators.request)
+                    .await?
+                    || (!locators.source_failed
+                        && !state
+                            .db
+                            .recover_request_source(identity, &locators.request)
+                            .await?)
+            } else {
+                !missing_raw_document(&locators.request)
+            };
+            if retry {
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
             let inline = state
                 .db
                 .session_body_inline_request(lease_owner, request_id)
@@ -1029,40 +1075,74 @@ pub(crate) async fn archive_session_body(
     {
         request_document = fallback;
     }
+    // Release the request JSON (including unused schemas/private fields) before
+    // loading/parsing the response. Public text moves into the body.
+    let mut body = crate::conversation::SessionBody::from_request_document(request_document);
     // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
     // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
     let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
-        Some(locator) => load_raw_document(state, &locator)
-            .await
-            .unwrap_or_else(|_| bytes::Bytes::from_static(b"{}")),
+        Some(locator) => match load_raw_document(state, &locator).await {
+            Ok(bytes) => bytes,
+            Err(_) if missing_raw_document(&locator) => bytes::Bytes::from_static(b"{}"),
+            Err(_) => {
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
+        },
         None => bytes::Bytes::from_static(b"{}"),
     };
     let return_document = crate::conversation::raw_return_document(&return_bytes)
         .unwrap_or_else(|| serde_json::json!({}));
     drop(return_bytes);
-    let mut body =
-        crate::conversation::session_body_from_documents(&request_document, &return_document);
-    drop(request_document);
-    drop(return_document);
+    body.append_return_document(return_document);
     let pending_media = body.take_media_bytes();
+    let mut media_staging = Vec::new();
+    let mut uploaded_media = std::collections::HashMap::new();
     for (turn_index, part_index, bytes) in pending_media {
-        match state.archive.put_content(bytes::Bytes::from(bytes)).await {
-            Ok(locator) => body.set_media_locator(turn_index, part_index, locator),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %request_id,
-                    "会话正文归档未能把媒体字节写成 blake3 对象"
-                );
-                return Err(error);
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        if let Some(locator) = uploaded_media.get(&hash) {
+            body.set_media_locator(turn_index, part_index, String::clone(locator));
+            continue;
+        }
+        let attempt = crate::proxy_lifecycle::begin_proxy_archive_attempt(
+            &state.db,
+            request_id,
+            crate::archive_staging::ArchiveStagingPurpose::Media,
+        )
+        .await?;
+        let locator = crate::archive_staging::conversation_media_locator(attempt.lease.key, &hash)?;
+        media_staging.push(attempt.lease);
+        {
+            let upload = state.archive.put(&locator, bytes::Bytes::from(bytes));
+            tokio::pin!(upload);
+            let mut heartbeat = tokio::time::interval(Duration::from_millis(
+                crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
+            ));
+            loop {
+                tokio::select! {
+                    result = &mut upload => {
+                        result?;
+                        break;
+                    }
+                    _ = heartbeat.tick() => {
+                        for lease in &mut media_staging {
+                            if !state.db.heartbeat_archive_staging_write(lease).await? {
+                                return Err(AppError::Conflict("session media staging writer was fenced".into()));
+                            }
+                        }
+                    }
+                }
             }
         }
+        body.set_media_locator(turn_index, part_index, locator.clone());
+        uploaded_media.insert(hash, locator);
     }
-    let (atoms, nodes) = body.into_prefix();
-    let media = body.media_locators(&atoms);
     if !state
         .db
-        .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
+        .prepare_staged_session_body_archive(lease_owner, request_id, body, &media_staging)
         .await?
     {
         return Ok(false);
@@ -1087,11 +1167,15 @@ async fn skip_session_body(
     Ok(false)
 }
 
-async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
-    if locator.starts_with("gap://")
+fn missing_raw_document(locator: &str) -> bool {
+    locator.is_empty()
+        || locator.starts_with("gap://")
         || locator.starts_with("metadata-only-json:")
         || locator.starts_with("provider-reference-json:")
-    {
+}
+
+async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
+    if missing_raw_document(locator) {
         return Err("session_body_skipped_archive_unreadable");
     }
     if let Some(inline) = locator.strip_prefix("inline-json:") {
@@ -1242,6 +1326,105 @@ mod tests {
             refresh_expiring_oauth(&state, uncertain.id, 1, &blocking).await,
             Err(AppError::Conflict(message)) if message.contains("outcome is unknown")
         ));
+        // Both a manual endpoint and a stale worker takeover may have saved a
+        // result under a key different from the deterministic generation key.
+        for pending_key in ["manual-refresh-result", "oauth-worker-takeover-result"] {
+            let pending = state
+                .db
+                .create_upstream_account(
+                    make_account(pending_key),
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .claim_upstream_oauth_refresh(
+                    pending.id,
+                    pending_key,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .mark_upstream_oauth_refresh_request_started(pending.id, pending_key)
+                .await
+                .unwrap();
+            let saved = UpstreamCredential::OAuth {
+                access_token: "already-refreshed-access".into(),
+                refresh_token: Some("already-rotated-refresh".into()),
+                expires_at: Some(crate::db::unix_millis() + 900_000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+                proxy_url: None,
+                proxy_network_scope: None,
+            };
+            let encrypted =
+                crate::provider::seal_credential(&saved, state.config.key_pepper.as_bytes())
+                    .unwrap();
+            sqlx::query("UPDATE upstream_oauth_refresh_leases SET pending_credential_ciphertext = $1, pending_expires_at = $2, lease_expires_at = 0 WHERE account_id = $3")
+                .bind(encrypted).bind(saved.expires_at()).bind(pending.id.to_string())
+                .execute(&test_pool).await.unwrap();
+            refresh_expiring_oauth(&state, pending.id, 1, &blocking)
+                .await
+                .unwrap();
+            let installed = state
+                .db
+                .upstream_account_with_credential(pending.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(installed.0.credential_generation, 2);
+            assert_eq!(
+                serde_json::to_value(&installed.1).unwrap()["refresh_token"],
+                "already-rotated-refresh"
+            );
+        }
+
+        // A new authorization installed after the scheduler's snapshot must
+        // not be refreshed with the old selected generation.
+        let replaced = state
+            .db
+            .create_upstream_account(
+                make_account("manual-replacement"),
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, replacement) = state
+            .db
+            .upstream_account_with_credential(replaced.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        state
+            .db
+            .rotate_upstream_credential(
+                replaced.id,
+                replacement,
+                "operator-replacement",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            refresh_expiring_oauth(&state, replaced.id, 1, &blocking).await,
+            Err(AppError::Conflict(message)) if message.contains("changed after automatic refresh")
+        ));
+        let installed = state
+            .db
+            .upstream_account_with_credential(replaced.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(installed.0.credential_generation, 2);
+        let claims: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+        )
+        .bind(replaced.id.to_string())
+        .fetch_one(&test_pool)
+        .await
+        .unwrap();
+        assert_eq!(claims, 0, "stale scheduling must roll back its claim");
         server.verify().await;
     }
 

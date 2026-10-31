@@ -16,11 +16,6 @@ pub(crate) struct ArchiveBudgetReservation {
 }
 
 impl ArchiveBudgetReservation {
-    pub(super) fn recover_refund_on_expiry(&self) {
-        self.released
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub(super) async fn consume(
         &self,
         tx: &mut Transaction<'_, Any>,
@@ -102,6 +97,7 @@ impl Database {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn reserve_deferred_archive_capacity(
         &self,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
@@ -124,9 +120,6 @@ impl Database {
             .ok_or(AppError::internal(
                 "reservations_reserve_buffered_archive_capacity_inner_1",
             ))?;
-        if amount > CIPHER_LIMIT {
-            return Ok(None);
-        }
         // Also recovers reservations during gateway-only rolling upgrades,
         // when the currently running worker predates this table.
         self.cleanup_expired_archive_budget_reservation().await?;
@@ -134,54 +127,25 @@ impl Database {
         let started = Instant::now();
         let mut tx = self.begin_write_transaction().await?;
         let now = archive_clock(&mut tx, self.backend).await?;
-        // The conditional budget update is the established short global
-        // serialization point. Once it succeeds, the slot inventory is stable
-        // until this transaction commits or rolls back the provisional charge.
-        let (statement, purpose_limit) = match archive.purpose() {
-            BufferedArchivePurpose::Request => (
+        let statement = match archive.purpose() {
+            BufferedArchivePurpose::Request => {
                 "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1,
                      request_cipher_bytes = request_cipher_bytes + $1
-                 WHERE singleton = 1
-                   AND cipher_bytes <= $2
-                   AND request_cipher_bytes <= $3",
-                REQUEST_CIPHER_LIMIT,
-            ),
-            BufferedArchivePurpose::Response => (
+                 WHERE singleton = 1"
+            }
+            BufferedArchivePurpose::Response => {
                 "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1
-                 WHERE singleton = 1
-                   AND cipher_bytes <= $2
-                   AND cipher_bytes - request_cipher_bytes <= $3",
-                RESPONSE_CIPHER_LIMIT,
-            ),
+                 WHERE singleton = 1"
+            }
         };
         let updated = sqlx::query(statement)
             .bind(amount)
-            .bind(CIPHER_LIMIT - amount)
-            .bind(purpose_limit - amount)
             .execute(&mut *tx)
             .await?;
         if updated.rows_affected() != 1 {
             tx.rollback().await?;
             tracing::warn!(phase = "archive_capacity_reserve", requested_bytes = amount,
                 request_id = %archive.identity().request_id, "archive capacity reservation unavailable");
-            return Ok(None);
-        }
-        let active_slots: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(
-            archive.purpose(),
-            "SELECT
-                (SELECT COUNT(*) FROM response_archive_spools
-                 WHERE cleaned_at IS NULL AND state IN ('capturing', 'pending', 'uploading'))
-              + (SELECT COUNT(*) FROM archive_budget_reservations
-                 WHERE purpose = $1)",
-        )))
-        .bind(archive.purpose().as_str())
-        .fetch_one(&mut *tx)
-        .await?;
-        if active_slots >= ARCHIVE_SLOT_LIMIT {
-            tx.rollback().await?;
-            tracing::warn!(phase = "archive_capacity_reserve", requested_bytes = amount,
-                request_id = %archive.identity().request_id, purpose = archive.purpose().as_str(),
-                reason = "slot_capacity", "archive capacity reservation unavailable");
             return Ok(None);
         }
         sqlx::query("INSERT INTO archive_budget_reservations (id, request_id, purpose, cipher_bytes, expires_at) VALUES ($1, $2, $3, $4, $5)")

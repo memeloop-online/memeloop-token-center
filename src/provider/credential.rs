@@ -733,32 +733,37 @@ pub fn seal_credential(
     {
         validate_adapter_state(state)?;
     }
-    seal_private_json(credential, key_material, ENVELOPE_AAD)
+    seal_envelope(credential, key_material, ENVELOPE_AAD)
 }
 
-pub(crate) fn seal_private_json<T: Serialize>(
+/// Seals a value this deployment keeps confidential at rest.
+///
+/// Only two callers remain: the upstream credential envelope below (operator
+/// secrets stay encrypted) and the response archive spool chunks. Every other
+/// piece of gateway state is stored as plain JSON by [`crate::plain_json`].
+pub(crate) fn seal_envelope<T: Serialize>(
     value: &T,
     key_material: &[u8],
     aad: &[u8],
 ) -> Result<String, AppError> {
     let mut nonce = [0_u8; 12];
-    fill(&mut nonce).map_err(|_| AppError::internal("credential_seal_private_json_1"))?;
-    seal_private_json_with_nonce(value, key_material, aad, nonce)
+    fill(&mut nonce).map_err(|_| AppError::internal("credential_seal_envelope_1"))?;
+    seal_envelope_with_nonce(value, key_material, aad, nonce)
 }
 
 /// Seals a private value with a caller-provided nonce. This is restricted to
 /// durable records whose caller can prove nonce uniqueness and needs an exact
 /// ciphertext replay after an unknown database COMMIT acknowledgement.
-pub(crate) fn seal_private_json_with_nonce<T: Serialize>(
+pub(crate) fn seal_envelope_with_nonce<T: Serialize>(
     value: &T,
     key_material: &[u8],
     aad: &[u8],
     nonce: [u8; 12],
 ) -> Result<String, AppError> {
     let plaintext = serde_json::to_vec(value)
-        .map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_1"))?;
+        .map_err(|_| AppError::internal("credential_seal_envelope_with_nonce_1"))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&current_encryption_key(key_material)?)
-        .map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_2"))?;
+        .map_err(|_| AppError::internal("credential_seal_envelope_with_nonce_2"))?;
     let ciphertext = cipher
         .encrypt(
             (&nonce).into(),
@@ -767,7 +772,7 @@ pub(crate) fn seal_private_json_with_nonce<T: Serialize>(
                 aad,
             },
         )
-        .map_err(|_| AppError::internal("credential_seal_private_json_with_nonce_3"))?;
+        .map_err(|_| AppError::internal("credential_seal_envelope_with_nonce_3"))?;
     Ok(format!(
         "{CURRENT_ENVELOPE_VERSION}.{}.{}",
         URL_SAFE_NO_PAD.encode(nonce),
@@ -779,7 +784,7 @@ pub fn open_credential(
     envelope: &str,
     key_material: &[u8],
 ) -> Result<UpstreamCredential, AppError> {
-    let credential = open_private_json(envelope, key_material, ENVELOPE_AAD)?;
+    let credential = open_envelope(envelope, key_material, ENVELOPE_AAD)?;
     if let UpstreamCredential::OAuth {
         adapter_state: Some(state),
         ..
@@ -790,7 +795,8 @@ pub fn open_credential(
     Ok(credential)
 }
 
-pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
+/// Opens a value written by [`seal_envelope`]; see there for the two callers.
+pub(crate) fn open_envelope<T: for<'de> Deserialize<'de>>(
     envelope: &str,
     key_material: &[u8],
     aad: &[u8],
@@ -805,22 +811,22 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
         // SHA-256 derivation. Keep that format read-only so an upgrade never
         // strands credentials; every new write uses RustCrypto HKDF below.
         Some(LEGACY_ENVELOPE_VERSION) => legacy_encryption_key(key_material),
-        _ => return Err(AppError::internal("credential_open_private_json_1")),
+        _ => return Err(AppError::internal("credential_open_envelope_1")),
     };
     if parts.next().is_some() {
-        return Err(AppError::internal("credential_open_private_json_2"));
+        return Err(AppError::internal("credential_open_envelope_2"));
     }
     let nonce = URL_SAFE_NO_PAD
-        .decode(nonce.ok_or(AppError::internal("credential_open_private_json_3"))?)
-        .map_err(|_| AppError::internal("credential_open_private_json_1"))?;
+        .decode(nonce.ok_or(AppError::internal("credential_open_envelope_3"))?)
+        .map_err(|_| AppError::internal("credential_open_envelope_1"))?;
     let nonce: [u8; 12] = nonce
         .try_into()
-        .map_err(|_| AppError::internal("credential_open_private_json_2"))?;
+        .map_err(|_| AppError::internal("credential_open_envelope_2"))?;
     let ciphertext = URL_SAFE_NO_PAD
-        .decode(ciphertext.ok_or(AppError::internal("credential_open_private_json_4"))?)
-        .map_err(|_| AppError::internal("credential_open_private_json_3"))?;
+        .decode(ciphertext.ok_or(AppError::internal("credential_open_envelope_4"))?)
+        .map_err(|_| AppError::internal("credential_open_envelope_3"))?;
     let cipher = ChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|_| AppError::internal("credential_open_private_json_4"))?;
+        .map_err(|_| AppError::internal("credential_open_envelope_4"))?;
     let plaintext = cipher
         .decrypt(
             (&nonce).into(),
@@ -829,9 +835,8 @@ pub(crate) fn open_private_json<T: for<'de> Deserialize<'de>>(
                 aad,
             },
         )
-        .map_err(|_| AppError::internal("credential_open_private_json_5"))?;
-    serde_json::from_slice(&plaintext)
-        .map_err(|_| AppError::internal("credential_open_private_json_6"))
+        .map_err(|_| AppError::internal("credential_open_envelope_5"))?;
+    serde_json::from_slice(&plaintext).map_err(|_| AppError::internal("credential_open_envelope_6"))
 }
 
 pub(super) fn current_encryption_key(key_material: &[u8]) -> Result<[u8; 32], AppError> {

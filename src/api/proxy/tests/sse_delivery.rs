@@ -685,7 +685,7 @@ pub(super) async fn pending_response_archive(
             spool.get::<String, _>("tenant_id"),
             spool.get::<String, _>("reservation_id"),
         );
-        let envelope: Value = crate::provider::open_private_json(
+        let envelope: Value = crate::provider::open_envelope(
             sealed,
             fixture.state.config.key_pepper.as_bytes(),
             aad.as_bytes(),

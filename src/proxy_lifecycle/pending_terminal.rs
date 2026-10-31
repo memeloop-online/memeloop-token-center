@@ -19,6 +19,16 @@ use crate::{
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+fn confirmed_not_executed(input: &FinishProxyRequest<'_>) -> bool {
+    use crate::model::{RequestTerminalCause, RequestUsageBasis};
+    matches!(
+        input.terminal_cause,
+        Some(RequestTerminalCause::GatewayPreAdmission)
+    ) && input.usage == TokenUsage::default()
+        && input.usage_basis == Some(RequestUsageBasis::NotObserved)
+        && (400..=599).contains(&input.status_code)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(remote = "UsageReservation")]
 struct ReservationWire {
@@ -475,22 +485,26 @@ impl Journal {
             .values_mut()
             .filter(|entry| entry.durable && entry.reconcile && !entry.running)
         {
-            // A receipt that already handed its conversation to the projection
-            // queue no longer needs the parsed request body to prove anything:
-            // the queue row is the record. Keeping it here is what made the
-            // process grow without bound, because these receipts are never
-            // removed (an unknown settlement keeps `reconcile` set forever).
-            let keep_unknown_evidence = entry.unknown_annotated
+            // An unknown receipt keeps its parsed conversation only while
+            // that is the sole copy: once the projection outbox row holds
+            // the payload, the evidence is durable and the compact disk
+            // receipt identifies the financial hold. Retaining the
+            // conversation after that is what made gateway memory grow
+            // without bound under quota-rejection traffic, and a restart
+            // already recovers from the conversation-less disk receipt, so
+            // nothing after enqueue may depend on the in-memory value.
+            let keep_unknown_conversation = entry.unknown_annotated
                 && entry.snapshot.claim.is_some()
                 && entry.snapshot.usage_basis
                     != Some(crate::model::RequestUsageBasis::ProviderReported)
                 && !entry.conversation_enqueued;
-            if !keep_unknown_evidence && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
+            if !keep_unknown_conversation && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot)
+            {
                 snapshot.conversation = None;
             }
             // The budgeted body can leave once its projection is durable.
             // Until then the permit stays with the unenqueued evidence.
-            if !keep_unknown_evidence || entry.conversation_enqueued {
+            if !keep_unknown_conversation || entry.conversation_enqueued {
                 entry.projection_retained = None;
             }
         }
@@ -1146,14 +1160,21 @@ impl Journal {
             let result = match snapshot.terminal() {
                 Ok(input) => {
                     if let Some(claim) = snapshot.claim.as_ref() {
-                        if input.usage_basis
-                            == Some(crate::model::RequestUsageBasis::ProviderReported)
-                        {
+                        let evidence = match input.usage_basis {
+                            Some(crate::model::RequestUsageBasis::ProviderReported) => {
+                                Some(crate::db::PendingProxySettlementEvidence::ProviderReported)
+                            }
+                            _ if confirmed_not_executed(&input) => Some(
+                                crate::db::PendingProxySettlementEvidence::ConfirmedNotExecuted,
+                            ),
+                            _ => None,
+                        };
+                        if let Some(evidence) = evidence {
                             database
                                 .finish_pending_proxy_settlement(
                                     claim,
                                     receipt_id,
-                                    crate::db::PendingProxySettlementEvidence::ProviderReported,
+                                    evidence,
                                     input,
                                     attribution,
                                 )

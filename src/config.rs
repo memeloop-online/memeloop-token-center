@@ -8,9 +8,9 @@ pub const DEFAULT_PRICING_LITELLM_URL: &str =
 pub const DEFAULT_PRICING_OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 pub const DEFAULT_GATEWAY_BODY_READ_CONCURRENCY: u32 = 1_024;
 pub const MAX_GATEWAY_BODY_READ_CONCURRENCY: u32 = 8_192;
-pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
-pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
+pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 256 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = DEFAULT_GATEWAY_BODY_READ_CONCURRENCY;
 pub const DEFAULT_RESPONSES_REQUEST_SPOOL_PATH: &str =
     "/var/lib/memeloop-token-center/request-spool";
@@ -1000,7 +1000,7 @@ mod tests {
     fn responses_body_configuration_keeps_large_reads_bounded() {
         assert_eq!(DEFAULT_RESPONSES_BODY_READ_CONCURRENCY, 1_024);
         assert_eq!(responses_body_read_concurrency(1_024), 1_024);
-        assert_eq!(DEFAULT_RESPONSES_BODY_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(DEFAULT_RESPONSES_BODY_MAX_BYTES, 64 * 1024 * 1024);
         assert_eq!(
             responses_body_max_bytes(MIN_RESPONSES_BODY_MAX_BYTES - 1),
             MIN_RESPONSES_BODY_MAX_BYTES

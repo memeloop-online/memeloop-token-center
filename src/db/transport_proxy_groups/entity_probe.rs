@@ -1,5 +1,4 @@
 use super::*;
-use crate::db::network_proxies::PROXY_AAD;
 
 impl TransportProxyGroups {
     pub(super) async fn spawn_entity_probes(
@@ -24,7 +23,7 @@ impl TransportProxyGroups {
                 .execute(pool)
                 .await?;
         }
-        let rows = sqlx::query("SELECT id, version, proxy_ciphertext, probe_target, probe_attempts FROM network_proxies WHERE probe_requested = 1 OR (probe_enabled = 1 AND (last_probe_checked_at IS NULL OR last_probe_checked_at + probe_interval_ms <= $1)) ORDER BY COALESCE(last_probe_checked_at, 0), id LIMIT 257")
+        let rows = sqlx::query("SELECT id, version, proxy_url, probe_target, probe_attempts FROM network_proxies WHERE probe_requested = 1 OR (probe_enabled = 1 AND (last_probe_checked_at IS NULL OR last_probe_checked_at + probe_interval_ms <= $1)) ORDER BY COALESCE(last_probe_checked_at, 0), id LIMIT 257")
             .bind(unix_millis()).fetch_all(pool).await?;
         for row in rows {
             let Ok(permit) = self.probe_permits.clone().try_acquire_owned() else {
@@ -40,11 +39,7 @@ impl TransportProxyGroups {
             {
                 continue;
             }
-            let proxy: String = open_private_json(
-                &row.try_get::<String, _>("proxy_ciphertext")?,
-                &self.key,
-                PROXY_AAD,
-            )?;
+            let proxy: String = row.try_get::<String, _>("proxy_url")?;
             let target: String = row.try_get("probe_target")?;
             let attempts: i64 = row.try_get("probe_attempts")?;
             sqlx::query(

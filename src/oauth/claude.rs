@@ -15,7 +15,8 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{UpstreamCredential, open_private_json, seal_private_json},
+    plain_json::{decode_handle, encode_handle},
+    provider::UpstreamCredential,
 };
 
 use super::{OAuthReauthorizationTarget, OAuthRefreshRequestGuard, validate_oauth_login_config};
@@ -32,9 +33,6 @@ pub const REDIRECT_URI: &str = "https://platform.claude.com/oauth/code/callback"
 pub const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
 
 const FLOW_KIND: &str = "claude_manual_pkce";
-pub(crate) const SESSION_AAD: &[u8] = b"memeloop-token-center/claude-manual-login/v1";
-pub(crate) const STATE_AAD: &[u8] = b"memeloop-token-center/claude-manual-state/v1";
-const READY_AAD: &[u8] = b"memeloop-token-center/claude-manual-ready/v1";
 const RESPONSE_LIMIT: usize = 1024 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SESSION_LIFETIME_MILLIS: i64 = 10 * 60 * 1_000;
@@ -212,7 +210,7 @@ pub async fn start_claude_login(
 async fn start_claude_login_at(
     db: &Database,
     input: StartClaudeLogin,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     endpoints: &ClaudeEndpoints,
 ) -> Result<ClaudeLoginStart, AppError> {
@@ -260,7 +258,7 @@ async fn start_claude_login_at(
         flow_kind: FLOW_KIND.into(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id: state.operator_service_id,
-        state_ciphertext: super::seal_oauth_login_state(&state, key_material, STATE_AAD)?,
+        state_ciphertext: super::seal_oauth_login_state(&state)?,
         next_poll_at: now,
         expires_at,
     })
@@ -275,7 +273,7 @@ async fn start_claude_login_at(
     Ok(ClaudeLoginStart {
         driver: PROVIDER_DRIVER,
         login_url: login_url.to_string(),
-        session_token: seal_private_json(&session, key_material, SESSION_AAD)?,
+        session_token: encode_handle(&session)?,
         expires_at,
         security_notice: "paste_only_the_code_from_the_login_you_started",
     })
@@ -312,15 +310,14 @@ async fn complete_claude_login_at(
     http: &reqwest::Client,
     session_token: &str,
     code_and_state: &str,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     scope: ClaudeCompleteScope<'_>,
     allow_test_loopback: bool,
     endpoints: &ClaudeEndpoints,
 ) -> Result<ClaudeCompleteResult, AppError> {
-    let session: ClaudeSessionToken =
-        open_private_json(session_token, key_material, SESSION_AAD)
-            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    let session: ClaudeSessionToken = decode_handle(session_token)
+        .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if session.flow_kind != FLOW_KIND
         || scope
             .required_tenant
@@ -360,19 +357,14 @@ async fn complete_claude_login_at(
         } => {
             return Ok(ClaudeCompleteResult::Ready {
                 lease_owner,
-                login: Box::new(open_private_json(
-                    &ready_ciphertext,
-                    key_material,
-                    READY_AAD,
-                )?),
+                login: Box::new(decode_handle(&ready_ciphertext)?),
             });
         }
         OAuthLoginClaim::Claimed {
             lease_owner,
             state_ciphertext,
         } => {
-            let state: ClaudeLoginState =
-                open_private_json(&state_ciphertext, key_material, STATE_AAD)?;
+            let state: ClaudeLoginState = decode_handle(&state_ciphertext)?;
             (lease_owner, state)
         }
     };
@@ -401,24 +393,15 @@ async fn complete_claude_login_at(
             return Err(error);
         }
     };
-    db.stage_oauth_login_ready(
-        ready.session_id,
-        lease_owner,
-        seal_private_json(&ready, key_material, READY_AAD)?,
-        now,
-    )
-    .await?;
+    db.stage_oauth_login_ready(ready.session_id, lease_owner, encode_handle(&ready)?, now)
+        .await?;
     match db.claim_oauth_login_poll(&reference, now, 1).await? {
         OAuthLoginClaim::Ready {
             lease_owner,
             ready_ciphertext,
         } => Ok(ClaudeCompleteResult::Ready {
             lease_owner,
-            login: Box::new(open_private_json(
-                &ready_ciphertext,
-                key_material,
-                READY_AAD,
-            )?),
+            login: Box::new(decode_handle(&ready_ciphertext)?),
         }),
         OAuthLoginClaim::Consumed { account_id } => Ok(ClaudeCompleteResult::Consumed {
             account_id,

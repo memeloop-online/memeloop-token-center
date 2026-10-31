@@ -654,79 +654,22 @@ fn classify_codex_send_error(
     }
 }
 
-fn codex_transport_cause(error: &reqwest::Error) -> &'static str {
-    if let Some(cause) = sanitized_error_source_cause(error) {
-        cause
-    } else {
-        let class = crate::simple_http::classify_transport(error);
-        if class.timeout {
-            "transport_timeout"
-        } else if class.connection_reset {
-            "connection_reset"
-        } else if class.dns {
-            "dns_resolution"
-        } else if class.tls {
-            "tls_failure"
-        } else {
-            "unclassified"
-        }
-    }
-}
-
-fn sanitized_error_source_cause(error: &(dyn std::error::Error + 'static)) -> Option<&'static str> {
-    let mut source = Some(error);
-    let mut io_cause = None;
+/// Report the real transport cause. These messages describe a socket, TLS or
+/// HTTP failure against an upstream and carry no credential material, so the
+/// full source chain is logged instead of a masked label. Masking it hid the
+/// reason requests failed and made upstream faults undiagnosable.
+fn codex_transport_cause(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = Vec::new();
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     for _ in 0..16 {
-        let current = source?;
-        if exact_error_label(current, "keep-alive timed out")
-            && current
-                .source()
-                .is_some_and(|cause| exact_error_label(cause, "operation timed out"))
-        {
-            return Some("http2_keepalive_timeout");
-        }
-        if let Some(io_error) = current.downcast_ref::<std::io::Error>() {
-            io_cause = io_cause.or_else(|| sanitized_io_cause(io_error.kind()));
-        }
+        let current = match source {
+            Some(current) => current,
+            None => break,
+        };
+        parts.push(current.to_string());
         source = current.source();
-        if source.is_none() {
-            break;
-        }
     }
-    io_cause
-}
-
-fn sanitized_io_cause(kind: std::io::ErrorKind) -> Option<&'static str> {
-    match kind {
-        std::io::ErrorKind::ConnectionRefused => Some("connection_refused"),
-        std::io::ErrorKind::ConnectionReset => Some("connection_reset"),
-        std::io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
-        std::io::ErrorKind::NotConnected => Some("not_connected"),
-        std::io::ErrorKind::BrokenPipe => Some("broken_pipe"),
-        std::io::ErrorKind::TimedOut => Some("transport_io_timeout"),
-        std::io::ErrorKind::UnexpectedEof => Some("unexpected_eof"),
-        _ => None,
-    }
-}
-
-fn exact_error_label(error: &dyn std::error::Error, label: &'static str) -> bool {
-    struct ExactLabel<'a> {
-        remaining: &'a str,
-    }
-
-    impl std::fmt::Write for ExactLabel<'_> {
-        fn write_str(&mut self, text: &str) -> std::fmt::Result {
-            if let Some(remaining) = self.remaining.strip_prefix(text) {
-                self.remaining = remaining;
-                Ok(())
-            } else {
-                Err(std::fmt::Error)
-            }
-        }
-    }
-
-    let mut writer = ExactLabel { remaining: label };
-    std::fmt::write(&mut writer, format_args!("{error}")).is_ok() && writer.remaining.is_empty()
+    parts.join(" <- ")
 }
 
 fn codex_egress_failure_stage(error: &ProxySendError) -> CodexEgressFailureStage {
@@ -823,7 +766,7 @@ mod timeout_tests {
     }
 
     #[test]
-    fn transport_source_distinguishes_keepalive_from_io_and_other_timeout() {
+    fn transport_cause_reports_the_real_source_chain() {
         let keepalive = TestError {
             label: "keep-alive timed out",
             source: Some(Box::new(TestError {
@@ -832,44 +775,33 @@ mod timeout_tests {
             })),
         };
         assert_eq!(
-            sanitized_error_source_cause(&keepalive),
-            Some("http2_keepalive_timeout")
+            codex_transport_cause(&keepalive),
+            "keep-alive timed out <- operation timed out"
         );
         let read_timeout = std::io::Error::new(std::io::ErrorKind::TimedOut, "private endpoint");
-        assert_eq!(
-            sanitized_error_source_cause(&read_timeout),
-            Some("transport_io_timeout")
-        );
-        let unrelated = TestError {
-            label: "keep-alive timed out",
-            source: Some(Box::new(TestError {
-                label: "not the timeout sentinel",
-                source: None,
-            })),
-        };
-        assert_eq!(sanitized_error_source_cause(&unrelated), None);
-        assert!(!exact_error_label(
-            &unrelated,
-            "keep-alive timed out private endpoint"
-        ));
+        assert_eq!(codex_transport_cause(&read_timeout), "private endpoint");
     }
 
     #[test]
-    fn transport_source_scan_is_bounded() {
+    fn transport_cause_scan_is_bounded() {
         let mut error: Box<dyn std::error::Error + Send + Sync> = Box::new(TestError {
-            label: "keep-alive timed out",
-            source: Some(Box::new(TestError {
-                label: "operation timed out",
-                source: None,
-            })),
+            label: "root",
+            source: None,
         });
-        for _ in 0..16 {
+        for _ in 0..32 {
             error = Box::new(TestError {
                 label: "wrapper",
                 source: Some(error),
             });
         }
-        assert_eq!(sanitized_error_source_cause(error.as_ref()), None);
+        // The walk stops after a bounded number of links instead of walking an
+        // arbitrarily deep chain.
+        assert_eq!(
+            codex_transport_cause(error.as_ref())
+                .matches("wrapper")
+                .count(),
+            16
+        );
     }
 
     #[test]

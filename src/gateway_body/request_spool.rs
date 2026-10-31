@@ -30,7 +30,16 @@ pub(crate) fn request_body_object_key(request_id: &str) -> Option<String> {
         && request_id
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
-    safe.then(|| format!("gateway/request-bodies/{request_id}"))
+    safe.then(|| match uuid::Uuid::parse_str(request_id) {
+        Ok(request_id) => format!("staging/proxy/{request_id}/request/{request_id}/body.json"),
+        Err(_) => format!("gateway/request-bodies/{request_id}"),
+    })
+}
+
+pub(crate) fn source_request_id(locator: &str) -> Option<uuid::Uuid> {
+    let request_id = locator.strip_prefix("staging/proxy/")?.split('/').next()?;
+    let request_id = uuid::Uuid::parse_str(request_id).ok()?;
+    (request_body_object_key(&request_id.to_string())?.as_str() == locator).then_some(request_id)
 }
 
 #[derive(Clone)]
@@ -46,28 +55,41 @@ pub(crate) struct MemoryObjectStore {
     reads: AtomicUsize,
     writes: AtomicUsize,
     entered_writes: AtomicUsize,
+    fail_writes: AtomicBool,
     pauses: Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<()>>>,
+    backing: Mutex<Option<crate::archive::ArchiveStore>>,
 }
 
 #[cfg(test)]
 impl MemoryObjectStore {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             objects: Mutex::new(std::collections::HashMap::new()),
             reads: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             entered_writes: AtomicUsize::new(0),
+            fail_writes: AtomicBool::new(false),
             pauses: Mutex::new(std::collections::VecDeque::new()),
+            backing: Mutex::new(None),
         })
     }
 
-    fn pause_next_write(&self) -> tokio::sync::oneshot::Sender<()> {
+    pub(crate) fn pause_next_write(&self) -> tokio::sync::oneshot::Sender<()> {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         self.pauses
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push_back(receiver);
         sender
+    }
+
+    pub(crate) fn fail_writes_for_test(&self) {
+        self.fail_writes.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn resume_writes_for_test(&self, archive: crate::archive::ArchiveStore) {
+        *self.backing.lock().unwrap() = Some(archive);
+        self.fail_writes.store(false, Ordering::Release);
     }
 }
 
@@ -83,6 +105,13 @@ impl DurableRequestBodies {
                     let _ = pause.await;
                 }
                 store.writes.fetch_add(1, Ordering::AcqRel);
+                if store.fail_writes.load(Ordering::Acquire) {
+                    return Err(());
+                }
+                let backing = store.backing.lock().map_err(|_| ())?.clone();
+                if let Some(backing) = backing {
+                    backing.put(key, body.clone()).await.map_err(|_| ())?;
+                }
                 store
                     .objects
                     .lock()
@@ -179,6 +208,19 @@ pub(crate) struct RequestSpoolAdmission {
 }
 
 impl RequestSpoolAdmission {
+    pub(crate) fn source(&self, request_id: uuid::Uuid) -> Option<Arc<RequestSpool>> {
+        self.usage.sources.lock().ok()?.get(&request_id)?.upgrade()
+    }
+
+    pub(crate) fn register_source(&self, request_id: uuid::Uuid, source: &Arc<RequestSpool>) {
+        if let Ok(mut sources) = self.usage.sources.lock() {
+            sources.insert(request_id, Arc::downgrade(source));
+        }
+    }
+    pub(crate) fn has_durable_store(&self) -> bool {
+        self.usage.durable.is_some()
+    }
+
     pub(crate) fn new(_directory: PathBuf) -> Self {
         Self {
             usage: Arc::new(RequestSpoolUsage::default()),
@@ -197,7 +239,7 @@ impl RequestSpoolAdmission {
     }
 
     #[cfg(test)]
-    fn with_memory_store(mut self, store: Arc<MemoryObjectStore>) -> Self {
+    pub(crate) fn with_memory_store(mut self, store: Arc<MemoryObjectStore>) -> Self {
         let usage = Arc::get_mut(&mut self.usage)
             .expect("durable store is attached before the admission is shared");
         usage.durable = Some(DurableRequestBodies::Memory(store));
@@ -395,6 +437,17 @@ impl RequestSpoolAdmission {
                     DURABLE_IN_FLIGHT
                 })),
                 durable_write: Mutex::new(None),
+                archived: AtomicBool::new(false),
+                outcome: tokio::sync::watch::channel(if captured.durable_settled {
+                    Some(true)
+                } else {
+                    None
+                })
+                .0,
+                archive_owner: Mutex::new(None),
+                background_upload: !captured.durable_settled,
+                archive_ready: tokio::sync::Notify::new(),
+                source_dropped: AtomicBool::new(false),
             }),
             #[cfg(test)]
             read_count: self.read_count.clone(),
@@ -424,6 +477,7 @@ struct RequestSpoolUsage {
     durable: Option<DurableRequestBodies>,
     /// Oldest resident first. Only a settled object-storage copy may leave memory.
     residents: Mutex<std::collections::VecDeque<std::sync::Weak<SharedBody>>>,
+    sources: Mutex<std::collections::HashMap<uuid::Uuid, std::sync::Weak<RequestSpool>>>,
 }
 
 impl RequestSpoolUsage {
@@ -490,6 +544,12 @@ struct SharedBody {
     durable_ok: Arc<AtomicBool>,
     durable_phase: Arc<AtomicU8>,
     durable_write: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    archived: AtomicBool,
+    outcome: tokio::sync::watch::Sender<Option<bool>>,
+    archive_owner: Mutex<Option<(crate::db::Database, crate::db::ArchiveSpoolIdentity)>>,
+    background_upload: bool,
+    archive_ready: tokio::sync::Notify,
+    source_dropped: AtomicBool,
 }
 
 pub(crate) struct RequestSpool {
@@ -499,6 +559,68 @@ pub(crate) struct RequestSpool {
 }
 
 impl RequestSpool {
+    #[cfg(test)]
+    pub(crate) async fn abort_writer_for_test(&self) {
+        let handle = self.shared.durable_write.lock().unwrap().take().unwrap();
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+    }
+
+    pub(crate) fn object_locator(&self) -> Option<&str> {
+        self.shared.object_key.as_deref()
+    }
+
+    pub(crate) fn retain_for_archive(
+        &self,
+        database: crate::db::Database,
+        identity: crate::db::ArchiveSpoolIdentity,
+    ) {
+        self.shared.archived.store(true, Ordering::Release);
+        let mut owner = self
+            .shared
+            .archive_owner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *owner = Some((database, identity));
+        if !self.shared.background_upload {
+            let success = self.shared.outcome.borrow().unwrap_or(false);
+            let (database, identity) = owner.take().unwrap();
+            let locator = self.shared.object_key.clone().unwrap();
+            let length = self.shared.length;
+            let digest = self.shared.digest;
+            release_resident_memory(&self.shared);
+            database.schedule_request_source_completion(identity, locator, length, digest, success);
+        }
+        self.shared.archive_ready.notify_one();
+    }
+
+    pub(crate) async fn upload_outcome(&self) -> bool {
+        let mut outcome = self.shared.outcome.subscribe();
+        loop {
+            if let Some(success) = *outcome.borrow_and_update() {
+                return success;
+            }
+            if outcome.changed().await.is_err() {
+                return false;
+            }
+        }
+    }
+
+    pub(crate) fn shared_bytes(self: &Arc<Self>, bytes: Bytes) -> Bytes {
+        struct BodySource {
+            bytes: Bytes,
+            _source: Arc<RequestSpool>,
+        }
+        impl AsRef<[u8]> for BodySource {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        Bytes::from_owner(BodySource {
+            bytes,
+            _source: self.clone(),
+        })
+    }
     pub(crate) fn len(&self) -> usize {
         self.shared.length
     }
@@ -553,16 +675,7 @@ impl RequestSpool {
         if let Some(body) = resident {
             return verified_body(&self.shared, body);
         }
-        let handle = self
-            .shared
-            .durable_write
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take();
-        if let Some(handle) = handle {
-            let _ = handle.await;
-        }
-        if !self.shared.durable_ok.load(Ordering::Acquire) {
+        if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
             return Err(RequestSpoolReadError);
         }
         let Some(store) = self.shared.durable.as_ref() else {
@@ -582,6 +695,20 @@ impl RequestSpool {
 impl Drop for RequestSpool {
     fn drop(&mut self) {
         release_resident_memory(&self.shared);
+        self.shared.source_dropped.store(true, Ordering::Release);
+        self.shared.archive_ready.notify_one();
+        if let Some(request_id) = self.object_locator().and_then(source_request_id)
+            && let Ok(lease) = self.shared.lease.lock()
+            && let Ok(mut sources) = lease.usage.sources.lock()
+            && sources
+                .get(&request_id)
+                .is_some_and(|source| source.strong_count() == 0)
+        {
+            sources.remove(&request_id);
+        }
+        if self.shared.archived.load(Ordering::Acquire) {
+            return;
+        }
         // Detach the writer. Aborting it lets a late PutObject land after the
         // delete and leave a body no request still owns.
         drop(
@@ -664,7 +791,7 @@ fn evict_oldest_settled(usage: &RequestSpoolUsage) -> bool {
     false
 }
 
-fn publish_durable(shared: &SharedBody) {
+fn publish_durable(shared: &Arc<SharedBody>) {
     let Some(store) = shared.durable.clone() else {
         return;
     };
@@ -682,31 +809,128 @@ fn publish_durable(shared: &SharedBody) {
     let ok = Arc::clone(&shared.durable_ok);
     let phase = Arc::clone(&shared.durable_phase);
     let residency = shared.residency.clone();
+    let outcome = shared.outcome.clone();
+    let source = shared.clone();
     let handle = tokio::spawn(async move {
-        let wrote = store.put(&key, bytes).await.is_ok();
-        if wrote {
-            match phase.compare_exchange(
-                DURABLE_IN_FLIGHT,
-                DURABLE_COMMITTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    ok.store(true, Ordering::Release);
-                    // Only a completed upload may leave memory. A failed put
-                    // keeps this resident as the only copy.
-                    residency.durable_settled.store(true, Ordering::Release);
+        let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
+        let upload = async {
+            let retry_upload = async {
+                loop {
+                    if store.put(&key, bytes.clone()).await.is_ok() {
+                        break true;
+                    }
+                    if source.source_dropped.load(Ordering::Acquire)
+                        && !source.archived.load(Ordering::Acquire)
+                    {
+                        break false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                 }
-                Err(DURABLE_DROPPED) => {
-                    store.delete(&key).await;
-                    residency.durable_settled.store(true, Ordering::Release);
+            };
+            let wrote = tokio::select! {
+                biased;
+                _ = cancelled => false,
+                result = retry_upload => result,
+            };
+            drop(bytes);
+            if wrote {
+                match phase.compare_exchange(
+                    DURABLE_IN_FLIGHT,
+                    DURABLE_COMMITTED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => {
+                        ok.store(true, Ordering::Release);
+                    }
+                    Err(DURABLE_DROPPED) => {
+                        store.delete(&key).await;
+                    }
+                    Err(_) => {}
                 }
-                Err(_) => {}
+                if source.archived.load(Ordering::Acquire) {
+                    release_resident_memory(&source);
+                }
+                residency.durable_settled.store(true, Ordering::Release);
+                residency.release_if_idle();
+            } else {
+                tracing::warn!("request body stayed in memory; object storage write failed");
             }
-        } else {
-            tracing::warn!("request body stayed in memory; object storage write failed");
-        }
-        residency.release_if_idle();
+            outcome.send_replace(Some(wrote));
+        };
+        let completion = async {
+            loop {
+                let ready = source.archive_ready.notified();
+                let owner = source
+                    .archive_owner
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take();
+                if let Some((database, identity)) = owner {
+                    let lease = async {
+                        let wrote = database
+                            .wait_request_source_upload(
+                                identity,
+                                &key,
+                                source.length,
+                                source.digest,
+                                outcome.subscribe(),
+                            )
+                            .await;
+                        if wrote.is_none() {
+                            let _ = cancel.send(());
+                        }
+                        wrote
+                    };
+                    let handoff = async {
+                        let mut settled = outcome.subscribe();
+                        let success = loop {
+                            if let Some(success) = *settled.borrow_and_update() {
+                                break success;
+                            }
+                            if settled.changed().await.is_err() {
+                                break false;
+                            }
+                        };
+                        let permit = if success {
+                            database.try_request_source_completion()
+                        } else {
+                            Some(database.request_source_completion().await)
+                        };
+                        release_resident_memory(&source);
+                        residency.durable_settled.store(true, Ordering::Release);
+                        residency.release_if_idle();
+                        permit
+                    };
+                    let (wrote, permit) = tokio::join!(lease, handoff);
+                    if let (Some(_permit), Some(wrote)) = (permit, wrote) {
+                        database
+                            .complete_request_source(
+                                identity,
+                                &key,
+                                source.length,
+                                source.digest,
+                                wrote,
+                            )
+                            .await;
+                    }
+                    break;
+                }
+                if source.source_dropped.load(Ordering::Acquire) {
+                    let mut settled = outcome.subscribe();
+                    while settled.borrow_and_update().is_none() {
+                        if settled.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    residency.durable_settled.store(true, Ordering::Release);
+                    residency.release_if_idle();
+                    break;
+                }
+                ready.await;
+            }
+        };
+        tokio::join!(upload, completion);
     });
     *shared
         .durable_write
@@ -791,6 +1015,9 @@ pub(crate) enum RequestSpoolCaptureError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RequestSpoolReadError;
+
+#[cfg(test)]
+mod archive_source_tests;
 
 #[cfg(test)]
 mod tests {

@@ -41,8 +41,8 @@ impl ClientKey {
             proxy_fingerprint: proxy_fingerprint(credential),
             http_protocol: policy.http_protocol,
             timeouts: [
-                policy.connect_timeout_millis,
-                policy.read_timeout_millis,
+                policy.connect_timeout_millis.unwrap_or(0),
+                policy.read_timeout_millis.unwrap_or(0),
                 policy.request_timeout_millis,
             ],
         }
@@ -517,7 +517,7 @@ mod tests {
         assert!(first != ClientKey::new(&route, policy));
         route.transport_revision -= 1;
         let changed = CodexTransportPolicy {
-            connect_timeout_millis: 1000,
+            connect_timeout_millis: Some(1000),
             ..policy
         };
         assert!(first != ClientKey::new(&route, changed));

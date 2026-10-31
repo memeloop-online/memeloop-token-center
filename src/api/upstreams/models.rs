@@ -75,11 +75,10 @@ fn codex_catalog_budget(config: &Value) -> Result<CatalogBudget, &'static str> {
     } else {
         CODEX_MODEL_CATALOG_TIMEOUT
     };
-    let read = if value.is_some_and(|p| p.get("read_timeout_millis").is_some()) {
-        Duration::from_millis(policy.read_timeout_millis).min(total)
-    } else {
-        total
-    };
+    let read = policy
+        .read_timeout_millis
+        .filter(|_| value.is_some_and(|p| p.get("read_timeout_millis").is_some()))
+        .map_or(total, |millis| Duration::from_millis(millis).min(total));
     Ok(CatalogBudget { total, read })
 }
 
@@ -2219,10 +2218,19 @@ mod tests {
     async fn codex_catalog_connect_fallback_is_bounded_by_members_attempts_and_budget() {
         for (policy, expected_attempts) in [
             (
-                json!({"connect_attempts": 4, "connect_retry_delay_millis": 0}),
+                // These are unreachable SOCKS fixture members. Bound each
+                // connect so both fit inside the management catalog budget;
+                // an absent connect timeout intentionally has no deadline.
+                json!({
+                    "connect_attempts": 4, "connect_retry_delay_millis": 0,
+                    "connect_timeout_millis": 100,
+                }),
                 2,
             ),
-            (json!({"connect_attempts": 1}), 1),
+            (
+                json!({"connect_attempts": 1, "connect_timeout_millis": 100}),
+                1,
+            ),
             (
                 json!({
                     "connect_attempts": 4, "connect_retry_delay_millis": 1000,

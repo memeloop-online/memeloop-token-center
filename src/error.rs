@@ -1648,6 +1648,14 @@ pub(crate) fn explained_failure_body(
 
 impl From<sqlx::Error> for AppError {
     fn from(error: sqlx::Error) -> Self {
+        #[cfg(test)]
+        if let sqlx::Error::Database(database) = &error
+            && let Some(code) = database.code()
+            && code.len() == 5
+            && code.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        {
+            eprintln!("database operation failed: SQLSTATE={code}");
+        }
         // Driver messages can echo bound values (including identifiers or
         // encrypted credential envelopes). Keep a stable diagnostic class,
         // never the driver-provided message, in application logs.

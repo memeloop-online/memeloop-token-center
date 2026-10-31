@@ -5,8 +5,6 @@ pub(crate) mod signals;
 mod tests;
 pub(crate) use members::{load_group_members, normalize_legacy_members, store_group_members};
 
-pub(crate) const PROXY_AAD: &[u8] = b"mtc/network-proxy/v1";
-
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProxyProbe {
@@ -84,12 +82,8 @@ fn validate_probe(probe: &ProxyProbe) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn proxy_view(row: &AnyRow, external: &str, key: &[u8]) -> Result<Value, AppError> {
-    let proxy: String = open_private_json(
-        &row.try_get::<String, _>("proxy_ciphertext")?,
-        key,
-        PROXY_AAD,
-    )?;
+pub(crate) fn proxy_view(row: &AnyRow, external: &str, _key: &[u8]) -> Result<Value, AppError> {
+    let proxy: String = row.try_get::<String, _>("proxy_url")?;
     let parsed = url::Url::parse(&proxy).map_err(|_| invalid_proxy())?;
     Ok(serde_json::json!({
         "id": row.try_get::<String, _>("id")?, "tenant_external_id": external,
@@ -159,7 +153,7 @@ impl Database {
         validate_proxy_name(&body.name)?;
         validate_probe(&body.probe)?;
         crate::network::validate_managed_codex_proxy(&body.proxy_url).await?;
-        let ciphertext = seal_private_json(&body.proxy_url, key, PROXY_AAD)?;
+        let proxy_url = body.proxy_url.clone();
         let mut tx = self.begin_write_transaction().await?;
         proxy_lock(&mut tx).await?;
         let tenant: String = sqlx::query_scalar("SELECT id FROM tenants WHERE external_id = $1")
@@ -178,8 +172,8 @@ impl Database {
             return Err(AppError::ProxyGroupConflict("network_proxy_name_conflict"));
         }
         let id = Uuid::now_v7();
-        sqlx::query("INSERT INTO network_proxies (id, tenant_id, name, version, proxy_ciphertext, probe_enabled, probe_target, probe_interval_ms, probe_attempts, created_at, updated_at) VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$9,$9)")
-            .bind(id.to_string()).bind(&tenant).bind(&body.name).bind(ciphertext)
+        sqlx::query("INSERT INTO network_proxies (id, tenant_id, name, version, proxy_url, probe_enabled, probe_target, probe_interval_ms, probe_attempts, created_at, updated_at) VALUES ($1,$2,$3,1,$4,$5,$6,$7,$8,$9,$9)")
+            .bind(id.to_string()).bind(&tenant).bind(&body.name).bind(proxy_url)
             .bind(i64::from(body.probe.enabled)).bind(&body.probe.target_url).bind(body.probe.interval_ms).bind(body.probe.attempts)
             .bind(unix_millis()).execute(&mut *tx).await?;
         proxy_audit(&mut tx, &tenant, id, "proxy_create", 1, actor).await?;
@@ -231,23 +225,14 @@ impl Database {
             interval_ms: row.try_get("probe_interval_ms")?,
             attempts: row.try_get("probe_attempts")?,
         });
-        let old_proxy: String = open_private_json(
-            &row.try_get::<String, _>("proxy_ciphertext")?,
-            key,
-            PROXY_AAD,
-        )?;
+        let old_proxy: String = row.try_get::<String, _>("proxy_url")?;
         let old_name: String = row.try_get("name")?;
-        let ciphertext = body
-            .proxy_url
-            .as_ref()
-            .map(|proxy| seal_private_json(proxy, key, PROXY_AAD))
-            .transpose()?
-            .unwrap_or(row.try_get("proxy_ciphertext")?);
+        let proxy_url = body.proxy_url.clone().unwrap_or(row.try_get("proxy_url")?);
         let version = version
             .checked_add(1)
             .ok_or_else(|| AppError::internal("network_proxy_version"))?;
-        sqlx::query("UPDATE network_proxies SET name = $1, version = $2, proxy_ciphertext = $3, probe_enabled = $4, probe_target = $5, probe_interval_ms = $6, probe_attempts = $7, updated_at = $8, last_probe_status = NULL, last_probe_checked_at = NULL, last_probe_latency_ms = NULL WHERE id = $9")
-            .bind(&body.name).bind(version).bind(ciphertext).bind(i64::from(probe.enabled)).bind(probe.target_url)
+        sqlx::query("UPDATE network_proxies SET name = $1, version = $2, proxy_url = $3, probe_enabled = $4, probe_target = $5, probe_interval_ms = $6, probe_attempts = $7, updated_at = $8, last_probe_status = NULL, last_probe_checked_at = NULL, last_probe_latency_ms = NULL WHERE id = $9")
+            .bind(&body.name).bind(version).bind(proxy_url).bind(i64::from(probe.enabled)).bind(probe.target_url)
             .bind(probe.interval_ms).bind(probe.attempts).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
         self.refresh_network_proxy_references(&mut tx, id, &old_proxy, &old_name, None, key)
             .await?;

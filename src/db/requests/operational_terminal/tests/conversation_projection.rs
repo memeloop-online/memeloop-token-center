@@ -153,6 +153,7 @@ async fn contract(fixture: Fixture) {
         .mark_pending_proxy_settlement_unknown(&fixture.claim)
         .await
         .unwrap();
+    super::unknown_bridge::drain_terminal(&fixture).await;
     let tasks = fixture
         .database
         .claim_conversation_projection_tasks(owner, 1)
@@ -165,7 +166,7 @@ async fn contract(fixture: Fixture) {
     assert!(
         fixture
             .database
-            .prepare_session_body_archive(owner, request_id, &atoms, &nodes, &[])
+            .prepare_session_body_archive(owner, request_id, atoms, &nodes, &[])
             .await
             .unwrap()
     );

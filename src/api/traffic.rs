@@ -10,7 +10,7 @@ use axum::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{MAX_IMAGE_REQUEST_BODY, MAX_REPORTED_TOKENS};
+use super::MAX_REPORTED_TOKENS;
 use crate::{
     AppState,
     error::AppError,
@@ -447,7 +447,7 @@ async fn apply_traffic_plugin(
         Some(
             state
                 .proxy_memory_budget
-                .temporary(64 * 1024 * 1024 + input_length.max(16 * 1024 * 1024).saturating_mul(5))
+                .temporary(input_length.saturating_mul(5))
                 .map_err(|error| {
                     named_memory_rejection(
                         "proxy_memory_plugin",
@@ -464,7 +464,7 @@ async fn apply_traffic_plugin(
     let plugin_configurations = plugins
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
-    let plugin_request = original_request_json.clone();
+    let plugin_request = original_request_json;
     #[cfg(feature = "experimental-plugin-revisions")]
     let application_snapshot = state.pinned_application_plugins.clone();
     let plugin_context = RequestContext {
@@ -476,7 +476,7 @@ async fn apply_traffic_plugin(
         config_json: "{}".to_owned(),
     };
     let metrics = state.metrics.clone();
-    let plugin_decision =
+    let (plugin_decision, original_request_json) =
         plugin_execution::run(state.metrics.clone(), Phase::PostAuth, move || {
             let _temporary_memory = temporary_memory;
             let result = (|| {
@@ -496,15 +496,17 @@ async fn apply_traffic_plugin(
                     memory.as_deref(),
                 )
             })();
-            result.map_err(|error| {
-                named_memory_rejection(
-                    "proxy_memory_plugin",
-                    metrics.observe_proxy_memory_error(
-                        crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                        error,
-                    ),
-                )
-            })
+            result
+                .map(|decision| (decision, plugin_request))
+                .map_err(|error| {
+                    named_memory_rejection(
+                        "proxy_memory_plugin",
+                        metrics.observe_proxy_memory_error(
+                            crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                            error,
+                        ),
+                    )
+                })
         })
         .await?;
     if !plugin_decision.allow {
@@ -538,12 +540,10 @@ async fn apply_traffic_plugin(
         ));
     }
     request_json["model"] = Value::String(model.clone());
-    if crate::gateway_body::memory::json_encoded_length(&request_json)? > MAX_IMAGE_REQUEST_BODY {
-        return Err(AppError::upstream_with(
-            "upstream_unavailable",
-            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
-        ));
-    }
+    // Request size is enforced once, by ingress body admission. Re-checking it
+    // here with the image-generation ceiling rejected large Codex contexts with
+    // a misleading 502 "upstream_unavailable" even though the upstream was
+    // reachable and the body had already been admitted.
     let upstream_account_hint = plugin_decision
         .upstream_account_id
         .map(|value| {

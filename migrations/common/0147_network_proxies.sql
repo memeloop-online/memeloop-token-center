@@ -3,7 +3,7 @@ CREATE TABLE network_proxies (
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     name TEXT NOT NULL,
     version BIGINT NOT NULL CHECK (version > 0),
-    proxy_ciphertext TEXT NOT NULL,
+    proxy_url TEXT NOT NULL,
     probe_enabled BIGINT NOT NULL DEFAULT 1,
     probe_target TEXT NOT NULL DEFAULT 'https://openai.com/',
     probe_interval_ms BIGINT NOT NULL DEFAULT 60000,
