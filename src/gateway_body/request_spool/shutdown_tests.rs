@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn shutdown_waits_for_already_accepted_request_object_upload() {
+async fn shutdown_drains_abandoned_request_upload_without_leaving_an_orphan() {
     let directory = tempfile::tempdir().unwrap();
     let store = MemoryObjectStore::new();
     let release = store.pause_next_write();
@@ -22,11 +22,11 @@ async fn shutdown_waits_for_already_accepted_request_object_upload() {
         .unwrap();
     let mut drain = Box::pin(admission.drain_uploads());
     assert!(futures_util::poll!(&mut drain).is_pending());
+    drop(spool);
     release.send(()).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(5), drain)
         .await
         .unwrap();
-    assert!(spool.upload_outcome().await);
     let key = request_body_object_key(request_id).unwrap();
-    assert_eq!(store.objects.lock().unwrap().get(&key), Some(&body));
+    assert!(!store.objects.lock().unwrap().contains_key(&key));
 }

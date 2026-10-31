@@ -70,6 +70,19 @@ async fn stopped_http_server_drains_stream_archive_and_receipt_without_blocking_
     .unwrap();
     assert!(!process.is_finished(), "archive writer is still owned");
     release_archive.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while fixture
+            .state
+            .proxy_archive_stream_permits
+            .available_permits()
+            != 0
+        {
+            assert!(!process.is_finished());
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("shutdown must pass archive drain before waiting for the receipt");
     assert!(!process.is_finished(), "receipt writer is still owned");
     drop(receipt_writer);
     tokio::time::timeout(Duration::from_secs(10), process)

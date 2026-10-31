@@ -167,6 +167,7 @@ impl AppState {
             .expect("proxy archive admission remains open during shutdown");
         self.pending_terminals.drain().await;
         self.responses_request_spool.drain_uploads().await;
+        self.db.drain_gateway_persistence().await;
     }
 
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
