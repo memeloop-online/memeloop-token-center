@@ -1201,6 +1201,38 @@ mod tests {
     };
 
     #[test]
+    fn reset_readback_requires_fresh_relevant_allowed_usage_not_credits_or_other_windows() {
+        let account: UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1), "tenant_id":Uuid::from_u128(2), "name":"readback",
+            "driver":"openai-codex", "auth_kind":"oauth", "connection_method":"native_oauth",
+            "credential_generation":1, "status":"active", "config":{}, "can_refresh":true,
+            "can_rotate":false, "can_reauthorize":true, "route_count":0, "created_at":0, "updated_at":10
+        })).unwrap();
+        for (usage, allowed) in [
+            (json!({"credits":{"has_credits":true}}), false),
+            (
+                json!({"code_review_rate_limit":{"allowed":true,"primary_window":{}}}),
+                false,
+            ),
+            (
+                json!({"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{}}}),
+                false,
+            ),
+            (
+                json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{}}}),
+                true,
+            ),
+        ] {
+            let mut snapshot = QuotaSnapshot::empty(&account, "test", None);
+            normalize::usage(&mut snapshot, &usage, 20).unwrap();
+            snapshot.status = "ready";
+            assert_eq!(snapshot.conclusively_allows_codex(), allowed);
+            snapshot.stale = true;
+            assert!(!snapshot.conclusively_allows_codex());
+        }
+    }
+
+    #[test]
     fn cache_identity_separates_tenant_rename_and_credential_generation() {
         let mut account: UpstreamAccountView = serde_json::from_value(json!({
             "id":Uuid::from_u128(1), "tenant_id":Uuid::from_u128(2), "name":"fixture",

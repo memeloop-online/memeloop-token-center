@@ -528,7 +528,7 @@ async fn send_codex_attempt_once(
             IndependentProbeTarget::dispatched(&route.route);
             let response = client.execute(request).await?;
             IndependentProbeTarget::response(response.status());
-            Ok(response)
+            Ok::<_, reqwest::Error>(response)
         }
         .await
         .map_err(|error| {

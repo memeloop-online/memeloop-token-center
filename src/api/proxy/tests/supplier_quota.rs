@@ -158,9 +158,9 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
         .db
         .create_model_route(CreateModelRouteInput {
             tenant_external_id: tenant.into(),
-            public_model: "eur-only".into(),
+            public_model: "cny-only".into(),
             upstream_account_id: account,
-            upstream_model: "eur-only".into(),
+            upstream_model: "cny-only".into(),
             protocol: "openai".into(),
             priority: 0,
         })
@@ -171,7 +171,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     fixture
         .state
         .db
-        .upsert_model_price("eur-only", "EUR", Decimal::ZERO, Decimal::ZERO)
+        .upsert_model_price("cny-only", "CNY", Decimal::ZERO, Decimal::ZERO)
         .await
         .unwrap();
     let context = fixture
@@ -199,7 +199,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
         "cheap-alias",
         "different-model",
         "upstream-0",
-        "eur-only",
+        "cny-only",
     ]
     .map(|name| crate::db::DiscoveredUpstreamModel {
         model_id: name.into(),
@@ -366,6 +366,11 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     assert_eq!(periodic["error_code"], "supplier_quota_reset_pending");
     assert_eq!(periodic["reset_at"], deadline);
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    sqlx::query("DELETE FROM upstream_account_health WHERE upstream_account_id=$1")
+        .bind(account.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
     // Ordinary response with no timing and a shorter exhausted response must
     // retain the provider deadline and perform zero background inference.
     let scoped_route = ResolvedUpstream {
@@ -448,7 +453,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     assert_eq!(timed_out["actual_model"], "upstream-0");
     assert!(timed_out["upstream_status"].is_null());
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-    config["probe_model"] = json!("eur-only");
+    config["probe_model"] = json!("cny-only");
     sqlx::query("UPDATE upstream_accounts SET config_json=$2 WHERE id=$1")
         .bind(account.to_string())
         .bind(config.to_string())
@@ -464,7 +469,7 @@ async fn default_probe_skips_unusable_cheaper_models_and_explicit_alias_stays_sk
     .unwrap();
     assert_eq!(unpriced["status"], "skipped");
     assert_eq!(unpriced["error_code"], "probe_model_unpriced");
-    assert_eq!(unpriced["selected_model"], "eur-only");
+    assert_eq!(unpriced["selected_model"], "cny-only");
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     sqlx::query("UPDATE upstream_accounts SET status='disabled' WHERE id=$1")
         .bind(account.to_string())

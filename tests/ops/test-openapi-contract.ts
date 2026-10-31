@@ -75,6 +75,17 @@ test("health GET and POST payloads validate against both published contracts", (
   }
 });
 
+test("accepted reset readback uses the existing fresh-read interface without a second consume", () => {
+  const source = readFileSync(`${repository}/src/upstream_quota/reset.rs`, "utf8");
+  const confirm = source.slice(source.indexOf("pub(crate) async fn confirm("), source.indexOf("pub(crate) async fn reconcile("));
+  assert.equal(confirm.match(/dispatch_once\(/gu)?.length, 1);
+  const accepted = confirm.slice(confirm.indexOf("if accepted {"));
+  assert.match(accepted, /\.read_fresh\(\s*state,\s*account,\s*credential,\s*tenant,\s*QuotaReadTrigger::ResetWorkflow/su);
+  assert.doesNotMatch(accepted, /fresh_snapshot\(|dispatch_once\(/u);
+  assert.match(confirm, /let dispatch_credential = &selection.credential/u);
+  assert.doesNotMatch(confirm, /let credential = &selection.credential/u);
+});
+
 test("statistics cache metadata matches the serialized Rust coverage contract", () => {
   const schemas = cloneDocument().components.schemas;
   assert.ok(schemas.StatisticsSummary.required.includes("cache_usage"));

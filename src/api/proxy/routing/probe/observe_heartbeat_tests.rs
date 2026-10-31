@@ -118,8 +118,13 @@ async fn customer_success_does_not_wait_on_observe_or_heal_the_breaker() {
         .unwrap()
         .unwrap();
     assert_eq!(probe["checked_at"], 1);
-    assert_eq!(probe["error_code"], "upstream_unavailable");
-    assert_eq!(probe["latency_ms"], 1);
+    assert_eq!(probe["status"], "unknown");
+    assert_eq!(probe["source"], "legacy_unverified");
+    assert_eq!(
+        probe["historical_result"]["error_code"],
+        "upstream_unavailable"
+    );
+    assert_eq!(probe["historical_result"]["latency_ms"], 1);
     assert!(
         state
             .db
