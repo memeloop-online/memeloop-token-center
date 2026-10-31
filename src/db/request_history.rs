@@ -437,11 +437,38 @@ impl Database {
         snapshots: &[HistorySnapshot],
     ) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
+        const ACK: &str = "DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4";
         for snapshot in snapshots {
-            sqlx::query("DELETE FROM request_history_export WHERE revision = $1 AND source = $2 AND request_id = $3 AND snapshot = $4")
-                .bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string())
+            let deleted = sqlx::query(ACK)
+                .bind(snapshot.revision)
+                .bind(&snapshot.identity.source)
+                .bind(snapshot.identity.request_id.to_string())
                 .bind(serde_json::to_string(snapshot)?)
-                .execute(&mut *transaction).await?;
+                .execute(&mut *transaction)
+                .await?;
+            if deleted.rows_affected() != 0 {
+                continue;
+            }
+            // Older frozen JSON may omit a newly defaulted read-model field.
+            // Compare decoded content, then still ACK the exact stored bytes.
+            // The final DELETE rechecks revision if a correction races us.
+            let frozen=sqlx::query_scalar::<_,Option<String>>("SELECT snapshot FROM request_history_export WHERE revision=$1 AND source=$2 AND request_id=$3")
+                .bind(snapshot.revision).bind(&snapshot.identity.source).bind(snapshot.identity.request_id.to_string())
+                .fetch_optional(&mut *transaction).await?.flatten();
+            if let Some(frozen) = frozen {
+                let decoded: HistorySnapshot = serde_json::from_str(&frozen)?;
+                if crate::request_history::canonical_hash(&decoded)?
+                    == crate::request_history::canonical_hash(snapshot)?
+                {
+                    sqlx::query(ACK)
+                        .bind(snapshot.revision)
+                        .bind(&snapshot.identity.source)
+                        .bind(snapshot.identity.request_id.to_string())
+                        .bind(frozen)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+            }
         }
         transaction.commit().await?;
         Ok(())

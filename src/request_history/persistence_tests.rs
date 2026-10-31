@@ -95,6 +95,31 @@ async fn capture_replay(database: &Database) {
     assert!(database.history_switch(true).await.is_err());
     database.history_acknowledge(&corrected).await.unwrap();
     assert!(native_pending(database).await.is_empty());
+    // Upgrade a durable first-slice frozen record that predates read_model.
+    sqlx::query("UPDATE request_records SET duration_ms=21 WHERE id=$1")
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let current = native_pending(database).await;
+    let mut legacy = serde_json::to_value(&current[0]).unwrap();
+    legacy.as_object_mut().unwrap().remove("read_model");
+    sqlx::query(
+        "UPDATE request_history_export SET snapshot=$1 WHERE source='native' AND request_id=$2",
+    )
+    .bind(serde_json::to_string(&legacy).unwrap())
+    .bind(request_id.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let replay = native_pending(database).await;
+    assert!(replay[0].read_model.is_null());
+    let mut changed = replay[0].clone();
+    changed.payload.as_mut().unwrap()["model"] = serde_json::json!("not-the-frozen-payload");
+    database.history_acknowledge(&[changed]).await.unwrap();
+    assert_eq!(native_pending(database).await.len(), 1);
+    database.history_acknowledge(&replay).await.unwrap();
+    assert!(native_pending(database).await.is_empty());
 }
 
 #[tokio::test]
