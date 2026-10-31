@@ -367,6 +367,15 @@ impl Database {
             .ok()
     }
 
+    pub(crate) async fn drain_gateway_persistence(&self) {
+        let _accepted = self
+            .gateway_persistence
+            .slots
+            .acquire_many(TASK_LIMIT as u32)
+            .await
+            .expect("gateway persistence admission remains open during shutdown");
+    }
+
     pub(crate) async fn request_source_completion(&self) -> OwnedSemaphorePermit {
         self.gateway_persistence
             .slots

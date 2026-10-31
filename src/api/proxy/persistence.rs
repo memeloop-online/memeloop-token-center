@@ -15,6 +15,7 @@ pub(crate) struct Persistence {
     rejected: AtomicU64,
     failed: AtomicU64,
     archives: AtomicU64,
+    archives_idle: tokio::sync::Notify,
 }
 
 impl Default for Persistence {
@@ -29,6 +30,7 @@ impl Default for Persistence {
             rejected: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             archives: AtomicU64::new(0),
+            archives_idle: tokio::sync::Notify::new(),
         }
     }
 }
@@ -50,20 +52,44 @@ impl Persistence {
             .replace("deferred_persistence", "routing_persistence")
     }
 
+    pub(crate) async fn drain(&self) {
+        // Capture registers before spawn, including writers still waiting for
+        // a job. Taking all job permits alone could overtake those writers.
+        loop {
+            let idle = self.archives_idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.archives.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            idle.await;
+        }
+        let _permits = self
+            .jobs
+            .acquire_many(JOBS as u32)
+            .await
+            .expect("buffered persistence admission remains open during shutdown");
+    }
+
     #[cfg(test)]
     pub(crate) async fn drain_for_test(&self) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while self.archives.load(Ordering::Acquire) != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all accepted archive bodies must finish their handoff");
-        let _permits =
-            tokio::time::timeout(Duration::from_secs(5), self.jobs.acquire_many(JOBS as u32))
-                .await
-                .expect("bounded buffered persistence drain")
-                .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), self.drain())
+            .await
+            .expect("all accepted archive bodies must finish their handoff");
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_jobs_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.jobs
+            .clone()
+            .acquire_many_owned(JOBS as u32)
+            .await
+            .unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_archives_for_test(&self) -> u64 {
+        self.archives.load(Ordering::Acquire)
     }
 
     pub(crate) fn submit(
@@ -162,10 +188,14 @@ pub(crate) fn record_capture_failure(state: &AppState, identity: crate::db::Arch
                 }
             }
         }
-        background
+        if background
             .persistence
             .archives
-            .fetch_sub(1, Ordering::Release);
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            background.persistence.archives_idle.notify_waiters();
+        }
     });
 }
 
@@ -263,10 +293,14 @@ pub(crate) fn capture(
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        background
+        if background
             .persistence
             .archives
-            .fetch_sub(1, Ordering::Release);
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            background.persistence.archives_idle.notify_waiters();
+        }
     });
 }
 
@@ -321,6 +355,9 @@ mod tests {
         assert_eq!(state.persistence.rejected.load(Ordering::Relaxed), 0);
         assert_eq!(state.persistence.archives.load(Ordering::Acquire), 1);
         assert!(state.proxy_memory_budget.snapshot().0 > 0);
+        // No await since capture: the writer has not even been polled yet.
+        let mut shutdown = Box::pin(state.drain_proxy_tasks());
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
         drop(jobs);
         tokio::time::timeout(Duration::from_secs(5), async {
             while state.persistence.failed.load(Ordering::Relaxed) == 0 {
@@ -330,10 +367,14 @@ mod tests {
         .await
         .unwrap();
         assert!(state.proxy_memory_budget.snapshot().0 > 0);
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
         sqlx::query("DROP TRIGGER pause_buffered_capture")
             .execute(&pool)
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown waits through capture retry until durable handoff");
         state.persistence.drain_for_test().await;
         let reference = state
             .archive

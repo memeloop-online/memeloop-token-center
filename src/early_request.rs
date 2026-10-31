@@ -10,7 +10,10 @@ use std::{
 
 use tokio::sync::Notify;
 
-use crate::db::{Database, EarlyRequestTerminal};
+use crate::{
+    db::{Database, EarlyRequestTerminal},
+    proxy_lifecycle::{ProxyLifecycleActivity, ProxyLifecycleCounter},
+};
 
 const MAX_RECORD_BYTES: u64 = 4096;
 const REPLAY_BATCH: usize = 64;
@@ -23,7 +26,8 @@ pub(crate) struct Journal {
     wake: Arc<Notify>,
     writes: Arc<tokio::sync::Mutex<()>>,
     pending_writes: Arc<tokio::sync::Semaphore>,
-    deferred: Arc<Mutex<VecDeque<EarlyRequestTerminal>>>,
+    deferred: Arc<Mutex<VecDeque<(EarlyRequestTerminal, ProxyLifecycleActivity)>>>,
+    accepted: Arc<ProxyLifecycleCounter>,
     inflight: Arc<AtomicUsize>,
     written: Arc<AtomicU64>,
     replayed: AtomicU64,
@@ -39,6 +43,7 @@ impl Journal {
             writes: Arc::new(tokio::sync::Mutex::new(())),
             pending_writes: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES)),
             deferred: Arc::new(Mutex::new(VecDeque::new())),
+            accepted: Arc::new(ProxyLifecycleCounter::default()),
             inflight: Arc::new(AtomicUsize::new(0)),
             written: Arc::new(AtomicU64::new(0)),
             replayed: AtomicU64::new(0),
@@ -88,11 +93,17 @@ impl Journal {
                 deferred
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .push_back(queued);
+                    .push_back((queued, self.accepted.start()));
                 wake.notify_one();
                 true
             }
         }
+    }
+
+    pub(crate) async fn drain(&self) {
+        // HTTP has drained: no new append can arrive. Keep ownership across
+        // queue -> replay -> retry, until each accepted in-memory row commits.
+        self.accepted.wait_for_idle().await;
     }
 
     fn unavailable(&self, request_id: uuid::Uuid, reason: &'static str) -> bool {
@@ -127,7 +138,7 @@ impl Journal {
         let mut index = 0;
         while index < pending.len() {
             match database
-                .record_early_request_terminal(&pending[index])
+                .record_early_request_terminal(&pending[index].0)
                 .await
             {
                 Ok(()) => {
@@ -137,7 +148,7 @@ impl Journal {
                 }
                 Err(error) => {
                     tracing::warn!(
-                        request_id = %pending[index].request_id,
+                        request_id = %pending[index].0.request_id,
                         error_category = error.diagnostic_category(),
                         "early request terminal retained for replay"
                     );
@@ -154,6 +165,7 @@ impl Journal {
                 }
             }
         }
+        drop(pending);
         let Ok(mut entries) = tokio::fs::read_dir(&self.directory).await else {
             return;
         };

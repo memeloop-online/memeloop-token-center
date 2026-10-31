@@ -908,9 +908,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             run_bounded_proxy_lifecycle(lifecycle_deadline, Box::pin(finalization)).await
         });
         let lifecycle_result = lifecycle.await.map_err(|_| "finalization_deadline");
-        // Optional routing SQL and journal settlement continue after the
-        // response. They must not keep a proxy lifecycle slot.
-        drop(_proxy_lifecycle_permit);
         wait_diagnostics.emit(
             request_id,
             if lifecycle_result.is_err() {
