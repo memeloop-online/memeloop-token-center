@@ -299,7 +299,7 @@ impl ClickHouse {
             snapshot_hash: String,
         }
         let query = HistoryQuery {
-            scope,
+            scope: scope.clone(),
             from_created_at: None,
             to_created_at: None,
             cursor: None,

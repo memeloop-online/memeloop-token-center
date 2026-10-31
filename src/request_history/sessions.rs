@@ -147,10 +147,8 @@ impl ClickHouse {
                     .names
                     .insert(title.to_lowercase());
             }
-            sessions
-                .entry((entry.key_id, entry.session_id.clone()))
-                .or_default()
-                .directory = Some(entry);
+            let identity = (entry.key_id, entry.session_id.clone());
+            sessions.entry(identity).or_default().directory = Some(entry);
         }
         let mut result = Vec::new();
         for ((key_id, session_id), session) in sessions {

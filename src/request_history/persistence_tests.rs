@@ -569,6 +569,51 @@ async fn request_history_real_services_acceptance() {
             .as_deref(),
         Some(cluster.to_string().as_str())
     );
+    let mut accounts = Vec::new();
+    for name in ["history-traffic", "history-zero"] {
+        let id = Uuid::now_v7();
+        sqlx::query("INSERT INTO upstream_accounts (id,tenant_id,name,driver,auth_kind,config_json,status,credential_generation,created_at,updated_at) VALUES ($1,$2,$3,'http-json','api_key','{}','active',1,1,1)")
+            .bind(id.to_string()).bind(key.tenant_id.to_string()).bind(name).execute(&database.pool).await.unwrap();
+        accounts.push(id);
+    }
+    sqlx::query("UPDATE request_records SET upstream_account_id=$1 WHERE id=$2")
+        .bind(accounts[0].to_string())
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    crate::request_history::migration::drain(&database, &client, 500)
+        .await
+        .unwrap();
+    let availability = database
+        .upstream_account_availability(
+            "history-tenant",
+            crate::db::UpstreamAccountAvailabilityFilter {
+                from_created_at: 0,
+                to_created_at: i64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(availability.accounts.len(), 2);
+    let traffic = availability
+        .accounts
+        .iter()
+        .find(|a| a.upstream_account_id == accounts[0].to_string())
+        .unwrap();
+    assert_eq!(traffic.metrics.requests, 1);
+    assert_eq!(traffic.terminal_outcomes.len(), 1);
+    assert_eq!(traffic.terminal_outcomes[0].status, "success");
+    assert_eq!(
+        availability
+            .accounts
+            .iter()
+            .find(|a| a.upstream_account_id == accounts[1].to_string())
+            .unwrap()
+            .metrics
+            .requests,
+        0
+    );
     for (zone, offset) in [("America/New_York", None), ("UTC", Some(-480))] {
         let analysis = client
             .session_task_activity(

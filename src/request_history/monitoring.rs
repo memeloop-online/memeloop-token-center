@@ -14,6 +14,60 @@ pub(crate) struct HistoryMonitoringPair {
     pub outcomes: Vec<MonitoringTerminalOutcome>,
 }
 impl ClickHouse {
+    pub(crate) async fn account_availability(
+        &self,
+        query: HistoryQuery,
+    ) -> Result<BTreeMap<String, (MonitoringMetrics, Vec<MonitoringTerminalOutcome>)>, HistoryError>
+    {
+        let mut accounts = BTreeMap::<String, (Metrics, Vec<MonitoringTerminalOutcome>)>::new();
+        self.scan(query, |snapshot| {
+            let fact = &snapshot.read_model["fact"];
+            if !fact.is_object() {
+                return Ok(());
+            }
+            let payload = snapshot.payload.as_ref().ok_or(HistoryError::Mismatch)?;
+            let Some(upstream) = payload["upstream_account_id"].as_str() else {
+                return Ok(());
+            };
+            let account = accounts.entry(upstream.to_owned()).or_default();
+            account.0.add(&snapshot);
+            account.1.push(MonitoringTerminalOutcome {
+                id: snapshot.identity.request_id.to_string(),
+                source: if snapshot.identity.source == "native" {
+                    "request"
+                } else {
+                    "generation"
+                }
+                .into(),
+                created_at: snapshot.identity.created_at,
+                status: if fact["status_class"] == "success" {
+                    "success"
+                } else {
+                    "failure"
+                }
+                .into(),
+                duration_ms: fact["duration_ms"].as_i64().unwrap_or_default(),
+                error_code: payload["error_code"]
+                    .as_str()
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned),
+            });
+            account.1.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| b.id.cmp(&a.id))
+                    .then_with(|| b.source.cmp(&a.source))
+            });
+            account.1.truncate(5);
+            Ok(())
+        })
+        .await?;
+        Ok(accounts
+            .into_iter()
+            .map(|(id, (m, events))| (id, (m.monitoring(), events)))
+            .collect())
+    }
+
     pub(crate) async fn monitoring(
         &self,
         query: HistoryQuery,
@@ -46,11 +100,14 @@ impl ClickHouse {
                     status: if fact["status_class"] == "success" {
                         "success"
                     } else {
-                        "error"
+                        "failure"
                     }
                     .into(),
                     duration_ms: fact["duration_ms"].as_i64().unwrap_or_default(),
-                    error_code: payload["error_code"].as_str().map(str::to_owned),
+                    error_code: payload["error_code"]
+                        .as_str()
+                        .filter(|v| !v.is_empty())
+                        .map(str::to_owned),
                 });
                 pair.1.sort_by(|a, b| {
                     b.created_at
