@@ -583,6 +583,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   </>;
   function renderAccountDetails(value: UpstreamAccount) {
     const providerAvailable = providers.some(provider => provider.id === value.driver);
+    const needsReauthorization = providerAccountStatus(value, accountStatusNow).needsReauthorization;
     const manageable = canManage(value);
     const currentHealth = providerAvailable ? health[value.id] : undefined;
     const currentReadiness = deletionReadiness[value.id];
@@ -597,10 +598,11 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <ProviderModelCatalog key={`catalog-${value.id}-${generation}`} accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} onRouteAction={(action) => openCatalogRouteAction(value, action)} routeActionDisabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} routeCacheRevision={routeCacheRevisions[value.id] ?? 0} />
             <div className="account-main">
             <ProviderAccountStatus account={value} />
+            {needsReauthorization && canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="primary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openReauthorization(value)}>{value.driver === 'kimi-oauth' ? connectionCopy.signInAgain : t('providers.reauthorize')}</Button>}
             <ProviderAccountIdentity account={value} />
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             <Disclosure title={t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
-            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} readState={cachedQuota?.generation === generation ? cachedQuota : undefined} onRefresh={() => void quotaReads.read(value)} refreshDisabled={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} />
+            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} readState={cachedQuota?.generation === generation ? cachedQuota : undefined} onRefresh={() => void quotaReads.read(value)} refreshDisabled={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} canRecover={manageable && value.can_update_transport_proxy === true} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
@@ -609,7 +611,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
               {providerAvailable && <>
                 <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</Button>
                 {value.can_refresh && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</Button>}
-                {canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openReauthorization(value)}>{value.driver === 'kimi-oauth' ? connectionCopy.signInAgain : t('providers.reauthorize')}</Button>}
+                {!needsReauthorization && canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openReauthorization(value)}>{value.driver === 'kimi-oauth' ? connectionCopy.signInAgain : t('providers.reauthorize')}</Button>}
                 {value.can_rotate && <Button data-rotation-trigger={value.id} appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openRotation(value)}>{t('providers.rotateCredential')}</Button>}
               </>}
             </div></Disclosure>
@@ -654,7 +656,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <div className="provider-directory-actions">
               <Button appearance="secondary" type="button" disabled={!token || !(value.tenant_external_id ?? tenant) || value.status !== 'active' || Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} onClick={() => void quotaReads.read(value)}>{t('quota.refreshAccount')}</Button>
               <Button data-manage-account-trigger={value.id} appearance="secondary" type="button" aria-expanded={detailOpen} aria-controls={`provider-details-${value.id}`} disabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => detailOpen ? returnToAccountList(value) : openAccount(value)}>{t('providerDirectory.open')}</Button>
-              {accountStatus.expired && canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="primary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => openReauthorization(value)}>{value.driver === 'kimi-oauth' ? connectionCopy.signInAgain : t('providers.reauthorize')}</Button>}
+              {accountStatus.needsReauthorization && canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="primary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onClick={() => openReauthorization(value)}>{value.driver === 'kimi-oauth' ? connectionCopy.signInAgain : t('providers.reauthorize')}</Button>}
             </div>
             <div className="provider-sync-slot"><ManagedModelSync accountId={value.id} tenant={value.tenant_external_id ?? tenant} token={token} disabled={!manageable || !providerAvailable || value.status !== 'active' || Boolean(busy) || proxyEditorOpen} reviewModelsDisabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} reviewPricingDisabled={Boolean(busy) || proxyEditorOpen || providerWorkspaceActive} onReviewModels={() => openAccount(value)} onReviewPricing={onOpenPricing ? () => onOpenPricing(value.tenant_external_id ?? tenant) : undefined} onReconciled={() => {
               setRouteCacheRevisions((current) => ({ ...current, [value.id]: (current[value.id] ?? 0) + 1 }));

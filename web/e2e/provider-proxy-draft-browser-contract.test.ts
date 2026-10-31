@@ -549,7 +549,7 @@ test('account workspace returns without retained details, shares list tracks and
       const rows = page.locator('.provider-directory-row');
       await rows.nth(2).waitFor();
       const expiredRow = page.locator('[data-upstream-id="expired-fixture-a"]');
-      assert.equal(await expiredRow.getByText(chinese ? '授权已过期' : 'Authorization expired', { exact: true }).count(), 1, 'enabled Kimi accounts still expose credential expiry');
+      assert.equal(await expiredRow.getByText(chinese ? '访问令牌已过期' : 'Access token expired', { exact: true }).count(), 1, 'enabled Kimi accounts still expose access-token expiry');
       assert.equal(await expiredRow.locator('.status.ok').count(), 0, 'enabled is not proof of valid authorization');
       for (const width of [1440, 1101, 1100, 900, 390, 320]) {
         await page.setViewportSize({ width, height: 1000 });
@@ -572,7 +572,7 @@ test('account workspace returns without retained details, shares list tracks and
       }
       const expiredDetails = await manageProviderAccount(page, 'expired-fixture-a');
       await expiredDetails.locator('.provider-model-catalog').getByText(chinese ? '已同步' : 'Synced', { exact: false }).waitFor();
-      assert.equal(await expiredDetails.locator('.account-main > .status').innerText(), chinese ? '授权已过期' : 'Authorization expired', 'a ready catalog never overrides an expired Kimi credential');
+      assert.equal(await expiredDetails.locator('.account-main > .status').innerText(), chinese ? '访问令牌已过期' : 'Access token expired', 'a ready catalog never overrides an expired Kimi access token');
       assert.equal(await expiredDetails.locator('.account-main > .status.ok').count(), 0);
       await page.screenshot({ path: `${artifacts}/expired-kimi-${locale}-320.png`, fullPage: true });
       await expiredDetails.getByRole('button', { name: labels.back, exact: true }).click();
