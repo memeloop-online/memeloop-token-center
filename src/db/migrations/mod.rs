@@ -759,9 +759,9 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/sqlite/0144_retire_failover_deadline.sql"),
     },
     Migration {
-        version: 147,
+        version: 148,
         name: "first class network proxies",
-        sql: include_str!("../../../migrations/common/0147_network_proxies.sql"),
+        sql: include_str!("../../../migrations/common/0148_network_proxies.sql"),
     },
 ];
 
@@ -1501,9 +1501,9 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/postgres/0144_retire_failover_deadline.sql"),
     },
     Migration {
-        version: 147,
+        version: 148,
         name: "first class network proxies",
-        sql: include_str!("../../../migrations/common/0147_network_proxies.sql"),
+        sql: include_str!("../../../migrations/common/0148_network_proxies.sql"),
     },
 ];
 
