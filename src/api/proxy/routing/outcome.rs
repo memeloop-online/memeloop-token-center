@@ -74,7 +74,6 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
             ProxySendError::CodexBadRequest
             | ProxySendError::AmbiguousResponse(_)
             | ProxySendError::CandidateUnavailable
-            | ProxySendError::OuterDeadline
             | ProxySendError::CredentialUnavailable
             | ProxySendError::Credential,
         ) => None,
@@ -87,7 +86,6 @@ pub(in crate::api::proxy) fn attempt_failure_stage(
     match result {
         Err(ProxySendError::RetryableConnection(stage)) => stage,
         Err(ProxySendError::NonRetryableTransport(kind)) => kind.failure_stage(),
-        Err(ProxySendError::OuterDeadline) => "request_deadline",
         Err(
             ProxySendError::RetryableCodexBadRequest
             | ProxySendError::CodexBadRequest
@@ -167,7 +165,6 @@ mod tests {
         }
         for error in [
             ProxySendError::NonRetryableTransport(TransportFailureKind::Other),
-            ProxySendError::OuterDeadline,
             ProxySendError::AmbiguousResponse("visible_output"),
             ProxySendError::RetryableCodexBadRequest,
             ProxySendError::CodexBadRequest,

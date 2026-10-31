@@ -2,26 +2,40 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
-import { assetGatewayRssEvidence, chatPayload, createMockServer, HarnessFailure, MockState, seed, smallChat, streamChat, waitForTextRouteRecovery } from "./benchmark-memory.ts";
+import { assetGatewayRssEvidence, chatPayload, createMockServer, createRequestSpool, HarnessFailure, MockState, seed, smallChat, streamChat, waitForTextRouteRecovery } from "./benchmark-memory.ts";
 import { StreamStartBarrier } from "./benchmark-stream-barrier.ts";
 import { DatabaseSync } from "node:sqlite";
 import { FirstSoakFailureEvidence, readSoakFailureClassification } from "./benchmark-soak-diagnostics.ts";
 
 const benchmarkEntry = resolve(import.meta.dirname, "./benchmark-memory.ts");
-const serviceEntry = resolve(import.meta.dirname, "../../src/lib.rs");
+const factoryEntry = resolve(import.meta.dirname, "../../src/http_settings/factory.rs");
 
-test("memory mock keep-alive lifetime exceeds the gateway idle pool", () => {
+test("memory roles use a real owner-private journal directory rather than the production default", () => {
+  const temporary = mkdtempSync(resolve(tmpdir(), "mtc-memory-spool-"));
+  try {
+    const spool = createRequestSpool(temporary);
+    assert.equal(spool, resolve(temporary, "request-spool"));
+    assert.equal(statSync(spool).mode & 0o777, 0o700);
+    const receipt = resolve(spool, "write-probe");
+    writeFileSync(receipt, "owned", { mode: 0o600, flag: "wx" });
+    assert.equal(readFileSync(receipt, "utf8"), "owned");
+    const source = readFileSync(benchmarkEntry, "utf8");
+    assert.match(source, /MTC_RESPONSES_REQUEST_SPOOL_PATH: requestSpool/u);
+    assert.match(source, /startRole\(binary, role, ports\[role\]!, environment, log\)/u);
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
+});
+
+test("memory mock does not retire connections behind the configurable gateway pool", () => {
   const server = createMockServer();
-  const source = readFileSync(serviceEntry, "utf8");
-  const baseBuilder = /fn base_http_client_builder\(\)[\s\S]+?(?=pub\(crate\) fn build_http_client)/u.exec(source)?.[0];
-  assert.ok(baseBuilder, "generic HTTP client builder must remain discoverable");
-  const idleSeconds = Number(/pool_idle_timeout\(Duration::from_secs\((\d+)\)\)/u.exec(baseBuilder)?.[1]);
-  assert.ok(Number.isFinite(idleSeconds) && idleSeconds > 0, "generic idle timeout must remain explicit");
-  assert.ok(server.keepAliveTimeout > idleSeconds * 1_000, "mock upstream must outlive every idle pooled connection");
+  const source = readFileSync(factoryEntry, "utf8");
+  assert.match(source, /\.pool_idle_timeout\(\s*effective\s*\.pool_idle_timeout_ms\s*\.value\s*\.map\(Duration::from_millis\)/u);
+  assert.equal(server.keepAliveTimeout, 0, "mock must not impose an idle deadline on an unlimited configured pool");
   assert.ok(server.keepAliveTimeoutBuffer > 0, "mock keep-alive retirement must retain a positive scheduling buffer");
   assert.ok(server.headersTimeout > server.keepAliveTimeout + server.keepAliveTimeoutBuffer, "header deadline must not retire a keep-alive socket first");
   assert.ok(server.requestTimeout > server.headersTimeout, "complete-request deadline must contain the header deadline");

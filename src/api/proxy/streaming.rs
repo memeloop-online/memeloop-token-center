@@ -187,7 +187,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         .metrics
         .active_stream(crate::metrics::ActiveStreamKind::ProxyResponse);
     let (body_sender, body_receiver) = tokio::sync::mpsc::channel(PROXY_BODY_CHANNEL_CAPACITY);
+    note_in_flight_stage(&buffered_request, "response_delivery").await;
     let background_state = state.clone();
+    let pending_terminals = state.pending_terminals.clone();
     let status_code = i64::from(status.as_u16());
     let BufferedRequest {
         reservation,
@@ -214,7 +216,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         let request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
-        let owner_loss = _proxy_lifecycle_permit.owner_loss();
         let deadline_database = background_state.db.clone();
         let deadline_metrics = background_state.metrics.clone();
         let deadline_reservation = reservation.clone();
@@ -281,8 +282,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let codex_responses_progress_heartbeat =
                 is_sse && is_codex_route && matches!(protocol, Protocol::OpenAiResponses);
             let mut transport_error: Option<&'static str> = None;
+            let mut codex_chat_translation_error = None;
             let mut response_bytes = 0_usize;
-            let mut delivery_confirmed = false;
+            let mut billable_queued = false;
             let mut delivered_billable = false;
             let mut terminal_delivery = ResponsesTerminalDelivery::default();
             let mut terminal_frames =
@@ -592,6 +594,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     }
                                     Ok(None) => {}
                                     Err(error_code) => {
+                                        codex_chat_translation_error = Some(error_code);
                                         transport_error =
                                             Some(transport_error_with_downstream_precedence(
                                                 downstream_closed_observed
@@ -678,16 +681,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             match delivery::send_frame(
                                 delivery::FrameDelivery {
                                     waits,
-                                    diagnostic_context,
-                                    state: &background_state,
                                     sender: &body_sender,
-                                    request_id,
-                                    tenant_id,
-                                    reservation: &reservation,
-                                    input_token_ceiling,
-                                    output_token_ceiling,
-                                    requested_service_tier: requested_service_tier.as_deref(),
-                                    confirmed: &mut delivery_confirmed,
+                                    queued: &mut billable_queued,
                                     probe: ((matches!(protocol, Protocol::OpenAiResponses)
                                         || strict_openai_chat_usage
                                         || is_codex_route)
@@ -791,7 +786,13 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             let local_response_boundary =
                 transport_error.is_some_and(buffered_upstream::is_local_response_boundary);
             let sse_summary = sse_capture.map(|capture| {
-                capture.finish_summary_after_local_boundary(local_response_boundary)
+                let mut summary =
+                    capture.finish_summary_after_local_boundary(local_response_boundary);
+                lifecycle::apply_chat_translation_usage_evidence(
+                    &mut summary,
+                    codex_chat_translation_error,
+                );
+                summary
             });
             let incomplete = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),
@@ -838,16 +839,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     match delivery::send_frame(
                         delivery::FrameDelivery {
                             waits,
-                            diagnostic_context,
-                            state: &background_state,
                             sender: &body_sender,
-                            request_id,
-                            tenant_id,
-                            reservation: &reservation,
-                            input_token_ceiling,
-                            output_token_ceiling,
-                            requested_service_tier: requested_service_tier.as_deref(),
-                            confirmed: &mut delivery_confirmed,
+                            queued: &mut billable_queued,
                             probe: ((matches!(protocol, Protocol::OpenAiResponses)
                                 || strict_openai_chat_usage
                                 || is_codex_route)
@@ -932,7 +925,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         );
                         tokio::time::timeout(SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT, evidence)
                             .await
-                            .map_err(|_| AppError::Internal)?
+                            .map_err(|_| AppError::internal("streaming_site_1"))?
                     });
             }
             waits.terminal(transport_error.unwrap_or("completed"));
@@ -944,7 +937,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             );
             let gap_response = format!("gap://{request_id}/response");
             let stored_response = gap_response.clone();
-            let response_archive_attempt = None;
             let terminal_phase =
                 proxy_diagnostics::Phase::new(diagnostic_context, "stream_terminal_settlement");
             let lifecycle_deadline = tokio::time::Instant::now() + MAX_PROXY_FINALIZATION_LIFETIME;
@@ -974,9 +966,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     delivered_billable,
                     sse_summary,
                     usage_capture,
-                    response_archive_attempt,
                     stored_response,
-                    gap_response,
                     routing_terminal_observed_at,
                     routing_terminal_pre_published,
                 })
@@ -987,11 +977,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             };
             run_bounded_proxy_lifecycle(lifecycle_deadline, Box::pin(finalization)).await
         });
-        let lifecycle_result = tokio::select! {
-            biased;
-            _ = crate::proxy_lifecycle::wait_for_owner_loss(owner_loss) => Err("request_owner_lost"),
-            result = lifecycle => result.map_err(|_| "finalization_deadline"),
-        };
+        let lifecycle_result = lifecycle.await.map_err(|_| "finalization_deadline");
+        // Optional routing SQL and journal settlement continue after the
+        // response. They must not keep a proxy lifecycle slot.
+        drop(_proxy_lifecycle_permit);
         wait_diagnostics.emit(
             request_id,
             if lifecycle_result.is_err() {
@@ -1006,6 +995,22 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 stage = reason,
                 "proxy owner or terminal settlement could not continue"
             );
+            if pending_terminals.has_claim(request_id) {
+                pending_terminals.submit_unobserved(
+                    request_id,
+                    &deadline_reservation,
+                    diagnostic_context.elapsed_millis_at(Instant::now()),
+                    (504, "request_lifecycle_timeout"),
+                    None,
+                    "response_delivery",
+                );
+                deadline_metrics.observe_proxy_lifecycle_deadline(
+                    crate::metrics::ProxyLifecycleDeadlineOutcome::ReconcileFailed,
+                );
+                drop(_dispatch_permit);
+                stream_owner.finish("returned", Some(status.as_u16()), None);
+                return;
+            }
             match tokio::time::timeout(
                 MAX_PROXY_FINALIZATION_LIFETIME,
                 deadline_database.expire_proxy_lifecycle_deadline(
@@ -1016,7 +1021,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 ),
             )
             .await
-            .unwrap_or(Err(AppError::Internal))
+            .unwrap_or(Err(AppError::internal("streaming_site_1")))
             {
                 Ok(FinishProxyRequestResult::Finished { .. }) => {
                     deadline_metrics.observe_proxy_lifecycle_deadline(
@@ -1042,7 +1047,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
             }
         }
-        drop(_proxy_lifecycle_permit);
         drop(_dispatch_permit);
         stream_owner.finish("returned", Some(status.as_u16()), None);
     });
@@ -1054,7 +1058,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
     }
     let mut response = response
         .body(Body::from_stream(ReceiverStream::new(body_receiver)))
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("streaming_site_2"))?;
     if !response_headers.is_empty() {
         crate::api::anthropic::append_response_headers(response.headers_mut(), &response_headers);
     }

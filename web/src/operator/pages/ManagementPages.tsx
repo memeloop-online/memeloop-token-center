@@ -40,7 +40,7 @@ import {
   type KeyListLoadState, type KeyListRequestIdentity,
 } from '../keyPagination';
 import { directCredentialSchema, isKimiDeviceProvider, oauthCreationProxyMode, supportsDirectConnection } from '../providerConnectionMethods';
-import { UpstreamAvailability, manualHealthLabel } from '../UpstreamAvailability';
+import { UpstreamAvailability } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuotaPanel';
 import { QuotaSummary } from '../QuotaSummary';
 import { useUpstreamQuotaReads } from '../useUpstreamQuotaReads';
@@ -81,6 +81,7 @@ import { credentialCreateSchema, credentialCreateUiSchema, credentialFormFields,
 import { upstreamAvailabilityPath, type UpstreamAvailabilityWindow } from '../upstreamAvailabilityWindow';
 import { useOperatorResource } from '../hooks/useOperatorResource';
 import { loadModelPricePages } from '../pricingLoading';
+import { loadModelRoutePages } from '../modelRouteLoading';
 import { CredentialPolicySummary } from '../CredentialPolicySummary';
 import { PricingTable } from '../PricingTable';
 import { enumLabel, IssuedCredential, messageOf, queryForTenant, WriteScopeNotice } from '../scope/operatorShared';
@@ -227,6 +228,17 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
   const [busy, setBusy] = useState('');
   const providerList = useRef<HTMLElement>(null);
   const [health, setHealth] = useState<Record<string, UpstreamHealth>>({});
+  useEffect(() => {
+    if (!token || !workspaceAccountId) return;
+    let cancelled = false;
+    void api<UpstreamHealth | null>(`/internal/v1/upstreams/${workspaceAccountId}/health${queryForTenant(writeTenant)}`, token)
+      .then(result => {
+        if (cancelled || !result?.checked_at) return;
+        setHealth(current => ({ ...current, [workspaceAccountId]: result }));
+      })
+      .catch(() => undefined);
+    return () => { cancelled = true; };
+  }, [token, writeTenant, workspaceAccountId]);
   const [deletionReadiness, setDeletionReadiness] = useState<Record<string, UpstreamDeletionReadiness>>({});
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -587,7 +599,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <ProviderAccountStatus account={value} />
             <ProviderAccountIdentity account={value} />
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
-            <Disclosure title={currentHealth ? `${t('providers.recentAvailability')} · ${t(manualHealthLabel(currentHealth))}` : t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
+            <Disclosure title={t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
             <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} readState={cachedQuota?.generation === generation ? cachedQuota : undefined} onRefresh={() => void quotaReads.read(value)} refreshDisabled={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
@@ -1272,8 +1284,6 @@ function RouteFields({ token, tenant, draft, existingSelection, upstreams, provi
 }
 
 function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, providers, renderModelRouteActions }: { token: string; tenant: string; writeTenant?: string; upstreams: UpstreamAccount[]; providers: ProviderType[]; renderModelRouteActions?: (route: ModelRouteView) => ReactNode }) {
-  const routePageSize = 100;
-  const maximumFocusedRoutePages = 100;
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, writeTenant]);
   const [routes, setRoutes] = useState<ModelRouteView[]>([]);
@@ -1313,28 +1323,7 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       // The table is the route page's primary content. Credential choices are
       // only used by an opened create/edit form, so never put their paged
       // read on this critical path.
-      const nextRoutes: ModelRouteView[] = [];
-      const visitedCursors = new Set<string>();
-      let beforeCreatedAt: number | undefined;
-      let beforeId: string | undefined;
-      for (let pageIndex = 0; pageIndex < maximumFocusedRoutePages; pageIndex += 1) {
-        const routeQuery = new URLSearchParams({ limit: String(routePageSize) });
-        if (beforeCreatedAt !== undefined && beforeId) {
-          routeQuery.set('before_created_at', String(beforeCreatedAt));
-          routeQuery.set('before_id', beforeId);
-        }
-        const page = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant, routeQuery.toString())}`, loadToken, { signal: controller.signal });
-        nextRoutes.push(...page);
-        if (!requestedFocusRouteId || page.some((route) => route.id === requestedFocusRouteId) || page.length < routePageSize) break;
-        const last = page.at(-1);
-        if (!last || !Number.isSafeInteger(last.created_at) || !last.id) throw new Error(t('providerCatalog.routesIncomplete'));
-        const cursor = `${last.created_at}\u0000${last.id}`;
-        if (visitedCursors.has(cursor)) throw new Error(t('providerCatalog.routesIncomplete'));
-        visitedCursors.add(cursor);
-        beforeCreatedAt = last.created_at;
-        beforeId = last.id;
-        if (pageIndex === maximumFocusedRoutePages - 1) throw new Error(t('providerCatalog.routesIncomplete'));
-      }
+      const nextRoutes = await loadModelRoutePages(loadTenant, controller.signal, (path, signal) => apiRead<ModelRouteView[]>(path, loadToken, { signal }), t('providerCatalog.routesIncomplete'), { focusRouteId: requestedFocusRouteId || undefined, firstPageOnly: !requestedFocusRouteId });
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       setRoutes(nextRoutes); setError('');
     }
@@ -1540,6 +1529,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const [keyListState, setKeyListState] = useState<KeyListLoadState>('idle');
   const [keyError, setKeyError] = useState('');
   const [routeError, setRouteError] = useState('');
+  const [routesLoading, setRoutesLoading] = useState(false);
   const [secret, setSecret] = useState<{ value: string; kind: 'issued' | 'revealed'; alias?: string; displayId: string; scopeGeneration: number }>();
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
@@ -1605,25 +1595,25 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const loadRoutes = async (loadToken: string, loadTenant: string, currentScopeGeneration: number) => {
     routeRequest.current?.controller.abort();
     routeRequest.current = undefined;
-    if (!shouldLoadCredentialRoutes(loadTenant)) { setRoutes([]); setRouteError(''); return; }
+    if (!shouldLoadCredentialRoutes(loadTenant)) { setRoutes([]); setRouteError(''); setRoutesLoading(false); return; }
     const request = {
       generation: ++routeRequestGeneration.current,
       scopeGeneration: currentScopeGeneration,
       controller: new AbortController(),
     };
     routeRequest.current = request;
-    setRouteError('');
+    setRouteError(''); setRoutesLoading(true);
     try {
-      const nextRoutes = await apiRead<ModelRouteView[]>(`/internal/v1/model-routes${queryForTenant(loadTenant)}`, loadToken, { signal: request.controller.signal });
+      const nextRoutes = await loadModelRoutePages(loadTenant, request.controller.signal, (path, signal) => apiRead<ModelRouteView[]>(path, loadToken, { signal }), t('providerCatalog.routesIncomplete'));
       const active = routeRequest.current;
       if (!active || active.generation !== request.generation || active.scopeGeneration !== request.scopeGeneration || scopeGeneration.current !== request.scopeGeneration || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       routeRequest.current = undefined;
-      setRoutes(nextRoutes); setRouteError('');
+      setRoutes(nextRoutes); setRouteError(''); setRoutesLoading(false);
     } catch (reason) {
       const active = routeRequest.current;
       if (request.controller.signal.aborted || !active || active.generation !== request.generation || active.scopeGeneration !== request.scopeGeneration || scopeGeneration.current !== request.scopeGeneration || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       routeRequest.current = undefined;
-      setRouteError(messageOf(reason, t('common.requestFailed')));
+      setRouteError(messageOf(reason, t('common.requestFailed'))); setRoutesLoading(false);
     }
   };
   const load = async () => {
@@ -1631,7 +1621,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     if (!loadToken) {
       keyRequest.current?.controller.abort(); keyRequest.current = undefined;
       routeRequest.current?.controller.abort(); routeRequest.current = undefined;
-      setValues([]); setRoutes([]); setNextCursor(undefined); setKeyListState('idle'); setKeyError(''); setRouteError('');
+      setValues([]); setRoutes([]); setNextCursor(undefined); setKeyListState('idle'); setKeyError(''); setRouteError(''); setRoutesLoading(false);
       return;
     }
     const request = startKeyRequest('initial-loading');
@@ -1857,7 +1847,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
           {workspace?.kind === 'limits' && (limitSnapshots[value.key_id] ? <LimitSnapshot value={limitSnapshots[value.key_id]} /> : <><LoadingProgress active label={t('common.loading')} level="page" /><LoadingState label={t('common.loading')} variant="detail" /></>)}
           {editingPolicy === value.key_id && policyFormSchema && <div className="inline-editor form-panel"><h3>{t('credentials.policyFor', { alias: value.alias })}</h3><CredentialPolicySummary policy={value.policy} currency={value.currency} /><Form key={value.key_id} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={policyDrafts[value.key_id] ?? value.policy} onChange={({ formData }) => setPolicyDrafts(current => ({ ...current, [value.key_id]: formData }))} uiSchema={credentialPolicyUiSchema} fields={credentialFormFields} validator={validator} templates={credentialFormTemplates} widgets={fluentFormWidgets} onSubmit={({ formData }) => void saveCredentialConfiguration(value, 'policy', formData, t('credentials.policySaved'))}><Button appearance="primary" type="submit" disabled={!canWrite || Boolean(busy)}>{t('common.save')}</Button></Form></div>}
           {editingRouting === value.key_id && routingDraft && <div className="inline-editor form-panel routing-editor"><h3>{t('credentials.routingFor', { alias: value.alias })}</h3><p className="muted">{t('credentials.routingHint')}</p>
-            <CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} groups={routeGroupOptions} routeIds={routingDraft.route_ids} groupIds={routingDraft.route_group_ids} onRoutes={route_ids => setRoutingDraft({ ...routingDraft, route_ids })} onGroups={route_group_ids => setRoutingDraft({ ...routingDraft, route_group_ids })} />
+            <CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} routesLoading={routesLoading} routesError={routeError} onRetryRoutes={() => void loadRoutes(token, tenant, scopeGeneration.current)} groups={routeGroupOptions} routeIds={routingDraft.route_ids} groupIds={routingDraft.route_group_ids} onRoutes={route_ids => setRoutingDraft({ ...routingDraft, route_ids })} onGroups={route_group_ids => setRoutingDraft({ ...routingDraft, route_group_ids })} />
             {routingDraft.effective_route_ids.length > 0 && <small className="field-hint">{t('credentials.effectiveRoutes', { count: formatNumber(routingDraft.effective_route_ids.length, locale) })}</small>}
             <Button appearance="primary" type="button" disabled={!canWrite || Boolean(busy)} onClick={() => void saveRouting(value, routingDraft)}>{t('common.save')}</Button>
           </div>}
@@ -1906,7 +1896,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       {(error || routeError || routeGroups.error) && <div className="notice error" role="alert">{error || routeError || routeGroups.error}</div>}
       {activeCredential && credentialEditor(activeCredential)}
       <div hidden={workspace?.kind !== 'create'}>
-      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, alias: { 'ui:help': t('credentials.aliasHelp') } }} formContext={{ principalField, authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
+      {createFormSchema ? <Form key={`${tenant}-${writeTenant}`} schema={localizeSchema(createFormSchema as RJSFSchema, locale)} formData={createCredentialDraft} onChange={({ formData }) => setCreateCredentialDraft(formData)} uiSchema={{ ...credentialCreateUiSchema, alias: { 'ui:help': t('credentials.aliasHelp') } }} formContext={{ principalField, authorizationFields: <FormSection title={formJourneyCopy(locale).access} description={t('credentials.createRoutingHint')}><CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} routesLoading={routesLoading} routesError={routeError} onRetryRoutes={() => void loadRoutes(token, tenant, scopeGeneration.current)} groups={routeGroupOptions} routeIds={newRouteIds} groupIds={newRouteGroupIds} onRoutes={setNewRouteIds} onGroups={setNewRouteGroupIds} /></FormSection> }} fields={credentialFormFields} validator={validator} widgets={fluentFormWidgets} templates={credentialFormTemplates} onSubmit={async ({ formData }) => {
         if (!writeTenant) return;
         const operation = beginSecretOperation();
         if (!operation) return;
@@ -1936,7 +1926,7 @@ const serviceCredentialStatisticsGroupId = 'statistics-and-requests';
 const serviceCredentialScopeGroups = [
   { id: serviceCredentialStatisticsGroupId, title: '统计与请求', titleEn: 'Statistics and requests', scopes: [
     { value: 'metrics:read', label: '读取诊断指标', labelEn: 'Read diagnostic metrics', hint: '读取诊断与健康状态；不包含请求记录或用量分析。', hintEn: 'Read diagnostics and health status, not request records or usage analysis.' },
-    { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '读取请求记录、监控快照和用量分析；不允许写入。', hintEn: 'Read request records, monitoring snapshots, and usage analysis without write access.' },
+    { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '只读：请求记录、监控快照和用量分析。', hintEn: 'Read request records, monitoring snapshots, and usage analysis.' },
   ] },
   { id: 'credentials-and-credits', title: '凭据与额度', titleEn: 'Credentials and credits', scopes: [
     { value: 'keys:read', label: '读取客户端凭据', labelEn: 'Read client credentials', hint: '查看客户端凭据及其配置。', hintEn: 'View client credentials and their configuration.' },

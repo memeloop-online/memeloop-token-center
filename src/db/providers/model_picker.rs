@@ -128,8 +128,8 @@ impl Database {
         let explicit_accounts = uuid_list_json(filter.explicit_account_ids)?;
         let included_groups = uuid_list_json(filter.included_provider_group_ids)?;
         let excluded_groups = uuid_list_json(filter.excluded_provider_group_ids)?;
-        let public_providers =
-            serde_json::to_string(filter.public_provider_ids).map_err(|_| AppError::Internal)?;
+        let public_providers = serde_json::to_string(filter.public_provider_ids)
+            .map_err(|_| AppError::internal("model_picker_model_picker_projection_1"))?;
         let has_positive_filter = if filter.explicit_account_ids.is_empty()
             && filter.included_provider_group_ids.is_empty()
         {
@@ -190,7 +190,9 @@ impl Database {
             };
             let route_id = parse_uuid(row.try_get::<String, _>("route_id")?)?;
             let account_id = parse_uuid(account_id)?;
-            let item = items.last_mut().ok_or(AppError::Internal)?;
+            let item = items
+                .last_mut()
+                .ok_or(AppError::internal("model_picker_model_picker_projection_1"))?;
             let is_new_source = item.sources.last().is_none_or(|source| {
                 source.route_id != route_id || source.account.id != account_id.to_string()
             });
@@ -222,18 +224,11 @@ impl Database {
                     catalog_expires_at,
                     now,
                 );
-                let health_generation_matches =
-                    row.try_get::<i64, _>("health_generation_matches")? != 0;
-                let health_failures: Option<i64> = row.try_get("health_failures")?;
-                let health_cooldown: Option<i64> = row.try_get("health_cooldown_until")?;
-                let health_status = if !health_generation_matches || health_failures.is_none() {
-                    "unknown"
-                } else if health_cooldown.is_some_and(|until| until > now) {
-                    "unhealthy"
-                } else if health_failures.is_some_and(|count| count > 0) {
-                    "degraded"
-                } else {
-                    "healthy"
+                let probe_status: Option<String> = row.try_get("probe_status")?;
+                let health_status = match probe_status.as_deref() {
+                    Some("healthy") => "healthy",
+                    Some(_) => "unhealthy",
+                    None => "unknown",
                 };
                 let route_protocol: String = row.try_get("route_protocol")?;
                 let upstream_model: String = row.try_get("upstream_model")?;
@@ -275,22 +270,11 @@ impl Database {
                     },
                     passive_health: ModelPickerHealthEvidence {
                         status: health_status.to_owned(),
-                        observed_at: if health_generation_matches {
-                            row.try_get("health_observed_at")?
-                        } else {
-                            None
-                        },
-                        cooldown_until: if health_generation_matches {
-                            health_cooldown
-                        } else {
-                            None
-                        },
-                        failure_kind: if health_generation_matches {
-                            row.try_get::<Option<String>, _>("health_failure_kind")?
-                                .filter(|value| !value.is_empty())
-                        } else {
-                            None
-                        },
+                        observed_at: row.try_get("probe_checked_at")?,
+                        cooldown_until: None,
+                        failure_kind: row
+                            .try_get::<Option<String>, _>("probe_error_code")?
+                            .filter(|value| !value.is_empty()),
                     },
                 });
             }
@@ -301,7 +285,10 @@ impl Database {
                 id: parse_uuid(group_id)?.to_string(),
                 label: row.try_get("provider_group_label")?,
             };
-            let source = item.sources.last_mut().ok_or(AppError::Internal)?;
+            let source = item
+                .sources
+                .last_mut()
+                .ok_or(AppError::internal("model_picker_site_1"))?;
             if source.provider_groups.last() != Some(&group) {
                 source.provider_groups.push(group);
             }
@@ -340,7 +327,7 @@ fn model_picker_sql(backend: DatabaseBackend) -> &'static str {
 
 fn uuid_list_json(values: &[Uuid]) -> Result<String, AppError> {
     serde_json::to_string(&values.iter().map(Uuid::to_string).collect::<Vec<_>>())
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("model_picker_uuid_list_json_1"))
 }
 
 fn escape_like(value: &str) -> String {
@@ -492,12 +479,9 @@ WITH direct_sources AS (
                             AND model.model_id = source.upstream_model
                             AND (model.protocol = 'any' OR model.protocol = route.protocol)
                      ) THEN 1 ELSE 0 END AS catalog_model_listed,
-           health.credential_generation AS health_generation,
-           CASE WHEN health.credential_generation = account.credential_generation THEN 1 ELSE 0 END AS health_generation_matches,
-           health.consecutive_failures AS health_failures,
-           health.cooldown_until AS health_cooldown_until,
-           health.last_failure_kind AS health_failure_kind,
-           health.updated_at AS health_observed_at
+           probe.status AS probe_status,
+           probe.error_code AS probe_error_code,
+           probe.checked_at AS probe_checked_at
       FROM page
       JOIN model_routes route
         ON route.enabled = 1 AND route.archived_at IS NULL
@@ -513,7 +497,7 @@ WITH direct_sources AS (
         ON snapshot.tenant_id = account.tenant_id
        AND snapshot.upstream_account_id = account.id
        AND snapshot.id = catalog.current_snapshot_id
-      LEFT JOIN upstream_account_health health ON health.upstream_account_id = account.id AND health.transport_revision = account.updated_at
+      LEFT JOIN upstream_service_probes probe ON probe.upstream_account_id = account.id
 ), ranked_groups AS MATERIALIZED (
     SELECT membership.upstream_account_id, provider_group.id AS provider_group_id,
            provider_group.name AS provider_group_label,
@@ -669,12 +653,9 @@ WITH direct_sources AS (
                             AND model.model_id = source.upstream_model
                             AND (model.protocol = 'any' OR model.protocol = route.protocol)
                      ) THEN 1 ELSE 0 END AS catalog_model_listed,
-           health.credential_generation AS health_generation,
-           CASE WHEN health.credential_generation = account.credential_generation THEN 1 ELSE 0 END AS health_generation_matches,
-           health.consecutive_failures AS health_failures,
-           health.cooldown_until AS health_cooldown_until,
-           health.last_failure_kind AS health_failure_kind,
-           health.updated_at AS health_observed_at
+           probe.status AS probe_status,
+           probe.error_code AS probe_error_code,
+           probe.checked_at AS probe_checked_at
       FROM page
       JOIN model_routes route
         ON route.enabled = 1 AND route.archived_at IS NULL
@@ -690,7 +671,7 @@ WITH direct_sources AS (
         ON snapshot.tenant_id = account.tenant_id
        AND snapshot.upstream_account_id = account.id
        AND snapshot.id = catalog.current_snapshot_id
-      LEFT JOIN upstream_account_health health ON health.upstream_account_id = account.id AND health.transport_revision = account.updated_at
+      LEFT JOIN upstream_service_probes probe ON probe.upstream_account_id = account.id
 ), ranked_groups AS MATERIALIZED (
     SELECT membership.upstream_account_id, provider_group.id AS provider_group_id,
            provider_group.name AS provider_group_label,

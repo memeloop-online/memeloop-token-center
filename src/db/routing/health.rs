@@ -7,7 +7,9 @@ use crate::config::UpstreamHealthConfig;
 mod delivery;
 mod strategy;
 
+#[cfg(test)]
 const CONNECTION_FAILURE_DOMAIN_WINDOW_MILLIS: i64 = 60_000;
+#[cfg(test)]
 const CONNECTION_FAILURE_GLOBAL_DOMAIN_THRESHOLD: i64 = 2;
 
 pub(crate) struct UpstreamTransportDiagnostic<'a> {
@@ -23,6 +25,7 @@ pub(crate) struct UpstreamTransportDiagnostic<'a> {
     pub failure_domain: &'a str,
 }
 
+#[cfg(test)]
 pub(crate) struct AdmittedConnectionFailure<'a> {
     pub request_id: Uuid,
     pub upstream_account_id: Uuid,
@@ -35,6 +38,7 @@ pub(crate) struct AdmittedConnectionFailure<'a> {
     pub failure_domain: &'a str,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ConnectionFailureDomainResult {
     pub distinct_failure_domains: i64,
@@ -64,6 +68,9 @@ pub(crate) enum UpstreamFailureKind {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UpstreamAttemptAdmission {
+    /// Customer forwarding does not participate in circuit-breaker leases.
+    /// Its outcome is published by the existing background observer.
+    Observed,
     Healthy {
         /// Database-backed health epoch shared by every request admitted in
         /// the same healthy cohort. Success rotates it; only the first
@@ -122,6 +129,7 @@ impl UpstreamFailureKind {
         }
     }
 
+    #[cfg(test)]
     fn base_cooldown_millis(self, health: UpstreamHealthConfig) -> i64 {
         match self {
             Self::RateLimited | Self::RateLimitedUntil { .. } => {
@@ -133,6 +141,7 @@ impl UpstreamFailureKind {
         }
     }
 
+    #[cfg(test)]
     fn explicit_deadline(self, now: i64, health: UpstreamHealthConfig) -> i64 {
         match self {
             Self::RateLimitedUntil { until, .. } => until
@@ -221,6 +230,7 @@ impl Database {
     /// a bounded window. The existing healthy-admission epoch remains the
     /// global cohort fence, so concurrent failures can open the breaker only
     /// once after the cross-domain threshold is met.
+    #[cfg(test)]
     pub(crate) async fn record_admitted_connection_failure_by_domain(
         &self,
         failure: AdmittedConnectionFailure<'_>,
@@ -419,14 +429,12 @@ impl Database {
             .map(|row| {
                 Ok(crate::model::RequestTransportDiagnosticView {
                     route_id: Uuid::parse_str(&row.try_get::<String, _>("route_id")?).map_err(
-                        |_| AppError::Storage("transport diagnostic route is malformed".into()),
+                        |_| AppError::storage("transport_diagnostic_route_is_malformed"),
                     )?,
                     upstream_account_id: Uuid::parse_str(
                         &row.try_get::<String, _>("upstream_account_id")?,
                     )
-                    .map_err(|_| {
-                        AppError::Storage("transport diagnostic account is malformed".into())
-                    })?,
+                    .map_err(|_| AppError::storage("transport_diagnostic_account_is_malformed"))?,
                     credential_generation: row.try_get("credential_generation")?,
                     transport_revision: row.try_get("transport_revision")?,
                     failure_kind: row.try_get("failure_kind")?,
@@ -529,7 +537,7 @@ impl Database {
         token
             .map(|token| {
                 Uuid::parse_str(&token)
-                    .map_err(|_| AppError::Storage("healthy admission epoch is malformed".into()))
+                    .map_err(|_| AppError::storage("healthy_admission_epoch_is_malformed"))
             })
             .transpose()
     }
@@ -537,6 +545,7 @@ impl Database {
     /// Observe current-generation routing suppression without claiming a probe
     /// lease or changing circuit-breaker state. A catalog GET cannot prove that
     /// generation requests have recovered their quota.
+    #[cfg(test)]
     pub(crate) async fn upstream_manual_health_suppression(
         &self,
         upstream_account_id: Uuid,
@@ -667,6 +676,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn claim_upstream_account_attempt_at_revision_with_health_config(
         &self,
         upstream_account_id: Uuid,
@@ -747,6 +757,31 @@ impl Database {
             None,
         )
         .await
+    }
+
+    /// Provider quota exhaustion is not a transport probe. Customer forwarding
+    /// still has to leave that account alone until its deadline.
+    pub(crate) async fn customer_attempt_blocked_by_quota(
+        &self,
+        upstream_account_id: Uuid,
+        credential_generation: i64,
+        transport_revision: i64,
+    ) -> Result<bool, AppError> {
+        let blocked: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM upstream_account_health
+             WHERE upstream_account_id = $1
+               AND credential_generation = $2
+               AND transport_revision = $3
+               AND cooldown_until > $4
+               AND last_failure_kind IN ('quota_exhausted', 'rate_limited')",
+        )
+        .bind(upstream_account_id.to_string())
+        .bind(credential_generation)
+        .bind(transport_revision)
+        .bind(unix_millis())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(blocked.is_some())
     }
 
     async fn claim_upstream_attempt_inner(
@@ -951,9 +986,7 @@ impl Database {
         token
             .map(|token| {
                 Uuid::parse_str(&token)
-                    .map_err(|_| {
-                        AppError::Storage("upstream probe lease token is malformed".into())
-                    })
+                    .map_err(|_| AppError::storage("upstream_probe_lease_token_is_malformed"))
                     .map(|lease_token| UpstreamAttemptAdmission::SharedProbe { lease_token })
             })
             .transpose()
@@ -1000,6 +1033,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_failure_at_revision_with_health_config(
         &self,
         upstream_account_id: Uuid,
@@ -1048,6 +1082,7 @@ impl Database {
     /// times: after the first writer establishes health, its siblings are
     /// stale and become no-ops. A later half-open probe remains responsible
     /// for escalating a genuinely sustained failure.
+    #[cfg(test)]
     pub(crate) async fn record_admitted_upstream_account_failure_at_revision(
         &self,
         upstream_account_id: Uuid,
@@ -1117,6 +1152,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     async fn record_upstream_account_failure_inner(
         &self,
         upstream_account_id: Uuid,
@@ -1223,6 +1259,7 @@ impl Database {
     /// newer cohort's epoch and suppressing that cohort's genuine failure.
     /// Hard quota/authentication isolation and half-open probe leases remain
     /// separate authorities and are intentionally not touched.
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_success_at_revision(
         &self,
         upstream_account_id: Uuid,
@@ -1263,7 +1300,11 @@ impl Database {
         .bind(success_epoch.to_string())
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let recovered = result.rows_affected() == 1;
+        if recovered {
+            self.note_service_available(upstream_account_id).await;
+        }
+        Ok(recovered)
     }
 
     #[cfg(test)]
@@ -1311,6 +1352,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn record_upstream_account_probe_failure_at_revision_with_health_config(
         &self,
         upstream_account_id: Uuid,
@@ -1396,7 +1438,11 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        Ok(result.rows_affected() == 1)
+        let recovered = result.rows_affected() == 1;
+        if recovered {
+            self.note_service_available(upstream_account_id).await;
+        }
+        Ok(recovered)
     }
 
     #[cfg(test)]
@@ -2315,7 +2361,8 @@ mod tests {
             .iter()
             .find_map(|admission| match admission {
                 UpstreamAttemptAdmission::Probe { lease_token } => Some(*lease_token),
-                UpstreamAttemptAdmission::Healthy { .. }
+                UpstreamAttemptAdmission::Observed
+                | UpstreamAttemptAdmission::Healthy { .. }
                 | UpstreamAttemptAdmission::SharedProbe { .. }
                 | UpstreamAttemptAdmission::Unavailable { .. } => None,
             })
@@ -2327,12 +2374,28 @@ mod tests {
                 .count(),
             1
         );
+        sqlx::query(
+            "INSERT INTO upstream_service_probes (upstream_account_id, status, checked_at)
+             VALUES ($1, 'unhealthy', 1)",
+        )
+        .bind(account_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
         assert!(
             database
                 .record_upstream_account_probe_success(account_id, 1, lease_token)
                 .await
                 .unwrap()
         );
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM upstream_service_probes WHERE upstream_account_id = $1",
+        )
+        .bind(account_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "healthy");
         assert!(
             database
                 .claim_upstream_account_attempt(account_id, 1)

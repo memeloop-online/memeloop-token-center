@@ -37,17 +37,18 @@ impl ApplicationPlugins {
                             &directory,
                             std::fs::Permissions::from_mode(0o550),
                         )
-                        .map_err(|_| AppError::Internal)?;
+                        .map_err(|_| AppError::internal("empty_register_empty_1"))?;
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(_) => return Err(AppError::Internal),
+                Err(_) => return Err(AppError::internal("empty_register_empty_1")),
             }
-            let metadata = std::fs::symlink_metadata(&directory).map_err(|_| AppError::Internal)?;
+            let metadata = std::fs::symlink_metadata(&directory)
+                .map_err(|_| AppError::internal("empty_register_empty_2"))?;
             if !metadata.is_dir()
                 || metadata.file_type().is_symlink()
                 || std::fs::read_dir(&directory)
-                    .map_err(|_| AppError::Internal)?
+                    .map_err(|_| AppError::internal("empty_register_empty_3"))?
                     .next()
                     .is_some()
             {
@@ -55,13 +56,13 @@ impl ApplicationPlugins {
             }
             std::fs::File::open(&directory)
                 .and_then(|file| file.sync_all())
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::internal("empty_register_empty_4"))?;
             std::fs::File::open(directory.parent().ok_or(AppError::Forbidden)?)
                 .and_then(|file| file.sync_all())
-                .map_err(|_| AppError::Internal)
+                .map_err(|_| AppError::internal("empty_register_empty_5"))
         })
         .await
-        .map_err(|_| AppError::Internal)??;
+        .map_err(|_| AppError::internal("empty_register_empty_6"))??;
         let entry = PreinstalledInventory {
             root,
             grants: BTreeMap::new(),

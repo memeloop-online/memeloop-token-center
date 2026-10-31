@@ -4,6 +4,9 @@ use crate::plugin::application::descriptor_export::{
     DescriptorAuthoritySnapshot, DescriptorCandidateReceipt,
 };
 
+#[cfg(test)]
+mod tests;
+
 impl Database {
     pub(crate) async fn plugin_descriptor_authority_snapshot(
         &self,
@@ -75,7 +78,7 @@ impl Database {
         let locked = sqlx::query("UPDATE application_plugin_install_lock SET operation_id=$1,lease_until=$2 WHERE scope='global' AND lease_until <= $3")
             .bind(event_key).bind(now + 90_000).bind(now).execute(&mut *transaction).await?.rows_affected();
         if locked != 1 {
-            return Err(AppError::Overloaded);
+            return Err(AppError::capacity_error("plugin_installation_lock"));
         }
         let installed =
             sqlx::query("SELECT id FROM application_plugin_installations WHERE inventory_id=$1")
@@ -155,7 +158,9 @@ impl Database {
             ));
         }
         let revision: Option<i64> = row.try_get("result_revision")?;
-        let revision = revision.ok_or(AppError::Internal)?;
+        let revision = revision.ok_or(AppError::internal(
+            "plugin_revisions_replay_application_plugin_operation_1",
+        ))?;
         self.application_plugin_revision(revision).await.map(Some)
     }
 
@@ -190,7 +195,9 @@ impl Database {
     pub(crate) async fn application_plugin_head(&self) -> Result<ApplicationRevision, AppError> {
         self.optional_application_plugin_head()
             .await?
-            .ok_or(AppError::Internal)
+            .ok_or(AppError::internal(
+                "plugin_revisions_application_plugin_head_1",
+            ))
     }
 
     pub(crate) async fn optional_application_plugin_head(
@@ -251,11 +258,14 @@ impl Database {
         action: &str,
         audit_event_key: Option<&str>,
     ) -> Result<ApplicationRevision, AppError> {
-        let next = expected_revision
-            .checked_add(1)
-            .filter(|n| *n > 0)
-            .ok_or(AppError::Internal)?;
-        let mut tx = self.pool.begin().await?;
+        let next =
+            expected_revision
+                .checked_add(1)
+                .filter(|n| *n > 0)
+                .ok_or(AppError::internal(
+                    "plugin_revisions_publish_application_plugin_action_1",
+                ))?;
+        let mut tx = self.begin_write_transaction().await?;
         if reason != "rollback" {
             let frozen_base: Option<i64> = sqlx::query_scalar("SELECT r.base_revision FROM application_plugin_release_resolutions r JOIN application_plugin_installations i ON i.idempotency_hash=r.install_key_hash WHERE i.inventory_id=$1")
                 .bind(inventory_id).fetch_optional(&mut *tx).await?;
@@ -276,7 +286,9 @@ impl Database {
                 ));
             }
             let revision: Option<i64> = row.try_get("result_revision")?;
-            let revision = revision.ok_or(AppError::Internal)?;
+            let revision = revision.ok_or(AppError::internal(
+                "plugin_revisions_publish_application_plugin_action_2",
+            ))?;
             tx.commit().await?;
             return self.application_plugin_revision(revision).await;
         }

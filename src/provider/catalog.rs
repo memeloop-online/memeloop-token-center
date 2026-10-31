@@ -397,6 +397,13 @@ impl ProviderCatalog {
             "required": ["base_url"],
             "properties": {
                 "base_url": {"type": "string", "format": "uri", "title": "Base URL"},
+                "probe_model": {
+                    "title": "Probe model",
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Exact upstream model for the short health probe. Leave unset to use the cheapest catalog model, then the lowest numeric version, then the first listed model. The probe is billed to the filter-assistant credential and does not use that assistant's model."
+                },
                 "network_scope": {
                     "title": "Network scope",
                     "type": "string",
@@ -404,7 +411,7 @@ impl ProviderCatalog {
                     "default": "public",
                     "description": "Private destinations require a global operator credential."
                 },
-                "timeout_seconds": {"type": "integer", "minimum": 1, "default": 120},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "description": "Optional explicit end-to-end request timeout in seconds. When omitted, no application deadline is imposed."},
                 "reservation_token_bounds": {
                     "type": "object",
                     "propertyNames": {"minLength": 1, "maxLength": 500},
@@ -730,16 +737,16 @@ impl ProviderCatalog {
                     "description": "Provider default preserves native TLS protocol negotiation. HTTP/1.1 only is an explicit account override for controlled compatibility checks; it does not enable automatic fallback. Changes affect new account clients, including model and quota reads; existing requests retain their client."
                 },
                 "connect_timeout_millis": {
-                    "type": "integer", "minimum": 100, "maximum": 60000, "default": 5000,
-                    "description": "Pre-delivery connection deadline; must be lower than the total request timeout."
+                    "type": ["integer", "null"], "minimum": 100, "maximum": 600000, "default": null,
+                    "description": "Optional connection-establishment timeout. Unset by default; no application connection deadline is imposed. An explicit value covers connection establishment, including TLS and the configured proxy, without limiting response duration."
                 },
                 "read_timeout_millis": {
-                    "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 600000,
-                    "description": "Maximum inactivity from response headers to the first body read and between later body reads."
+                    "type": ["integer", "null"], "minimum": 1000, "maximum": 1260000, "default": null,
+                    "description": "Stored with the account; optional. When unset (the default) a quiet upstream is never aborted. When set, the value is a read-inactivity window that restarts on every byte. A Codex forward does not apply it as an absolute deadline."
                 },
                 "request_timeout_millis": {
                     "type": "integer", "minimum": 1000, "maximum": 1260000, "default": 1260000,
-                    "description": "One absolute budget from the first send through the complete response body, including the sole permitted classified HTTP 400 replay."
+                    "description": "HTTP/2 keepalive PING acknowledgement timeout, and explicit total budget for model catalog and quota reads. This does not impose an absolute deadline on inference or compaction. Quiet upstream responses continue while the connection remains healthy."
                 },
                 "memory_admission_wait_millis": {
                     "type": "integer", "minimum": 100, "maximum": 300000, "default": 30000,
@@ -778,12 +785,6 @@ impl ProviderCatalog {
                     "minimum": 1,
                     "maximum": 8,
                     "default": 3
-                },
-                "failover_deadline_millis": {
-                    "type": "integer",
-                    "minimum": 1000,
-                    "maximum": 300000,
-                    "default": 300000
                 },
                 "connect_attempts": {
                     "type": "integer",
@@ -902,8 +903,7 @@ impl ProviderCatalog {
         kimi.config_schema["properties"]["timeout_seconds"] = json!({
             "type": "integer",
             "minimum": 1,
-            "default": 120,
-            "description": "Request timeout in seconds, including the complete response stream."
+            "description": "Optional explicit request timeout in seconds, including the complete response stream. When omitted, no application deadline is imposed."
         });
         kimi.oauth_adapter = Some(OAuthAdapterContribution {
             api_version: "oauth-adapter-v1".to_owned(),
@@ -1220,6 +1220,13 @@ fn builtin_managed_oauth_provider(
             "properties": {
                 "base_url": {"const": base_url, "readOnly": true},
                 "network_scope": {"const": "public", "readOnly": true},
+                "probe_model": {
+                    "title": "Probe model",
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Exact upstream model for the short health probe. Leave unset to use the cheapest catalog model, then the lowest numeric version, then the first listed model. The probe is billed to the filter-assistant credential and does not use that assistant's model."
+                },
                 "reservation_token_bounds": {
                     "type": "object",
                     "default": {},
@@ -1285,7 +1292,14 @@ fn builtin_interactive_oauth_provider(
             "required": ["base_url", "network_scope"],
             "properties": {
                 "base_url": {"const": base_url, "readOnly": true},
-                "network_scope": {"const": "public", "readOnly": true}
+                "network_scope": {"const": "public", "readOnly": true},
+                "probe_model": {
+                    "title": "Probe model",
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 200,
+                    "description": "Exact upstream model for the short health probe. Leave unset to use the cheapest catalog model, then the lowest numeric version, then the first listed model. The probe is billed to the filter-assistant credential and does not use that assistant's model."
+                }
             }
         }),
         credential_schema: json!({

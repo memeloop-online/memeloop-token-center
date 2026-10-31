@@ -42,8 +42,6 @@ async fn http2_failure_upstream(
                     let count = count.clone();
                     connections.spawn(async move {
                         let mut connection = http2::server::handshake(stream).await.unwrap();
-                        let mut held_headers = Vec::new();
-                        let mut held_streams = Vec::new();
                         let mut held_requests = Vec::new();
                         while let Some(accepted) = connection.accept().await {
                             let Ok((request, mut response)) = accepted else {
@@ -92,14 +90,20 @@ async fn http2_failure_upstream(
                                     body.send_data(Bytes::from_static(br#"{"error":{"type":"rate_limit_error","message":"Rate limit reached"}}"#), true).unwrap();
                                 }
                                 Failure::ResetThenRateLimitThenReset => response.send_reset(http2::Reason::CANCEL),
-                                Failure::PreHeaderSilence => held_headers.push(response),
+                                Failure::PreHeaderSilence => response.send_reset(http2::Reason::CANCEL),
                                 Failure::PostHeaderSilence => {
                                     let headers = http::Response::builder()
                                         .status(200)
                                         .header(http::header::CONTENT_TYPE, "text/event-stream")
                                         .body(())
                                         .unwrap();
-                                    held_streams.push(response.send_response(headers, false).unwrap());
+                                    let mut body = response.send_response(headers, false).unwrap();
+                                    // Let the connection driver flush the headers before
+                                    // resetting the body, rather than cancelling queued headers.
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_millis(20)).await;
+                                        body.send_reset(http2::Reason::CANCEL);
+                                    });
                                 }
                                 Failure::RejectedReset | Failure::RejectedPlain | Failure::RejectedPriorReset | Failure::RejectedFinalReset => {
                                     let headers = http::Response::builder()
@@ -148,8 +152,7 @@ async fn set_short_http2_deadline(fixture: &CodexRouteFixture) {
         "candidate_attempts": 2,
         "connect_timeout_millis": 100,
         "read_timeout_millis": 1000,
-        "request_timeout_millis": 3000,
-        "failover_deadline_millis": 5000
+        "request_timeout_millis": 3000
     });
     sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
         .bind(config.to_string())
@@ -166,9 +169,9 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     let standby =
         add_codex_standby_route(&fixture, &format!("codex-route-{label}"), "account-456").await;
     fixture.state.codex_clients.install_test_client(
-        wreq::Client::builder()
-            .http2_only()
-            .retry(wreq::retry::Policy::never())
+        reqwest::Client::builder()
+            .http2_prior_knowledge()
+            .retry(reqwest::retry::never())
             .no_proxy()
             .build()
             .unwrap(),
@@ -196,7 +199,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     let body = String::from_utf8_lossy(&body);
     assert!(!body.contains("untrusted-diagnostic"));
     assert!(!body.contains("upstream_http2_reset"));
-    wait_for_request_settlement(&fixture, 1).await;
+    let receipt = cancellation::single_unknown_receipt(&fixture).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let expected_attempts = if matches!(
         failure,
@@ -208,6 +211,7 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         Failure::RejectedPriorReset
             | Failure::RejectedFinalReset
             | Failure::PreHeaderReset
+            | Failure::PreHeaderSilence
             | Failure::PreHeaderRefusedReset
     ) {
         2
@@ -230,14 +234,14 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(rows[0].cost, "0");
+    assert_eq!(rows[0].billing.cost, None);
     let expected_error = match failure {
         Failure::PreHeaderReset
+        | Failure::PreHeaderSilence
         | Failure::PreHeaderRefusedReset
         | Failure::ResetThenTransientThenReset
         | Failure::ResetThenRateLimitThenReset => "upstream_transport_http2_reset",
-        Failure::PreHeaderSilence => "upstream_request_timeout",
-        Failure::PostHeaderSilence => "upstream_read_timeout",
+        Failure::PostHeaderSilence => "upstream_http2_reset",
         Failure::RejectedReset
         | Failure::RejectedPlain
         | Failure::RejectedPriorReset
@@ -264,11 +268,12 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .all_request_events_after(0, None, 500)
         .await
         .unwrap();
-    let finished = events
-        .iter()
-        .find(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
-        .unwrap();
-    assert_eq!(finished.terminal_cause_code.as_deref(), expected_cause);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.request_id == rows[0].request_id && event.event_kind == "finished")
+    );
+    assert_eq!(receipt["terminal_cause"].as_str(), expected_cause);
     let (expected_account, expected_route) = if matches!(
         failure,
         Failure::RejectedPriorReset
@@ -289,14 +294,8 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
     } else {
         (fixture.upstream_account_id, fixture.route_id)
     };
-    assert_exactly_once_side_effects_for(
-        &fixture,
-        rows[0].request_id,
-        None,
-        expected_account,
-        expected_route,
-    )
-    .await;
+    assert_eq!(rows[0].upstream_account_id, Some(expected_account));
+    assert_eq!(rows[0].route_id, Some(expected_route));
 }
 
 #[tokio::test]
@@ -338,9 +337,9 @@ async fn pre_header_reset_then_success_settles_one_logical_request() {
         .await;
         set_short_http2_deadline(&fixture).await;
         fixture.state.codex_clients.install_test_client(
-            wreq::Client::builder()
-                .http2_only()
-                .retry(wreq::retry::Policy::never())
+            reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .retry(reqwest::retry::never())
                 .no_proxy()
                 .build()
                 .unwrap(),

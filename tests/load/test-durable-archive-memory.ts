@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test from "node:test";
-import { allocatorEvidence, assertArchiveGapEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
+import { allocatorEvidence, archiveDrainReady, assertArchiveGapEvidence, assertArchiveReplayGapEvidence, assertUnknownArchiveEvidence, assertUnknownFinancialEvidence, assertUnknownSemanticEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
 import { processMemoryFromProc } from "./benchmark-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
@@ -42,6 +44,153 @@ test("missing permit telemetry never masquerades as returned permits", () => {
   assert.throws(() => permitEvidence(""), /required permit gauge absent/u);
 });
 
+test("drain exempts only one explicitly owned unknown hold and its exact durable archive", () => {
+  const empty = { pending_requests: 0, unsettled_reservations: 0, cipher_bytes: 0, request_cipher_bytes: 0 };
+  assert.equal(archiveDrainReady(empty), true);
+  const retained = { pending_requests: 1, unsettled_reservations: 1, cipher_bytes: 0, request_cipher_bytes: 0 };
+  assert.equal(archiveDrainReady(retained), false);
+  assert.equal(archiveDrainReady(retained, 0), true);
+  assert.equal(archiveDrainReady(empty, 0), false);
+  for (const field of Object.keys(retained)) {
+    assert.equal(archiveDrainReady({ ...retained, [field]: retained[field as keyof typeof retained] + 1 }, 0), false);
+  }
+  assert.equal(archiveDrainReady({ ...retained, pending_requests: 0 }, 0), false);
+  assert.equal(archiveDrainReady({ ...retained, unsettled_reservations: 0 }, 0), false);
+  assert.throws(() => archiveDrainReady(retained, NaN), /retained archive bytes/u);
+  assert.throws(() => archiveDrainReady(retained, -1), /retained archive bytes/u);
+});
+
+test("unknown requires owned semantics exactly once while retaining its receipt, hold and no financial ACK", () => {
+  const responseObject = 'inline-json:{"error":{"code":"upstream_invalid_response","message":"上游请求失败。上游响应无效。","message_en":"upstream request failed. the upstream response was invalid.","type":"upstream_error"}}';
+  const claim = {
+    request_id: "request", tenant_id: "tenant", key_id: "key", account_id: "account",
+    reservation_id: "reservation", owner_token: "owner", fence: "fence", contract_digest: "digest",
+  };
+  const row = {
+    ...claim, financial_completed: null, financial_status: null, actual_micros: null,
+    receipt_id: null, receipt_digest: null, cost_micros: null, reserved_micros: 123,
+    reservation_status: "reserved", state: "pending", unknown_reason: "authoritative_usage_unavailable",
+    ledger_count: 0, event_count: 1, fact_count: 1, observation_count: 1, projected_event_count: 1,
+    stats_usage_basis: "not_observed", stats_cost_micros: 0, stats_input_tokens: 0,
+    stats_output_tokens: 0, stats_cached_input_tokens: 0, stats_cache_write_tokens: 0,
+    stats_status_class: "failure", stats_error_code: "upstream_invalid_response",
+    stats_tenant_id: "tenant", stats_key_id: "key", finished_cost_micros: 0,
+    finished_tenant_id: "tenant", finished_key_id: "key",
+    principal_id: "principal", request_cluster_id: "cluster",
+    observation_id: "observation", observation_request_id: "request", observation_key_id: "key",
+    observation_cluster_id: "cluster", cluster_tenant_id: "tenant", cluster_principal_id: "principal",
+    projection_tenant_id: "tenant", projection_key_id: "key", projection_principal_id: "principal",
+    projection_completed: 1235, projection_observed_at: 1234, projected_event_id: "projected",
+    projected_event_tenant_id: "tenant", projected_event_key_id: "key",
+    operational_status: 502, operational_error: "upstream_invalid_response",
+    operational_stage: "buffered_response_ready", operational_completed: 1234,
+    operational_receipt_id: "receipt", operational_response_object: responseObject,
+  };
+  const receipt = {
+    request_id: "request", receipt_id: "receipt", usage_basis: "not_observed",
+    status_code: 502, error_code: "upstream_invalid_response", response_object: responseObject,
+    claim, reservation: { id: "reservation", reserved_micros: 123 },
+    operational_terminal: {
+      status_code: 502, error_code: "upstream_invalid_response", stage: "buffered_response_ready",
+      completed_at: 1234, response_object: responseObject,
+    },
+  };
+  assert.equal(assertUnknownFinancialEvidence(row, receipt), 0);
+  const semantics = assertUnknownSemanticEvidence(row);
+  assert.deepEqual(assertUnknownSemanticEvidence({ ...row }, semantics), semantics);
+  assert.equal(assertUnknownFinancialEvidence({ ...row }, receipt), 0);
+  for (const count of [0, 2]) {
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_count: count }), /exactly one conversation observation/u);
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_count: count }), /exactly one semantic projected event/u);
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_count: count }, semantics), /exactly one conversation observation/u);
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, projected_event_count: count }, semantics), /exactly one semantic projected event/u);
+  }
+  for (const field of [
+    "observation_request_id", "observation_key_id", "cluster_tenant_id", "cluster_principal_id",
+    "observation_cluster_id", "projection_tenant_id", "projection_key_id", "projection_principal_id",
+    "projected_event_tenant_id", "projected_event_key_id",
+  ]) {
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "other-owner" }), /exact ownership/u);
+  }
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, projection_completed: null }), /projection must commit/u);
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, projection_observed_at: 999 }, semantics), /operational receipt timestamp/u);
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, projection_completed: 1236 }, semantics), /replay must preserve timestamp/u);
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, operational_completed: 1235, projection_observed_at: 1235 }, semantics), /replay must preserve timestamp/u);
+  for (const field of ["observation_id", "projected_event_id", "operational_receipt_id"]) {
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "" }), /semantic evidence missing/u);
+    assert.throws(() => assertUnknownSemanticEvidence({ ...row, [field]: "replacement" }, semantics), /replay must preserve identity/u);
+  }
+  assert.throws(() => assertUnknownSemanticEvidence({ ...row, observation_cluster_id: "replacement", request_cluster_id: "replacement" }, semantics), /replay must preserve identity/u);
+  for (const field of ["financial_completed", "financial_status", "actual_micros", "receipt_id", "receipt_digest", "cost_micros"]) {
+    assert.throws(() => assertUnknownFinancialEvidence({ ...row, [field]: 0 }, receipt), /financial completion/u);
+  }
+  assert.throws(() => assertUnknownFinancialEvidence({ ...row, ledger_count: 1 }, receipt), /financial side effects/u);
+  for (const field of ["event_count", "fact_count"]) {
+    for (const count of [0, 2]) assert.throws(() => assertUnknownFinancialEvidence({ ...row, [field]: count }, receipt), /exactly one observed stats/u);
+  }
+  for (const field of ["stats_cost_micros", "stats_input_tokens", "stats_output_tokens", "stats_cached_input_tokens", "stats_cache_write_tokens", "finished_cost_micros"]) {
+    assert.throws(() => assertUnknownFinancialEvidence({ ...row, [field]: 1 }, receipt), /fabricate billing or usage/u);
+  }
+  for (const field of ["stats_tenant_id", "stats_key_id", "finished_tenant_id", "finished_key_id"]) {
+    assert.throws(() => assertUnknownFinancialEvidence({ ...row, [field]: "other" }, receipt), /exact ownership/u);
+  }
+  assert.throws(() => assertUnknownFinancialEvidence({ ...row, stats_usage_basis: "provider_reported" }, receipt), /unknown provider usage/u);
+  assert.throws(() => assertUnknownFinancialEvidence({ ...row, stats_status_class: "success" }, receipt), /real upstream failure/u);
+  assert.throws(() => assertUnknownFinancialEvidence({ ...row, stats_error_code: "" }, receipt), /real upstream failure/u);
+  for (const field of Object.keys(claim)) {
+    assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, claim: { ...claim, [field]: "different" } }), /claim authority/u);
+  }
+  assert.throws(() => assertUnknownFinancialEvidence({ ...row, reservation_status: "settled" }, receipt), /original financial hold/u);
+  assert.throws(() => assertUnknownFinancialEvidence({ ...row, operational_status: 499 }, receipt), /real upstream failure/u);
+  assert.throws(() => assertUnknownFinancialEvidence({ ...row, operational_completed: null }, receipt), /completion must be recorded/u);
+  assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, receipt_id: "different" }), /operational receipt/u);
+  assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, usage_basis: "provider_reported" }), /fabricate provider usage/u);
+  assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, reservation: { id: "reservation", reserved_micros: 0 } }), /original reservation/u);
+  assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, operational_terminal: { ...receipt.operational_terminal, completed_at: 1235 } }), /operational ACK/u);
+  assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, response_object: "inline-json:private upstream body" }), /safe local error/u);
+});
+
+test("unknown source requires the exact bound locator, digest and original object bytes", () => {
+  const archive = mkdtempSync(join(tmpdir(), "mtc-unknown-source-contract-"));
+  const requestId = "00000000-0000-4000-8000-000000000001";
+  const locator = `staging/proxy/${requestId}/request/${requestId}/body.json`;
+  const row = {
+    request_id: requestId, request_object: locator, bound_locator: locator, spool_state: "bound",
+    body_byte_count: 512, body_blake3: "a".repeat(64), source_intent_digest: "a".repeat(64),
+    spool_plain_bytes: 0, spool_cipher_bytes: 0, chunk_count: 0,
+  };
+  const plan = inputPlan(512);
+  const body = Buffer.concat([plan.prefix, Buffer.alloc(plan.fillBytes, "x"), plan.suffix]);
+  const path = join(archive, locator);
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, body);
+    const evidence = assertUnknownArchiveEvidence(row, archive);
+    assert.deepEqual(evidence, { locator, bytes: 512, blake3: row.body_blake3, sha256: planHash(plan) });
+    assert.throws(() => assertUnknownArchiveEvidence({ ...row, request_id: "../outside" }, archive), /canonical request identity/u);
+    assert.throws(() => assertUnknownArchiveEvidence({ ...row, source_intent_digest: "b".repeat(64) }, archive), /staging digest/u);
+    for (const field of ["request_object", "bound_locator"]) {
+      for (const value of ["gap://missing", locator.replace(requestId, "other-request"), "../outside"]) {
+        assert.throws(() => assertUnknownArchiveEvidence({ ...row, [field]: value }, archive), /exact request-bound source locator/u);
+      }
+    }
+    for (const state of ["pending", "capturing", "gap"]) assert.throws(() => assertUnknownArchiveEvidence({ ...row, spool_state: state }, archive), /remain durable/u);
+    assert.throws(() => assertUnknownArchiveEvidence({ ...row, body_byte_count: 511 }, archive), /exact 512 byte length/u);
+    for (const digest of [null, "", "0".repeat(64), "A".repeat(64), "b".repeat(64)]) {
+      assert.throws(() => assertUnknownArchiveEvidence({ ...row, body_blake3: digest }, archive), /staging digest/u);
+    }
+    for (const field of ["spool_plain_bytes", "spool_cipher_bytes", "chunk_count"]) {
+      assert.throws(() => assertUnknownArchiveEvidence({ ...row, [field]: 1 }, archive), /zero encrypted spool accounting/u);
+    }
+    writeFileSync(path, Buffer.alloc(512, "y"));
+    assert.throws(() => assertUnknownArchiveEvidence(row, archive), /original request bytes\/hash/u);
+    writeFileSync(path, body.subarray(0, 511));
+    assert.throws(() => assertUnknownArchiveEvidence(row, archive), /original request bytes\/hash/u);
+    rmSync(path);
+    assert.throws(() => assertUnknownArchiveEvidence(row, archive), /ENOENT/u);
+  } finally { rmSync(archive, { recursive: true, force: true }); }
+});
+
 test("archive gaps require explicit finite capacity evidence", () => {
   const metrics = ["accepted", "capacity", "failed"]
     .map((outcome, index) => `memeloop_token_center_deferred_persistence_total{outcome="${outcome}"} ${index}`)
@@ -65,6 +214,31 @@ test("request and response gaps require their own bounded queue evidence", () =>
   assert.throws(() => assertArchiveGapEvidence(0, 0, request, { ...response, failed: 1 }), /capture failures/u);
   assert.throws(() => assertArchiveGapEvidence(0, 0, { ...request, retention_limit: 1 }, response), /retention limit/u);
   assert.throws(() => assertArchiveGapEvidence(0, 0, request, { failed: 0 }), /capacity rejection counter/u);
+});
+
+test("journal replay preserves accounted gaps across process counter reset without accepting new gaps or failures", () => {
+  const baseline = {
+    successful_request_archive_gaps: 4, successful_response_archive_gaps: 2,
+    request_persistence: { accepted: 3, capacity: 4, failed: 0, retention_limit: 0 },
+    persistence: { accepted: 4, capacity: 2, failed: 0 },
+  };
+  const request = { accepted: 0, capacity: 0, failed: 0, retention_limit: 0 };
+  const response = { accepted: 0, capacity: 0, failed: 0 };
+  assertArchiveReplayGapEvidence(4, 2, request, response, baseline);
+  assert.throws(() => assertArchiveGapEvidence(4, 2, request, response), /request archive gaps/u);
+  for (const gaps of [3, 5]) {
+    assert.throws(() => assertArchiveReplayGapEvidence(gaps, 2, { ...request, capacity: 10 }, response, baseline), /preserve.*request archive gaps/u);
+  }
+  for (const gaps of [1, 3]) {
+    assert.throws(() => assertArchiveReplayGapEvidence(4, gaps, request, { ...response, capacity: 10 }, baseline), /preserve.*response archive gaps/u);
+  }
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, request, response, { ...baseline, request_persistence: { ...baseline.request_persistence, capacity: 3 } }), /request archive gaps/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, request, response, { ...baseline, persistence: { ...baseline.persistence, capacity: 1 } }), /response archive gaps/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, { ...request, failed: 1 }, response, baseline), /capture failures/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, request, { ...response, failed: 1 }, baseline), /capture failures/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, { ...request, retention_limit: 1 }, response, baseline), /retention limit/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, { ...request, capacity: NaN }, response, baseline), /capacity rejection counter/u);
+  assert.throws(() => assertArchiveReplayGapEvidence(4, 2, request, { failed: 0 }, baseline), /capacity rejection counter/u);
 });
 
 test("allocator evidence preserves every jemalloc state", () => {

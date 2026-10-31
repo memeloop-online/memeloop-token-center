@@ -2076,7 +2076,7 @@ async fn oauth_refresh_finalize_failure_recovers_pending_ciphertext_without_remo
         .unwrap_err();
     assert!(matches!(
         failed,
-        memeloop_token_center::error::AppError::Internal
+        memeloop_token_center::error::AppError::Internal { .. }
     ));
     let staged: (i64, i64) = sqlx::query_as(
         "SELECT CASE WHEN request_started_at IS NOT NULL THEN 1 ELSE 0 END, CASE WHEN pending_credential_ciphertext IS NOT NULL THEN 1 ELSE 0 END FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND idempotency_key = $2",
@@ -2135,9 +2135,9 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
             ResponseTemplate::new(200)
                 .set_body_json(json!({"data": [], "never_return": "original-secret"})),
         )
-        // One request is the explicit health probe; the other is the model
-        // catalog refresh caused by the successful provider config update.
-        .expect(2)
+        // Manual health is a billed model probe and does not call /v1/models.
+        // The remaining request is the catalog refresh after a config update.
+        .expect(1)
         .mount(&mock)
         .await;
     Mock::given(method("GET"))
@@ -2279,8 +2279,9 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(health["status"], "healthy");
-    assert_eq!(health["upstream_status"], 200);
+    assert_eq!(health["status"], "skipped");
+    assert_eq!(health["error_code"], "probe_model_unavailable");
+    assert!(health.get("upstream_status").is_none());
     assert!(!health.to_string().contains("original-secret"));
     assert!(!health.to_string().contains("never_return"));
 
@@ -2334,7 +2335,7 @@ async fn unified_upstream_management_is_scoped_optimistic_and_history_safe() {
     let updated = account(updated);
     assert_eq!(updated.config["timeout_seconds"], 900);
     assert!(updated.updated_at > upstream.updated_at);
-    wait_for_authorized_requests(&mock, "Bearer original-secret", 2).await;
+    wait_for_authorized_requests(&mock, "Bearer original-secret", 1).await;
 
     let (status, _) = json_request(
         &state,

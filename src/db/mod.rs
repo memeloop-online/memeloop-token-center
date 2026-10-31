@@ -44,7 +44,7 @@ use crate::{
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
-        open_private_json, seal_credential, seal_private_json, validate_config,
+        seal_credential, validate_config,
     },
 };
 
@@ -62,6 +62,7 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
@@ -84,6 +85,8 @@ pub(crate) use requests::EarlyRequestTerminal;
 pub(crate) use requests::pending_settlement::{
     PendingProxySettlementAck, PendingProxySettlementClaim, PendingProxySettlementEvidence,
 };
+#[allow(unused_imports)] // Separately owned API journal integration.
+pub(crate) use requests::{PendingProxyOperationalTerminal, PendingProxyOperationalTerminalAck};
 mod rotation;
 mod routing;
 pub use routing::egress;
@@ -106,7 +109,9 @@ pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
+pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
+mod upstream_service_probes;
 mod usage_analysis;
 mod validation;
 
@@ -207,10 +212,18 @@ pub use requests::{
     ProxyConversationInput, RequestListFilter, StartMeteredSynchronousRequest, StartProxyRequest,
     StatsFilter, normalize_proxy_usage,
 };
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use requests::{
-    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution,
-    SessionRoutingTerminalInput, SwitchProxyCandidateInput, allocate_request_event_cursor,
-    attach_conversation_upstream_response_in_transaction, is_session_avoid_terminal,
+    ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
+};
+#[cfg(test)]
+pub(crate) use requests::{
+    FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
+    FILTERED_ACTIVITY_SOURCE_ROLLUPS,
+};
+pub(crate) use requests::{
+    MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, SessionRoutingTerminalInput,
+    SwitchProxyCandidateInput, allocate_request_event_cursor, is_session_avoid_terminal,
     normalize_proxy_usage_with_output_limit, price_token_usage,
     record_request_finished_in_transaction, record_request_started_in_transaction,
     reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
@@ -218,16 +231,7 @@ pub(crate) use requests::{
 };
 #[cfg(test)]
 pub(crate) use requests::{
-    FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
-    FILTERED_ACTIVITY_SOURCE_ROLLUPS,
-};
-#[cfg(test)]
-pub(crate) use requests::{
     RequestEventCursor, claim_request_event_locator, claim_request_record_locator,
-};
-pub(crate) use routing::{
-    AdmittedConnectionFailure, GrantedModelCapabilitySource, UpstreamAttemptAdmission,
-    UpstreamFailureKind, UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
 };
 pub use routing::{
     CreateRoutedModelRouteInput, CreateRoutedModelRouteResult, CredentialRoutingView,
@@ -235,14 +239,21 @@ pub use routing::{
     RouteCreateDisposition, RouteCreateIdempotencyKey, RouteRoutingView, RouteSelectionOptions,
     UpdateRoutedModelRouteInput,
 };
+pub(crate) use routing::{
+    GrantedModelCapabilitySource, UpstreamAttemptAdmission, UpstreamFailureKind,
+    UpstreamTransportDiagnostic, upstream_probe_heartbeat_interval,
+};
 pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,
     UpstreamAccountAvailabilityWindow,
 };
-pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
+pub use usage_analysis::{
+    UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter,
+};
 
 #[derive(Clone)]
 pub struct Database {
+    pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
     pool_role: &'static str,
     backend: DatabaseBackend,
@@ -432,7 +443,9 @@ impl Database {
             .await
             .map_err(|error| match error {
                 DatabaseReadinessError::Dependency(error) => error,
-                DatabaseReadinessError::SchemaOutdated(_) => AppError::Internal,
+                DatabaseReadinessError::SchemaOutdated(_) => {
+                    AppError::internal("db_mod_readiness_check_1")
+                }
             })
     }
 
@@ -509,6 +522,40 @@ impl Database {
         Self::connect_with_max(database_url, 8).await
     }
 
+    #[cfg(test)]
+    pub(crate) fn sqlite_database_url(database_url: &str) -> String {
+        Self::normalized_sqlite_url(database_url).into_owned()
+    }
+
+    fn normalized_sqlite_url(database_url: &str) -> std::borrow::Cow<'_, str> {
+        // `sqlite://C:/...` is a URL with host `C` and loses the drive. Keep the
+        // drive in the path (`sqlite:///C:/...`) and accept Windows separators.
+        let Some(rest) = database_url.strip_prefix("sqlite://") else {
+            return std::borrow::Cow::Borrowed(database_url);
+        };
+        if !rest.contains('\\') && !Self::is_windows_drive_path(rest) {
+            return std::borrow::Cow::Borrowed(database_url);
+        }
+        let rest = rest.replace('\\', "/");
+        let (path, query) = rest.split_once('?').unwrap_or((rest.as_str(), ""));
+        let path = if Self::is_windows_drive_path(path) {
+            format!("/{path}")
+        } else {
+            path.to_owned()
+        };
+        let mut url = format!("sqlite://{path}");
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(query);
+        }
+        std::borrow::Cow::Owned(url)
+    }
+
+    fn is_windows_drive_path(path: &str) -> bool {
+        let bytes = path.as_bytes();
+        bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/'
+    }
+
     pub async fn connect_with_max(
         database_url: &str,
         maximum_connections: u32,
@@ -530,7 +577,9 @@ impl Database {
     }
 
     pub(crate) async fn close(&self) {
-        self.gateway_persistence.pool.close().await;
+        if self.pool_role != "independent_persistence" {
+            self.gateway_persistence.pool.close().await;
+        }
         self.pool.close().await;
     }
 
@@ -597,7 +646,10 @@ impl Database {
                 })
             });
         }
-        let pool = pool_options.connect(database_url).await?;
+        // Windows test paths use `\`. SQLite's URL parser treats that as an
+        // invalid URL, so the same `sqlite://...` fixtures never open a file.
+        let database_url = Self::normalized_sqlite_url(database_url);
+        let pool = pool_options.connect(database_url.as_ref()).await?;
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
             // over the same lightweight/test database. WAL keeps readers on a
@@ -610,8 +662,9 @@ impl Database {
                 .await?;
         }
         Ok(Self {
+            http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
-                database_url,
+                database_url.as_ref(),
                 backend,
             )?),
             pool,
@@ -683,6 +736,7 @@ impl Database {
 
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
+            http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
             pool: self
@@ -696,6 +750,12 @@ impl Database {
             terminal_projection_enabled: self.terminal_projection_enabled,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn refresh_closed_persistence_pool(&mut self) {
+        if self.pool_role == "independent_persistence" && self.pool.is_closed() {
+            *self = self.independent_persistence_pool();
         }
     }
 

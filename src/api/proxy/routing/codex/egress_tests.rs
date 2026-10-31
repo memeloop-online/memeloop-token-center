@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 struct Fixture {
     state: AppState,
     route: PreparedProxyRoute,
-    client: wreq::Client,
+    client: reqwest::Client,
     identity: send_diagnostics::TransportIdentity,
     selected: SelectedEgress,
     _directory: tempfile::TempDir,
@@ -101,7 +101,6 @@ impl Fixture {
             context,
             false,
             body.clone(),
-            false,
         );
         AttemptRecorder::begin(
             &self.state,

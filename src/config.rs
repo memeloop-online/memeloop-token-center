@@ -8,9 +8,9 @@ pub const DEFAULT_PRICING_LITELLM_URL: &str =
 pub const DEFAULT_PRICING_OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/models";
 pub const DEFAULT_GATEWAY_BODY_READ_CONCURRENCY: u32 = 1_024;
 pub const MAX_GATEWAY_BODY_READ_CONCURRENCY: u32 = 8_192;
-pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 16 * 1024 * 1024;
+pub const DEFAULT_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
 pub const MIN_RESPONSES_BODY_MAX_BYTES: u32 = 4 * 1024 * 1024;
-pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 64 * 1024 * 1024;
+pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 256 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = DEFAULT_GATEWAY_BODY_READ_CONCURRENCY;
 pub const DEFAULT_RESPONSES_REQUEST_SPOOL_PATH: &str =
     "/var/lib/memeloop-token-center/request-spool";
@@ -180,8 +180,6 @@ pub struct Config {
     pub responses_body_read_concurrency: u32,
     /// Shared per-upstream-account circuit-breaker and half-open probe timings.
     pub upstream_health: UpstreamHealthConfig,
-    #[serde(default)]
-    pub h2_attempt_binding_enabled: bool,
     pub quota_observation_interval_millis: u32,
     pub quota_observation_batch_limit: u32,
     pub quota_observation_timeout_millis: u32,
@@ -263,10 +261,6 @@ impl std::fmt::Debug for Config {
                 &self.responses_body_read_concurrency,
             )
             .field("upstream_health", &self.upstream_health)
-            .field(
-                "h2_attempt_binding_enabled",
-                &self.h2_attempt_binding_enabled,
-            )
             .field("run_migrations_on_start", &self.run_migrations_on_start)
             .field("key_pepper", &"[redacted]")
             .field("service_token", &"[redacted]")
@@ -463,7 +457,6 @@ impl Config {
                 DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             )?),
             upstream_health,
-            h2_attempt_binding_enabled: env_bool("MTC_H2_ATTEMPT_BINDING_ENABLED", false),
             quota_observation_interval_millis: env_u32(
                 "MTC_QUOTA_OBSERVATION_INTERVAL_MILLIS",
                 10_000,
@@ -518,8 +511,6 @@ impl Config {
     pub(crate) fn validate_proxy_memory_budget(&self) -> Result<(), ConfigError> {
         if self.proxy_memory_budget_bytes < DEFAULT_PROXY_MEMORY_BUDGET_BYTES
             || self.proxy_memory_budget_bytes > 2 * 1024 * 1024 * 1024
-            || u64::from(self.proxy_memory_budget_bytes)
-                < u64::from(self.responses_body_max_bytes) * 12 + 1024 * 1024
             || u64::from(self.proxy_memory_budget_bytes) < u64::from(self.audio_body_max_bytes) * 3
         {
             return Err(ConfigError::InvalidProxyMemoryBudget);
@@ -530,7 +521,9 @@ impl Config {
             && spool_path.components().all(|component| {
                 matches!(
                     component,
-                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                    std::path::Component::Prefix(_)
+                        | std::path::Component::RootDir
+                        | std::path::Component::Normal(_)
                 )
             });
         if !valid_spool_path {
@@ -557,7 +550,6 @@ impl Config {
             audio_body_max_bytes: DEFAULT_AUDIO_BODY_MAX_BYTES,
             responses_body_read_concurrency: DEFAULT_RESPONSES_BODY_READ_CONCURRENCY,
             upstream_health: UpstreamHealthConfig::DEFAULT,
-            h2_attempt_binding_enabled: false,
             quota_observation_interval_millis: 10_000,
             quota_observation_batch_limit: 4,
             quota_observation_timeout_millis: 10_000,
@@ -730,7 +722,7 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB, at least twelve times MTC_RESPONSES_BODY_MAX_BYTES plus 1 MiB, and at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
+        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB and at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
     )]
     InvalidProxyMemoryBudget,
     #[error(
@@ -809,9 +801,10 @@ mod tests {
         assert!(config.validate_proxy_memory_budget().is_err());
         config.proxy_memory_budget_bytes = DEFAULT_PROXY_MEMORY_BUDGET_BYTES;
         config.responses_body_max_bytes = MAX_RESPONSES_BODY_MAX_BYTES;
-        assert!(config.validate_proxy_memory_budget().is_err());
-        config.proxy_memory_budget_bytes = MAX_RESPONSES_BODY_MAX_BYTES * 12 + 1024 * 1024;
         assert!(config.validate_proxy_memory_budget().is_ok());
+        config.proxy_memory_budget_bytes = 2 * 1024 * 1024 * 1024 + 1;
+        assert!(config.validate_proxy_memory_budget().is_err());
+        config.proxy_memory_budget_bytes = DEFAULT_PROXY_MEMORY_BUDGET_BYTES;
         config.audio_body_max_bytes = config.proxy_memory_budget_bytes / 3 + 1;
         assert!(config.validate_proxy_memory_budget().is_err());
     }
@@ -1007,7 +1000,7 @@ mod tests {
     fn responses_body_configuration_keeps_large_reads_bounded() {
         assert_eq!(DEFAULT_RESPONSES_BODY_READ_CONCURRENCY, 1_024);
         assert_eq!(responses_body_read_concurrency(1_024), 1_024);
-        assert_eq!(DEFAULT_RESPONSES_BODY_MAX_BYTES, 16 * 1024 * 1024);
+        assert_eq!(DEFAULT_RESPONSES_BODY_MAX_BYTES, 64 * 1024 * 1024);
         assert_eq!(
             responses_body_max_bytes(MIN_RESPONSES_BODY_MAX_BYTES - 1),
             MIN_RESPONSES_BODY_MAX_BYTES

@@ -11,7 +11,6 @@
     "migration",
     "serviceAccount",
     "roles",
-    "requestSpool",
     "config",
     "plugins",
     "ingress",
@@ -30,6 +29,52 @@
     "serviceMonitor"
   ],
   "properties": {
+    "rustfs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "connectArchive", "image", "persistence", "resources", "terminationGracePeriodSeconds", "probes", "nodeSelector", "tolerations", "affinity"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "connectArchive": { "type": "boolean" },
+        "image": {
+          "type": "object", "additionalProperties": false,
+          "required": ["repository", "tag", "digest", "pullPolicy"],
+          "properties": {
+            "repository": { "type": "string", "minLength": 1 },
+            "tag": { "type": "string", "minLength": 1 },
+            "digest": { "type": "string", "pattern": "^$|^sha256:[a-f0-9]{64}$" },
+            "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+          }
+        },
+        "persistence": {
+          "type": "object", "additionalProperties": false,
+          "required": ["existingClaim", "storageClass", "size"],
+          "properties": {
+            "existingClaim": { "type": "string" },
+            "storageClass": { "type": "string" },
+            "size": { "type": "string", "pattern": "^[1-9][0-9]*(Mi|Gi|Ti)$" }
+          }
+        },
+        "resources": { "$ref": "#/definitions/resources" },
+        "terminationGracePeriodSeconds": {
+          "type": "integer", "minimum": 1,
+          "description": "Time Kubernetes allows RustFS to finish in-flight operations before stopping the dedicated Pod."
+        },
+        "probes": {
+          "type": "object", "additionalProperties": false,
+          "required": ["startup", "readiness", "liveness"],
+          "properties": {
+            "startup": { "$ref": "#/definitions/probe" },
+            "readiness": { "$ref": "#/definitions/probe" },
+            "liveness": { "$ref": "#/definitions/probe" }
+          }
+        },
+        "nodeSelector": { "type": "object", "additionalProperties": { "type": "string" } },
+        "tolerations": { "type": "array", "items": { "type": "object" } },
+        "affinity": { "$ref": "#/definitions/affinity" }
+      },
+      "allOf": [{ "if": { "properties": { "connectArchive": { "const": true } } }, "then": { "properties": { "enabled": { "const": true } } } }]
+    },
     "image": {
       "type": "object",
       "additionalProperties": false,
@@ -71,7 +116,7 @@
       ],
       "properties": {
         "enabled": { "type": "boolean" },
-        "schemaVersion": { "type": "integer", "const": 132 },
+        "schemaVersion": { "type": "integer", "const": 146 },
         "backoffLimit": { "type": "integer", "minimum": 0, "maximum": 20 },
         "activeDeadlineSeconds": { "type": "integer", "minimum": 30 },
         "ttlSecondsAfterFinished": { "type": "integer", "minimum": 0 },
@@ -119,15 +164,6 @@
           }
         }
       ]
-    },
-    "requestSpool": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["mountPath", "sizeLimit"],
-      "properties": {
-        "mountPath": { "type": "string", "pattern": "^/.+$" },
-        "sizeLimit": { "$ref": "#/definitions/resourceQuantity" }
-      }
     },
     "config": {
       "type": "object",

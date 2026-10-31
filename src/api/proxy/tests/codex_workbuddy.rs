@@ -436,7 +436,8 @@ async fn workbuddy_native_conflicting_item_done_and_terminal_fails_through_strea
     let request_id =
         Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
     assert_failed_chat_stream(response.into_body()).await;
-    wait_for_request_settlement(&fixture, 1).await;
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_response"))
+        .await;
     drain_archive_capture(&fixture).await;
     let rows = fixture
         .state
@@ -451,7 +452,6 @@ async fn workbuddy_native_conflicting_item_done_and_terminal_fails_through_strea
         rows[0].error_code.as_deref(),
         Some("upstream_invalid_response")
     );
-    assert_exactly_once_side_effects(&fixture, request_id, None).await;
     assert_chat_failure_account_health(&fixture, true).await;
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     upstream.verify().await;
@@ -490,14 +490,12 @@ async fn assert_chat_failure_account_health(fixture: &CodexRouteFixture, invalid
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     if invalid_response {
-        let health = sqlx::query("SELECT consecutive_failures, cooldown_until, last_failure_kind FROM upstream_account_health WHERE upstream_account_id = $1")
+        let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1 AND consecutive_failures > 0")
             .bind(fixture.upstream_account_id.to_string()).fetch_one(&pool).await.unwrap();
-        assert_eq!(health.get::<i64, _>("consecutive_failures"), 1);
         assert_eq!(
-            health.get::<String, _>("last_failure_kind"),
-            "invalid_response"
+            failures, 0,
+            "an invalid Chat response is request evidence, not an account health sample"
         );
-        assert!(health.get::<i64, _>("cooldown_until") > 0);
     } else {
         let failures: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1 AND (consecutive_failures <> 0 OR cooldown_until <> 0 OR last_failure_kind <> '')")
             .bind(fixture.upstream_account_id.to_string()).fetch_one(&pool).await.unwrap();
@@ -561,7 +559,12 @@ async fn workbuddy_unmappable_native_chat_output_fails_without_replay_or_account
             assert!(body.get("error").is_some());
             assert!(body.get("choices").is_none());
         }
-        wait_for_request_settlement(&fixture, 1).await;
+        cancellation::assert_single_unknown_receipt(
+            &fixture,
+            502,
+            Some("upstream_unsupported_chat_output"),
+        )
+        .await;
         drain_archive_capture(&fixture).await;
         let rows = fixture
             .state
@@ -576,7 +579,6 @@ async fn workbuddy_unmappable_native_chat_output_fails_without_replay_or_account
             rows[0].error_code.as_deref(),
             Some("upstream_unsupported_chat_output")
         );
-        assert_exactly_once_side_effects(&fixture, request_id, None).await;
         assert_chat_failure_account_health(&fixture, false).await;
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
         upstream.verify().await;

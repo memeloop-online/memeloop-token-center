@@ -7,6 +7,30 @@ image:
   digest: ""
   pullPolicy: IfNotPresent
 
+rustfs:
+  enabled: false
+  connectArchive: false
+  image:
+    repository: rustfs/rustfs
+    tag: "1.0.4"
+    digest: ""
+    pullPolicy: IfNotPresent
+  persistence:
+    existingClaim: ""
+    storageClass: ""
+    size: 10Gi
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "1", memory: 1Gi }
+  terminationGracePeriodSeconds: 60
+  probes:
+    startup: { path: /health, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 60 }
+    readiness: { path: /health/ready, periodSeconds: 5, timeoutSeconds: 2, failureThreshold: 3 }
+    liveness: { path: /health, periodSeconds: 10, timeoutSeconds: 2, failureThreshold: 6 }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -15,7 +39,7 @@ migration:
   enabled: true
   # Must equal the greatest migration registered by the release binary.
   # The packaging contract rejects drift between this value and migrations/.
-  schemaVersion: 132
+  schemaVersion: 146
   # The hook is the only component that applies schema migrations. Application
   # Deployments always set MTC_RUN_MIGRATIONS_ON_START=false.
   backoffLimit: 4
@@ -44,8 +68,10 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
-      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
+      # Request is what the scheduler reserves. The limit is higher so a burst
+      # of in-memory request bodies can allocate without pinning that RAM up front.
+      requests: { cpu: 100m, memory: 512Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: "1", memory: 8Gi, ephemeral-storage: 256Mi }
     autoscaling:
       # Size this together with config.databaseMaxConnections and the database
       # connection budget before enabling.
@@ -103,8 +129,8 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 100m, memory: 256Mi, ephemeral-storage: 64Mi }
-      limits: { cpu: "1", memory: 1Gi, ephemeral-storage: 256Mi }
+      requests: { cpu: 100m, memory: 512Mi, ephemeral-storage: 64Mi }
+      limits: { cpu: "1", memory: 2Gi, ephemeral-storage: 256Mi }
     autoscaling:
       enabled: false
       minReplicas: 1
@@ -114,12 +140,6 @@ roles:
       behavior: {}
     podDisruptionBudget: { enabled: false, minAvailable: 1 }
 
-# Authenticated Responses bodies are first written to bounded node-local disk.
-# The file is request-owned and unlinked on completion, rejection, or cancellation.
-requestSpool:
-  mountPath: /var/lib/memeloop-token-center/request-spool
-  sizeLimit: 160Mi
-
 config:
   terminalProjectionEnabled: false
   # Keep the sum across replicas below the PostgreSQL/PgBouncer connection budget.
@@ -127,12 +147,12 @@ config:
   # Legacy compatibility value; proxy lifecycle admission uses the byte budget.
   proxyLifecycleConcurrency: 64
   # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
-  # this budget + 256Mi; raising body max also requires budget >= max * 12 + 1Mi.
-  proxyMemoryBudgetBytes: 536870912
+  # this budget + 256Mi. The budget is not a multiple of the maximum body.
+  proxyMemoryBudgetBytes: 2147483648
   # Count admission for readers without complete shared byte accounting.
   # Metered default text bodies use bytes; other readers retain 1..8192 permits.
   gatewayBodyReadConcurrency: 1024
-  # `/v1/responses` uses disk-backed spools with bounded RAM and a per-request ceiling.
+  # `/v1/responses` keeps the upload in memory until the upstream response finishes.
   responsesBodyMaxBytes: 33554432
   # Independent multipart ceiling for `/v1/audio/transcriptions`; changing it
   # does not widen `/v1/responses` or other text endpoints.
@@ -180,10 +200,8 @@ config:
   memeloopCloudWebhookSecret:
     name: ""
     key: memeloop-cloud-webhook-secret
-  # The Kubernetes chart supports only externally managed S3-compatible
-  # storage. The runtime filesystem/memory backends are intentionally limited
-  # to local and test harnesses; mounting them into this hardened Pod would
-  # create a single-replica, non-durable archive.
+  # External S3 remains the default. rustfs.connectArchive selects the dedicated
+  # chart-managed S3 service after bucket provisioning and reader validation.
   archiveBackend: s3
   s3:
     # Shared by all roles; configuration changes need a rolling restart, not a build.

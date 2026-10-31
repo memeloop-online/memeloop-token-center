@@ -126,10 +126,19 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
         .execute(&mut *budget_holder)
         .await
         .unwrap();
+    let journal_writer = state.pending_terminals.hold_writer_for_test().await;
+    let key = state
+        .db
+        .authenticate_key(&issued.key, state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let original_body =
+        json!({"model": model, "input": "durable semantic recovery", "stream": false});
+    let request_body = original_body.clone();
     let endpoint = upstream.uri();
     let request_state = state.clone();
     let request = tokio::spawn(async move {
-        let body = json!({"model": model, "input": "durable semantic recovery", "stream": false});
+        let body = request_body;
         let request = Request::post("/v1/responses")
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::AUTHORIZATION, format!("Bearer {}", issued.key))
@@ -166,13 +175,66 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
         serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
         "admitted exactly once"
     );
-    let row =
-        sqlx::query("SELECT request_id, tenant_id, key_id FROM conversation_semantic_payloads")
+    let charges_before_ack: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'")
             .fetch_one(&holder_pool)
             .await
             .unwrap();
+    assert_eq!(charges_before_ack, 0);
+    drop(journal_writer);
+    let row = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(row) = sqlx::query(
+                "SELECT o.request_id, r.request_object FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.tenant_id = $1 AND o.key_id = $2 AND o.principal_id = $3 AND o.projected_at IS NULL",
+            )
+            .bind(key.tenant_id.to_string())
+            .bind(key.key_id.to_string())
+            .bind(key.principal_id.to_string())
+            .fetch_optional(&holder_pool)
+            .await
+            .unwrap()
+            {
+                break row;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("owned source identity must persist after delivery while content locks remain held");
     let request_id: String = row.get("request_id");
     let request_id = Uuid::parse_str(&request_id).unwrap();
+    let locator: String = row.get("request_object");
+    assert_eq!(
+        locator,
+        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
+            .unwrap()
+    );
+    assert_eq!(
+        crate::gateway_body::request_spool::source_request_id(&locator),
+        Some(request_id)
+    );
+    let raw = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(raw) = state.archive.get(&locator).await {
+                break raw;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original request bytes must be readable while semantic content is locked");
+    assert_eq!(
+        raw.as_ref(),
+        serde_json::to_vec(&original_body).unwrap().as_slice()
+    );
+    let payloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&holder_pool)
+    .await
+    .unwrap();
+    assert_eq!(payloads, 0, "new enqueue must not persist raw payloads");
     let charges: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'")
             .fetch_one(&holder_pool)

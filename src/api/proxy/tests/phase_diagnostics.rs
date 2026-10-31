@@ -167,6 +167,7 @@ async fn successful_proxy_response_and_durable_record_keep_the_same_correlation(
         .unwrap()
         .to_owned();
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    responses_transport::wait_for_key_settlement(&fixture.state, fixture.key_id).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM request_records WHERE id = $1 AND completed_at IS NOT NULL",

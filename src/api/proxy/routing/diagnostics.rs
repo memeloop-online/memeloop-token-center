@@ -5,7 +5,6 @@ fn classification(status: Option<StatusCode>, error: Option<&ProxySendError>) ->
     match (status, error) {
         (Some(_), None) => "upstream_http_status",
         (None, Some(ProxySendError::RetryableConnection(_))) => "connect_not_delivered",
-        (None, Some(ProxySendError::OuterDeadline)) => "outer_deadline_delivery_unknown",
         (None, Some(ProxySendError::NonRetryableTransport(kind))) => kind.diagnostic_outcome(),
         (None, Some(ProxySendError::AmbiguousResponse(_))) => "response_delivery_unknown",
         (None, Some(ProxySendError::CandidateUnavailable)) => "local_candidate_unavailable",
@@ -176,10 +175,6 @@ mod tests {
                 "transport_http2_goaway_delivery_unknown",
             ),
             (
-                ProxySendError::OuterDeadline,
-                "outer_deadline_delivery_unknown",
-            ),
-            (
                 ProxySendError::AmbiguousResponse("SECRET_CANARY"),
                 "response_delivery_unknown",
             ),
@@ -193,10 +188,6 @@ mod tests {
                 "upstream_http_status"
             );
         }
-        assert_eq!(
-            super::super::failover_disposition(None, Some(&ProxySendError::OuterDeadline)),
-            super::super::outcome::FailoverDisposition::Stop
-        );
     }
 
     #[test]

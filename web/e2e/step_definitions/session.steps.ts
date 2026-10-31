@@ -235,6 +235,10 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
   await controls.getByLabel('会话状态').selectOption('active');
   await controls.getByRole('button', { name: '应用筛选', exact: true }).click();
   await page.getByRole('checkbox', { name: '自动刷新', exact: true }).check();
+  const cadence = page.getByRole('slider', { name: '刷新节奏', exact: true });
+  await cadence.press('Home');
+  assert.equal(await cadence.inputValue(), '0');
+  assert.equal(await cadence.getAttribute('aria-valuetext'), '实时');
   const observation = observations.get(this)!;
   observation.baselineSessionListRequests = observation.sessionListRequests.length;
   observation.baselineSessionSummaryRequests = observation.sessionSummaryRequests.length;
@@ -260,7 +264,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
     }),
   });
   const sessionReady = observeSessionReadyRequests({
-    credential: seed.serviceCredential,
+    credential: seed.sessionObserverCredential,
     keyId: seed.sessionClientKeyId,
     requestModel: sessionModel,
     sessionName: 'Codex release dogfood',

@@ -3,7 +3,7 @@ use super::*;
 use futures_util::StreamExt;
 
 #[tokio::test]
-async fn responses_done_then_trailing_partial_is_rejected_and_settled_once() {
+async fn responses_done_then_trailing_partial_is_rejected_with_unknown_responsibility() {
     let completed = completed_response_with_usage(29, 7);
     let first_chunk = format!(
         concat!(
@@ -43,30 +43,15 @@ async fn responses_done_then_trailing_partial_is_rejected_and_settled_once() {
     assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert_eq!(delivered.matches("upstream request failed").count(), 1);
     upstream.await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
+    let receipt = cancellation::assert_single_unknown_receipt(
+        &fixture,
+        502,
+        Some("upstream_incomplete_response"),
+    )
+    .await;
     assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_incomplete_response")
-    );
-    assert_eq!(rows[0].output_tokens, 0);
-    assert_eq!(rows[0].cost, "0");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        refs.response_object.as_deref(),
-        Some(format!("gap://{}/response", rows[0].request_id).as_str())
+        receipt["response_object"],
+        format!("gap://{}/response", receipt["request_id"].as_str().unwrap())
     );
 }
 
@@ -179,30 +164,22 @@ async fn fragmented_crlf_comment_frames_fail_without_starting_billable_delivery(
         body.as_ref(),
         [
             b": heartbeat\r\n\r\n: heartbeat\r\n\r\n".as_slice(),
-            b"data: {\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream stream did not complete\"}}\n\n".as_slice(),
+            "data: {\"error\":{\"code\":\"upstream_incomplete_response\",\"message\":\"上游响应流没有完整结束。失败阶段 invalid_terminal。\",\"message_en\":\"upstream stream did not complete. failure stage invalid_terminal.\",\"type\":\"upstream_error\"}}\n\n".as_bytes(),
         ].concat(),
     );
     upstream.await.unwrap();
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(rows[0].cost, "0");
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    let receipt = cancellation::single_unknown_receipt(&fixture).await;
+    assert_eq!(receipt["status_code"], 502);
+    assert_eq!(receipt["queued_billable"], false);
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let delivery_state: String =
+    let delivery_state: Option<String> =
         sqlx::query_scalar("SELECT error_code FROM request_records WHERE id = $1")
-            .bind(rows[0].request_id.to_string())
+            .bind(receipt["request_id"].as_str().unwrap())
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_ne!(delivery_state, "delivery_started");
+    assert_ne!(delivery_state.as_deref(), Some("delivery_started"));
     pool.close().await;
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
 #[tokio::test]
@@ -230,26 +207,19 @@ async fn no_op_chat_preamble_and_terminal_disconnect_do_not_start_contract_billi
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&body).contains("\"role\":\"assistant\""));
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(rows[0].cost, "0");
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (0, 0));
+    let receipt = cancellation::single_unknown_receipt(&fixture).await;
+    assert_eq!(receipt["status_code"], 502);
+    assert_eq!(receipt["queued_billable"], false);
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let delivery_state: String =
+    let delivery_state: Option<String> =
         sqlx::query_scalar("SELECT error_code FROM request_records WHERE id = $1")
-            .bind(rows[0].request_id.to_string())
+            .bind(receipt["request_id"].as_str().unwrap())
             .fetch_one(&pool)
             .await
             .unwrap();
     pool.close().await;
-    assert_ne!(delivery_state, "delivery_started");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+    assert_ne!(delivery_state.as_deref(), Some("delivery_started"));
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -358,28 +328,15 @@ async fn oversized_chat_event_errors_downstream_and_cannot_recover_into_done() {
     assert!(saw_error);
     upstream.await.unwrap();
 
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
+    let receipt = cancellation::assert_single_unknown_receipt(
+        &fixture,
+        502,
+        Some("upstream_response_event_too_large"),
+    )
+    .await;
     assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_response_event_too_large")
-    );
-    assert_eq!(rows[0].cost, "0");
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        refs.response_object.as_deref(),
-        Some(format!("gap://{}/response", rows[0].request_id).as_str())
+        receipt["response_object"],
+        format!("gap://{}/response", receipt["request_id"].as_str().unwrap())
     );
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -496,18 +453,8 @@ async fn total_chat_response_limit_does_not_poison_upstream_health() {
     assert!(saw_error);
     upstream.await.unwrap();
 
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_response_too_large")
-    );
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_response_too_large"))
+        .await;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let probe_lease_until: i64 = sqlx::query_scalar(

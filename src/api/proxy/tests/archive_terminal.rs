@@ -1,5 +1,55 @@
 use super::*;
 
+async fn assert_unknown_archive_terminal(
+    fixture: &ResilientRouteFixture,
+    status_code: i64,
+    error_code: Option<&str>,
+) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            if rows.len() == 1
+                && rows[0].operational_terminal.as_ref().is_some_and(|terminal| {
+                    terminal.financial_state == crate::model::RequestFinancialState::Unknown
+                })
+            {
+                let record = &rows[0];
+                assert_eq!(record.status_code, Some(status_code));
+                assert_eq!(record.error_code.as_deref(), error_code);
+                assert_eq!(record.completed_at, None);
+                assert_eq!(record.billing.cost, None);
+                assert!(record.usage.tokens.is_none());
+                let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+                let financial = sqlx::query(
+                    "SELECT q.completed_at, r.status, r.actual_micros, p.state, p.receipt_id, p.receipt_digest, p.cost_micros, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id JOIN pending_proxy_settlements p ON p.request_id = q.id WHERE q.id = $1",
+                )
+                .bind(record.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(financial.get::<Option<i64>, _>("completed_at"), None);
+                assert_eq!(financial.get::<String, _>("status"), "reserved");
+                assert_eq!(financial.get::<Option<i64>, _>("actual_micros"), None);
+                assert_eq!(financial.get::<String, _>("state"), "pending");
+                assert_eq!(financial.get::<Option<String>, _>("receipt_id"), None);
+                assert_eq!(financial.get::<Option<String>, _>("receipt_digest"), None);
+                assert_eq!(financial.get::<Option<i64>, _>("cost_micros"), None);
+                assert_eq!(financial.get::<i64, _>("ledger_count"), 0);
+                pool.close().await;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operational completion must preserve unknown finance and its uncharged hold");
+}
+
 #[tokio::test]
 async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
     let upstream = MockServer::start().await;
@@ -12,6 +62,7 @@ async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
     let response = send_resilient_chat(&fixture, None, false).await;
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_unknown_archive_terminal(&fixture, 502, Some("upstream_invalid_content_encoding")).await;
     let rows = fixture
         .state
         .db
@@ -60,6 +111,7 @@ async fn request_archive_failure_after_dispatch_does_not_skip_response_or_repeat
     let failed = sqlx::query("UPDATE request_archive_spools SET state = 'gap', last_error_code = 'capture_failed' WHERE EXISTS (SELECT 1 FROM response_archive_spools s WHERE s.request_id = request_archive_spools.request_id AND s.tenant_id = request_archive_spools.tenant_id AND s.reservation_id = request_archive_spools.reservation_id)")
         .execute(&pool).await.unwrap();
     assert_eq!(failed.rows_affected(), 1);
+    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db
@@ -137,15 +189,10 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         .expect(1)
         .mount(&upstream)
         .await;
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({
-            "model": fixture.model, "input": "only safety must be durable before dispatch", "stream": false
-        }),
-    )
-    .await;
+    let request = json!({
+        "model": fixture.model, "input": "only safety must be durable before dispatch", "stream": false
+    });
+    let response = send_codex_route(&fixture, &upstream, "/v1/responses", request.clone()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
@@ -154,7 +201,6 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         serde_json::from_slice::<Value>(&delivered).unwrap()["output"][0]["content"][0]["text"],
         "response survives optional spool rejection"
     );
-    drain_archive_capture(&fixture).await;
     let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
         .fetch_one(&pool)
         .await
@@ -170,16 +216,20 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
+    gateway_persistence::assert_readable_source_without_spool(
+        &fixture,
+        &pool,
+        rows[0].request_id,
+        &request,
+    )
+    .await;
+    // The retained metadata job retries until this injected outage is removed.
+    sqlx::query("DROP TRIGGER reject_request_capture")
+        .execute(&pool)
         .await
         .unwrap();
-    assert_eq!(
-        refs.request_archive_state,
-        crate::model::RequestArchiveState::Gap
-    );
+    drain_completed_response_archive(&fixture).await;
+    wait_for_request_settlement(&fixture, 1).await;
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     upstream.verify().await;
     pool.close().await;
@@ -287,31 +337,34 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
         assert_eq!(response.status(), StatusCode::OK);
         let body =
             tokio::spawn(async move { to_bytes(response.into_body(), 1024 * 1024).await.unwrap() });
-        if let Some((entering, release)) = begin_pause {
+        let begin_release = if let Some((entering, release)) = begin_pause {
             tokio::time::timeout(Duration::from_secs(1), entering)
                 .await
                 .expect("owned writer must reach the deterministic pre-begin pause")
                 .unwrap();
             tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    let row: Option<(String, Option<i64>, Option<String>)> = sqlx::query_as(
-                        "SELECT id, completed_at, response_object FROM request_records",
+                    let row: Option<(String, Option<i64>, String)> = sqlx::query_as(
+                        "SELECT q.id, q.completed_at, o.response_object FROM request_records q JOIN proxy_operational_terminals o ON o.request_id = q.id WHERE o.completed_at IS NOT NULL",
                     )
                     .fetch_optional(&pool)
                     .await
                     .unwrap();
-                    if let Some((request_id, Some(_), Some(response_object))) = row
+                    if let Some((request_id, financial_completed_at, response_object)) = row
                         && response_object == format!("gap://{request_id}/response")
                     {
+                        assert_eq!(financial_completed_at, None);
                         break;
                     }
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("short stream must finalize before the paused writer begins");
-            release.send(()).unwrap();
-        }
+            .expect("short stream must record its operational terminal before the paused writer begins");
+            Some(release)
+        } else {
+            None
+        };
         let fence_owner = if let Some((probe, entered, release)) = fence_probe {
             tokio::time::timeout(Duration::from_secs(5), entered)
                 .await
@@ -325,6 +378,10 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
             .await
             .expect("terminal delivery and EOF must not await a cancelled writer fence")
             .unwrap();
+        assert_eq!(body.as_ref(), payload.as_bytes());
+        if let Some(release) = begin_release {
+            release.send(()).unwrap();
+        }
         let fence_probe = fence_owner.map(|(probe, release)| {
             assert_eq!(
                 probe.calls(),
@@ -334,7 +391,6 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
             release.send(()).unwrap();
             probe
         });
-        assert_eq!(body.as_ref(), payload.as_bytes());
         let (state, gap_reason): (String, Option<String>) =
             tokio::time::timeout(std::time::Duration::from_secs(1), async {
                 loop {
@@ -362,6 +418,7 @@ async fn terminal_delivery_transfers_capture_to_the_owned_writer_or_records_a_ga
         if let Some(probe) = fence_probe {
             assert_eq!(probe.calls(), 1);
         }
+        assert_unknown_archive_terminal(&fixture, 200, None).await;
         upstream.verify().await;
         pool.close().await;
     }

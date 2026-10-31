@@ -226,7 +226,8 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
     let asset = ProviderGenerationAsset {
         asset_id: Uuid::now_v7(),
         index: 0,
-        url: "http://127.0.0.1:8188/view?filename=result.png&token=must-not-persist".to_owned(),
+        url: "http://127.0.0.1:8188/view?filename=result.png&token=provider-reference-fixture"
+            .to_owned(),
         expires_at: Some(unix_millis() + 60_000),
         mime_type: "image/png".to_owned(),
         filename: "result.png".to_owned(),
@@ -264,9 +265,15 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
             .fetch_one(&inspection)
             .await
             .unwrap();
-    assert!(!stored_result.contains(&asset.url));
-    assert!(!stored_result.contains("token="));
-    assert!(stored_result.contains("provider-reference-json:"));
+    // Delivery references intentionally persist as plaintext; public results stay redacted.
+    let stored_result: serde_json::Value = serde_json::from_str(&stored_result).unwrap();
+    let reference = stored_result["provider_reference"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("provider-reference-json:")
+        .unwrap();
+    let reference: serde_json::Value = serde_json::from_str(reference).unwrap();
+    assert_eq!(reference["assets"], json!([asset]));
     let archive_refs = database
         .request_archive_refs(key.key_id, job.job_id)
         .await
@@ -1010,9 +1017,9 @@ async fn atomic_generation_fixture(database_url: &str) -> AtomicGenerationFixtur
                 currency: "USD".to_owned(),
                 policy: KeyPolicy {
                     allowed_models: vec![model.clone()],
-                    requests_per_minute: 60,
-                    tokens_per_minute: 100_000,
-                    max_concurrency: 8,
+                    requests_per_minute: Some(60),
+                    tokens_per_minute: Some(100_000),
+                    max_concurrency: Some(8),
                     ..KeyPolicy::default()
                 },
                 initial_balance: Decimal::TEN,

@@ -314,7 +314,7 @@
         ],
         "operationId": "operatorChatCompletion",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\ncompletions are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\ncompletions are supported; stream=true is rejected.\n",
         "security": [
           {
             "serviceBearer": []
@@ -341,6 +341,9 @@
                   "key_id": {
                     "type": "string",
                     "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
                   },
                   "request": {
                     "type": "object",
@@ -395,7 +398,7 @@
         ],
         "operationId": "operatorMessages",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
         "security": [
           {
             "serviceBearer": []
@@ -422,6 +425,9 @@
                   "key_id": {
                     "type": "string",
                     "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
                   },
                   "request": {
                     "type": "object",
@@ -452,6 +458,90 @@
           },
           "400": {
             "description": "Invalid JSON Messages request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/internal/v1/inference/responses": {
+      "post": {
+        "tags": [
+          "Client credentials"
+        ],
+        "operationId": "operatorResponse",
+        "summary": "Run inference using an explicitly authorized billing credential",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nResponses are supported; stream=true is rejected.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "keys:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key_id",
+                  "request"
+                ],
+                "properties": {
+                  "key_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
+                  },
+                  "request": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                      "stream": {
+                        "type": "boolean",
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI Responses result including image generation output, billed to the selected key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON Responses request",
             "content": {
               "application/json": {
                 "schema": {
@@ -4912,6 +5002,56 @@
       }
     },
     "/internal/v1/upstreams/{account_id}/health": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "readUpstreamProviderHealth",
+        "summary": "Read the latest independent upstream service probe",
+        "description": "Returns the stored result of the periodic or manually requested service\nprobe. Customer requests do not update this result. `null` means no probe\nhas completed yet.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Stored probe, or null when none has completed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/UpstreamHealthResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
       "post": {
         "tags": [
           "Upstream providers"
@@ -5189,6 +5329,67 @@
           },
           "503": {
             "description": "Configuration storage temporarily unavailable."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxy-groups/{group_id}/probe": {
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "probeTransportProxyGroup",
+        "summary": "Queue an independent reachability probe for a proxy group",
+        "description": "Marks the group's current exits for the next independent probe. The probe\nuses its own connection and does not carry a customer request. The stored\nverdict is visible on the group after that probe finishes.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "group_id",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Probe requested for the accounts currently bound in this process.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "requested_accounts"
+                  ],
+                  "properties": {
+                    "requested_accounts": {
+                      "type": "integer",
+                      "minimum": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
@@ -11033,6 +11234,48 @@
         }
       }
     },
+    "/internal/v1/system-settings/http": {
+      "get": {
+        "tags": ["System"],
+        "operationId": "getHttpSettings",
+        "summary": "Read global HTTP settings and locally installed effective values",
+        "description": "Global operators only. Refreshes the local snapshot from persistent system settings. Each purpose reports effective values, units and sources. No credentials or proxy URLs are returned.",
+        "security": [{"serviceBearer": []}],
+        "x-required-scope": "providers:read",
+        "x-global-operator-only": true,
+        "responses": {
+          "200": {
+            "description": "Current installed revision. An unconfigured system has revision zero.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HttpSettingsView"}}}
+          },
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"}
+        }
+      },
+      "put": {
+        "tags": ["System"],
+        "operationId": "putHttpSettings",
+        "summary": "Atomically replace global HTTP settings",
+        "description": "Full-document replacement with revision comparison and a transactional audit receipt. Omitted fields inherit; explicit null disables a duration even when the parent supplies a finite value. Purpose overrides take precedence over global defaults and explicit source defaults. Removing a field clears its override. All duration defaults are unlimited. New outbound requests use the new local revision; in-flight clients retain their previous pools. Other processes refresh off the request path every five seconds and retain their last valid snapshot if storage is unavailable. TLS verification, proxy authorization, DNS pinning, redirect and non-idempotent retry rules cannot be changed here.",
+        "security": [{"serviceBearer": []}],
+        "x-required-scope": "providers:write",
+        "x-global-operator-only": true,
+        "requestBody": {
+          "required": true,
+          "content": {"application/json": {"schema": {"$ref": "#/components/schemas/PutHttpSettings"}}}
+        },
+        "responses": {
+          "200": {
+            "description": "Locally installed settings and effective values after durable commit.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/HttpSettingsView"}}}
+          },
+          "400": {"$ref": "#/components/responses/InvalidRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"},
+          "409": {"$ref": "#/components/responses/Conflict"}
+        }
+      }
+    },
     "/internal/v1/filter-assistant/settings": {
       "get": {
         "tags": [
@@ -11629,6 +11872,60 @@
           },
           "409": {
             "description": "Retained prefix path is incomplete or inconsistent."
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/{session_id}/requests/{request_id}/dialogue": {
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getOperatorSessionDialogue",
+        "summary": "Read the cleaned session dialogue stored for this request",
+        "description": "Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "requests:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ContextKeyId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cleaned dialogue turns for viewing and training export.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDialogue"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
@@ -12246,7 +12543,7 @@
         ],
         "operationId": "getOperatorUsageAnalysis",
         "summary": "Analyze bounded tenant or global usage from hourly or daily rollups",
-        "description": "Reads only compact terminal request and generation rollups; it never scans the raw\nrequest table. `auto` selects hourly buckets through 31 days and daily buckets for\nlonger ranges. Omitted bounds default to the last 24 hours (`auto`/`hour`) or seven\ndays (`day`). The inclusive interval may not exceed 93 days, and explicit hourly\nintervals may not exceed 31 days. Bucket starts and heatmap coordinates are UTC.\nCosts are returned as a currency-keyed array and are never added across currencies.\nDuration P95 values are bounded-histogram approximations capped at 60000 ms.\n",
+        "description": "Reads compact terminal request and generation rollups with exact boundary facts.\nThe full and output_rate projections also read retained terminal records for exact\nprovider-reported, successful, non-compaction output rates.\n`auto` selects hourly buckets through 31 days and daily buckets for\nlonger ranges. Omitted bounds default to the last 24 hours (`auto`/`hour`) or seven\ndays (`day`). The inclusive interval may not exceed 93 days, and explicit hourly\nintervals may not exceed 31 days. Bucket starts and heatmap coordinates are UTC.\nCosts are returned as a currency-keyed array and are never added across currencies.\nDuration P95 values are bounded-histogram approximations capped at 60000 ms.\nExplicit projections retain the same response envelope. Unselected arrays are empty\nand unselected summary metrics are zero placeholders, not usage totals.\noverview returns summary, time_series, and generation breakdowns; trends returns\nsummary and time_series; dimensions returns by_model, by_key, by_upstream,\nby_protocol, by_status, and errors plus summary and time_series.\nsessions returns by_session; heatmap returns heatmap. These projections omit output_rate.\noutput_rate runs only the exact output-rate query and returns summary.output_rate\nand time_series entries containing bucket_start and output_rate; other metrics are\nzero placeholders. Merge rates by bucket_start, treating absent buckets as zero samples.\n",
         "security": [
           {
             "serviceBearer": []
@@ -12254,6 +12551,17 @@
         ],
         "x-required-scope": "requests:read",
         "parameters": [
+          {
+            "name": "projection",
+            "in": "query",
+            "required": false,
+            "description": "Select only the analysis needed by the current view; full preserves the complete legacy response.",
+            "schema": {
+              "type": "string",
+              "enum": ["full", "overview", "trends", "dimensions", "sessions", "heatmap", "output_rate"],
+              "default": "full"
+            }
+          },
           {
             "$ref": "#/components/parameters/TenantFilter"
           },
@@ -12373,7 +12681,7 @@
         ],
         "operationId": "getOperatorUsageAnalysisTrends",
         "summary": "Read the bounded summary and time-series usage projection",
-        "description": "Uses the same tenant scope, filters, inclusive range, bucket selection, and metric\naggregation as the complete usage-analysis resource. The response is restricted to\nsummary and time-series data and executes one business aggregation statement; it does\nnot load dimension, session, generation-breakdown, or heatmap projections.\n",
+        "description": "Uses the same tenant scope, filters, inclusive range, bucket selection, and metric\naggregation as the complete usage-analysis resource. The response is restricted to\nsummary and time-series data. The default full projection preserves exact output rates\nand executes two business statements. Explicit projection=trends executes one rollup\nstatement and omits output_rate. Neither loads dimensions, sessions, generation\nbreakdowns, or the heatmap.\n",
         "security": [
           {
             "serviceBearer": []
@@ -12381,6 +12689,17 @@
         ],
         "x-required-scope": "requests:read",
         "parameters": [
+          {
+            "name": "projection",
+            "in": "query",
+            "required": false,
+            "description": "full includes exact output rates; trends returns only rollup summary and time-series metrics.",
+            "schema": {
+              "type": "string",
+              "enum": ["full", "trends"],
+              "default": "full"
+            }
+          },
           {
             "$ref": "#/components/parameters/TenantFilter"
           },
@@ -13626,6 +13945,50 @@
         }
       }
     },
+    "/self/v1/sessions/{session_id}/requests/{request_id}/dialogue": {
+      "get": {
+        "tags": [
+          "Self service"
+        ],
+        "operationId": "getOwnSessionDialogue",
+        "summary": "Read the cleaned session dialogue stored for this owned request",
+        "description": "Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.",
+        "security": [
+          {
+            "clientBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cleaned dialogue turns for this credential's request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDialogue"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/self/v1/sessions/{session_id}/requests/{request_id}/context/content": {
       "get": {
         "tags": [
@@ -14442,6 +14805,66 @@
             "$ref": "#/components/responses/UpstreamError"
           }
         }
+      }
+    },
+    "/internal/v1/upstream-concurrency": {
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getUpstreamConcurrency",
+        "summary": "Read sampled active leases and observed proxy concurrency",
+        "description": "Requires both providers:read and requests:read. Read-only asynchronous samples across gateways sharing the database. Live request-owner leases, generation job states, and unfinished egress attempts have separate measurement bases. Five-second sampled peaks are lower bounds; history is process-local for 15 minutes. Expired/missing request leases are excluded. Metadata gaps, truncation and stale collection are explicit. Unknown proxy attribution is never inferred from configured proxies or health. Recommendations are null; application is manual only.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "parameters": [
+          {
+            "name": "tenant_external_id",
+            "in": "query",
+            "required": false,
+            "description": "Tenant-scoped credentials remain restricted to their tenant. Global credentials may select a tenant or omit for global observations.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cached operational concurrency samples.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamConcurrencySnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "x-required-scopes": [
+          "providers:read",
+          "requests:read"
+        ]
       }
     }
   },
@@ -15760,6 +16183,48 @@
       }
     },
     "schemas": {
+      "OperatorInferenceConversation": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": false,
+        "required": [
+          "id"
+        ],
+        "description": "Gateway-owned session and turn identifiers; consumed before forwarding the inference request.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+          },
+          "turn_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parent_turn_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "OperatorInferenceConversationIdentifier": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9._:-]+$"
+      },
       "SessionContextItem": {
         "type": "object",
         "required": [
@@ -15982,6 +16447,132 @@
               "null"
             ],
             "maxLength": 4096
+          }
+        }
+      },
+      "SessionDialogue": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "contract_version",
+          "representation",
+          "request_id",
+          "session_id",
+          "turns"
+        ],
+        "properties": {
+          "contract_version": {
+            "type": "string",
+            "enum": [
+              "session_dialogue_v1"
+            ]
+          },
+          "representation": {
+            "type": "string",
+            "enum": [
+              "session_body"
+            ]
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "turns": {
+            "type": "array",
+            "maxItems": 4096,
+            "items": {
+              "$ref": "#/components/schemas/SessionDialogueTurn"
+            }
+          }
+        }
+      },
+      "SessionDialogueTurn": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "role",
+          "origin",
+          "parts"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "request",
+              "return"
+            ]
+          },
+          "parts": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "$ref": "#/components/schemas/SessionDialoguePart"
+            }
+          }
+        }
+      },
+      "SessionDialoguePart": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "part_index",
+          "kind",
+          "text",
+          "media_type",
+          "byte_length",
+          "call_id",
+          "tool_call_id"
+        ],
+        "properties": {
+          "part_index": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "media_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "byte_length": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "call_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_call_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -16261,6 +16852,32 @@
           },
           "bound_account_count": {
             "type": "integer"
+          },
+          "probe_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "probe_attempts": {
+            "type": "integer"
+          },
+          "last_probe_status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "healthy",
+              "unhealthy",
+              null
+            ]
+          },
+          "last_probe_checked_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "created_at": {
             "type": "integer"
@@ -24566,6 +25183,17 @@
           "session_context"
         ],
         "properties": {
+          "operational_terminal": {
+            "description": "Independently persisted execution completion on request list/detail projections. Null or absent means no such observation is available, not proof that execution is still running. Event and historical projections may omit this field. This observation does not settle usage, release a financial hold, or authorize journal deletion.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RequestOperationalTerminal"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "egress": {
             "description": "Historical selected egress for authorized self/operator request lists. Final-response attempts take precedence, otherwise the latest observation is used. Null means not recorded or not projected; never inferred from current proxy configuration.",
             "oneOf": [
@@ -24627,7 +25255,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Terminal accounting timestamp in Unix milliseconds; null while pending or when the historical record lacks a terminal timestamp."
+            "description": "Terminal accounting timestamp in Unix milliseconds. May remain null after execution has failed, been cancelled, or succeeded while financial settlement is pending or unknown. Use operational_terminal.completed_at for independently recorded execution completion; historical records may lack either timestamp."
           },
           "source_completed_at": {
             "type": [
@@ -24667,7 +25295,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Recorded execution outcome. An independently recorded client failure or cancellation remains visible even when a later authoritative usage receipt completes financial settlement."
           },
           "duration_ms": {
             "type": [
@@ -24761,6 +25390,9 @@
               "null"
             ],
             "enum": [
+              "gateway_pre_admission",
+              "upstream_http_status",
+              "client_disconnected",
               "upstream_transport_timeout",
               "upstream_transport_outer_deadline",
               "upstream_transport_connection_reset",
@@ -24777,7 +25409,18 @@
               "upstream_stream_read_error",
               null
             ],
-            "description": "Allowlisted transport cause recorded by the winning terminal transaction. Null when no specific cause was recorded, including historical, imported and generation records. Never inferred from a status code or keepalive."
+            "description": "Allowlisted cause recorded in an operational or financial terminal fact. Null when no specific cause was recorded, including historical, imported and generation records. Never inferred from a status code or keepalive."
+          },
+          "failure_diagnostic": {
+            "description": "Fixed diagnostic for a recorded allowlisted cause. Uses the recorded operational stage when available; null if the cause is unknown. Never contains arbitrary supplier messages or request contents.",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RequestFailureDiagnostic"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "archive_state": {
             "$ref": "#/components/schemas/RequestArchiveState"
@@ -24802,6 +25445,111 @@
               {
                 "type": "null"
               }
+            ]
+          }
+        }
+      },
+      "RequestOperationalTerminal": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "completed_at",
+          "stage",
+          "financial_state"
+        ],
+        "properties": {
+          "completed_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Actual observed execution completion in Unix milliseconds, preserved across durable replay rather than replaced with the recovery time."
+          },
+          "stage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "upstream_response_headers",
+              "upstream_response_body",
+              "response_delivery",
+              "buffered_response_ready",
+              null
+            ],
+            "description": "Observed execution phase at completion; null when no phase was captured. Never reconstructed from a historical status code."
+          },
+          "financial_state": {
+            "$ref": "#/components/schemas/RequestFinancialState"
+          }
+        },
+        "examples": [
+          {
+            "completed_at": 1792195200000,
+            "stage": "response_delivery",
+            "financial_state": "unknown"
+          }
+        ]
+      },
+      "RequestFinancialState": {
+        "type": "string",
+        "enum": [
+          "pending",
+          "unknown",
+          "applied"
+        ],
+        "description": "State of the separate settlement authority. Pending awaits an authoritative financial receipt; unknown records unavailable authoritative usage; applied acknowledges the committed financial receipt. Pending or unknown retains financial responsibility and any existing hold, and does not imply zero usage or zero cost. This is independent of the execution lifecycle and is not a journal-deletion ACK."
+      },
+      "RequestFailureDiagnostic": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "stage",
+          "source",
+          "reason"
+        ],
+        "properties": {
+          "stage": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "pre_admission",
+              "upstream_response_headers",
+              "upstream_response_body",
+              "response_delivery",
+              "buffered_response_ready",
+              null
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "gateway",
+              "upstream_http_response",
+              "downstream_connection",
+              "upstream"
+            ]
+          },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "gateway_pre_admission",
+              "upstream_http_status",
+              "client_disconnected",
+              "upstream_transport_timeout",
+              "upstream_transport_outer_deadline",
+              "upstream_transport_connection_reset",
+              "upstream_transport_http2_reset",
+              "upstream_transport_http2_goaway",
+              "upstream_transport_body",
+              "upstream_transport_decode",
+              "upstream_transport_request",
+              "upstream_transport_other",
+              "upstream_http2_reset",
+              "upstream_http2_goaway",
+              "upstream_read_timeout",
+              "upstream_request_timeout",
+              "upstream_stream_read_error"
             ]
           }
         }
@@ -24844,7 +25592,7 @@
           "failed",
           "cancelled"
         ],
-        "description": "Execution lifecycle, independent from the persisted product error code."
+        "description": "Execution lifecycle, independent from financial settlement and the persisted product error code. Failed, cancelled, or succeeded execution can coexist with pending or unknown financial settlement."
       },
       "RequestArchiveState": {
         "type": "string",
@@ -25400,6 +26148,114 @@
           },
           "ast": {
             "$ref": "#/components/schemas/TypedFilterAst"
+          }
+        }
+      },
+      "HttpDurationOverride": {
+        "type": ["integer", "null"],
+        "minimum": 1,
+        "maximum": 9007199254740991,
+        "description": "Milliseconds. Null disables the duration. Omit the containing field to inherit."
+      },
+      "HttpOverrides": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "connect_timeout_ms": {"$ref": "#/components/schemas/HttpDurationOverride"},
+          "read_timeout_ms": {"$ref": "#/components/schemas/HttpDurationOverride"},
+          "request_timeout_ms": {"$ref": "#/components/schemas/HttpDurationOverride"},
+          "pool_idle_timeout_ms": {"$ref": "#/components/schemas/HttpDurationOverride"},
+          "pool_max_idle_per_host": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Idle connections per host. Zero disables idle retention; it does not limit active requests."
+          }
+        }
+      },
+      "HttpSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "defaults": {"$ref": "#/components/schemas/HttpOverrides"},
+          "purposes": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "general": {"$ref": "#/components/schemas/HttpOverrides"},
+              "codex": {"$ref": "#/components/schemas/HttpOverrides"},
+              "oauth": {"$ref": "#/components/schemas/HttpOverrides"},
+              "plugin": {"$ref": "#/components/schemas/HttpOverrides"},
+              "plugin_release": {"$ref": "#/components/schemas/HttpOverrides"},
+              "probe": {"$ref": "#/components/schemas/HttpOverrides"}
+            }
+          }
+        }
+      },
+      "PutHttpSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["expected_revision", "settings"],
+        "properties": {
+          "expected_revision": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+          "settings": {"$ref": "#/components/schemas/HttpSettings"}
+        }
+      },
+      "HttpSettingSource": {
+        "type": "string",
+        "enum": ["purpose_override", "global_default", "source_default"]
+      },
+      "EffectiveHttpDuration": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["value", "source", "unit"],
+        "properties": {
+          "value": {"$ref": "#/components/schemas/HttpDurationOverride"},
+          "source": {"$ref": "#/components/schemas/HttpSettingSource"},
+          "unit": {"type": "string", "enum": ["milliseconds"]}
+        }
+      },
+      "EffectiveHttpPoolSize": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["value", "source", "unit"],
+        "properties": {
+          "value": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+          "source": {"$ref": "#/components/schemas/HttpSettingSource"},
+          "unit": {"type": "string", "enum": ["connections"]}
+        }
+      },
+      "EffectiveHttpSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["connect_timeout_ms", "read_timeout_ms", "request_timeout_ms", "pool_idle_timeout_ms", "pool_max_idle_per_host"],
+        "properties": {
+          "connect_timeout_ms": {"$ref": "#/components/schemas/EffectiveHttpDuration"},
+          "read_timeout_ms": {"$ref": "#/components/schemas/EffectiveHttpDuration"},
+          "request_timeout_ms": {"$ref": "#/components/schemas/EffectiveHttpDuration"},
+          "pool_idle_timeout_ms": {"$ref": "#/components/schemas/EffectiveHttpDuration"},
+          "pool_max_idle_per_host": {"$ref": "#/components/schemas/EffectiveHttpPoolSize"}
+        }
+      },
+      "HttpSettingsView": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["revision", "settings", "effective"],
+        "properties": {
+          "revision": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+          "settings": {"$ref": "#/components/schemas/HttpSettings"},
+          "effective": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["general", "codex", "oauth", "plugin", "plugin_release", "probe"],
+            "properties": {
+              "general": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
+              "codex": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
+              "oauth": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
+              "plugin": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
+              "plugin_release": {"$ref": "#/components/schemas/EffectiveHttpSettings"},
+              "probe": {"$ref": "#/components/schemas/EffectiveHttpSettings"}
+            }
           }
         }
       },
@@ -28815,6 +29671,247 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 32000
+          }
+        }
+      },
+      "UpstreamConcurrencySnapshot": {
+        "type": "object",
+        "required": [
+          "contract_version",
+          "scope",
+          "generated_at",
+          "observed_at",
+          "last_attempt_at",
+          "last_error_at",
+          "stale",
+          "expired_and_missing_request_leases_excluded",
+          "sample_interval_ms",
+          "retention_ms",
+          "peak_is_sampled_lower_bound",
+          "samples_truncated",
+          "recommendation",
+          "application_mode",
+          "series",
+          "samples",
+          "metadata_gaps"
+        ],
+        "properties": {
+          "contract_version": {
+            "const": "upstream_concurrency_v1"
+          },
+          "scope": {
+            "const": "shared_database_operational_leases_and_generation_states"
+          },
+          "generated_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "observed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_attempt_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_error_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "expired_and_missing_request_leases_excluded": {
+            "const": true
+          },
+          "sample_interval_ms": {
+            "const": 5000
+          },
+          "retention_ms": {
+            "const": 900000
+          },
+          "peak_is_sampled_lower_bound": {
+            "const": true
+          },
+          "samples_truncated": {
+            "type": "boolean"
+          },
+          "recommendation": {
+            "type": "null"
+          },
+          "application_mode": {
+            "const": "manual_only"
+          },
+          "series": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "tenant_external_id",
+                "dimension",
+                "identity",
+                "measurement_basis",
+                "current",
+                "sampled_peak",
+                "points",
+                "sample_ids"
+              ],
+              "properties": {
+                "tenant_external_id": {
+                  "type": "string"
+                },
+                "dimension": {
+                  "enum": [
+                    "upstream_account",
+                    "network_proxy"
+                  ]
+                },
+                "identity": {
+                  "type": "string"
+                },
+                "measurement_basis": {
+                  "type": "string"
+                },
+                "current": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "sampled_peak": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "points": {
+                  "type": "array",
+                  "maxItems": 180,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "observed_at": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "value": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "truncated": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "sample_ids": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "samples": {
+            "type": "array",
+            "maxItems": 4096,
+            "items": {
+              "type": "object",
+              "required": [
+                "tenant_external_id",
+                "sample_id",
+                "source",
+                "upstream_account_id",
+                "state",
+                "lease_expires_at",
+                "lease_state",
+                "selected_egress",
+                "egress_attempt_id",
+                "egress_upstream_account_id",
+                "egress_state"
+              ],
+              "properties": {
+                "tenant_external_id": {
+                  "type": "string"
+                },
+                "sample_id": {
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "request_owner",
+                    "generation_job"
+                  ]
+                },
+                "upstream_account_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "type": "string"
+                },
+                "lease_expires_at": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "lease_state": {
+                  "enum": [
+                    "live",
+                    "expired",
+                    "missing"
+                  ]
+                },
+                "selected_egress": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Sanitized selected egress metadata, without authentication material."
+                },
+                "egress_attempt_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "egress_upstream_account_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "egress_state": {
+                  "enum": [
+                    "unfinished_attempt",
+                    "completed_attempt",
+                    "invalid_metadata",
+                    "missing_metadata"
+                  ]
+                }
+              }
+            }
+          },
+          "metadata_gaps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         }
       }

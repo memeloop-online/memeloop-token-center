@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -10,15 +10,11 @@ use super::*;
 
 mod managed;
 mod persistence;
+mod probe;
 #[cfg(test)]
 mod tests;
 
 const MAX_EPOCH: u64 = (1 << 28) - 1;
-
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_BEFORE_PROXY_ADVANCE: std::cell::RefCell<Option<Box<dyn FnOnce()>>>;
-}
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -36,6 +32,11 @@ struct Entry {
     durable: AtomicU64,
     observed_generation: AtomicU64,
     blocked: AtomicBool,
+    probe_url: std::sync::Mutex<Option<String>>,
+    probe_attempts: AtomicU8,
+    probe_inflight: AtomicBool,
+    probe_requested: AtomicBool,
+    last_probe_millis: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -73,6 +74,7 @@ impl Snapshot {
 }
 
 pub(crate) struct TransportProxyGroups {
+    http_clients: Arc<crate::http_settings::HttpClientFactory>,
     groups: BTreeMap<Uuid, Arc<Entry>>,
     managed: std::sync::RwLock<BTreeMap<Uuid, managed::ManagedEntry>>,
     key: Vec<u8>,
@@ -91,14 +93,12 @@ fn unavailable() -> AppError {
 }
 
 impl TransportProxyGroups {
-    #[cfg(test)]
-    pub(crate) async fn with_test_connect_failure_interleaving<F: std::future::Future>(
-        interleave: impl FnOnce() + 'static,
-        future: F,
-    ) -> F::Output {
-        TEST_BEFORE_PROXY_ADVANCE
-            .scope(std::cell::RefCell::new(Some(Box::new(interleave))), future)
-            .await
+    pub(crate) fn with_http_clients(
+        mut self,
+        factory: Arc<crate::http_settings::HttpClientFactory>,
+    ) -> Self {
+        self.http_clients = factory;
+        self
     }
 
     pub(crate) fn parse(input: &str, key: &[u8]) -> Result<Self, AppError> {
@@ -131,12 +131,18 @@ impl TransportProxyGroups {
                 durable: AtomicU64::new(0),
                 observed_generation: AtomicU64::new(0),
                 blocked: AtomicBool::new(false),
+                probe_url: std::sync::Mutex::new(None),
+                probe_attempts: AtomicU8::new(2),
+                probe_inflight: AtomicBool::new(false),
+                probe_requested: AtomicBool::new(false),
+                last_probe_millis: AtomicU64::new(0),
             });
             if groups.insert(account_id, entry).is_some() {
                 return Err(unavailable());
             }
         }
         Ok(Self {
+            http_clients: Arc::default(),
             groups,
             managed: std::sync::RwLock::new(BTreeMap::new()),
             key: key.to_vec(),
@@ -364,14 +370,6 @@ impl ProxySelection {
             return Ok("not_grouped");
         };
         let snapshot = Snapshot::decode(*state);
-        #[cfg(test)]
-        if let Some(interleave) = TEST_BEFORE_PROXY_ADVANCE
-            .try_with(|hook| hook.borrow_mut().take())
-            .ok()
-            .flatten()
-        {
-            interleave();
-        }
         if entry.blocked.load(Ordering::Acquire)
             || u64::from(snapshot.credential_generation)
                 < entry.observed_generation.load(Ordering::Acquire)
@@ -405,5 +403,71 @@ impl ProxySelection {
                 "contended"
             },
         )
+    }
+
+    /// Ask the background probe to check this exit. The customer request does
+    /// not move the sticky member.
+    pub(crate) fn request_independent_probe(&self) {
+        if let Some((entry, _)) = &self.ticket {
+            entry.probe_requested.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Entry {
+    pub(super) fn configure_probe(&self, url: Option<String>, attempts: i64) {
+        let url = url.and_then(|value| {
+            let trimmed = value.trim().to_owned();
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        if let Ok(mut slot) = self.probe_url.lock() {
+            *slot = url;
+        }
+        let attempts = u8::try_from(attempts).unwrap_or(2).clamp(1, 8);
+        self.probe_attempts.store(attempts, Ordering::Release);
+    }
+
+    /// Move the sticky exit after an independent probe failed. A customer
+    /// request never calls this.
+    pub(super) fn advance_after_probe(&self, state: u64) -> bool {
+        if state == 0 || self.blocked.load(Ordering::Acquire) {
+            return false;
+        }
+        let snapshot = Snapshot::decode(state);
+        if u64::from(snapshot.credential_generation)
+            < self.observed_generation.load(Ordering::Acquire)
+        {
+            return false;
+        }
+        let count = self.group.proxies.len();
+        if count < 2 {
+            return false;
+        }
+        let selected = (snapshot.selected + 1) % count;
+        let Ok(next) = (Snapshot {
+            selected,
+            epoch: snapshot.epoch + 1,
+            ..snapshot
+        })
+        .encode() else {
+            return false;
+        };
+        self.state
+            .compare_exchange(state, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+
+impl TransportProxyGroups {
+    #[cfg(test)]
+    pub(crate) fn advance_sticky_after_probe(&self, account_id: Uuid) -> bool {
+        if let Ok(managed) = self.managed.read()
+            && let Some(entry) = managed.get(&account_id).and_then(|item| item.entry.clone())
+        {
+            return entry.advance_after_probe(entry.state.load(Ordering::Acquire));
+        }
+        self.groups
+            .get(&account_id)
+            .is_some_and(|entry| entry.advance_after_probe(entry.state.load(Ordering::Acquire)))
     }
 }

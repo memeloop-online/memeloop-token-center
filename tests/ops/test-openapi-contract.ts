@@ -225,7 +225,18 @@ test("overview usage trends is an exact minimal projection of the full query con
   const trends = document.paths["/internal/v1/usage-analysis/trends"].get;
   assert.deepEqual(trends.security, full.security);
   assert.equal(trends["x-required-scope"], full["x-required-scope"]);
-  assert.deepEqual(trends.parameters, full.parameters);
+  const sharedParameters = (operation: Obj) => operation.parameters.filter((parameter: Obj) => parameter.name !== "projection");
+  assert.deepEqual(sharedParameters(trends), sharedParameters(full));
+  for (const [operation, values] of [
+    [full, ["full", "overview", "trends", "dimensions", "sessions", "heatmap", "output_rate"]],
+    [trends, ["full", "trends"]],
+  ] as const) {
+    const projections = operation.parameters.filter((parameter: Obj) => parameter.name === "projection");
+    assert.equal(projections.length, 1, "each endpoint declares exactly one projection selector");
+    assert.equal(projections[0].in, "query");
+    assert.equal(projections[0].required, false);
+    assert.deepEqual(projections[0].schema, { type: "string", enum: values, default: "full" });
+  }
   assert.equal(trends.responses["200"].content["application/json"].schema.$ref, "#/components/schemas/UsageAnalysisTrends");
   const schema = document.components.schemas.UsageAnalysisTrends;
   const expected = ["from_created_at", "to_created_at", "granularity", "time_zone", "p95_is_approximate", "p95_method", "summary", "time_series"];
@@ -480,4 +491,53 @@ test("session context contracts expose bounded signed reads and separate title e
 test("runtime discovery JSON matches the canonical OpenAPI contract", () => {
   const embedded = JSON.parse(readFileSync(new URL("../../openapi/openapi.json", import.meta.url), "utf8"));
   assert.deepEqual(embedded, cloneDocument());
+});
+
+test("request execution completion remains distinct from unknown financial settlement", () => {
+  const schemas = cloneDocument().components.schemas;
+  const summary = schemas.RequestSummary;
+  assert.deepEqual(summary.properties.operational_terminal.oneOf, [
+    { $ref: "#/components/schemas/RequestOperationalTerminal" },
+    { type: "null" },
+  ]);
+  // RequestEvent shares RequestSummary but does not publish this observation.
+  // Do not accidentally require an unimplemented operational SSE projection.
+  assert.ok(!summary.required.includes("operational_terminal"));
+  assert.deepEqual(schemas.RequestEvent.allOf[0], { $ref: "#/components/schemas/RequestSummary" });
+  assert.deepEqual(schemas.RequestDetail.allOf[0], { $ref: "#/components/schemas/RequestSummary" });
+  assert.deepEqual(schemas.RequestEvent.allOf[1].properties.event_kind.enum,
+    ["started", "finished", "projected", "archive_bound", "archive_gap"]);
+  const terminal = schemas.RequestOperationalTerminal;
+  assert.equal(terminal.additionalProperties, false);
+  assert.deepEqual(terminal.required, ["completed_at", "stage", "financial_state"]);
+  assert.deepEqual(Object.keys(terminal.properties).sort(), [...terminal.required].sort());
+  assert.equal(terminal.properties.completed_at.type, "integer");
+  assert.equal(terminal.properties.completed_at.format, "int64");
+  assert.deepEqual(terminal.properties.stage.type, ["string", "null"]);
+  assert.deepEqual(terminal.properties.stage.enum,
+    ["upstream_response_headers", "upstream_response_body", "response_delivery", "buffered_response_ready", null]);
+  assert.equal(terminal.properties.financial_state.$ref, "#/components/schemas/RequestFinancialState");
+  assert.deepEqual(schemas.RequestFinancialState.enum, ["pending", "unknown", "applied"]);
+  assert.deepEqual(summary.properties.completed_at.type, ["integer", "null"]);
+  assert.match(summary.properties.completed_at.description, /May remain null after execution/u);
+  assert.match(schemas.RequestFinancialState.description, /does not imply zero usage or zero cost/u);
+  assert.deepEqual(summary.properties.cost.oneOf, [{ $ref: "#/components/schemas/Money" }, { type: "null" }]);
+  assert.deepEqual(schemas.RequestBilling.properties.cost.oneOf,
+    [{ $ref: "#/components/schemas/Money" }, { type: "null" }]);
+  assert.deepEqual(schemas.RequestUsage.properties.tokens.oneOf,
+    [{ $ref: "#/components/schemas/RequestTokenUsage" }, { type: "null" }]);
+  // Execution metadata must not expose the private claim, receipt, or locator.
+  for (const field of ["receipt_id", "fence", "owner_token", "contract_digest", "response_object", "usage", "cost"]) {
+    assert.ok(!(field in terminal.properties));
+  }
+  assert.deepEqual(summary.properties.failure_diagnostic.oneOf,
+    [{ $ref: "#/components/schemas/RequestFailureDiagnostic" }, { type: "null" }]);
+  const diagnostic = schemas.RequestFailureDiagnostic;
+  assert.deepEqual(diagnostic.required, ["stage", "source", "reason"]);
+  assert.equal(diagnostic.additionalProperties, false);
+  assert.ok(diagnostic.properties.reason.enum.includes("client_disconnected"));
+  assert.deepEqual(diagnostic.properties.reason.enum,
+    summary.properties.terminal_cause_code.enum.filter((value: unknown) => value !== null));
+  assert.deepEqual(diagnostic.properties.stage.enum,
+    ["pre_admission", ...terminal.properties.stage.enum]);
 });

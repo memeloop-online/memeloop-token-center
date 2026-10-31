@@ -15,11 +15,10 @@ use crate::{
     },
     db::{Database, FinishProxyRequest, FinishProxyRequestResult, ProxyRequestUpstreamAttribution},
     error::AppError,
-    model::UsageReservation,
 };
 
 mod owner;
-pub(crate) use owner::wait_for_owner_loss;
+pub(crate) mod pending_terminal;
 
 #[derive(Default)]
 pub(crate) struct ProxyLifecycleCounter {
@@ -62,10 +61,6 @@ impl ProxyLifecycleActivity {
         self.owner = Some(owner::RequestOwnerLease::acquire(database, identity, lost).await?);
         Ok(())
     }
-
-    pub(crate) fn owner_loss(&self) -> Option<tokio::sync::watch::Receiver<bool>> {
-        self.owner.as_ref().map(owner::RequestOwnerLease::loss)
-    }
 }
 
 impl Drop for ProxyLifecycleActivity {
@@ -95,10 +90,12 @@ pub(crate) async fn begin_proxy_archive_attempt(
 ) -> Result<ProxyArchiveAttempt, AppError> {
     if !matches!(
         purpose,
-        ArchiveStagingPurpose::Request | ArchiveStagingPurpose::Response
+        ArchiveStagingPurpose::Request
+            | ArchiveStagingPurpose::Response
+            | ArchiveStagingPurpose::Media
     ) {
         return Err(AppError::BadRequest(
-            "proxy archive purpose must be request or response".into(),
+            "proxy archive purpose must be request, response, or media".into(),
         ));
     }
     let attempt_id = Uuid::now_v7();
@@ -142,7 +139,12 @@ async fn begin_proxy_archive_attempt_with_retry(
     for delay in RETRY_DELAYS {
         match database.begin_archive_staging_attempt(input.clone()).await {
             Ok(result) => return Ok(result),
-            Err(AppError::Internal) => tokio::time::sleep(delay).await,
+            Err(AppError::Internal {
+                code: "proxy_lifecycle_begin_proxy_archive_attempt_with_retry_1",
+                ..
+            }) => {
+                tokio::time::sleep(delay).await;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -156,22 +158,6 @@ pub(crate) async fn heartbeat_proxy_archive_attempt(
     database
         .heartbeat_archive_staging_write(&mut attempt.lease)
         .await
-}
-
-pub(crate) async fn abandon_proxy_archive_attempt(
-    database: &Database,
-    attempt: &ProxyArchiveAttempt,
-) {
-    if database
-        .abandon_archive_staging_attempt(&attempt.lease)
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            error_code = "archive_staging_abandon_failed",
-            "proxy archive staging attempt could not be scheduled for cleanup"
-        );
-    }
 }
 
 pub(crate) async fn finish_proxy_request_with_retry(
@@ -190,7 +176,12 @@ pub(crate) async fn finish_proxy_request_with_retry(
             .await
         {
             Ok(result) => return Ok(result),
-            Err(AppError::Internal) => tokio::time::sleep(delay).await,
+            Err(AppError::Internal {
+                code: "proxy_lifecycle_finish_proxy_request_with_retry_1",
+                ..
+            }) => {
+                tokio::time::sleep(delay).await;
+            }
             Err(error) => return Err(error),
         }
     }
@@ -206,6 +197,7 @@ pub(crate) async fn finish_proxy_request_with_retry(
 /// A conclusive terminal loss may relinquish the fenced attempt. An internal
 /// error can mean that commit succeeded but its ACK was lost, so unknown
 /// outcomes leave the attempt untouched for exact replay or stale promotion.
+#[cfg(test)]
 pub(crate) fn response_archive_requires_cleanup(
     result: &Result<FinishProxyRequestResult, AppError>,
     stored_response: &str,
@@ -216,67 +208,7 @@ pub(crate) fn response_archive_requires_cleanup(
             response_object,
             ..
         }) if response_object != stored_response
-    ) || matches!(result, Err(error) if !matches!(error, AppError::Internal))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn prepare_proxy_delivery_with_retry(
-    database: &Database,
-    request_id: Uuid,
-    tenant_id: Uuid,
-    reservation: &UsageReservation,
-    input_token_ceiling: i64,
-    output_token_ceiling: i64,
-    requested_service_tier: Option<&str>,
-) -> Result<(), AppError> {
-    for delay in RETRY_DELAYS {
-        match database
-            .prepare_proxy_delivery(
-                request_id,
-                tenant_id,
-                reservation,
-                input_token_ceiling,
-                output_token_ceiling,
-                requested_service_tier,
-            )
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(AppError::Internal) => tokio::time::sleep(delay).await,
-            Err(error) => return Err(error),
-        }
-    }
-    database
-        .prepare_proxy_delivery(
-            request_id,
-            tenant_id,
-            reservation,
-            input_token_ceiling,
-            output_token_ceiling,
-            requested_service_tier,
-        )
-        .await
-}
-
-pub(crate) async fn confirm_proxy_delivery_with_retry(
-    database: &Database,
-    request_id: Uuid,
-    tenant_id: Uuid,
-    reservation: &UsageReservation,
-) -> Result<(), AppError> {
-    for delay in RETRY_DELAYS {
-        match database
-            .mark_proxy_delivery_started(request_id, tenant_id, reservation)
-            .await
-        {
-            Ok(()) => return Ok(()),
-            Err(AppError::Internal) => tokio::time::sleep(delay).await,
-            Err(error) => return Err(error),
-        }
-    }
-    database
-        .mark_proxy_delivery_started(request_id, tenant_id, reservation)
-        .await
+    ) || matches!(result, Err(error) if !matches!(error, AppError::Internal { .. }))
 }
 
 #[cfg(test)]

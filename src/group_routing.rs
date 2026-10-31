@@ -2,14 +2,14 @@
 pub(crate) mod durable;
 mod quota;
 #[cfg(test)]
-pub(crate) mod test_observe_gate;
+use crate::plugin::routing::{GroupRoutingObserveInput, GroupRoutingOutcome};
 use crate::{
     AppState,
     error::AppError,
     plugin::routing::{
         GROUP_ROUTING_V2_VERSION, GroupRoutingCandidate, GroupRoutingDirective, GroupRoutingHealth,
-        GroupRoutingInput, GroupRoutingObserveInput, GroupRoutingOutcome,
-        GroupRoutingTransientPolicy, GroupRoutingTransientSignal, transient_health_window_ms,
+        GroupRoutingInput, GroupRoutingTransientPolicy, GroupRoutingTransientSignal,
+        transient_health_window_ms,
     },
     provider::AuthorizedUpstreamCandidate,
 };
@@ -94,7 +94,8 @@ fn transient_health_scope(
     config: &serde_json::Value,
 ) -> Result<TransientHealthScope, AppError> {
     let window_ms = transient_health_window_ms(config)?;
-    let config = serde_json::to_vec(config).map_err(|_| AppError::Internal)?;
+    let config = serde_json::to_vec(config)
+        .map_err(|_| AppError::internal("group_routing_transient_health_scope_1"))?;
     let mut hasher = blake3::Hasher::new();
     hash_scope_field(&mut hasher, b"group-routing-v2-transient-health-scope-v1");
     hash_scope_field(&mut hasher, tenant_id.as_bytes());
@@ -632,7 +633,7 @@ async fn prepare_inner(
             ),
         )
         .await
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("group_routing_site_1"))
         .and_then(|result| result);
         match result {
             Ok(mut plan) => {
@@ -648,8 +649,10 @@ async fn prepare_inner(
                         .expect("validated exact candidate permutation")
                         .clone();
                     let key = (
-                        Uuid::parse_str(&directive.route_id).map_err(|_| AppError::Internal)?,
-                        Uuid::parse_str(&directive.account_id).map_err(|_| AppError::Internal)?,
+                        Uuid::parse_str(&directive.route_id)
+                            .map_err(|_| AppError::internal("group_routing_site_2"))?,
+                        Uuid::parse_str(&directive.account_id)
+                            .map_err(|_| AppError::internal("group_routing_site_3"))?,
                         directive.generation as i64,
                     );
                     ranks.insert(key, bucket_rank + position);
@@ -708,6 +711,7 @@ async fn prepare_inner(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) async fn observe_with_signal(
     state: &AppState,
     request_id: Uuid,
@@ -717,8 +721,6 @@ pub(crate) async fn observe_with_signal(
     outcome: GroupRoutingOutcome,
     transient_signal: Option<GroupRoutingTransientSignal>,
 ) -> Option<crate::plugin::routing::GroupRoutingExecutionDirective> {
-    #[cfg(test)]
-    test_observe_gate::wait(request_id).await;
     let snapshot = state.group_routing.as_ref()?;
     let policy = snapshot.policy(route, account, generation)?;
     let mut candidate = policy.candidate.clone();
