@@ -104,7 +104,7 @@ pub(crate) async fn store_group_members(
             }
             let old: String = previous.try_get::<String, _>("proxy_url")?;
             if old != member.proxy_url || previous.try_get::<String, _>("name")? != member.label {
-                sqlx::query("UPDATE network_proxies SET name = $1, proxy_url = $2, version = version + 1, updated_at = $3, last_probe_status = NULL, last_probe_checked_at = NULL WHERE id = $4")
+                sqlx::query("UPDATE network_proxies SET name = $1, proxy_url = $2, version = version + 1, updated_at = $3, last_probe_status = NULL, last_probe_checked_at = NULL, last_probe_latency_ms = NULL, probe_successes = 0 WHERE id = $4")
                     .bind(&member.label).bind(member.proxy_url.clone())
                     .bind(unix_millis()).bind(member.id.to_string()).execute(&mut **tx).await?;
                 database

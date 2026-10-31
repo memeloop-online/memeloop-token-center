@@ -175,14 +175,14 @@ impl PluginRuntime {
                 runtime: self.runtime.as_ref().ok_or_else(invalid)?.clone(),
                 kv: None,
                 limits: StoreLimitsBuilder::new()
-                    .memory_size(PLUGIN_MEMORY_BYTES)
+                    .memory_size(16 * 1024 * 1024)
                     .table_elements(PLUGIN_TABLE_ELEMENTS)
                     .instances(8)
                     .tables(2)
                     .memories(2)
                     .build(),
                 deadline,
-                http_body_limit: PLUGIN_HTTP_BODY_BYTES,
+                http_body_limit: None,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
@@ -208,5 +208,139 @@ impl PluginRuntime {
         let plan: ProxyStrategyPlan = serde_json::from_str(&output).map_err(|_| invalid())?;
         validate_plan(input, &plan)?;
         Ok(plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
+    use wit_parser::Resolve;
+
+    fn component(output: &str, endless: bool) -> Vec<u8> {
+        let escaped: String = output.bytes().map(|byte| format!("\\{byte:02x}")).collect();
+        let body = if endless {
+            "(loop br 0) unreachable".to_owned()
+        } else {
+            format!(
+                "i32.const 32 i32.const 0 i32.store i32.const 36 i32.const 1024 i32.store i32.const 40 i32.const {} i32.store i32.const 32",
+                output.len()
+            )
+        };
+        let mut module = wat::parse_str(format!(
+            r#"(module
+            (memory (export "memory") 2)
+            (global $heap (mut i32) (i32.const 8192))
+            (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32)
+                (local $result i32)
+                global.get $heap local.set $result
+                global.get $heap local.get 3 i32.add global.set $heap
+                local.get $result)
+            (data (i32.const 1024) "{escaped}")
+            (func (export "memeloop:token-center/network-proxy-strategy-v1@0.2.0#plan")
+                (param i32 i32) (result i32) {body}))"#
+        ))
+        .unwrap();
+        let mut resolve = Resolve::default();
+        let (package, _) = resolve.push_path("wit/token-center.wit").unwrap();
+        let world = resolve
+            .select_world(&[package], Some("network-proxy-strategy-plugin"))
+            .unwrap();
+        embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8).unwrap();
+        ComponentEncoder::default()
+            .module(&module)
+            .unwrap()
+            .validate(true)
+            .encode()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_guest_enforces_candidate_version_schema_and_execution_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = directory.path().join("plugins/exit-picker");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("plugin.json"), serde_json::to_vec(&serde_json::json!({
+            "id":"exit-picker", "version":"1.0.0", "wit_version":"0.2.0", "wasm":"plugin.wasm", "capabilities":[],
+            "contributions":{"network_proxy_strategy":{"version":VERSION,
+                "schema":{"type":"object","additionalProperties":false}, "default":{}}}
+        })).unwrap()).unwrap();
+        let database = crate::db::Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("db.sqlite").display()
+        ))
+        .await
+        .unwrap();
+        let candidate = ProxyCandidate {
+            proxy_id: Uuid::now_v7(),
+            proxy_version: 7,
+            active_health: "unknown".into(),
+            checked_at: None,
+            latency_ms: None,
+            consecutive_successes: 0,
+            sample_count: 0,
+            transport_success_rate: None,
+        };
+        let input = ProxyStrategyInput {
+            tenant_id: "tenant".into(),
+            policy_revision: 3,
+            current_proxy_id: None,
+            observed_at: 100,
+            config: serde_json::json!({}),
+            candidates: vec![candidate.clone()],
+        };
+        let plan = |id, version| {
+            serde_json::json!({"candidates":[{"proxy_id":id,"proxy_version":version}],"reason":"configured"}).to_string()
+        };
+        let load = |output: &str, endless| {
+            fs::write(package.join("plugin.wasm"), component(output, endless)).unwrap();
+            PluginRuntime::load(directory.path().join("plugins").to_str(), database.clone())
+                .unwrap()
+        };
+        let runtime = load(&plan(candidate.proxy_id, 7), false);
+        assert_eq!(
+            runtime
+                .execute_network_proxy_strategy("exit-picker", "1.0.0", &input)
+                .unwrap()
+                .candidates[0]
+                .proxy_id,
+            candidate.proxy_id
+        );
+        assert!(
+            runtime
+                .validate_network_proxy_configuration(
+                    "exit-picker",
+                    "1.0.0",
+                    &serde_json::json!({"unknown":true})
+                )
+                .is_err()
+        );
+        assert!(
+            runtime
+                .execute_network_proxy_strategy("exit-picker", "2.0.0", &input)
+                .is_err()
+        );
+        for output in [
+            plan(candidate.proxy_id, 6),
+            plan(Uuid::now_v7(), 7),
+            "{\"candidates\":[],\"reason\":\"empty\"}".into(),
+        ] {
+            assert!(
+                load(&output, false)
+                    .execute_network_proxy_strategy("exit-picker", "1.0.0", &input)
+                    .is_err()
+            );
+        }
+        assert!(
+            load("", true)
+                .execute_network_proxy_strategy("exit-picker", "1.0.0", &input)
+                .is_err()
+        );
+        // A package upgrade cannot change a captured runtime's component or version.
+        assert!(
+            runtime
+                .execute_network_proxy_strategy("exit-picker", "1.0.0", &input)
+                .is_ok()
+        );
     }
 }

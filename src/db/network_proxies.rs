@@ -136,7 +136,7 @@ impl Database {
         let mut result = proxy_view(&row, external, key)?;
         let groups: Vec<String> = sqlx::query_scalar("SELECT group_id FROM network_proxy_group_members WHERE proxy_id = $1 ORDER BY group_id")
             .bind(id.to_string()).fetch_all(&self.pool).await?;
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT b.account_id) FROM transport_proxy_bindings b JOIN network_proxy_group_members m ON m.group_id = b.group_id WHERE m.proxy_id = $1")
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_bindings b WHERE EXISTS (SELECT 1 FROM network_proxy_group_members m WHERE m.group_id = b.group_id AND m.proxy_id = $1) OR EXISTS (SELECT 1 FROM network_proxy_selection_policies p WHERE p.account_id = b.account_id AND p.mode = 'manual' AND p.proxy_id = $1)")
             .bind(id.to_string()).fetch_one(&self.pool).await?;
         result["group_ids"] = serde_json::json!(groups);
         result["bound_account_count"] = serde_json::json!(count);
@@ -231,7 +231,7 @@ impl Database {
         let version = version
             .checked_add(1)
             .ok_or_else(|| AppError::internal("network_proxy_version"))?;
-        sqlx::query("UPDATE network_proxies SET name = $1, version = $2, proxy_url = $3, probe_enabled = $4, probe_target = $5, probe_interval_ms = $6, probe_attempts = $7, updated_at = $8, last_probe_status = NULL, last_probe_checked_at = NULL, last_probe_latency_ms = NULL WHERE id = $9")
+        sqlx::query("UPDATE network_proxies SET name = $1, version = $2, proxy_url = $3, probe_enabled = $4, probe_target = $5, probe_interval_ms = $6, probe_attempts = $7, updated_at = $8, last_probe_status = NULL, last_probe_checked_at = NULL, last_probe_latency_ms = NULL, probe_successes = 0 WHERE id = $9")
             .bind(&body.name).bind(version).bind(proxy_url).bind(i64::from(probe.enabled)).bind(probe.target_url)
             .bind(probe.interval_ms).bind(probe.attempts).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
         self.refresh_network_proxy_references(&mut tx, id, &old_proxy, &old_name, None, key)

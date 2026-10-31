@@ -183,6 +183,8 @@ impl TransportProxyGroups {
             self.strategy_status.write().map_err(|_| unavailable())?.insert(account, serde_json::json!({
                 "selected_proxy_id": members[selected].id, "selected_proxy_version": members[selected].version,
                 "selection_epoch": Snapshot::decode(next).epoch, "policy_revision": version,
+                "configuration_revision": stamp.selection_version, "credential_generation": generation,
+                "binding_version": stamp.binding_version,
                 "plugin_revision": plugin_revision, "reason": reason, "stale": stale, "observed_at": now,
                 "selected_at": if changed || last_change == 0 { now } else { last_change }, "scope": "process" }));
         }
@@ -193,7 +195,12 @@ impl TransportProxyGroups {
         if let Ok(status) = self.strategy_status.read() {
             body["applied"] = status
                 .get(&account)
-                .filter(|status| status["policy_revision"] == body["selection_version"])
+                .filter(|status| {
+                    status["policy_revision"] == body["selection_version"]
+                        && status["configuration_revision"] == body["configuration_revision"]
+                        && status["credential_generation"] == body["credential_generation"]
+                        && status["binding_version"] == body["binding_version"]
+                })
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({"pending": true, "scope": "process"}));
         }

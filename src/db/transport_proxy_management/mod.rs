@@ -122,7 +122,7 @@ impl Database {
         tenant_id: &str,
         mut inputs: Vec<MemberInput>,
         previous: &[Member],
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<Vec<Member>, AppError> {
         let mut known = previous.to_vec();
         for input in &mut inputs {
@@ -226,11 +226,22 @@ impl Database {
         let manual = sqlx::query("SELECT p.account_id, p.tenant_id, b.version FROM network_proxy_selection_policies p JOIN transport_proxy_bindings b ON b.account_id = p.account_id WHERE p.proxy_id = $1 AND p.mode = 'manual' ORDER BY p.account_id")
             .bind(proxy_id.to_string()).fetch_all(&mut **tx).await?;
         if !manual.is_empty() {
-            let proxy = sqlx::query("SELECT proxy_url FROM network_proxies WHERE id = $1")
-                .bind(proxy_id.to_string())
-                .fetch_one(&mut **tx)
-                .await?;
-            let url: String = proxy.try_get::<String, _>("proxy_url")?;
+            let proxy =
+                sqlx::query("SELECT name, version, proxy_url FROM network_proxies WHERE id = $1")
+                    .bind(proxy_id.to_string())
+                    .fetch_one(&mut **tx)
+                    .await?;
+            let url: String = proxy.try_get("proxy_url")?;
+            let next = vec![Member {
+                id: proxy_id,
+                label: proxy.try_get("name")?,
+                version: proxy.try_get("version")?,
+                proxy_url: url.clone(),
+            }];
+            let previous = vec![Member {
+                proxy_url: old_proxy.to_owned(),
+                ..next[0].clone()
+            }];
             for account in manual {
                 let stamp = BindingStamp {
                     selection_version: revision(tx).await?,
@@ -238,9 +249,10 @@ impl Database {
                     group_id: None,
                     group_version: None,
                 };
+                let account_id = parse_uuid(account.try_get("account_id")?)?;
                 self.write_transport_account(
                     tx,
-                    parse_uuid(account.try_get("account_id")?)?,
+                    account_id,
                     &account.try_get::<String, _>("tenant_id")?,
                     &stamp,
                     &url,
@@ -248,6 +260,8 @@ impl Database {
                     key,
                 )
                 .await?;
+                selection::rebase_selection(tx, account_id, &previous, &next, proxy_id, None, key)
+                    .await?;
             }
         }
         Ok(())

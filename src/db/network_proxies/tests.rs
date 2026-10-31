@@ -54,6 +54,18 @@ async fn contract(database: &Database) {
     let group = database.create_transport_group(serde_json::from_value(serde_json::json!({"tenant_external_id":external,"name":"Reusable","proxy_ids":[id]})).unwrap(), None, KEY).await.unwrap();
     let group_id = parse_uuid(group["id"].as_str().unwrap().to_owned()).unwrap();
     assert_eq!(group["members"][0]["id"], proxy["id"]);
+    let shared_group = database
+        .create_transport_group(
+            serde_json::from_value(serde_json::json!({
+                "tenant_external_id":external,"name":"Shared reference","proxy_ids":[id]
+            }))
+            .unwrap(),
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    let shared_group_id = parse_uuid(shared_group["id"].as_str().unwrap().to_owned()).unwrap();
     let ciphertext: String =
         sqlx::query_scalar("SELECT members_ciphertext FROM transport_proxy_groups WHERE id = $1")
             .bind(group_id.to_string())
@@ -149,6 +161,13 @@ async fn contract(database: &Database) {
     assert_eq!(updated["version"], 2);
     assert_eq!(
         database
+            .get_transport_group(shared_group_id, &external, KEY)
+            .await
+            .unwrap()["version"],
+        2
+    );
+    assert_eq!(
+        database
             .get_transport_group(group_id, &external, KEY)
             .await
             .unwrap()["version"],
@@ -219,6 +238,19 @@ async fn contract(database: &Database) {
     assert_eq!(selected.member_count(), 1);
     assert!(selected.select_unattempted(&[0]).unwrap());
     assert_eq!(selected.credential.proxy().unwrap().0, BACKUP);
+    let mut applied = database
+        .get_network_proxy_selection(account.id, &external)
+        .await
+        .unwrap();
+    runtime.describe_network_proxy_selection(account.id, &mut applied);
+    assert_eq!(applied["applied"]["selected_proxy_id"], id.to_string());
+    assert_eq!(
+        database
+            .get_network_proxy(id, &external, KEY)
+            .await
+            .unwrap()["bound_account_count"],
+        1
+    );
     let observations = database
         .network_proxy_observations(id, &external, 1, 2, KEY)
         .await
@@ -260,6 +292,70 @@ async fn contract(database: &Database) {
         .await
         .unwrap();
     assert_eq!(credential.proxy().unwrap().0, BACKUP);
+    // Policy version alone is unchanged by entity edits: old applied status must be pending.
+    let mut pending = database
+        .get_network_proxy_selection(account.id, &external)
+        .await
+        .unwrap();
+    runtime.describe_network_proxy_selection(account.id, &mut pending);
+    assert_eq!(pending["applied"]["pending"], true);
+    // Restore from DB with a new runtime, not the in-memory selector used before the edit.
+    let restarted = TransportProxyGroups::parse("[]", KEY).unwrap();
+    restarted
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    restarted
+        .evaluate_strategies(&database.pool, &crate::plugin::PluginRuntime::default())
+        .await
+        .unwrap();
+    let (restored, credential) = database
+        .upstream_account_with_credential(account.id, KEY)
+        .await
+        .unwrap();
+    let restored_selection = restarted
+        .select_config(
+            account.id,
+            restored.credential_generation,
+            &credential,
+            &restored.config,
+        )
+        .unwrap();
+    assert_eq!(restored_selection.credential.proxy().unwrap().0, BACKUP);
+    assert_eq!(
+        restored_selection.egress_snapshot().unwrap().proxy_version,
+        Some(3)
+    );
+    let stale_policy = serde_json::json!({"tenant_external_id":external,
+        "expected_selection_version":1,"expected_binding_version":pending["binding_version"],
+        "expected_credential_generation":manual.credential_generation,"expected_updated_at":manual.updated_at,
+        "mode":"manual","proxy_id":id});
+    assert!(matches!(
+        database
+            .update_network_proxy_selection(
+                account.id,
+                serde_json::from_value(stale_policy).unwrap(),
+                None,
+                KEY
+            )
+            .await,
+        Err(AppError::ProxyGroupConflict(_))
+    ));
+    let rejected = serde_json::json!({"tenant_external_id":"other-tenant",
+        "expected_selection_version":1,"expected_binding_version":pending["binding_version"],
+        "expected_credential_generation":restored.credential_generation,"expected_updated_at":restored.updated_at,
+        "mode":"manual","proxy_id":id});
+    assert!(matches!(
+        database
+            .update_network_proxy_selection(
+                account.id,
+                serde_json::from_value(rejected).unwrap(),
+                None,
+                KEY
+            )
+            .await,
+        Err(AppError::NotFound)
+    ));
     legacy_contract(database, &external).await;
 }
 

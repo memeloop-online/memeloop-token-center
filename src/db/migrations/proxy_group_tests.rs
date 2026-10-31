@@ -84,6 +84,11 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&125));
     assert!(versions.contains(&126));
     for statement in [
+        "DROP TABLE network_proxy_attempt_signals",
+        "DROP TABLE network_proxy_selection_policies",
+        "DROP TABLE network_proxy_group_members",
+        "DROP TABLE network_proxies",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN members_normalized",
         "DROP TABLE session_generated_titles",
         "DROP TABLE session_response_summaries",
         "DROP VIEW model_route_eligible_upstream_accounts",
