@@ -62,7 +62,8 @@ impl Database {
         let scopes_json: String = credential.try_get("scopes_json")?;
         let scopes = match scopes {
             Some(scopes) => scopes.to_vec(),
-            None => serde_json::from_str(&scopes_json).map_err(|_| AppError::Internal)?,
+            None => serde_json::from_str(&scopes_json)
+                .map_err(|_| AppError::internal("service_token_scopes_decode"))?,
         };
         super::service_tokens::validate_service_scopes(&scopes)?;
         let tenant_external_id = match tenant_external_id {
@@ -77,7 +78,7 @@ impl Database {
             .execute(&mut *tx)
             .await?;
         let changed = sqlx::query("UPDATE service_credentials SET scopes_json = $1, tenant_external_id = $2 WHERE service_principal_id = $3 AND generation = $4 AND revoked_at IS NULL")
-            .bind(serde_json::to_string(&scopes).map_err(|_| AppError::Internal)?)
+            .bind(serde_json::to_string(&scopes).map_err(|_| AppError::internal("service_token_scopes_encode"))?)
             .bind(&tenant_external_id)
             .bind(service_id.to_string())
             .bind(current.try_get::<i64, _>("credential_generation")?)
