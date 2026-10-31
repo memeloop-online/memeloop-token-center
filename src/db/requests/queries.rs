@@ -279,9 +279,9 @@ impl Database {
             view.egress = observations.remove(&view.request_id);
             if view.status_code.is_some_and(|status| status >= 400)
                 && let Some(archive) = &self.archive
-                && let Ok(locator) = self
+                && let Some(locator) = self
                     .request_record_locator(&view.request_id.to_string())
-                    .await
+                    .await?
                 && let Some(summary) = archive
                     .supplier_summary(parse_uuid(locator.tenant_id)?, view.request_id)
                     .await?
