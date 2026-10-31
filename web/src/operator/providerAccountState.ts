@@ -28,6 +28,7 @@ export function providerAccountStatus(account: AccountStatusInput, now: number) 
   const credentialLabel = revoked ? 'providers.authorizationRevoked' : expired ? account.auth_kind === 'oauth' ? 'providers.accessTokenExpired' : 'providers.credentialExpired' : known ? 'providers.credentialExpires' : 'providers.credentialExpiryUnknown';
   return {
     expired,
+    uncertain: account.status === 'active' && !revoked && diagnostic?.refresh_state === 'outcome_unknown',
     needsReauthorization: expired || revoked || diagnostic?.automatic_refresh_paused === true,
     credentialLabel,
     renewalLabel,

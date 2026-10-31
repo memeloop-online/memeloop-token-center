@@ -5,7 +5,7 @@ import { useI18n } from '../i18n';
 import { useConfirmDialog } from '../useConfirmDialog';
 import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import { useQuotaClock } from './useQuotaClock';
-import { Button, Field, Select } from '../design-system';
+import { Button, Disclosure, Field, Select } from '../design-system';
 
 export interface QuotaResetOperation {
   id: string;
@@ -175,6 +175,17 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
   const dispatchState = operation && ['submitted', 'accepted', 'unknown'].includes(operation.state);
   const unlocked = released || operation?.state === 'unknown' && operation.settled_at != null;
   const recoverable = !unlocked && operation?.state === 'unknown' && canRecover && operation.manual_unlock_available === true && Number.isFinite(operation.updated_at);
+  const operationDetails = operation && <>
+    <p>{t(dispatchState ? operation.state === 'accepted' ? 'quota.resetAccepted' : 'quota.resetUncertain' : 'quota.resetPrepared')}</p>
+    <code>{operation.id}</code>
+    {operation.state === 'prepared' && <p data-reset-operation-expiry={operation.expires_at}>{t('quota.resetPreparedExpiresAt', { time: new Date(operation.expires_at).toLocaleString(locale) })} · {operation.expires_at <= now
+      ? t('quota.resetPreparedExpired')
+      : t('quota.resetPreparedExpiresIn', { time: formatCountdown(operation.expires_at - now, locale) })}</p>}
+    <p>{t(unlocked ? 'quota.recoverReleased' : 'quota.resetLocked')}</p>
+    {operation.quota_refresh_status && <p>{t(operation.quota_refresh_status === 'succeeded' ? 'quota.resetReadbackSucceeded' : operation.quota_refresh_status === 'pending' ? 'quota.resetReadbackPending' : 'quota.resetReadbackNotAttempted')}</p>}
+    {operation.dispatch_diagnostic && <p>{t(['timeout', 'connect_timeout', 'connect_failed'].includes(operation.dispatch_diagnostic.reason) ? 'quota.resetNetworkUnknown' : 'quota.resetDispatchUnknown')}</p>}
+    {operation.last_reconciled_at !== null && <p>{t('quota.resetReconciled', { time: new Date(operation.last_reconciled_at).toLocaleString(locale), available: operation.reconciled_available_credits ?? '—', applicable: operation.reconciled_applicable_credits ?? '—' })}</p>}
+  </>;
   return <div className="upstream-quota-reset-action">
     {confirmationDialog}
     {!operation && <button type="button" className="danger" disabled={busy || !capability.prepare_available || error === 'status-unavailable'} onClick={() => void prepare()}>{t('quota.resetAction')}</button>}
@@ -185,29 +196,27 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     {!operation && error === 'status-unavailable' && <Button disabled={busy} onClick={() => void reloadCurrent()}>{t('quota.resetCheckStatus')}</Button>}
     {recoveryError && <p role="alert">{t(recoveryError === 'stale' ? 'quota.recoverStale' : recoveryError === 'forbidden' ? 'quota.recoverForbidden' : 'quota.recoverUnavailable')}</p>}
     {operation && <div role="status">
-      <p>{t(dispatchState ? operation.state === 'accepted' ? 'quota.resetAccepted' : 'quota.resetUncertain' : 'quota.resetPrepared')}</p>
-      <code>{operation.id}</code>
-      {operation.state === 'prepared' && <p data-reset-operation-expiry={operation.expires_at}>{t('quota.resetPreparedExpiresAt', { time: new Date(operation.expires_at).toLocaleString(locale) })} · {operation.expires_at <= now
-        ? t('quota.resetPreparedExpired')
-        : t('quota.resetPreparedExpiresIn', { time: formatCountdown(operation.expires_at - now, locale) })}</p>}
-      <p>{t(unlocked ? 'quota.recoverReleased' : 'quota.resetLocked')}</p>
-      {operation.quota_refresh_status && <p>{t(operation.quota_refresh_status === 'succeeded' ? 'quota.resetReadbackSucceeded' : operation.quota_refresh_status === 'pending' ? 'quota.resetReadbackPending' : 'quota.resetReadbackNotAttempted')}</p>}
-      {operation.dispatch_diagnostic && <p>{t(['timeout', 'connect_timeout', 'connect_failed'].includes(operation.dispatch_diagnostic.reason) ? 'quota.resetNetworkUnknown' : 'quota.resetDispatchUnknown')}</p>}
+      {operation.state === 'unknown' ? <>
+        <p>{t(unlocked ? 'quota.recoverReady' : recoverable ? 'quota.recoverHelp' : 'quota.resetUncertain')}</p>
+        <Disclosure title={t('quota.resetOperationDetails')}>{operationDetails}</Disclosure>
+      </> : operationDetails}
       <div className="button-row">
         {(!recoverable && !unlocked || recoveryError || error) && <button type="button" className="secondary" disabled={busy} onClick={() => void inspect(false)}>{t('quota.resetCheckStatus')}</button>}
         {operation.state === 'prepared' && secret.current && <button type="button" className="danger" disabled={busy} onClick={() => void retryConfirmation()}>{t('quota.resetRetryConfirmation')}</button>}
         {dispatchState && !recoverable && !unlocked && <button type="button" className="secondary" disabled={busy} onClick={() => void inspect(true)}>{t('quota.resetReconcile')}</button>}
       </div>
-      {recoverable && <div>
-        <p>{t('quota.recoverHelp')}</p>
-        <Field label={t('quota.recoverReason')}><Select value={unlockReason} disabled={busy} onChange={event => setUnlockReason(event.target.value as typeof unlockReason)}>
+      {recoverable && <div style={{ display: 'grid', gap: 12, justifyItems: 'start', maxWidth: '100%' }}>
+        <Field label={t('quota.recoverReason')} style={{ width: '100%', maxWidth: 320, minWidth: 0 }}><Select
+          style={{ display: 'inline-flex', position: 'relative', width: '100%', minWidth: 0 }}
+          select={{ style: { width: '100%', minWidth: 0 } }}
+          icon={{ style: { display: 'flex', position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', margin: 0 } }}
+          value={unlockReason} disabled={busy} onChange={event => setUnlockReason(event.target.value as typeof unlockReason)}>
           <option value="operator_authorized_retry">{t('quota.recoverOperatorReason')}</option>
           <option value="supplier_confirmed_not_applied">{t('quota.recoverSupplierReason')}</option>
         </Select></Field>
         <Button appearance="primary" disabled={busy || recoveryError === 'stale' || recoveryError === 'forbidden'} onClick={() => void recover()}>{t('quota.recoverAction')}</Button>
       </div>}
       {unlocked && <Button appearance="primary" disabled={busy} onClick={() => { setOperation(undefined); setReleased(false); setRecoveryError(undefined); }}>{t('quota.recoverContinue')}</Button>}
-      {operation.last_reconciled_at !== null && <p>{t('quota.resetReconciled', { time: new Date(operation.last_reconciled_at).toLocaleString(locale), available: operation.reconciled_available_credits ?? '—', applicable: operation.reconciled_applicable_credits ?? '—' })}</p>}
     </div>}
   </div>;
 }

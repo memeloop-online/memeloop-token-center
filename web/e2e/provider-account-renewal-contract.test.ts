@@ -11,6 +11,8 @@ test('0142 network and 7021 local persistence retain distinct uncertainty withou
     assert.equal(status.accountLabel, 'providers.accessTokenExpired');
     assert.equal(status.renewalLabel, label);
     assert.equal(status.paused, true);
+    assert.equal(status.uncertain, true);
+    assert.equal(status.needsReauthorization, true);
     assert.equal(status.tone, 'bad');
   }
 });
