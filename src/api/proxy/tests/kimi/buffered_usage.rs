@@ -70,7 +70,7 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         .publish_raw_capture(key.tenant_id, request_id, "request", &raw_request)
         .await
         .unwrap();
-    let request = BufferedRequest {
+    let mut request = BufferedRequest {
         session_preference: None,
         state: &fixture.state,
         reservation,
@@ -109,12 +109,13 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         .send()
         .await
         .unwrap();
+    let captured = request.capture_original_response(raw.into());
     // Exercise the production buffered finalizer and its real reservation,
     // accounting, and archive path without relaxing Kimi's fixed network origin.
     let response = finish_non_sse_proxy_response(NonSseProxyResponseInput {
         buffered_request: &request,
         selected_driver: crate::oauth::managed::kimi::PROVIDER_DRIVER,
-        upstream: raw.into(),
+        upstream: captured,
         status: StatusCode::OK,
         content_type: Some(HeaderValue::from_static("application/json")),
         protocol: Protocol::OpenAiChat,

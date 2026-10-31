@@ -78,43 +78,6 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 .send()
                 .await
                 .unwrap();
-            let mut parts = UpstreamResponse::from(raw).into_parts();
-            if *slow_body {
-                parts.stream = Box::pin(parts.stream.then(|chunk| async move {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    chunk
-                }));
-            }
-            let (retained, rejection) = read_safe_proxy_rejection(
-                UpstreamResponse::Prefetched {
-                    status: parts.status,
-                    headers: parts.headers,
-                    version: parts.version,
-                    content_length: parts.content_length,
-                    stream: parts.stream,
-                },
-                protocol,
-                false,
-                crate::oauth::managed::kimi::PROVIDER_DRIVER,
-            )
-            .await;
-            assert!(retained.is_none());
-            let rejection = rejection.expect("native Kimi non-success uses the safe reader");
-            let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
-            assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
-            assert_eq!(
-                rejection.terminal_cause,
-                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
-            );
-            if let Some(reason) = expected_reason {
-                assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
-                assert_eq!(
-                    delivered["error"]["mtc_safe_reason"].as_str(),
-                    Some(*reason)
-                );
-            } else {
-                assert_eq!(rejection.body, upstream_error::fallback_body());
-            }
             let key = fixture
                 .state
                 .db
@@ -154,7 +117,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 })
                 .await
                 .unwrap();
-            let request = BufferedRequest {
+            let mut request = BufferedRequest {
                 session_preference: None,
                 state: &fixture.state,
                 reservation,
@@ -170,6 +133,43 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 original_response_capture: false,
                 memory: fixture.state.proxy_memory_budget.reservation(),
             };
+            let mut parts = UpstreamResponse::from(raw).into_parts();
+            if *slow_body {
+                parts.stream = Box::pin(parts.stream.then(|chunk| async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    chunk
+                }));
+            }
+            let (retained, rejection) = read_safe_proxy_rejection(
+                request.capture_original_response(UpstreamResponse::Prefetched {
+                    status: parts.status,
+                    headers: parts.headers,
+                    version: parts.version,
+                    content_length: parts.content_length,
+                    stream: parts.stream,
+                }),
+                protocol,
+                false,
+                crate::oauth::managed::kimi::PROVIDER_DRIVER,
+            )
+            .await;
+            assert!(retained.is_none());
+            let rejection = rejection.expect("native Kimi non-success uses the safe reader");
+            let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
+            assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
+            assert_eq!(
+                rejection.terminal_cause,
+                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
+            );
+            if let Some(reason) = expected_reason {
+                assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
+                assert_eq!(
+                    delivered["error"]["mtc_safe_reason"].as_str(),
+                    Some(*reason)
+                );
+            } else {
+                assert_eq!(rejection.body, upstream_error::fallback_body());
+            }
             let response = finish_buffered_request_with_upstream_attribution_and_response_object(
                 &request,
                 StatusCode::FORBIDDEN,
@@ -193,7 +193,7 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                 .unwrap();
             assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), delivered);
             wait_for_request_settlement(&fixture, 1).await;
-            fixture.state.persistence.drain_for_test().await;
+            drain_completed_response_archive(&fixture).await;
             let records = fixture
                 .state
                 .db
@@ -225,10 +225,12 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
                     .await
                     .unwrap()
                     .as_ref(),
-                bytes.as_ref()
+                body.as_bytes()
             );
             let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
-            assert_eq!(detail.response_body, delivered);
+            if let Ok(original) = serde_json::from_str::<Value>(body) {
+                assert_eq!(detail.response_body, original);
+            }
             assert!(
                 !serde_json::to_string(&record.supplier_error)
                     .unwrap()
