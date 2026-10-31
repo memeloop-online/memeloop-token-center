@@ -126,7 +126,7 @@ async fn corrupt_frames_lengths_digests_and_trailing_data_fail_closed() {
             .unwrap();
         assert!(
             store
-                .get_bounded(&stored.object_locator, compressed::MAX_PLAIN as usize)
+                .get_bounded(&stored.object_locator, stored.size_bytes as usize)
                 .await
                 .is_err()
         );
@@ -459,4 +459,50 @@ async fn legacy_raw_versioned_text_and_tenant_cas_remain_readable_together() {
     assert_eq!(store.get("objects/legacy/raw").await.unwrap(), legacy);
     assert_eq!(store.get(&old.object_locator).await.unwrap(), versioned);
     assert_eq!(store.get(&cas.object_locator).await.unwrap(), cas_body);
+}
+
+#[tokio::test]
+async fn compressed_text_stream_crosses_former_total_limit_without_collecting_body() {
+    use futures_util::StreamExt;
+    let store = memory_store();
+    let block = Bytes::from_static(&[b'x'; compressed::BLOCK]);
+    let count = 80 * 1024 * 1024 / compressed::BLOCK;
+    let mut writer = store
+        .start_compressed_writer("staging/test/long-stream")
+        .await
+        .unwrap();
+    let mut expected = blake3::Hasher::new();
+    for _ in 0..count {
+        writer.write(block.clone()).await.unwrap();
+        expected.update(&block);
+    }
+    let object = writer.finish_staged().await.unwrap();
+    assert_eq!(object.size_bytes, 80 * 1024 * 1024);
+    assert_eq!(
+        object.blake3_digest,
+        expected.finalize().to_hex().to_string()
+    );
+    let mut stream = store
+        .open_stream(&object.object_locator, None)
+        .await
+        .unwrap()
+        .stream;
+    let mut bytes = 0_u64;
+    let mut restored = blake3::Hasher::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.unwrap();
+        assert!(chunk.len() <= compressed::BLOCK);
+        bytes += chunk.len() as u64;
+        restored.update(&chunk);
+    }
+    assert_eq!(bytes, object.size_bytes);
+    assert_eq!(restored.finalize(), expected.finalize());
+    let range = store
+        .open_stream(&object.object_locator, Some(bytes - 7..bytes))
+        .await
+        .unwrap();
+    assert_eq!(
+        range.stream.try_collect::<Vec<_>>().await.unwrap().concat(),
+        b"xxxxxxx"
+    );
 }

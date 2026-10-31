@@ -89,9 +89,6 @@ impl ArchiveWriter {
         if self.inner.is_none() {
             return Err(AppError::storage("archive_writer_is_already_closed"));
         }
-        if self.compressed && next_size > super::compressed::MAX_PLAIN {
-            return Err(AppError::storage("local_storage_failed"));
-        }
         self.hasher.update(&bytes);
         self.size_bytes = next_size;
         if self.compressed {

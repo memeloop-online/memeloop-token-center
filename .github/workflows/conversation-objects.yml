@@ -62,6 +62,7 @@ jobs:
           done
           exit 1
       - run: cargo test --locked --lib archive::conversation
+      - run: cargo test --locked --lib archive::compressed_tests
       - run: cargo test --locked --lib archive::text
       - run: cargo test --locked --lib archive::supplier_summary
       - run: cargo test --locked --lib archive::raw_capture
