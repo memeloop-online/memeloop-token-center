@@ -196,6 +196,11 @@ impl AppState {
             .await
             .map_err(|error| InitializationError::Database(error.into()))?
             .with_terminal_projection_enabled(config.terminal_projection_enabled);
+        db.refresh_http_settings()
+            .await
+            .map_err(InitializationError::Database)?;
+        db.start_http_settings_refresh();
+        let http_clients = db.http_clients.clone();
         // Runs on every process start rather than behind the migration switch:
         // a row that still holds a sealed envelope must be rewritten before the
         // first request reads it, and the recorded schema version keeps every
@@ -206,11 +211,6 @@ impl AppState {
         if let Err(error) = db.convert_sealed_state(config.key_pepper.as_bytes()).await {
             tracing::error!(%error, "converting sealed gateway state failed; serving existing rows");
         }
-        db.refresh_http_settings()
-            .await
-            .map_err(InitializationError::Database)?;
-        db.start_http_settings_refresh();
-        let http_clients = db.http_clients.clone();
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;

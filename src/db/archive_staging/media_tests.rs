@@ -195,7 +195,7 @@ impl Fixture {
     }
 
     async fn retry_cleanup(&self) {
-        sqlx::query("UPDATE archive_staging_attempts SET next_cleanup_at = 0 WHERE owner_id IN (SELECT request_id FROM conversation_projection_outbox WHERE tenant_id = $1) AND purpose = 'media' AND state = 'cleanup_pending'")
+        sqlx::query("UPDATE archive_staging_attempts SET next_cleanup_at = created_at WHERE owner_id IN (SELECT request_id FROM conversation_projection_outbox WHERE tenant_id = $1) AND purpose = 'media' AND state = 'cleanup_pending'")
             .bind(self.key.tenant_id.to_string()).execute(&self.state.db.pool).await.unwrap();
         ArchiveReaper::new(
             self.state.db.clone(),
@@ -242,7 +242,7 @@ async fn shared_media_contract(database_url: &str) {
         locators.push(
             crate::archive_staging::conversation_media_locator(
                 attempt.key,
-                &blake3::hash(&[1, 2, 3, 4]).to_hex().to_string(),
+                blake3::hash(&[1, 2, 3, 4]).to_hex().as_ref(),
             )
             .unwrap(),
         );

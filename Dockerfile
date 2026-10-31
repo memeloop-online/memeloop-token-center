@@ -67,6 +67,7 @@ COPY --from=cosign-builder /build/cosign/LICENSE /release-input/third-party-lice
 COPY --from=web-builder /build/web/dist /release-input/web
 COPY LICENSE THIRD_PARTY_NOTICES.md /release-input/
 COPY vendor/rust_decimal/LICENSE /release-input/third-party-licenses/rust_decimal-LICENSE
+COPY vendor/wreq-util/LICENSE /release-input/third-party-licenses/wreq-util-LICENSE
 
 FROM ${RUNTIME_IMAGE} AS release-input-smoke
 # SQLite copies every bound archive ciphertext through libc. Keep those

@@ -247,7 +247,9 @@ pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,
     UpstreamAccountAvailabilityWindow,
 };
-pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
+pub use usage_analysis::{
+    UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter,
+};
 
 #[derive(Clone)]
 pub struct Database {
@@ -575,7 +577,9 @@ impl Database {
     }
 
     pub(crate) async fn close(&self) {
-        self.gateway_persistence.pool.close().await;
+        if self.pool_role != "independent_persistence" {
+            self.gateway_persistence.pool.close().await;
+        }
         self.pool.close().await;
     }
 
@@ -746,6 +750,12 @@ impl Database {
             terminal_projection_enabled: self.terminal_projection_enabled,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn refresh_closed_persistence_pool(&mut self) {
+        if self.pool_role == "independent_persistence" && self.pool.is_closed() {
+            *self = self.independent_persistence_pool();
         }
     }
 

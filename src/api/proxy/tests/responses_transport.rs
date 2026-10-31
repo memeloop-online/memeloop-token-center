@@ -54,7 +54,7 @@ pub(super) async fn wait_for_financial_events(state: &AppState, key_id: Uuid, ex
                 .db
                 .claim_terminal_projection_tasks(owner, 10)
                 .await
-                .unwrap()
+                .expect("claim terminal projections")
             {
                 assert!(
                     state

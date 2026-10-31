@@ -13,7 +13,7 @@ export function formJourneyCopy(locale: string) {
     access: '凭据授权', noGrant: '这次没有新增凭据授权。路由只对已经授权的凭据开放。',
     codexProxy: '此地址用于标识服务协议端点。可为账号配置独立的 socks5h 网络代理；留空时使用服务端默认出口。',
     draftNoRoutes: '尚未授权模型访问；可创建后再配置路由。',
-    credentialFlowHint: '填写使用者，选择可访问的模型，再按需设置预算。',
+    credentialFlowHint: '填写使用者并选择可访问的模型。',
     concurrentDraftPreserved: '配置已被其他人修改。你的草稿已保留；请关闭并重新打开编辑，查看最新配置后重试。',
     routeAccess: '3. 模型访问授权', protocolHelp: '协议兼容性说明',
   } : {
@@ -29,7 +29,7 @@ export function formJourneyCopy(locale: string) {
     access: 'Credential access', noGrant: 'This save adds no credential grant. The route stays open only to credentials that already have access.',
     codexProxy: 'This is the service protocol endpoint. Add a dedicated socks5h account proxy when needed, or use the server default egress.',
     draftNoRoutes: 'No model access selected. You can configure routes after creation.',
-    credentialFlowHint: 'Name the user, choose model access, then set a budget if needed.',
+    credentialFlowHint: 'Name the user and choose the models they can access.',
     concurrentDraftPreserved: 'Someone changed this configuration. Your draft is preserved; close and reopen the editor to review the latest version before retrying.',
     routeAccess: '3. Model access', protocolHelp: 'Protocol compatibility details',
   };

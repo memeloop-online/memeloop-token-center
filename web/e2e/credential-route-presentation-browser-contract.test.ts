@@ -51,6 +51,73 @@ test('route models lead compact chips, scope remains visible, details do not cha
   } finally { await browser.close(); await server.close(); }
 });
 
+test('catalog loading and failure stay honest, retry restores readable names, deleted routes remain removable', { timeout: 60000 }, async context => {
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ?? chromium.executablePath();
+  if (!existsSync(executablePath)) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    return context.skip('Chromium required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer!.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ executablePath, headless: true });
+  try {
+    const loading = await browser.newPage();
+    await loading.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/credential-route-presentation.html?catalog=loading`);
+    await loading.getByRole('status').filter({ hasText: '正在读取模型路由目录…' }).first().waitFor();
+    await loading.getByRole('button', { name: /单独授权模型/ }).click();
+    const loadingInput = loading.getByRole('combobox', { name: '具体路由', exact: true });
+    await loadingInput.fill('gpt-6-astra');
+    assert.equal(await loading.getByText('没有匹配项', { exact: true }).count(), 0, 'a pending directory never claims the search found nothing');
+    assert.equal(await loading.locator('.credential-route-preview').getByRole('listitem').count(), 1, 'unreadable grants collapse into one honest pending row');
+    assert.equal(await loading.locator('.credential-route-preview').getByText(/未知路由/).count(), 0, 'pending grants are not mislabeled as deleted');
+    assert.match(await loading.locator('.credential-route-preview').innerText(), /直接授权/);
+    await loading.close();
+
+    const page = await browser.newPage({ viewport: { width: 1123, height: 900 } });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/credential-route-presentation.html?catalog=error`);
+    await page.getByRole('alert').filter({ hasText: '模型路由目录读取失败' }).first().waitFor();
+    const initial = await page.getByTestId('grant-ids').textContent();
+    await page.getByRole('button', { name: /单独授权模型/ }).click();
+    const routes = page.getByRole('combobox', { name: '具体路由', exact: true });
+    await routes.fill('gpt-6-astra');
+    assert.equal(await page.getByText('没有匹配项', { exact: true }).count(), 0, 'a failed directory never claims the search found nothing');
+    await page.locator('.combobox-state.error').getByRole('button', { name: '重试', exact: true }).click();
+    await page.waitForFunction(() => document.querySelector('[data-testid="retry-count"]')?.textContent === '1');
+    await routes.fill('');
+    // The granted Voice model is already selected, so the picker excludes it;
+    // the readable directory offers the remaining available route instead.
+    const option = page.getByRole('option').filter({ hasText: 'Additional model' });
+    await option.waitFor();
+    assert.equal(await option.getAttribute('aria-disabled'), null, 'a healthy route stays selectable after retry');
+    assert.match(await option.innerText(), /secondary-account@example\.test/, 'readable options pair the model name with its account');
+    await page.keyboard.press('Escape');
+    const voiceChip = page.locator('.selection-chip-hierarchy').filter({ hasText: 'Voice model' });
+    await voiceChip.waitFor();
+    assert.match(await voiceChip.innerText(), /primary-account-with-long-name@example\.test/, 'the granted Voice model keeps its readable name and primary account');
+    const missingChip = page.locator('.selection-chip-hierarchy').filter({ hasText: '未知路由 …9f8e7d' });
+    await missingChip.waitFor();
+    await missingChip.hover();
+    await page.getByRole('tooltip').filter({ hasText: '路由 ID: deleted-route-9f8e7d' }).waitFor();
+    await page.keyboard.press('Escape');
+    assert.match(await page.locator('.credential-route-preview').innerText(), /已不在目录中/, 'a confirmed-readable directory reports the deleted route honestly');
+    await page.getByRole('button', { name: '移除 未知路由 …9f8e7d', exact: true }).click();
+    assert.equal(await page.getByTestId('grant-ids').textContent(), JSON.stringify(['single-route-id']), 'a deleted route stays explicitly removable');
+    await page.getByRole('button', { name: '移除 Voice model', exact: true }).click();
+    await page.getByTestId('grant-ids').filter({ hasText: '[]' }).waitFor();
+
+    // 320px: the focused editor keeps one outer frame and never overflows.
+    await page.setViewportSize({ width: 320, height: 800 });
+    await routes.focus();
+    assert.equal(await routes.evaluate(input => getComputedStyle(input).outlineStyle), 'none', 'the inner input does not draw a second focus frame');
+    assert.notEqual(await routes.evaluate(input => getComputedStyle(input.closest('.multi-combobox-control')!).boxShadow), 'none', 'the outer control keeps one visible focus frame');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, '320px focus stays inside the viewport');
+    assert.equal(await page.getByTestId('grant-ids').textContent(), '[]', 'layout and catalog state never change grant IDs');
+    assert.equal(initial, JSON.stringify(['single-route-id', 'deleted-route-9f8e7d']));
+    await page.close();
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('compact preview preserves exact scope and same-name source identities', { timeout: 60000 }, async () => {
   const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
   await server.listen();

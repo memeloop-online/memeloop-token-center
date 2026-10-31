@@ -22,6 +22,13 @@ async fn postgres_archive_backlog_uses_ready_indexes_and_recovers_unsettled_uplo
             .await
             .unwrap()
     );
+    // The uploading branch needs a populated backlog: with no uploading rows,
+    // PostgreSQL can cheaply prove emptiness through the legacy claim index.
+    // Future leases keep these plan-only rows out of the recovery claim below.
+    sqlx::query("INSERT INTO response_archive_spools (request_id, tenant_id, reservation_id, state, lease_expires_at, next_attempt_at, created_at, updated_at, expires_at) SELECT md5('uploading-' || sequence::text), $1, $2, 'uploading', 9223372036854775807 - sequence, sequence, 0, 0, 9223372036854775807 FROM generate_series(1, 10000) sequence")
+        .bind(fixture.id.tenant_id.to_string())
+        .bind(fixture.id.reservation_id.to_string())
+        .execute(&fixture.db.pool).await.unwrap();
     sqlx::query("ANALYZE response_archive_spools")
         .execute(&fixture.db.pool)
         .await

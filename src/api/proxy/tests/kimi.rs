@@ -482,7 +482,8 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
         "translated"
     );
-    assert_eq!(budget.snapshot().0, 192 * 1024 * 1024);
+    assert_eq!(budget.snapshot().0, 64 * 1024);
+    assert!(memory.response_json_fits(&body));
     drop(memory);
     assert_eq!(budget.snapshot().0, 0);
     upstream.verify().await;

@@ -276,6 +276,7 @@ impl Database {
         let mut database = self.clone();
         database.pool = self.gateway_persistence.pool.clone();
         database.pool_role = "gateway_archive";
+        #[cfg(not(test))]
         let timeout = Duration::from_secs(2);
         #[cfg(test)]
         let timeout = self.gateway_persistence.source_timeout;

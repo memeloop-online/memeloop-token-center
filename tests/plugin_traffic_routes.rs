@@ -99,6 +99,63 @@ fn policy_wat(body: &str) -> String {
     format!("{prefix};; BEGIN POST-AUTH BODY\n{body}\n;; END POST-AUTH BODY{suffix}")
 }
 
+// Exercise the exact core fixture before the gateway hides Wasmtime errors
+// behind plugin_execution_failed. This does not replace the real component
+// invocation or its >256 MiB success assertion below.
+fn assert_policy_rewrite_core(source: &str, pointer: usize, length: usize, json: &str) {
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, wat::parse_str(source).unwrap()).unwrap();
+    let memory_type = module
+        .exports()
+        .find_map(|export| match export.ty() {
+            wasmtime::ExternType::Memory(memory) if export.name() == "cm32p2_memory" => {
+                Some(memory)
+            }
+            _ => None,
+        })
+        .expect("the policy core must export its canonical ABI memory");
+    let pages = (pointer + length).div_ceil(65536) as u64;
+    assert!(
+        memory_type.maximum().is_none_or(|maximum| maximum >= pages),
+        "fixture needs {pages} pages, but its core memory maximum is {:?}",
+        memory_type.maximum(),
+    );
+    let mut linker = wasmtime::Linker::new(&engine);
+    linker.define_unknown_imports_as_traps(&module).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let hook = instance
+        .get_func(
+            &mut store,
+            "cm32p2|memeloop:token-center/traffic-policy@0.2|post-auth",
+        )
+        .unwrap();
+    let mut result = [wasmtime::Val::I32(0)];
+    // The generated rewrite ignores context arguments and makes no host calls.
+    let arguments: [wasmtime::Val; 14] = std::array::from_fn(|_| wasmtime::Val::I32(0));
+    hook.call(&mut store, &arguments, &mut result)
+        .unwrap_or_else(|error| {
+            panic!(
+                "policy core rewrite failed (required pages {pages}, maximum {:?}): {error:#}",
+                memory_type.maximum(),
+            )
+        });
+    assert_eq!(result[0].i32(), Some(256));
+    let memory = instance.get_memory(&mut store, "cm32p2_memory").unwrap();
+    let data = memory.data(&store);
+    assert_eq!(
+        u32::from_le_bytes(data[304..308].try_into().unwrap()) as usize,
+        pointer
+    );
+    assert_eq!(
+        u32::from_le_bytes(data[308..312].try_into().unwrap()) as usize,
+        length
+    );
+    let rewrite = &data[pointer..pointer + length];
+    assert_eq!(&rewrite[..json.len()], json.as_bytes());
+    assert!(rewrite[json.len()..].iter().all(|byte| *byte == b' '));
+}
+
 #[tokio::test]
 async fn small_text_input_can_expand_past_sixteen_mib_in_a_real_traffic_hook() {
     let upstream = MockServer::start().await;
@@ -182,7 +239,8 @@ async fn traffic_rewrite_over_256_mib_reaches_upstream_with_service_memory_capac
     let length: usize = 256 * 1024 * 1024 + 1;
     let pointer: usize = 64 * 1024;
     let pages = (pointer + length).div_ceil(65536);
-    let contents = stores_for_string(pointer, &serde_json::to_string(&rewritten).unwrap());
+    let rewritten_json = serde_json::to_string(&rewritten).unwrap();
+    let contents = stores_for_string(pointer, &rewritten_json);
     let body = format!(
         r#"
         i32.const {pages} memory.size i32.sub memory.grow
@@ -200,12 +258,21 @@ async fn traffic_rewrite_over_256_mib_reaches_upstream_with_service_memory_capac
         i32.const 256
         "#,
     );
+    assert_policy_rewrite_core(&policy_wat(&body), pointer, length, &rewritten_json);
     write_policy_package(fixture._directory.path(), &body, json!([]));
     let mut config = (*fixture.state.config).clone();
     config.proxy_memory_budget_bytes = 2 * 1024 * 1024 * 1024;
     fixture.state = AppState::initialize(config).await.unwrap();
-    let (status, response) = call_hint_routing_fixture(&fixture).await;
-    assert_eq!(status, StatusCode::OK, "{response}");
+    let capture = LogCapture::default();
+    let (status, response) = call_hint_routing_fixture(&fixture)
+        .with_subscriber(capture.dispatch())
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{response}; {}",
+        String::from_utf8_lossy(&capture.0.lock().unwrap())
+    );
     let received = upstream.received_requests().await.unwrap();
     let request: Value = serde_json::from_slice(&received[0].body).unwrap();
     assert_eq!(request["messages"], rewritten["messages"]);

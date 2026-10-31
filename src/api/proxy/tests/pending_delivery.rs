@@ -326,13 +326,20 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
         receipt["operational_terminal"]["stage"],
         "upstream_response_headers"
     );
-    assert!(
-        fixture
+    // An in-memory snapshot is published before the writer gate completes.
+    // Wait for that existing barrier before checking durable receipt retention.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !fixture
             .state
             .pending_terminals
-            .contains_receipt_for_test(operational_receipt_id),
-        "runtime ACK must not retire unknown finance"
-    );
+            .contains_receipt_for_test(operational_receipt_id)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runtime ACK must not retire unknown finance");
+    cancellation::assert_unknown_request(&fixture, request_id, 0).await;
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     upstream.verify().await;
     pool.close().await;
@@ -1434,7 +1441,12 @@ async fn unknown_failure_retries_operational_projection() {
         &json!({"model": fixture.model, "input": "operational failure retry", "stream": true}),
     )
     .await;
-    assert_eq!(payload, original["conversation"]["request_json"]);
+    // The durable source retains the entire ingress envelope; the receipt
+    // deliberately keeps only the conversation fields.
+    assert_eq!(
+        payload["input"],
+        original["conversation"]["request_json"]["input"]
+    );
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if fixture

@@ -66,6 +66,7 @@ pub(crate) struct ArchiveSpoolChunk {
     pub byte_count: i64,
 }
 
+#[cfg(test)]
 pub(crate) async fn insert_request_archive_gap_in_transaction(
     tx: &mut Transaction<'_, Any>,
     now: i64,
@@ -400,7 +401,7 @@ impl Database {
             AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact")
         })?;
         let gap_locator = format!("gap://{}/{}", identity.request_id, purpose.as_str());
-        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object = $4)")))
+        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object IS NULL OR response_object = $4)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).bind(gap_locator).fetch_one(&mut **tx).await?;
         if valid != 1 {
@@ -534,7 +535,7 @@ impl Database {
         // until the worker binds a durable object; no other completed request
         // may be reopened for capture.
         let gap_locator = format!("gap://{}/response", identity.request_id);
-        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object = $4)")))
+        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object IS NULL OR response_object = $4)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).bind(gap_locator).fetch_one(&mut *tx).await?;
         if valid != 1 {

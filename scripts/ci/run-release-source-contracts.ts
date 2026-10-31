@@ -8,6 +8,7 @@ for (const script of [
   'tests/ops/github-release-assets-contract.test.ts',
   'tests/ops/github-workflow-policy-fixtures.test.ts',
   'tests/ops/readme-canonical-contract.test.ts',
+  'tests/ops/request-stats-reconcile-static.ts',
   'scripts/ci/compact-runtime-probe.test.ts',
 ]) {
   const result = spawnSync(process.execPath, ['--test', script], { cwd: repository, encoding: 'utf8', stdio: 'inherit', shell: false });

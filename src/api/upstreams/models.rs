@@ -2218,10 +2218,19 @@ mod tests {
     async fn codex_catalog_connect_fallback_is_bounded_by_members_attempts_and_budget() {
         for (policy, expected_attempts) in [
             (
-                json!({"connect_attempts": 4, "connect_retry_delay_millis": 0}),
+                // These are unreachable SOCKS fixture members. Bound each
+                // connect so both fit inside the management catalog budget;
+                // an absent connect timeout intentionally has no deadline.
+                json!({
+                    "connect_attempts": 4, "connect_retry_delay_millis": 0,
+                    "connect_timeout_millis": 100,
+                }),
                 2,
             ),
-            (json!({"connect_attempts": 1}), 1),
+            (
+                json!({"connect_attempts": 1, "connect_timeout_millis": 100}),
+                1,
+            ),
             (
                 json!({
                     "connect_attempts": 4, "connect_retry_delay_millis": 1000,

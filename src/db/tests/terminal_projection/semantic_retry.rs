@@ -221,16 +221,31 @@ async fn retry_contract(database_url: &str) {
             .await
             .unwrap()
     );
-    let retry_expiry = expiry(&database, request_id).await;
-    assert!(retry_expiry < original_expiry);
-    retained(&database, request_id, retry_expiry).await;
+    let released: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND terminal_lease_owner IS NULL AND terminal_lease_expires_at IS NULL AND projected_at IS NULL")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(released, 1);
+    let replacement_owner = Uuid::now_v7();
+    assert!(
+        database
+            .claim_conversation_projection_tasks(replacement_owner, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id)
+    );
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(owner, request_id)
+            .await
+            .unwrap()
+    );
     sqlx::query("UPDATE terminal_projection_outbox SET projected_at = $1 WHERE request_id = $2")
         .bind(terminal_projected_at)
         .bind(request_id.to_string())
         .execute(&database.pool)
         .await
         .unwrap();
-    complete(&database, request_id, &reservation, owner).await;
+    complete(&database, request_id, &reservation, replacement_owner).await;
 
     for (name, trigger) in [
         (

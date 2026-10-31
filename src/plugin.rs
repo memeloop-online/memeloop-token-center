@@ -1247,6 +1247,7 @@ impl PluginRuntime {
                 },
             );
             store.limiter(|state| &mut state.limits);
+            store.set_hostcall_fuel(usize::MAX);
             store.set_epoch_deadline(epoch_deadline_ticks(self.execution_timeout));
             store
                 .set_fuel(self.fuel)
@@ -3154,7 +3155,15 @@ fn plugin_reported_error(_plugin_id: &str, _operation: &str, error: &str) -> App
     AppError::upstream(code)
 }
 
-fn plugin_failure(_plugin_id: &str, _error: wasmtime::Error) -> AppError {
+fn plugin_failure(_plugin_id: &str, error: wasmtime::Error) -> AppError {
+    let category = match error.downcast_ref::<wasmtime::Trap>() {
+        Some(wasmtime::Trap::OutOfFuel) => "fuel_exhausted",
+        Some(wasmtime::Trap::Interrupt) => "execution_interrupted",
+        Some(wasmtime::Trap::MemoryOutOfBounds) => "memory_out_of_bounds",
+        Some(_) => "guest_trap",
+        None => "component_error",
+    };
+    tracing::warn!(category, "plugin execution failed");
     AppError::upstream("plugin_execution_failed")
 }
 

@@ -153,6 +153,9 @@ pub(super) async fn read_bounded_upstream(
     if !memory.response_json_fits(&body) {
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
+    if !reserve_adapter_maximum {
+        memory.shrink_buffered_response(&body);
+    }
     Ok(body)
 }
 

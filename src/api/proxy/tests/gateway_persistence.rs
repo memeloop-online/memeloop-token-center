@@ -48,7 +48,6 @@ async fn request_archive_degradation_preserves_sse(saturated: bool) {
     );
     wait_for_request_settlement(&fixture, 1).await;
     drop(capacity);
-    fixture.state.db.drain_gateway_persistence_for_test().await;
     let rows = fixture
         .state
         .db
@@ -57,6 +56,7 @@ async fn request_archive_degradation_preserves_sse(saturated: bool) {
         .unwrap();
     assert_eq!(rows[0].status_code, Some(200));
     assert_readable_source_without_spool(&fixture, &pool, rows[0].request_id, &request).await;
+    // Restore metadata writes before the archive helper drains retained jobs.
     sqlx::query("DROP TRIGGER reject_optional_capture")
         .execute(&pool)
         .await
