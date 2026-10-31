@@ -360,10 +360,7 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await aba.evaluate(() => window.credentialFixture.releaseIssue('mts_service_secret_current'));
     await aba.getByText('mts_service_secret_current', { exact: true }).waitFor();
 
-    // Exercise the actual page and shipped schemas on this same server. Each
-    // locale creates a different mode and both edit to the remaining value,
-    // covering both payload values in both endpoints without a second
-    // synthetic component/server fixture.
+    // Exercise the actual page and shipped schemas on this same server.
     for (const locale of ['en', 'zh-CN'] as const) {
       const client = await browser.newPage({ viewport: { width: 390, height: 844 } });
       client.setDefaultTimeout(5_000);
@@ -390,6 +387,15 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
       assert.equal(await editMode.evaluate(element => document.activeElement === element), true);
       const editedMode = 'metered_unlimited';
       await editMode.selectOption(editedMode);
+      if (!english) {
+        const editArtifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
+        mkdirSync(editArtifacts, { recursive: true });
+        for (const width of [1440, 390] as const) {
+          await client.setViewportSize({ width, height: 900 });
+          await client.screenshot({ path: join(editArtifacts, `client-credential-edit-form-zh-CN-${width}.png`), fullPage: true });
+        }
+        await client.setViewportSize({ width: 390, height: 844 });
+      }
       await edit.getByRole('button', { name: english ? 'Save' : '保存', exact: true }).click();
       await nextPaint(client);
       assert.deepEqual(await edit.locator('.schema-errors').allTextContents(), [], 'valid policy must submit without schema validation errors');
@@ -559,8 +565,6 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
     await exactCatalog.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await exactCatalog.goto(`${fixture('client-form')}&paged-route-catalog-exact`);
     await exactCatalog.getByText('Research workspace', { exact: true }).waitFor();
-    // Two full pages are followed by one empty read: the empty page, not a
-    // route count, is what ends the walk.
     await exactCatalog.waitForFunction(() => window.credentialFixture.calls.filter((call) => call.startsWith('/internal/v1/model-routes?') && call.includes('before_created_at=')).length === 2, undefined, { timeout: 10_000 });
     await exactCatalog.getByRole('button', { name: 'More actions', exact: true }).click();
     await exactCatalog.getByRole('menuitem', { name: 'Edit', exact: true }).click();

@@ -87,8 +87,6 @@ export function UsagePage({ token, tenant, onOpenSession }: OperatorPageProps & 
   const upstreamMetadataError = resource.state.kind === 'failed'
     ? resource.state.message
     : resource.state.kind === 'ready' ? resource.state.refreshError : undefined;
-  // An optional catalog 403 is a capability boundary, not a page failure:
-  // usage analysis keeps rendering while upstream names fall back to IDs.
   const upstreamMetadataDenied = resource.state.kind === 'failed'
     ? resource.state.status === 403
     : resource.state.kind === 'ready' && resource.state.refreshErrorStatus === 403;

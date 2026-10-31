@@ -29,8 +29,6 @@ export function SessionCredentialFilter({ value, sessions, token, tenant, onChan
     setLoading(true); setFailed(false); setDenied(false);
     void api<KeyView[]>(`/internal/v1/keys?${params}`, token.trim(), { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]) })
       .then(values => { if (!Array.isArray(values)) throw new Error('Invalid credential page'); if (!controller.signal.aborted) setPage(previous => ({ scope, values: last ? [...previous.values, ...values] : values, more: values.length === 100 })); })
-      // A directory 403 is a capability boundary: retrying cannot help, but a
-      // pasted credential ID remains a valid filter.
       .catch((reason) => { if (!controller.signal.aborted) { const forbidden = reason instanceof ApiError && reason.status === 403; setDenied(forbidden); setFailed(!forbidden); } })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();

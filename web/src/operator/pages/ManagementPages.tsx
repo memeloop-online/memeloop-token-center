@@ -1694,8 +1694,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
   const canLoadMore = canLoadMoreKeys(keyListState, Boolean(nextCursor), Boolean(keyRequest.current));
   const listPresentation = credentialListPresentation(keyListState, filtersApplied);
   const canReadLimits = canReadCredentialLimits(token);
-  // Tenant selection is the write context, not permission evidence: the first
-  // real 403 is remembered and disables write affordances with the server's answer.
   const canWrite = canWriteCredential(writeTenant) && !writeDenied;
   const writeMutationFailure = (reason: unknown) => {
     if (reason instanceof ApiError && reason.status === 403) {
@@ -1766,8 +1764,6 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
       showSecret({ value: result.key, kind: 'issued', alias: value.alias, displayId: crypto.randomUUID() });
       setMessage(t('credentials.rotated', { alias: value.alias })); await load();
     } catch (reason) {
-      // A cancelled request is a normal outcome, not a failure: never surface
-      // the browser's raw abort message as a page error.
       if (!controller.signal.aborted && ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) setError(writeMutationFailure(reason));
     } finally {
       if (secretRequest.current === controller) secretRequest.current = undefined;
@@ -2036,8 +2032,6 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, tenan
       setValues(loadTenant ? all.filter((value) => !value.tenant_external_id || value.tenant_external_id === loadTenant) : all); setError(''); setListDenied('');
     } catch (reason) {
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
-      // A 403 here is a definitive capability answer, not a transient failure:
-      // show the real boundary instead of a retryable-looking generic error.
       if (reason instanceof ApiError && reason.status === 403) { setValues([]); setListDenied(`${t('services.listPermission')} ${messageOf(reason, '')}`.trim()); return; }
       setError(messageOf(reason, t('common.requestFailed')));
     }
@@ -2049,9 +2043,6 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, tenan
     return () => { secretRequest.current?.abort(); };
   }, [token, tenant, writeTenant]);
   const statusFilter = useResourceListStatusFilter('service-credentials', tenant, values, (value) => (value.status ?? 'active') === 'active');
-  // A selected tenant is only the write context, never proof of authorization.
-  // The first real 403 is remembered and disables further write affordances
-  // with the server's own answer instead of the tenant-non-empty guess.
   const canManage = (value: ServiceTokenView) => Boolean(writeTenant) && !writeDenied && (!value.tenant_external_id || value.tenant_external_id === writeTenant);
   const writePermissionReason = writeDenied || t('services.writePermission');
   const mutationFailure = (reason: unknown) => {
@@ -2176,7 +2167,6 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, tenan
       const updated = await api<ServiceTokenView>(`/internal/v1/service-tokens/${encodeURIComponent(target.service_id)}`, operationToken, { method: 'PATCH', body: JSON.stringify(plan.payload) });
       if (!ownsSecretScope(operationToken, operationTenant, operationWriteTenant, operationScopeGeneration)) return;
       if (updated.service_id !== target.service_id) throw new Error(t('common.requestFailed'));
-      // A successful write is the only proof that clears an earlier denial.
       setWriteDenied('');
       setEditing(undefined); setMessage(t('services.updated', { name: updated.name })); await load();
     } catch (reason) {
@@ -2247,7 +2237,6 @@ interface OperatorPageProps {
   tenant: string;
   /** Explicit target for every create/update action. */
   writeTenant?: string;
-  /** Visible tenant directory; optional pickers never infer a binding from it. */
   tenants?: TenantView[];
 }
 

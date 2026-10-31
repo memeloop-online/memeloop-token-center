@@ -122,10 +122,15 @@ test('service credential edit panel shares the create form and saves through PAT
 
   await name.fill('统计报表集成');
   await form.getByRole('checkbox', { name: '读取请求与用量 (requests:read)' }).check();
-  await form.getByRole('button', { name: '保存修改', exact: true }).click();
-  await page.getByText('已更新 统计报表集成。', { exact: true }).waitFor();
   const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
   mkdirSync(artifacts, { recursive: true });
+  for (const width of [1440, 390] as const) {
+    await page.setViewportSize({ width, height: 900 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'the open edit form has no horizontal overflow');
+    await page.screenshot({ path: join(artifacts, `service-credential-edit-form-zh-CN-${width}.png`), fullPage: true });
+  }
+  await form.getByRole('button', { name: '保存修改', exact: true }).click();
+  await page.getByText('已更新 统计报表集成。', { exact: true }).waitFor();
   for (const width of [1440, 390] as const) {
     await page.setViewportSize({ width, height: 900 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'the successful edit state has no horizontal overflow');

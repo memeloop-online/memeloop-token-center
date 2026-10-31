@@ -176,9 +176,6 @@ async fn invalid_partial_service_updates_leave_all_fields_unchanged() {
     let (state, _directory) = test_state().await;
     let issued = issue(&state, "original", &["requests:read"], None).await;
     let path = format!("/internal/v1/service-tokens/{}", issued.service_id);
-    // The control-plane middleware normalizes every plain-text extractor
-    // rejection (schema-shape errors included) to a uniform 400, so semantic
-    // validation failures and malformed request shapes share one status here.
     for body in [
         json!({}),
         json!({"name":"changed", "scopes": []}),

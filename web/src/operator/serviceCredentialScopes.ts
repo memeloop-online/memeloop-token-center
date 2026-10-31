@@ -8,14 +8,10 @@ export interface ServiceCredentialScopeCopy {
 
 export const serviceCredentialStatisticsGroupId = 'statistics-and-requests';
 
-// The runtime accepts exactly these scopes (SUPPORTED_SERVICE_SCOPES in
-// src/db/credentials/service_tokens.rs); a contract test keeps this catalog
-// in parity with the service. Each entry explains what the permission allows
-// so operators can grant the narrowest useful scope.
 export const serviceCredentialScopeGroups = [
   { id: serviceCredentialStatisticsGroupId, title: '统计与请求', titleEn: 'Statistics and requests', scopes: [
-    { value: 'metrics:read', label: '读取诊断指标', labelEn: 'Read diagnostic metrics', hint: '读取诊断与健康状态；不包含请求记录或用量分析。', hintEn: 'Read diagnostics and health status, not request records or usage analysis.' },
-    { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '读取请求记录、监控快照和用量分析；不允许写入。', hintEn: 'Read request records, monitoring snapshots, and usage analysis without write access.' },
+    { value: 'metrics:read', label: '读取诊断指标', labelEn: 'Read diagnostic metrics', hint: '诊断指标与健康状态。', hintEn: 'Diagnostic metrics and health status.' },
+    { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '请求记录、监控快照与用量分析。', hintEn: 'Request records, monitoring snapshots, and usage analysis.' },
   ] },
   { id: 'credentials-and-credits', title: '凭据与额度', titleEn: 'Credentials and credits', scopes: [
     { value: 'keys:read', label: '读取客户端凭据', labelEn: 'Read client credentials', hint: '查看客户端凭据及其配置。', hintEn: 'View client credentials and their configuration.' },

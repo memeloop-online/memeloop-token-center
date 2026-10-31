@@ -248,8 +248,6 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     const upstreamRequest = ++upstreamSequence.current;
     void api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token)
       .then((values) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams(values); setUpstreamError(''); setUpstreamDenied(false); } })
-      // A 403 on this optional catalog is a capability boundary, not a search
-      // failure: requests, filters, and details keep working with ID labels.
       .catch((reason) => { if (upstreamRequest === upstreamSequence.current) { setUpstreams([]); const denied = reason instanceof ApiError && reason.status === 403; setUpstreamDenied(denied); setUpstreamError(denied ? '' : apiDiagnosticMessage(reason, t('common.requestFailed'), diagnosticLabels)); } });
     void load(emptyTypedFilterAst);
     return () => { cancelOverflowRefresh(); loadAbort.current?.abort(); };

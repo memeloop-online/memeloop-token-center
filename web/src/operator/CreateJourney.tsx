@@ -8,7 +8,6 @@ export function CreateJourney({ title, description, children, onOpen, open, onOp
   open: boolean; onOpenChange: (open: boolean) => void; busy?: boolean; className?: string;
   /** False hides the closed-state trigger while keeping the mounted draft subtree. */
   showTrigger?: boolean;
-  /** Credential editors use the same top-left Back affordance as detail pages. */
   closeLabel?: string;
   closePlacement?: 'start' | 'end';
 }) {
