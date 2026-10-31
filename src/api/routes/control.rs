@@ -19,6 +19,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(super::super::operator_inference::chat_completions),
         )
         .route(
+            "/internal/v1/inference/responses",
+            post(super::super::operator_inference::responses),
+        )
+        .route(
             "/internal/v1/transport-proxy-groups/access",
             get(transport_group_access),
         )

@@ -23,6 +23,7 @@ pub mod model;
 pub mod native_cli;
 pub mod network;
 pub mod oauth;
+mod plain_json;
 pub mod plugin;
 #[cfg(feature = "plugin-distribution")]
 pub mod plugin_distribution;
@@ -184,7 +185,7 @@ impl AppState {
             .await
             .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db
-                .migrate_with_credential_pepper(config.key_pepper.as_bytes())
+                .migrate()
                 .await
                 .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db.close().await;
@@ -198,6 +199,16 @@ impl AppState {
             .map_err(InitializationError::Database)?;
         db.start_http_settings_refresh();
         let http_clients = db.http_clients.clone();
+        // Runs on every process start rather than behind the migration switch:
+        // a row that still holds a sealed envelope must be rewritten before the
+        // first request reads it, and the recorded schema version keeps every
+        // later start to a single SELECT. A failure here must not stop the
+        // process: an outage is worse than a few unreadable historic rows, and
+        // the next start retries because the version marker is only written on
+        // success.
+        if let Err(error) = db.convert_sealed_state(config.key_pepper.as_bytes()).await {
+            tracing::error!(%error, "converting sealed gateway state failed; serving existing rows");
+        }
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;

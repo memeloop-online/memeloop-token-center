@@ -31,6 +31,7 @@ tokio::task_local! {
 #[cfg(test)]
 tokio::task_local! {
     static TEST_CAPTURE_BEFORE_DISPATCH: Arc<GatewayPersistence>;
+    static TEST_SOURCE_POOL_TIMEOUT: Duration;
 }
 
 pub(super) struct GatewayPersistence {
@@ -45,14 +46,21 @@ pub(super) struct GatewayPersistence {
     retention_limit: AtomicU64,
     #[cfg(test)]
     busy_retries: AtomicU64,
+    #[cfg(test)]
+    source_timeout: Duration,
 }
 
 impl GatewayPersistence {
     pub(super) fn new(url: &str, backend: DatabaseBackend) -> Result<Self, sqlx::Error> {
+        let acquire_timeout = Duration::from_millis(250);
+        #[cfg(test)]
+        let acquire_timeout = TEST_SOURCE_POOL_TIMEOUT
+            .try_with(|timeout| *timeout)
+            .unwrap_or(acquire_timeout);
         let pool = AnyPoolOptions::new()
             .max_connections(1)
             .min_connections(0)
-            .acquire_timeout(Duration::from_millis(250))
+            .acquire_timeout(acquire_timeout)
             .idle_timeout(Some(Duration::from_secs(60)))
             .after_connect(move |connection, _| {
                 Box::pin(async move {
@@ -88,6 +96,10 @@ impl GatewayPersistence {
             retention_limit: AtomicU64::new(0),
             #[cfg(test)]
             busy_retries: AtomicU64::new(0),
+            #[cfg(test)]
+            source_timeout: TEST_SOURCE_POOL_TIMEOUT
+                .try_with(|timeout| *timeout)
+                .unwrap_or(Duration::from_secs(2)),
         })
     }
 
@@ -137,6 +149,14 @@ impl GatewayPersistence {
 }
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) async fn with_source_pool_timeout_for_test<F: std::future::Future>(
+        timeout: Duration,
+        future: F,
+    ) -> F::Output {
+        TEST_SOURCE_POOL_TIMEOUT.scope(timeout, future).await
+    }
+
     pub(crate) async fn start_proxy_request_with_source(
         &self,
         input: StartProxyRequest<'_>,
@@ -168,14 +188,6 @@ impl Database {
             reservation_id: reservation.id,
         };
         source.retain_for_archive(self.clone(), identity);
-        self.persist_request_source(
-            identity,
-            source.object_locator().unwrap(),
-            source.len(),
-            source.digest(),
-            None,
-        )
-        .await;
         #[cfg(test)]
         if TEST_CAPTURE_BEFORE_DISPATCH
             .try_with(|persistence| Arc::ptr_eq(persistence, &self.gateway_persistence))
@@ -205,8 +217,52 @@ impl Database {
         digest: [u8; 32],
         success: bool,
     ) {
-        self.persist_request_source(identity, locator, length, digest, Some(success))
-            .await;
+        loop {
+            if self
+                .persist_request_source(identity, locator, length, digest, Some(success))
+                .await
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub(crate) async fn wait_request_source_upload(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+        mut outcome: tokio::sync::watch::Receiver<Option<bool>>,
+    ) -> Option<bool> {
+        loop {
+            if let Some(success) = *outcome.borrow_and_update() {
+                return Some(success);
+            }
+            let delay = match self
+                .persist_request_source(identity, locator, length, digest, None)
+                .await
+            {
+                Some(false) => return None,
+                Some(true) => Duration::from_millis(
+                    crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
+                ),
+                None => Duration::from_millis(250),
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                changed = outcome.changed() => {
+                    if changed.is_err() {
+                        return None;
+                    }
+                    if let Some(success) = *outcome.borrow_and_update() {
+                        return Some(success);
+                    }
+                }
+            }
+        }
     }
 
     async fn persist_request_source(
@@ -216,24 +272,33 @@ impl Database {
         length: usize,
         digest: [u8; 32],
         success: Option<bool>,
-    ) {
+    ) -> Option<bool> {
         let mut database = self.clone();
         database.pool = self.gateway_persistence.pool.clone();
         database.pool_role = "gateway_archive";
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        #[cfg(not(test))]
+        let timeout = Duration::from_secs(2);
+        #[cfg(test)]
+        let timeout = self.gateway_persistence.source_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
         let result = tokio::time::timeout_at(
             deadline,
             ARCHIVE_DEADLINE.scope(
                 (self.gateway_persistence.clone(), deadline),
-                database.record_request_source_state(identity, locator, length, digest, success),
+                database
+                    .record_request_source_state(identity, locator, length, digest, success, false),
             ),
         )
         .await;
-        if !matches!(result, Ok(Ok(()))) {
-            self.gateway_persistence
-                .failed
-                .fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(request_id = %identity.request_id, "request source state awaits worker recovery");
+        match result {
+            Ok(Ok(owned)) => Some(owned),
+            _ => {
+                self.gateway_persistence
+                    .failed
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(request_id = %identity.request_id, "request source metadata retained for retry");
+                None
+            }
         }
     }
 
@@ -268,6 +333,14 @@ impl Database {
         let database = self.clone();
         tokio::spawn(async move {
             let _permit = permit;
+            let (_outcome, receiver) = tokio::sync::watch::channel(Some(success));
+            if database
+                .wait_request_source_upload(identity, &locator, length, digest, receiver)
+                .await
+                .is_none()
+            {
+                return;
+            }
             database
                 .complete_request_source(identity, &locator, length, digest, success)
                 .await;
@@ -282,7 +355,17 @@ impl Database {
         digest: [u8; 32],
         success: bool,
     ) -> Result<(), AppError> {
-        self.record_request_source_state(identity, locator, length, digest, Some(success))
+        self.record_request_source_state(identity, locator, length, digest, Some(success), true)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn recover_request_source(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+    ) -> Result<bool, AppError> {
+        self.record_request_source_state(identity, locator, 0, [0; 32], Some(false), true)
             .await
     }
 
@@ -293,36 +376,95 @@ impl Database {
         length: usize,
         digest: [u8; 32],
         success: Option<bool>,
-    ) -> Result<(), AppError> {
+        recovery: bool,
+    ) -> Result<bool, AppError> {
         if crate::gateway_body::request_spool::source_request_id(locator)
             != Some(identity.request_id)
         {
             return Err(AppError::internal("gateway_request_source_identity"));
         }
         let mut transaction = self.begin_write_transaction().await?;
-        let now = super::unix_millis();
         let owned = sqlx::query("UPDATE request_records SET request_object = request_object WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND request_object = $4 RETURNING key_id")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string()).bind(locator)
             .fetch_optional(&mut *transaction).await?;
         let Some(owned) = owned else {
-            return Ok(());
+            return Ok(false);
         };
-        let changed = sqlx::query("INSERT INTO request_archive_spools (request_id, tenant_id, reservation_id, state, chunk_count, byte_count, cipher_bytes, attempts, next_attempt_at, created_at, updated_at, expires_at, cleaned_at, last_error_code, bound_locator, body_byte_count, body_blake3) VALUES ($1, $2, $3, $4, 0, 0, 0, 0, $5, $5, $5, $10, $5, $6, $7, $8, $9) ON CONFLICT(request_id) DO UPDATE SET state = excluded.state, bound_locator = excluded.bound_locator, last_error_code = excluded.last_error_code, updated_at = excluded.updated_at WHERE request_archive_spools.tenant_id = excluded.tenant_id AND request_archive_spools.reservation_id = excluded.reservation_id AND request_archive_spools.cipher_bytes = 0 AND ((request_archive_spools.state = 'capturing' AND excluded.state IN ('bound', 'gap')) OR (request_archive_spools.state = 'gap' AND excluded.state = 'bound'))")
+        let clock = match self.backend {
+            DatabaseBackend::PostgreSql => {
+                "SELECT CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)"
+            }
+            DatabaseBackend::Sqlite => {
+                "SELECT CAST((julianday('now') - 2440587.5) * 86400000 AS BIGINT)"
+            }
+        };
+        let now: i64 = sqlx::query_scalar(clock)
+            .fetch_one(&mut *transaction)
+            .await?;
+        let expires_at =
+            now.saturating_add(crate::archive_staging::ARCHIVE_STAGING_WRITE_LEASE_MILLIS);
+        let inserted = sqlx::query("INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, next_cleanup_at, created_at, updated_at) VALUES ($1, 'proxy_request', $1, 'request', $2, 'writing', 'gateway-source', $1, 'gateway-source', $1, $3, NULL, $4, $4) ON CONFLICT(attempt_id) DO NOTHING")
+            .bind(identity.request_id.to_string()).bind(blake3::Hash::from_bytes(digest).to_hex().to_string())
+            .bind(expires_at).bind(now)
+            .execute(&mut *transaction).await?;
+        if recovery && success == Some(false) && inserted.rows_affected() == 1 {
+            transaction.commit().await?;
+            return Ok(false);
+        }
+        let stage = sqlx::query("UPDATE archive_staging_attempts SET updated_at = updated_at WHERE attempt_id = $1 AND owner_kind = 'proxy_request' AND owner_id = $1 AND purpose = 'request' AND writer_owner = 'gateway-source' AND writer_token = $1 RETURNING state, lease_owner, lease_token, lease_expires_at")
+            .bind(identity.request_id.to_string()).fetch_optional(&mut *transaction).await?;
+        let Some(stage) = stage else {
+            return Ok(false);
+        };
+        let writing = stage.try_get::<String, _>("state")? == "writing";
+        let live = writing
+            && stage
+                .try_get::<Option<i64>, _>("lease_expires_at")?
+                .is_some_and(|expiry| expiry > now);
+        let existing: Option<String> = sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1 AND tenant_id = $2 AND reservation_id = $3")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string())
+            .fetch_optional(&mut *transaction).await?;
+        if recovery {
+            if success == Some(false) && (live || existing.as_deref() == Some("bound")) {
+                return Ok(false);
+            }
+            if existing.as_deref() == Some("gap") && success == Some(false) {
+                return Ok(true);
+            }
+        } else {
+            if !writing
+                || stage
+                    .try_get::<Option<String>, _>("lease_owner")?
+                    .as_deref()
+                    != Some("gateway-source")
+                || stage
+                    .try_get::<Option<String>, _>("lease_token")?
+                    .is_none_or(|token| token != identity.request_id.to_string())
+            {
+                return Ok(false);
+            }
+        }
+        if success.is_some() {
+            sqlx::query("UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, next_cleanup_at = $2, updated_at = $2 WHERE attempt_id = $1")
+                .bind(identity.request_id.to_string()).bind(now).execute(&mut *transaction).await?;
+        } else {
+            sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = $2, updated_at = $3 WHERE attempt_id = $1 AND state = 'writing'")
+                .bind(identity.request_id.to_string()).bind(expires_at).bind(now).execute(&mut *transaction).await?;
+        }
+        let changed = sqlx::query("INSERT INTO request_archive_spools (request_id, tenant_id, reservation_id, state, chunk_count, byte_count, cipher_bytes, attempts, next_attempt_at, created_at, updated_at, expires_at, cleaned_at, last_error_code, bound_locator, body_byte_count, body_blake3) VALUES ($1, $2, $3, $4, 0, 0, 0, 0, $5, $5, $5, $10, $5, $6, $7, $8, $9) ON CONFLICT(request_id) DO UPDATE SET state = excluded.state, bound_locator = excluded.bound_locator, last_error_code = excluded.last_error_code, updated_at = excluded.updated_at, body_byte_count = COALESCE(excluded.body_byte_count, request_archive_spools.body_byte_count), body_blake3 = COALESCE(excluded.body_blake3, request_archive_spools.body_blake3) WHERE request_archive_spools.tenant_id = excluded.tenant_id AND request_archive_spools.reservation_id = excluded.reservation_id AND request_archive_spools.cipher_bytes = 0 AND ((request_archive_spools.state = 'capturing' AND excluded.state IN ('bound', 'gap')) OR (request_archive_spools.state = 'gap' AND excluded.state = 'bound'))")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.reservation_id.to_string())
             .bind(match success { Some(true) => "bound", Some(false) => "gap", None => "capturing" }).bind(now)
             .bind((success == Some(false)).then_some("capture_failed")).bind((success == Some(true)).then_some(locator))
-            .bind(i64::try_from(length).map_err(|_| AppError::internal("gateway_request_source_length"))?)
-            .bind(blake3::Hash::from_bytes(digest).to_hex().to_string()).bind(i64::MAX).execute(&mut *transaction).await?;
-        let key = crate::archive_staging::ArchiveStagingKey::new(
-            crate::archive_staging::ArchiveStagingOwner::ProxyRequest(identity.request_id),
-            crate::archive_staging::ArchiveStagingPurpose::Request,
-            identity.request_id,
-        )?;
-        sqlx::query("INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, bound_at, next_cleanup_at, created_at, updated_at) VALUES ($1, 'proxy_request', $1, 'request', $2, 'cleanup_pending', 'gateway-source', $1, $3, $3, $3, $3) ON CONFLICT(attempt_id) DO NOTHING")
-            .bind(key.attempt_id.to_string()).bind(blake3::Hash::from_bytes(digest).to_hex().to_string()).bind(now).execute(&mut *transaction).await?;
+            .bind((!recovery || success != Some(false)).then_some(i64::try_from(length).map_err(|_| AppError::internal("gateway_request_source_length"))?))
+            .bind((!recovery || success != Some(false)).then(|| blake3::Hash::from_bytes(digest).to_hex().to_string())).bind(i64::MAX).execute(&mut *transaction).await?;
         if changed.rows_affected() == 1
             && let Some(success) = success
         {
+            super::requests::conversations::wake_session_body_archive_in_transaction(
+                &mut transaction,
+                identity.request_id,
+            )
+            .await?;
             let tenant_id = identity.tenant_id.to_string();
             let request_id = identity.request_id.to_string();
             let key_id: String = owned.try_get("key_id")?;
@@ -345,7 +487,7 @@ impl Database {
         {
             tracing::warn!(request_id = %identity.request_id, reason = error.diagnostic_category(), "request started event omitted");
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(super) fn gateway_archive_retry_deadline(&self) -> Option<tokio::time::Instant> {
@@ -402,6 +544,18 @@ impl Database {
             persistence.failed.load(Ordering::Relaxed),
             persistence.retention_limit.load(Ordering::Relaxed),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn hold_gateway_archive_connection_for_test(
+        &self,
+    ) -> sqlx::pool::PoolConnection<sqlx::Any> {
+        self.gateway_persistence.pool.acquire().await.unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_source_write_failures_for_test(&self) -> u64 {
+        self.gateway_persistence.failed.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]

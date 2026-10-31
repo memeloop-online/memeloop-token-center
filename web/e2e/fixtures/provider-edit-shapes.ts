@@ -13,16 +13,16 @@ export const codexTransportPolicySchema = {
       description: 'Provider default preserves native TLS protocol negotiation. HTTP/1.1 only is an explicit account override for controlled compatibility checks; it does not enable automatic fallback. Changes affect new account clients, including model and quota reads; existing requests retain their client.',
     },
     connect_timeout_millis: {
-      type: 'integer', minimum: 100, maximum: 60000, default: 5000,
-      description: 'Stored with the account and still required to be lower than the total request timeout. A Codex forward does not use it as a connection deadline. Proxy reachability is a separate probe configured on the proxy group.',
+      type: ['integer', 'null'], minimum: 100, maximum: 600000, default: null,
+      description: 'Optional connection-establishment timeout. Unset by default; no application connection deadline is imposed. An explicit value covers connection establishment, including TLS and the configured proxy, without limiting response duration.',
     },
     read_timeout_millis: {
-      type: 'integer', minimum: 1000, maximum: 1260000, default: 600000,
-      description: 'Stored with the account. A Codex forward does not abort when the body is quiet. The body ends when the upstream finishes, the client cancels, or the socket fails.',
+      type: ['integer', 'null'], minimum: 1000, maximum: 1260000, default: null,
+      description: 'Stored with the account; optional. When unset (the default) a quiet upstream is never aborted. When set, the value is a read-inactivity window that restarts on every byte. A Codex forward does not apply it as an absolute deadline.',
     },
     request_timeout_millis: {
       type: 'integer', minimum: 1000, maximum: 1260000, default: 1260000,
-      description: 'Stored with the account. A Codex forward, including compaction, does not apply this absolute deadline. The attempt ends when the upstream answers, the client cancels, or the socket fails.',
+      description: 'HTTP/2 keepalive PING acknowledgement timeout, and explicit total budget for model catalog and quota reads. This does not impose an absolute deadline on inference or compaction. Quiet upstream responses continue while the connection remains healthy.',
     },
     memory_admission_wait_millis: {
       type: 'integer', minimum: 100, maximum: 300000, default: 30000,
@@ -57,7 +57,6 @@ export const codexTransportPolicySchema = {
       description: 'Maximum validated Responses terminal bytes held until EOF. Must be between max_sse_event_bytes and max_sse_framed_bytes.',
     },
     candidate_attempts: { type: 'integer', minimum: 1, maximum: 8, default: 3 },
-    failover_deadline_millis: { type: 'integer', minimum: 1000, maximum: 300000, default: 300000 },
     connect_attempts: { type: 'integer', minimum: 1, maximum: 4, default: 2 },
     connect_retry_delay_millis: { type: 'integer', minimum: 0, maximum: 2000, default: 150 },
     shared_probe_attempts: { type: 'integer', minimum: 0, maximum: 4, default: 1 },
@@ -81,7 +80,7 @@ export function providerEditShape(variant: string | null) {
       network_scope: 'public',
       reservation_token_bounds: Object.fromEntries(models.map((model, index) => [model, variant === 'retry-only' && index === 0 ? 1_000_000_000 : 64000])),
       transport_policy: variant === 'retry-only'
-        ? { candidate_attempts: 3, connect_attempts: 4, connect_retry_delay_millis: 150, failover_deadline_millis: 300000, shared_probe_attempts: 4, version: 1 }
+        ? { candidate_attempts: 3, connect_attempts: 4, connect_retry_delay_millis: 150, shared_probe_attempts: 4, version: 1 }
         : variant === 'csil'
           ? { connect_attempts: 2, connect_timeout_millis: 10000, memory_admission_wait_millis: 12000,
             dispatch_max_in_flight: 2, dispatch_max_queued: 0, dispatch_queue_timeout_millis: 15000,

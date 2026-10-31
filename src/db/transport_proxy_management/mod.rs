@@ -1,4 +1,5 @@
 use super::*;
+use crate::plain_json::decode_json;
 
 mod bindings;
 mod groups;
@@ -11,7 +12,6 @@ pub(crate) use oauth::lock_oauth_transport_group;
 pub(crate) use types::*;
 
 pub(crate) const CONFIG_KEY: &str = "__mtc_transport_proxy_binding";
-const MEMBERS_AAD: &[u8] = b"mtc/transport-proxy-members/v1";
 
 fn conflict(code: &'static str) -> AppError {
     AppError::ProxyGroupConflict(code)
@@ -69,12 +69,14 @@ fn validate_name(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn open_members(row: &AnyRow, key: &[u8]) -> Result<Vec<Member>, AppError> {
-    open_private_json(
-        &row.try_get::<String, _>("members_ciphertext")?,
-        key,
-        MEMBERS_AAD,
-    )
+/// Proxy members are stored as plain JSON so operators can read and repair
+/// them directly from the database.
+pub(super) fn decode_members(stored: &str) -> Result<Vec<Member>, AppError> {
+    decode_json(stored)
+}
+
+fn open_members(row: &AnyRow, _key: &[u8]) -> Result<Vec<Member>, AppError> {
+    decode_members(&row.try_get::<String, _>("members_ciphertext")?)
 }
 
 async fn available_name(

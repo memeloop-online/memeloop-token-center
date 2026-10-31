@@ -201,7 +201,6 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         serde_json::from_slice::<Value>(&delivered).unwrap()["output"][0]["content"][0]["text"],
         "response survives optional spool rejection"
     );
-    drain_archive_capture(&fixture).await;
     let requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
         .fetch_one(&pool)
         .await
@@ -224,6 +223,7 @@ async fn request_capture_failure_preserves_admission_and_dispatches_once() {
         &request,
     )
     .await;
+    // The retained metadata job retries until this injected outage is removed.
     sqlx::query("DROP TRIGGER reject_request_capture")
         .execute(&pool)
         .await

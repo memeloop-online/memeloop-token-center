@@ -41,6 +41,69 @@ async fn allocate_fixture(
     (transaction, cursor)
 }
 
+async fn claimed_locator_without_event_keeps_its_global_identity(database: &Database) {
+    let tenant_id = Uuid::now_v7();
+    let key_id = Uuid::now_v7();
+    let request_id = Uuid::now_v7();
+    let now = unix_millis();
+    let (seed_transaction, seed) =
+        allocate_fixture(database, now, tenant_id, key_id, request_id).await;
+    seed_transaction.commit().await.unwrap();
+    let mut transaction = database.begin_write_transaction().await.unwrap();
+    let reserved = allocate_request_event_cursor(
+        &mut transaction,
+        seed.event_at,
+        &tenant_id.to_string(),
+        &key_id.to_string(),
+        &request_id.to_string(),
+    )
+    .await
+    .unwrap();
+    transaction.commit().await.unwrap();
+    let (transaction, next) =
+        allocate_fixture(database, seed.event_at, tenant_id, key_id, request_id).await;
+    assert!((next.event_at, &next.event_id) > (reserved.event_at, &reserved.event_id));
+    transaction.commit().await.unwrap();
+    let reserved_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_event_locators WHERE id = $1")
+            .bind(&reserved.event_id)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(reserved_count, 1);
+    let reserved_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE event_id = $1")
+            .bind(&reserved.event_id)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(reserved_events, 0);
+}
+
+#[tokio::test]
+async fn sqlite_event_cursor_does_not_reuse_a_claimed_locator_without_event() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("claimed-cursor.db").display()
+    ))
+    .await
+    .unwrap();
+    database.migrate().await.unwrap();
+    claimed_locator_without_event_keeps_its_global_identity(&database).await;
+}
+
+#[tokio::test]
+async fn postgres_event_cursor_does_not_reuse_a_claimed_locator_without_event() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL fixture required");
+    let isolated = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+    let database = Database::connect(isolated.url()).await.unwrap();
+    database.migrate().await.unwrap();
+    claimed_locator_without_event_keeps_its_global_identity(&database).await;
+    database.close().await;
+    isolated.cleanup().await;
+}
+
 async fn wait_for_postgres_advisory_lock(
     observer: &Database,
     application_name: &str,

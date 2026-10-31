@@ -9,6 +9,8 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub use factory::{ClientOptions, HttpClient, HttpClientFactory, HttpClientSource};
 pub(crate) use factory::{HttpSnapshot, scoped};
 
+pub(crate) const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HttpPurpose {
@@ -147,7 +149,7 @@ impl HttpSettings {
                 &settings.pool_idle_timeout_ms,
             ] {
                 if let Override::Value(Some(value)) = timeout
-                    && (*value == 0 || *value > 9_007_199_254_740_991)
+                    && (*value == 0 || *value > MAX_SAFE_INTEGER)
                 {
                     return Err(
                         "HTTP durations must be positive safe integers in milliseconds or null",
@@ -155,7 +157,7 @@ impl HttpSettings {
                 }
             }
             if let Override::Value(value) = settings.pool_max_idle_per_host
-                && value as u128 > 9_007_199_254_740_991
+                && value as u128 > u128::from(MAX_SAFE_INTEGER)
             {
                 return Err("HTTP pool size must be a nonnegative safe integer");
             }

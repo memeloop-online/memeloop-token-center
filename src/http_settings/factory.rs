@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 
-use super::{HttpPurpose, HttpSettingsDocument};
+use super::{HttpPurpose, HttpSettingsDocument, ValueSource};
 
 #[derive(Default)]
 pub struct ClientOptions<'a> {
@@ -39,8 +39,28 @@ impl HttpSnapshot {
     }
 
     pub(crate) fn builder(&self, purpose: HttpPurpose) -> reqwest::ClientBuilder {
+        self.builder_with_connect_read_timeouts(purpose, None, None)
+    }
+
+    pub(crate) fn builder_with_connect_read_timeouts(
+        &self,
+        purpose: HttpPurpose,
+        connect_timeout_ms: Option<u64>,
+        read_timeout_ms: Option<u64>,
+    ) -> reqwest::ClientBuilder {
         crate::simple_http::install_ring_provider();
         let effective = self.document.settings.effective(purpose);
+        // Account timeouts remain an explicit fallback only while the operator
+        // inherits. A global/purpose value (including null) is authoritative.
+        let connect_timeout_ms = match effective.connect_timeout_ms.source {
+            ValueSource::SourceDefault => connect_timeout_ms,
+            _ => effective.connect_timeout_ms.value,
+        };
+        let read_timeout_ms = match effective.read_timeout_ms.source {
+            ValueSource::SourceDefault => read_timeout_ms,
+            _ => effective.read_timeout_ms.value,
+        };
+        let codex = purpose == HttpPurpose::Codex;
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -51,13 +71,15 @@ impl HttpSnapshot {
                     .map(Duration::from_millis),
             )
             .pool_max_idle_per_host(effective.pool_max_idle_per_host.value)
-            .tcp_keepalive(None::<Duration>)
-            .tcp_keepalive_interval(None::<Duration>)
-            .tcp_keepalive_retries(None::<u32>);
-        if let Some(timeout) = effective.connect_timeout_ms.value {
+            // Preserve Codex's TCP liveness probes from the shared transport.
+            // These do not impose an HTTP request or read deadline.
+            .tcp_keepalive(codex.then_some(Duration::from_secs(60)))
+            .tcp_keepalive_interval(codex.then_some(Duration::from_secs(30)))
+            .tcp_keepalive_retries(codex.then_some(3));
+        if let Some(timeout) = connect_timeout_ms {
             builder = builder.connect_timeout(Duration::from_millis(timeout));
         }
-        if let Some(timeout) = effective.read_timeout_ms.value {
+        if let Some(timeout) = read_timeout_ms {
             builder = builder.read_timeout(Duration::from_millis(timeout));
         }
         if let Some(timeout) = effective.request_timeout_ms.value {
@@ -210,5 +232,60 @@ impl HttpClientSource for ScopedClient<'_> {
     ) -> Result<reqwest::Client, reqwest::Error> {
         options.purpose = Some(self.purpose);
         self.source.http_client(options)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pools_are_isolated_by_purpose_proxy_credentials_dns_and_retry_policy() {
+        let factory = Arc::new(HttpClientFactory::default());
+        let source = factory.handle(HttpPurpose::General);
+        let address = "127.0.0.1:8080".parse().unwrap();
+        let changed = "127.0.0.1:8081".parse().unwrap();
+        for _ in 0..2 {
+            source.http_client(ClientOptions::default()).unwrap();
+            source
+                .http_client(ClientOptions {
+                    purpose: Some(HttpPurpose::Oauth),
+                    ..Default::default()
+                })
+                .unwrap();
+            source
+                .http_client(ClientOptions {
+                    no_retry: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            for password in ["fixture-one", "fixture-two"] {
+                source
+                    .http_client(ClientOptions {
+                        proxy_url: Some("http://127.0.0.1:8088"),
+                        proxy_auth: Some(("fixture-user", password)),
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+            for address in [address, changed] {
+                source
+                    .http_client(ClientOptions {
+                        pins: &[("fixture.invalid", &[address])],
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+        }
+        assert_eq!(factory.snapshot().clients.lock().unwrap().len(), 7);
+        source
+            .http_client(ClientOptions {
+                pins: &[("fixture.invalid", &[address, address])],
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(factory.snapshot().clients.lock().unwrap().len(), 7);
+        let independent = HttpClientFactory::default();
+        assert_eq!(independent.snapshot().clients.lock().unwrap().len(), 0);
     }
 }

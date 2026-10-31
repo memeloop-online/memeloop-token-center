@@ -1266,6 +1266,7 @@ pub struct StatsSummary {
     pub total_requests: i64,
     pub successful_requests: i64,
     pub failed_requests: i64,
+    pub pending_requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_usage: CacheStats,

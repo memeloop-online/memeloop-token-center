@@ -4,6 +4,7 @@ use crate::model::{RequestFinancialState, RequestLifecycleState, RequestUsageBas
 use rust_decimal::Decimal;
 
 mod conversation_projection;
+mod unknown_bridge;
 
 struct Fixture {
     isolated: Option<PostgresTestDatabase>,
@@ -46,6 +47,25 @@ impl Fixture {
         isolated: Option<PostgresTestDatabase>,
         tenant: &str,
     ) -> Self {
+        Self::create_with_mode(database, isolated, tenant, EnforcementMode::Prepaid).await
+    }
+
+    async fn create_with_mode(
+        database: Database,
+        isolated: Option<PostgresTestDatabase>,
+        tenant: &str,
+        enforcement_mode: EnforcementMode,
+    ) -> Self {
+        Self::create_with_currency(database, isolated, tenant, enforcement_mode, "USD").await
+    }
+
+    async fn create_with_currency(
+        database: Database,
+        isolated: Option<PostgresTestDatabase>,
+        tenant: &str,
+        enforcement_mode: EnforcementMode,
+        currency: &str,
+    ) -> Self {
         database.migrate().await.unwrap();
         let pepper = b"operational receipt regression";
         let issued = database
@@ -54,9 +74,9 @@ impl Fixture {
                     tenant_external_id: tenant.into(),
                     principal_external_id: "member".into(),
                     alias: "operational-test".into(),
-                    currency: "USD".into(),
+                    currency: currency.into(),
                     policy: KeyPolicy {
-                        enforcement_mode: EnforcementMode::Prepaid,
+                        enforcement_mode,
                         ..KeyPolicy::default()
                     },
                     initial_balance: Decimal::ONE,
@@ -71,7 +91,7 @@ impl Fixture {
             .await
             .unwrap();
         let price = database
-            .upsert_model_price("operational-model", "USD", Decimal::ONE, Decimal::ONE)
+            .upsert_model_price("operational-model", currency, Decimal::ONE, Decimal::ONE)
             .await
             .unwrap();
         let request_id = Uuid::now_v7();
@@ -204,7 +224,7 @@ impl Fixture {
         );
         assert!(row.get::<Option<i64>, _>("completed_at").is_none());
         assert!(row.get::<Option<i64>, _>("actual_micros").is_none());
-        for name in ["ledgers", "outboxes", "facts"] {
+        for name in ["ledgers", "facts"] {
             assert_eq!(row.get::<i64, _>(name), 0, "{name}");
         }
     }
@@ -353,8 +373,6 @@ async fn unsettled_requests_count_as_failures_in_success_rates(fixture: Fixture)
         to_created_at: Some(created_at),
         ..StatsFilter::default()
     };
-    // Without any terminal evidence the request still lands in the denominator
-    // as a failure: unknown settlement is never dropped from success rates.
     let unsettled = fixture
         .database
         .stats_filtered(fixture.key.key_id, filter.clone())
@@ -362,7 +380,8 @@ async fn unsettled_requests_count_as_failures_in_success_rates(fixture: Fixture)
         .unwrap();
     assert_eq!(unsettled.summary.total_requests, 1);
     assert_eq!(unsettled.summary.successful_requests, 0);
-    assert_eq!(unsettled.summary.failed_requests, 1);
+    assert_eq!(unsettled.summary.failed_requests, 0);
+    assert_eq!(unsettled.summary.pending_requests, 1);
     assert_eq!(unsettled.summary.total_cost, None);
     assert!(unsettled.summary.costs.is_empty());
     assert_eq!(unsettled.by_model.len(), 1);
@@ -380,8 +399,8 @@ async fn unsettled_requests_count_as_failures_in_success_rates(fixture: Fixture)
         )
         .await
         .unwrap();
-    assert_eq!(errored.summary.total_requests, 1);
-    assert_eq!(errored.summary.failed_requests, 1);
+    assert_eq!(errored.summary.total_requests, 0);
+    assert_eq!(errored.summary.failed_requests, 0);
     let succeeded = fixture
         .database
         .stats_filtered(

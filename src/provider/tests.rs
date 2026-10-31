@@ -79,10 +79,9 @@ fn hkdf_key_derivation_is_deterministic_and_separated_from_legacy() {
 #[test]
 fn envelope_aad_is_domain_separated_and_tamper_evident() {
     let key_material = b"a key material with at least 32 bytes";
-    let envelope =
-        seal_private_json(&json!({"secret": "value"}), key_material, b"domain-a").unwrap();
+    let envelope = seal_envelope(&json!({"secret": "value"}), key_material, b"domain-a").unwrap();
     assert!(
-        open_private_json::<Value>(&envelope, key_material, b"domain-b").is_err(),
+        open_envelope::<Value>(&envelope, key_material, b"domain-b").is_err(),
         "an envelope must not open under a different protocol domain"
     );
     let mut bytes = envelope.into_bytes();
@@ -90,7 +89,7 @@ fn envelope_aad_is_domain_separated_and_tamper_evident() {
     bytes[index] = if bytes[index] == b'A' { b'B' } else { b'A' };
     let tampered = String::from_utf8(bytes).unwrap();
     assert!(
-        open_private_json::<Value>(&tampered, key_material, b"domain-a").is_err(),
+        open_envelope::<Value>(&tampered, key_material, b"domain-a").is_err(),
         "authenticated encryption must reject modified ciphertext"
     );
 }

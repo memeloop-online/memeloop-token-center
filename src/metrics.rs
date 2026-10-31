@@ -529,6 +529,7 @@ impl Metrics {
         self.inner.proxy_memory_rejections[stage as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_request_archive_gap(&self, reason: RequestArchiveGapReason) {
         self.inner.request_archive_gaps[reason.index()].fetch_add(1, Ordering::Relaxed);
     }

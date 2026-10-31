@@ -14,7 +14,8 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{UpstreamCredential, open_private_json, seal_private_json},
+    plain_json::{decode_handle, encode_handle},
+    provider::UpstreamCredential,
 };
 
 use super::OAuthReauthorizationTarget;
@@ -31,9 +32,6 @@ const DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const DEVICE_TOKEN_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const JWKS_ENDPOINT: &str = "https://auth.openai.com/.well-known/jwks.json";
 const EXPECTED_ISSUER: &str = "https://auth.openai.com";
-const SESSION_AAD: &[u8] = b"memeloop-token-center/openai-codex-device-login/v1";
-const STATE_AAD: &[u8] = b"memeloop-token-center/openai-codex-device-state/v1";
-const READY_AAD: &[u8] = b"memeloop-token-center/openai-codex-device-ready/v1";
 const SESSION_LIFETIME_MILLIS: i64 = 15 * 60 * 1_000;
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const MIN_POLL_SECONDS: u64 = 1;
@@ -141,7 +139,6 @@ struct CodexDeviceEndpoints {
 }
 
 struct CodexDevicePollRuntime<'a> {
-    key_material: &'a [u8],
     now: i64,
     scope: CodexDevicePollScope<'a>,
     allow_test_loopback: bool,
@@ -247,7 +244,7 @@ async fn start_codex_device_login_at(
     http: &dyn crate::http_settings::HttpClientSource,
     db: &Database,
     input: StartCodexDeviceLogin,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     allow_test_loopback: bool,
     endpoints: &CodexDeviceEndpoints,
@@ -311,7 +308,7 @@ async fn start_codex_device_login_at(
         flow_kind: "openai_codex_device".to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id: state.operator_service_id,
-        state_ciphertext: super::seal_oauth_login_state(&state, key_material, STATE_AAD)?,
+        state_ciphertext: super::seal_oauth_login_state(&state)?,
         next_poll_at: not_before,
         expires_at,
     })
@@ -322,7 +319,7 @@ async fn start_codex_device_login_at(
         driver: PROVIDER_DRIVER,
         verification_url,
         user_code,
-        session_token: seal_private_json(&session, key_material, SESSION_AAD)?,
+        session_token: encode_handle(&session)?,
         expires_at,
         poll_after_seconds: poll_interval_seconds,
         security_notice: "only_continue_if_you_started_this_login",
@@ -333,7 +330,7 @@ pub async fn poll_codex_device_login(
     db: &Database,
     http: &dyn crate::http_settings::HttpClientSource,
     session_token: &str,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     scope: CodexDevicePollScope<'_>,
     allow_test_loopback: bool,
@@ -343,7 +340,6 @@ pub async fn poll_codex_device_login(
         db,
         session_token,
         CodexDevicePollRuntime {
-            key_material,
             now,
             scope,
             allow_test_loopback,
@@ -356,7 +352,7 @@ pub async fn poll_codex_device_login(
 pub async fn recover_codex_device_session_token(
     db: &Database,
     session_id: Uuid,
-    key_material: &[u8],
+    _key_material: &[u8],
     scope: CodexDevicePollScope<'_>,
 ) -> Result<String, AppError> {
     let (reference, ciphertext) = db.codex_login_session_reference(session_id).await?;
@@ -367,7 +363,7 @@ pub async fn recover_codex_device_session_token(
     {
         return Err(AppError::Forbidden);
     }
-    let state: CodexDeviceLoginState = open_private_json(&ciphertext, key_material, STATE_AAD)?;
+    let state: CodexDeviceLoginState = decode_handle(&ciphertext)?;
     if state.session_id != reference.session_id
         || state.tenant_external_id != reference.tenant_external_id
         || state.operator_service_id != reference.operator_service_id
@@ -375,17 +371,13 @@ pub async fn recover_codex_device_session_token(
     {
         return Err(AppError::Forbidden);
     }
-    seal_private_json(
-        &CodexDeviceSessionToken {
-            session_id,
-            tenant_external_id: state.tenant_external_id,
-            operator_service_id: state.operator_service_id,
-            poll_interval_seconds: state.poll_interval_seconds,
-            expires_at: state.expires_at,
-        },
-        key_material,
-        SESSION_AAD,
-    )
+    encode_handle(&CodexDeviceSessionToken {
+        session_id,
+        tenant_external_id: state.tenant_external_id,
+        operator_service_id: state.operator_service_id,
+        poll_interval_seconds: state.poll_interval_seconds,
+        expires_at: state.expires_at,
+    })
 }
 
 async fn poll_codex_device_login_at(
@@ -395,15 +387,13 @@ async fn poll_codex_device_login_at(
     runtime: CodexDevicePollRuntime<'_>,
 ) -> Result<CodexDevicePollResult, AppError> {
     let CodexDevicePollRuntime {
-        key_material,
         now,
         scope,
         allow_test_loopback,
         endpoints,
     } = runtime;
-    let session: CodexDeviceSessionToken =
-        open_private_json(session_token, key_material, SESSION_AAD)
-            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    let session: CodexDeviceSessionToken = decode_handle(session_token)
+        .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if scope
         .required_tenant
         .is_some_and(|tenant| tenant != session.tenant_external_id)
@@ -439,7 +429,7 @@ async fn poll_codex_device_login_at(
             lease_owner,
             ready_ciphertext,
         } => {
-            let ready = open_private_json(&ready_ciphertext, key_material, READY_AAD)?;
+            let ready = decode_handle(&ready_ciphertext)?;
             return Ok(CodexDevicePollResult::Ready {
                 lease_owner,
                 login: Box::new(ready),
@@ -449,8 +439,7 @@ async fn poll_codex_device_login_at(
             lease_owner,
             state_ciphertext,
         } => {
-            let state: CodexDeviceLoginState =
-                open_private_json(&state_ciphertext, key_material, STATE_AAD)?;
+            let state: CodexDeviceLoginState = decode_handle(&state_ciphertext)?;
             (lease_owner, state)
         }
     };
@@ -508,12 +497,8 @@ async fn poll_codex_device_login_at(
             return Err(device_error());
         }
         state.device_token = Some(device_token);
-        db.replace_oauth_login_poll_state(
-            state.session_id,
-            lease_owner,
-            seal_private_json(&state, key_material, STATE_AAD)?,
-        )
-        .await?;
+        db.replace_oauth_login_poll_state(state.session_id, lease_owner, encode_handle(&state)?)
+            .await?;
     }
     let token = if let Some(token) = state.issued_token.clone() {
         token
@@ -522,12 +507,8 @@ async fn poll_codex_device_login_at(
             "codex_device_poll_codex_device_login_at_1",
         ))?;
         state.exchange_dispatched = true;
-        db.replace_oauth_login_poll_state(
-            state.session_id,
-            lease_owner,
-            seal_private_json(&state, key_material, STATE_AAD)?,
-        )
-        .await?;
+        db.replace_oauth_login_poll_state(state.session_id, lease_owner, encode_handle(&state)?)
+            .await?;
         let token = exchange_authorization_code(
             http,
             &device_token.authorization_code,
@@ -539,12 +520,8 @@ async fn poll_codex_device_login_at(
         .await?;
         state.issued_token = Some(token.clone());
         state.token_received_at = Some(now);
-        db.replace_oauth_login_poll_state(
-            state.session_id,
-            lease_owner,
-            seal_private_json(&state, key_material, STATE_AAD)?,
-        )
-        .await?;
+        db.replace_oauth_login_poll_state(state.session_id, lease_owner, encode_handle(&state)?)
+            .await?;
         token
     };
     let claims = verify_id_token(
@@ -592,7 +569,7 @@ async fn poll_codex_device_login_at(
         },
         reauthorize: state.reauthorize,
     };
-    let ready_ciphertext = seal_private_json(&ready, key_material, READY_AAD)?;
+    let ready_ciphertext = encode_handle(&ready)?;
     db.stage_oauth_login_ready(state.session_id, lease_owner, ready_ciphertext, now)
         .await?;
     match db
@@ -604,11 +581,7 @@ async fn poll_codex_device_login_at(
             ready_ciphertext,
         } => Ok(CodexDevicePollResult::Ready {
             lease_owner,
-            login: Box::new(open_private_json(
-                &ready_ciphertext,
-                key_material,
-                READY_AAD,
-            )?),
+            login: Box::new(decode_handle(&ready_ciphertext)?),
         }),
         OAuthLoginClaim::Consumed { account_id } => Ok(CodexDevicePollResult::Consumed {
             account_id,
@@ -1022,7 +995,6 @@ mod tests {
             &restarted_database,
             &recovered_token,
             CodexDevicePollRuntime {
-                key_material,
                 now: now + 1_000,
                 scope: CodexDevicePollScope {
                     required_tenant: Some("codex-device-test"),

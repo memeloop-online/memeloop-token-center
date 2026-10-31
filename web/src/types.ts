@@ -327,6 +327,7 @@ export interface SelfStats {
     total_requests: number;
     successful_requests: number;
     failed_requests: number;
+    pending_requests?: number;
     input_tokens: number;
     output_tokens: number;
     cache_usage?: CacheStats;

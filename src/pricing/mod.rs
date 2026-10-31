@@ -20,7 +20,6 @@ pub use types::{ModelPriceSyncResult, SyncCandidate, SyncCandidateSet, SyncSourc
 pub const MAX_SYNC_MODELS: usize = 500;
 pub(crate) static MODEL_PRICE_SYNC_PERMITS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(2);
-const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SOURCE_PRICES: usize = 20_000;
 const MAX_CANDIDATES_PER_MODEL: usize = 8;
 

@@ -46,7 +46,10 @@ impl ArchiveStagingObjectStore for CanaryWorkerStore {
         &self,
         _key: ArchiveStagingKey,
     ) -> Result<(), AppError> {
-        Err(AppError::storage("local_storage_failed"))
+        Err(AppError::from(object_store::Error::Generic {
+            store: "security-log-worker-store",
+            source: Box::new(std::io::Error::other(WORKER_CANARY)),
+        }))
     }
 
     async fn archive_staging_segment_is_empty(
@@ -154,7 +157,10 @@ async fn proxy_oauth_database_and_object_store_never_log_or_return_canaries() {
             );
         }
         let staging_key = ArchiveStagingKey::new(
-            ArchiveStagingOwner::ProxyRequest(uuid::Uuid::now_v7()),
+            // A missing proxy request is protected until its conversation
+            // archive commits. Use an unreferenced synchronous attempt so the
+            // reaper reaches the failing object-store operation.
+            ArchiveStagingOwner::SynchronousRequest(uuid::Uuid::now_v7()),
             ArchiveStagingPurpose::Request,
             uuid::Uuid::now_v7(),
         )

@@ -19,6 +19,16 @@ use crate::{
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+fn confirmed_not_executed(input: &FinishProxyRequest<'_>) -> bool {
+    use crate::model::{RequestTerminalCause, RequestUsageBasis};
+    matches!(
+        input.terminal_cause,
+        Some(RequestTerminalCause::GatewayPreAdmission)
+    ) && input.usage == TokenUsage::default()
+        && input.usage_basis == Some(RequestUsageBasis::NotObserved)
+        && (400..=599).contains(&input.status_code)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(remote = "UsageReservation")]
 struct ReservationWire {
@@ -1150,14 +1160,21 @@ impl Journal {
             let result = match snapshot.terminal() {
                 Ok(input) => {
                     if let Some(claim) = snapshot.claim.as_ref() {
-                        if input.usage_basis
-                            == Some(crate::model::RequestUsageBasis::ProviderReported)
-                        {
+                        let evidence = match input.usage_basis {
+                            Some(crate::model::RequestUsageBasis::ProviderReported) => {
+                                Some(crate::db::PendingProxySettlementEvidence::ProviderReported)
+                            }
+                            _ if confirmed_not_executed(&input) => Some(
+                                crate::db::PendingProxySettlementEvidence::ConfirmedNotExecuted,
+                            ),
+                            _ => None,
+                        };
+                        if let Some(evidence) = evidence {
                             database
                                 .finish_pending_proxy_settlement(
                                     claim,
                                     receipt_id,
-                                    crate::db::PendingProxySettlementEvidence::ProviderReported,
+                                    evidence,
                                     input,
                                     attribution,
                                 )

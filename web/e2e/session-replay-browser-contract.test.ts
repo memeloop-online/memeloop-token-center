@@ -208,7 +208,7 @@ test('large archive content is explicit, paged to its real end, and cleared on v
     const zhPage = await browser.newPage();
     await zhPage.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
     await zhPage.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/session-replay.html?full=1&invalid-payload=1`);
-    const openZh = zhPage.getByRole('button', { name: '读取完整响应内容', exact: true });
+    const openZh = zhPage.getByRole('button', { name: '读取完整原始返回 JSON内容', exact: true });
     await openZh.waitFor();
     await openZh.click();
     await zhPage.getByRole('alert').getByText('归档格式无法读取。', { exact: true }).waitFor();

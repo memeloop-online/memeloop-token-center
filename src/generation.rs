@@ -36,7 +36,8 @@ use crate::{
         ArchivedGenerationAsset, GenerationJobWork, GenerationStagedAssets, ProviderGenerationAsset,
     },
     network,
-    provider::{ResolvedUpstream, open_private_json, seal_private_json},
+    plain_json::{decode_json, encode_json},
+    provider::ResolvedUpstream,
 };
 
 const MAX_CONTROL_BODY: usize = 4 * 1024 * 1024;
@@ -46,7 +47,6 @@ const MAX_SILICONFLOW_VIDEO_ASSETS: usize = 1;
 const MAX_FAILURES: i64 = 20;
 const MAX_JOB_AGE_MILLIS: i64 = 24 * 60 * 60 * 1_000;
 pub(crate) const PROVIDER_REFERENCE_PREFIX: &str = "provider-reference-json:";
-const PROVIDER_REFERENCE_AAD: &[u8] = b"memeloop-token-center/generation-provider-reference/v1";
 
 #[derive(Deserialize, Serialize)]
 struct ProviderAssetReference {
@@ -54,48 +54,24 @@ struct ProviderAssetReference {
 }
 
 pub(crate) fn seal_provider_asset_reference(
-    owner_kind: &str,
-    owner_id: uuid::Uuid,
     assets: &[ProviderGenerationAsset],
-    key_material: &[u8],
 ) -> Result<String, AppError> {
-    let aad = provider_reference_aad(owner_kind, owner_id);
-    let envelope = seal_private_json(
-        &ProviderAssetReference {
-            assets: assets.to_vec(),
-        },
-        key_material,
-        &aad,
-    )?;
+    let envelope = encode_json(&ProviderAssetReference {
+        assets: assets.to_vec(),
+    })?;
     Ok(format!("{PROVIDER_REFERENCE_PREFIX}{envelope}"))
 }
 
 pub(crate) fn open_provider_asset_reference(
-    owner_kind: &str,
-    owner_id: uuid::Uuid,
     reference: &str,
-    key_material: &[u8],
 ) -> Result<Vec<ProviderGenerationAsset>, AppError> {
     let envelope = reference
         .strip_prefix(PROVIDER_REFERENCE_PREFIX)
         .ok_or(AppError::internal(
             "generation_open_provider_asset_reference_1",
         ))?;
-    let aad = provider_reference_aad(owner_kind, owner_id);
-    let reference: ProviderAssetReference = open_private_json(envelope, key_material, &aad)?;
+    let reference: ProviderAssetReference = decode_json(envelope)?;
     Ok(reference.assets)
-}
-
-fn provider_reference_aad(owner_kind: &str, owner_id: uuid::Uuid) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(
-        PROVIDER_REFERENCE_AAD.len() + owner_kind.len() + owner_id.as_bytes().len() + 2,
-    );
-    aad.extend_from_slice(PROVIDER_REFERENCE_AAD);
-    aad.push(0);
-    aad.extend_from_slice(owner_kind.as_bytes());
-    aad.push(0);
-    aad.extend_from_slice(owner_id.as_bytes());
-    aad
 }
 
 /// Begins a non-secret, uniquely tracked staging attempt. The durable digest

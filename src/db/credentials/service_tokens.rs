@@ -230,15 +230,7 @@ impl Database {
         )
         .await?
         {
-            let issued = open_rotation_replay::<StoredIssuedServiceToken>(
-                replay,
-                SERVICE_TOKEN_ROTATION_RESOURCE,
-                service_id,
-                idempotency_key,
-                &request_hash,
-                pepper,
-                now,
-            )?;
+            let issued = open_rotation_replay::<StoredIssuedServiceToken>(replay, now)?;
             transaction.commit().await?;
             return Ok(issued.into());
         }
@@ -313,7 +305,6 @@ impl Database {
             service_id,
             &request_hash,
             expires_at,
-            pepper,
         )
         .await?;
         transaction.commit().await?;

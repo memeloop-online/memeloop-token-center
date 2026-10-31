@@ -447,7 +447,7 @@ async fn apply_traffic_plugin(
         Some(
             state
                 .proxy_memory_budget
-                .temporary(64 * 1024 * 1024 + input_length.max(16 * 1024 * 1024).saturating_mul(5))
+                .temporary(input_length.saturating_mul(5))
                 .map_err(|error| {
                     named_memory_rejection(
                         "proxy_memory_plugin",
@@ -464,7 +464,7 @@ async fn apply_traffic_plugin(
     let plugin_configurations = plugins
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
-    let plugin_request = original_request_json.clone();
+    let plugin_request = original_request_json;
     #[cfg(feature = "experimental-plugin-revisions")]
     let application_snapshot = state.pinned_application_plugins.clone();
     let plugin_context = RequestContext {
@@ -476,7 +476,7 @@ async fn apply_traffic_plugin(
         config_json: "{}".to_owned(),
     };
     let metrics = state.metrics.clone();
-    let plugin_decision =
+    let (plugin_decision, original_request_json) =
         plugin_execution::run(state.metrics.clone(), Phase::PostAuth, move || {
             let _temporary_memory = temporary_memory;
             let result = (|| {
@@ -496,15 +496,17 @@ async fn apply_traffic_plugin(
                     memory.as_deref(),
                 )
             })();
-            result.map_err(|error| {
-                named_memory_rejection(
-                    "proxy_memory_plugin",
-                    metrics.observe_proxy_memory_error(
-                        crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                        error,
-                    ),
-                )
-            })
+            result
+                .map(|decision| (decision, plugin_request))
+                .map_err(|error| {
+                    named_memory_rejection(
+                        "proxy_memory_plugin",
+                        metrics.observe_proxy_memory_error(
+                            crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                            error,
+                        ),
+                    )
+                })
         })
         .await?;
     if !plugin_decision.allow {
@@ -626,12 +628,27 @@ fn named_memory_rejection(stage: &'static str, error: AppError) -> AppError {
     error.name_if_overloaded(stage)
 }
 
-pub(super) fn component_provider_timeout(config: &Value) -> Duration {
-    Duration::from_secs(
-        config
-            .get("timeout_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(120)
-            .clamp(1, 120),
-    )
+/// Only explicit account configuration adds a request-local deadline. Shared
+/// client defaults and purpose overrides are installed by the HTTP factory.
+pub(super) fn configured_http_timeout(config: &Value) -> Result<Option<Duration>, &'static str> {
+    let Some(value) = config.get("timeout_seconds") else {
+        return Ok(None);
+    };
+    let seconds = value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|seconds| {
+                    seconds.fract() == 0.0 && *seconds > 0.0 && *seconds < u64::MAX as f64
+                })
+                .map(|seconds| seconds as u64)
+        })
+        .filter(|seconds| *seconds > 0)
+        .ok_or("invalid_request_timeout")?;
+    let duration = Duration::from_secs(seconds);
+    tokio::time::Instant::now()
+        .checked_add(duration)
+        .ok_or("invalid_request_timeout")?;
+    Ok(Some(duration))
 }

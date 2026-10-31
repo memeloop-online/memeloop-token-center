@@ -2614,10 +2614,23 @@ async fn execute_component_provider(
             .await;
         }
     };
+    let timeout = match super::traffic::configured_http_timeout(config) {
+        Ok(timeout) => timeout,
+        Err(_) => {
+            return finish_component_provider_failure(
+                &request,
+                Some("component_request_timeout"),
+                "provider_invalid_config",
+            )
+            .await;
+        }
+    };
     let mut upstream_request = outbound_http
         .request(prepared.method, target)
-        .timeout(component_provider_timeout(config))
         .body(prepared.body);
+    if let Some(timeout) = timeout {
+        upstream_request = upstream_request.timeout(timeout);
+    }
     for (name, value) in prepared.headers {
         let name = match reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
             Ok(name) => name,
@@ -3374,6 +3387,7 @@ async fn finish_buffered_request_before_deadline(
             },
             crate::response_archive_spool::BufferedArchivePurpose::Response,
             body.clone(),
+            request.memory.clone(),
         );
     }
     if let Some(identity) = request.session_preference {
