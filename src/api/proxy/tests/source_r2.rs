@@ -17,12 +17,6 @@ async fn postgres_source_archive_pool_locked_still_dispatches_and_reaches_eof() 
     let directory = tempfile::tempdir().unwrap();
     let mut config = Config::for_test(isolated.to_string());
     config.responses_request_spool_path = directory.path().join("spool").display().to_string();
-    let state = crate::db::Database::with_source_pool_timeout_for_test(
-        Duration::from_secs(30),
-        AppState::initialize(config),
-    )
-    .await
-    .unwrap();
     for (protocol, endpoint, response_body) in [
         (
             "openai",
@@ -53,6 +47,15 @@ async fn postgres_source_archive_pool_locked_still_dispatches_and_reaches_eof() 
             }),
         ),
     ] {
+        // Each held-pool observation owns its own failure counter. A previous
+        // protocol's legitimate background retry after releasing that pool
+        // must not be attributed to this protocol's blocked forwarding phase.
+        let state = crate::db::Database::with_source_pool_timeout_for_test(
+            Duration::from_secs(30),
+            AppState::initialize(config.clone()),
+        )
+        .await
+        .unwrap();
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(endpoint))
@@ -146,16 +149,34 @@ async fn postgres_source_archive_pool_locked_still_dispatches_and_reaches_eof() 
         .expect("dispatch, first byte and EOF must precede release of the archive connection");
         assert!(String::from_utf8_lossy(&delivered).contains("source R2 delivered"));
         upstream.verify().await;
-        assert_eq!(state.db.request_source_write_failures_for_test(), 0);
+        assert_eq!(
+            state.db.request_source_write_failures_for_test(),
+            0,
+            "{endpoint}: no source write may fail while its archive connection is held"
+        );
         drop(held);
         responses_transport::wait_for_key_settlement(&state, issued.key_id).await;
         let requests = state.db.list_requests(issued.key_id, 10).await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].status_code, Some(200));
-        state.db.drain_gateway_persistence_for_test().await;
+        // This protocol's fixture is closing; keep source uploads and terminal
+        // tasks alive until their owners finish, before closing its pools.
+        tokio::time::timeout(Duration::from_secs(5), state.drain_proxy_tasks())
+            .await
+            .expect("bounded source fixture shutdown");
+        let archived = state
+            .db
+            .request_archive_refs(issued.key_id, requests[0].request_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            archived.request_archive_state,
+            crate::model::RequestArchiveState::Bound,
+            "{endpoint}: releasing the pool must allow source persistence to finish"
+        );
+        state.persistence.drain_for_test().await;
+        state.db.close().await;
     }
-    state.persistence.drain_for_test().await;
-    state.db.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await
