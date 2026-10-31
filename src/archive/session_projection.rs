@@ -1594,12 +1594,31 @@ mod tests {
             .get_conversation_manifest(tenant, &root, 1024 * 1024)
             .await
             .unwrap();
-        assert!(
-            manifest
-                .gaps
-                .iter()
-                .any(|gap| gap == "external_media_not_captured")
-        );
+        let mut head = manifest.head;
+        let mut found = false;
+        while let Some(prefix) = head {
+            let node: super::super::conversation::PrefixNode = store
+                .get_conversation_json(tenant, &prefix.object, 1024 * 1024)
+                .await
+                .unwrap();
+            let event: Value = store
+                .get_conversation_json(tenant, &node.event, 1024 * 1024)
+                .await
+                .unwrap();
+            if event["kind"] == "document" {
+                assert_eq!(event["document"], document);
+                assert!(
+                    event["gaps"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|gap| gap == "external_media_not_captured")
+                );
+                found = true;
+            }
+            head = node.parent;
+        }
+        assert!(found, "request event retains the media gap and exact URL");
         assert_eq!(store.get(&locator).await.unwrap(), original);
     }
 
