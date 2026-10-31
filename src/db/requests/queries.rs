@@ -636,12 +636,11 @@ fn build_request_list_query(
         push_identity_filter_joins(&mut query, "u", filter);
         query.push(" WHERE 1 = 1");
         push_archive_request_filters(&mut query, scope, filter);
+        push_identity_eligibility(&mut query, scope, "u");
         query.push(" ORDER BY u.source_started_at DESC, u.archive_request_id DESC LIMIT ");
         query.bind_i64(page_limit);
         query.push(" OFFSET 0) u LEFT JOIN conversation_observations observation ON observation.request_id = u.archive_request_id AND observation.key_id = u.key_id AND observation.cluster_id = u.conversation_cluster_id");
         push_operator_identity_joins(&mut query, scope, "u", &RequestListFilter::default());
-        query.push(" WHERE 1 = 1");
-        push_identity_eligibility(&mut query, scope, "u");
         query.push(") AS archive_page");
     }
 

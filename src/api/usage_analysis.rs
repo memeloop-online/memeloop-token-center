@@ -9,13 +9,15 @@ use uuid::Uuid;
 use super::{management_tenant, require_service};
 use crate::{
     AppState,
-    db::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter},
+    db::{UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter},
     error::AppError,
     model::{UsageAnalysisResponse, UsageAnalysisTrendsResponse},
 };
 
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct UsageAnalysisQuery {
+    #[serde(default)]
+    projection: UsageAnalysisProjection,
     tenant_external_id: Option<String>,
     from_created_at: Option<i64>,
     to_created_at: Option<i64>,
@@ -70,11 +72,12 @@ pub(super) async fn internal_usage_analysis(
     headers: HeaderMap,
     Query(query): Query<UsageAnalysisQuery>,
 ) -> Result<Json<UsageAnalysisResponse>, AppError> {
+    let projection = query.projection;
     let (tenant, filter) = authorized_usage_analysis_query(&state, &headers, query).await?;
-    let response = match tenant {
-        Some(tenant) => state.db.operator_usage_analysis(&tenant, filter).await?,
-        None => state.db.global_usage_analysis(filter).await?,
-    };
+    let response = state
+        .db
+        .projected_usage_analysis(tenant.as_deref(), filter, projection)
+        .await?;
     Ok(Json(response))
 }
 
@@ -83,7 +86,32 @@ pub(super) async fn internal_usage_analysis_trends(
     headers: HeaderMap,
     Query(query): Query<UsageAnalysisQuery>,
 ) -> Result<Json<UsageAnalysisTrendsResponse>, AppError> {
+    let projection = query.projection;
     let (tenant, filter) = authorized_usage_analysis_query(&state, &headers, query).await?;
+    if !matches!(
+        projection,
+        UsageAnalysisProjection::Full | UsageAnalysisProjection::Trends
+    ) {
+        return Err(AppError::BadRequest(
+            "the trends endpoint supports only full or trends projection".into(),
+        ));
+    }
+    if projection == UsageAnalysisProjection::Trends {
+        let analysis = state
+            .db
+            .projected_usage_analysis(tenant.as_deref(), filter, projection)
+            .await?;
+        return Ok(Json(UsageAnalysisTrendsResponse {
+            from_created_at: analysis.from_created_at,
+            to_created_at: analysis.to_created_at,
+            granularity: analysis.granularity,
+            time_zone: analysis.time_zone,
+            p95_is_approximate: analysis.p95_is_approximate,
+            p95_method: analysis.p95_method,
+            summary: analysis.summary,
+            time_series: analysis.time_series,
+        }));
+    }
     let response = match tenant {
         Some(tenant) => {
             state

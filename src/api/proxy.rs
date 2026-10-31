@@ -3374,6 +3374,7 @@ async fn finish_buffered_request_before_deadline(
             },
             crate::response_archive_spool::BufferedArchivePurpose::Response,
             body.clone(),
+            request.memory.clone(),
         );
     }
     if let Some(identity) = request.session_preference {

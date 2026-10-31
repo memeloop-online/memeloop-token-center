@@ -8,7 +8,8 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{UpstreamCredential, open_private_json, seal_private_json},
+    plain_json::{decode_handle, encode_handle},
+    provider::UpstreamCredential,
 };
 
 use super::{OAuthReauthorizationTarget, OAuthRefreshRequestGuard};
@@ -28,9 +29,6 @@ const GITHUB_HOST: &str = "github.com";
 const GITHUB_API_VERSION: &str = "2024-12-15";
 const REQUESTED_SCOPE: &str = "repo workflow";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
-const SESSION_AAD: &[u8] = b"memeloop-token-center/github-copilot-device-login/v1";
-const STATE_AAD: &[u8] = b"memeloop-token-center/github-copilot-device-state/v1";
-const READY_AAD: &[u8] = b"memeloop-token-center/github-copilot-device-ready/v1";
 const DEFAULT_POLL_SECONDS: u64 = 5;
 const SLOW_DOWN_SECONDS: u64 = 5;
 const MAX_DEVICE_LIFETIME_SECONDS: i64 = 60 * 60;
@@ -290,7 +288,7 @@ async fn start_at(
     db: &Database,
     http: &dyn crate::http_settings::HttpClientSource,
     input: StartCopilotDeviceLogin,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     allow_test_loopback: bool,
     endpoints: &Endpoints,
@@ -371,7 +369,7 @@ async fn start_at(
         flow_kind: OAUTH_DRIVER.to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id: state.operator_service_id,
-        state_ciphertext: super::seal_oauth_login_state(&state, key_material, STATE_AAD)?,
+        state_ciphertext: super::seal_oauth_login_state(&state)?,
         next_poll_at,
         expires_at,
     })
@@ -380,7 +378,7 @@ async fn start_at(
         driver: PROVIDER_DRIVER,
         verification_url: response.verification_uri,
         user_code: response.user_code,
-        session_token: seal_private_json(&token, key_material, SESSION_AAD)?,
+        session_token: encode_handle(&token)?,
         expires_at,
         poll_after_seconds: poll_interval_seconds,
         security_notice: "only_continue_if_you_started_this_login",
@@ -424,7 +422,7 @@ async fn poll_at(
         allow_test_loopback,
         endpoints,
     } = runtime;
-    let session: SessionToken = open_private_json(session_token, key_material, SESSION_AAD)
+    let session: SessionToken = decode_handle(session_token)
         .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if scope
         .required_tenant
@@ -466,20 +464,13 @@ async fn poll_at(
         } => {
             return Ok(CopilotDevicePollResult::Ready {
                 lease_owner,
-                login: Box::new(open_private_json(
-                    &ready_ciphertext,
-                    key_material,
-                    READY_AAD,
-                )?),
+                login: Box::new(decode_handle(&ready_ciphertext)?),
             });
         }
         OAuthLoginClaim::Claimed {
             lease_owner,
             state_ciphertext,
-        } => (
-            lease_owner,
-            open_private_json::<LoginState>(&state_ciphertext, key_material, STATE_AAD)?,
-        ),
+        } => (lease_owner, decode_handle::<LoginState>(&state_ciphertext)?),
     };
     if state.session_id != session.session_id || state.expires_at != session.expires_at {
         return Err(AppError::Forbidden);
@@ -659,13 +650,8 @@ async fn poll_at(
         api_endpoint: copilot.api_endpoint,
         reauthorize: state.reauthorize,
     };
-    db.stage_oauth_login_ready(
-        state.session_id,
-        lease_owner,
-        seal_private_json(&ready, key_material, READY_AAD)?,
-        now,
-    )
-    .await?;
+    db.stage_oauth_login_ready(state.session_id, lease_owner, encode_handle(&ready)?, now)
+        .await?;
     match db
         .claim_oauth_login_poll(&reference, now, session.poll_interval_seconds)
         .await?
@@ -675,11 +661,7 @@ async fn poll_at(
             ready_ciphertext,
         } => Ok(CopilotDevicePollResult::Ready {
             lease_owner,
-            login: Box::new(open_private_json(
-                &ready_ciphertext,
-                key_material,
-                READY_AAD,
-            )?),
+            login: Box::new(decode_handle(&ready_ciphertext)?),
         }),
         OAuthLoginClaim::Consumed { account_id } => Ok(CopilotDevicePollResult::Consumed {
             account_id,
@@ -734,7 +716,7 @@ async fn reschedule_poll(
     state: &mut LoginState,
     lease_owner: Uuid,
     next_interval_seconds: u64,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
 ) -> Result<(), AppError> {
     if next_interval_seconds == 0 {
@@ -759,7 +741,7 @@ async fn reschedule_poll(
     db.reschedule_oauth_login_poll(
         state.session_id,
         lease_owner,
-        super::seal_oauth_login_state(state, key_material, STATE_AAD)?,
+        super::seal_oauth_login_state(state)?,
         next_poll_at,
         now,
     )
@@ -2256,10 +2238,13 @@ mod tests {
             .await
             .unwrap_err();
             let text = error.to_string();
-            assert_eq!(
-                error.diagnostic_category(),
-                "github_copilot_authorization_failed"
-            );
+            assert!(matches!(
+                &error,
+                AppError::Upstream {
+                    code: "github_copilot_authorization_failed",
+                    ..
+                }
+            ));
             assert!(!text.contains("secret"));
             assert!(!text.contains("raw-super-secret"));
         }

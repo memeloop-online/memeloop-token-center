@@ -38,15 +38,14 @@ pub(crate) fn configured_codex_builder(
     proxy_url: Option<&str>,
 ) -> Result<reqwest::ClientBuilder, reqwest::Error> {
     let mut builder = snapshot
-        .builder(crate::http_settings::HttpPurpose::Codex)
-        .redirect(reqwest::redirect::Policy::none())
+        .builder_with_connect_read_timeouts(
+            crate::http_settings::HttpPurpose::Codex,
+            policy.connect_timeout_millis,
+            policy.read_timeout_millis,
+        )
         // Responses POSTs are not safe for an HTTP client's implicit retry.
         // Candidate failover remains explicit and pre-delivery in the proxy.
         .retry(reqwest::retry::never())
-        .no_proxy()
-        .tcp_keepalive(None::<Duration>)
-        .tcp_keepalive_interval(None::<Duration>)
-        .tcp_keepalive_retries(None::<u32>)
         .http2_keep_alive_interval(keep_alive_interval)
         .http2_keep_alive_timeout(Duration::from_millis(policy.request_timeout_millis))
         .http2_keep_alive_while_idle(false)
@@ -186,6 +185,7 @@ mod tests {
 
     async fn stalled_tls_request(
         settings: crate::http_settings::HttpSettings,
+        policy: CodexTransportPolicy,
     ) -> (
         tokio::task::JoinHandle<Result<reqwest::Response, reqwest::Error>>,
         tokio::task::JoinHandle<()>,
@@ -208,11 +208,7 @@ mod tests {
         });
         let client = configured_codex_builder(
             &factory.snapshot(),
-            CodexTransportPolicy {
-                connect_timeout_millis: Some(1),
-                read_timeout_millis: Some(1),
-                ..CodexTransportPolicy::default()
-            },
+            policy,
             CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
             None,
         )
@@ -227,7 +223,8 @@ mod tests {
 
     #[tokio::test]
     async fn default_connection_survives_old_fixed_windows_and_can_be_cancelled() {
-        let (request, server) = stalled_tls_request(Default::default()).await;
+        let (request, server) =
+            stalled_tls_request(Default::default(), CodexTransportPolicy::default()).await;
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(1_300)).await;
         tokio::task::yield_now().await;
@@ -244,6 +241,33 @@ mod tests {
                 "defaults": {"connect_timeout_ms": 1000}
             }))
             .unwrap(),
+            CodexTransportPolicy {
+                connect_timeout_millis: Some(100),
+                read_timeout_millis: Some(1000),
+                ..CodexTransportPolicy::default()
+            },
+        )
+        .await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_millis(101)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !request.is_finished(),
+            "global value supersedes the shorter account fallback"
+        );
+        tokio::time::advance(Duration::from_millis(900)).await;
+        assert!(request.await.unwrap().unwrap_err().is_timeout());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn inherited_settings_preserve_explicit_account_connection_timeout() {
+        let (request, server) = stalled_tls_request(
+            Default::default(),
+            CodexTransportPolicy {
+                connect_timeout_millis: Some(1000),
+                ..CodexTransportPolicy::default()
+            },
         )
         .await;
         tokio::time::pause();
@@ -260,6 +284,11 @@ mod tests {
                 "purposes": {"codex": {"connect_timeout_ms": null, "read_timeout_ms": null}}
             }))
             .unwrap(),
+            CodexTransportPolicy {
+                connect_timeout_millis: Some(100),
+                read_timeout_millis: Some(1000),
+                ..CodexTransportPolicy::default()
+            },
         )
         .await;
         tokio::time::pause();

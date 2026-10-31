@@ -1098,7 +1098,7 @@ fn synchronous_provider_asset_download(
 fn synchronous_provider_assets(
     row: AnyRow,
     request_id: Uuid,
-    key_material: &[u8],
+    _key_material: &[u8],
 ) -> Result<Vec<GenerationAssetDownload>, AppError> {
     let response_object = row
         .try_get::<Option<String>, _>("response_object")
@@ -1109,28 +1109,25 @@ fn synchronous_provider_assets(
     if !response_object.starts_with(crate::generation::PROVIDER_REFERENCE_PREFIX) {
         return Ok(Vec::new());
     }
-    Ok(crate::generation::open_provider_asset_reference(
-        "request",
-        request_id,
-        &response_object,
-        key_material,
-    )?
-    .into_iter()
-    .map(|asset| GenerationAssetDownload {
-        view: GenerationAssetView {
-            asset_id: asset.asset_id,
-            index: asset.index,
-            mime_type: asset.mime_type,
-            size_bytes: 0,
-            filename: asset.filename,
-        },
-        source: GenerationAssetSource::Provider {
-            owner: GenerationAssetProviderOwner::Request(request_id),
-            url: asset.url,
-            expires_at: asset.expires_at,
-        },
-    })
-    .collect())
+    Ok(
+        crate::generation::open_provider_asset_reference(&response_object)?
+            .into_iter()
+            .map(|asset| GenerationAssetDownload {
+                view: GenerationAssetView {
+                    asset_id: asset.asset_id,
+                    index: asset.index,
+                    mime_type: asset.mime_type,
+                    size_bytes: 0,
+                    filename: asset.filename,
+                },
+                source: GenerationAssetSource::Provider {
+                    owner: GenerationAssetProviderOwner::Request(request_id),
+                    url: asset.url,
+                    expires_at: asset.expires_at,
+                },
+            })
+            .collect(),
+    )
 }
 
 fn synchronous_image_claim_from_row(

@@ -5,10 +5,9 @@ use serde_json::Value;
 use wasmtime::{Store, StoreLimitsBuilder};
 
 use super::{
-    HostState, PLUGIN_MEMORY_BYTES, PLUGIN_TABLE_ELEMENTS, PluginRuntime,
-    PluginServiceDataEndpoint, PluginServiceDataProvenance, PluginServiceDataView,
-    epoch_deadline_ticks, plugin_configuration_schema_digest, plugin_failure,
-    plugin_reported_error,
+    HostState, PLUGIN_TABLE_ELEMENTS, PluginRuntime, PluginServiceDataEndpoint,
+    PluginServiceDataProvenance, PluginServiceDataView, epoch_deadline_ticks,
+    plugin_configuration_schema_digest, plugin_failure, plugin_reported_error,
 };
 use crate::{
     db::PluginServiceDataRefreshErrorCode,
@@ -349,7 +348,7 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline,
-                http_body_limit: endpoint.max_body_bytes,
+                http_body_limit: Some(endpoint.max_body_bytes),
                 http_diagnostic: super::PluginHttpDiagnostic {
                     stage: "not_called",
                     ..super::PluginHttpDiagnostic::default()
@@ -750,8 +749,8 @@ mod tests {
             (12_000_000, 12_000_000, false),
         ] {
             let (_directory, runtime) = service_data_runtime(collect_work, normalize_work).await;
-            assert_eq!(runtime.fuel, 5_000_000);
-            assert_eq!(super::super::PLUGIN_FUEL, 5_000_000);
+            assert_eq!(runtime.fuel, u64::MAX);
+            assert_eq!(super::super::PLUGIN_FUEL, u64::MAX);
             let target = runtime.service_data_targets().unwrap().remove(0);
             let result = runtime.collect_component_service_data(&target);
             if succeeds {

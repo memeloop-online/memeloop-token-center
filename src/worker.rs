@@ -979,7 +979,7 @@ pub(crate) async fn archive_session_body(
     if locators.pending {
         state
             .db
-            .defer_session_body_archive(lease_owner, request_id)
+            .defer_pending_session_body_archive(lease_owner, request_id)
             .await?;
         return Ok(false);
     }
@@ -1001,18 +1001,27 @@ pub(crate) async fn archive_session_body(
             }
             bytes
         }
-        Err(_)
-            if (locators.source_identity.is_some() && !locators.source_failed)
-                || (locators.source_identity.is_none()
-                    && !missing_raw_document(&locators.request)) =>
-        {
-            state
-                .db
-                .defer_session_body_archive(lease_owner, request_id)
-                .await?;
-            return Ok(false);
-        }
         Err(_) => {
+            let retry = if let Some(identity) = locators.source_identity {
+                state
+                    .archive
+                    .source_object_exists(&locators.request)
+                    .await?
+                    || (!locators.source_failed
+                        && !state
+                            .db
+                            .recover_request_source(identity, &locators.request)
+                            .await?)
+            } else {
+                !missing_raw_document(&locators.request)
+            };
+            if retry {
+                state
+                    .db
+                    .defer_session_body_archive(lease_owner, request_id)
+                    .await?;
+                return Ok(false);
+            }
             let inline = state
                 .db
                 .session_body_inline_request(lease_owner, request_id)
@@ -1056,6 +1065,9 @@ pub(crate) async fn archive_session_body(
     {
         request_document = fallback;
     }
+    // Release the request JSON (including unused schemas/private fields) before
+    // loading/parsing the response. Public text moves into the body.
+    let mut body = crate::conversation::SessionBody::from_request_document(request_document);
     // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
     // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
     let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
@@ -1075,29 +1087,52 @@ pub(crate) async fn archive_session_body(
     let return_document = crate::conversation::raw_return_document(&return_bytes)
         .unwrap_or_else(|| serde_json::json!({}));
     drop(return_bytes);
-    let mut body =
-        crate::conversation::session_body_from_documents(&request_document, &return_document);
-    drop(request_document);
-    drop(return_document);
+    body.append_return_document(return_document);
     let pending_media = body.take_media_bytes();
+    let mut media_staging = Vec::new();
+    let mut uploaded_media = std::collections::HashMap::new();
     for (turn_index, part_index, bytes) in pending_media {
-        match state.archive.put_content(bytes::Bytes::from(bytes)).await {
-            Ok(locator) => body.set_media_locator(turn_index, part_index, locator),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    %request_id,
-                    "会话正文归档未能把媒体字节写成 blake3 对象"
-                );
-                return Err(error);
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        if let Some(locator) = uploaded_media.get(&hash) {
+            body.set_media_locator(turn_index, part_index, String::clone(locator));
+            continue;
+        }
+        let attempt = crate::proxy_lifecycle::begin_proxy_archive_attempt(
+            &state.db,
+            request_id,
+            crate::archive_staging::ArchiveStagingPurpose::Media,
+        )
+        .await?;
+        let locator = crate::archive_staging::conversation_media_locator(attempt.lease.key, &hash)?;
+        media_staging.push(attempt.lease);
+        {
+            let upload = state.archive.put(&locator, bytes::Bytes::from(bytes));
+            tokio::pin!(upload);
+            let mut heartbeat = tokio::time::interval(Duration::from_millis(
+                crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
+            ));
+            loop {
+                tokio::select! {
+                    result = &mut upload => {
+                        result?;
+                        break;
+                    }
+                    _ = heartbeat.tick() => {
+                        for lease in &mut media_staging {
+                            if !state.db.heartbeat_archive_staging_write(lease).await? {
+                                return Err(AppError::Conflict("session media staging writer was fenced".into()));
+                            }
+                        }
+                    }
+                }
             }
         }
+        body.set_media_locator(turn_index, part_index, locator.clone());
+        uploaded_media.insert(hash, locator);
     }
-    let (atoms, nodes) = body.into_prefix();
-    let media = body.media_locators(&atoms);
     if !state
         .db
-        .prepare_session_body_archive(lease_owner, request_id, &atoms, &nodes, &media)
+        .prepare_staged_session_body_archive(lease_owner, request_id, body, &media_staging)
         .await?
     {
         return Ok(false);

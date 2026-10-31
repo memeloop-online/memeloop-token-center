@@ -3919,9 +3919,25 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
     let stored_reference = response_refs
         .response_object
         .as_deref()
-        .expect("encrypted provider reference");
-    assert!(!stored_reference.contains("must-not-leak"));
-    assert!(!stored_reference.contains("SECRET_TOKEN"));
+        .expect("plaintext provider reference");
+    let stored_reference: Value = serde_json::from_str(
+        stored_reference
+            .strip_prefix("provider-reference-json:")
+            .expect("provider reference prefix"),
+    )
+    .expect("plaintext provider reference JSON");
+    assert_eq!(stored_reference["assets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        stored_reference["assets"][0]["url"],
+        format!(
+            "{}/generated/SECRET_TOKEN.png?token=must-not-leak",
+            world.mock.as_ref().expect("mock server").uri()
+        )
+    );
+    assert_eq!(
+        stored_reference["assets"][0]["asset_id"],
+        assets[0].view.asset_id.to_string()
+    );
     let detail = world
         .client
         .get(format!(
@@ -4064,6 +4080,21 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
         .expect("URL-backed image stats JSON");
     assert_eq!(stats["summary"]["total_requests"], 1);
     assert_eq!(stats["summary"]["total_cost"], "0.3");
+    let upstream_requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("URL-backed image upstream requests");
+    assert_eq!(
+        upstream_requests
+            .iter()
+            .filter(|request| request.url.path() == "/v1/images/generations")
+            .count(),
+        1,
+        "replay and asset reads must not dispatch another generation"
+    );
 }
 
 #[then("malformed provider range responses are rejected")]
@@ -7314,7 +7345,35 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .await
         .expect("authenticate test key");
     let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-    assert!(refs.request_object.starts_with(&cas_prefix));
+    assert_eq!(
+        refs.request_object,
+        format!("staging/proxy/{request_uuid}/request/{request_uuid}/body.json")
+    );
+    let original_request = state
+        .archive
+        .get(&refs.request_object)
+        .await
+        .expect("original request source object");
+    let upstream_requests = world
+        .mock
+        .as_ref()
+        .expect("mock server")
+        .received_requests()
+        .await
+        .expect("original upstream requests");
+    let original_body = serde_json::to_vec(&json!({
+        "model": "gpt-test",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .expect("original request JSON bytes");
+    assert_eq!(original_request.as_ref(), original_body.as_slice());
+    assert_eq!(
+        upstream_requests
+            .iter()
+            .filter(|request| request.url.path() == "/v1/chat/completions")
+            .count(),
+        1
+    );
     let response_object = refs.response_object.expect("response object");
     assert!(response_object.starts_with(&cas_prefix));
 }
@@ -7937,6 +7996,7 @@ async fn send_buffered_responses_parent_and_child(world: &mut TokenCenterWorld, 
         send_responses_turn(world, &model, "buffered parent", None, false).await,
         StatusCode::OK
     );
+    wait_for_projected_conversation_requests(world, 1).await;
     world.status = Some(
         send_responses_turn(
             world,
@@ -8040,62 +8100,65 @@ async fn own_conversation_detail(world: &TokenCenterWorld) -> Value {
 }
 
 async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expected: usize) {
+    let state = world.state.as_ref().expect("conversation state");
+    let inspection = AnyPool::connect(&state.config.database_url)
+        .await
+        .expect("connect conversation projection inspection pool");
     let key_id = world
         .stable_key_id
         .expect("conversation key id")
         .to_string();
-    let response = world
-        .client
-        .get(format!(
-            "{}/internal/v1/request-events?after_event_at=0",
-            world.service_url
-        ))
-        .bearer_auth("test-service-token")
-        .send()
-        .await
-        .expect("conversation request event stream");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let mut stream = response.bytes_stream();
-    let mut projected = std::collections::HashSet::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let mut frame = String::new();
-        while let Some(chunk) = stream.next().await {
-            frame.push_str(&String::from_utf8_lossy(
-                &chunk.expect("conversation request SSE chunk"),
-            ));
-            while let Some(end) = frame.find("\n\n") {
-                let event = frame[..end].to_owned();
-                frame.drain(..end + 2);
-                let Some(data) = event
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
-                else {
-                    continue;
-                };
-                let event: Value =
-                    serde_json::from_str(data).expect("conversation request event JSON");
-                if event["event_kind"] != "projected" || event["key_id"] != key_id {
-                    continue;
-                }
-                let request_id = event["request_id"]
-                    .as_str()
-                    .and_then(|value| Uuid::parse_str(value).ok())
-                    .expect("projected conversation request id");
-                projected.insert(request_id);
-                if projected.len() >= expected {
-                    return;
-                }
+    let mut snapshot: Vec<Value> = Vec::new();
+    let result = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let rows = sqlx::query(
+                "SELECT o.request_id, o.projected_at, o.statistics_outcome, o.attempts,
+                    request_spool.state AS request_archive_state,
+                    response_spool.state AS response_archive_state,
+                    CAST(CASE WHEN EXISTS (
+                        SELECT 1 FROM conversation_observations observation
+                        WHERE observation.request_id = o.request_id AND observation.key_id = o.key_id
+                    ) THEN 1 ELSE 0 END AS BIGINT) AS observed,
+                    CAST(CASE WHEN EXISTS (
+                        SELECT 1 FROM request_events event
+                        WHERE event.request_id = o.request_id AND event.key_id = o.key_id
+                            AND event.event_kind = 'projected'
+                    ) THEN 1 ELSE 0 END AS BIGINT) AS emitted
+                 FROM conversation_projection_outbox o
+                 LEFT JOIN request_archive_spools request_spool ON request_spool.request_id = o.request_id
+                 LEFT JOIN response_archive_spools response_spool ON response_spool.request_id = o.request_id
+                 WHERE o.key_id = $1",
+            )
+            .bind(&key_id)
+            .fetch_all(&inspection)
+            .await
+            .expect("conversation projection readiness");
+            snapshot = rows.iter().map(|row| json!({
+                "request_id": row.get::<String, _>("request_id"),
+                "projected_at": row.get::<Option<i64>, _>("projected_at"),
+                "outcome": row.get::<Option<String>, _>("statistics_outcome"),
+                "attempts": row.get::<i64, _>("attempts"),
+                "request_archive_state": row.get::<Option<String>, _>("request_archive_state"),
+                "response_archive_state": row.get::<Option<String>, _>("response_archive_state"),
+                "observed": row.get::<i64, _>("observed"),
+                "emitted": row.get::<i64, _>("emitted"),
+            })).collect();
+            if snapshot.len() == expected && snapshot.iter().all(|row| {
+                row["projected_at"].as_i64().is_some()
+                    && row["outcome"] == "session_body"
+                    && row["observed"] == 1
+                    && row["emitted"] == 1
+            }) {
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .unwrap_or_else(|_| {
-        panic!("expected {expected} projected conversation requests for key {key_id} before timeout, observed {projected:?}")
-    });
+    .await;
+    inspection.close().await;
     assert!(
-        projected.len() >= expected,
-        "expected {expected} projected conversation requests, observed {projected:?}"
+        result.is_ok(),
+        "expected {expected} committed conversation projections for key {key_id} before timeout, observed {snapshot:?}"
     );
 }
 
@@ -8412,6 +8475,7 @@ async fn client_sends_explicit_subagent_turns(world: &mut TokenCenterWorld, mode
         .await,
         StatusCode::OK
     );
+    wait_for_projected_conversation_requests(world, 1).await;
     assert_eq!(
         send_subagent_chat(
             world,
@@ -8429,6 +8493,7 @@ async fn client_sends_explicit_subagent_turns(world: &mut TokenCenterWorld, mode
         .await,
         StatusCode::OK
     );
+    wait_for_projected_conversation_requests(world, 2).await;
     world.status = Some(
         send_subagent_chat(
             world,

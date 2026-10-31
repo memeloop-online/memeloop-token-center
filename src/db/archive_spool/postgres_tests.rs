@@ -458,14 +458,18 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
-    assert!(
-        fixture
-            .db
-            .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let unsettled_task = fixture
+        .db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("committed body is uploadable before orphan settlement");
+    assert!(!unsettled_task.successful_terminal);
+    sqlx::query("UPDATE request_archive_spools SET lease_expires_at = 0 WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&fixture.db.pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE usage_reservations SET created_at = 0 WHERE id = (SELECT reservation_id FROM request_records WHERE id = $1)").bind(request_id.to_string()).execute(&fixture.db.pool).await.unwrap();
     assert_eq!(
         fixture.db.release_orphaned_reservations(32).await.unwrap(),
@@ -672,14 +676,6 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
         reservation.id.to_string()
     );
     assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
-    assert!(
-        db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-            .await
-            .unwrap()
-            .is_none()
-    );
-
-    sqlx::query("UPDATE request_records SET completed_at = created_at + 1, status_code = 200, cost_micros = 123 WHERE id = $1").bind(request_id.to_string()).execute(&db.pool).await.unwrap();
     let (left, right) = tokio::join!(
         db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true),
         db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true),
@@ -690,6 +686,8 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
         .collect();
     assert_eq!(tasks.len(), 1, "exactly one HA worker acquires the request");
     let stale = &tasks[0];
+    assert!(!stale.successful_terminal);
+    sqlx::query("UPDATE request_records SET completed_at = created_at + 1, status_code = 200, cost_micros = 123 WHERE id = $1").bind(request_id.to_string()).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE request_archive_spools SET lease_expires_at = 0 WHERE request_id = $1")
         .bind(request_id.to_string())
         .execute(&db.pool)
@@ -869,6 +867,18 @@ impl PgFixture {
             .unwrap();
             sqlx::raw_sql(include_str!(
                 "../../../migrations/common/0106_archive_budget_reservations.sql"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/postgres/0143_archive_spool_storage_accounting.sql"
+            ))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            sqlx::raw_sql(include_str!(
+                "../../../migrations/common/0143_archive_spool_ready_indexes.sql"
             ))
             .execute(&db.pool)
             .await
