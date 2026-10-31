@@ -337,6 +337,53 @@ pub(in crate::api) async fn reconcile_quota_reset(
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct ResetRecovery {
+    expected_updated_at: i64,
+    reason: ResetRecoveryReason,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResetRecoveryReason {
+    SupplierConfirmedNotApplied,
+    OperatorAuthorizedRetry,
+}
+
+impl ResetRecoveryReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::SupplierConfirmedNotApplied => "supplier_confirmed_not_applied",
+            Self::OperatorAuthorizedRetry => "operator_authorized_retry",
+        }
+    }
+}
+
+pub(in crate::api) async fn recover_quota_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, operation_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<QuotaQuery>,
+    Json(body): Json<ResetRecovery>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:write").await?;
+    require_global_service(&service)?;
+    let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
+    let result = crate::upstream_quota::reset::recover(
+        &state,
+        &account,
+        &credential,
+        query.tenant_external_id.trim(),
+        &actor,
+        &operation_id.to_string(),
+        body.expected_updated_at,
+        body.reason.as_str(),
+    )
+    .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
+}
+
 pub(in crate::api) async fn get_quota_reset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -467,6 +514,66 @@ mod tests {
             atomic::{AtomicBool, Ordering},
         },
     };
+
+    #[test]
+    fn reset_recovery_requires_a_closed_reason_and_review_revision() {
+        let valid = json!({"expected_updated_at":42,
+            "reason":"operator_authorized_retry"});
+        assert!(serde_json::from_value::<ResetRecovery>(valid.clone()).is_ok());
+        for field in ["expected_updated_at", "reason"] {
+            let mut missing = valid.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<ResetRecovery>(missing).is_err());
+        }
+        let mut unknown = valid.clone();
+        unknown["reason"] = json!("free-text-secret");
+        assert!(serde_json::from_value::<ResetRecovery>(unknown).is_err());
+        let mut extra = valid;
+        extra["retry"] = json!(true);
+        assert!(serde_json::from_value::<ResetRecovery>(extra).is_err());
+    }
+
+    #[tokio::test]
+    async fn reset_recovery_rejects_tenant_writer_before_supplier_io() {
+        let (state, _directory) = crate::api::tests::test_state().await;
+        state
+            .db
+            .create_tenant("reset-recovery-tenant", None)
+            .await
+            .unwrap();
+        let token = state
+            .db
+            .create_service_token(
+                crate::db::CreateServiceTokenInput {
+                    name: "reset recovery scoped writer".into(),
+                    scopes: vec!["providers:write".into()],
+                    tenant_external_id: Some("reset-recovery-tenant".into()),
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap()
+            .token;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        let result = recover_quota_reset(
+            State(state),
+            headers,
+            Path((Uuid::now_v7(), Uuid::now_v7())),
+            Query(QuotaQuery {
+                tenant_external_id: "reset-recovery-tenant".into(),
+            }),
+            Json(ResetRecovery {
+                expected_updated_at: 42,
+                reason: ResetRecoveryReason::OperatorAuthorizedRetry,
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Forbidden)));
+    }
 
     fn batch_error_code(result: &QuotaBatchResult) -> &str {
         match result {

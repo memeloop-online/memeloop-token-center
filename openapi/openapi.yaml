@@ -2261,6 +2261,61 @@ paths:
           headers:
             Retry-After: { schema: { type: integer, minimum: 1 } }
 
+  "/internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/recover":
+    post:
+      tags:
+        - "Upstream providers"
+      operationId: "recoverUpstreamQuotaReset"
+      summary: "Audit explicit operator authorization to release an unknown reset lock"
+      security:
+        - {"serviceBearer": []}
+      x-required-scope: "providers:write"
+      x-global-operator-only: true
+      description: "Global operator only. Performs a fresh supplier GET and atomically releases only the reviewed unknown operation lock. A read cannot prove non-execution. Preserves unknown state, original dispatch error and baseline. Records reconciled audit with actor, time and manual_lock_released_<reason>. Never consumes a credit or repeats the old request. A new reset requires independent preparation and confirmation in a separate user action. Tenant/account authority and current operation/credential/transport revisions are enforced."
+      parameters:
+        - {"$ref": "#/components/parameters/AccountId"}
+        - {"name": "operation_id", "in": "path", "required": true, "schema": {"type": "string", "format": "uuid"}}
+        - {"name": "tenant_external_id", "in": "query", "required": true, "schema": {"type": "string", "minLength": 1, "maxLength": 200}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: "object"
+              additionalProperties: false
+              required:
+                - "expected_updated_at"
+                - "reason"
+              properties:
+                expected_updated_at:
+                  type: "integer"
+                  format: "int64"
+                  description: "updated_at of the unknown operation explicitly reviewed by the operator; compare-and-swap guard."
+                reason:
+                  type: "string"
+                  enum:
+                    - "supplier_confirmed_not_applied"
+                    - "operator_authorized_retry"
+      responses:
+        "200":
+          description: "Historical unknown operation with lock released and durable operator audit; Cache-Control no-store."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UpstreamQuotaResetOperation"
+        "400":
+          description: "Invalid reason or recovery request."
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: "Stale review, changed credentials or transport, or operation is not a locked unknown result."
+        "503":
+          description: "Fresh supplier GET evidence unavailable; no lock change or credit consumption."
+
   /internal/v1/upstreams/{account_id}/health:
     get:
       tags: [Upstream providers]
@@ -8014,7 +8069,7 @@ components:
         reason: { type: string, enum: [initial, reload, rollback] }
     UpstreamQuotaResetOperation:
       type: object
-      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, settled_at, error_code, audit, effect, consumes_credits]
+      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, settled_at, error_code, audit, effect, consumes_credits, dispatch_diagnostic, quota_refresh_status, manual_unlock_available]
       properties:
         id: { type: string, format: uuid }
         upstream_account_id: { type: string, format: uuid }
@@ -8032,9 +8087,15 @@ components:
         last_reconciled_at: { type: [integer, 'null'], format: int64 }
         reconciled_available_credits: { type: [integer, 'null'], format: int64 }
         reconciled_applicable_credits: { type: [integer, 'null'], format: int64 }
-        settled_at: { type: [integer, 'null'], format: int64, description: Fresh observation time when an accepted operation's exact old available-credit balance no longer applied; not proof that this operation caused the change or reset a quota window. }
+        settled_at:
+          type:
+            - "integer"
+            - "null"
+          format: "int64"
+          description: "Time the account lock was released by a fresh accepted-credit decrease or explicit manual recovery of an unknown result. For unknown, this is not settlement or proof of success; state remains unknown and the reconciled audit reason records manual authorization."
         error_code: { type: [string, 'null'] }
         audit:
+          description: "Most recent 32 events in chronological order; all historical events remain durable. Reconciled error codes include manual_lock_released_supplier_confirmed_not_applied, manual_lock_released_operator_authorized_retry, reset_readback_succeeded, and reset_readback_pending_<safe quota error code>."
           type: array
           maxItems: 32
           items:
@@ -8049,6 +8110,21 @@ components:
               created_at: { type: integer, format: int64 }
         effect: { const: supplier_defined_codex_rate_limits }
         consumes_credits: { const: 1 }
+        dispatch_diagnostic:
+          oneOf:
+            - {"type": "object", "additionalProperties": false, "required": ["stage", "reason", "supplier_http_status"], "properties": {"stage": {"type": "string", "enum": ["prepare", "send", "response"]}, "reason": {"type": "string", "enum": ["credential_invalid", "connect_timeout", "connect_failed", "timeout", "request_invalid", "transport_failed", "unavailable", "supplier_http_status"]}, "supplier_http_status": {"type": ["integer", "null"], "minimum": 100, "maximum": 599}}}
+            - {"type": "null"}
+          description: "Allowlisted dispatch phase and reason only. Connection failures do not prove that consumption was not applied; legacy records report unavailable."
+        quota_refresh_status:
+          type: "string"
+          enum:
+            - "not_attempted"
+            - "pending"
+            - "succeeded"
+          description: "Automatic post-acceptance full quota read only; succeeded does not assert that the supplier reset any particular window. Pending can be refreshed using the ordinary quota GET without consuming again."
+        manual_unlock_available:
+          type: "boolean"
+          description: "True for an unresolved unknown result only. Global operators may explicitly review and authorize recover; quota observations alone never unlock it."
     Health:
       type: object
       additionalProperties: false

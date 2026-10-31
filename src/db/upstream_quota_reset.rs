@@ -30,9 +30,51 @@ pub(crate) struct QuotaResetOperation {
     pub settled_at: Option<i64>,
     pub error_code: Option<String>,
     pub audit: Vec<QuotaResetAuditEvent>,
+    pub dispatch_diagnostic: Option<QuotaResetDispatchDiagnostic>,
+    pub quota_refresh_status: &'static str,
+    pub manual_unlock_available: bool,
     /// The supplier decides which Codex rate limits a credit resets.
     pub effect: &'static str,
     pub consumes_credits: i64,
+}
+
+/// Closed diagnostic vocabulary; never serialize raw HTTP errors or bodies.
+#[derive(Clone, Serialize)]
+pub(crate) struct QuotaResetDispatchDiagnostic {
+    pub stage: &'static str,
+    pub reason: &'static str,
+    pub supplier_http_status: Option<u16>,
+}
+
+impl QuotaResetDispatchDiagnostic {
+    fn from_code(code: Option<&str>) -> Option<Self> {
+        let code = code?;
+        let (stage, reason, status) = match code {
+            "reset_prepare_credential_invalid" => ("prepare", "credential_invalid", None),
+            "reset_send_connect_timeout" => ("send", "connect_timeout", None),
+            "reset_send_connect_failed" => ("send", "connect_failed", None),
+            "reset_send_timeout" => ("send", "timeout", None),
+            "reset_send_request_invalid" => ("send", "request_invalid", None),
+            "reset_send_transport_failed" => ("send", "transport_failed", None),
+            "reset_dispatch_unknown" => ("send", "unavailable", None),
+            "reset_supplier_response_unknown" => ("response", "unavailable", None),
+            _ => {
+                let status = code
+                    .strip_prefix("reset_response_http_")?
+                    .parse::<u16>()
+                    .ok()?;
+                if !(100..=599).contains(&status) {
+                    return None;
+                }
+                ("response", "supplier_http_status", Some(status))
+            }
+        };
+        Some(Self {
+            stage,
+            reason,
+            supplier_http_status: status,
+        })
+    }
 }
 
 pub(crate) struct PrepareQuotaReset {
@@ -307,10 +349,14 @@ impl Database {
         .ok_or(AppError::NotFound)?;
         let audit = sqlx::query(
             "SELECT id, event, actor_service_id, error_code, created_at
-             FROM upstream_quota_reset_audit
-             WHERE operation_id = $1 AND tenant_id = $2 AND upstream_account_id = $3
-             ORDER BY created_at, id
-             LIMIT 32",
+             FROM (
+                 SELECT id, event, actor_service_id, error_code, created_at
+                 FROM upstream_quota_reset_audit
+                 WHERE operation_id = $1 AND tenant_id = $2 AND upstream_account_id = $3
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 32
+             ) recent_audit
+             ORDER BY created_at, id",
         )
         .bind(id)
         .bind(tenant)
@@ -328,10 +374,36 @@ impl Database {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+        let state: String = row.try_get("state")?;
+        let settled_at: Option<i64> = row.try_get("settled_at")?;
+        let error_code: Option<String> = row.try_get("error_code")?;
+        let dispatch_diagnostic = QuotaResetDispatchDiagnostic::from_code(error_code.as_deref());
+        // Display pagination must not discard the durable readback outcome.
+        let latest_readback = sqlx::query_scalar::<_, String>(
+            "SELECT error_code FROM upstream_quota_reset_audit
+             WHERE operation_id = $1 AND tenant_id = $2 AND upstream_account_id = $3
+               AND event = 'reconciled'
+               AND (error_code = 'reset_readback_succeeded'
+                    OR substr(error_code, 1, 23) = 'reset_readback_pending_')
+             ORDER BY created_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(id)
+        .bind(tenant)
+        .bind(account)
+        .fetch_optional(&self.pool)
+        .await?;
+        let quota_refresh_status = match latest_readback.as_deref() {
+            Some("reset_readback_succeeded") => "succeeded",
+            Some(_) => "pending",
+            None if state == "accepted" => "pending",
+            None => "not_attempted",
+        };
+        let manual_unlock_available = state == "unknown" && settled_at.is_none();
         Ok(QuotaResetOperation {
             id: row.try_get("id")?,
             upstream_account_id: row.try_get("upstream_account_id")?,
-            state: row.try_get("state")?,
+            state,
             credential_generation: row.try_get("credential_generation")?,
             available_credits: row.try_get("available_credits")?,
             applicable_credits: row.try_get("applicable_credits")?,
@@ -345,8 +417,11 @@ impl Database {
             last_reconciled_at: row.try_get("last_reconciled_at")?,
             reconciled_available_credits: row.try_get("reconciled_available_credits")?,
             reconciled_applicable_credits: row.try_get("reconciled_applicable_credits")?,
-            settled_at: row.try_get("settled_at")?,
-            error_code: row.try_get("error_code")?,
+            settled_at,
+            error_code,
+            dispatch_diagnostic,
+            quota_refresh_status,
+            manual_unlock_available,
             audit,
             effect: "supplier_defined_codex_rate_limits",
             consumes_credits: 1,
@@ -487,6 +562,103 @@ impl Database {
             )
             .await?;
         }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn record_quota_reset_readback(
+        &self,
+        account: &UpstreamAccountView,
+        operation: &str,
+        actor: &str,
+        error: Option<&str>,
+    ) -> Result<(), AppError> {
+        let mut tx = self.pool.begin().await?;
+        let code = error
+            .map(|error| format!("reset_readback_pending_{error}"))
+            .unwrap_or_else(|| "reset_readback_succeeded".into());
+        insert_audit(
+            &mut tx,
+            operation,
+            &account.tenant_id.to_string(),
+            &account.id.to_string(),
+            "reconciled",
+            Some(actor),
+            Some(&code),
+            unix_millis(),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Explicit human authorization releases only the lock. The historical
+    /// unknown result, baseline, dispatch error and confirmation remain intact.
+    /// A subsequent reset must have a new prepare key and confirmation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn release_unknown_quota_reset(
+        &self,
+        account: &UpstreamAccountView,
+        operation: &str,
+        actor: &str,
+        expected_updated_at: i64,
+        reason: &str,
+        available: i64,
+        applicable: i64,
+        observed_at: i64,
+    ) -> Result<(), AppError> {
+        if !matches!(
+            reason,
+            "supplier_confirmed_not_applied" | "operator_authorized_retry"
+        ) {
+            return Err(AppError::BadRequest("unknown recovery reason".into()));
+        }
+        let tenant = account.tenant_id.to_string();
+        let account_id = account.id.to_string();
+        let now = unix_millis();
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query(
+            "UPDATE upstream_quota_reset_operations
+             SET settled_at = $1, updated_at = $1, last_reconciled_at = $2,
+                 reconciled_available_credits = $3, reconciled_applicable_credits = $4
+             WHERE id = $5 AND tenant_id = $6 AND upstream_account_id = $7
+               AND state = 'unknown' AND settled_at IS NULL AND updated_at = $8
+               AND $2 >= updated_at AND $3 >= 0 AND $4 >= 0
+               AND EXISTS (
+                 SELECT 1 FROM upstream_accounts account
+                 WHERE account.id = upstream_account_id AND account.tenant_id = $6
+                   AND account.credential_generation = $9 AND account.updated_at = $10
+               )",
+        )
+        .bind(now)
+        .bind(observed_at)
+        .bind(available)
+        .bind(applicable)
+        .bind(operation)
+        .bind(&tenant)
+        .bind(&account_id)
+        .bind(expected_updated_at)
+        .bind(account.credential_generation)
+        .bind(account.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::Conflict(
+                "unknown reset changed or is already unlocked; reload before reviewing recovery"
+                    .into(),
+            ));
+        }
+        insert_audit(
+            &mut tx,
+            operation,
+            &tenant,
+            &account_id,
+            "reconciled",
+            Some(actor),
+            Some(&format!("manual_lock_released_{reason}")),
+            now,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -653,6 +825,34 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_dispatch_diagnostic_is_allowlisted_and_legacy_safe() {
+        for code in [
+            "reset_send_connect_timeout",
+            "reset_send_connect_failed",
+            "reset_send_timeout",
+            "reset_send_request_invalid",
+            "reset_send_transport_failed",
+            "reset_prepare_credential_invalid",
+            "reset_dispatch_unknown",
+            "reset_supplier_response_unknown",
+        ] {
+            assert!(QuotaResetDispatchDiagnostic::from_code(Some(code)).is_some());
+        }
+        let status =
+            QuotaResetDispatchDiagnostic::from_code(Some("reset_response_http_503")).unwrap();
+        assert_eq!(status.stage, "response");
+        assert_eq!(status.supplier_http_status, Some(503));
+        for code in [
+            "https://user:secret@proxy.invalid/",
+            "reset_response_http_999",
+            "reset_response_http_401?access_token=secret",
+            "reset_send_secret",
+        ] {
+            assert!(QuotaResetDispatchDiagnostic::from_code(Some(code)).is_none());
+        }
+    }
 
     #[tokio::test]
     async fn sqlite_reset_is_idempotent_audited_and_unknown_blocks_new_operations() {
@@ -930,6 +1130,138 @@ mod tests {
             "credential changes cannot settle an unknown dispatch"
         );
 
+        assert!(unknown.manual_unlock_available);
+        assert_eq!(unknown.dispatch_diagnostic.as_ref().unwrap().stage, "send");
+        assert!(
+            db.release_unknown_quota_reset(
+                &changed_unknown_account,
+                &operation.id,
+                "operator",
+                unknown.updated_at - 1,
+                "operator_authorized_retry",
+                1,
+                1,
+                unix_millis()
+            )
+            .await
+            .is_err(),
+            "stale review cannot release the lock"
+        );
+        assert!(
+            db.release_unknown_quota_reset(
+                &changed_unknown_account,
+                &operation.id,
+                "operator",
+                unknown.updated_at,
+                "arbitrary-secret-text",
+                1,
+                1,
+                unix_millis()
+            )
+            .await
+            .is_err(),
+            "audit reasons are a closed vocabulary"
+        );
+        let mut foreign = changed_unknown_account.clone();
+        foreign.tenant_id = Uuid::now_v7();
+        assert!(
+            db.release_unknown_quota_reset(
+                &foreign,
+                &operation.id,
+                "operator",
+                unknown.updated_at,
+                "operator_authorized_retry",
+                1,
+                1,
+                unix_millis()
+            )
+            .await
+            .is_err(),
+            "foreign tenant cannot unlock"
+        );
+        db.release_unknown_quota_reset(
+            &changed_unknown_account,
+            &operation.id,
+            "operator",
+            unknown.updated_at,
+            "operator_authorized_retry",
+            1,
+            1,
+            unix_millis(),
+        )
+        .await
+        .unwrap();
+        let released = db
+            .quota_reset_operation(&tenant.to_string(), &account.id.to_string(), &operation.id)
+            .await
+            .unwrap();
+        assert_eq!(released.state, "unknown");
+        assert_eq!(released.error_code, unknown.error_code);
+        assert_eq!(released.available_credits, unknown.available_credits);
+        assert!(released.settled_at.is_some());
+        assert!(!released.manual_unlock_available);
+        let audit = released.audit.last().unwrap();
+        assert_eq!(audit.event, "reconciled");
+        assert_eq!(audit.actor_service_id.as_deref(), Some("operator"));
+        assert_eq!(
+            audit.error_code.as_deref(),
+            Some("manual_lock_released_operator_authorized_retry")
+        );
+        assert!(
+            db.release_unknown_quota_reset(
+                &changed_unknown_account,
+                &operation.id,
+                "operator",
+                released.updated_at,
+                "operator_authorized_retry",
+                1,
+                1,
+                unix_millis()
+            )
+            .await
+            .is_err(),
+            "unlock cannot be repeated"
+        );
+        assert!(
+            matches!(
+                db.claim_quota_reset(
+                    &changed_unknown_account,
+                    &operation.id,
+                    "actor",
+                    "confirmation-hash",
+                    "confirm-key"
+                )
+                .await
+                .unwrap(),
+                QuotaResetClaim::Replayed(_)
+            ),
+            "old confirmation never dispatches again"
+        );
+        let independent = db
+            .prepare_quota_reset(PrepareQuotaReset {
+                account: changed_unknown_account.clone(),
+                ..input("manual-recovery-new-key")
+            })
+            .await
+            .unwrap();
+        assert_ne!(independent.operation.id, released.id);
+        assert_eq!(independent.operation.state, "prepared");
+        assert!(
+            db.release_unknown_quota_reset(
+                &changed_unknown_account,
+                &independent.operation.id,
+                "operator",
+                independent.operation.updated_at,
+                "operator_authorized_retry",
+                1,
+                1,
+                unix_millis()
+            )
+            .await
+            .is_err(),
+            "recovery cannot unlock a live prepared dispatch"
+        );
+
         let mut accepted_account = account.clone();
         accepted_account.id = Uuid::now_v7();
         accepted_account.name = "accepted quota fixture".into();
@@ -965,6 +1297,91 @@ mod tests {
         db.finish_quota_reset(&accepted.id, true, None)
             .await
             .unwrap();
+        db.record_quota_reset_readback(
+            &accepted_account,
+            &accepted.id,
+            "actor",
+            Some("quota_timeout"),
+        )
+        .await
+        .unwrap();
+        let pending = db
+            .quota_reset_operation(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.state, "accepted");
+        assert_eq!(pending.quota_refresh_status, "pending");
+        assert!(!pending.manual_unlock_available);
+        db.record_quota_reset_readback(&accepted_account, &accepted.id, "actor", None)
+            .await
+            .unwrap();
+        let read = db
+            .quota_reset_operation(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.state, "accepted");
+        assert_eq!(read.quota_refresh_status, "succeeded");
+        assert_eq!(read.available_credits, 2);
+
+        // Ordinary reconciliation can evict every readback from the display window.
+        for _ in 0..32 {
+            db.reconcile_quota_reset(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+                "actor",
+                accepted_account.credential_generation,
+                accepted_account.updated_at,
+                2,
+                2,
+                unix_millis(),
+            )
+            .await
+            .unwrap();
+        }
+        let outside_window = db
+            .quota_reset_operation(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outside_window.audit.len(), 32);
+        assert!(
+            outside_window
+                .audit
+                .iter()
+                .all(|event| { event.event == "reconciled" && event.error_code.is_none() })
+        );
+        assert_eq!(outside_window.quota_refresh_status, "succeeded");
+
+        // The latest readback wins in both directions, independent of pagination.
+        for (error, expected) in [(Some("quota_timeout"), "pending"), (None, "succeeded")] {
+            db.record_quota_reset_readback(&accepted_account, &accepted.id, "actor", error)
+                .await
+                .unwrap();
+            let latest = db
+                .quota_reset_operation(
+                    &tenant.to_string(),
+                    &accepted_account.id.to_string(),
+                    &accepted.id,
+                )
+                .await
+                .unwrap();
+            assert_eq!(latest.quota_refresh_status, expected);
+            assert_eq!(latest.state, "accepted");
+            assert_eq!(latest.available_credits, 2);
+        }
+
         assert!(
             db.current_quota_reset_operation_for_tenant(
                 accepted_account.tenant_external_id.as_ref().unwrap(),
