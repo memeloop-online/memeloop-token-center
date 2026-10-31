@@ -27,6 +27,8 @@ pub enum Dimension {
     Principal,
     SessionId,
     TaskKind,
+    SessionAssociation,
+    RequestId,
 }
 
 impl Dimension {
@@ -46,6 +48,8 @@ impl Dimension {
             Self::Principal => "principal",
             Self::SessionId => "session_id",
             Self::TaskKind => "task_kind",
+            Self::SessionAssociation => "session_id",
+            Self::RequestId => "request_id",
         }
     }
 }
@@ -189,6 +193,7 @@ impl HistoryQuery {
                 " AND (created_at, toString(request_id)) < ({created}, {request})"
             ));
         }
+        query.sql.push_str(" AND source != 'event'");
         let limit = query.bind(self.limit + 1, "UInt64");
         query.sql = format!(
             "SELECT snapshot, snapshot_hash FROM ({}) ORDER BY created_at DESC, toString(request_id) DESC LIMIT {limit} FORMAT JSONEachRow",
@@ -201,7 +206,7 @@ impl HistoryQuery {
         let query = self.latest()?;
         Ok(BoundQuery {
             sql: format!(
-                "SELECT intDiv(latest.created_at, 86400000) AS day_bucket, latest.outcome AS outcome, latest.currency AS currency, latest.billing_unit AS billing_unit, count() AS requests, sumOrNull(latest.input_tokens) AS input_tokens, count(latest.input_tokens) AS input_known_requests, sumOrNull(latest.output_tokens) AS output_tokens, count(latest.output_tokens) AS output_known_requests, sumOrNull(latest.cached_input_tokens) AS cached_input_tokens, sumOrNull(latest.cache_write_tokens) AS cache_write_tokens, sumOrNull(latest.generation_units) AS generation_units, sumOrNull(latest.cost_micros) AS cost_micros, count(latest.cost_micros) AS cost_known_requests FROM ({}) AS latest WHERE latest.source != 'archive' GROUP BY day_bucket, latest.outcome, latest.currency, latest.billing_unit ORDER BY day_bucket, latest.outcome, latest.currency, latest.billing_unit FORMAT JSONEachRow",
+                "SELECT intDiv(latest.created_at, 86400000) AS day_bucket, latest.outcome AS outcome, latest.currency AS currency, latest.billing_unit AS billing_unit, count() AS requests, sumOrNull(latest.input_tokens) AS input_tokens, count(latest.input_tokens) AS input_known_requests, sumOrNull(latest.output_tokens) AS output_tokens, count(latest.output_tokens) AS output_known_requests, sumOrNull(latest.cached_input_tokens) AS cached_input_tokens, sumOrNull(latest.cache_write_tokens) AS cache_write_tokens, sumOrNull(latest.generation_units) AS generation_units, sumOrNull(latest.cost_micros) AS cost_micros, count(latest.cost_micros) AS cost_known_requests FROM ({}) AS latest WHERE latest.source NOT IN ('archive', 'event') GROUP BY day_bucket, latest.outcome, latest.currency, latest.billing_unit ORDER BY day_bucket, latest.outcome, latest.currency, latest.billing_unit FORMAT JSONEachRow",
                 query.sql
             ),
             parameters: query.parameters,
@@ -215,7 +220,10 @@ impl HistoryPredicate {
             Dimension::CreatedAt | Dimension::DurationMs | Dimension::CostMicros => {
                 matches!(self.value, PredicateValue::Integer(value) if value >= 0)
             }
-            Dimension::KeyId | Dimension::UpstreamAccountId | Dimension::RouteId => {
+            Dimension::KeyId
+            | Dimension::RequestId
+            | Dimension::UpstreamAccountId
+            | Dimension::RouteId => {
                 matches!(self.value, PredicateValue::Uuid(_))
                     || (self.comparison == Comparison::IsNull
                         && self.dimension != Dimension::KeyId
@@ -235,7 +243,11 @@ impl HistoryPredicate {
                     | Comparison::LessThan
                     | Comparison::LessThanOrEqual
             ),
-            Dimension::KeyId | Dimension::Protocol | Dimension::Status => {
+            Dimension::KeyId
+            | Dimension::RequestId
+            | Dimension::SessionAssociation
+            | Dimension::Protocol
+            | Dimension::Status => {
                 matches!(self.comparison, Comparison::Equals | Comparison::NotEquals)
             }
             Dimension::UpstreamAccountId | Dimension::RouteId => {
@@ -255,6 +267,11 @@ impl HistoryPredicate {
         if !valid_type || !valid_operator {
             return Err(HistoryError::Invalid("predicate type or operator"));
         }
+        if self.dimension == Dimension::SessionAssociation
+            && !matches!(&self.value, PredicateValue::Text(value) if matches!(value.as_str(), "confirmed" | "unlinked"))
+        {
+            return Err(HistoryError::Invalid("session association"));
+        }
         if self.dimension == Dimension::Status
             && !matches!(&self.value, PredicateValue::Text(value) if matches!(value.as_str(), "success" | "error" | "pending" | "unknown"))
         {
@@ -266,6 +283,16 @@ impl HistoryPredicate {
     fn append(&self, query: &mut BoundQuery) -> Result<(), HistoryError> {
         self.validate()?;
         let column = self.dimension.column();
+        if self.dimension == Dimension::SessionAssociation {
+            let unlinked = self.value == PredicateValue::Text("unlinked".into());
+            let null = unlinked == (self.comparison == Comparison::Equals);
+            query.sql.push_str(if null {
+                " AND session_id IS NULL"
+            } else {
+                " AND session_id IS NOT NULL"
+            });
+            return Ok(());
+        }
         if self.comparison == Comparison::IsNull {
             query.sql.push_str(&format!(" AND {column} IS NULL"));
             return Ok(());

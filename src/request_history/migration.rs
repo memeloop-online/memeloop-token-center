@@ -156,9 +156,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
     let mut hash = Sha256::new();
     let mut daily = BTreeMap::new();
     loop {
-        let source = database
-            .list_global_requests_filtered(filter.clone())
-            .await?;
+        let source = database.source_history_list(&filter).await?;
         let query = crate::request_history_api::query_from_request_filter(
             HistoryScope::GlobalOperator,
             &filter,
@@ -177,6 +175,7 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
                 || expected.payload != snapshot.payload
                 || expected.filter_cost_micros != snapshot.filter_cost_micros
                 || expected.statistics != snapshot.statistics
+                || expected.read_model != snapshot.read_model
                 || snapshot.revision <= 0
                 || snapshot.revision > revision
                 || expected.payload != Some(serde_json::to_value(view)?)

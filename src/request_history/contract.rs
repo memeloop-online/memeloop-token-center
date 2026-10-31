@@ -56,6 +56,9 @@ pub struct HistorySnapshot {
     pub filter_cost_micros: Option<i64>,
     pub payload: Option<Value>,
     pub statistics: Option<HistoryStatistics>,
+    /// Private locator/analysis metadata; never part of the public RequestView.
+    #[serde(default)]
+    pub read_model: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

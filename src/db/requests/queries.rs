@@ -172,6 +172,11 @@ impl Database {
         filter: RequestListFilter,
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_request_list(&client, self.history_key_scope(key_id).await?, &filter)
+                .await;
+        }
         let query = build_request_list_query(RequestListScope::Key(key_id), &filter);
         self.fetch_request_list(query).await
     }
@@ -197,6 +202,15 @@ impl Database {
         filter: RequestListFilter,
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_request_list(
+                    &client,
+                    self.history_scope(Some(tenant_external_id)).await?,
+                    &filter,
+                )
+                .await;
+        }
         let query = build_request_list_query(RequestListScope::Tenant(tenant_external_id), &filter);
         self.fetch_request_list(query).await
     }
@@ -214,8 +228,25 @@ impl Database {
         filter: RequestListFilter,
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_request_list(
+                    &client,
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    &filter,
+                )
+                .await;
+        }
         let query = build_request_list_query(RequestListScope::Global, &filter);
         self.fetch_request_list(query).await
+    }
+
+    pub(crate) async fn source_history_list(
+        &self,
+        filter: &RequestListFilter,
+    ) -> Result<Vec<RequestView>, AppError> {
+        self.fetch_request_list(build_request_list_query(RequestListScope::Global, filter))
+            .await
     }
 
     async fn fetch_request_list(
@@ -269,6 +300,19 @@ impl Database {
         key_id: Uuid,
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_archive_refs(&client, self.history_key_scope(key_id).await?, request_id)
+                .await;
+        }
+        self.source_request_archive_refs(key_id, request_id).await
+    }
+
+    pub(crate) async fn source_request_archive_refs(
+        &self,
+        key_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
         let request_id = request_id.to_string();
         let locator = self.request_record_locator(&request_id).await?;
         if let Some(locator) = locator.filter(|locator| locator.key_id == key_id.to_string()) {
@@ -302,6 +346,24 @@ impl Database {
         tenant_external_id: &str,
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_archive_refs(
+                    &client,
+                    self.history_scope(Some(tenant_external_id)).await?,
+                    request_id,
+                )
+                .await;
+        }
+        self.source_request_archive_refs_for_tenant(tenant_external_id, request_id)
+            .await
+    }
+
+    pub(crate) async fn source_request_archive_refs_for_tenant(
+        &self,
+        tenant_external_id: &str,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
         let request_id_string = request_id.to_string();
         let locator = self.request_record_locator(&request_id_string).await?;
         if let Some(locator) = locator {
@@ -325,7 +387,7 @@ impl Database {
                 )
                 .await?;
             let mut refs = self
-                .request_archive_refs(
+                .source_request_archive_refs(
                     parse_uuid(locator.key_id.clone())?,
                     parse_uuid(request_id_string.clone())?,
                 )
@@ -382,6 +444,22 @@ impl Database {
         &self,
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_archive_refs(
+                    &client,
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    request_id,
+                )
+                .await;
+        }
+        self.source_request_archive_refs_global(request_id).await
+    }
+
+    pub(crate) async fn source_request_archive_refs_global(
+        &self,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
         let request_id = request_id.to_string();
         if let Some(locator) = self.request_record_locator(&request_id).await? {
             let row = sqlx::query(
@@ -398,7 +476,7 @@ impl Database {
                 .historical_credential_identity(&locator.tenant_id, &locator.key_id, None)
                 .await?;
             let mut refs = self
-                .request_archive_refs(
+                .source_request_archive_refs(
                     parse_uuid(locator.key_id.clone())?,
                     parse_uuid(request_id.clone())?,
                 )

@@ -6,6 +6,106 @@ use crate::request_history::{
 const COLUMNS: &str = "source, request_id, tenant_id, key_id, created_at";
 
 impl Database {
+    /// A selected ClickHouse reader fails closed if its endpoint is missing.
+    pub(crate) async fn history_reader(
+        &self,
+    ) -> Result<Option<crate::request_history::ClickHouse>, HistoryError> {
+        if std::env::var_os("MTC_REQUEST_HISTORY_URL").is_none() {
+            if self.history_mode().await? == "clickhouse" {
+                return Err(HistoryError::Unavailable);
+            }
+            return Ok(None);
+        }
+        if self.history_mode().await? != "clickhouse" {
+            return Ok(None);
+        }
+        crate::request_history::ClickHouse::reader_from_env(
+            self.http_clients
+                .handle(crate::http_settings::HttpPurpose::General),
+        )
+    }
+
+    pub(crate) async fn history_key_scope(
+        &self,
+        key_id: Uuid,
+    ) -> Result<HistoryScope, HistoryError> {
+        let tenant: Option<String> = sqlx::query_scalar("SELECT tenant_id FROM key_records WHERE id = $1 UNION SELECT tenant_id FROM request_history_source_ids WHERE key_id = $1 LIMIT 1")
+            .bind(key_id.to_string()).fetch_optional(&self.pool).await?;
+        Ok(match tenant {
+            Some(tenant) => HistoryScope::Key {
+                tenant_id: parse_uuid(tenant)?,
+                key_id,
+            },
+            None => HistoryScope::EmptyTenant,
+        })
+    }
+
+    pub(crate) async fn history_request_list(
+        &self,
+        client: &crate::request_history::ClickHouse,
+        scope: HistoryScope,
+        filter: &RequestListFilter,
+    ) -> Result<Vec<RequestView>, AppError> {
+        let query = crate::request_history_api::query_from_request_filter(scope.clone(), filter)?;
+        let mut snapshots = client.snapshots(&query).await?;
+        snapshots.truncate(query.limit + usize::from(filter.lookahead));
+        snapshots
+            .into_iter()
+            .map(|snapshot| {
+                let mut view: RequestView = serde_json::from_value(
+                    snapshot
+                        .payload
+                        .ok_or_else(|| AppError::internal("history_payload_missing"))?,
+                )
+                .map_err(|_| AppError::internal("history_payload_invalid"))?;
+                if matches!(scope, HistoryScope::Key { .. }) {
+                    view.credential_identity = None;
+                }
+                Ok(view)
+            })
+            .collect()
+    }
+
+    pub(crate) async fn history_archive_refs(
+        &self,
+        client: &crate::request_history::ClickHouse,
+        scope: HistoryScope,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        use crate::request_history::{
+            Comparison, Dimension, HistoryPredicate, HistoryQuery, PredicateValue,
+        };
+        let query = HistoryQuery {
+            scope: scope.clone(),
+            from_created_at: None,
+            to_created_at: None,
+            cursor: None,
+            limit: 1,
+            predicates: vec![HistoryPredicate {
+                dimension: Dimension::RequestId,
+                comparison: Comparison::Equals,
+                value: PredicateValue::Uuid(request_id),
+            }],
+        };
+        let snapshot = client
+            .snapshots(&query)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or(AppError::NotFound)?;
+        let mut refs: RequestArchiveRefs =
+            serde_json::from_value(snapshot.read_model["archive"].clone())
+                .map_err(|_| AppError::internal("history_archive_projection_missing"))?;
+        // All read surfaces use the same corrected public entity, even when the
+        // locator was captured from a source's more specialized detail reader.
+        refs.view = serde_json::from_value(snapshot.payload.ok_or(AppError::NotFound)?)
+            .map_err(|_| AppError::internal("history_payload_invalid"))?;
+        if matches!(scope, HistoryScope::Key { .. }) {
+            refs.view.credential_identity = None;
+        }
+        Ok(refs)
+    }
+
     pub async fn history_start(&self) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
         for (table, identity) in [
@@ -345,13 +445,71 @@ impl Database {
         } else {
             None
         };
+        let read_model = if let Some(payload) = &payload {
+            let mut archive = self
+                .source_request_archive_refs(identity.key_id, identity.request_id)
+                .await?;
+            archive.view = serde_json::from_value(payload.clone())?;
+            let fact = self.history_analysis_fact(&identity).await?;
+            serde_json::json!({"archive": archive, "fact": fact})
+        } else {
+            Value::Null
+        };
         Ok(HistorySnapshot {
             identity,
             revision,
             filter_cost_micros,
             payload,
             statistics,
+            read_model,
         })
+    }
+
+    async fn history_analysis_fact(
+        &self,
+        identity: &HistoryIdentity,
+    ) -> Result<Value, HistoryError> {
+        let sql = match identity.source.as_str() {
+            "native" => {
+                "SELECT status_class, input_tokens, output_tokens, cached_input_tokens, cache_write_tokens, generation_units, duration_ms, cost_micros, currency FROM request_stats_facts WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            "generation" => {
+                "SELECT status_class, CAST(0 AS BIGINT) AS input_tokens, CAST(0 AS BIGINT) AS output_tokens, CAST(0 AS BIGINT) AS cached_input_tokens, CAST(0 AS BIGINT) AS cache_write_tokens, billed_units AS generation_units, duration_ms, cost_micros, currency FROM generation_stats_facts WHERE job_id = $1 AND tenant_id = $2 AND key_id = $3 AND created_at = $4"
+            }
+            _ => return Ok(Value::Null),
+        };
+        let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(identity.request_id.to_string())
+            .bind(identity.tenant_id.to_string())
+            .bind(identity.key_id.to_string())
+            .bind(identity.created_at)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else {
+            return Ok(Value::Null);
+        };
+        let mut fact = serde_json::Map::new();
+        for name in [
+            "input_tokens",
+            "output_tokens",
+            "cached_input_tokens",
+            "cache_write_tokens",
+            "generation_units",
+            "duration_ms",
+            "cost_micros",
+        ] {
+            fact.insert(
+                name.into(),
+                serde_json::to_value(row.try_get::<Option<i64>, _>(name)?)?,
+            );
+        }
+        for name in ["status_class", "currency"] {
+            fact.insert(
+                name.into(),
+                serde_json::to_value(row.try_get::<Option<String>, _>(name)?)?,
+            );
+        }
+        Ok(Value::Object(fact))
     }
 
     async fn history_statistics(

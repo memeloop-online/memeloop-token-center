@@ -271,6 +271,48 @@ async fn request_history_real_services_acceptance() {
     assert_eq!(stats.summary.pending_requests, 2);
     assert!(stats.summary.total_cost.is_none());
     database.history_switch(true).await.unwrap();
+    let source = database
+        .source_history_list(&RequestListFilter {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let active = database
+        .list_requests_filtered(
+            key.key_id,
+            RequestListFilter {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(source.len(), active.len());
+    let refs = database
+        .request_archive_refs(key.key_id, request_id)
+        .await
+        .unwrap();
+    let view = active
+        .iter()
+        .find(|view| view.request_id == request_id)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&refs.view).unwrap(),
+        serde_json::to_value(view).unwrap()
+    );
+    assert!(
+        database
+            .history_archive_refs(&client, HistoryScope::EmptyTenant, request_id)
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .request_archive_refs(Uuid::new_v4(), request_id)
+            .await
+            .is_err()
+    );
     use tower::ServiceExt;
     let app = crate::api::router(state.clone());
     let response = app

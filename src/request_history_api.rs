@@ -1,6 +1,6 @@
 use crate::{
     db::RequestListFilter,
-    filter_ast::{TypedFilterField, TypedFilterOperator, TypedFilterValue},
+    filter_ast::{TypedFilterOperator, TypedFilterValue},
     model::AuthenticatedKey,
     request_history::{
         Comparison, Dimension, HistoryCursor, HistoryError, HistoryPredicate, HistoryQuery,
@@ -21,13 +21,9 @@ pub(crate) async fn list_if_enabled(
     filter: &RequestListFilter,
     paged: bool,
 ) -> Result<Option<serde_json::Value>, crate::error::AppError> {
-    let Some(client) = crate::request_history::ClickHouse::reader_from_env(state.http.clone())?
-    else {
+    let Some(client) = state.db.history_reader().await? else {
         return Ok(None);
     };
-    if state.db.history_mode().await? != "clickhouse" {
-        return Ok(None);
-    }
     let query = query_from_request_filter(scope, filter)?;
     Ok(Some(client.list(&query).await?.into_api_response(paged)?))
 }
@@ -37,13 +33,9 @@ pub(crate) async fn statistics_if_enabled(
     scope: HistoryScope,
     filter: &crate::db::StatsFilter,
 ) -> Result<Option<crate::model::OperatorStats>, crate::error::AppError> {
-    let Some(client) = crate::request_history::ClickHouse::reader_from_env(state.http.clone())?
-    else {
+    let Some(client) = state.db.history_reader().await? else {
         return Ok(None);
     };
-    if state.db.history_mode().await? != "clickhouse" {
-        return Ok(None);
-    }
     let filter = RequestListFilter {
         from_created_at: filter.from_created_at,
         to_created_at: filter.to_created_at,
@@ -161,19 +153,24 @@ pub fn query_from_request_filter(
         ast.validate()
             .map_err(|_| HistoryError::Invalid("typed filter AST"))?;
         for condition in &ast.conditions {
-            let dimension = match condition.field {
-                TypedFilterField::CreatedAt => Dimension::CreatedAt,
-                TypedFilterField::KeyId => Dimension::KeyId,
-                TypedFilterField::Model => Dimension::Model,
-                TypedFilterField::Protocol => Dimension::Protocol,
-                TypedFilterField::Status => Dimension::Status,
-                TypedFilterField::ErrorCode => Dimension::ErrorCode,
-                TypedFilterField::UpstreamAccountId => Dimension::UpstreamAccountId,
-                TypedFilterField::RouteId => Dimension::RouteId,
-                TypedFilterField::DurationMs => Dimension::DurationMs,
-                TypedFilterField::CostMicros => Dimension::CostMicros,
-                TypedFilterField::KeyAlias => Dimension::KeyAlias,
-                TypedFilterField::Principal => Dimension::Principal,
+            // Use the stable typed field wire name so the session owner's additive
+            // enum can integrate without copying or editing their AST implementation.
+            let field = serde_json::to_value(condition.field)?;
+            let dimension = match field.as_str() {
+                Some("created_at") => Dimension::CreatedAt,
+                Some("key_id") => Dimension::KeyId,
+                Some("model") => Dimension::Model,
+                Some("protocol") => Dimension::Protocol,
+                Some("status") => Dimension::Status,
+                Some("error_code") => Dimension::ErrorCode,
+                Some("upstream_account_id") => Dimension::UpstreamAccountId,
+                Some("route_id") => Dimension::RouteId,
+                Some("duration_ms") => Dimension::DurationMs,
+                Some("cost_micros") => Dimension::CostMicros,
+                Some("key_alias") => Dimension::KeyAlias,
+                Some("principal") => Dimension::Principal,
+                Some("session_association") => Dimension::SessionAssociation,
+                _ => return Err(HistoryError::Invalid("unsupported typed history field")),
             };
             let comparison = match condition.operator {
                 TypedFilterOperator::Equals => Comparison::Equals,
