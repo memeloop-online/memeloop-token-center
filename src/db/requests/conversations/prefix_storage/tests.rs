@@ -468,6 +468,14 @@ async fn contract(url: &str) {
             .await
             .unwrap()
     );
+    let (atoms, nodes) =
+        crate::conversation::session_body_from_documents(&base_body, &json!({})).into_prefix();
+    assert!(
+        database
+            .prepare_session_body_archive(owner, projected, atoms, &nodes, &[])
+            .await
+            .unwrap()
+    );
     assert!(
         database
             .project_claimed_conversation_projection_task(owner, projected)

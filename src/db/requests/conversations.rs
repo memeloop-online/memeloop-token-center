@@ -3382,7 +3382,15 @@ mod tests {
             assert_eq!(role, atom.role);
             assert_eq!(kind, atom.kind);
             assert_eq!(instance_hash, atom.instance_hash);
-            assert_eq!(content_json, serde_json::to_string(&atom.content).unwrap());
+            let restored = db
+                .read_body_reference(Uuid::parse_str(&tenant).unwrap(), &content_json)
+                .await
+                .unwrap();
+            assert_eq!(restored, serde_json::to_string(&atom.content).unwrap());
+            assert!(
+                serde_json::from_str::<crate::archive::ConversationBodyReference>(&content_json)
+                    .is_ok()
+            );
         }
         assert_eq!(
             leaf.as_deref(),

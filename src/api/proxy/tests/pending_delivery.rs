@@ -1514,10 +1514,7 @@ async fn unknown_failure_retries_operational_projection() {
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].request_id, request_id);
     assert!(
-        fixture
-            .state
-            .db
-            .project_claimed_conversation_projection_task(owner, request_id)
+        crate::worker::archive_session_body(&fixture.state, owner, request_id)
             .await
             .unwrap()
     );
