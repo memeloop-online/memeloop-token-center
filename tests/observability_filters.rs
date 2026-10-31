@@ -642,8 +642,8 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     // Archive/native correlation remains unlinked even when the archive has
     // an exact session identity. It must navigate just like the native row.
     let confirmed_archive_id = Uuid::now_v7();
-    sqlx::query("INSERT INTO session_archive_correlations (tenant_id,source,external_request_id,disposition,key_id,principal_id,record_digest,proof_digest,identity_proof_kind,identity_proof_digest,source_model,source_started_at,correlated_at) SELECT tenant_id,source,$1,disposition,key_id,principal_id,record_digest,proof_digest,identity_proof_kind,identity_proof_digest,source_model,source_started_at,correlated_at FROM session_archive_correlations WHERE tenant_id=$2 AND external_request_id=$3")
-        .bind(confirmed_archive_id.to_string()).bind(key.tenant_id.to_string()).bind(archive_id.to_string()).execute(&inspection).await.unwrap();
+    sqlx::query("INSERT INTO session_archive_correlations (tenant_id,source,external_request_id,disposition,key_id,principal_id,record_digest,proof_digest,identity_proof_kind,identity_proof_digest,source_model,source_started_at,correlated_at) SELECT tenant_id,source,$1,disposition,key_id,principal_id,record_digest,$4,identity_proof_kind,identity_proof_digest,source_model,source_started_at,correlated_at FROM session_archive_correlations WHERE tenant_id=$2 AND external_request_id=$3")
+        .bind(confirmed_archive_id.to_string()).bind(key.tenant_id.to_string()).bind(archive_id.to_string()).bind("d".repeat(64)).execute(&inspection).await.unwrap();
     sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_object,response_object,imported_at,source_session_id) SELECT tenant_id,source,$1,$1,key_id,principal_id,$2,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,7,9,error_code,request_object,response_object,imported_at,source_session_id FROM session_archive_unlinked_requests WHERE tenant_id=$3 AND archive_request_id=$4")
         .bind(confirmed_archive_id.to_string()).bind(confirmed_cluster.to_string()).bind(key.tenant_id.to_string()).bind(archive_id.to_string()).execute(&inspection).await.unwrap();
     for (operator, value, confirmed) in [
@@ -743,7 +743,15 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
             let provenance = detail.provenance.unwrap();
             assert_eq!(provenance.disposition, "unlinked");
             assert!(provenance.unlinked);
-            assert_eq!(provenance.proof_digest, "b".repeat(64));
+            assert_eq!(
+                provenance.proof_digest,
+                if request == confirmed_archive_id {
+                    "d"
+                } else {
+                    "b"
+                }
+                .repeat(64)
+            );
         }
         assert!(
             state

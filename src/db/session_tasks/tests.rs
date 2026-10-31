@@ -878,8 +878,23 @@ async fn late_parent_reconciliation_rejects_cycles_and_parent_conflicts_atomical
         }
         sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,protocol,model,input_tokens,output_tokens,imported_at) VALUES ($1,'fixture',$2,$2,$3,$4,$5,1,'openai-responses','archive',7,9,1)")
             .bind(owner.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(owner.key_id.to_string()).bind(owner.principal_id.to_string()).bind(source.session_id.to_string()).execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO session_generated_titles (tenant_id,key_id,session_id,title,title_source,state,next_attempt_at,updated_at) VALUES ($1,$2,$3,'Source manual','manual','ready',1,1)")
-            .bind(owner.tenant_id.to_string()).bind(owner.key_id.to_string()).bind(source.session_id.to_string()).execute(&db.pool).await.unwrap();
+        let revision = db
+            .session_title(owner.tenant_id, owner.key_id, source.session_id)
+            .await
+            .unwrap()
+            .revision;
+        db.update_session_name(
+            owner.tenant_id,
+            &source,
+            SessionNameUpdate {
+                title: "Source manual".into(),
+                source: "manual".into(),
+                expected_revision: revision,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         type RelationshipSnapshot = (String, String, String, String, String, Option<String>, i64);
         let snapshot = async || {
             let tenant = owner.tenant_id.to_string();
