@@ -286,7 +286,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   </div>;
 }
 
-export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive, loadArchiveRange, titleAction, taskRelations, parentNav, contextLoader }: {
+export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive, loadArchiveRange, titleAction, taskRelations, backNav, parentNav, contextLoader }: {
   detail: LogicalSessionDetail;
   summary?: LogicalSessionSummary;
   currency?: string;
@@ -301,6 +301,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   titleAction?: ReactNode;
   /** Owner-scoped task relations (parent/sub/manual) between stable sessions. */
   taskRelations?: ReactNode;
+  backNav?: ReactNode;
   /** Uniform top-left navigation back to the parent session. */
   parentNav?: ReactNode;
   contextLoader?: SessionContextLoader;
@@ -321,6 +322,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
     return request ? t('sessions.timelinePoint', { index: request.index, time: new Date(request.createdAt).toLocaleString(locale) }) : t('sessions.timelineRequest');
   };
   return <section className="session-detail" aria-label={title}>
+    {backNav}
     {parentNav}
     <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2>{detail.unlinked && <p className="mtc-secondary-text">{t('sessions.unlinkedDetail')}</p>}</div>{onClose && <Button appearance="secondary" onClick={onClose} aria-label={t('common.close')}>×</Button>}</header>
     {titleAction}

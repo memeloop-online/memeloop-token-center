@@ -111,9 +111,11 @@ export function SessionTitleAction({ token, tenant, keyId, sessionId, onTitle }:
         {busy ? t('sessions.title.generating') : t('sessions.title.generate')}
       </Button>
       {nameable && <Button appearance="secondary" disabled={busy || !status} onClick={() => { setDraft(status?.title ?? ''); setError(''); setEditing(true); }}>{t('sessions.name.manual')}</Button>}
-      <small className="mtc-secondary-text">{t('sessions.title.billing')}</small>
-      {titleSource === 'manual' && <small className="mtc-secondary-text">{t('sessions.name.source.manual')} · {t('sessions.name.protectedManual')}</small>}
-      {titleSource === 'codex' && <small className="mtc-secondary-text">{t('sessions.name.source.codex')}</small>}
+      <div className="session-title-guidance">
+        <small className="mtc-secondary-text">{t('sessions.title.billing')}</small>{' '}
+        {titleSource === 'manual' && <small className="mtc-secondary-text">{t('sessions.name.source.manual')} · {t('sessions.name.protectedManual')}</small>}{' '}
+        {titleSource === 'codex' && <small className="mtc-secondary-text">{t('sessions.name.source.codex')}</small>}
+      </div>
     </>}
     {status?.state === 'waiting_config' && <p role="status">{t('sessions.title.configuration')}</p>}
     {(error || status?.state === 'failed') && <p role="status">{error || t('sessions.title.failed')}</p>}

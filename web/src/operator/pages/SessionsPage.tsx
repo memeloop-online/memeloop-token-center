@@ -17,8 +17,9 @@ import {
 } from '../requestDetailSelection.js';
 import type { SessionStreamState } from '../SessionMonitor.js';
 import type { SessionEventChannel } from '../sessionEventChannel.js';
+import type { SessionRequestOrigin } from '../sessionNavigation.js';
 
-export function SessionsPage({ token, tenant, focus, sessionEvents, streamState, streamError, onOpenRequests, onOpenUnlinkedRequests, requestRefresh }: {
+export function SessionsPage({ token, tenant, focus, sessionEvents, streamState, streamError, onOpenRequests, onOpenUnlinkedRequests, onReturnOrigin, requestRefresh }: {
   token: string;
   tenant: string;
   focus?: SessionFocus;
@@ -27,6 +28,7 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
   streamError: string;
   onOpenRequests: () => void;
   onOpenUnlinkedRequests?: (sessionId: string, keyId?: string) => void;
+  onReturnOrigin: (origin: SessionRequestOrigin) => void;
   requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const revision = useSyncExternalStore(sessionEvents.subscribe, sessionEvents.snapshot);
@@ -97,6 +99,7 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
         refreshCadence={requestRefresh}
         onSelectRequest={selectRequest}
         onOpenUnlinkedRequests={onOpenUnlinkedRequests}
+        onReturnOrigin={onReturnOrigin}
       />
     </article>
     {scopedSelection.request && <DrawerFrame title={scopedSelection.detail?.model ?? scopedSelection.request.model} eyebrow={t('request.operatorDiagnosis')} onClose={closeRequestDetail}>

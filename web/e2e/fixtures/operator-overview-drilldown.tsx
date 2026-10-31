@@ -31,6 +31,7 @@ const bucketStart = now - 3_600_000;
 const usageSessions = new URLSearchParams(location.search).has('usage-sessions');
 const requestSession = new URLSearchParams(location.search).has('request-session');
 const initialSessions = new URLSearchParams(location.search).has('initial-sessions');
+const initialRequests = new URLSearchParams(location.search).has('initial-requests');
 const sessionKey = '5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650';
 const realSession = '00000000-0000-4000-8000-000000000002';
 
@@ -147,14 +148,14 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   if (url.pathname === '/internal/v1/requests/query' && method === 'POST') {
     const body = JSON.parse(String(init?.body ?? '{}'));
     window.overviewDrilldownFixture.requestQueryBodies.push(body);
-    const filtered = Array.isArray(body.ast?.conditions) && body.ast.conditions.some((condition: { field: string }) => condition.field === 'created_at');
+    const filtered = Array.isArray(body.ast?.conditions) && body.ast.conditions.length > 0;
     return json({ requests: filtered ? [drilledRequest] : [], next_cursor: null });
   }
   return json({ error: { message: `Unexpected fixture endpoint: ${url.pathname}` } }, 404);
 };
 
 function Fixture() {
-  const [route, setRoute] = useState<OperatorRouteKey>(initialSessions ? 'sessions' : usageSessions ? 'usage' : 'overview');
+  const [route, setRoute] = useState<OperatorRouteKey>(initialSessions ? 'sessions' : initialRequests ? 'requests' : usageSessions ? 'usage' : 'overview');
   window.overviewDrilldownFixture.openOverview = () => setRoute(usageSessions ? 'usage' : 'overview');
   useEffect(() => { window.overviewDrilldownFixture.route = route; }, [route]);
   return <>

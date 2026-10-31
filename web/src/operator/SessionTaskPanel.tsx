@@ -271,9 +271,9 @@ export function SessionTaskPanel({ token, tenant }: { token: string; tenant: str
   );
   return <article className="panel usage-task-panel" aria-label={t('tasks.title')}>
     <div className="panel-title"><h2>{t('tasks.title')}</h2></div>
-    <label>{t('tasks.select')}
+    <label className="usage-task-picker"><span>{t('tasks.select')}</span>
       <Combobox aria-label={t('tasks.select')} inlinePopup value={query}
-        placeholder={t('sessions.searchPlaceholder')}
+        placeholder={t('tasks.selectPlaceholder')}
         input={{ onChange: (event) => setQuery(event.target.value) }}
         onOptionSelect={(_, data) => {
           const match = results.find((session) => `${session.key_id}:${session.session_id}` === data.optionValue);

@@ -9,7 +9,7 @@ import { SessionCredentialFilter } from './SessionCredentialFilter.js';
 import { SessionRelationships } from './SessionRelationships.js';
 import { SessionTitleAction } from './SessionTitleAction.js';
 import { enqueueSessionTitles, useSessionParentLabel } from './sessionTasks.js';
-import { isUnlinkedSession } from './sessionNavigation.js';
+import { isUnlinkedSession, type SessionRequestOrigin } from './sessionNavigation.js';
 import { credentialDisplayName } from '../identityPresentation.js';
 import { unnamedSessionName } from '../sessionTitles.js';
 import { RequestRefreshControl } from './traffic/RequestRefreshControl.js';
@@ -36,6 +36,7 @@ export interface SessionFocus {
   sessionId: string;
   keyId?: string;
   revision: number;
+  origin?: SessionRequestOrigin;
 }
 
 export type SessionStreamState = 'idle' | 'connecting' | 'live' | 'reconnecting';
@@ -96,7 +97,7 @@ function messageOf(reason: unknown, fallback: string) {
   return reason instanceof Error ? reason.message : fallback;
 }
 
-export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOverflowed, focus, streamState, onSelectRequest, onOpenUnlinkedRequests, refreshCadence }: {
+export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOverflowed, focus, streamState, onSelectRequest, onOpenUnlinkedRequests, onReturnOrigin, refreshCadence }: {
   token: string;
   tenant: string;
   revision: number;
@@ -106,6 +107,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   streamState: SessionStreamState;
   onSelectRequest: (request: RequestView) => Promise<void>;
   onOpenUnlinkedRequests?: (sessionId: string, keyId?: string) => void;
+  onReturnOrigin?: (origin: SessionRequestOrigin) => void;
   refreshCadence?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const { locale, t } = useI18n();
@@ -115,6 +117,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
   const [detail, setDetail] = useState<LogicalSessionDetail>();
   const [detailScope, setDetailScope] = useState('');
   const [selected, setSelected] = useState<LogicalSessionSummary>();
+  const [returnOrigin, setReturnOrigin] = useState<SessionRequestOrigin>();
+  const listReturn = useRef<{ element: HTMLElement; scrollY: number }>();
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
   const [nextCursor, setNextCursor] = useState<LogicalSessionCursor | null>(null);
@@ -516,6 +520,8 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
 
   useEffect(() => {
     if (!focus) return;
+    listReturn.current = undefined;
+    setReturnOrigin(focus.origin);
     if (isUnlinkedSession(focus.sessionId)) {
       onOpenUnlinkedRequests?.(focus.sessionId, focus.keyId);
       return;
@@ -749,6 +755,27 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     setDraft(next);
     setFilters(next);
   };
+  const clearDetail = () => {
+    detailRequests.current.invalidate();
+    detailInFlight.current = false;
+    setDetailLoading(false);
+    setDetail(undefined);
+    setDetailScope('');
+    setSelected(undefined);
+    selectedRef.current = undefined;
+  };
+  const returnFromDetail = () => {
+    if (returnOrigin && onReturnOrigin) {
+      onReturnOrigin(returnOrigin);
+      return;
+    }
+    const origin = listReturn.current;
+    clearDetail();
+    if (origin) requestAnimationFrame(() => {
+      window.scrollTo(0, origin.scrollY);
+      origin.element.focus({ preventScroll: true });
+    });
+  };
   const selectedParent = useSessionParentLabel(tenant, token,
     selected && visibleDetail && !visibleDetail.unlinked ? selected.key_id : undefined,
     selected && visibleDetail && !visibleDetail.unlinked && sessionIdentityUuid.test(visibleDetail.session_id) ? visibleDetail.session_id : null,
@@ -786,13 +813,18 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
     <p className="muted session-result-count">{loading && !visibleSessions.length ? t('common.loading') : t('sessions.serverFiltered', { count: visibleSessions.length })}{listScope === scopeKey && generatedAt > 0 && <> · {t('sessions.generatedAt', { time: new Date(generatedAt).toLocaleString(locale) })}</>}</p>
     <div className="session-workspace">
       <section className="session-browser" aria-label={t('sessions.recent')}>
-        <SessionList values={visibleSessions} loading={loading} showCredential selected={selected} layout="sidebar" onSelect={(session) => void selectSession(session)} />
+        <SessionList values={visibleSessions} loading={loading} showCredential selected={selected} layout="sidebar" onSelect={(session) => {
+          if (document.activeElement instanceof HTMLElement) listReturn.current = { element: document.activeElement, scrollY: window.scrollY };
+          setReturnOrigin(undefined);
+          void selectSession(session);
+        }} />
         {listScope === scopeKey && nextCursor && <div className="load-more"><Button appearance="secondary" disabled={loading} onClick={() => void loadSessions(true, filters)}>{loading ? t('common.loading') : t('sessions.loadOlder')}</Button></div>}
       </section>
       <div className="session-detail-region">
         {!visibleDetail && detailLoading && <div className="session-detail-skeleton" role="status" aria-label={t('common.loading')}><i /><i /><i /><i /></div>}
         {!visibleDetail && !detailLoading && <div className="empty">{selected && visibleError ? <button type="button" className="secondary" onClick={() => void selectSession(selected)}>{t('sessions.retryLoad')}</button> : t('sessions.selectHint')}</div>}
         {visibleDetail && <SessionDetailSurface detail={visibleDetail} summary={selected} showDiagnosticIds loading={detailLoading} onLoadOlder={() => void loadEarlier()} loadReplayArchive={loadReplayArchive} loadArchiveRange={loadArchiveRange} contextLoader={contextLoader}
+          backNav={<p className="session-origin-nav"><Button appearance="transparent" className="table-link" onClick={returnFromDetail}><span aria-hidden="true">←</span> {t(returnOrigin ? 'sessions.backToRequest' : 'sessions.backToList')}</Button></p>}
           parentNav={selectedParent ? <p className="session-parent-nav"><Button appearance="transparent" className="table-link"
             onClick={() => openSessionIdentity(selectedParent.identity)}>{t('sessions.rel.backToParent', { name: selectedParent.label })}</Button></p> : undefined}
           taskRelations={selected && !visibleDetail.unlinked && sessionIdentityUuid.test(visibleDetail.session_id)
@@ -807,7 +839,7 @@ export function SessionMonitor({ token, tenant, revision, eventKeyIds, eventOver
               setSelected((current) => current?.key_id === target.key_id && current.session_id === target.session_id ? { ...current, session_name: title } : current);
               setSessions((current) => current.map((session) => session.key_id === target.key_id && session.session_id === target.session_id ? { ...session, session_name: title } : session));
             }} /> : undefined}
-          onSelect={(request) => { void onSelectRequest(request); }} onClose={() => { detailRequests.current.invalidate(); detailInFlight.current = false; setDetailLoading(false); setDetail(undefined); setDetailScope(''); setSelected(undefined); selectedRef.current = undefined; }} />}
+          onSelect={(request) => { void onSelectRequest(request); }} onClose={returnFromDetail} />}
       </div>
     </div>
   </>;

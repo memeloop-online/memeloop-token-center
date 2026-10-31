@@ -59,7 +59,9 @@ test('session tasks: CAS rename protects concurrent names, relations manage, rol
     await page.waitForFunction(() => window.relationshipWrites.some((write) => write.method === 'DELETE' && write.kind === 'related'));
     await page.getByText('No related sessions yet.', { exact: true }).waitFor();
 
-    await page.getByRole('combobox', { name: 'Search by name or session ID, then select a session' }).click();
+    const taskPicker = page.getByRole('combobox', { name: 'Search session name, session ID, or credential alias' });
+    assert.equal(await taskPicker.getAttribute('placeholder'), 'Session name, session ID, or credential alias');
+    await taskPicker.click();
     await page.keyboard.type('Alpha');
     await page.getByRole('option', { name: /Parent task Alpha/ }).click();
     await page.waitForFunction(() => window.analyzeCalls.length === 1);
@@ -76,6 +78,22 @@ test('session tasks: CAS rename protects concurrent names, relations manage, rol
     assert.equal((await page.evaluate(() => window.analyzeCalls[0])).timezone, 'UTC');
     await page.screenshot({ path: `${evidence}/desktop.png`, fullPage: true });
     await page.setViewportSize({ width: 390, height: 844 });
+    const pickerLayout = await page.locator('.usage-task-picker').evaluate(element => {
+      const label = element.querySelector(':scope > span')!.getBoundingClientRect();
+      const control = element.querySelector('.fui-Combobox')!.getBoundingClientRect();
+      return { gap: control.top - label.bottom, width: control.width, viewport: innerWidth,
+        overflow: document.documentElement.scrollWidth > innerWidth };
+    });
+    assert.ok(pickerLayout.gap >= 7.5, JSON.stringify(pickerLayout));
+    assert.ok(pickerLayout.width > 0 && pickerLayout.width <= pickerLayout.viewport, JSON.stringify(pickerLayout));
+    assert.equal(pickerLayout.overflow, false);
+    const titleHelpers = await page.locator('.session-title-guidance small').evaluateAll(elements => elements.map(element => {
+      const bounds = element.getBoundingClientRect();
+      return { top: bounds.top, bottom: bounds.bottom };
+    }));
+    assert.ok(titleHelpers.length >= 2);
+    assert.ok(titleHelpers[1].top >= titleHelpers[0].bottom, JSON.stringify(titleHelpers));
+    assert.doesNotMatch(await page.locator('.session-title-guidance').innerText(), /closes\.Manual name/);
     await page.screenshot({ path: `${evidence}/mobile.png`, fullPage: true });
 
     await page.getByRole('button', { name: 'Include sub-sessions', exact: true }).click();

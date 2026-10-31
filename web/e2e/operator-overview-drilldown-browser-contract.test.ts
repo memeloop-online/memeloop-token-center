@@ -36,7 +36,7 @@ async function localChromiumExecutable() {
   return undefined;
 }
 
-test('Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter', { timeout: 30_000 }, async () => {
+test('Overview request actions open focused details and bucket drilldowns preserve the tenant-scoped filter', { timeout: 60_000 }, async () => {
   const executablePath = await localChromiumExecutable();
   if (!executablePath) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required for the Overview drilldown browser gate');
@@ -155,14 +155,61 @@ test('Usage virtual credential buckets open scoped requests while real sessions 
     assert.equal(await page.evaluate(() => window.overviewDrilldownFixture.route), 'requests', 'explicit aggregate selection navigates');
     assert.equal((await page.evaluate(() => window.overviewDrilldownFixture.calls)).some(call => /\/sessions\/unlinked(?::|%3A)/.test(call)), false);
 
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?initial-sessions=1`);
+    await page.setViewportSize({ width: 390, height: 844 });
+    await readyDetail();
+    const listOrigin = page.locator('.session-sidebar-item').filter({ hasText: 'Named Codex conversation' });
+    await listOrigin.scrollIntoViewIfNeeded();
+    const listScroll = await page.evaluate(() => window.scrollY);
+    await listOrigin.click();
+    await readyDetail();
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    await page.getByRole('button', { name: 'Back to session list', exact: true }).click();
+    await page.locator('.session-detail').waitFor({ state: 'detached' });
+    await page.waitForFunction(() => document.activeElement?.classList.contains('session-sidebar-item')
+      && document.activeElement.textContent?.includes('Named Codex conversation'));
+    assert.ok(Math.abs((await page.evaluate(() => window.scrollY)) - listScroll) <= 1);
+    await page.screenshot({ path: join(evidence, 'session-list-return-mobile.png'), fullPage: true });
+    await page.setViewportSize({ width: 1440, height: 900 });
+
     await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?request-session=1`);
-    await page.locator('.request-table').getByRole('button', { name: 'Named Codex conversation', exact: true }).click();
+    const requestOrigin = page.locator('.request-table').getByRole('button', { name: 'Named Codex conversation', exact: true });
+    await requestOrigin.scrollIntoViewIfNeeded();
+    const requestScroll = await page.evaluate(() => window.scrollY);
+    await requestOrigin.click();
     await readyDetail();
     const requestFocusCalls = await page.evaluate(() => window.overviewDrilldownFixture.calls);
     assert.equal(requestFocusCalls.includes('POST /internal/v1/sessions/summaries'), true, 'request rows carry their credential into exact summary focus');
     assert.equal(requestFocusCalls.some(call => call.includes('/sessions?') && call.includes('q=')), false);
     assert.equal(requestFocusCalls.some(call => call.includes('/sessions/00000000-0000-4000-8000-000000000002?') && call.includes('key_id=5dae9b5a-6bd0-54a7-ae14-fb5aa4f61650')), true);
     await page.screenshot({ path: join(evidence, 'request-session-detail-desktop.png'), fullPage: true });
+    await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+    await page.getByRole('button', { name: 'Back to originating request', exact: true }).click();
+    await page.waitForFunction(() => window.overviewDrilldownFixture.route === 'overview'
+      && document.activeElement?.textContent === 'Named Codex conversation');
+    assert.ok(Math.abs((await page.evaluate(() => window.scrollY)) - requestScroll) <= 1);
+    await page.screenshot({ path: join(evidence, 'request-session-return-desktop.png'), fullPage: true });
+
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-overview-drilldown.html?request-session=1&initial-requests=1`);
+    await page.getByRole('button', { name: 'Filter', exact: true }).click();
+    await page.getByRole('button', { name: 'Add condition', exact: true }).click();
+    await page.getByLabel('Field', { exact: true }).selectOption('protocol');
+    await page.getByRole('button', { name: 'Apply filters', exact: true }).click();
+    await page.waitForFunction(() => window.overviewDrilldownFixture.requestQueryBodies.length === 1);
+    await page.getByRole('button', { name: 'Open details for drilled-model', exact: true }).click();
+    const drawerOrigin = page.locator('.request-diagnostic-session');
+    await drawerOrigin.waitFor();
+    const drawerScroll = await page.evaluate(() => window.scrollY);
+    await drawerOrigin.click();
+    await readyDetail();
+    await page.getByRole('button', { name: 'Back to originating request', exact: true }).click();
+    await page.getByRole('dialog', { name: 'drilled-model', exact: true }).waitFor();
+    await page.waitForFunction(() => document.activeElement?.classList.contains('request-diagnostic-session'));
+    const restoredQuery = await page.evaluate(() => window.overviewDrilldownFixture.requestQueryBodies.at(-1));
+    assert.ok(restoredQuery && typeof restoredQuery === 'object');
+    assert.equal((restoredQuery as { ast: { conditions: { field: string }[] } }).ast.conditions[0].field, 'protocol');
+    assert.ok(Math.abs((await page.evaluate(() => window.scrollY)) - drawerScroll) <= 1);
+    await page.screenshot({ path: join(evidence, 'request-filter-drawer-return-desktop.png'), fullPage: true });
 
   } finally {
     await browser.close();

@@ -233,7 +233,7 @@ export function RequestDiagnostics({
 }: {
   request: RequestView;
   currency?: string;
-  onOpenSession?: (sessionId: string, keyId?: string) => void;
+  onOpenSession?: (sessionId: string, keyId?: string, requestId?: string) => void;
   upstreamName?: string;
   /** Resolved parent session of a confirmed sub-session, loaded on demand by the owner layer. */
   sessionParent?: { label: string; sessionId: string; keyId?: string };
@@ -285,7 +285,7 @@ export function RequestDiagnostics({
       {context && <section className="request-detail-group request-detail-session" aria-label={t('request.session')}><div className="request-detail-wide"><b>{t('request.session')}</b>
       {context.association === 'confirmed'
         ? context.session_id && onOpenSession
-          ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(context.session_id!, request.credential_identity?.key_id)}>{sessionLabel}</button>
+          ? <button type="button" className="table-link request-diagnostic-session" onClick={() => onOpenSession(context.session_id!, request.credential_identity?.key_id, request.request_id)}>{sessionLabel}</button>
           : <span>{sessionLabel}</span>
         : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
       <RequestMetadata label={zh ? '会话信息' : 'Session details'} fields={[[zh ? '会话 ID' : 'Session ID', context.session_id], [zh ? '任务类型' : 'Task kind', context.task_kind], [zh ? '代理 ID' : 'Agent ID', context.agent_id]]} />
@@ -303,7 +303,7 @@ export function RequestTable({
 }: {
   requests: RequestView[];
   onSelect?: (request: RequestView) => void;
-  onOpenSession?: (sessionId: string, keyId?: string) => void;
+  onOpenSession?: (sessionId: string, keyId?: string, requestId?: string) => void;
   currency?: string;
   credentialAlias?: string;
   upstreamNames?: ReadonlyMap<string, string>;
@@ -350,7 +350,7 @@ export function RequestTable({
             const credentialLabel = 'label' in credential ? credential.label : t(credential.key);
             const credentialDetails = request.credential_identity ? [request.credential_identity.key_id, principalDisplayName(request.credential_identity.principal_external_id, t)].filter(Boolean).join(' · ') : credentialLabel;
             const upstreamName = request.upstream_account_id ? upstreamNames?.get(request.upstream_account_id) : undefined;
-            return <tr key={request.request_id}>
+            return <tr key={request.request_id} data-request-id={request.request_id}>
               <td className="request-time-cell" data-label={t('request.receivedAt')}><time>{new Date(request.created_at).toLocaleString(locale)}</time><RequestIdentifier requestId={request.request_id} compact /></td>
               <td className="request-credential-cell" data-label={t('self.credential')}><DetailTooltip content={credentialDetails}><strong tabIndex={0}>{credentialLabel}</strong></DetailTooltip></td>
               <td className="request-model-cell"><DetailTooltip content={technicalSummary}><span className="request-routing-info" tabIndex={0}><code>{request.model}</code>{upstreamName && <small className="request-upstream-name">{upstreamName}</small>}</span></DetailTooltip><RequestCompaction request={request} /></td>
@@ -361,7 +361,7 @@ export function RequestTable({
                   ? '—'
                   : context.association === 'confirmed'
                     ? context.session_id && onOpenSession
-                      ? <DetailTooltip content={sessionLabel}><button type="button" className={`table-link${contextualSession ? ' request-session-context' : ''}`} onClick={() => onOpenSession(context.session_id!, request.credential_identity?.key_id)}>{sessionDisplay}</button></DetailTooltip>
+                      ? <DetailTooltip content={sessionLabel}><button type="button" className={`table-link${contextualSession ? ' request-session-context' : ''}`} onClick={() => onOpenSession(context.session_id!, request.credential_identity?.key_id, request.request_id)}>{sessionDisplay}</button></DetailTooltip>
                       : <DetailTooltip content={sessionLabel}><span className={`request-session-name${contextualSession ? ' request-session-context' : ''}`} tabIndex={0}>{sessionDisplay}</span></DetailTooltip>
                     : <span className="request-session-unlinked">{t('sessions.unlinkedRequests')}</span>}
                 {sessionMeta && <RequestSessionMetadata value={sessionMeta} />}
