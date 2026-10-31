@@ -4,12 +4,48 @@ import { readFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 
 import { parseArguments, validateUtcDate } from "../../scripts/maintenance/reconcile-postgres-request-stats.ts";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const driver = resolve(repository, "scripts/maintenance/reconcile-postgres-request-stats.ts");
 const daySql = resolve(repository, "scripts/maintenance/reconcile-observability-day.sql");
+
+test("retained-record reconciliation preserves latest corrections and uncorrected costs on replay", () => {
+  const sqlSource = readFileSync(daySql, "utf8");
+  const retainedInsert = sqlSource.slice(sqlSource.indexOf("INSERT INTO request_stats_facts", sqlSource.indexOf("INSERT INTO request_stats_facts") + 1));
+  const statement = retainedInsert.slice(0, retainedInsert.indexOf(";"));
+  const columns = statement.slice(statement.indexOf("(") + 1, statement.indexOf(")")).split(",").map((column) => column.trim());
+  const database = new DatabaseSync(":memory:");
+  try {
+    database.exec(`
+      CREATE TABLE request_stats_facts (${columns.map((column) => `${column} ${column === "request_id" ? "TEXT PRIMARY KEY" : ""}`).join(",")});
+      CREATE TABLE request_records (id TEXT, ${columns.filter((column) => column !== "request_id" && column !== "status_class").join(",")}, completed_at, status_code, usage_basis TEXT);
+      CREATE TABLE key_records (id TEXT, tenant_id TEXT, currency TEXT);
+      CREATE TABLE terminal_projection_outbox (request_id TEXT);
+      CREATE TABLE mtc_reconcile_day_bounds (start_ms, end_ms);
+      CREATE TABLE request_cost_projection_corrections (request_id TEXT, corrected_fact_cost_micros, applied_at, correction_version TEXT);
+      INSERT INTO key_records VALUES ('key', 'tenant', 'USD');
+      INSERT INTO mtc_reconcile_day_bounds VALUES (0, 100);
+    `);
+    for (const [request, status, cost, basis] of [["corrected", 499, 900, "contract_ceiling"], ["provider", 499, 40, "provider_reported"], ["legacy-null", 504, 50, null], ["success", 200, 60, "provider_reported"]] as const) {
+      database.prepare("INSERT INTO request_records (id, tenant_id, key_id, created_at, completed_at, status_code, cost_micros, currency, usage_basis) VALUES (?, 'tenant', 'key', 1, 2, ?, ?, 'USD', ?)").run(request, status, cost, basis);
+    }
+    database.exec(`
+      INSERT INTO request_cost_projection_corrections VALUES ('corrected', 30, 1, 'v1'), ('corrected', 20, 2, 'v1'), ('corrected', 0, 2, 'v2');
+      INSERT INTO request_stats_facts (request_id, cost_micros) VALUES ('corrected', 999);
+    `);
+    const expected = [["corrected", 0], ["legacy-null", 50], ["provider", 40], ["success", 60]];
+    for (const replay of [1, 2]) {
+      database.exec(statement);
+      assert.deepEqual(database.prepare("SELECT request_id, cost_micros FROM request_stats_facts ORDER BY request_id").all().map((row) => [row.request_id, row.cost_micros]), expected, `replay ${replay}`);
+      assert.equal(database.prepare("SELECT cost_micros FROM request_records WHERE id = 'corrected'").get()?.cost_micros, 900);
+    }
+  } finally {
+    database.close();
+  }
+});
 
 test("reconciliation defaults to a bounded read-only inventory", () => {
   assert.deepEqual(parseArguments([], "2026-08-28"), {

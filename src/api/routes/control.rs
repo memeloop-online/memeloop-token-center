@@ -15,6 +15,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(super::super::operator_inference::chat_completions),
         )
         .route(
+            "/internal/v1/inference/responses",
+            post(super::super::operator_inference::responses),
+        )
+        .route(
             "/internal/v1/transport-proxy-groups/access",
             get(transport_group_access),
         )
@@ -283,6 +287,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/sessions/{session_id}/requests/{request_id}/context",
             get(internal_session_context),
+        )
+        .route(
+            "/internal/v1/sessions/{session_id}/requests/{request_id}/dialogue",
+            get(internal_session_dialogue),
         )
         .route(
             "/internal/v1/sessions/{session_id}/requests/{request_id}/context/content",

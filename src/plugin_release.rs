@@ -156,7 +156,7 @@ pub async fn resolve_github_release(
     let original = validate_github_release_url(value)?;
     let _permit = RELEASE_FETCH_PERMITS
         .try_acquire()
-        .map_err(|_| AppError::Overloaded)?;
+        .map_err(|_| AppError::capacity_error("plugin_release_fetch_capacity"))?;
     download_release(original, |url| request_release(url, proxy.as_ref())).await
 }
 

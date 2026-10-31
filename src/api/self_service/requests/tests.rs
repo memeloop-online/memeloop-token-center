@@ -44,6 +44,7 @@ fn request_detail_refs(request_id: Uuid) -> crate::model::RequestArchiveRefs {
             },
             error_code: None,
             terminal_cause_code: None,
+            in_flight_stage: None,
             supplier_error: None,
             archive_state: crate::model::RequestArchiveState::Bound,
             credential_identity: None,

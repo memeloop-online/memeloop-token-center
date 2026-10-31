@@ -99,8 +99,65 @@ fn policy_wat(body: &str) -> String {
     format!("{prefix};; BEGIN POST-AUTH BODY\n{body}\n;; END POST-AUTH BODY{suffix}")
 }
 
+// Exercise the exact core fixture before the gateway hides Wasmtime errors
+// behind plugin_execution_failed. This does not replace the real component
+// invocation or its >256 MiB success assertion below.
+fn assert_policy_rewrite_core(source: &str, pointer: usize, length: usize, json: &str) {
+    let engine = wasmtime::Engine::default();
+    let module = wasmtime::Module::new(&engine, wat::parse_str(source).unwrap()).unwrap();
+    let memory_type = module
+        .exports()
+        .find_map(|export| match export.ty() {
+            wasmtime::ExternType::Memory(memory) if export.name() == "cm32p2_memory" => {
+                Some(memory)
+            }
+            _ => None,
+        })
+        .expect("the policy core must export its canonical ABI memory");
+    let pages = (pointer + length).div_ceil(65536) as u64;
+    assert!(
+        memory_type.maximum().is_none_or(|maximum| maximum >= pages),
+        "fixture needs {pages} pages, but its core memory maximum is {:?}",
+        memory_type.maximum(),
+    );
+    let mut linker = wasmtime::Linker::new(&engine);
+    linker.define_unknown_imports_as_traps(&module).unwrap();
+    let mut store = wasmtime::Store::new(&engine, ());
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let hook = instance
+        .get_func(
+            &mut store,
+            "cm32p2|memeloop:token-center/traffic-policy@0.2|post-auth",
+        )
+        .unwrap();
+    let mut result = [wasmtime::Val::I32(0)];
+    // The generated rewrite ignores context arguments and makes no host calls.
+    let arguments: [wasmtime::Val; 14] = std::array::from_fn(|_| wasmtime::Val::I32(0));
+    hook.call(&mut store, &arguments, &mut result)
+        .unwrap_or_else(|error| {
+            panic!(
+                "policy core rewrite failed (required pages {pages}, maximum {:?}): {error:#}",
+                memory_type.maximum(),
+            )
+        });
+    assert_eq!(result[0].i32(), Some(256));
+    let memory = instance.get_memory(&mut store, "cm32p2_memory").unwrap();
+    let data = memory.data(&store);
+    assert_eq!(
+        u32::from_le_bytes(data[304..308].try_into().unwrap()) as usize,
+        pointer
+    );
+    assert_eq!(
+        u32::from_le_bytes(data[308..312].try_into().unwrap()) as usize,
+        length
+    );
+    let rewrite = &data[pointer..pointer + length];
+    assert_eq!(&rewrite[..json.len()], json.as_bytes());
+    assert!(rewrite[json.len()..].iter().all(|byte| *byte == b' '));
+}
+
 #[tokio::test]
-async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
+async fn small_text_input_can_expand_past_sixteen_mib_in_a_real_traffic_hook() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(successful_hint_response("expanded"))
@@ -121,13 +178,13 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
         fixture.model
     );
     let suffix = "\"}],\"stream\":false}";
-    let length = 16 * 1024 * 1024;
+    let length = 16 * 1024 * 1024 + 1;
     let pointer = 64 * 1024;
     let start = stores_for_string(pointer, &prefix);
     let end = stores_for_string(pointer + length - suffix.len(), suffix);
     let body = format!(
         r#"
-        i32.const 256 memory.grow drop
+        i32.const 257 memory.grow drop
         i32.const {pointer} i32.const 120 i32.const {length} memory.fill
         {start}
         {end}
@@ -146,12 +203,6 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
     fixture.state = AppState::initialize((*fixture.state.config).clone())
         .await
         .unwrap();
-    // Isolate this memory-admission boundary from the independently tested
-    // guest fuel ceiling: bulk-filling 16 MiB intentionally exceeds it.
-    fixture
-        .state
-        .plugins
-        .set_execution_limits_for_tests(std::time::Duration::from_secs(30), u64::MAX);
     let (status, response) = call_hint_routing_fixture(&fixture).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let received = upstream.received_requests().await.unwrap();
@@ -160,6 +211,72 @@ async fn small_text_input_can_expand_to_sixteen_mib_in_a_real_traffic_hook() {
         rewritten["messages"][0]["content"].as_str().unwrap().len(),
         length - prefix.len() - suffix.len()
     );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn traffic_rewrite_over_256_mib_reaches_upstream_with_service_memory_capacity() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(successful_hint_response("large-whitespace-rewrite"))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let mut fixture = hint_routing_fixture_with_database(
+        "large-whitespace-rewrite",
+        upstream.uri(),
+        upstream.uri(),
+        false,
+        None,
+        None,
+    )
+    .await;
+    let rewritten = json!({
+        "model": fixture.model,
+        "messages": [{"role":"user", "content":"kept after padding"}],
+        "stream": false
+    });
+    let length: usize = 256 * 1024 * 1024 + 1;
+    let pointer: usize = 64 * 1024;
+    let pages = (pointer + length).div_ceil(65536);
+    let rewritten_json = serde_json::to_string(&rewritten).unwrap();
+    let contents = stores_for_string(pointer, &rewritten_json);
+    let body = format!(
+        r#"
+        i32.const {pages} memory.size i32.sub memory.grow
+        i32.const -1 i32.eq if unreachable end
+        i32.const {pointer} i32.const 32 i32.const {length} memory.fill
+        {contents}
+        i32.const 256 i32.const 0 i32.store
+        i32.const 260 i32.const 1 i32.store
+        i32.const 264 i32.const 0 i32.store
+        i32.const 276 i32.const 0 i32.store
+        i32.const 288 i32.const 0 i32.store
+        i32.const 300 i32.const 1 i32.store
+        i32.const 304 i32.const {pointer} i32.store
+        i32.const 308 i32.const {length} i32.store
+        i32.const 256
+        "#,
+    );
+    assert_policy_rewrite_core(&policy_wat(&body), pointer, length, &rewritten_json);
+    write_policy_package(fixture._directory.path(), &body, json!([]));
+    let mut config = (*fixture.state.config).clone();
+    config.proxy_memory_budget_bytes = 2 * 1024 * 1024 * 1024;
+    fixture.state = AppState::initialize(config).await.unwrap();
+    let capture = LogCapture::default();
+    let (status, response) = call_hint_routing_fixture(&fixture)
+        .with_subscriber(capture.dispatch())
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{response}; {}",
+        String::from_utf8_lossy(&capture.0.lock().unwrap())
+    );
+    let received = upstream.received_requests().await.unwrap();
+    let request: Value = serde_json::from_slice(&received[0].body).unwrap();
+    assert_eq!(request["messages"], rewritten["messages"]);
+    assert!(received[0].body.len() < 1024);
     upstream.verify().await;
 }
 
@@ -958,19 +1075,21 @@ async fn log_capability_emits_only_bounded_host_owned_fields() {
     let gateway_dispatch = capture.dispatch();
 
     let decision = tracing::dispatcher::with_default(&direct_dispatch, || {
-        state.plugins.apply_traffic(
-            memeloop_token_center::plugin::memeloop::token_center::types::RequestContext {
-                tenant_id: "tenant".into(),
-                principal_id: "principal".into(),
-                key_id: "key".into(),
-                protocol: "openai".into(),
-                model: "requested-model".into(),
-                config_json: "{}".into(),
-            },
-            &json!({"model": "requested-model", "messages": []}),
-        )
-    })
-    .expect("execute policy with Log capability");
+        state
+            .plugins
+            .apply_traffic(
+                memeloop_token_center::plugin::memeloop::token_center::types::RequestContext {
+                    tenant_id: "tenant".into(),
+                    principal_id: "principal".into(),
+                    key_id: "key".into(),
+                    protocol: "openai".into(),
+                    model: "requested-model".into(),
+                    config_json: "{}".into(),
+                },
+                &json!({"model": "requested-model", "messages": []}),
+            )
+            .unwrap_or_else(|error| panic!("execute policy with Log capability: {error}"))
+    });
     assert!(!decision.allow);
 
     let response = call(
@@ -1425,7 +1544,7 @@ async fn call(state: &AppState, key: &str, path: &str, body: Value) -> (StatusCo
 }
 
 #[tokio::test]
-async fn component_input_limit_returns_413_after_authentication_and_route_authorization() {
+async fn large_traffic_input_preserves_real_guest_errors_and_authorization() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
@@ -1452,8 +1571,6 @@ async fn component_input_limit_returns_413_after_authentication_and_route_author
     let length = 16 * 1024 * 1024 - 1;
     let overhead = serde_json::to_vec(&request).unwrap().len();
     request["prompt"] = json!("x".repeat(length - overhead));
-    // The image endpoint accepts this raw body, but its JSON plus authenticated
-    // context exceeds the component ABI limit. No guest/upstream may execute.
     assert_eq!(serde_json::to_vec(&request).unwrap().len(), length);
     let (status, body) = call(
         &state,
@@ -1462,8 +1579,8 @@ async fn component_input_limit_returns_413_after_authentication_and_route_author
         request.clone(),
     )
     .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(body["error"]["code"], "plugin_input_too_large");
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    assert_eq!(body["error"]["code"], "plugin_execution_failed");
     let (status, _) = call(
         &state,
         "invalid-test-key",

@@ -54,7 +54,7 @@ pub(super) async fn configuration_schemas(
 ) -> Result<impl IntoResponse, AppError> {
     require_service(&headers, &state, "schemas:read").await?;
     fn schema(source: &str) -> Result<Value, AppError> {
-        serde_json::from_str(source).map_err(|_| AppError::Internal)
+        serde_json::from_str(source).map_err(|_| AppError::internal("control_requests_schema_1"))
     }
     Ok(Json(json!({
         "core_config": schema(include_str!("../../schemas/core-config.schema.json"))?,
@@ -405,7 +405,7 @@ pub(super) async fn put_filter_assistant_settings(
         .as_deref()
         .map(serde_json::from_slice::<FilterAssistantSettings>)
         .transpose()
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("control_requests_put_filter_assistant_settings_1"))?
         .map(|value| value.updated_at)
         != body.expected_updated_at
     {
@@ -413,7 +413,8 @@ pub(super) async fn put_filter_assistant_settings(
             "filter assistant settings changed; reload before saving".into(),
         ));
     }
-    let value = serde_json::to_vec(&settings).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_vec(&settings)
+        .map_err(|_| AppError::internal("control_requests_put_filter_assistant_settings_2"))?;
     state
         .db
         .replace_filter_assistant_settings(
@@ -494,7 +495,8 @@ async fn load_filter_preset_state(
     else {
         return Ok(FilterPresetState::default());
     };
-    serde_json::from_slice(&value).map_err(|_| AppError::Internal)
+    serde_json::from_slice(&value)
+        .map_err(|_| AppError::internal("control_requests_load_filter_preset_state_1"))
 }
 
 async fn store_filter_preset_state(
@@ -503,7 +505,8 @@ async fn store_filter_preset_state(
     tenant: Option<&str>,
     stored: &FilterPresetState,
 ) -> Result<(), AppError> {
-    let value = serde_json::to_vec(stored).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_vec(stored)
+        .map_err(|_| AppError::internal("control_requests_store_filter_preset_state_1"))?;
     state
         .db
         .plugin_kv_put(
@@ -530,7 +533,7 @@ pub(in crate::api) async fn load_filter_assistant_settings(
     };
     serde_json::from_slice(&value)
         .map(Some)
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("control_requests_load_filter_assistant_settings_1"))
 }
 
 pub(super) async fn assistant_execution_context(
