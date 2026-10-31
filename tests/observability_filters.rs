@@ -593,6 +593,51 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     );
     assert_eq!(text_detail["usage"]["tokens"]["input_tokens"], 4);
     assert_eq!(text_detail["billing"]["cost"], "0.125");
+
+    // The same credential has linked native usage alongside unlinked generation/archive usage.
+    state
+        .db
+        .record_conversation_observation(
+            &key,
+            text_id,
+            &json!({"input": "explicitly linked request"}),
+            &ConversationHints {
+                session_id: Some(Uuid::now_v7().to_string()),
+                ..Default::default()
+            },
+            Some("association-filter-contract"),
+        )
+        .await
+        .unwrap();
+    let unlinked = state
+        .db
+        .list_all_requests_filtered(
+            "projection-a",
+            memeloop_token_center::db::RequestListFilter {
+                limit: 100,
+                key_id: Some(key.key_id),
+                typed_ast: Some(TypedFilterAst {
+                    logical_operator: TypedFilterLogicalOperator::And,
+                    conditions: vec![TypedFilterCondition {
+                        field: TypedFilterField::SessionAssociation,
+                        operator: TypedFilterOperator::Equals,
+                        value: TypedFilterValue::Text("unlinked".into()),
+                        upper: None,
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(unlinked.iter().all(|row| row.request_id != text_id));
+    assert!(unlinked.iter().any(|row| row.request_id == generation_id));
+    assert!(unlinked.iter().any(|row| row.request_id == archive_id));
+    assert!(unlinked.iter().all(|row| {
+        row.session_context.as_ref().is_none_or(|context| {
+            context.association == memeloop_token_center::model::RequestSessionAssociation::Unlinked
+        })
+    }));
 }
 
 #[tokio::test]
@@ -708,6 +753,35 @@ async fn postgres_observability_queries_use_the_same_bound_contract() {
         memeloop_token_center::model::RequestSessionAssociation::Unlinked
     );
     assert!(unlinked.session_id.is_none());
+    for (association, expected, excluded) in [
+        ("unlinked", unlinked_request, confirmed_request),
+        ("confirmed", confirmed_request, unlinked_request),
+    ] {
+        let requests = state
+            .db
+            .list_all_requests_filtered(
+                &tenant,
+                memeloop_token_center::db::RequestListFilter {
+                    limit: 100,
+                    key_id: Some(key.key_id),
+                    typed_ast: Some(TypedFilterAst {
+                        logical_operator: TypedFilterLogicalOperator::And,
+                        conditions: vec![TypedFilterCondition {
+                            field: TypedFilterField::SessionAssociation,
+                            operator: TypedFilterOperator::Equals,
+                            value: TypedFilterValue::Text(association.into()),
+                            upper: None,
+                        }],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(requests.iter().any(|row| row.request_id == expected));
+        assert!(requests.iter().all(|row| row.request_id != excluded));
+    }
+
     let filter = memeloop_token_center::db::RequestListFilter {
         limit: 10,
         route_id: Some(route_id),
