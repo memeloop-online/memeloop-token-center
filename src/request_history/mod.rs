@@ -3,6 +3,7 @@ mod contract;
 pub mod migration;
 mod monitoring;
 mod query;
+mod session_tasks;
 mod sessions;
 mod statistics;
 mod usage;

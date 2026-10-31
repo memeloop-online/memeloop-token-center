@@ -426,7 +426,8 @@ async fn request_history_real_services_acceptance() {
             &format!("unlinked:{}", key.key_id),
             crate::db::ConversationDetailFilter {
                 limit: 100,
-                ..Default::default()
+                before_created_at: None,
+                before_request_id: None,
             },
         )
         .await

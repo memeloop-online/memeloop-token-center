@@ -128,7 +128,7 @@ impl ClickHouse {
         Ok(response)
     }
 
-    async fn rows<Row: DeserializeOwned>(
+    pub(crate) async fn rows<Row: DeserializeOwned>(
         &self,
         query: BoundQuery,
     ) -> Result<Vec<Row>, HistoryError> {

@@ -259,6 +259,17 @@ impl Database {
         })
     }
 
+    pub(crate) async fn history_source_event_page(
+        &self,
+        after: i64,
+        after_id: Option<Uuid>,
+        limit: i64,
+    ) -> Result<Vec<HistoryIdentity>, HistoryError> {
+        let rows=sqlx::query("SELECT 'event' AS source, event_id AS request_id, event_at AS created_at, tenant_id, key_id FROM request_events WHERE (event_at > $1 OR (event_at = $1 AND event_id > $2)) ORDER BY event_at, event_id LIMIT $3")
+            .bind(after).bind(after_id.map(|id|id.to_string()).unwrap_or_default()).bind(limit).fetch_all(&self.pool).await?;
+        rows.iter().map(history_identity).collect()
+    }
+
     pub async fn history_backfill_page(&self, page_size: i64) -> Result<usize, HistoryError> {
         if page_size <= 0 || self.history_mode().await? == "off" {
             return Err(HistoryError::Invalid(
