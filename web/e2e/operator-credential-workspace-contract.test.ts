@@ -375,6 +375,13 @@ test('credential workspaces isolate loads and preserve issued service plaintext'
       await client.getByRole('button', { name: english ? 'More actions' : '更多操作', exact: true }).click();
       await client.getByRole('menuitem', { name: english ? 'Edit' : '编辑', exact: true }).click();
       const edit = client.locator('.inline-editor.form-panel');
+      const principal = edit.getByRole('textbox', { name: english ? 'Principal' : '用户主体', exact: true });
+      assert.equal(await principal.inputValue(), 'tenant-a-principal', 'editing distinguishes the shared principal from the credential alias');
+      assert.equal(await principal.isEditable(), false, 'alias editing never silently rebinds the shared principal');
+      const editBack = client.locator('.create-journey > .journey-heading [data-workspace-toggle]');
+      assert.equal(await editBack.innerText(), english ? 'Back' : '返回');
+      const [backBox, titleBox] = await Promise.all([editBack.boundingBox(), client.locator('.create-journey > .journey-heading h2').boundingBox()]);
+      assert.ok(backBox && titleBox && backBox.x < titleBox.x, 'client editing uses the same top-left Back navigation');
       const renamedAlias = english ? 'Research workspace renamed' : '研发工作区改名';
       await edit.getByRole('textbox', { name: english ? 'Credential alias' : '凭据别名', exact: true }).fill(renamedAlias);
       const editMode = edit.getByRole('combobox', { name: modeLabel, exact: true });

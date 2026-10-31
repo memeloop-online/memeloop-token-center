@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -61,6 +61,7 @@ async function editFixturePage(context: TestContext, query: string) {
   context.after(() => page.close());
   await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
   await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-credential-workspace.html?${query}`);
+  if (new URLSearchParams(query).has('suspended')) await page.locator('[data-resource-list-status-filter] button').click();
   await page.getByText('Existing service credential', { exact: true }).waitFor();
   return page;
 }
@@ -104,6 +105,10 @@ test('service credential edit panel shares the create form and saves through PAT
 
   const form = page.locator('form.service-credential-create');
   await form.getByText('编辑服务凭据', { exact: false }).waitFor();
+  const back = form.getByRole('button', { name: '返回', exact: true });
+  const title = form.getByRole('heading', { name: /编辑服务凭据/ });
+  const [backBox, titleBox] = await Promise.all([back.boundingBox(), title.boundingBox()]);
+  assert.ok(backBox && titleBox && backBox.x < titleBox.x, 'Back stays at the editor’s top-left');
   const name = form.getByRole('textbox', { name: '名称', exact: true });
   assert.equal(await name.inputValue(), 'Existing service credential');
   const tenant = form.getByRole('combobox', { name: '租户范围', exact: true });
@@ -119,6 +124,13 @@ test('service credential edit panel shares the create form and saves through PAT
   await form.getByRole('checkbox', { name: '读取请求与用量 (requests:read)' }).check();
   await form.getByRole('button', { name: '保存修改', exact: true }).click();
   await page.getByText('已更新 统计报表集成。', { exact: true }).waitFor();
+  const artifacts = fileURLToPath(new URL('../e2e-artifacts/upstream-availability', import.meta.url));
+  mkdirSync(artifacts, { recursive: true });
+  for (const width of [1440, 390] as const) {
+    await page.setViewportSize({ width, height: 900 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, 'the successful edit state has no horizontal overflow');
+    await page.screenshot({ path: join(artifacts, `service-credential-edit-success-zh-CN-${width}.png`), fullPage: true });
+  }
   const firstPatch = await page.evaluate(() => window.credentialFixture.requests.filter((request) => request.method === 'PATCH').map((request) => JSON.parse(request.body ?? '{}')));
   assert.deepEqual(firstPatch, [{ name: '统计报表集成', scopes: ['keys:read', 'requests:read'] }], 'an untouched tenant binding is omitted so the server preserves it');
   await page.getByText('统计报表集成', { exact: true }).waitFor();
@@ -133,6 +145,34 @@ test('service credential edit panel shares the create form and saves through PAT
   await page.getByText('已更新 统计报表集成。', { exact: true }).waitFor();
   const patches = await page.evaluate(() => window.credentialFixture.requests.filter((request) => request.method === 'PATCH').map((request) => JSON.parse(request.body ?? '{}')));
   assert.deepEqual(patches.at(-1), { tenant_external_id: null }, 'selecting the global option sends an explicit null, never an inferred one');
+  await page.locator('.credential-compact-row', { hasText: '统计报表集成' }).getByRole('button', { name: '编辑', exact: true }).click();
+  await form.getByRole('button', { name: '返回', exact: true }).click();
+  await page.getByRole('button', { name: '创建服务凭据表单', exact: true }).waitFor();
+});
+
+test('a transient service edit failure preserves the draft and retries the same PATCH', { timeout: 60_000 }, async (context) => {
+  const page = await editFixturePage(context, 'scenario=service-edit&transient');
+  if (!page) return;
+  const row = page.locator('.credential-compact-row', { hasText: 'Existing service credential' });
+  await row.getByRole('button', { name: '编辑', exact: true }).click();
+  const form = page.locator('form.service-credential-create');
+  const name = form.getByRole('textbox', { name: '名称', exact: true });
+  await name.fill('故障恢复后的统计集成');
+  await form.getByRole('checkbox', { name: '读取请求与用量 (requests:read)' }).check();
+  await form.getByRole('button', { name: '保存修改', exact: true }).click();
+  await page.getByRole('alert').getByText('fixture credential service temporarily unavailable', { exact: false }).waitFor();
+  assert.equal(await name.inputValue(), '故障恢复后的统计集成', 'a 503 keeps the edited name in the open form');
+  assert.equal(await form.getByRole('checkbox', { name: '读取请求与用量 (requests:read)' }).isChecked(), true, 'a 503 keeps the edited scopes');
+  assert.equal(await page.locator('input[type="password"]').count(), 0, 'a server outage does not turn into a credential-login prompt');
+
+  await page.evaluate(() => { document.documentElement.dataset.serviceEditAvailable = 'true'; });
+  await form.getByRole('button', { name: '保存修改', exact: true }).click();
+  await page.getByText('已更新 故障恢复后的统计集成。', { exact: true }).waitFor();
+  const patches = await page.evaluate(() => window.credentialFixture.requests.filter((request) => request.method === 'PATCH').map((request) => JSON.parse(request.body ?? '{}')));
+  assert.deepEqual(patches, [
+    { name: '故障恢复后的统计集成', scopes: ['keys:read', 'requests:read'] },
+    { name: '故障恢复后的统计集成', scopes: ['keys:read', 'requests:read'] },
+  ], 'retry repeats the preserved draft without adding a tenant or another write');
 });
 
 test('a real 403 retires service credential write affordances with the capability boundary', { timeout: 60_000 }, async (context) => {
@@ -151,4 +191,13 @@ test('a real 403 retires service credential write affordances with the capabilit
   assert.equal(await row.getByRole('button', { name: '轮换服务凭据', exact: true }).isEnabled(), false, 'the observed 403 disables other write affordances');
   assert.equal(await form.getByRole('button', { name: '保存修改', exact: true }).isEnabled(), false, 'the open editor stops offering the denied save');
   assert.equal(await page.evaluate(() => window.credentialFixture.requests.filter((request) => request.method === 'PATCH').length), 1, 'the denial was one real attempt, not a loop');
+});
+
+test('a suspended service credential keeps Resume available without offering rotation', { timeout: 60_000 }, async (context) => {
+  const page = await editFixturePage(context, 'scenario=service-edit&suspended');
+  if (!page) return;
+  const row = page.locator('.credential-compact-row', { hasText: 'Existing service credential' });
+  assert.equal(await row.getByRole('button', { name: '轮换服务凭据', exact: true }).isEnabled(), false, 'the backend’s active-only rotation rule is represented before a request');
+  assert.equal(await row.getByRole('button', { name: '启用服务凭据', exact: true }).isEnabled(), true, 'a credential-state restriction never latches a global write denial');
+  assert.equal(await row.getByRole('button', { name: '编辑', exact: true }).isEnabled(), true, 'suspended credentials remain editable without reactivating them');
 });

@@ -205,6 +205,9 @@ globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit) => {
   }
   if (url.pathname === '/internal/v1/service-tokens/service-existing' && method === 'PATCH' && scenario === 'service-edit') {
     if (parameters.has('forbidden')) return json({ error: { code: 'forbidden', message: 'fixture global service_tokens:write required' } }, 403);
+    if (parameters.has('transient') && document.documentElement.dataset.serviceEditAvailable !== 'true') {
+      return json({ error: { code: 'service_unavailable', message: 'fixture credential service temporarily unavailable' } }, 503);
+    }
     const body = JSON.parse(String(init?.body ?? '{}'));
     serviceEditState = {
       ...serviceEditState,

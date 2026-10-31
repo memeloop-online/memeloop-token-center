@@ -1751,7 +1751,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
     setSecret(undefined);
   };
   const rotateCredential = async (value: KeyView) => {
-    if (!canManage(value) || value.status === 'revoked') return;
+    if (!canManage(value) || (value.status ?? 'active') !== 'active') return;
     const operation = beginSecretOperation();
     if (!operation) return;
     const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
@@ -1883,10 +1883,13 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
             <Field label={t('schema.Credential alias')} required validationState={credentialAliasReady(aliasDrafts[value.key_id] ?? value.alias) ? 'none' : 'error'} validationMessage={credentialAliasReady(aliasDrafts[value.key_id] ?? value.alias) ? undefined : t('credentials.editAliasRequired')}>
               <Input value={aliasDrafts[value.key_id] ?? value.alias} maxLength={200} onChange={(event) => setAliasDrafts(drafts => ({ ...drafts, [value.key_id]: event.target.value }))} />
             </Field>
+            <Field label={t('schema.Principal')} hint={t('credentials.editPrincipalHint')}>
+              <Input readOnly value={value.principal_external_id ?? t('common.unknownPrincipal')} />
+            </Field>
             {policyFormSchema && <section className="credential-edit-section" aria-label={t('credentials.editPolicy')}><h4>{t('credentials.editPolicy')}</h4><CredentialPolicySummary policy={value.policy} currency={value.currency} /><Form key={value.key_id} schema={localizeSchema(policyFormSchema as RJSFSchema, locale)} formData={policyDrafts[value.key_id] ?? value.policy} onChange={({ formData }) => { setPolicyDrafts(current => ({ ...current, [value.key_id]: formData })); setPolicyErrors(current => { const { [value.key_id]: _cleared, ...remaining } = current; return remaining; }); }} uiSchema={credentialPolicyUiSchema} fields={credentialFormFields} validator={validator} templates={credentialFormTemplates} widgets={fluentFormWidgets} extraErrors={policyErrors[value.key_id]}><></></Form></section>}
             <section className="credential-edit-section routing-editor" aria-label={t('credentials.routing')}><h4>{t('credentials.routing')}</h4><p className="muted">{t('credentials.routingHint')}</p>
               {routingDraft ? <>
-                <CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} groups={routeGroupOptions} routeIds={routingDraft.route_ids} groupIds={routingDraft.route_group_ids} onRoutes={route_ids => setRoutingDraft({ ...routingDraft, route_ids })} onGroups={route_group_ids => setRoutingDraft({ ...routingDraft, route_group_ids })} />
+                <CredentialRouteAuthorization token={token} tenant={writeTenant} routes={routeOptions} routesLoading={routesLoading} routesError={routeError} onRetryRoutes={() => void loadRoutes(token, tenant, scopeGeneration.current)} groups={routeGroupOptions} routeIds={routingDraft.route_ids} groupIds={routingDraft.route_group_ids} onRoutes={route_ids => setRoutingDraft({ ...routingDraft, route_ids })} onGroups={route_group_ids => setRoutingDraft({ ...routingDraft, route_group_ids })} />
                 {routingDraft.effective_route_ids.length > 0 && <small className="field-hint">{t('credentials.effectiveRoutes', { count: formatNumber(routingDraft.effective_route_ids.length, locale) })}</small>}
               </> : <LoadingState label={t('common.loading')} variant="detail" />}
             </section>
@@ -1923,7 +1926,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
               try { const snapshot = await api<KeyLimitSnapshot>(`/internal/v1/keys/${value.key_id}/limits`, token); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || editorGeneration.current !== generation) return; setLimitSnapshots(current => ({ ...current, [value.key_id]: snapshot })); }
               catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && editorGeneration.current === generation) setError(messageOf(reason, t('common.requestFailed'))); }
             } },
-            { id: 'rotate', label: t('credentials.rotate'), disabled: !canWrite || value.status === 'revoked', onSelect: () => rotateCredential(value) },
+            { id: 'rotate', label: t('credentials.rotate'), disabled: !canWrite || (value.status ?? 'active') !== 'active', description: value.status === 'revoked' ? t('credentials.copyRevoked') : value.status === 'suspended' ? t('credentials.rotateSuspended') : undefined, onSelect: () => rotateCredential(value) },
             { id: 'credential', label: t('credentials.store'), disabled: !canManage(value) || value.status === 'revoked', onSelect: () => setEditingCredential(value.key_id) },
             { id: 'grant', label: t('credentials.grant'), disabled: !canWrite || !value.account_id || value.status === 'revoked', description: !value.account_id ? t('credentials.accountMissing') : undefined, onSelect: () => setGranting(value.key_id) },
             ...(value.status === 'revoked' ? [] : [{ id: 'status', label: value.status === 'active' ? t('credentials.suspend') : t('credentials.resume'), disabled: !canWrite, onSelect: async () => {
@@ -1933,7 +1936,7 @@ function CredentialWorkspace({ token, tenant, writeTenant = tenant, createSchema
             } }]),
           ]} /></div>
         </div>})}</div>{keyListState === 'failed' ? <div className="load-more"><button type="button" className="secondary" onClick={() => void load()}>{t('credentials.retryLoad')}</button></div> : nextCursor && (keyListState === 'more' || keyListState === 'loading-more') && <div className="load-more"><button type="button" className="secondary" disabled={!canLoadMore} onClick={() => void loadMore()}>{loadingKeys ? t('common.loading') : t('credentials.loadMore')}</button></div>}</article>
-    <CreateJourney title={activeCredential ? `${t('credentials.title')} · ${activeCredential.alias}` : t('credentials.createTitle')} description={formJourneyCopy(locale).credentialFlowHint} open={Boolean(workspace)} busy={Boolean(busy) || Boolean(visibleSecret)} onOpenChange={(open) => { editorGeneration.current += 1; if (!open) setCredentialValue(''); setWorkspace(open ? { kind: 'create' } : undefined); }}>
+    <CreateJourney title={activeCredential ? `${t('credentials.title')} · ${activeCredential.alias}` : t('credentials.createTitle')} description={formJourneyCopy(locale).credentialFlowHint} open={Boolean(workspace)} busy={Boolean(busy) || Boolean(visibleSecret)} closeLabel={workspace?.kind === 'edit' ? t('common.back') : undefined} closePlacement={workspace?.kind === 'edit' ? 'start' : 'end'} onOpenChange={(open) => { editorGeneration.current += 1; if (!open) setCredentialValue(''); setWorkspace(open ? { kind: 'create' } : undefined); }}>
       {(error || routeError || routeGroups.error) && <div className="notice error" role="alert">{error || routeError || routeGroups.error}</div>}
       {activeCredential && credentialEditor(activeCredential)}
       <div hidden={workspace?.kind !== 'create'}>
@@ -2030,7 +2033,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, tenan
     try {
       const all = await api<ServiceTokenView[]>('/internal/v1/service-tokens', loadToken);
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
-      setValues(loadTenant ? all.filter((value) => value.tenant_external_id === loadTenant) : all); setError(''); setListDenied('');
+      setValues(loadTenant ? all.filter((value) => !value.tenant_external_id || value.tenant_external_id === loadTenant) : all); setError(''); setListDenied('');
     } catch (reason) {
       if (sequence !== loadSequence.current || scopeRef.current.token !== loadToken || scopeRef.current.tenant !== loadTenant) return;
       // A 403 here is a definitive capability answer, not a transient failure:
@@ -2111,7 +2114,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, tenan
     }
   };
   const rotateServiceCredential = async (value: ServiceTokenView) => {
-    if (!canManage(value) || value.status === 'revoked') return;
+    if (!canManage(value) || (value.status ?? 'active') !== 'active') return;
     const operation = beginSecretOperation();
     if (!operation) return;
     const operationToken = token; const operationTenant = tenant; const operationWriteTenant = writeTenant; const operationScopeGeneration = renderScope.current.generation;
@@ -2204,13 +2207,13 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, tenan
               ? t('services.copyNeedsOriginal')
               : undefined;
       const manageReason = !canManage(value) ? writePermissionReason : undefined;
-      const rotateReason = manageReason ?? (value.status === 'revoked' ? t('credentials.copyRevoked') : undefined);
+      const rotateReason = manageReason ?? (value.status === 'revoked' ? t('credentials.copyRevoked') : value.status === 'suspended' ? t('credentials.rotateSuspended') : undefined);
       const nextStatus = value.status === 'active' ? 'suspended' : 'active';
       const statusLabel = value.status === 'active' ? t('services.suspend') : t('services.resume');
       return <div className="managed-resource credential-compact-row" key={value.service_id}><div className="managed-resource-header"><div><b title={technicalDetails}>{value.name}</b><div className="credential-row-summary"><span className="credential-budget" title={t('services.notBilledHint')}>{t('services.notBilled')}</span><span className="credential-group-summary">{tenantDisplayName(value.tenant_external_id ?? t('services.globalScope'), locale)} · {value.scopes.length ? serviceCredentialScopeSummary(value.scopes, zh) : t('common.none')}</span></div></div><div className="account-meta"><span className={`status ${value.status === 'active' ? 'ok' : value.status === 'revoked' ? 'bad' : 'pending'}`}>{enumLabel(t, 'status', value.status ?? 'active')}</span><span className="pill">{t('providers.generation')} {formatNumber(value.credential_generation, locale)}</span></div></div><div className="row-actions credential-row-actions"><DetailTooltip content={copyReason ?? t('credentials.copy')}><span tabIndex={copyReason ? 0 : undefined}><Button appearance="secondary" type="button" disabled={Boolean(copyReason) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void copyServiceCredential(value)}>{busy === `copy-${value.service_id}` ? t('common.loading') : t('credentials.copy')}</Button></span></DetailTooltip><DetailTooltip content={rotateReason ?? t('services.rotate')}><span tabIndex={rotateReason ? 0 : undefined}><Button appearance="secondary" type="button" disabled={Boolean(rotateReason) || Boolean(busy) || Boolean(visibleSecret)} onClick={() => void rotateServiceCredential(value)}>{busy === `rotate-${value.service_id}` ? t('common.loading') : t('services.rotate')}</Button></span></DetailTooltip>{value.status !== 'revoked' && <DetailTooltip content={manageReason ?? t('services.edit')}><span tabIndex={manageReason ? 0 : undefined}><Button appearance="secondary" type="button" disabled={Boolean(manageReason) || Boolean(busy)} onClick={() => openServiceEditor(value)}>{t('services.edit')}</Button></span></DetailTooltip>}{value.status !== 'revoked' && <DetailTooltip content={manageReason ?? statusLabel}><span tabIndex={manageReason ? 0 : undefined}><Button appearance="secondary" type="button" disabled={Boolean(manageReason) || Boolean(busy)} onClick={async () => { setBusy(`status-${value.service_id}`); try { await api(`/internal/v1/service-tokens/${value.service_id}/status`, token, { method: 'PATCH', body: JSON.stringify({ status: nextStatus }) }); if (scopeRef.current.token !== token || scopeRef.current.tenant !== tenant || scopeRef.current.writeTenant !== writeTenant) return; setMessage(t(nextStatus === 'active' ? 'services.resumed' : 'services.suspended', { name: value.name })); await load(); } catch (reason) { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setError(mutationFailure(reason)); } finally { if (scopeRef.current.token === token && scopeRef.current.tenant === tenant && scopeRef.current.writeTenant === writeTenant) setBusy(''); } } }>{busy === `status-${value.service_id}` ? t('common.loading') : statusLabel}</Button></span></DetailTooltip>}</div></div>;
     })}</div></article>
     {editing ? <section className="panel create-resource"><form className="create-resource-body form-panel service-credential-create" noValidate onSubmit={(event) => void saveServiceEdit(event)}>
-      <div className="panel-title"><div><h2>{t('services.editTitle')} · {editing.name}</h2><p className="muted">{t('services.description')}</p></div></div>
+      <div className="panel-title"><Button appearance="subtle" type="button" disabled={Boolean(busy)} onClick={() => setEditing(undefined)}>{t('common.back')}</Button><div><h2>{t('services.editTitle')} · {editing.name}</h2><p className="muted">{t('services.description')}</p></div></div>
       <Field label={zh ? '名称' : 'Name'} required validationState={editAttempted && (!editName.trim() || new TextEncoder().encode(editName.trim()).length > 120) ? 'error' : 'none'} validationMessage={editAttempted && !editName.trim() ? (zh ? '请输入服务凭据名称。' : 'Enter a service credential name.') : editAttempted && new TextEncoder().encode(editName.trim()).length > 120 ? (zh ? '名称不能超过 120 个 UTF-8 字节。' : 'Name must be 120 UTF-8 bytes or fewer.') : undefined}>
         <Input value={editName} onChange={(event) => setEditName(event.target.value)} />
       </Field>
@@ -2222,7 +2225,7 @@ function ServiceCredentialWorkspace({ token, tenant, writeTenant = tenant, tenan
       </Field>
       <ServiceCredentialScopeSelector scopes={editScopes} onChange={setEditScopes} showError={editAttempted && editScopes.length === 0} />
       {editNotice && <p className="muted" role="status">{editNotice}</p>}
-      <div className="journey-actions"><Button appearance="secondary" type="button" disabled={Boolean(busy)} onClick={() => setEditing(undefined)}>{t('common.cancel')}</Button><DetailTooltip content={writeDenied || t('services.save')}><span tabIndex={writeDenied ? 0 : undefined}><Button appearance="primary" type="submit" aria-label={t('services.save')} disabled={Boolean(busy) || Boolean(visibleSecret) || Boolean(writeDenied)}>{busy === `edit-${editing.service_id}` ? t('common.loading') : t('services.save')}</Button></span></DetailTooltip></div>
+      <div className="journey-actions"><DetailTooltip content={writeDenied || t('services.save')}><span tabIndex={writeDenied ? 0 : undefined}><Button appearance="primary" type="submit" aria-label={t('services.save')} disabled={Boolean(busy) || Boolean(visibleSecret) || Boolean(writeDenied)}>{busy === `edit-${editing.service_id}` ? t('common.loading') : t('services.save')}</Button></span></DetailTooltip></div>
     </form></section> : <section className="panel create-resource"><Disclosure title={zh ? '创建服务凭据表单' : 'Create service credential form'} open={createOpen} onOpenChange={setCreateOpen}><form className="create-resource-body form-panel service-credential-create" noValidate onSubmit={(event) => void createServiceCredential(event)}>
       <p className="muted">{t('services.description')}</p>
       <Field label={zh ? '名称' : 'Name'} required validationState={createAttempted && (!createName.trim() || new TextEncoder().encode(createName.trim()).length > 120) ? 'error' : 'none'} validationMessage={createAttempted && !createName.trim() ? (zh ? '请输入服务凭据名称。' : 'Enter a service credential name.') : createAttempted && new TextEncoder().encode(createName.trim()).length > 120 ? (zh ? '名称不能超过 120 个 UTF-8 字节。' : 'Name must be 120 UTF-8 bytes or fewer.') : undefined}>

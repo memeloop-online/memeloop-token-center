@@ -44,7 +44,7 @@ export const serviceCredentialScopeGroups = [
     { value: 'filter_assistant:execute', label: '运行筛选助手', labelEn: 'Run filter assistant', hint: '调用模型执行筛选，可能产生计费用量。', hintEn: 'Invoke models for filtering; this may incur billable usage.' },
     { value: 'oauth:write', label: '管理 OAuth 授权', labelEn: 'Manage OAuth authorization', hint: '发起或管理 OAuth 授权流程。', hintEn: 'Start or manage OAuth authorization flows.' },
     { value: 'service_tokens:read', label: '读取服务凭据', labelEn: 'Read service credentials', hint: '列出服务凭据及其权限范围。', hintEn: 'List service credentials and their scopes.' },
-    { value: 'service_tokens:write', label: '管理服务凭据', labelEn: 'Manage service credentials', hint: '创建、复制、轮换或暂停服务凭据。', hintEn: 'Create, copy, rotate, or suspend service credentials.' },
+    { value: 'service_tokens:write', label: '管理服务凭据', labelEn: 'Manage service credentials', hint: '创建、编辑、复制、轮换或暂停服务凭据。', hintEn: 'Create, edit, copy, rotate, or suspend service credentials.' },
     { value: 'tenants:read', label: '读取租户', labelEn: 'Read tenants', hint: '查看租户信息。', hintEn: 'View tenant information.' },
     { value: 'tenants:write', label: '管理租户', labelEn: 'Manage tenants', hint: '创建或修改租户。', hintEn: 'Create or modify tenants.' },
     { value: 'settlements:adjust', label: '调整结算记录', labelEn: 'Adjust settlements', hint: '执行结算记录调整。', hintEn: 'Adjust settlement records.' },
