@@ -142,6 +142,15 @@ impl Persistence {
     }
 }
 
+pub(super) fn record_capture_failure(state: &AppState, identity: crate::db::ArchiveSpoolIdentity) {
+    let archive = state.archive.clone();
+    state.persistence.submit(0, async move {
+        archive
+            .publish_raw_capture_failure(identity.tenant_id, identity.request_id, "response")
+            .await
+    });
+}
+
 pub(super) fn capture(
     state: &AppState,
     identity: crate::db::ArchiveSpoolIdentity,

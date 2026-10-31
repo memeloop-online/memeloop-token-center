@@ -170,6 +170,8 @@ pub(crate) struct Snapshot {
     terminal_cause: Option<String>,
     error_code: Option<String>,
     response_object: String,
+    #[serde(default)]
+    supplier_summary: Option<String>,
     routing_session_id: Option<String>,
     routing_terminal_observed_at: Option<i64>,
     conversation: Option<OwnedConversation>,
@@ -225,6 +227,7 @@ impl Snapshot {
             terminal_cause: input.terminal_cause.map(|cause| cause.as_str().to_owned()),
             error_code: input.error_code.map(str::to_owned),
             response_object: input.response_object.to_owned(),
+            supplier_summary: None,
             routing_session_id: input.routing_session_id.map(str::to_owned),
             routing_terminal_observed_at: input.routing_terminal_observed_at,
             conversation: input.conversation.map(OwnedConversation::capture),
@@ -244,6 +247,32 @@ impl Snapshot {
         } else {
             ProxyRequestUpstreamAttribution::LastDispatched(self.last_dispatched)
         }
+    }
+
+    pub(crate) fn with_supplier_summary(mut self, body: &[u8]) -> Self {
+        if self.status_code >= 400 && body.len() <= 2048 {
+            if let Ok(body) = std::str::from_utf8(body) {
+                let envelope = format!("inline-json:{body}");
+                if crate::supplier_error::supplier_error_from_inline_json(Some(&envelope)).is_some()
+                {
+                    self.supplier_summary = Some(envelope);
+                }
+            }
+        }
+        self
+    }
+
+    async fn persist_supplier_summary(
+        &self,
+        database: &Database,
+    ) -> Result<(), crate::error::AppError> {
+        if let Some(summary) = &self.supplier_summary {
+            database
+                .body_archive()?
+                .publish_supplier_summary(self.tenant_id, self.request_id, summary)
+                .await?;
+        }
+        Ok(())
     }
 
     fn operational_digest(&self) -> Result<String, crate::error::AppError> {
@@ -586,6 +615,7 @@ impl Journal {
             }
             entry.snapshot.clone()
         };
+        snapshot.persist_supplier_summary(database).await?;
         if snapshot.claim.is_none() {
             let attribution = snapshot.attribution();
             let input = snapshot.terminal()?;
@@ -998,6 +1028,7 @@ impl Journal {
             let task = tokio::spawn(async move {
                 let request_id = snapshot.request_id;
                 let result = async {
+                    snapshot.persist_supplier_summary(&database).await?;
                     let claim = snapshot
                         .claim
                         .as_ref()
@@ -1157,7 +1188,11 @@ impl Journal {
         let mut reconcile = false;
         if !applied && durable {
             let attribution = snapshot.attribution();
-            let result = match snapshot.terminal() {
+            let result = match snapshot
+                .persist_supplier_summary(&database)
+                .await
+                .and_then(|()| snapshot.terminal())
+            {
                 Ok(input) => {
                     if let Some(claim) = snapshot.claim.as_ref() {
                         let evidence = match input.usage_basis {

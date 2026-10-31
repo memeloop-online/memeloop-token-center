@@ -36,6 +36,7 @@ mod readiness;
 #[cfg(test)]
 mod rustfs_contract_tests;
 mod staging;
+mod supplier_summary;
 mod text;
 
 pub use cas::CasArchiveObject;

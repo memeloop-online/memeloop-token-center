@@ -2585,20 +2585,7 @@ impl BufferedRequest<'_> {
             self.state.persistence.stream_memory.reservation(),
         );
         if capture.is_none() {
-            let archive = self.state.archive.clone();
-            tokio::spawn(async move {
-                if let Err(error) = archive
-                    .publish_raw_capture_failure(
-                        identity.tenant_id,
-                        identity.request_id,
-                        "response",
-                    )
-                    .await
-                {
-                    tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
-                        "raw response capture admission failure could not be persisted");
-                }
-            });
+            persistence::record_capture_failure(self.state, identity);
         }
         upstream.with_archive_capture(capture)
     }
@@ -3338,7 +3325,8 @@ async fn finish_buffered_request_before_deadline(
         response_id.clone(),
         false,
         "buffered_response_ready",
-    );
+    )
+    .with_supplier_summary(&body);
     request.state.pending_terminals.submit_with_preparation(
         snapshot,
         (body.clone(), request.memory.clone(), _response_buffer),

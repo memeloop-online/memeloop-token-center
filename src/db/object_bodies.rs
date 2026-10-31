@@ -10,6 +10,19 @@ impl Database {
     ) -> Result<crate::model::RequestArchiveRefs, AppError> {
         let archive = self.body_archive()?;
         let request_id = refs.view.request_id;
+        if refs.view.status_code.is_some_and(|status| status >= 400)
+            && let Some(summary) = archive.supplier_summary(tenant_id, request_id).await?
+        {
+            refs.view.supplier_error = Some(summary);
+        }
+        // Explicit metadata-only operations (for example audio audit records)
+        // have no raw-root contract until their media capture is migrated.
+        if refs.request_archive_state == crate::model::RequestArchiveState::MetadataOnly
+            && refs.response_archive_state == crate::model::RequestArchiveState::MetadataOnly
+        {
+            return Ok(refs);
+        }
+
         for side in ["request", "response"] {
             let (locator, state, reason) = if let Some(object) = archive
                 .raw_capture_reference(tenant_id, request_id, side)
