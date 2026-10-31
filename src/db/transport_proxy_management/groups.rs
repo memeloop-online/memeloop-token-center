@@ -68,6 +68,7 @@ impl Database {
             &members,
             probe_url.as_deref(),
             probe_attempts,
+            probe_url.is_some(),
             key,
         )
         .await?;
@@ -137,6 +138,8 @@ impl Database {
             .ok_or(AppError::internal("groups_update_transport_group_1"))?;
         let ciphertext = "";
         let (probe_url, probe_attempts) = probe_settings(body.probe_url, body.probe_attempts)?;
+        let update_probe = probe_url != row.try_get::<Option<String>, _>("probe_url")?
+            || probe_attempts != row.try_get::<i64, _>("probe_attempts")?;
         sqlx::query("UPDATE transport_proxy_groups SET name = $1, version = $2, members_ciphertext = $3, probe_url = $4, probe_attempts = $5, updated_at = $6 WHERE id = $7")
             .bind(&body.name).bind(version).bind(ciphertext).bind(&probe_url).bind(probe_attempts).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
         store_group_members(
@@ -147,6 +150,7 @@ impl Database {
             &next,
             probe_url.as_deref(),
             probe_attempts,
+            update_probe,
             key,
         )
         .await?;

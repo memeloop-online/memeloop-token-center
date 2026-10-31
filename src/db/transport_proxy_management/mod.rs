@@ -91,15 +91,26 @@ async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppErro
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_groups")
         .fetch_one(&mut **tx)
         .await?;
-    let rows = sqlx::query("SELECT b.account_id, g.id FROM transport_proxy_bindings b JOIN transport_proxy_groups g ON g.id = b.group_id")
+    let rows = sqlx::query("SELECT b.account_id, b.group_id, p.proxy_id FROM transport_proxy_bindings b LEFT JOIN network_proxy_selection_policies p ON p.account_id = b.account_id WHERE b.group_id IS NOT NULL OR p.mode = 'manual' ")
         .fetch_all(&mut **tx).await?;
     let mut bytes = 0usize;
     for row in &rows {
-        let proxies = load_group_members(&mut **tx, &row.try_get::<String, _>("id")?, key)
-            .await?
-            .into_iter()
-            .map(|member| member.proxy_url)
-            .collect::<Vec<_>>();
+        let proxies = if let Some(group) = row.try_get::<Option<String>, _>("group_id")? {
+            load_group_members(&mut **tx, &group, key)
+                .await?
+                .into_iter()
+                .map(|member| member.proxy_url)
+                .collect::<Vec<_>>()
+        } else {
+            vec![
+                sqlx::query_scalar::<_, String>(
+                    "SELECT proxy_url FROM network_proxies WHERE id = $1",
+                )
+                .bind(row.try_get::<String, _>("proxy_id")?)
+                .fetch_one(&mut **tx)
+                .await?,
+            ]
+        };
         bytes += serde_json::to_vec(&serde_json::json!([{
             "account_id":row.try_get::<String, _>("account_id")?,
             "version":i64::MAX,

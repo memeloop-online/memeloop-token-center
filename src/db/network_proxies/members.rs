@@ -87,6 +87,7 @@ pub(crate) async fn store_group_members(
     members: &[Member],
     probe_target: Option<&str>,
     probe_attempts: i64,
+    update_probe: bool,
     key: &[u8],
 ) -> Result<(), AppError> {
     sqlx::query("DELETE FROM network_proxy_group_members WHERE group_id = $1")
@@ -103,10 +104,31 @@ pub(crate) async fn store_group_members(
                 return Err(AppError::NotFound);
             }
             let old: String = previous.try_get::<String, _>("proxy_url")?;
-            if old != member.proxy_url || previous.try_get::<String, _>("name")? != member.label {
-                sqlx::query("UPDATE network_proxies SET name = $1, proxy_url = $2, version = version + 1, updated_at = $3, last_probe_status = NULL, last_probe_checked_at = NULL, last_probe_latency_ms = NULL, probe_successes = 0 WHERE id = $4")
-                    .bind(&member.label).bind(member.proxy_url.clone())
-                    .bind(unix_millis()).bind(member.id.to_string()).execute(&mut **tx).await?;
+            let enabled = if update_probe {
+                i64::from(probe_target.is_some())
+            } else {
+                previous.try_get("probe_enabled")?
+            };
+            let target = if update_probe {
+                probe_target.unwrap_or("https://openai.com/").to_owned()
+            } else {
+                previous.try_get("probe_target")?
+            };
+            let attempts = if update_probe {
+                probe_attempts
+            } else {
+                previous.try_get("probe_attempts")?
+            };
+            let probe_changed = enabled != previous.try_get::<i64, _>("probe_enabled")?
+                || target != previous.try_get::<String, _>("probe_target")?
+                || attempts != previous.try_get::<i64, _>("probe_attempts")?;
+            if old != member.proxy_url
+                || previous.try_get::<String, _>("name")? != member.label
+                || probe_changed
+            {
+                sqlx::query("UPDATE network_proxies SET name = $1, proxy_url = $2, version = version + 1, updated_at = $3, probe_enabled = $5, probe_target = $6, probe_attempts = $7, last_probe_status = NULL, last_probe_checked_at = NULL, last_probe_latency_ms = NULL, probe_successes = 0 WHERE id = $4")
+                    .bind(&member.label).bind(&member.proxy_url)
+                    .bind(unix_millis()).bind(member.id.to_string()).bind(enabled).bind(target).bind(attempts).execute(&mut **tx).await?;
                 database
                     .refresh_network_proxy_references(
                         tx,

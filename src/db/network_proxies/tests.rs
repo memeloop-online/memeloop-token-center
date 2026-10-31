@@ -356,7 +356,160 @@ async fn contract(database: &Database) {
             .await,
         Err(AppError::NotFound)
     ));
+    let current_group = database
+        .get_transport_group(group_id, &external, KEY)
+        .await
+        .unwrap();
+    database.update_transport_group(group_id, serde_json::from_value(serde_json::json!({
+        "tenant_external_id":external,"expected_version":current_group["version"],"name":"Reusable",
+        "proxy_ids":[id],"probe_url":"https://example.com/check","probe_attempts":3
+    })).unwrap(), None, KEY).await.unwrap();
+    let probe_config = database
+        .get_network_proxy(id, &external, KEY)
+        .await
+        .unwrap();
+    assert_eq!(
+        probe_config["probe"]["target_url"],
+        "https://example.com/check"
+    );
+    assert_eq!(probe_config["probe"]["attempts"], 3);
+    assert_eq!(probe_config["probe"]["enabled"], true);
+    assert!(probe_config["active_health"]["checked_at"].is_null());
+    let latest = database
+        .get_network_proxy_selection(account.id, &external)
+        .await
+        .unwrap();
+    let group = database
+        .get_transport_group(group_id, &external, KEY)
+        .await
+        .unwrap();
+    let automatic = serde_json::json!({"tenant_external_id":external,
+        "expected_selection_version":latest["selection_version"],"expected_binding_version":latest["binding_version"],
+        "expected_credential_generation":latest["credential_generation"],"expected_updated_at":latest["account_updated_at"],
+        "expected_group_version":group["version"],"mode":"auto","group_id":group_id,
+        "config":{"minimum_dwell_ms":0,"recovery_successes":1}});
+    let automatic: UpdateProxySelection = serde_json::from_value(automatic).unwrap();
+    automatic
+        .validate(&crate::plugin::PluginRuntime::default())
+        .unwrap();
+    database
+        .update_network_proxy_selection(account.id, automatic, None, KEY)
+        .await
+        .unwrap();
+    restarted
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    restarted
+        .evaluate_strategies(&database.pool, &crate::plugin::PluginRuntime::default())
+        .await
+        .unwrap();
+    let mut state = database
+        .get_network_proxy_selection(account.id, &external)
+        .await
+        .unwrap();
+    restarted.describe_network_proxy_selection(account.id, &mut state);
+    assert_eq!(state["desired"]["mode"], "auto");
+    assert_eq!(state["applied"]["selected_proxy_id"], id.to_string());
+    signal_contract(database, id, account.id, &external).await;
     legacy_contract(database, &external).await;
+}
+
+async fn signal_contract(database: &Database, proxy: Uuid, account: Uuid, external: &str) {
+    use crate::db::egress::{RequestEgressAttempt, SelectedEgress};
+    let tenant: String = sqlx::query_scalar("SELECT id FROM tenants WHERE external_id = $1")
+        .bind(external)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let version = database
+        .get_network_proxy(proxy, external, KEY)
+        .await
+        .unwrap()["version"]
+        .as_i64()
+        .unwrap();
+    for (status, error, complete, connection) in [
+        (200_i64, None, true, false),
+        (429, Some("upstream_rate_limited"), true, false),
+        (499, Some("client_cancelled"), true, false),
+        (200, None, false, false),
+        (502, Some("upstream_transport_error"), false, true),
+    ] {
+        let request = Uuid::now_v7();
+        let mut selected = SelectedEgress::capture(Some(BACKUP)).unwrap();
+        selected.member_id = Some(proxy);
+        selected.proxy_version = Some(version);
+        let attempt = RequestEgressAttempt {
+            request_id: request,
+            attempt_id: Uuid::now_v7(),
+            outbound_attempt: 1,
+            connect_attempt: 1,
+            route_id: Uuid::now_v7(),
+            upstream_account_id: account,
+            credential_generation: 1,
+            transport_revision: 1,
+            observed_at: 10,
+            selected,
+            transport: serde_json::json!({}),
+            connection_binding: None,
+            request_payload_bytes: Some(10),
+            response_payload_bytes: Some(20),
+            completed: true,
+            final_response: true,
+            response_body_complete: complete,
+            measurement_basis: "application_payload_estimate",
+        };
+        database
+            .record_request_egress_attempt(&attempt)
+            .await
+            .unwrap();
+        database
+            .record_request_egress_attempt(&attempt)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO proxy_operational_terminals (request_id, request_created_at, tenant_id, key_id, account_id, reservation_id, owner_token, fence, contract_digest, receipt_id, operational_digest, status_code, error_code, completed_at, duration_ms, response_object, upstream_account_id, model_route_id, recorded_at) VALUES ($1,10,$2,'fixture','fixture',$1,'fixture','fixture','fixture','fixture','fixture',$3,$4,11,1,'fixture',$5,$6,11)")
+            .bind(request.to_string()).bind(&tenant).bind(status).bind(error).bind(account.to_string()).bind(attempt.route_id.to_string()).execute(&database.pool).await.unwrap();
+        if connection {
+            sqlx::query("INSERT INTO request_upstream_transport_diagnostics (request_id, route_id, upstream_account_id, credential_generation, transport_revision, failure_kind, failure_stage, gateway_pod, failure_domain, observed_at) VALUES ($1,$2,$3,1,1,'connection','proxy_connect','fixture','fixture',11)")
+                .bind(request.to_string()).bind(attempt.route_id.to_string()).bind(account.to_string()).execute(&database.pool).await.unwrap();
+        }
+    }
+    // The actual request outcomes never overwrite the independent probe signal.
+    sqlx::query("UPDATE network_proxies SET last_probe_status = 'unhealthy' WHERE id = $1")
+        .bind(proxy.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    signals::merge_pending(&database.pool).await.unwrap();
+    signals::merge_pending(&database.pool).await.unwrap();
+    let result = database
+        .network_proxy_observations(proxy, external, 1, 20, KEY)
+        .await
+        .unwrap();
+    assert_eq!(result["active_health"]["status"], "unhealthy");
+    for key in [
+        "succeeded",
+        "provider_failed",
+        "transport_failed",
+        "cancelled",
+        "unknown",
+    ] {
+        assert_eq!(result["request_outcomes"][key], 1, "{key}: {result}");
+    }
+    assert_eq!(result["request_outcomes"]["sample_count"], 3);
+    assert_eq!(
+        result["request_outcomes"]["transport_success_rate"],
+        2.0 / 3.0
+    );
+    assert_eq!(result["traffic"]["recorded_attempts"], 5);
+    assert_eq!(result["traffic"]["request_payload_bytes"], 50);
+    assert_eq!(result["traffic"]["response_payload_bytes"], 100);
+    assert!(matches!(
+        database
+            .network_proxy_observations(proxy, "other-tenant", 1, 20, KEY)
+            .await,
+        Err(AppError::NotFound)
+    ));
 }
 
 async fn legacy_contract(database: &Database, external: &str) {
