@@ -160,6 +160,20 @@ fn plugin_initialization_error(error: crate::error::AppError) -> InitializationE
 }
 
 impl AppState {
+    pub async fn drain_proxy_tasks(&self) {
+        self.proxy_lifecycles.wait_for_idle().await;
+        let _archives = self
+            .proxy_archive_stream_permits
+            .acquire_many(PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+            .await
+            .expect("proxy archive admission remains open during shutdown");
+        self.persistence.drain().await;
+        self.pending_terminals.drain().await;
+        self.early_requests.drain().await;
+        self.responses_request_spool.drain_uploads().await;
+        self.db.drain_gateway_persistence().await;
+    }
+
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
         let transport_proxy_groups = db::TransportProxyGroups::parse(
             &config.transport_proxy_groups,
