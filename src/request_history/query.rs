@@ -29,6 +29,7 @@ pub enum Dimension {
     TaskKind,
     SessionAssociation,
     RequestId,
+    Source,
 }
 
 impl Dimension {
@@ -50,6 +51,7 @@ impl Dimension {
             Self::TaskKind => "task_kind",
             Self::SessionAssociation => "session_id",
             Self::RequestId => "request_id",
+            Self::Source => "source",
         }
     }
 }

@@ -114,6 +114,16 @@ impl Database {
         after_event_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<RequestEventView>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return Ok(client
+                .events(
+                    self.history_scope(Some(tenant_external_id)).await?,
+                    after_event_at,
+                    after_event_id,
+                    limit.clamp(1, 500) as usize,
+                )
+                .await?);
+        }
         let after_event_id = after_event_id
             .map(|event_id| event_id.to_string())
             .unwrap_or_default();
@@ -136,6 +146,16 @@ impl Database {
         after_event_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<RequestEventView>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return Ok(client
+                .events(
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    after_event_at,
+                    after_event_id,
+                    limit.clamp(1, 500) as usize,
+                )
+                .await?);
+        }
         let after_event_id = after_event_id
             .map(|event_id| event_id.to_string())
             .unwrap_or_default();
@@ -149,6 +169,62 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         request_event_views(rows)
+    }
+
+    pub(crate) async fn source_history_event(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Option<RequestEventView>, AppError> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(enriched_request_events_sql(
+            "SELECT e.* FROM request_events e WHERE e.event_id = $1",
+        )))
+        .bind(event_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2")
+            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).fetch_optional(&self.pool).await?;
+        if let Some(row) = row {
+            let identity = crate::request_history::HistoryIdentity {
+                source: row.try_get("source")?,
+                request_id: event.request_id,
+                tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+                key_id: event.key_id,
+                created_at: row.try_get("created_at")?,
+            };
+            if let Some(view) = self.request_history_view(&identity).await? {
+                event.created_at = Some(view.created_at);
+                event.completed_at = view.completed_at;
+                event.lifecycle_state = view.lifecycle_state;
+                event.upstream_model = view.upstream_model;
+                event.upstream_account_id = view.upstream_account_id;
+                event.route_id = view.route_id;
+                event.status_code = view.status_code;
+                event.duration_ms = view.duration_ms;
+                event.first_output_ms = view.first_output_ms;
+                event.generation_duration_ms = view.generation_duration_ms;
+                event.usage_basis = view.usage_basis;
+                event.compaction = view.compaction;
+                event.input_tokens = view.input_tokens;
+                event.output_tokens = view.output_tokens;
+                event.cached_input_tokens = view.cached_input_tokens;
+                event.cache_write_tokens = view.cache_write_tokens;
+                event.currency = view.currency;
+                event.cost = view.cost;
+                event.usage = view.usage;
+                event.billing = view.billing;
+                event.error_code = view.error_code;
+                event.terminal_cause_code = view.terminal_cause_code;
+                event.in_flight_stage = view.in_flight_stage;
+                event.supplier_error = view.supplier_error;
+                event.archive_state = view.archive_state;
+                event.session_context = view.session_context;
+                event.credential_identity = view.credential_identity;
+            }
+        }
+        Ok(Some(event))
     }
 
     pub async fn list_requests(

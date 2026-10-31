@@ -88,10 +88,9 @@ impl Metrics {
         }
         if let (Some(cost), Some(currency)) =
             (fact["cost_micros"].as_i64(), fact["currency"].as_str())
+            && !currency.is_empty()
         {
-            if !currency.is_empty() {
-                *self.costs.entry(currency.into()).or_default() += cost;
-            }
+            *self.costs.entry(currency.into()).or_default() += cost;
         }
         let protocol = text(payload, "protocol");
         if success

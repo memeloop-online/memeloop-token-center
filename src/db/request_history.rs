@@ -109,6 +109,7 @@ impl Database {
     pub async fn history_start(&self) -> Result<(), HistoryError> {
         let mut transaction = self.pool.begin().await?;
         for (table, identity) in [
+            ("request_events", Some(("event", "event_id", "event_at"))),
             ("request_records", Some(("native", "id", "created_at"))),
             ("generation_jobs", Some(("generation", "id", "created_at"))),
             (
@@ -164,9 +165,30 @@ impl Database {
                     DatabaseBackend::PostgreSql => "nextval('request_history_export_revision_seq')",
                     DatabaseBackend::Sqlite => "excluded.revision",
                 };
-                let enqueue = format!(
+                let mut enqueue = format!(
                     "INSERT INTO request_history_export ({COLUMNS}) {select} ON CONFLICT (source, request_id) DO UPDATE SET revision = {revision}, snapshot = NULL;"
                 );
+                if table != "request_events"
+                    && table != "session_archive_unlinked_requests"
+                    && table != "session_archive_correlations"
+                {
+                    let event_predicate = match table {
+                        "request_records" | "generation_jobs" => {
+                            format!("request_id = {record}.id")
+                        }
+                        "generation_stats_facts" => format!("request_id = {record}.job_id"),
+                        "key_records" => format!("key_id = {record}.id"),
+                        "tenants" => format!("tenant_id = {record}.id"),
+                        "principals" => format!(
+                            "key_id IN (SELECT id FROM key_records WHERE principal_id = {record}.id)"
+                        ),
+                        "upstream_accounts" => format!(
+                            "request_id IN (SELECT id FROM request_records WHERE upstream_account_id = {record}.id UNION ALL SELECT id FROM generation_jobs WHERE upstream_account_id = {record}.id)"
+                        ),
+                        _ => format!("request_id = {record}.request_id"),
+                    };
+                    enqueue.push_str(&format!("INSERT INTO request_history_export ({COLUMNS}) SELECT 'event', event_id, tenant_id, key_id, event_at FROM request_events WHERE {event_predicate} AND (SELECT mode FROM request_history_state WHERE id = 1) != 'off' ON CONFLICT (source, request_id) DO UPDATE SET revision = {revision}, snapshot = NULL;"));
+                }
                 let identity_guard = if event == "UPDATE" {
                     if let Some((_, id, created_at)) = identity {
                         let changed = format!(
@@ -433,6 +455,21 @@ impl Database {
         identity: HistoryIdentity,
         revision: i64,
     ) -> Result<HistorySnapshot, HistoryError> {
+        if identity.source == "event" {
+            let payload = self
+                .source_history_event(identity.request_id)
+                .await?
+                .map(|event| serde_json::to_value(&event))
+                .transpose()?;
+            return Ok(HistorySnapshot {
+                identity,
+                revision,
+                payload,
+                filter_cost_micros: None,
+                statistics: None,
+                read_model: Value::Null,
+            });
+        }
         let payload = self
             .request_history_view(&identity)
             .await?
@@ -456,6 +493,18 @@ impl Database {
                 .await?;
             archive.view = serde_json::from_value(payload.clone())?;
             let fact = self.history_analysis_fact(&identity).await?;
+            let observation = sqlx::query("SELECT * FROM conversation_observations WHERE request_id = $1 AND key_id = $2 AND cluster_id = $3")
+                .bind(identity.request_id.to_string()).bind(identity.key_id.to_string()).bind(payload["session_context"]["session_id"].as_str()).fetch_optional(&self.pool).await?;
+            let execution = observation
+                .as_ref()
+                .map(super::requests::conversations::execution_metadata_from_row)
+                .transpose()?
+                .flatten();
+            let structure = observation
+                .as_ref()
+                .map(super::requests::conversations::execution_structure_from_row)
+                .transpose()?
+                .flatten();
             {
                 let upstream_name: Option<String> =
                     if let Some(upstream) = payload["upstream_account_id"].as_str() {
@@ -466,7 +515,7 @@ impl Database {
                     } else {
                         None
                     };
-                serde_json::json!({"archive": archive, "fact": fact, "upstream_name": upstream_name})
+                serde_json::json!({"archive": archive, "fact": fact, "upstream_name": upstream_name, "execution": execution, "structure": structure})
             }
         } else {
             Value::Null

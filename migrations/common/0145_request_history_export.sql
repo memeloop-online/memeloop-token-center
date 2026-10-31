@@ -11,11 +11,13 @@ CREATE TABLE request_history_backfill (
     after_id TEXT NOT NULL DEFAULT '',
     done BIGINT NOT NULL DEFAULT 0
 );
-INSERT INTO request_history_backfill (source) VALUES ('native'), ('generation'), ('archive');
+INSERT INTO request_history_backfill (source) VALUES ('native'), ('generation'), ('archive'), ('event');
 
 CREATE VIEW request_history_source_ids AS
     SELECT 'native' AS source, id AS request_id, tenant_id, key_id, created_at FROM request_records
     UNION ALL
     SELECT 'generation', id, tenant_id, key_id, created_at FROM generation_jobs
     UNION ALL
-    SELECT 'archive', archive_request_id, tenant_id, key_id, source_started_at FROM session_archive_unlinked_requests;
+    SELECT 'archive', archive_request_id, tenant_id, key_id, source_started_at FROM session_archive_unlinked_requests
+    UNION ALL
+    SELECT 'event', event_id, tenant_id, key_id, event_at FROM request_events;

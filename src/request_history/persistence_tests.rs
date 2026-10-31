@@ -61,30 +61,40 @@ async fn finish(database: &Database, request_id: Uuid) {
         .unwrap();
 }
 
+async fn native_pending(database: &Database) -> Vec<HistorySnapshot> {
+    database
+        .history_pending(500)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|snapshot| snapshot.identity.source == "native")
+        .collect()
+}
+
 async fn capture_replay(database: &Database) {
     database.migrate().await.unwrap();
     database.history_start().await.unwrap();
     let (_, request_id, _) = seed(database).await;
-    let pending = database.history_pending(1).await.unwrap();
+    let pending = native_pending(database).await;
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].statistics.as_ref().unwrap().status, "pending");
     finish(database, request_id).await;
     database.history_acknowledge(&pending).await.unwrap();
-    let corrected = database.history_pending(1).await.unwrap();
+    let corrected = native_pending(database).await;
     assert_eq!(corrected.len(), 1);
     assert!(corrected[0].revision > pending[0].revision);
     assert_eq!(
         corrected[0].statistics.as_ref().unwrap().cost_micros,
         Some(17)
     );
-    let replay = database.history_pending(1).await.unwrap();
+    let replay = native_pending(database).await;
     assert_eq!(
         serde_json::to_value(&corrected).unwrap(),
         serde_json::to_value(&replay).unwrap()
     );
     assert!(database.history_switch(true).await.is_err());
     database.history_acknowledge(&corrected).await.unwrap();
-    assert_eq!(database.history_pending_count().await.unwrap(), 0);
+    assert!(native_pending(database).await.is_empty());
 }
 
 #[tokio::test]
@@ -184,15 +194,15 @@ async fn request_history_real_services_acceptance() {
     )
     .unwrap();
     client.initialize().await.unwrap();
-    let old = database.history_pending(1).await.unwrap();
+    let old = native_pending(&database).await;
     client.append(&old).await.unwrap();
     finish(&database, request_id).await;
-    let latest = database.history_pending(1).await.unwrap();
+    let latest = native_pending(&database).await;
     client.append(&latest).await.unwrap();
     client.append(&old).await.unwrap();
     client.append(&latest).await.unwrap();
     database.history_acknowledge(&old).await.unwrap();
-    assert_eq!(database.history_pending_count().await.unwrap(), 1);
+    assert_eq!(native_pending(&database).await.len(), 1);
     let query = HistoryQuery {
         scope: HistoryScope::Key {
             tenant_id: key.tenant_id,
@@ -272,6 +282,49 @@ async fn request_history_real_services_acceptance() {
     let stats = client.statistics(&query).await.unwrap();
     assert_eq!(stats.summary.pending_requests, 2);
     assert!(stats.summary.total_cost.is_none());
+    let usage_filter = crate::db::UsageAnalysisFilter {
+        from_created_at: Some(0),
+        to_created_at: Some(i64::MAX),
+        ..Default::default()
+    };
+    let usage_query = crate::request_history::HistoryQuery {
+        limit: 500,
+        ..query.clone()
+    };
+    let direct_usage = client
+        .usage(
+            HistoryScope::Tenant(key.tenant_id),
+            &usage_filter,
+            crate::db::UsageAnalysisProjection::Full,
+            0,
+            i64::MAX,
+            "day",
+        )
+        .await
+        .unwrap();
+    let direct_monitoring = client.monitoring(usage_query).await.unwrap();
+    assert_eq!(direct_usage.summary.requests, 1);
+    assert_eq!(direct_monitoring.summary.requests, 1);
+    let events = client
+        .events(HistoryScope::Tenant(key.tenant_id), 0, None, 500)
+        .await
+        .unwrap();
+    assert!(!events.is_empty());
+    let latest_request = database
+        .source_history_list(&RequestListFilter {
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|view| view.request_id == request_id)
+        .unwrap();
+    for event in events.iter().filter(|event| event.request_id == request_id) {
+        assert_eq!(event.lifecycle_state, latest_request.lifecycle_state);
+        assert_eq!(event.usage, latest_request.usage);
+        assert_eq!(event.compaction, latest_request.compaction);
+    }
     database.history_switch(true).await.unwrap();
     let source = database
         .source_history_list(&RequestListFilter {
@@ -315,6 +368,70 @@ async fn request_history_real_services_acceptance() {
             .await
             .is_err()
     );
+    let usage = database
+        .projected_usage_analysis(
+            Some("history-tenant"),
+            usage_filter,
+            crate::db::UsageAnalysisProjection::Full,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&usage).unwrap(),
+        serde_json::to_value(&direct_usage).unwrap()
+    );
+    let monitoring = database
+        .operator_monitoring_snapshot(
+            crate::db::MonitoringScope::Tenant("history-tenant".into()),
+            crate::db::MonitoringSnapshotFilter {
+                from_created_at: 0,
+                to_created_at: i64::MAX,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(monitoring.summary.requests, 1);
+    let active_events = database
+        .request_events_after("history-tenant", 0, None, 500)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&active_events).unwrap(),
+        serde_json::to_value(&events).unwrap()
+    );
+    assert!(
+        database
+            .request_events_after("missing-tenant", 0, None, 500)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let sessions = database
+        .operator_recent_sessions(
+            "history-tenant",
+            crate::db::LogicalSessionListFilter {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].active_requests, 2);
+    assert_eq!(sessions[0].requests, 1);
+    let detail = database
+        .logical_session_detail(
+            key.tenant_id,
+            key.key_id,
+            &format!("unlinked:{}", key.key_id),
+            crate::db::ConversationDetailFilter {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.requests.len(), 3);
     use tower::ServiceExt;
     let app = crate::api::router(state.clone());
     let response = app

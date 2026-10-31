@@ -309,6 +309,53 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
             return Err(HistoryError::Mismatch);
         }
     }
+    // Event receipts have their own ascending, stable cursor and are never
+    // included in request or financial totals. Compare the full inventory.
+    let mut event_at = 0;
+    let mut event_id = None;
+    let mut event_count = 0_u64;
+    let mut event_hash = Sha256::new();
+    loop {
+        let source = sqlx::query("SELECT event_id, event_at, tenant_id, key_id FROM request_events WHERE (event_at > $1 OR (event_at = $1 AND event_id > $2)) ORDER BY event_at, event_id LIMIT 500")
+            .bind(event_at).bind(event_id.map(|id:uuid::Uuid|id.to_string()).unwrap_or_default()).fetch_all(&database.pool).await?;
+        let target = client
+            .event_snapshots(HistoryScope::GlobalOperator, event_at, event_id, 500)
+            .await?;
+        if source.len() != target.len() {
+            return Err(HistoryError::Mismatch);
+        }
+        use sqlx::Row;
+        for (row, actual) in source.iter().zip(target) {
+            let id: String = row.try_get("event_id")?;
+            let identity = super::HistoryIdentity {
+                source: "event".into(),
+                request_id: id.parse().map_err(|_| HistoryError::Mismatch)?,
+                created_at: row.try_get("event_at")?,
+                tenant_id: row
+                    .try_get::<String, _>("tenant_id")?
+                    .parse()
+                    .map_err(|_| HistoryError::Mismatch)?,
+                key_id: row
+                    .try_get::<String, _>("key_id")?
+                    .parse()
+                    .map_err(|_| HistoryError::Mismatch)?,
+            };
+            let expected = database.history_snapshot(identity, actual.revision).await?;
+            if super::canonical_hash(&expected)? != super::canonical_hash(&actual)?
+                || actual.revision <= 0
+                || actual.revision > revision
+            {
+                return Err(HistoryError::Mismatch);
+            }
+            event_count += 1;
+            event_hash.update(super::canonical_hash(&expected)?);
+            event_at = expected.identity.created_at;
+            event_id = Some(expected.identity.request_id);
+        }
+        if source.is_empty() {
+            break;
+        }
+    }
     if revision != database.history_revision().await?
         || database.history_pending_count().await? != 0
     {
@@ -319,7 +366,9 @@ pub async fn verify(database: &Database, client: &ClickHouse) -> Result<Value, H
         "tenants": tenants, "daily": daily.values().collect::<Vec<_>>(),
         "request_list_payloads_equal": true, "statistics_equal": true,
         "credential_scopes_verified": credentials.len(), "tenant_key_negative_probes": true,
-        "read_surfaces": ["requests", "stats"], "other_surfaces_use_existing_readers": true,
+        "event_count":event_count,"events_sha256":format!("{:x}",event_hash.finalize()),
+        "read_surfaces": ["requests", "stats", "detail", "events", "usage", "pricing", "sessions", "monitoring"],
+        "private_read_models_equal":true,
     });
     database
         .history_save_verification(revision, &report)

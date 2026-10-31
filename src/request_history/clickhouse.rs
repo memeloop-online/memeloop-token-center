@@ -282,6 +282,68 @@ impl ClickHouse {
         })
     }
 
+    pub(crate) async fn event_snapshots(
+        &self,
+        scope: HistoryScope,
+        after: i64,
+        after_id: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> Result<Vec<HistorySnapshot>, HistoryError> {
+        #[derive(serde::Deserialize)]
+        struct Stored {
+            snapshot: String,
+            snapshot_hash: String,
+        }
+        let query = HistoryQuery {
+            scope,
+            from_created_at: None,
+            to_created_at: None,
+            cursor: None,
+            limit,
+            predicates: vec![],
+        };
+        let mut sql = query.latest()?;
+        let at = sql.bind(after, "Int64");
+        let id = sql.bind(
+            after_id.map(|v| v.to_string()).unwrap_or_default(),
+            "String",
+        );
+        let size = sql.bind(limit, "UInt64");
+        sql.sql = format!(
+            "SELECT snapshot, snapshot_hash FROM ({}) WHERE source = 'event' AND (created_at, toString(request_id)) > ({at}, {id}) ORDER BY created_at, toString(request_id) LIMIT {size} FORMAT JSONEachRow",
+            sql.sql
+        );
+        self.rows::<Stored>(sql)
+            .await?
+            .into_iter()
+            .map(|row| {
+                let snapshot: HistorySnapshot = serde_json::from_str(&row.snapshot)?;
+                if super::canonical_hash(&snapshot)? != row.snapshot_hash {
+                    return Err(HistoryError::Mismatch);
+                }
+                Ok(snapshot)
+            })
+            .collect()
+    }
+
+    pub(crate) async fn events(
+        &self,
+        scope: HistoryScope,
+        after: i64,
+        after_id: Option<uuid::Uuid>,
+        limit: usize,
+    ) -> Result<Vec<crate::model::RequestEventView>, HistoryError> {
+        self.event_snapshots(scope, after, after_id, limit)
+            .await?
+            .into_iter()
+            .map(|snapshot| {
+                Ok(serde_json::from_value(
+                    snapshot.payload.ok_or(HistoryError::Mismatch)?,
+                )?)
+            })
+            .collect()
+    }
+
     pub async fn daily(&self, query: &HistoryQuery) -> Result<Vec<DailyBucket>, HistoryError> {
         self.rows(query.daily_sql()?).await
     }

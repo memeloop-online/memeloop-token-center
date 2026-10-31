@@ -392,6 +392,61 @@ impl Database {
         session_id: &str,
         filter: ConversationDetailFilter,
     ) -> Result<LogicalSessionDetail, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            if session_id == format!("unlinked:{key_id}") {
+                let mut requests = client
+                    .conversation_requests(
+                        crate::request_history::HistoryScope::Key { tenant_id, key_id },
+                        session_id,
+                        &filter,
+                    )
+                    .await?;
+                let limit = filter.limit.clamp(1, 200) as usize;
+                let has_more = requests.len() > limit;
+                requests.truncate(limit);
+                let next_cursor = if has_more {
+                    requests.last().map(|row| crate::model::ConversationCursor {
+                        before_created_at: row.request.created_at,
+                        before_request_id: row.request.request_id,
+                    })
+                } else {
+                    None
+                };
+                requests.reverse();
+                return Ok(LogicalSessionDetail {
+                    session_id: session_id.into(),
+                    cluster_id: None,
+                    unlinked: true,
+                    requests,
+                    edges: vec![],
+                    has_more,
+                    next_cursor,
+                    edges_truncated: false,
+                });
+            }
+            if session_id.starts_with("unlinked:") {
+                return Err(AppError::NotFound);
+            }
+            let cluster = Uuid::parse_str(session_id).map_err(|_| AppError::NotFound)?;
+            let owned = sqlx::query("SELECT 1 FROM conversation_key_clusters p JOIN conversation_clusters c ON c.id = p.cluster_id WHERE p.key_id = $1 AND p.cluster_id = $2 AND c.tenant_id = $3")
+                .bind(key_id.to_string()).bind(cluster.to_string()).bind(tenant_id.to_string()).fetch_optional(&self.pool).await?.is_some();
+            if !owned {
+                return Err(AppError::NotFound);
+            }
+            let detail = self
+                .conversation_cluster_detail(key_id, cluster, filter)
+                .await?;
+            return Ok(LogicalSessionDetail {
+                session_id: session_id.into(),
+                cluster_id: Some(cluster),
+                unlinked: false,
+                requests: detail.requests,
+                edges: detail.edges,
+                has_more: detail.has_more,
+                next_cursor: detail.next_cursor,
+                edges_truncated: detail.edges_truncated,
+            });
+        }
         // Durable session facts outlive a physically retired credential. Authorize
         // details from those tenant-scoped facts instead of the mutable key row.
         let owned = sqlx::query(
@@ -454,6 +509,15 @@ impl Database {
         tenant_id: &str,
         filter: LogicalSessionListFilter,
     ) -> Result<Vec<LogicalSessionSummary>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let tenant = parse_uuid(tenant_id.to_owned())?;
+            let scope = if tenant.is_nil() {
+                crate::request_history::HistoryScope::EmptyTenant
+            } else {
+                crate::request_history::HistoryScope::Tenant(tenant)
+            };
+            return Ok(client.session_summaries(scope, &filter, None).await?);
+        }
         self.recent_sessions_with_candidate_first(tenant_id, filter, true)
             .await
     }
@@ -817,6 +881,17 @@ impl Database {
             return Err(AppError::BadRequest(format!(
                 "at most {MAX_SESSION_SUMMARY_IDENTITIES} session identities can be loaded at once"
             )));
+        }
+        if let Some(client) = self.history_reader().await? {
+            let tenant = parse_uuid(tenant_id.to_owned())?;
+            let scope = if tenant.is_nil() {
+                crate::request_history::HistoryScope::EmptyTenant
+            } else {
+                crate::request_history::HistoryScope::Tenant(tenant)
+            };
+            return Ok(client
+                .session_summaries(scope, &filter, Some(identities))
+                .await?);
         }
         let mut statement = "WITH requested(key_id, session_id) AS (VALUES ".to_owned();
         for index in 0..identities.len() {

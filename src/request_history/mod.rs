@@ -1,7 +1,9 @@
 mod clickhouse;
 mod contract;
 pub mod migration;
+mod monitoring;
 mod query;
+mod sessions;
 mod statistics;
 mod usage;
 
