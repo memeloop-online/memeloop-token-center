@@ -576,7 +576,7 @@ async fn terminal_followed_by_unterminated_data_never_leaks_terminal_or_archives
 }
 
 #[tokio::test]
-async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
+async fn codex_crlf_terminal_redacts_delivery_and_archives_original_comments() {
     let fixture = codex_route_fixture("terminal-crlf-safe-comment").await;
     let upstream = MockServer::start().await;
     let secret = "Authorization: provider-comment-secret";
@@ -631,7 +631,7 @@ async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
         .get(refs.response_object.as_deref().expect("response archive"))
         .await
         .unwrap();
-    assert!(!String::from_utf8_lossy(&archived).contains(secret));
+    assert_eq!(archived.as_ref(), sse.as_bytes());
     upstream.verify().await;
 }
 

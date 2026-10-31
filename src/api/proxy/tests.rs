@@ -3697,16 +3697,14 @@ async fn codex_buffered_chat_translates_request_and_response_and_settles_once() 
         original
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(
-            &fixture
-                .state
-                .archive
-                .get(refs.response_object.as_deref().unwrap())
-                .await
-                .unwrap()
-        )
-        .unwrap(),
-        body
+        fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap()
+            .as_ref(),
+        completed_codex_sse("Au revoir").as_bytes()
     );
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -3854,7 +3852,7 @@ async fn codex_buffered_chat_maps_valid_incomplete_to_success_with_provider_usag
             .await
             .unwrap()
             .as_ref(),
-        body.as_ref()
+        incomplete_codex_sse("Partial translation", "max_output_tokens", false).as_bytes()
     );
     upstream.verify().await;
 }
@@ -3925,7 +3923,7 @@ async fn codex_streaming_chat_maps_valid_incomplete_without_responses_lifecycle_
             .await
             .unwrap()
             .as_ref(),
-        body.as_ref()
+        incomplete_codex_sse("Partial translation", "future_bounded_reason", true).as_bytes()
     );
     upstream.verify().await;
 }

@@ -53,8 +53,13 @@ async fn assert_unknown_archive_terminal(
 #[tokio::test]
 async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
     let upstream = MockServer::start().await;
+    let original = br#"{ "opaque": "exact rejected encoding bytes" }"#;
     Mock::given(method("POST"))
-        .respond_with(successful_chat_response().insert_header("content-encoding", "gzip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(original.as_slice(), "application/json")
+                .insert_header("content-encoding", "gzip"),
+        )
         .expect(1)
         .mount(&upstream)
         .await;
@@ -92,12 +97,22 @@ async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
         .unwrap();
     assert_eq!(
         refs.response_archive_state,
-        crate::model::RequestArchiveState::Gap
+        crate::model::RequestArchiveState::Bound
     );
     assert!(
         refs.response_object
             .as_deref()
             .is_none_or(|locator| !locator.starts_with("inline-json:"))
+    );
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap()
+            .as_ref(),
+        original
     );
     upstream.verify().await;
 }
