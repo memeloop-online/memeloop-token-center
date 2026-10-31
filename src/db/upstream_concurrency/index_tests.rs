@@ -121,7 +121,7 @@ async fn sqlite_live_owner_sampling_seeks_past_expired_history() {
     }
 }
 
-fn inspect_request_scans(node: &Value, visited: &mut u64, seeks: &mut u64) {
+fn inspect_request_scans(node: &Value, require_seek: bool, visited: &mut u64, seeks: &mut u64) {
     if node["Relation Name"]
         .as_str()
         .is_some_and(|name| name.starts_with("request_records"))
@@ -131,10 +131,11 @@ fn inspect_request_scans(node: &Value, visited: &mut u64, seeks: &mut u64) {
             + node["Rows Removed by Filter"].as_u64().unwrap_or(0)
             + node["Rows Removed by Index Recheck"].as_u64().unwrap_or(0);
         *visited += rows * loops;
-        if rows * loops > 0 {
+        if require_seek && rows * loops > 0 {
             assert!(
-                node["Index Cond"]
-                    .as_str()
+                node.get("Index Cond")
+                    .or_else(|| node.get("Recheck Cond"))
+                    .and_then(Value::as_str)
                     .is_some_and(|condition| condition.contains("proxy_owner_expires_at >")),
                 "populated request partitions must range-seek live leases: {node}"
             );
@@ -143,7 +144,7 @@ fn inspect_request_scans(node: &Value, visited: &mut u64, seeks: &mut u64) {
     }
     if let Some(children) = node["Plans"].as_array() {
         for child in children {
-            inspect_request_scans(child, visited, seeks);
+            inspect_request_scans(child, require_seek, visited, seeks);
         }
     }
 }
@@ -192,12 +193,19 @@ async fn postgres_live_owner_sampling_bounds_history_scans_and_indexes_all_parti
         let raw: String = row.try_get_unchecked(0).unwrap();
         let plan: Value = serde_json::from_str(&raw).unwrap();
         let (mut visited, mut seeks) = (0, 0);
-        inspect_request_scans(&plan[0]["Plan"], &mut visited, &mut seeks);
-        assert!(seeks > 0, "missing live lease range seek: {plan}");
-        assert!(
-            visited <= 16,
-            "request history visits grew beyond the nine live leases: {plan}"
-        );
+        let large_history = size >= 8192;
+        inspect_request_scans(&plan[0]["Plan"], large_history, &mut visited, &mut seeks);
+        if large_history {
+            assert!(seeks > 0, "missing live lease range seek: {plan}");
+            assert!(
+                visited <= 16,
+                "request history visits grew beyond the nine live leases: {plan}"
+            );
+        } else {
+            // A sequential scan of a tiny leaf can cost less than opening its
+            // index. The large fixture must still seek and visit <=16 rows.
+            assert!(visited <= 1024, "unexpected small-fixture scan: {plan}");
+        }
     }
     // A partition created after the migration must inherit the same parent
     // index. Old live requests in DEFAULT above also exercise existing leaves.
