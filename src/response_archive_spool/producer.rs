@@ -662,6 +662,37 @@ impl ResponseArchiveProducer {
         true
     }
 
+    /// A detached original-body drain has no client delivery deadline. Await
+    /// the existing bounded queue instead of abandoning a large remaining body.
+    pub(crate) async fn append_background(&mut self, chunk: Bytes) -> bool {
+        let mut remaining = chunk.as_ref();
+        while !remaining.is_empty() {
+            if !self.active.load(Ordering::Acquire) {
+                return false;
+            }
+            let take = remaining.len().min(super::CHUNK_BYTES - self.pending.len());
+            self.pending.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            if self.pending.len() == super::CHUNK_BYTES {
+                let Some(sender) = self.sender.clone() else {
+                    return false;
+                };
+                let Ok(permit) = sender.reserve().await else {
+                    return false;
+                };
+                let Ok(memory) = self.chunk_memory.clone().acquire_owned().await else {
+                    return false;
+                };
+                permit.send(QueuedArchiveChunk {
+                    bytes: Bytes::from(std::mem::take(&mut self.pending)),
+                    _memory: Some(memory),
+                });
+                self.pending = Vec::with_capacity(super::CHUNK_BYTES);
+            }
+        }
+        true
+    }
+
     fn abandon(&mut self, reason: &'static str) {
         tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_producer", outcome = reason, "response capture abandoned");
         self.active.store(false, Ordering::Release);

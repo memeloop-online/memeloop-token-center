@@ -1,4 +1,7 @@
-use std::pin::Pin;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
@@ -50,6 +53,74 @@ pub(super) async fn rejected_response_terminal_cause(
         .await
         .ok()
         .flatten()
+}
+
+// The delivery reader may reject an oversized/non-JSON error or stop after a
+// terminal event. Keep ownership of its original, deadline-bearing stream so
+// that dropping that reader cannot turn the retained original into a prefix.
+struct CapturedUpstream {
+    upstream: Option<UpstreamByteStream>,
+    capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
+}
+
+impl Stream for CapturedUpstream {
+    type Item = Result<Bytes, &'static str>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        let Some(upstream) = this.upstream.as_mut() else {
+            return Poll::Ready(None);
+        };
+        match upstream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(chunk)) => {
+                match &chunk {
+                    Ok(bytes) => {
+                        if let Some(writer) = this.capture.as_mut()
+                            && !writer.append(vec![bytes.clone()])
+                        {
+                            this.capture.take();
+                        }
+                    }
+                    Err(_) => {
+                        this.capture.take();
+                    }
+                }
+                Poll::Ready(Some(chunk))
+            }
+            Poll::Ready(None) => {
+                this.upstream.take();
+                if let Some(writer) = this.capture.take() {
+                    drop(writer.seal());
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for CapturedUpstream {
+    fn drop(&mut self) {
+        let (Some(mut upstream), Some(mut writer)) = (self.upstream.take(), self.capture.take())
+        else {
+            return;
+        };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                while let Some(chunk) = upstream.next().await {
+                    match chunk {
+                        Ok(bytes) => {
+                            if !writer.append_background(bytes).await {
+                                return;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                drop(writer.seal());
+            });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -266,32 +337,10 @@ impl UpstreamResponse {
         capture: Option<crate::response_archive_spool::ResponseArchiveProducer>,
     ) -> Self {
         let parts = self.into_parts();
-        let captured = stream::unfold(
-            (parts.stream, capture),
-            |(mut upstream, mut capture)| async move {
-                match upstream.next().await {
-                    Some(chunk) => {
-                        match &chunk {
-                            Ok(bytes) => {
-                                if let Some(writer) = capture.as_mut()
-                                    && !writer.append(vec![bytes.clone()])
-                                {
-                                    drop(capture.take());
-                                }
-                            }
-                            Err(_) => drop(capture.take()),
-                        }
-                        Some((chunk, (upstream, capture)))
-                    }
-                    None => {
-                        if let Some(writer) = capture {
-                            drop(writer.seal());
-                        }
-                        None
-                    }
-                }
-            },
-        );
+        let captured = CapturedUpstream {
+            upstream: Some(parts.stream),
+            capture,
+        };
         Self::Prefetched {
             status: parts.status,
             headers: parts.headers,
