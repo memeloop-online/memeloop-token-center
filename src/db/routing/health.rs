@@ -414,6 +414,27 @@ impl Database {
         &self,
         request_id: Uuid,
     ) -> Result<Vec<crate::model::RequestTransportDiagnosticView>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let Some(snapshot) = client
+                .request_snapshot(
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    request_id,
+                )
+                .await?
+            else {
+                return Ok(Vec::new());
+            };
+            return serde_json::from_value(snapshot.read_model["transport_diagnostics"].clone())
+                .map_err(|_| AppError::internal("history_transport_projection_missing"));
+        }
+        self.source_request_upstream_transport_diagnostics(request_id)
+            .await
+    }
+
+    pub(crate) async fn source_request_upstream_transport_diagnostics(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Vec<crate::model::RequestTransportDiagnosticView>, AppError> {
         let rows = sqlx::query(
             "SELECT route_id, upstream_account_id, credential_generation,
                     transport_revision, failure_kind, failure_stage,

@@ -84,6 +84,10 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&125));
     assert!(versions.contains(&126));
     for statement in [
+        "DROP TABLE session_relationships",
+        "DROP TABLE session_thread_parents",
+        "DROP INDEX conversation_observations_explicit_session_idx",
+        "DROP INDEX request_stats_facts_session_idx",
         "DROP TABLE session_generated_titles",
         "DROP TABLE session_response_summaries",
         "DROP VIEW model_route_eligible_upstream_accounts",
@@ -179,6 +183,17 @@ async fn upgrade_contract(database: &Database) {
         "DROP INDEX IF EXISTS session_archive_unlinked_recent_idx",
         "DROP INDEX IF EXISTS request_egress_attempts_request_idx",
         "DROP INDEX IF EXISTS conversation_observations_compacted_probe_idx",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    for statement in [
+        "DROP VIEW request_history_source_ids",
+        "DROP TABLE request_history_backfill",
+        "DROP TABLE request_history_export",
+        "DROP TABLE request_history_state",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)
@@ -288,7 +303,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 146
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147
             ]
         );
     }
