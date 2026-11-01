@@ -1,4 +1,4 @@
-import { useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { api } from '../../api';
 import { Button, LoadingProgress, LoadingState, Tab, TabList } from '../../design-system';
 import { useI18n } from '../../i18n';
@@ -26,6 +26,7 @@ export function ProxyGroupsPage({ token, tenant, initialAccountId, onBack }: {
   const [tab, setTab] = useState<'proxies' | 'groups' | 'policies'>(initialAccountId ? 'groups' : 'proxies');
   const closeRequest = useRef<(() => Promise<boolean>) | null>(null);
   const switching = useRef(false);
+  useEffect(() => { if (initialAccountId) setTab('groups'); }, [initialAccountId]);
   useNavigationGuard(async () => closeRequest.current ? closeRequest.current() : true);
   const access = useOperatorResource(Boolean(token), token, async signal => {
     try {

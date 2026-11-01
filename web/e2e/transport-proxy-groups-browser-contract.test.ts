@@ -604,7 +604,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
         assert.match(details, new RegExp(`${copy.healthTitle}: ${copy.health.healthy}`));
         await captureNavigationIdentity(page, 'proxy-groups', 'network-exits-details', locale);
         await workspace.getByRole('button', { name: copy.edit('CSIL'), exact: true }).click();
-        const address = workspace.getByLabel(copy.address, { exact: true });
+        const address = workspace.locator('.proxy-address-input');
         assert.equal(await address.inputValue(), 'socks5h://100.64.0.16:1080');
         assert.equal(await address.getAttribute('type'), 'text');
         await captureNavigationIdentity(page, 'proxy-groups', 'network-exit-edit-address', locale);
@@ -632,11 +632,12 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await workspace.getByRole('button', { name: copy.save, exact: true }).click();
       await workspace.getByRole('button', { name: copy.edit('研发备用'), exact: true }).waitFor();
       await workspace.getByRole('button', { name: copy.edit('研发备用'), exact: true }).click();
-      const replacement = workspace.getByLabel(copy.address, { exact: true });
+      const replacement = workspace.locator('.proxy-address-input');
       assert.equal(await replacement.inputValue(), 'socks5h://10.20.30.40:1080');
       await replacement.fill('socks5h://10.20.30.41:1080');
       await workspace.getByRole('button', { name: copy.save, exact: true }).click();
       await workspace.getByText(copy.saved, { exact: true }).waitFor();
+      await page.waitForFunction(() => window.proxyGroupFixture.writes.length === 3);
       writes = await page.evaluate(() => window.proxyGroupFixture.writes);
       assert.equal(writes.length, 3);
       assert.equal(writes[1].method, 'POST');
@@ -668,6 +669,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await policies.getByLabel('minimum_samples', { exact: true }).fill('6');
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await policies.getByText(copy.policySaved, { exact: true }).waitFor();
+      await page.waitForFunction(() => window.proxyGroupFixture.writes.length === 6);
       writes = await page.evaluate(() => window.proxyGroupFixture.writes);
       const policyWrites = writes.slice(3);
       assert.deepEqual(policyWrites.map(write => write.body.mode), ['manual', 'auto', 'plugin']);
