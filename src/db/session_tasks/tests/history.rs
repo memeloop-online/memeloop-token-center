@@ -42,7 +42,7 @@ async fn native(
 ) -> Uuid {
     let request_id = Uuid::now_v7();
     let session_id = identity.map(|identity| identity.session_id.to_string());
-    sqlx::query("INSERT INTO request_records (id,tenant_id,key_id,created_at,protocol,model,currency,request_object,reservation_id,conversation_cluster_id) VALUES ($1,$2,$3,$4,'openai','session-history',$5,'gap://fixture/request',$6,$7)")
+    sqlx::query("INSERT INTO request_records (id,tenant_id,key_id,created_at,protocol,model,input_tokens,output_tokens,cost_micros,currency,request_object,reservation_id,conversation_cluster_id) VALUES ($1,$2,$3,$4,'openai','session-history',0,0,0,$5,'gap://fixture/request',$6,$7)")
         .bind(request_id.to_string()).bind(owner.tenant_id.to_string()).bind(owner.key_id.to_string())
         .bind(timestamp).bind(currency).bind(Uuid::now_v7().to_string()).bind(&session_id)
         .execute(&db.pool).await.unwrap();
