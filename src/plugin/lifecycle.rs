@@ -178,16 +178,6 @@ impl RuntimeSnapshot {
         request: &serde_json::Value,
         configurations: &BTreeMap<String, serde_json::Value>,
     ) -> Result<TrafficDecision, AppError> {
-        self.apply_traffic_with_config_and_memory(context, request, configurations, None)
-    }
-
-    pub(crate) fn apply_traffic_with_config_and_memory(
-        &self,
-        context: types::RequestContext,
-        request: &serde_json::Value,
-        configurations: &BTreeMap<String, serde_json::Value>,
-        memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
-    ) -> Result<TrafficDecision, AppError> {
         let mut decision = TrafficDecision {
             allow: true,
             ..Default::default()
@@ -214,12 +204,8 @@ impl RuntimeSnapshot {
             // budgets. Restrict this invocation to exactly one installed plugin.
             let mut runtime = self.runtime.clone();
             runtime.plugins = Arc::new(vec![plugin.clone()]);
-            let result = runtime.apply_traffic_with_config_and_memory(
-                plugin_context,
-                current.as_ref(),
-                configurations,
-                memory,
-            );
+            let result =
+                runtime.apply_traffic_with_config(plugin_context, current.as_ref(), configurations);
             drop(current);
             let mut circuits = self.circuits.lock().map_err(|_| {
                 AppError::internal("lifecycle_apply_traffic_with_config_and_memory_2")

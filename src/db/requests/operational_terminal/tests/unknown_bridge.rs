@@ -92,9 +92,14 @@ async fn correction_contract(
         (false, true, true) => 503,
         (true, false, false) => 504,
         (true, false, true) => 200,
-        _ => 502,
+        (true, true, false) => 502,
+        (true, true, true) => 408,
     };
-    let terminal = fixture.operational(status);
+    let mut terminal = fixture.operational(status);
+    if matches!(status, 408 | 504) {
+        terminal.error_code = Some("upstream_timeout".into());
+        terminal.terminal_cause = Some("upstream_read_timeout".into());
+    }
     if unknown_first {
         fixture
             .database
@@ -269,6 +274,117 @@ async fn correction_contract(
     assert_eq!(stats.summary.failed_requests, 1);
     assert_eq!(stats.summary.pending_requests, 0);
     assert_eq!(stats.summary.total_cost.as_deref(), Some("0.000012"));
+    fixture.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_statistics_keep_inflight_and_unprojected_failures_separate() {
+    inflight_and_unprojected_failures_contract(Fixture::sqlite().await).await;
+}
+
+#[tokio::test]
+async fn postgres_statistics_keep_inflight_and_unprojected_failures_separate() {
+    let Some(fixture) = Fixture::postgres().await else {
+        return;
+    };
+    inflight_and_unprojected_failures_contract(fixture).await;
+}
+
+async fn inflight_and_unprojected_failures_contract(fixture: Fixture) {
+    for status in [None, Some("pending")] {
+        let filter = StatsFilter {
+            status: status.map(str::to_owned),
+            ..stats_window()
+        };
+        let pending = fixture
+            .database
+            .stats_filtered(fixture.key.key_id, filter.clone())
+            .await
+            .unwrap();
+        assert_eq!(pending.summary.total_requests, 1);
+        assert_eq!(pending.summary.pending_requests, 1);
+        assert_eq!(pending.summary.successful_requests, 0);
+        assert_eq!(pending.summary.failed_requests, 0);
+        assert_eq!(pending.summary.total_cost, None);
+        assert!(pending.summary.costs.is_empty());
+        for bucket in pending.by_day.iter().chain(&pending.by_model) {
+            assert_eq!(bucket.cost, None);
+            assert!(bucket.costs.is_empty());
+        }
+        for (minimum, maximum) in [(Some(0), None), (None, Some(0))] {
+            let priced = fixture
+                .database
+                .stats_filtered(
+                    fixture.key.key_id,
+                    StatsFilter {
+                        min_cost_micros: minimum,
+                        max_cost_micros: maximum,
+                        ..filter.clone()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(priced.summary.total_requests, 0);
+        }
+    }
+    for (status_code, error_code) in [
+        (Some(499), "client_cancelled"),
+        (None, "upstream_timeout"),
+        (Some(413), "request_body_too_large"),
+        (Some(429), "rate_limited"),
+        (Some(502), "upstream_read"),
+        (Some(503), "upstream_unavailable"),
+        (Some(504), "upstream_timeout"),
+        (Some(200), "upstream_stream_read_error"),
+    ] {
+        sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, duration_ms = 42 WHERE id = $3")
+            .bind(status_code)
+            .bind(error_code)
+            .bind(fixture.claim.request_id.to_string())
+            .execute(&fixture.database.pool)
+            .await
+            .unwrap();
+        for status in [None, Some("error"), Some("pending"), Some("success")] {
+            for duration in [None, Some(42)] {
+                let filter = StatsFilter {
+                    status: status.map(str::to_owned),
+                    min_duration_ms: duration,
+                    max_duration_ms: duration,
+                    ..stats_window()
+                };
+                let expected = i64::from(status.is_none() || status == Some("error"));
+                let stats = fixture
+                    .database
+                    .stats_filtered(fixture.key.key_id, filter.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(stats.summary.total_requests, expected, "{status_code:?}");
+                assert_eq!(stats.summary.failed_requests, expected);
+                assert_eq!(stats.summary.successful_requests, 0);
+                assert_eq!(stats.summary.pending_requests, 0);
+                if expected == 1 {
+                    assert_eq!(stats.summary.total_cost, None);
+                    assert!(stats.summary.costs.is_empty());
+                }
+                for (minimum, maximum) in [(Some(0), None), (None, Some(0))] {
+                    let priced = fixture
+                        .database
+                        .stats_filtered(
+                            fixture.key.key_id,
+                            StatsFilter {
+                                min_cost_micros: minimum,
+                                max_cost_micros: maximum,
+                                ..filter.clone()
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(priced.summary.total_requests, 0);
+                }
+            }
+        }
+    }
+    fixture.assert_unsettled().await;
     fixture.close().await;
 }
 
