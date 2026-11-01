@@ -824,7 +824,10 @@ fn builtin_http_json_exposes_only_fixed_video_profiles() {
         .config_schema
         .pointer("/properties/video_api")
         .expect("video API profile schema");
-    assert_eq!(video_api["enum"], json!(["siliconflow-v1", "wasu-wan-v1"]));
+    assert_eq!(
+        video_api["enum"],
+        json!(["siliconflow-v1", "wasu-wan-v1", "tkmarket-seedance-v1"])
+    );
     assert_eq!(
         http_json.config_schema["properties"]["provider_asset_reads_repeatable"]["default"],
         false

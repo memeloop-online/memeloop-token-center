@@ -10260,7 +10260,7 @@ components:
       type: object
       required: [billing_unit, price_per_unit]
       properties:
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         price_per_unit: { $ref: '#/components/schemas/NonNegativeMoney' }
     GenerationPrice:
       type: object
@@ -10269,7 +10269,7 @@ components:
         id: { type: string, format: uuid }
         model: { type: string }
         currency: { $ref: '#/components/schemas/Currency' }
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         price_per_unit: { $ref: '#/components/schemas/NonNegativeMoney' }
     GrantRequest:
       type: object
@@ -11885,7 +11885,7 @@ components:
         completed_at: { type: [integer, 'null'], format: int64 }
         model: { type: string }
         driver: { type: string }
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         status: { type: string, enum: [queued, running, cancelling, succeeded, failed, cancelled] }
         upstream_job_id: { type: [string, 'null'] }
         estimated_units: { type: integer, format: int64 }
