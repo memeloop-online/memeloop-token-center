@@ -719,10 +719,13 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
+    let observer = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
     let remaining_route: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM model_routes WHERE id = $1")
             .bind(deleted_route.id.to_string())
-            .fetch_one(&state.db.pool)
+            .fetch_one(&observer)
             .await
             .unwrap();
     assert_eq!(remaining_route, 0);
@@ -743,7 +746,7 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
         "SELECT model_route_id, input_tokens + output_tokens, cost_micros FROM request_records WHERE id = $1",
     )
     .bind(deleted_request_id.to_string())
-    .fetch_one(&state.db.pool)
+    .fetch_one(&observer)
     .await
     .unwrap();
     assert_eq!(
@@ -753,7 +756,7 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
     let stored_settlement: (String, i64) =
         sqlx::query_as("SELECT status, actual_micros FROM usage_reservations WHERE id = $1")
             .bind(deleted_reservation.id.to_string())
-            .fetch_one(&state.db.pool)
+            .fetch_one(&observer)
             .await
             .unwrap();
     assert_eq!(stored_settlement, ("settled".into(), deleted_cost));
