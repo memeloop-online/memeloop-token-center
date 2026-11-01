@@ -119,6 +119,17 @@ fn validate_background_evidence(
     guard: &BackgroundResetGuard,
     now: i64,
 ) -> Result<(), AppError> {
+    if snapshot
+        .reset_capability
+        .available_credits
+        .is_none_or(|count| count < 1)
+        || snapshot
+            .reset_capability
+            .applicable_credits
+            .is_none_or(|count| count < 1)
+    {
+        return Err(blocked());
+    }
     let current = inventory(snapshot, now);
     let target = current
         .credits

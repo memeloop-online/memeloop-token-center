@@ -428,6 +428,11 @@ impl Database {
         }
         let now = unix_millis();
         if let Some(guard) = guard {
+            if now < guard.not_before_ms {
+                return Err(AppError::Conflict(
+                    "background action has not started".into(),
+                ));
+            }
             // A lock wait must not preserve an already-expired lease/deadline.
             plugin_background_actions::require_grant(
                 &mut tx,
