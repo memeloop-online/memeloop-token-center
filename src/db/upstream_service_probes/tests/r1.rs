@@ -303,8 +303,171 @@ async fn legacy_deadline_and_provenance(db: &Database) {
 
 async fn contracts(db: &Database) {
     evidence_merge_orders(db).await;
+    retained_evidence_success_orders(db).await;
     deadlines_and_reset_verification(db).await;
     legacy_deadline_and_provenance(db).await;
+}
+
+/// R2-F2: H(T), W(T+3), S(T+2) must have the same routing meaning in
+/// either persistence order, without throwing away W or the success fence.
+async fn retained_evidence_success_orders(db: &Database) {
+    let now = super::super::super::unix_millis();
+    let key = billing_key(db).await;
+    for hard in [false, true] {
+        for reset in [None, Some(now + 3_600_000)] {
+            for success_first in [false, true] {
+                let target = fixture(db).await;
+                let public = format!("r2-{}", target.account_id);
+                let route_id = route(db, target.account_id, &public, "exact").await;
+                grant(db, key.key_id, route_id, None).await;
+                let weak_request = Uuid::now_v7();
+                if success_first {
+                    db.recover_supplier_quota_from_probe(
+                        target.account_id,
+                        &success(&target, now + 2),
+                    )
+                    .await
+                    .unwrap();
+                } else {
+                    db.store_supplier_quota(&target, Uuid::now_v7(), now, failure(hard, reset))
+                        .await
+                        .unwrap();
+                }
+                db.store_supplier_quota(&target, weak_request, now + 3, failure(false, None))
+                    .await
+                    .unwrap();
+                if success_first {
+                    db.store_supplier_quota(&target, Uuid::now_v7(), now, failure(hard, reset))
+                        .await
+                        .unwrap();
+                } else {
+                    db.recover_supplier_quota_from_probe(
+                        target.account_id,
+                        &success(&target, now + 2),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let row = sqlx::query(
+                    "SELECT * FROM upstream_supplier_availability WHERE upstream_account_id=$1",
+                )
+                .bind(target.account_id.to_string())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+                assert_eq!(row.get::<String, _>("failure_kind"), "rate_limited");
+                assert_eq!(row.get::<i64, _>("observed_at"), now + 3);
+                assert_eq!(row.get::<String, _>("request_id"), weak_request.to_string());
+                assert_eq!(row.get::<Option<i64>, _>("success_at"), Some(now + 2));
+                assert_eq!(row.get::<Option<i64>, _>("hard_observed_at"), None);
+                assert_eq!(row.get::<Option<i64>, _>("reset_observed_at"), None);
+                assert_eq!(row.get::<Option<i64>, _>("reset_at"), None);
+                assert_eq!(row.get::<String, _>("reset_source"), "unknown");
+                assert_eq!(
+                    db.supplier_quota_probe_deadline(target.account_id, "exact")
+                        .await
+                        .unwrap(),
+                    None
+                );
+                assert!(
+                    db.supplier_quota_recovery_models(target.account_id)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    db.list_authorized_upstream_candidates_with_hint(
+                        key.key_id,
+                        key.tenant_id,
+                        &public,
+                        "openai",
+                        selection(Some(target.account_id)),
+                    )
+                    .await
+                    .unwrap()
+                    .len(),
+                    1
+                );
+                // Older success and subsequently arriving pre-success hard facts
+                // cannot roll the success fence or routing state back.
+                db.recover_supplier_quota_from_probe(target.account_id, &success(&target, now + 1))
+                    .await
+                    .unwrap();
+                db.store_supplier_quota(&target, Uuid::now_v7(), now + 1, failure(true, reset))
+                    .await
+                    .unwrap();
+                assert_eq!(kind(db, &target).await, "rate_limited");
+            }
+        }
+    }
+    // Hard and reset facts age independently; equal-time failure still wins.
+    for evidence_at in [now + 2, now + 3] {
+        for new_hard in [false, true] {
+            let target = fixture(db).await;
+            db.store_supplier_quota(
+                &target,
+                Uuid::now_v7(),
+                now,
+                failure(true, Some(now + 3_600_000)),
+            )
+            .await
+            .unwrap();
+            db.store_supplier_quota(
+                &target,
+                Uuid::now_v7(),
+                evidence_at,
+                failure(new_hard, (!new_hard).then_some(now + 7_200_000)),
+            )
+            .await
+            .unwrap();
+            db.recover_supplier_quota_from_probe(target.account_id, &success(&target, now + 2))
+                .await
+                .unwrap();
+            let row = sqlx::query(
+                "SELECT * FROM upstream_supplier_availability WHERE upstream_account_id=$1",
+            )
+            .bind(target.account_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                row.get::<String, _>("failure_kind"),
+                if new_hard {
+                    "quota_exhausted"
+                } else {
+                    "rate_limited"
+                }
+            );
+            assert_eq!(
+                row.get::<Option<i64>, _>("hard_observed_at"),
+                new_hard.then_some(evidence_at)
+            );
+            assert_eq!(
+                row.get::<Option<i64>, _>("reset_at"),
+                (!new_hard).then_some(now + 7_200_000)
+            );
+            assert_eq!(
+                row.get::<Option<i64>, _>("reset_observed_at"),
+                (!new_hard).then_some(evidence_at)
+            );
+            assert_eq!(
+                db.supplier_quota_probe_deadline(target.account_id, "exact")
+                    .await
+                    .unwrap(),
+                (!new_hard).then_some(now + 7_200_000)
+            );
+            assert_eq!(
+                db.supplier_quota_recovery_models(target.account_id)
+                    .await
+                    .unwrap(),
+                if new_hard {
+                    vec!["exact".to_owned()]
+                } else {
+                    vec![]
+                }
+            );
+        }
+    }
 }
 
 #[tokio::test]

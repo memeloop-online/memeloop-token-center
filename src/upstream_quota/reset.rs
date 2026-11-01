@@ -342,19 +342,7 @@ pub(crate) async fn confirm(
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
-    let http = tokio::time::timeout(
-        Duration::from_secs(5),
-        crate::network::client_for_codex_url_without_retries(
-            &state.http,
-            CONSUME_URL,
-            &json!({"network_scope":"public"}),
-            dispatch_credential.proxy(),
-            false,
-        ),
-    )
-    .await
-    .map_err(|_| temporarily_unavailable("quota_reset_transport_timeout"))?
-    .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
+    let http = consume_client(state, dispatch_credential).await?;
     let claim = state
         .db
         .claim_quota_reset(
@@ -370,11 +358,17 @@ pub(crate) async fn confirm(
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
     // No automatic retry and no new redeem ID on any ambiguous outcome.
+    #[cfg(test)]
+    let fixture_url = r2_tests::fixture_url(CONSUME_URL);
+    #[cfg(test)]
+    let consume_url = fixture_url.as_deref().unwrap_or(CONSUME_URL);
+    #[cfg(not(test))]
+    let consume_url = CONSUME_URL;
     let result = dispatch_once(
         &http,
         dispatch_credential,
         account_header,
-        CONSUME_URL,
+        consume_url,
         &redeem,
     )
     .await;
@@ -390,6 +384,8 @@ pub(crate) async fn confirm(
         .lock()
         .await
         .retain(|key, _| key.account != account.id);
+    #[cfg(test)]
+    r2_tests::after_reset_eviction().await;
     if accepted {
         // The consume response proves only that the reset was accepted. A
         // separate fresh supplier read is the evidence that may clear the
@@ -434,6 +430,29 @@ pub(crate) async fn confirm(
             operation,
         )
         .await
+}
+
+async fn consume_client(
+    state: &AppState,
+    dispatch_credential: &UpstreamCredential,
+) -> Result<reqwest::Client, AppError> {
+    #[cfg(test)]
+    if r2_tests::fixture_url(CONSUME_URL).is_some() {
+        return Ok(crate::build_no_retry_http_client(None, &[]).unwrap());
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::network::client_for_codex_url_without_retries(
+            &state.http,
+            CONSUME_URL,
+            &json!({"network_scope":"public"}),
+            dispatch_credential.proxy(),
+            false,
+        ),
+    )
+    .await
+    .map_err(|_| temporarily_unavailable("quota_reset_transport_timeout"))?
+    .map_err(|_| temporarily_unavailable("quota_reset_transport"))
 }
 
 pub(crate) async fn reconcile(

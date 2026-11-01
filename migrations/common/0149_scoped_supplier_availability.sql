@@ -10,6 +10,9 @@ CREATE TABLE upstream_supplier_availability (
     reset_source TEXT NOT NULL,
     observed_at BIGINT NOT NULL,
     request_id TEXT NOT NULL,
+    -- Retained evidence has its own age; a later weak 429 is not a renewal.
+    hard_observed_at BIGINT,
+    reset_observed_at BIGINT,
     success_at BIGINT,
     verification_after BIGINT,
     PRIMARY KEY (upstream_account_id, upstream_model, credential_generation, transport_revision)

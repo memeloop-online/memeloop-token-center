@@ -44,8 +44,11 @@ impl Database {
         sqlx::query(
             "INSERT INTO upstream_supplier_availability
              (upstream_account_id, upstream_model, credential_generation, transport_revision,
-              failure_kind, reset_at, reset_source, observed_at, request_id)
-             SELECT id, $2, $3, $4, $5, $6, $7, $8, $9 FROM upstream_accounts
+              failure_kind, reset_at, reset_source, observed_at, request_id,
+              hard_observed_at, reset_observed_at)
+             SELECT id, $2, $3, $4, $5, $6, $7, $8, $9,
+               CASE WHEN $5 = 'quota_exhausted' THEN $8 ELSE NULL END,
+               CASE WHEN $6 IS NOT NULL THEN $8 ELSE NULL END FROM upstream_accounts
              WHERE id = $1 AND status = 'active'
                AND credential_generation = $3 AND updated_at = $4
              ON CONFLICT (upstream_account_id, upstream_model, credential_generation, transport_revision)
@@ -54,12 +57,25 @@ impl Database {
                     AND excluded.failure_kind = 'rate_limited'
                     AND (upstream_supplier_availability.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.observed_at)
                  THEN upstream_supplier_availability.failure_kind ELSE excluded.failure_kind END,
+               hard_observed_at = CASE
+                 WHEN excluded.hard_observed_at IS NOT NULL THEN
+                   CASE WHEN upstream_supplier_availability.hard_observed_at > excluded.hard_observed_at
+                     THEN upstream_supplier_availability.hard_observed_at ELSE excluded.hard_observed_at END
+                 WHEN upstream_supplier_availability.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.observed_at
+                   THEN upstream_supplier_availability.hard_observed_at ELSE NULL END,
                reset_at = CASE WHEN upstream_supplier_availability.reset_at > excluded.observed_at
                     AND (excluded.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.reset_at)
                  THEN upstream_supplier_availability.reset_at ELSE excluded.reset_at END,
                reset_source = CASE WHEN upstream_supplier_availability.reset_at > excluded.observed_at
-                    AND (excluded.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.reset_at)
+                    AND (excluded.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.reset_at
+                      OR (upstream_supplier_availability.reset_at = excluded.reset_at
+                        AND upstream_supplier_availability.reset_observed_at > excluded.reset_observed_at))
                  THEN upstream_supplier_availability.reset_source ELSE excluded.reset_source END,
+               reset_observed_at = CASE WHEN upstream_supplier_availability.reset_at > excluded.observed_at
+                    AND (excluded.reset_at IS NULL OR upstream_supplier_availability.reset_at > excluded.reset_at
+                      OR (upstream_supplier_availability.reset_at = excluded.reset_at
+                        AND upstream_supplier_availability.reset_observed_at > excluded.reset_observed_at))
+                 THEN upstream_supplier_availability.reset_observed_at ELSE excluded.reset_observed_at END,
                observed_at = CASE WHEN excluded.observed_at > upstream_supplier_availability.observed_at
                  THEN excluded.observed_at ELSE upstream_supplier_availability.observed_at END,
                request_id = CASE WHEN excluded.observed_at >= upstream_supplier_availability.observed_at
@@ -149,7 +165,9 @@ impl Database {
             return Ok(());
         };
         // Retain a tombstone so delayed failure persistence predating this
-        // probe cannot re-open it. A later/concurrent 429 still wins.
+        // probe cannot re-open it. Invalidate each retained fact by its own
+        // timestamp, not the latest weak failure that may have carried it.
+        // A later/concurrent 429 still wins and retains its request/recency.
         sqlx::query(
             "INSERT INTO upstream_supplier_availability
              (upstream_account_id, upstream_model, credential_generation, transport_revision,
@@ -160,11 +178,19 @@ impl Database {
              ON CONFLICT (upstream_account_id, upstream_model, credential_generation, transport_revision)
              DO UPDATE SET
                failure_kind = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
-                 THEN excluded.failure_kind ELSE upstream_supplier_availability.failure_kind END,
-               reset_at = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
+                 THEN excluded.failure_kind
+                 WHEN upstream_supplier_availability.hard_observed_at >= excluded.success_at
+                 THEN 'quota_exhausted' ELSE 'rate_limited' END,
+               hard_observed_at = CASE WHEN upstream_supplier_availability.hard_observed_at < excluded.success_at
+                 THEN NULL ELSE upstream_supplier_availability.hard_observed_at END,
+               reset_at = CASE WHEN upstream_supplier_availability.reset_observed_at < excluded.success_at
                  THEN NULL ELSE upstream_supplier_availability.reset_at END,
+               reset_observed_at = CASE WHEN upstream_supplier_availability.reset_observed_at < excluded.success_at
+                 THEN NULL ELSE upstream_supplier_availability.reset_observed_at END,
                reset_source = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
-                 THEN excluded.reset_source ELSE upstream_supplier_availability.reset_source END,
+                 THEN excluded.reset_source
+                 WHEN upstream_supplier_availability.reset_observed_at < excluded.success_at
+                 THEN 'unknown' ELSE upstream_supplier_availability.reset_source END,
                observed_at = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
                  THEN excluded.observed_at ELSE upstream_supplier_availability.observed_at END,
                request_id = CASE WHEN upstream_supplier_availability.observed_at < excluded.observed_at
