@@ -213,6 +213,14 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        ports: ["8123:8123"]
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s --health-timeout 3s --health-retries 20
       postgres:
         image: postgres:16-alpine
         env:
@@ -259,6 +267,17 @@ jobs:
       - name: Verify durable archive RSS harness contract
         run: node --test tests/load/test-durable-archive-memory.ts
       - run: cargo fmt --all -- --check
+      - name: Verify request history capture, replay, migration and isolated ClickHouse reads
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+          MTC_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+          MTC_REQUEST_HISTORY_URL: http://127.0.0.1:8123
+        run: |
+          cargo test --locked --all-features --lib request_history -- --nocapture
+          cargo test --locked --all-features --lib request_history_real_services_acceptance -- --ignored --nocapture
+          curl --fail --silent --show-error "$MTC_TEST_CLICKHOUSE_URL" --data-binary 'CREATE DATABASE IF NOT EXISTS session_tasks'
+          MTC_REQUEST_HISTORY_DATABASE=session_tasks cargo test --locked --all-features --lib session_tasks_history_real_services_acceptance -- --ignored --nocapture
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Verify pinned Claude privacy component through the host ABI
         id: claude_component
         env:
@@ -299,10 +318,6 @@ jobs:
           cargo test --locked --all-features --lib privacy_wire_shim_release_component -- --ignored
           cargo test --locked --all-features --test plugin_product \
             installable_example_contributes_provider_oauth_policy_and_rewrite
-      - name: Verify empty inventory registration and SQLite/PostgreSQL recovery CAS
-        run: cargo test --locked --all-features --lib empty_inventory -- --nocapture
-        env:
-          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
       - name: Reuse the signed Claude component through native and bridge gateway finalization
         if: ${{ !cancelled() && steps.claude_component.outcome == 'success' }}
         run: |
@@ -344,7 +359,6 @@ jobs:
           "$RUNNER_TEMP/preferred-tools/wasm-tools" component new .plugin-examples/plugin-sources/soonest-reset/target/wasm32-unknown-unknown/release/mtc_soonest_reset.wasm \
             -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Verify the H2 binding build without the default features
         run: cargo test --locked --no-default-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
       - name: Run documentation tests

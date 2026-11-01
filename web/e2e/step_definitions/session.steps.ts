@@ -268,7 +268,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
     }),
   });
   const sessionReady = observeSessionReadyRequests({
-    credential: seed.serviceCredential,
+    credential: seed.sessionObserverCredential,
     keyId: seed.sessionClientKeyId,
     requestModel: sessionModel,
     sessionName: 'Codex release dogfood',

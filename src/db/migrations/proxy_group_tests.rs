@@ -115,6 +115,7 @@ async fn upgrade_contract(database: &Database) {
         "DROP TABLE plugin_installer_network_preferences",
         "DROP TABLE pending_proxy_settlements",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_token",
+        "DROP INDEX request_records_live_owner_expiry_idx",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_expires_at",
         "ALTER TABLE request_records DROP COLUMN cache_known_input_tokens",
         "ALTER TABLE request_records DROP COLUMN cache_known_read_tokens",
@@ -182,6 +183,17 @@ async fn upgrade_contract(database: &Database) {
         "DROP INDEX IF EXISTS session_archive_unlinked_recent_idx",
         "DROP INDEX IF EXISTS request_egress_attempts_request_idx",
         "DROP INDEX IF EXISTS conversation_observations_compacted_probe_idx",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    for statement in [
+        "DROP VIEW request_history_source_ids",
+        "DROP TABLE request_history_backfill",
+        "DROP TABLE request_history_export",
+        "DROP TABLE request_history_state",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)
@@ -291,7 +303,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 147
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147
             ]
         );
     }

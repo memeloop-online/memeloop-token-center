@@ -389,6 +389,7 @@ impl Database {
                 "choose an IANA timezone or a fixed offset, not both".into(),
             ));
         }
+        let history_reader = self.history_reader().await?;
         let mut tx = self.pool.begin().await?;
         let postgres = matches!(self.backend, DatabaseBackend::PostgreSql);
         if postgres {
@@ -430,6 +431,36 @@ impl Database {
             }
         }
         let selected = selected.into_iter().collect::<Vec<_>>();
+        if let Some(client) = history_reader {
+            tx.commit().await?;
+            let tuples = selected
+                .iter()
+                .map(|identity| (identity.key_id, identity.session_id))
+                .collect::<Vec<_>>();
+            let mut activity = client
+                .session_task_activity(
+                    tenant,
+                    &tuples,
+                    &options.timezone,
+                    options.timezone_offset_minutes,
+                )
+                .await?;
+            let result = activity
+                .as_object_mut()
+                .ok_or_else(|| AppError::internal("history_session_task_activity"))?;
+            result.insert("scope".into(), json!(scope));
+            result.insert(
+                "include_subtrees".into(),
+                json!(scope == "subtree" || (scope == "related" && options.include_subtrees)),
+            );
+            result.insert("identities".into(), json!(selected));
+            result.insert("timezone".into(), json!(options.timezone));
+            result.insert(
+                "timezone_offset_minutes".into(),
+                json!(options.timezone_offset_minutes),
+            );
+            return Ok(activity);
+        }
         let mut daily = BTreeMap::<i64, TaskUsage>::new();
         let mut day_starts = BTreeMap::<i64, i64>::new();
         let mut total = TaskUsage::default();

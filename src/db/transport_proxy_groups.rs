@@ -74,6 +74,7 @@ impl Snapshot {
 }
 
 pub(crate) struct TransportProxyGroups {
+    http_clients: Arc<crate::http_settings::HttpClientFactory>,
     groups: BTreeMap<Uuid, Arc<Entry>>,
     managed: std::sync::RwLock<BTreeMap<Uuid, managed::ManagedEntry>>,
     key: Vec<u8>,
@@ -92,6 +93,14 @@ fn unavailable() -> AppError {
 }
 
 impl TransportProxyGroups {
+    pub(crate) fn with_http_clients(
+        mut self,
+        factory: Arc<crate::http_settings::HttpClientFactory>,
+    ) -> Self {
+        self.http_clients = factory;
+        self
+    }
+
     pub(crate) fn parse(input: &str, key: &[u8]) -> Result<Self, AppError> {
         if input.len() > 256 * 1024 {
             return Err(unavailable());
@@ -133,6 +142,7 @@ impl TransportProxyGroups {
             }
         }
         Ok(Self {
+            http_clients: Arc::default(),
             groups,
             managed: std::sync::RwLock::new(BTreeMap::new()),
             key: key.to_vec(),

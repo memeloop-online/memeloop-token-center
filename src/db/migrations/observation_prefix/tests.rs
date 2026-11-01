@@ -70,11 +70,23 @@ async fn conversion_contract(url: &str) {
         "DROP TABLE plugin_installer_network_snapshots",
         "DROP TABLE plugin_installer_network_preferences",
         "DROP TABLE pending_proxy_settlements",
+        "DROP INDEX request_records_live_owner_expiry_idx",
         "DROP TABLE upstream_service_probes",
         "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_status",
         "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_checked_at",
         "ALTER TABLE request_records DROP COLUMN in_flight_stage",
         "DROP TABLE conversation_media_parts",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    for statement in [
+        "DROP VIEW request_history_source_ids",
+        "DROP TABLE request_history_backfill",
+        "DROP TABLE request_history_export",
+        "DROP TABLE request_history_state",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)
