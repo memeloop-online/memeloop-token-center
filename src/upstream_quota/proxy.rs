@@ -211,6 +211,7 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             get_codex_json_with_routes(
+                &crate::codex_clients::CodexClients::default(),
                 policy,
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,

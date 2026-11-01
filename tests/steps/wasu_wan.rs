@@ -182,7 +182,7 @@ async fn mock_wan_result(world: &mut TokenCenterWorld, usage_present: bool, mime
             "video_url": format!("{}/wan.mp4?signature=private-wan-signature", assets.uri())}
     });
     if usage_present {
-        result["usage"] = json!({"video_count": 1, "duration": 5, "output_video_duration": 5});
+        result["usage"] = json!({"video_count": 1, "duration": 5.0, "output_video_duration": 5.0});
     }
     Mock::given(method("GET"))
         .and(path("/api/v1/tasks/wan-task-1"))

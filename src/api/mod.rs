@@ -51,6 +51,7 @@ mod generation;
 mod generation_quarantine;
 mod groups;
 mod health;
+mod http_settings;
 mod image_generation_quarantine;
 mod kimi_transport;
 mod limits;
@@ -147,10 +148,9 @@ use tenants::{
 use traffic::{
     AppliedTraffic, Protocol, TrafficPolicyProtocols,
     apply_traffic_plugin_for_existing_idempotency, apply_traffic_policy,
-    authorize_applied_traffic_policy, component_provider_timeout, component_provider_url,
-    inject_controlled_output_ceiling, negotiate_openai_responses_websocket,
-    normalize_component_provider, prepare_component_provider, proxy_anthropic,
-    proxy_anthropic_count_tokens, proxy_openai_alpha_search, proxy_openai_chat,
+    authorize_applied_traffic_policy, component_provider_url, inject_controlled_output_ceiling,
+    negotiate_openai_responses_websocket, normalize_component_provider, prepare_component_provider,
+    proxy_anthropic, proxy_anthropic_count_tokens, proxy_openai_alpha_search, proxy_openai_chat,
     proxy_openai_embeddings, proxy_openai_responses, proxy_openai_responses_compact,
 };
 pub(crate) use upstreams::sync_upstream_models_after_refresh;
