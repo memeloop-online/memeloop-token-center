@@ -1619,6 +1619,10 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
         &json!({"model": fixture.model, "input": "cancel before provider terminal", "stream": true}),
     ).await;
     assert_eq!(enqueued["input"], "cancel before provider terminal");
+    // Enqueue precedes the compact journal write and the receipt attempt's
+    // durable flag. Acknowledge that owner, not just the outbox, before
+    // checking preservation; the upstream terminal is still withheld.
+    fixture.state.pending_terminals.drain().await;
     assert!(
         fixture
             .state
@@ -1626,6 +1630,21 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
             .contains_receipt_for_test(receipt_id),
         "runtime ACK is not a financial receipt ACK"
     );
+    let compact: Value = serde_json::from_slice(
+        &tokio::fs::read(
+            fixture
+                .state
+                .pending_terminals
+                .directory_for_test()
+                .join(format!("{receipt_id}.json")),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(compact["receipt_id"], receipt["receipt_id"]);
+    assert_eq!(compact["claim"], receipt["claim"]);
+    assert!(compact["financial_ack"].is_null());
     release.send(()).unwrap();
     server.await.unwrap();
     drain_archive_capture(&fixture).await;
