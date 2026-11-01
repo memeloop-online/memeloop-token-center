@@ -94,7 +94,11 @@ pub(super) async fn put(
     let tenant = tenant(&query)?;
     require_service_tenant(&service, tenant)?;
     state.db.require_upstream_tenant(account, tenant).await?;
-    let state = state.pin_application_plugins().await?;
+    let state = if body.enabled {
+        state.pin_application_plugins().await?
+    } else {
+        state
+    };
     if body.enabled && !state.plugins.has_background_actions(&plugin) {
         return Err(AppError::BadRequest(
             "plugin has no installed background action contribution".into(),

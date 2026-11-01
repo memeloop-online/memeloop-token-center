@@ -384,7 +384,6 @@ impl Database {
         idempotency_hash: &str,
         guard: Option<&crate::upstream_quota::reset::BackgroundResetGuard>,
     ) -> Result<QuotaResetClaim, AppError> {
-        let now = unix_millis();
         let tenant = account.tenant_id.to_string();
         let account_id = account.id.to_string();
         let mut tx = self.begin_write_transaction().await?;
@@ -395,13 +394,19 @@ impl Database {
             {
                 return Err(AppError::Forbidden);
             }
+            plugin_background_actions::require_runtime(
+                &mut tx,
+                self.backend,
+                guard.runtime_revision,
+            )
+            .await?;
             plugin_background_actions::require_grant(
                 &mut tx,
                 self.backend,
                 &guard.grant,
                 &guard.lease_owner,
                 guard.deadline_ms,
-                now,
+                unix_millis(),
             )
             .await?;
             // Lock the account and tenant as well as the grant. Credential
@@ -422,10 +427,17 @@ impl Database {
                 .ok_or(AppError::Forbidden)?;
         }
         let now = unix_millis();
-        if guard.is_some_and(|guard| now >= guard.deadline_ms) {
-            return Err(AppError::Conflict(
-                "background action deadline elapsed".into(),
-            ));
+        if let Some(guard) = guard {
+            // A lock wait must not preserve an already-expired lease/deadline.
+            plugin_background_actions::require_grant(
+                &mut tx,
+                self.backend,
+                &guard.grant,
+                &guard.lease_owner,
+                guard.deadline_ms,
+                now,
+            )
+            .await?;
         }
         let changed = sqlx::query(
             "UPDATE upstream_quota_reset_operations

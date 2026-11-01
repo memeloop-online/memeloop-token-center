@@ -258,18 +258,10 @@ pub(crate) async fn execute_tick(
     let Some(intent) = intent else {
         return Ok(None);
     };
-    // Re-pin before mutation: a disabled/uninstalled component cannot use a
-    // tick queued by the previous runtime. The durable grant is fenced again
-    // in the dispatch transaction, independent of runtime publication.
-    let current = state.clone().pin_application_plugins().await?;
-    if current.application_plugin_revision() != state.application_plugin_revision()
-        || !current.plugins.has_background_actions(&grant.plugin_id)
-    {
-        return Err(AppError::Conflict(
-            "plugin runtime changed during background action".into(),
-        ));
-    }
+    // The exact host-validated snapshot is fenced against the durable runtime
+    // head in the final dispatch transaction, after all supplier reads.
     let guard = BackgroundResetGuard {
+        runtime_revision: state.application_plugin_revision(),
         grant,
         lease_owner: owner,
         credit_fingerprint: intent.credit_fingerprint,
@@ -277,7 +269,7 @@ pub(crate) async fn execute_tick(
         not_before_ms: intent.not_before_ms,
         deadline_ms: intent.deadline_ms,
     };
-    crate::upstream_quota::reset::background_reset(&current, &account, &credential, &guard)
+    crate::upstream_quota::reset::background_reset(&state, &account, &credential, &guard)
         .await
         .map(Some)
 }

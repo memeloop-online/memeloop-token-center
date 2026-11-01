@@ -8,7 +8,7 @@ async fn fixture(db: &Database) -> (UpstreamAccountView, BackgroundResetGuard, S
     let tenant = format!("background-{}", Uuid::now_v7());
     let account = db.create_upstream_account(CreateUpstreamAccountInput {
         tenant_external_id: tenant.clone(), name: tenant.clone(), driver: "openai-codex".into(),
-        config: serde_json::json!({}), credential: UpstreamCredential::OAuth {
+        config: serde_json::json!({"base_url":"https://chatgpt.com"}), credential: UpstreamCredential::OAuth {
             access_token: "synthetic-only".into(), refresh_token: None, expires_at: None,
             header: "authorization".into(), prefix: "Bearer ".into(), proxy_url: None,
             proxy_network_scope: None, adapter_state: Some(serde_json::json!({"schema":"openai-codex-oauth-v1","account_id":"synthetic"})),
@@ -55,6 +55,7 @@ async fn fixture(db: &Database) -> (UpstreamAccountView, BackgroundResetGuard, S
     (
         account,
         BackgroundResetGuard {
+            runtime_revision: None,
             grant,
             lease_owner: "owner".into(),
             credit_fingerprint: "credit".into(),
@@ -153,10 +154,12 @@ async fn contract(db: &Database) {
             .count(),
         1
     );
-    for accepted in [false, true] {
-        db.finish_quota_reset(&id, accepted, (!accepted).then_some("synthetic_ambiguous"))
-            .await
-            .unwrap();
+    for state in ["submitted", "unknown"] {
+        if state == "unknown" {
+            db.finish_quota_reset(&id, false, Some("synthetic_ambiguous"))
+                .await
+                .unwrap();
+        }
         db.refresh_background_quota_reset_prepare(&account, &id, 9, 9, unix_millis(), &guard)
             .await
             .unwrap();
@@ -168,13 +171,36 @@ async fn contract(db: &Database) {
             )
             .await
             .unwrap();
-        assert_ne!(operation.state, "prepared");
+        assert_eq!(operation.state, state);
         assert_eq!(operation.available_credits, 3);
         assert!(matches!(
             claim(db, &account, &guard, &id).await.unwrap(),
             QuotaResetClaim::Replayed(_)
         ));
     }
+    let (account, guard, id) = fixture(db).await;
+    assert!(matches!(
+        claim(db, &account, &guard, &id).await.unwrap(),
+        QuotaResetClaim::Claimed { .. }
+    ));
+    db.finish_quota_reset(&id, true, None).await.unwrap();
+    db.refresh_background_quota_reset_prepare(&account, &id, 9, 9, unix_millis(), &guard)
+        .await
+        .unwrap();
+    let accepted = db
+        .quota_reset_operation(
+            &guard.grant.tenant_id,
+            &guard.grant.upstream_account_id,
+            &id,
+        )
+        .await
+        .unwrap();
+    assert_eq!(accepted.state, "accepted");
+    assert_eq!(accepted.available_credits, 1);
+    assert!(matches!(
+        claim(db, &account, &guard, &id).await.unwrap(),
+        QuotaResetClaim::Replayed(_)
+    ));
     // Racing renewal and claim retain the same irreversible operation.
     let (account, guard, id) = fixture(db).await;
     let (renew, claimed) = tokio::join!(
@@ -232,7 +258,86 @@ async fn contract(db: &Database) {
                 .await
                 .unwrap();
         assert_eq!(state, "prepared", "{scenario}");
+        if scenario == "account" || scenario == "tenant" {
+            let actor = AuthenticatedService {
+                service_id: Some(Uuid::parse_str(&guard.grant.actor_service_id).unwrap()),
+                credential_generation: Some(guard.grant.actor_generation),
+                scopes: vec!["providers:write".into(), "plugins:write".into()],
+                tenant_external_id: Some(guard.grant.tenant_external_id.clone()),
+            };
+            let disabled = db
+                .put_background_action_grant(
+                    PLUGIN,
+                    &guard.grant.tenant_external_id,
+                    account.id,
+                    false,
+                    guard.grant.revision,
+                    &actor,
+                    "",
+                )
+                .await
+                .unwrap();
+            assert!(
+                !disabled.enabled,
+                "paused resources must still allow revocation"
+            );
+            assert!(
+                db.put_background_action_grant(
+                    PLUGIN,
+                    &guard.grant.tenant_external_id,
+                    account.id,
+                    true,
+                    disabled.revision,
+                    &actor,
+                    ""
+                )
+                .await
+                .is_err()
+            );
+        }
     }
+
+    // Runtime publication / uninstall is serialized with dispatch, including
+    // an absent head becoming managed while an old startup tick is queued.
+    let (account, mut guard, id) = fixture(db).await;
+    sqlx::query("INSERT INTO application_plugin_candidates (inventory_id,identity_digest,contract_digest,created_at) VALUES ('background-runtime','fixture','fixture',1)").execute(&db.pool).await.unwrap();
+    for (revision, reason) in [(1, "initial"), (2, "reload")] {
+        sqlx::query("INSERT INTO application_plugin_revisions (revision,inventory_id,reason,created_at) VALUES ($1,'background-runtime',$2,1)").bind(revision as i64).bind(reason).execute(&db.pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO application_plugin_head (scope,revision) VALUES ('global',1)")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        claim(db, &account, &guard, &id).await.is_err(),
+        "startup runtime cannot bypass an activated managed head"
+    );
+    guard.runtime_revision = Some(1);
+    let mut publication = db.begin_write_transaction().await.unwrap();
+    sqlx::query("UPDATE application_plugin_head SET revision=2 WHERE scope='global'")
+        .execute(&mut *publication)
+        .await
+        .unwrap();
+    {
+        let pending = claim(db, &account, &guard, &id);
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
+                .await
+                .is_err(),
+            "dispatch waits for runtime publication fence"
+        );
+        publication.commit().await.unwrap();
+        assert!(
+            pending.await.is_err(),
+            "removed or replaced runtime cannot claim an old tick"
+        );
+    }
+    guard.runtime_revision = Some(2);
+    assert!(matches!(
+        claim(db, &account, &guard, &id).await.unwrap(),
+        QuotaResetClaim::Claimed { .. }
+    ));
 }
 
 #[tokio::test]

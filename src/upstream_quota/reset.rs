@@ -44,6 +44,8 @@ pub(crate) struct CreditInventory {
 
 pub(crate) struct BackgroundResetGuard {
     pub grant: crate::db::plugin_background_actions::BackgroundActionGrant,
+    /// Exact host-validated plugin snapshot; never part of business identity.
+    pub runtime_revision: Option<i64>,
     pub lease_owner: String,
     pub credit_fingerprint: String,
     pub inventory_fingerprint: String,

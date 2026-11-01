@@ -119,8 +119,8 @@ impl Database {
         }
         let account_id = account.to_string();
         let mut tx = self.begin_write_transaction().await?;
-        let tenant_id: String = sqlx::query_scalar("SELECT a.tenant_id FROM upstream_accounts a JOIN tenants t ON t.id=a.tenant_id WHERE a.id=$1 AND t.external_id=$2 AND t.status='active' AND a.driver='openai-codex' AND a.status='active'")
-            .bind(&account_id).bind(tenant).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
+        let tenant_id: String = sqlx::query_scalar("SELECT a.tenant_id FROM upstream_accounts a JOIN tenants t ON t.id=a.tenant_id WHERE a.id=$1 AND t.external_id=$2 AND ($3=0 OR (t.status='active' AND a.driver='openai-codex' AND a.status='active'))")
+            .bind(&account_id).bind(tenant).bind(i64::from(enabled)).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
         let actor_id = actor
             .service_id
             .map(|id| id.to_string())
@@ -177,6 +177,32 @@ impl Database {
             .bind(error).bind(&grant.plugin_id).bind(&grant.tenant_id).bind(&grant.upstream_account_id).bind(grant.revision).bind(owner).bind(result).bind(operation).execute(&self.pool).await?;
         Ok(())
     }
+}
+
+/// Serialize dispatch with runtime publication, including insertion of the first
+/// head. A row lock alone cannot fence an absent head. The short SHARE table lock
+/// conflicts with publication's INSERT/UPDATE and is held only through the local
+/// claim transaction; no supplier or component execution occurs under it.
+pub(super) async fn require_runtime(
+    tx: &mut Transaction<'_, Any>,
+    backend: DatabaseBackend,
+    expected: Option<i64>,
+) -> Result<(), AppError> {
+    if matches!(backend, DatabaseBackend::PostgreSql) {
+        sqlx::query("LOCK TABLE application_plugin_head IN SHARE MODE")
+            .execute(&mut **tx)
+            .await?;
+    }
+    let current: Option<i64> =
+        sqlx::query_scalar("SELECT revision FROM application_plugin_head WHERE scope='global'")
+            .fetch_optional(&mut **tx)
+            .await?;
+    if current != expected {
+        return Err(AppError::Conflict(
+            "plugin runtime changed before background dispatch".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Called inside the reset dispatch transaction. Lock the grant and actor so

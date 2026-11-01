@@ -45,7 +45,7 @@ async fn account(state: &AppState, supplier: &MockServer, tenant: &str) -> Upstr
                 tenant_external_id: tenant.into(),
                 name: format!("fixture-{}", Uuid::now_v7()),
                 driver: "openai-codex".into(),
-                config: json!({"reset_test_supplier_url":format!("{}/",supplier.uri())}),
+                config: json!({"base_url":"https://chatgpt.com","reset_test_supplier_url":format!("{}/",supplier.uri())}),
                 credential: UpstreamCredential::OAuth {
                     access_token: "synthetic-only".into(),
                     refresh_token: None,
