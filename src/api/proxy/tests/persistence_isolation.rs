@@ -50,6 +50,7 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                 }
             }
             let upstream = MockServer::start().await;
+            let request = json!({"model": fixture.model, "input": "isolation", "stream": stream});
             Mock::given(method("POST"))
                 .respond_with(ResponseTemplate::new(200).set_body_raw(
                     completed_codex_sse("forwarding stays available"),
@@ -59,13 +60,8 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                 .mount(&upstream)
                 .await;
             let delivered = tokio::time::timeout(Duration::from_secs(2), async {
-                let response = send_codex_route(
-                    &fixture,
-                    &upstream,
-                    "/v1/responses",
-                    json!({"model": fixture.model, "input": "isolation", "stream": stream}),
-                )
-                .await;
+                let response =
+                    send_codex_route(&fixture, &upstream, "/v1/responses", request.clone()).await;
                 assert_eq!(response.status(), StatusCode::OK, "{mode}, stream={stream}");
                 to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
                     .await
@@ -98,6 +94,57 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                 .unwrap();
             assert_eq!(rows.len(), 1);
             assert_settlement_once_with_inline_request(&fixture, rows[0].request_id).await;
+            match mode {
+                "normal" | "saturation" | "pool_starvation" => {
+                    assert_exactly_once_side_effects(
+                        &fixture,
+                        rows[0].request_id,
+                        Some("resp-codex"),
+                    )
+                    .await;
+                }
+                "failure" => {
+                    for table in ["request_archive_spools", "response_archive_spools"] {
+                        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER reject_{table}")))
+                            .execute(&pool)
+                            .await
+                            .unwrap();
+                    }
+                    fixture.state.db.drain_gateway_persistence_for_test().await;
+                    gateway_persistence::assert_readable_source_without_spool(
+                        &fixture,
+                        &pool,
+                        rows[0].request_id,
+                        &request,
+                    )
+                    .await;
+                    assert_exactly_once_side_effects(
+                        &fixture,
+                        rows[0].request_id,
+                        Some("resp-codex"),
+                    )
+                    .await;
+                }
+                "pool_closed" => {
+                    let refs = fixture
+                        .state
+                        .db
+                        .request_archive_refs(fixture.key_id, rows[0].request_id)
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        refs.request_archive_state,
+                        crate::model::RequestArchiveState::Pending
+                            | crate::model::RequestArchiveState::Gap
+                    ));
+                    assert!(matches!(
+                        refs.response_archive_state,
+                        crate::model::RequestArchiveState::Pending
+                            | crate::model::RequestArchiveState::Gap
+                    ));
+                }
+                _ => unreachable!("the persistence mode list is exhaustive"),
+            }
             upstream.verify().await;
             pool.close().await;
         }

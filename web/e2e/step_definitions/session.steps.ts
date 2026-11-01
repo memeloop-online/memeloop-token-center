@@ -359,7 +359,7 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
   assert.ok(summaryRefreshes <= 4,
     `continuous events must not issue an unbounded summary read per lifecycle event: ${summaryRefreshes}`);
   assert.match(await page.locator('.session-result-count').textContent() ?? '', /0/);
-  const failedIds = responses.filter((response) => response.status === 429).map((response) => response.headers.get('x-request-id'));
+  const failedIds = responses.filter((response) => response.status === 429).map((response) => response.headers.get('x-mtc-request-id'));
   assert.ok(failedIds.every(Boolean), 'upstream failures must retain request identities');
   await eventually(async () => {
     const requests = await requestJson<Array<{
@@ -391,7 +391,7 @@ Then('服务端错误筛选返回含错误的聚合结果', async function () {
     signal: AbortSignal.timeout(5_000),
   });
   assert.equal(invalid.status, 400);
-  assert.ok(invalid.headers.get('x-request-id'), 'authenticated parse failures must have a journal request identity');
+  assert.ok(invalid.headers.get('x-mtc-request-id'), 'authenticated parse failures must have a journal request identity');
   await invalid.text();
   const params = new URLSearchParams({
     tenant_external_id: tenant,
