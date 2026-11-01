@@ -1412,6 +1412,64 @@
         }
       }
     },
+    "/internal/v1/service-tokens/{service_id}": {
+      "patch": {
+        "tags": [
+          "Service credentials"
+        ],
+        "operationId": "updateServiceCredential",
+        "summary": "Update service credential name, exact scopes, or tenant binding",
+        "description": "Requires a global service credential with service_tokens:write. At least one field is required; omitted fields are preserved. Explicit null tenant_external_id selects global scope. Scope updates replace the complete exact scope set without changing the credential secret or generation. Suspended credentials remain suspended; revoked credentials cannot be edited. Earlier rotation receipts remain historical and do not restore earlier authority; use the list API for current metadata.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "service_tokens:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ServiceId"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateServiceCredentialRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Current service credential metadata, without a secret.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceCredential"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
     "/internal/v1/service-tokens/{service_id}/rotate": {
       "post": {
         "tags": [
@@ -19604,6 +19662,36 @@
             "minLength": 1,
             "maxLength": 200,
             "description": "Null creates a global operator credential; normal application integrations should be tenant-bound."
+          }
+        }
+      },
+      "UpdateServiceCredentialRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "minProperties": 1,
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120,
+            "description": "Trimmed nonblank name; the runtime limit is 120 UTF-8 bytes and control characters are rejected."
+          },
+          "scopes": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "$ref": "#/components/schemas/ServiceScope"
+            }
+          },
+          "tenant_external_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1,
+            "maxLength": 200,
+            "description": "Omitted preserves the binding. Explicit null selects global scope. Strings are trimmed and must contain 1 to 200 UTF-8 bytes without control characters."
           }
         }
       },

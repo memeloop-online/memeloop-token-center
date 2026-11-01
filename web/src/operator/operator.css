@@ -825,6 +825,41 @@
   color: #e28484;
 }
 
+.credential-edit-section {
+  margin-top: 16px;
+}
+
+.credential-edit-section h4 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
+
+.service-credential-scope-groups {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+}
+
+.service-credential-scope-group {
+  min-width: 0;
+}
+
+.service-credential-scope-group h3 {
+  font-size: 14px;
+  margin: 0 0 10px;
+}
+
+.service-credential-scope-options {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.service-credential-scope-hint {
+  margin: 2px 0 0 26px;
+}
+
 .multi-combobox-control {
   align-items: center;
   background: #071115;

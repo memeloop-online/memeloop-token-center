@@ -8,6 +8,48 @@ pub(in crate::api) struct CreateServiceTokenRequest {
     tenant_external_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct UpdateServiceTokenRequest {
+    #[serde(default, deserialize_with = "optional_value")]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "optional_value")]
+    scopes: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "optional_value")]
+    tenant_external_id: Option<Option<String>>,
+}
+
+fn optional_value<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+pub(in crate::api) async fn update_service_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(service_id): Path<Uuid>,
+    Json(body): Json<UpdateServiceTokenRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "service_tokens:write").await?;
+    require_global_service(&service)?;
+    Ok(Json(
+        state
+            .db
+            .update_service_token(
+                service_id,
+                body.name.as_deref(),
+                body.scopes.as_deref(),
+                body.tenant_external_id
+                    .as_ref()
+                    .map(|tenant| tenant.as_deref()),
+            )
+            .await?,
+    ))
+}
+
 pub(in crate::api) async fn create_service_token(
     State(state): State<AppState>,
     headers: HeaderMap,

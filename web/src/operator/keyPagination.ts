@@ -123,12 +123,20 @@ export function shouldLoadCredentialRoutes(tenant: string) {
   return Boolean(tenant.trim());
 }
 
-/** A global management token may read a key by its unambiguous stable ID. */
+/**
+ * A presented token is the read context, not proof of keys:read. The first
+ * real 403 from the API is the capability answer and is handled where the
+ * request is made.
+ */
 export function canReadCredentialLimits(token: string) {
   return Boolean(token.trim());
 }
 
-/** All credential mutations require choosing one tenant in the operator UI. */
+/**
+ * All credential mutations require choosing one tenant in the operator UI.
+ * This is only the write context: it never proves keys:write, and callers
+ * combine it with the first observed 403 before offering more write actions.
+ */
 export function canWriteCredential(tenant: string) {
   return Boolean(tenant.trim());
 }

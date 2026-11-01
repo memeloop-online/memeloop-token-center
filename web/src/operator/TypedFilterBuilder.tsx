@@ -1,5 +1,5 @@
-import { useEffect, useId, useMemo, useState } from 'react';
-import { api } from '../api';
+import { useEffect, useId, useMemo, useState, type ReactNode } from 'react';
+import { ApiError, api } from '../api';
 import { Button, Input, LoadingState, Select, Textarea } from '../design-system';
 import { useI18n } from '../i18n';
 import { ModelPicker } from '../ModelPicker';
@@ -161,7 +161,7 @@ function CatalogModelPicker({ disabled, onSelect, tenant, token, value }: {
           setNames([...new Set(next.filter((name) => typeof name === 'string' && name.trim()))]);
         })
         // A failed suggestion read must not clear the entered or selected name.
-        .catch(() => { if (!controller.signal.aborted) setError(t('filter.catalogInputFallback')); })
+        .catch((reason) => { if (!controller.signal.aborted) setError(reason instanceof ApiError && reason.status === 403 ? t('filter.catalogDenied') : t('filter.catalogInputFallback')); })
         .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     }, 200);
     return () => { clearTimeout(timer); controller.abort(); };

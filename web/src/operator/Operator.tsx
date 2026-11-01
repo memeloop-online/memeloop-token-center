@@ -269,7 +269,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   // This prevents a transient empty tenant from turning a
   // tenant-scoped resource request into an accidental all-tenant read.
   if (scope.activeCredential && scope.validated && (scope.tenant || (emptyTenantScope && globalBootstrapPage))) {
-    const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
+    const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant, tenants: scope.tenants };
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
         case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenRequest={openRequestById} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} /></>; break;
