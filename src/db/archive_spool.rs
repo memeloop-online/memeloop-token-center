@@ -23,11 +23,14 @@ use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingWriteLease};
 #[cfg_attr(not(test), allow(dead_code))]
 const PLAIN_LIMIT: i64 = 64 * 1024 * 1024;
 const CIPHER_CHUNK_LIMIT: usize = 512 * 1024;
+#[cfg(test)]
 const CIPHER_LIMIT: i64 = 2 * 1024 * 1024 * 1024;
+#[cfg(test)]
 pub(super) const REQUEST_CIPHER_LIMIT: i64 = CIPHER_LIMIT / 2;
+#[cfg(test)]
 pub(super) const RESPONSE_CIPHER_LIMIT: i64 = CIPHER_LIMIT - REQUEST_CIPHER_LIMIT;
+#[cfg(test)]
 pub(super) const ARCHIVE_SLOT_LIMIT: i64 = 4096;
-const CHUNK_LIMIT: i64 = 65536;
 const CHUNK_OVERHEAD: i64 = 512;
 const SPOOL_OVERHEAD: i64 = 1024;
 pub(super) const CAPTURE_TTL: i64 = 30 * 60 * 1000;
@@ -63,6 +66,7 @@ pub(crate) struct ArchiveSpoolChunk {
     pub byte_count: i64,
 }
 
+#[cfg(test)]
 pub(crate) async fn insert_request_archive_gap_in_transaction(
     tx: &mut Transaction<'_, Any>,
     now: i64,
@@ -112,6 +116,29 @@ pub(crate) async fn insert_request_archive_gap_in_transaction(
 }
 
 impl Database {
+    pub(crate) async fn deferred_archive_is_captured(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        purpose: BufferedArchivePurpose,
+        body: &[u8],
+    ) -> Result<bool, AppError> {
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(
+            purpose,
+            "SELECT COUNT(*) FROM response_archive_spools
+             WHERE request_id = $1 AND tenant_id = $2 AND reservation_id = $3
+               AND byte_count = $4 AND body_blake3 = $5
+               AND state IN ('pending', 'uploading', 'bound')",
+        )))
+        .bind(identity.request_id.to_string())
+        .bind(identity.tenant_id.to_string())
+        .bind(identity.reservation_id.to_string())
+        .bind(i64::try_from(body.len()).map_err(|_| AppError::internal("archive_body_length"))?)
+        .bind(blake3::hash(body).to_hex().to_string())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count == 1)
+    }
+
     pub(crate) async fn capture_deferred_archive(
         &self,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,
@@ -119,55 +146,42 @@ impl Database {
         let prepared = archive.prepare_first_batch().await?;
         let reservation = self.reserve_buffered_archive_capacity(archive).await?;
         let Some(reservation) = reservation else {
-            if archive.purpose() == BufferedArchivePurpose::Request {
-                let mut transaction = self.begin_write_transaction().await?;
-                insert_request_archive_gap_in_transaction(
-                    &mut transaction,
-                    super::unix_millis(),
-                    archive.identity(),
-                    archive.body(),
-                    "capacity",
-                )
-                .await?;
-                transaction.commit().await?;
-            }
             return Ok(false);
         };
-        reservation.recover_refund_on_expiry();
-        let (mut transaction, now, hold) = self
-            .reserved_spool_transaction(&reservation, "deferred_capture")
-            .await?;
-        let captured = self
-            .capture_reserved_buffered_archive_body_in_transaction(
-                &mut transaction,
-                now,
-                archive,
-                Some(prepared),
-                Some(&reservation),
-            )
-            .await?;
-        BudgetHold::commit_optional(transaction, Some(hold)).await?;
+        let result = async {
+            let (mut transaction, now, hold) = self
+                .reserved_spool_transaction(&reservation, "deferred_capture")
+                .await?;
+            let captured = self
+                .capture_reserved_buffered_archive_body_in_transaction(
+                    &mut transaction,
+                    now,
+                    archive,
+                    Some(prepared),
+                    Some(&reservation),
+                )
+                .await?;
+            if captured {
+                sqlx::query(sqlx::AssertSqlSafe(spool_sql(
+                    archive.purpose(),
+                    "UPDATE response_archive_spools SET body_blake3 = $1
+                     WHERE request_id = $2 AND tenant_id = $3 AND reservation_id = $4",
+                )))
+                .bind(blake3::hash(archive.body()).to_hex().to_string())
+                .bind(archive.identity().request_id.to_string())
+                .bind(archive.identity().tenant_id.to_string())
+                .bind(archive.identity().reservation_id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+            }
+            BudgetHold::commit_optional(transaction, Some(hold)).await?;
+            Ok(captured)
+        }
+        .await;
         reservation.release().await;
-        Ok(captured)
+        result
     }
 
-    pub(crate) async fn record_deferred_request_retention_gap(
-        &self,
-        identity: ArchiveSpoolIdentity,
-        body: &bytes::Bytes,
-    ) -> Result<(), AppError> {
-        let mut transaction = self.begin_write_transaction().await?;
-        insert_request_archive_gap_in_transaction(
-            &mut transaction,
-            super::unix_millis(),
-            identity,
-            body,
-            "retention_limit",
-        )
-        .await?;
-        transaction.commit().await?;
-        Ok(())
-    }
     /// Atomic buffered capture: no partially captured row is ever visible.
     /// The global budget serializes admission for both archive purposes.
     #[cfg(test)]
@@ -199,9 +213,6 @@ impl Database {
     ) -> Result<bool, AppError> {
         let mut bytes = 0_i64;
         let mut accounted = SPOOL_OVERHEAD;
-        if chunks.len() > CHUNK_LIMIT as usize {
-            return Ok(false);
-        }
         for (seq, chunk) in chunks.iter().enumerate() {
             if chunk.seq != seq as i64
                 || !(1..=65536).contains(&chunk.byte_count)
@@ -222,9 +233,6 @@ impl Database {
                 .ok_or(AppError::internal(
                     "archive_spool_capture_buffered_archive_spool_in_transaction_3",
                 ))?;
-        }
-        if accounted > CIPHER_LIMIT {
-            return Ok(false);
         }
         let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL")
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
@@ -256,8 +264,8 @@ impl Database {
             }
             return Ok(true);
         }
-        let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
-            .bind(accounted).bind(CIPHER_LIMIT - accounted).execute(&mut **tx).await?;
+        let budget = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1")))
+            .bind(accounted).execute(&mut **tx).await?;
         if budget.rows_affected() != 1 {
             return Ok(false);
         }
@@ -334,9 +342,6 @@ impl Database {
         let chunk_count = body
             .len()
             .div_ceil(crate::response_archive_spool::CHUNK_BYTES);
-        if chunk_count > CHUNK_LIMIT as usize {
-            return Ok(false);
-        }
         let mut accounted = SPOOL_OVERHEAD;
         for bytes in body.chunks(crate::response_archive_spool::CHUNK_BYTES) {
             let cipher_bytes = archive.sealed_len(bytes.len()).ok_or(AppError::internal(
@@ -347,9 +352,6 @@ impl Database {
                 .ok_or(AppError::internal(
                     "archive_spool_capture_reserved_buffered_archive_body_in_transact",
                 ))?;
-        }
-        if accounted > CIPHER_LIMIT {
-            return Ok(false);
         }
         let prepared_first_batch = prepared_first_batch
             .map(|prepared| {
@@ -399,7 +401,7 @@ impl Database {
             AppError::internal("archive_spool_capture_reserved_buffered_archive_body_in_transact")
         })?;
         let gap_locator = format!("gap://{}/{}", identity.request_id, purpose.as_str());
-        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object = $4)")))
+        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object IS NULL OR response_object = $4)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).bind(gap_locator).fetch_one(&mut **tx).await?;
         if valid != 1 {
@@ -442,8 +444,8 @@ impl Database {
         }
         let reserved = match reservation {
             Some(reservation) => reservation.consume(tx, identity, purpose, accounted).await?,
-            None => sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1 AND cipher_bytes <= $2")))
-                .bind(accounted).bind(CIPHER_LIMIT - accounted).execute(&mut **tx).await?.rows_affected() == 1,
+            None => sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1 WHERE singleton = 1")))
+                .bind(accounted).execute(&mut **tx).await?.rows_affected() == 1,
         };
         if !reserved {
             return Ok(false);
@@ -533,7 +535,7 @@ impl Database {
         // until the worker binds a durable object; no other completed request
         // may be reopened for capture.
         let gap_locator = format!("gap://{}/response", identity.request_id);
-        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object = $4)")))
+        let valid: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT COUNT(*) FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND (completed_at IS NULL OR response_object IS NULL OR response_object = $4)")))
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string()).bind(gap_locator).fetch_one(&mut *tx).await?;
         if valid != 1 {
@@ -558,13 +560,9 @@ impl Database {
         hold.phase("budget_and_slot_admission");
         let budget = sqlx::query(
             "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1
-             WHERE singleton = 1
-               AND cipher_bytes <= $2
-               AND cipher_bytes - request_cipher_bytes <= $3",
+             WHERE singleton = 1",
         )
         .bind(SPOOL_OVERHEAD)
-        .bind(CIPHER_LIMIT - SPOOL_OVERHEAD)
-        .bind(RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD)
         .execute(&mut *tx)
         .await?;
         if budget.rows_affected() != 1 {
@@ -573,23 +571,6 @@ impl Database {
                 identity,
                 "begin",
                 "global_cipher_capacity",
-            ));
-        }
-        let active_slots: i64 = sqlx::query_scalar(
-            "SELECT
-                (SELECT COUNT(*) FROM response_archive_spools
-                 WHERE cleaned_at IS NULL AND state IN ('capturing', 'pending', 'uploading'))
-              + (SELECT COUNT(*) FROM archive_budget_reservations
-                 WHERE purpose = 'response')",
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if active_slots >= ARCHIVE_SLOT_LIMIT {
-            BudgetHold::rollback_optional(tx, Some(hold)).await?;
-            return Ok(spool_write_rejected(
-                identity,
-                "begin",
-                "response_slot_capacity",
             ));
         }
         hold.phase("spool_insert");
@@ -746,7 +727,7 @@ impl Database {
             }
             return Ok(accepted);
         }
-        if first_seq != count || count > CHUNK_LIMIT - batch_count {
+        if first_seq != count || count.checked_add(batch_count).is_none() {
             return Ok(spool_write_rejected(
                 identity,
                 "append",
@@ -800,13 +781,9 @@ impl Database {
         hold.phase("budget_update");
         let budget = sqlx::query(
             "UPDATE response_archive_spool_budget SET cipher_bytes = cipher_bytes + $1
-             WHERE singleton = 1
-               AND cipher_bytes <= $2
-               AND cipher_bytes - request_cipher_bytes <= $3",
+             WHERE singleton = 1",
         )
         .bind(cipher_bytes)
-        .bind(CIPHER_LIMIT - cipher_bytes)
-        .bind(RESPONSE_CIPHER_LIMIT - cipher_bytes)
         .execute(&mut *tx)
         .await?;
         if budget.rows_affected() != 1 {
@@ -925,10 +902,36 @@ impl Database {
         let hint_now = archive_clock(&mut tx, self.backend).await?;
         let claim = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = '')) ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED"
+                "WITH pending AS MATERIALIZED (
+                    SELECT s.* FROM response_archive_spools s
+                    WHERE s.cleaned_at IS NULL AND s.state = 'pending'
+                      AND s.next_attempt_at <= $1 AND s.expires_at > $1
+                      AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = ''))
+                    ORDER BY s.next_attempt_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
+                 ), expired_lease AS MATERIALIZED (
+                    SELECT s.* FROM response_archive_spools s
+                    WHERE s.cleaned_at IS NULL AND s.state = 'uploading'
+                      AND s.lease_expires_at <= $1 AND s.expires_at > $1
+                      AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = ''))
+                    ORDER BY s.lease_expires_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
+                 ) SELECT * FROM (SELECT * FROM pending UNION ALL SELECT * FROM expired_lease) candidates
+                 ORDER BY CASE WHEN state = 'pending' THEN next_attempt_at ELSE lease_expires_at END, request_id LIMIT 1"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT s.* FROM response_archive_spools s WHERE s.expires_at > $1 AND s.attempts < 10 AND ((s.state = 'pending' AND s.next_attempt_at <= $1) OR (s.state = 'uploading' AND s.lease_expires_at <= $1)) AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = '')) ORDER BY s.next_attempt_at, s.request_id LIMIT 1"
+                "WITH pending AS (
+                    SELECT s.* FROM response_archive_spools s
+                    WHERE s.cleaned_at IS NULL AND s.state = 'pending'
+                      AND s.next_attempt_at <= $1 AND s.expires_at > $1
+                      AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = ''))
+                    ORDER BY s.next_attempt_at, s.request_id LIMIT 1
+                 ), expired_lease AS (
+                    SELECT s.* FROM response_archive_spools s
+                    WHERE s.cleaned_at IS NULL AND s.state = 'uploading'
+                      AND s.lease_expires_at <= $1 AND s.expires_at > $1
+                      AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND (r.response_object = 'gap://' || s.request_id || '/response' OR r.response_object IS NULL OR r.response_object = ''))
+                    ORDER BY s.lease_expires_at, s.request_id LIMIT 1
+                 ) SELECT * FROM (SELECT * FROM pending UNION ALL SELECT * FROM expired_lease) candidates
+                 ORDER BY CASE WHEN state = 'pending' THEN next_attempt_at ELSE lease_expires_at END, request_id LIMIT 1"
             }
         };
         let row = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, claim)))
@@ -945,7 +948,7 @@ impl Database {
         let now = archive_clock(&mut tx, self.backend).await?;
         let state: String = row.try_get("state")?;
         let claimable = row.try_get::<i64, _>("expires_at")? > now
-            && row.try_get::<i64, _>("attempts")? < 10
+            && row.try_get::<Option<i64>, _>("cleaned_at")?.is_none()
             && match state.as_str() {
                 "pending" => row.try_get::<i64, _>("next_attempt_at")? <= now,
                 "uploading" => row
@@ -1192,22 +1195,8 @@ impl Database {
         };
         let attempts: i64 = row.try_get("attempts")?;
         let backoff = 5_000_i64 * (1_i64 << attempts.clamp(0, 10) as u32);
-        let terminal = attempts >= 10;
-        // Terminal retry exhaustion has the same irreversible payload state
-        // as producer capture failure: retain audit facts, but let GC reclaim
-        // ciphertext through the existing expiry index immediately.
-        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = $1, next_attempt_at = $2, updated_at = $3, expires_at = CASE WHEN $1 = 'gap' THEN $3 ELSE expires_at END, last_error_code = $4, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $5")))
-            .bind(if attempts >= 10 { "gap" } else { "pending" }).bind(now + backoff).bind(now).bind(reason_code(reason)).bind(task.identity.request_id.to_string()).execute(&mut *tx).await?;
-        if terminal {
-            emit_response_archive_transition_event_in_transaction(
-                &mut tx,
-                purpose,
-                task.identity.request_id,
-                now,
-                "archive_gap",
-            )
-            .await?;
-        }
+        sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "UPDATE response_archive_spools SET state = 'pending', next_attempt_at = $1, updated_at = $2, last_error_code = $3, lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE request_id = $4")))
+            .bind(now + backoff).bind(now).bind(reason_code(reason)).bind(task.identity.request_id.to_string()).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1295,31 +1284,8 @@ impl Database {
         hold.phase("gc_select_and_delete");
         let row = match self.backend {
             DatabaseBackend::PostgreSql => {
-                // Each class contributes its oldest unlocked row. Abandoned
-                // requests win first; other classes retain oldest-first order.
-                // Locking during selection means a busy oldest row cannot hide
-                // later work, and
-                // concurrent workers naturally fan out across the queue.
-                let (abandoned_candidate, abandoned_union) = if purpose
-                    == BufferedArchivePurpose::Request
-                {
-                    (
-                            "abandoned_candidate AS MATERIALIZED (
-                               SELECT s.request_id, s.updated_at AS eligible_at
-                               FROM response_archive_spools s CROSS JOIN db_clock c
-                               WHERE s.cleaned_at IS NULL AND s.state = 'pending'
-                                 AND s.updated_at <= c.db_now - 2700000
-                                 AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NULL)
-                               ORDER BY s.updated_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
-                             ),",
-                            "UNION ALL SELECT request_id, eligible_at, 0 AS priority FROM abandoned_candidate",
-                        )
-                } else {
-                    ("", "")
-                };
-                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, &format!(
+                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose,
                     "WITH db_clock AS MATERIALIZED (SELECT CAST(FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000) AS BIGINT) AS db_now),
-                     {abandoned_candidate}
                      bound_candidate AS MATERIALIZED (
                        SELECT s.request_id, s.updated_at AS eligible_at
                        FROM response_archive_spools s
@@ -1332,51 +1298,24 @@ impl Database {
                        WHERE s.cleaned_at IS NULL AND s.expires_at <= c.db_now
                        ORDER BY s.expires_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
                      ),
-                     exhausted_candidate AS MATERIALIZED (
-                       SELECT s.request_id, s.lease_expires_at AS eligible_at
-                       FROM response_archive_spools s CROSS JOIN db_clock c
-                       WHERE s.cleaned_at IS NULL AND s.state = 'uploading' AND s.attempts >= 10 AND s.lease_expires_at <= c.db_now
-                       ORDER BY s.lease_expires_at, s.request_id LIMIT 1 FOR UPDATE OF s SKIP LOCKED
-                     ),
                      chosen AS (
-                       SELECT request_id, eligible_at, 1 AS priority FROM bound_candidate
-                       UNION ALL SELECT request_id, eligible_at, 1 AS priority FROM expired_candidate
-                       UNION ALL SELECT request_id, eligible_at, 1 AS priority FROM exhausted_candidate
-                       {abandoned_union}
-                       ORDER BY priority, eligible_at, request_id LIMIT 1
+                       SELECT request_id, eligible_at FROM bound_candidate
+                       UNION ALL SELECT request_id, eligible_at FROM expired_candidate
+                       ORDER BY eligible_at, request_id LIMIT 1
                      )
                      SELECT s.request_id, s.state, s.cipher_bytes, c.db_now
-                     FROM chosen JOIN response_archive_spools s USING (request_id) CROSS JOIN db_clock c"))))
+                     FROM chosen JOIN response_archive_spools s USING (request_id) CROSS JOIN db_clock c")))
                 .fetch_optional(&mut *tx)
                 .await?
             }
             DatabaseBackend::Sqlite => {
-                // BEGIN IMMEDIATE serializes SQLite writers, so row-level skip
-                // locking is neither available nor necessary. Preserve the
-                // existing partial-index-friendly probes, with abandoned
-                // requests first, and recheck using database time.
-                let abandoned_predicate = if purpose == BufferedArchivePurpose::Request {
-                    "s.state = 'pending' AND s.updated_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 2700000 AND EXISTS (SELECT 1 FROM request_records r WHERE r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id AND r.completed_at IS NULL)"
-                } else {
-                    "0 = 1"
-                };
-                let abandoned = if purpose == BufferedArchivePurpose::Request {
-                    sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, &format!(
-                        "SELECT s.request_id FROM response_archive_spools s WHERE s.cleaned_at IS NULL AND ({abandoned_predicate}) ORDER BY s.updated_at, s.request_id LIMIT 1"
-                    ))))
-                    .fetch_optional(&mut *tx).await?
-                } else {
-                    None
-                };
                 let hint_now = super::unix_millis();
                 let bound = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT request_id, updated_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'bound' ORDER BY updated_at, request_id LIMIT 1")))
                     .fetch_optional(&mut *tx).await?;
                 let expired = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT request_id, expires_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND expires_at <= $1 ORDER BY expires_at, request_id LIMIT 1")))
                     .bind(hint_now).fetch_optional(&mut *tx).await?;
-                let exhausted = sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, "SELECT request_id, lease_expires_at AS eligible_at FROM response_archive_spools WHERE cleaned_at IS NULL AND state = 'uploading' AND attempts >= 10 AND lease_expires_at <= $1 ORDER BY lease_expires_at, request_id LIMIT 1")))
-                    .bind(hint_now).fetch_optional(&mut *tx).await?;
                 let mut candidate: Option<(i64, String)> = None;
-                for candidate_row in [bound, expired, exhausted].into_iter().flatten() {
+                for candidate_row in [bound, expired].into_iter().flatten() {
                     let item = (
                         candidate_row.try_get::<i64, _>("eligible_at")?,
                         candidate_row.try_get::<String, _>("request_id")?,
@@ -1385,15 +1324,13 @@ impl Database {
                         candidate = Some(item);
                     }
                 }
-                let id = if let Some(abandoned) = abandoned {
-                    abandoned.try_get::<String, _>("request_id")?
-                } else if let Some((_, id)) = candidate {
+                let id = if let Some((_, id)) = candidate {
                     id
                 } else {
                     return Ok(None);
                 };
-                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose, &format!(
-                    "SELECT request_id, state, cipher_bytes, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AS db_now FROM response_archive_spools s WHERE request_id = $1 AND cleaned_at IS NULL AND (state = 'bound' OR expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) OR (state = 'uploading' AND attempts >= 10 AND lease_expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)) OR ({abandoned_predicate}))"))))
+                sqlx::query(sqlx::AssertSqlSafe(spool_sql(purpose,
+                    "SELECT request_id, state, cipher_bytes, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) AS db_now FROM response_archive_spools s WHERE request_id = $1 AND cleaned_at IS NULL AND (state = 'bound' OR expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))")))
                 .bind(id)
                 .fetch_optional(&mut *tx)
                 .await?
@@ -1594,6 +1531,12 @@ async fn emit_response_archive_transition_event_in_transaction(
     let Some(owner) = owner else {
         return Ok(());
     };
+    super::requests::conversations::wake_session_body_archive_in_transaction(
+        tx,
+        Uuid::parse_str(&request_id)
+            .map_err(|_| AppError::internal("archive_spool_wake_identity"))?,
+    )
+    .await?;
     let tenant_id: String = owner.try_get("tenant_id")?;
     let key_id: String = owner.try_get("key_id")?;
     let cursor = allocate_request_event_cursor(tx, now, &tenant_id, &key_id, &request_id).await?;

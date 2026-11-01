@@ -44,7 +44,7 @@ use crate::{
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
-        open_private_json, seal_credential, seal_private_json, validate_config,
+        seal_credential, validate_config,
     },
 };
 
@@ -62,6 +62,7 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
@@ -108,6 +109,7 @@ pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
+pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
 mod upstream_service_probes;
 mod usage_analysis;
@@ -245,10 +247,13 @@ pub use upstream_account_availability::{
     UpstreamAccountAvailability, UpstreamAccountAvailabilityFilter,
     UpstreamAccountAvailabilityWindow,
 };
-pub use usage_analysis::{UsageAnalysisFilter, UsageAnalysisUpstreamFilter};
+pub use usage_analysis::{
+    UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter,
+};
 
 #[derive(Clone)]
 pub struct Database {
+    pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
     pool_role: &'static str,
     backend: DatabaseBackend,
@@ -572,7 +577,9 @@ impl Database {
     }
 
     pub(crate) async fn close(&self) {
-        self.gateway_persistence.pool.close().await;
+        if self.pool_role != "independent_persistence" {
+            self.gateway_persistence.pool.close().await;
+        }
         self.pool.close().await;
     }
 
@@ -655,6 +662,7 @@ impl Database {
                 .await?;
         }
         Ok(Self {
+            http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
                 database_url.as_ref(),
                 backend,
@@ -728,6 +736,7 @@ impl Database {
 
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
+            http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
             pool: self
@@ -741,6 +750,12 @@ impl Database {
             terminal_projection_enabled: self.terminal_projection_enabled,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn refresh_closed_persistence_pool(&mut self) {
+        if self.pool_role == "independent_persistence" && self.pool.is_closed() {
+            *self = self.independent_persistence_pool();
         }
     }
 

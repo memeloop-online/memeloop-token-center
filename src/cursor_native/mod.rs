@@ -5,13 +5,9 @@ pub(crate) mod models;
 pub(crate) mod proto;
 
 use crate::{AppState, network, provider::UpstreamCredential};
-use futures_util::StreamExt;
-use std::time::Duration;
 
 pub(crate) const DRIVER: &str = "cursor";
 const BACKEND: &str = "https://api2.cursor.sh";
-pub(crate) const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy)]
 pub(crate) enum Method {
@@ -43,33 +39,16 @@ pub(crate) async fn unary(
     let UpstreamCredential::OAuth { access_token, .. } = credential else {
         return Err("credential_invalid");
     };
-    // The deadline includes DNS/proxy setup, headers and the entire body.
-    tokio::time::timeout(TIMEOUT, async {
-        let client = if credential.proxy().is_some() {
-            // Match OAuth's approved SOCKS5H boundary: do not resolve the
-            // fixed supplier hostname locally when the proxy owns DNS.
-            network::client_for_oauth_url_no_retry(&state.http, BACKEND, credential.proxy(), false)
-                .await
-        } else {
-            network::client_for_config_url_no_retry(
-                &state.http,
-                BACKEND,
-                &serde_json::json!({"network_scope":"public"}),
-                None,
-                false,
-            )
+    let client =
+        network::client_for_oauth_url_no_retry(&state.http, BACKEND, credential.proxy(), false)
             .await
-        }
-        .map_err(|_| "destination_invalid")?;
-        send(
-            &client,
-            &format!("{BACKEND}{}", method.path()),
-            access_token,
-        )
-        .await
-    })
+            .map_err(|_| "destination_invalid")?;
+    send(
+        &client,
+        &format!("{BACKEND}{}", method.path()),
+        access_token,
+    )
     .await
-    .map_err(|_| "connection_failed")?
 }
 
 async fn send(
@@ -92,7 +71,6 @@ async fn send(
         .header("x-cursor-client-version", "cli-2026.07.23-e383d2b")
         .header("x-cursor-client-type", "cli")
         .header("x-request-id", uuid::Uuid::now_v7().to_string())
-        .timeout(TIMEOUT)
         // Empty protobuf: no custom model IDs or team override.
         .body(Vec::new())
         .send()
@@ -121,22 +99,11 @@ async fn send(
     {
         return Err("invalid_response");
     }
-    if response
-        .content_length()
-        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
-    {
-        return Err("response_too_large");
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| "connection_failed")?;
-        if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err("response_too_large");
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+    response
+        .bytes()
+        .await
+        .map(|body| body.to_vec())
+        .map_err(|_| "connection_failed")
 }
 
 #[cfg(test)]
@@ -212,33 +179,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_size_is_bounded_with_and_without_content_length() {
+    async fn http_body_has_no_fixed_size_cap_with_or_without_content_length() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let client = crate::build_no_retry_http_client(None, &[]).unwrap();
         for chunked in [false, true] {
+            let size = 2 * 1024 * 1024 + 1;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}/catalog", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = [0; 4096];
-                let _ = socket.read(&mut request).await;
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let bytes = vec![0_u8; size];
                 if chunked {
                     socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
-                    let bytes = vec![0_u8; MAX_RESPONSE_BYTES + 1];
                     socket
                         .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
                         .await
                         .unwrap();
-                    // The receiver may close immediately on reaching the cap.
-                    let _ = socket.write_all(&bytes).await;
-                    let _ = socket.write_all(b"\r\n0\r\n\r\n").await;
+                    socket.write_all(&bytes).await.unwrap();
+                    socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
                 } else {
-                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nContent-Length: {}\r\n\r\n", MAX_RESPONSE_BYTES + 1).as_bytes()).await.unwrap();
+                    socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/proto\r\nContent-Length: {size}\r\n\r\n").as_bytes()).await.unwrap();
+                    socket.write_all(&bytes).await.unwrap();
                 }
             });
             assert_eq!(
-                send(&client, &url, "fixture-token").await,
-                Err("response_too_large")
+                send(&client, &url, "fixture-token").await.unwrap().len(),
+                size
             );
             server.await.unwrap();
         }

@@ -437,12 +437,12 @@ fn is_allowed_generation_error_code(error_code: &str) -> bool {
 }
 
 fn safe_generation_result(
-    job_id: Uuid,
+    _job_id: Uuid,
     driver: &str,
     billed_units: i64,
     assets: &[ArchivedGenerationAsset],
     provider_assets: Option<&[ProviderGenerationAsset]>,
-    provider_key_material: Option<&[u8]>,
+    _provider_key_material: Option<&[u8]>,
 ) -> Result<serde_json::Value, AppError> {
     let provider = match driver {
         "volcengine-seedance" => {
@@ -483,13 +483,8 @@ fn safe_generation_result(
                     })
                 })
                 .collect::<Vec<_>>();
-            let provider_reference = crate::generation::seal_provider_asset_reference(
-                "job",
-                job_id,
-                provider_assets,
-                provider_key_material
-                    .ok_or(AppError::internal("finish_safe_generation_result_1"))?,
-            )?;
+            let provider_reference =
+                crate::generation::seal_provider_asset_reference(provider_assets)?;
             Ok(serde_json::json!({
                 "provider": provider,
                 "assets": assets,
@@ -505,9 +500,9 @@ fn safe_generation_result(
 fn provider_generation_result_matches(
     existing: Option<&serde_json::Value>,
     expected: Option<&serde_json::Value>,
-    job_id: Uuid,
+    _job_id: Uuid,
     provider_assets: &[ProviderGenerationAsset],
-    key_material: &[u8],
+    _key_material: &[u8],
 ) -> Result<bool, AppError> {
     let (Some(mut existing), Some(mut expected)) = (existing.cloned(), expected.cloned()) else {
         return Ok(false);
@@ -525,12 +520,7 @@ fn provider_generation_result_matches(
         .ok_or(AppError::internal(
             "finish_provider_generation_result_matches_2",
         ))?;
-    let existing_assets = crate::generation::open_provider_asset_reference(
-        "job",
-        job_id,
-        &existing_reference,
-        key_material,
-    )?;
+    let existing_assets = crate::generation::open_provider_asset_reference(&existing_reference)?;
     Ok(existing == expected && existing_assets == provider_assets)
 }
 

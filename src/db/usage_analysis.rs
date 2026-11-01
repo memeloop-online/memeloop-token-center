@@ -43,6 +43,36 @@ pub struct UsageAnalysisFilter {
     pub principal: Option<String>,
 }
 
+/// Explicit opt-in read projections. Full remains the compatibility default.
+/// Unselected fields in the response envelope are empty and must not be merged
+/// over fields returned by a different projection.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsageAnalysisProjection {
+    #[default]
+    Full,
+    Overview,
+    Trends,
+    Dimensions,
+    Sessions,
+    Heatmap,
+    OutputRate,
+}
+
+impl UsageAnalysisProjection {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Overview => "overview",
+            Self::Trends => "trends",
+            Self::Dimensions => "dimensions",
+            Self::Sessions => "sessions",
+            Self::Heatmap => "heatmap",
+            Self::OutputRate => "output_rate",
+        }
+    }
+}
+
 /// The only execution boundary for usage-analysis business statements.
 ///
 /// Transaction setup and commit are intentionally outside the counter. The transaction itself
@@ -99,12 +129,12 @@ impl UsageAnalysisSnapshot {
         Ok(rows)
     }
 
-    fn record_completion(&self, projection: UsageAnalysisMainProjectionSet) {
+    fn record_completion(&self, projection: &str) {
         let business_statement_count =
             u64::try_from(self.completed_business_statements.len()).unwrap_or(u64::MAX);
         tracing::debug!(
             target: "mtc_usage_analysis",
-            projection = projection.as_str(),
+            projection,
             business_statement_count,
             business_statements = ?self.completed_business_statements,
             "usage analysis business statements completed"
@@ -144,6 +174,17 @@ impl UsageAnalysisUpstreamFilter {
 }
 
 impl Database {
+    pub async fn projected_usage_analysis(
+        &self,
+        tenant_external_id: Option<&str>,
+        filter: UsageAnalysisFilter,
+        projection: UsageAnalysisProjection,
+    ) -> Result<UsageAnalysisResponse, AppError> {
+        let tenant_id = self.usage_analysis_tenant_id(tenant_external_id).await?;
+        self.aggregate_usage_analysis_projection(tenant_id, &filter, projection)
+            .await
+    }
+
     pub async fn operator_usage_analysis(
         &self,
         tenant_external_id: &str,
@@ -241,6 +282,7 @@ impl Database {
                 filter,
                 range,
                 UsageAnalysisMainProjectionSet::Trends,
+                true,
             )
             .await?;
         let (summary, time_series) = take_summary_time_series(&mut projections)?;
@@ -249,7 +291,7 @@ impl Database {
                 "usage_analysis_aggregate_usage_analysis_trends_for_tenant_id_1",
             ));
         }
-        snapshot.record_completion(UsageAnalysisMainProjectionSet::Trends);
+        snapshot.record_completion("trends");
         snapshot.commit().await?;
         Ok(UsageAnalysisTrendsResponse {
             from_created_at: range.from_created_at,
@@ -268,19 +310,58 @@ impl Database {
         tenant_id: Option<Uuid>,
         filter: &UsageAnalysisFilter,
     ) -> Result<UsageAnalysisResponse, AppError> {
+        self.aggregate_usage_analysis_projection(tenant_id, filter, UsageAnalysisProjection::Full)
+            .await
+    }
+
+    async fn aggregate_usage_analysis_projection(
+        &self,
+        tenant_id: Option<Uuid>,
+        filter: &UsageAnalysisFilter,
+        projection: UsageAnalysisProjection,
+    ) -> Result<UsageAnalysisResponse, AppError> {
         let range = validate_usage_analysis_filter(filter)?;
         let tenant_scoped = tenant_id.is_some();
         let mut snapshot = UsageAnalysisSnapshot::begin(self).await?;
-        let mut projections = self
-            .query_usage_analysis_main(
+        let mut projections = if matches!(
+            projection,
+            UsageAnalysisProjection::Full
+                | UsageAnalysisProjection::Overview
+                | UsageAnalysisProjection::Trends
+                | UsageAnalysisProjection::Dimensions
+        ) {
+            self.query_usage_analysis_main(
                 &mut snapshot,
                 tenant_id,
                 filter,
                 range,
-                UsageAnalysisMainProjectionSet::Full,
+                if matches!(
+                    projection,
+                    UsageAnalysisProjection::Full | UsageAnalysisProjection::Dimensions
+                ) {
+                    UsageAnalysisMainProjectionSet::Full
+                } else {
+                    UsageAnalysisMainProjectionSet::Trends
+                },
+                projection == UsageAnalysisProjection::Full,
+            )
+            .await?
+        } else {
+            BTreeMap::new()
+        };
+        let tenant_id = tenant_id.map(|id| id.to_string()).unwrap_or_default();
+        if projection == UsageAnalysisProjection::OutputRate {
+            output_rate::attach_output_rates(
+                &mut snapshot,
+                &mut projections,
+                &tenant_id,
+                tenant_scoped,
+                filter,
+                range,
+                true,
             )
             .await?;
-        let tenant_id = tenant_id.map(|id| id.to_string()).unwrap_or_default();
+        }
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();
         let upstream_account_id = filter
             .upstream_account_id
@@ -318,33 +399,47 @@ impl Database {
             };
         }
 
-        let heatmap_sql = usage_analysis_heatmap_sql(tenant_scoped);
-        let heatmap_plan =
-            UsageAnalysisBucketPlan::new(range.from_created_at, range.to_created_at, 3_600_000);
-        // Same closed generator boundary as the main analysis statement above.
-        let heatmap_rows = snapshot
-            .fetch_all(
-                "heatmap",
-                bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(heatmap_sql)), heatmap_plan),
-            )
-            .await?;
+        let heatmap_rows = if matches!(
+            projection,
+            UsageAnalysisProjection::Full | UsageAnalysisProjection::Heatmap
+        ) {
+            let heatmap_sql = usage_analysis_heatmap_sql(tenant_scoped);
+            let heatmap_plan =
+                UsageAnalysisBucketPlan::new(range.from_created_at, range.to_created_at, 3_600_000);
+            // Same closed generator boundary as the main analysis statement above.
+            snapshot
+                .fetch_all(
+                    "heatmap",
+                    bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(heatmap_sql)), heatmap_plan),
+                )
+                .await?
+        } else {
+            Vec::new()
+        };
         let mut heatmap_projection: BTreeMap<(String, String), UsageMetricsAccumulator> =
             BTreeMap::new();
         for row in heatmap_rows {
             accumulate_usage_row(&mut heatmap_projection, &row)?;
         }
 
-        let generation_dimension_sql =
-            generation_usage_dimension_sql(range.granularity, tenant_scoped);
-        let generation_dimension_rows = snapshot
-            .fetch_all(
-                "generation_dimensions",
-                bind_usage_filter!(
-                    sqlx::query(sqlx::AssertSqlSafe(generation_dimension_sql)),
-                    main_plan
-                ),
-            )
-            .await?;
+        let generation_dimension_rows = if matches!(
+            projection,
+            UsageAnalysisProjection::Full | UsageAnalysisProjection::Overview
+        ) {
+            let generation_dimension_sql =
+                generation_usage_dimension_sql(range.granularity, tenant_scoped);
+            snapshot
+                .fetch_all(
+                    "generation_dimensions",
+                    bind_usage_filter!(
+                        sqlx::query(sqlx::AssertSqlSafe(generation_dimension_sql)),
+                        main_plan
+                    ),
+                )
+                .await?
+        } else {
+            Vec::new()
+        };
         let mut generation_units_by_modality = Vec::new();
         let mut generation_units_by_billing_unit = Vec::new();
         for row in generation_dimension_rows {
@@ -385,13 +480,20 @@ impl Database {
                 .then_with(|| left.currency.cmp(&right.currency))
         });
 
-        let session_sql = session_usage_dimension_sql(range.granularity, tenant_scoped);
-        let session_rows = snapshot
-            .fetch_all(
-                "sessions",
-                bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(session_sql)), main_plan),
-            )
-            .await?;
+        let session_rows = if matches!(
+            projection,
+            UsageAnalysisProjection::Full | UsageAnalysisProjection::Sessions
+        ) {
+            let session_sql = session_usage_dimension_sql(range.granularity, tenant_scoped);
+            snapshot
+                .fetch_all(
+                    "sessions",
+                    bind_usage_filter!(sqlx::query(sqlx::AssertSqlSafe(session_sql)), main_plan),
+                )
+                .await?
+        } else {
+            Vec::new()
+        };
         let mut session_projection: BTreeMap<(String, String), SessionUsageAccumulator> =
             BTreeMap::new();
         for row in session_rows {
@@ -498,7 +600,7 @@ impl Database {
             errors,
             heatmap,
         };
-        snapshot.record_completion(UsageAnalysisMainProjectionSet::Full);
+        snapshot.record_completion(projection.as_str());
         snapshot.commit().await?;
         Ok(response)
     }
@@ -510,6 +612,7 @@ impl Database {
         filter: &UsageAnalysisFilter,
         range: ValidatedUsageAnalysisRange,
         projection: UsageAnalysisMainProjectionSet,
+        include_output_rate: bool,
     ) -> Result<BTreeMap<(String, String), UsageMetricsAccumulator>, AppError> {
         let tenant_scoped = tenant_id.is_some();
         let tenant_id = tenant_id.map(|id| id.to_string()).unwrap_or_default();
@@ -562,15 +665,18 @@ impl Database {
         for row in rows {
             accumulate_usage_row(&mut projections, &row)?;
         }
-        output_rate::attach_output_rates(
-            snapshot,
-            &mut projections,
-            &tenant_id,
-            tenant_scoped,
-            filter,
-            range,
-        )
-        .await?;
+        if include_output_rate {
+            output_rate::attach_output_rates(
+                snapshot,
+                &mut projections,
+                &tenant_id,
+                tenant_scoped,
+                filter,
+                range,
+                false,
+            )
+            .await?;
+        }
         Ok(projections)
     }
 }
@@ -966,15 +1072,6 @@ fn usage_analysis_generation_fact_sql(
 enum UsageAnalysisMainProjectionSet {
     Full,
     Trends,
-}
-
-impl UsageAnalysisMainProjectionSet {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Trends => "trends",
-        }
-    }
 }
 
 #[cfg(test)]

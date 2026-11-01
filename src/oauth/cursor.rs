@@ -12,7 +12,8 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{ProviderCatalog, UpstreamCredential, open_private_json, seal_private_json},
+    plain_json::{decode_handle, encode_handle},
+    provider::{ProviderCatalog, UpstreamCredential},
 };
 
 use super::{
@@ -23,9 +24,6 @@ use super::{
     validate_oauth_login_config,
 };
 
-const CURSOR_SESSION_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-session/v2";
-const CURSOR_STATE_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-state/v2";
-const CURSOR_READY_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-ready/v2";
 const CURSOR_ADAPTER_SCHEMA: &str = "cursor-oauth-v1";
 const MAX_CURSOR_IDENTITY_BYTES: usize = 512;
 const MAX_CURSOR_TOKEN_BYTES: usize = 128 * 1024;
@@ -191,7 +189,7 @@ pub async fn start_cursor_login(
     db: &Database,
     input: StartCursorLogin,
     operator_service_id: Option<Uuid>,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
 ) -> Result<OAuthLoginStart, AppError> {
     if input.account_name.trim().is_empty()
@@ -293,12 +291,12 @@ pub async fn start_cursor_login(
         .to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id,
-        state_ciphertext: super::seal_oauth_login_state(&state, key_material, CURSOR_STATE_AAD)?,
+        state_ciphertext: super::seal_oauth_login_state(&state)?,
         next_poll_at: now,
         expires_at,
     })
     .await?;
-    let session_token = seal_private_json(&session, key_material, CURSOR_SESSION_AAD)?;
+    let session_token = encode_handle(&session)?;
     Ok(OAuthLoginStart {
         driver: oauth_driver,
         login_url: login_url.to_string(),
@@ -320,13 +318,12 @@ pub struct CursorPollAuthority<'a> {
 
 pub(crate) fn cursor_login_application_revision(
     session_token: &str,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     authority: CursorPollAuthority<'_>,
 ) -> Result<Option<i64>, AppError> {
-    let session: CursorLoginSessionToken =
-        open_private_json(session_token, key_material, CURSOR_SESSION_AAD)
-            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    let session: CursorLoginSessionToken = decode_handle(session_token)
+        .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if authority
         .required_tenant
         .is_some_and(|tenant| tenant != session.tenant_external_id)
@@ -349,15 +346,14 @@ pub(crate) fn cursor_login_application_revision(
 pub async fn poll_cursor_login(
     db: &Database,
     providers: &ProviderCatalog,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     session_token: &str,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     authority: CursorPollAuthority<'_>,
 ) -> Result<CursorPollResult, AppError> {
-    let session: CursorLoginSessionToken =
-        open_private_json(session_token, key_material, CURSOR_SESSION_AAD)
-            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    let session: CursorLoginSessionToken = decode_handle(session_token)
+        .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if authority
         .required_tenant
         .is_some_and(|tenant| tenant != session.tenant_external_id)
@@ -393,8 +389,7 @@ pub async fn poll_cursor_login(
             lease_owner,
             ready_ciphertext,
         } => {
-            let login: ReadyCursorLogin =
-                open_private_json(&ready_ciphertext, key_material, CURSOR_READY_AAD)?;
+            let login: ReadyCursorLogin = decode_handle(&ready_ciphertext)?;
             if login.application_plugin_revision != session.application_plugin_revision {
                 return Err(AppError::Forbidden);
             }
@@ -416,11 +411,7 @@ pub async fn poll_cursor_login(
             state_ciphertext,
         } => (
             lease_owner,
-            open_private_json::<CursorLoginState>(
-                &state_ciphertext,
-                key_material,
-                CURSOR_STATE_AAD,
-            )?,
+            decode_handle::<CursorLoginState>(&state_ciphertext)?,
         ),
     };
     if state.application_plugin_revision != session.application_plugin_revision {
@@ -461,7 +452,7 @@ pub async fn poll_cursor_login(
         .await?
     } else {
         network::client_for_url(
-            http,
+            &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
             poll_url.as_str(),
             scope,
             authority.allow_test_loopback,
@@ -561,24 +552,15 @@ pub async fn poll_cursor_login(
         },
         reauthorize: state.reauthorize,
     };
-    db.stage_oauth_login_ready(
-        ready.session_id,
-        lease_owner,
-        seal_private_json(&ready, key_material, CURSOR_READY_AAD)?,
-        now,
-    )
-    .await?;
+    db.stage_oauth_login_ready(ready.session_id, lease_owner, encode_handle(&ready)?, now)
+        .await?;
     match db.claim_oauth_login_poll(&reference, now, 1).await? {
         OAuthLoginClaim::Ready {
             lease_owner,
             ready_ciphertext,
         } => Ok(CursorPollResult::Ready {
             lease_owner,
-            login: Box::new(open_private_json(
-                &ready_ciphertext,
-                key_material,
-                CURSOR_READY_AAD,
-            )?),
+            login: Box::new(decode_handle(&ready_ciphertext)?),
         }),
         OAuthLoginClaim::Consumed { account_id } => Ok(CursorPollResult::Consumed {
             account_id,
@@ -594,7 +576,7 @@ pub async fn poll_cursor_login(
 }
 
 pub async fn refresh_cursor_credential(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     refresh_url: &str,
     credential: &UpstreamCredential,
     now: i64,
@@ -612,6 +594,11 @@ pub async fn refresh_cursor_credential(
     };
     let refresh_url =
         validate_oauth_endpoint_with_scope(refresh_url, "refresh_url", configured_scope)?;
+    let http = http.http_client(crate::http_settings::ClientOptions {
+        purpose: Some(crate::http_settings::HttpPurpose::Oauth),
+        no_retry: true,
+        ..Default::default()
+    })?;
     let request = http
         .post(refresh_url.as_str())
         .bearer_auth(refresh_token)

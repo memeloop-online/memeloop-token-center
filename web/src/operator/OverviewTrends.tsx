@@ -30,12 +30,12 @@ function CostLines({ costs, locale }: { costs: OperatorUsageAnalysisTrends['time
 /** Independent historical trends: a slow query cannot hide current traffic. */
 export function useOverviewTrendResource(token: string, tenant: string) {
   const { t } = useI18n();
-  return useOperatorResource(Boolean(token), `${token}\0${tenant}`, () => {
+  return useOperatorResource(Boolean(token), `${token}\0${tenant}`, (signal) => {
     const query = statsQuery(tenant, {
       preset: '24h', granularity: 'hour', customFrom: '', customTo: '',
       filters: { model: '', keyId: '', upstreamId: '', protocol: '', status: '', errorCode: '' },
     });
-    return api<OperatorUsageAnalysisTrends>(`/internal/v1/usage-analysis/trends${query}`, token);
+    return api<OperatorUsageAnalysisTrends>(`/internal/v1/usage-analysis/trends${query}&projection=trends`, token, { signal });
   }, t('usage.loadFailed'));
 }
 

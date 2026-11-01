@@ -191,9 +191,15 @@ async fn run() -> Result<(), &'static str> {
             .await
             .map_err(|_| "database_connect_failed")?;
             database
-                .migrate_with_credential_pepper(config.key_pepper.as_bytes())
+                .migrate()
                 .await
                 .map_err(|_| "database_migration_failed")?;
+            if let Err(error) = database
+                .convert_sealed_state(config.key_pepper.as_bytes())
+                .await
+            {
+                tracing::error!(%error, "converting sealed gateway state failed");
+            }
             info!("database schema is current");
         }
         Command::BackfillExactFailedRequestCosts {
@@ -278,6 +284,8 @@ async fn run() -> Result<(), &'static str> {
             let (app, startup) = api::startup::router(role);
             let (worker_shutdown, mut receiver) = watch::channel(false);
             let (oauth_shutdown, oauth_receiver) = watch::channel(false);
+            let proxy_state = std::sync::Arc::new(std::sync::OnceLock::new());
+            let initialized_proxy_state = proxy_state.clone();
             // Keep dependency initialization off the HTTP lifecycle. A database
             // outage retains the existing static shell and explicit 503 API
             // errors, then recovers through the original router/auth chain.
@@ -289,6 +297,7 @@ async fn run() -> Result<(), &'static str> {
                     };
                     match initialized {
                         Ok(state) => {
+                            let _ = initialized_proxy_state.set(state.clone());
                             startup.install(api::router_for_role(state.clone(), role));
                             #[cfg(feature = "experimental-plugin-revisions")]
                             let refresh = async {
@@ -341,6 +350,11 @@ async fn run() -> Result<(), &'static str> {
                 Some(worker_task),
                 Some(worker_shutdown),
                 Some(oauth_shutdown),
+                async move {
+                    if let Some(state) = proxy_state.get() {
+                        state.drain_proxy_tasks().await;
+                    }
+                },
             )
             .await?;
         }
@@ -356,6 +370,7 @@ async fn serve_with_worker_shutdown(
     mut worker_task: Option<tokio::task::JoinHandle<()>>,
     worker_shutdown: Option<watch::Sender<bool>>,
     oauth_shutdown: Option<watch::Sender<bool>>,
+    proxy_drain: impl std::future::Future<Output = ()>,
 ) -> Result<(), &'static str> {
     let mut worker_failed = false;
     let result = memeloop_token_center::server::serve(listener, app, async {
@@ -365,6 +380,7 @@ async fn serve_with_worker_shutdown(
         }
     })
     .await;
+    proxy_drain.await;
     if let Some(sender) = oauth_shutdown {
         let _ = sender.send(true);
     }
@@ -403,6 +419,10 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 }
+
+#[cfg(test)]
+#[path = "shutdown_durability_tests.rs"]
+mod shutdown_durability_tests;
 
 #[cfg(test)]
 mod lifecycle_tests {
@@ -484,6 +504,7 @@ mod lifecycle_tests {
             Some(worker),
             Some(worker_stop),
             Some(oauth_stop),
+            async {},
         ));
         let request = tokio::spawn(async move {
             reqwest::Client::builder()

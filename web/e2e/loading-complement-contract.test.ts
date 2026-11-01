@@ -34,7 +34,7 @@ test('page loading regions retain complete authority and route scopes without DO
 test('overview prerequisites and optional metadata do not share a request barrier', () => {
   const monitoring = overview.slice(overview.indexOf('function OverviewMonitoringSection'), overview.indexOf('function OverviewRecentRequestsSection'));
   const recent = overview.slice(overview.indexOf('function OverviewRecentRequestsSection'), overview.indexOf('export function OverviewPage'));
-  const usage = overview.slice(overview.indexOf('export function UsagePage'), overview.indexOf('export function GenerationsPage'));
+  const usage = overview.slice(overview.indexOf('export function UsagePage'), overview.length);
   assert.match(monitoring, /<LoadingState[^>]*level="page"/);
   assert.match(monitoring, /<LoadingProgress active=\{state\.refreshing === true\}/);
   assert.match(recent, /<LoadingState label=\{t\('common.loading'\)\} \/>/);

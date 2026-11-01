@@ -349,6 +349,33 @@ impl ProxyMemoryReservation {
         bounded_json_fits(bytes, self.response_bytes.load(Ordering::Acquire))
     }
 
+    pub(crate) fn shrink_buffered_response(&self, body: &[u8]) {
+        let nodes = JsonMemoryScanner::default().observe(body);
+        let required = body
+            .len()
+            .saturating_mul(CAPTURE_MEMORY_WEIGHT)
+            .max(
+                body.len()
+                    .saturating_mul(2)
+                    .saturating_add(nodes.saturating_mul(256)),
+            )
+            .max(UNIT_BYTES);
+        let Ok(mut held) = self.held.lock() else {
+            return;
+        };
+        let previous = self.response_bytes.load(Ordering::Acquire);
+        let required = required.div_ceil(UNIT_BYTES).saturating_mul(UNIT_BYTES);
+        let released = previous.saturating_sub(required);
+        if released == 0 {
+            return;
+        }
+        if let Some(permit) = held.1.as_mut() {
+            drop(permit.split(released / UNIT_BYTES));
+        }
+        held.0 = held.0.saturating_sub(released);
+        self.response_bytes.store(required, Ordering::Release);
+    }
+
     pub(crate) fn release(&self, bytes: usize, weight: usize) {
         let Ok(mut held) = self.held.lock() else {
             return;
@@ -674,6 +701,45 @@ mod tests {
             requests.push(request);
         }
         assert_eq!(requests.len(), 4);
+    }
+
+    #[test]
+    fn completed_chunked_response_releases_unused_envelope_without_releasing_request() {
+        let budget = ProxyMemoryBudget::new(crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES);
+        let first = budget.reservation();
+        assert!(first.try_grow(1024, REQUEST_MEMORY_WEIGHT));
+        assert!(first.finalize_request(tokio::time::Instant::now()));
+        let request_snapshot = budget.snapshot();
+        assert!(
+            first.reserve_buffered_response(
+                MAX_BUFFERED_RESPONSE_BYTES,
+                tokio::time::Instant::now()
+            )
+        );
+        let second = budget.reservation();
+        assert!(
+            !second.reserve_buffered_response(
+                MAX_BUFFERED_RESPONSE_BYTES,
+                tokio::time::Instant::now()
+            )
+        );
+        let body = br#"{"choices":[{"message":{"content":"complete"}}]}"#;
+        first.shrink_buffered_response(body);
+        assert!(first.response_json_fits(body));
+        assert_eq!(budget.snapshot().0, request_snapshot.0 + UNIT_BYTES);
+        assert_eq!(budget.snapshot().2, request_snapshot.2);
+        first.shrink_buffered_response(body);
+        assert_eq!(budget.snapshot().0, request_snapshot.0 + UNIT_BYTES);
+        assert!(
+            second.reserve_buffered_response(
+                MAX_BUFFERED_RESPONSE_BYTES,
+                tokio::time::Instant::now()
+            )
+        );
+        drop(second);
+        drop(first);
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(budget.snapshot().2, 0);
     }
 
     #[test]

@@ -4,8 +4,8 @@ use super::super::*;
 use crate::db::routing::{
     bump_credential_grant_revisions, bump_route_grant_revisions, lock_routing_relation_writes,
 };
+use crate::plain_json::{decode_json, encode_json};
 
-const KEY_PROVISIONING_AAD: &[u8] = b"memeloop-token-center/key-provisioning-response/v1";
 const KEY_ROTATION_RESOURCE: &str = "key";
 const CLOUD_PRINCIPAL_PROVISIONING_PREFIX: &str = "memeloop-cloud-principal:";
 
@@ -187,7 +187,7 @@ impl Database {
             key: issued.secret.clone(),
             fingerprint: issued.fingerprint.clone(),
         };
-        let issued_key_ciphertext = seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD)?;
+        let issued_key_ciphertext = encode_json(&issued_key)?;
         sqlx::query(
             "INSERT INTO credit_accounts (id, tenant_id, principal_id, currency, available_micros, reserved_micros, created_at, updated_at) VALUES ($1, $2, $3, $4, 0, 0, $5, $6)",
         )
@@ -493,16 +493,12 @@ impl Database {
                     ));
                 }
                 let ciphertext: Option<String> = existing.try_get("issued_key_ciphertext")?;
-                let issued = open_private_json(
-                    ciphertext.as_deref().ok_or_else(|| {
+                let issued = decode_json(ciphertext.as_deref().ok_or_else(|| {
                         AppError::BadRequest(
                             "idempotent key provisioning response is no longer available; rotate the key"
                                 .into(),
                         )
-                    })?,
-                    pepper,
-                    KEY_PROVISIONING_AAD,
-                )?;
+                    })?)?;
                 tx.commit().await?;
                 return Ok(issued);
             }
@@ -570,7 +566,7 @@ impl Database {
             fingerprint: issued.fingerprint.clone(),
         };
         let issued_key_ciphertext = idempotency_key
-            .map(|_| seal_private_json(&issued_key, pepper, KEY_PROVISIONING_AAD))
+            .map(|_| encode_json(&issued_key))
             .transpose()?;
         sqlx::query(
             "INSERT INTO key_records (id, tenant_id, principal_id, account_id, alias, currency, policy_json, status, credential_generation, provisioning_idempotency_key, provisioning_request_hash, issued_key_ciphertext, created_at, updated_at, creation_source) VALUES ($1, $2, $3, $4, $5, $6, $7, 'active', 1, $8, $9, $10, $11, $12, $13)",
@@ -697,15 +693,7 @@ impl Database {
         )
         .await?
         {
-            let issued = open_rotation_replay(
-                replay,
-                KEY_ROTATION_RESOURCE,
-                key_id,
-                idempotency_key,
-                &request_hash,
-                pepper,
-                now,
-            )?;
+            let issued = open_rotation_replay(replay, now)?;
             tx.commit().await?;
             return Ok(issued);
         }
@@ -750,7 +738,6 @@ impl Database {
             key_id,
             &request_hash,
             expires_at,
-            pepper,
         )
         .await?;
         tx.commit().await?;
@@ -1235,8 +1222,7 @@ fn provisioned_cloud_credential_from_stable_row(
         ciphertext
             .as_deref()
             .map(|ciphertext| {
-                let issued =
-                    open_private_json::<IssuedKey>(ciphertext, pepper, KEY_PROVISIONING_AAD)?;
+                let issued = decode_json::<IssuedKey>(ciphertext)?;
                 let (_, secret_fingerprint) = crypto::hash_credential(&issued.key, pepper);
                 if issued.key_id != key_id
                     || issued.account_id != account_id
@@ -1672,7 +1658,8 @@ mod tests {
         let request_hash: String = replay_row.try_get("request_hash").unwrap();
         let ciphertext: String = replay_row.try_get("response_ciphertext").unwrap();
         assert_eq!(request_hash.len(), 64);
-        assert!(!ciphertext.contains(&rotated[0].key));
+        let replay: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
+        assert_eq!(replay["key"].as_str(), Some(rotated[0].key.as_str()));
 
         sqlx::query(
             "UPDATE credential_rotation_replays SET expires_at = $1 WHERE idempotency_key = $2",
@@ -1713,7 +1700,7 @@ mod tests {
         assert_eq!(generation, 2);
     }
     #[tokio::test]
-    async fn key_provisioning_replays_one_encrypted_response_for_an_idempotency_key() {
+    async fn key_provisioning_replays_one_stored_response_for_an_idempotency_key() {
         let directory = tempfile::tempdir().unwrap();
         let database_url = format!(
             "sqlite://{}?mode=rwc",
@@ -1763,7 +1750,8 @@ mod tests {
                 .unwrap()
                 .try_get("issued_key_ciphertext")
                 .unwrap();
-        assert!(!ciphertext.contains(&first.key));
+        let replay: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
+        assert_eq!(replay["key"].as_str(), Some(first.key.as_str()));
 
         let other_tenant = database
             .create_key(

@@ -79,10 +79,9 @@ fn hkdf_key_derivation_is_deterministic_and_separated_from_legacy() {
 #[test]
 fn envelope_aad_is_domain_separated_and_tamper_evident() {
     let key_material = b"a key material with at least 32 bytes";
-    let envelope =
-        seal_private_json(&json!({"secret": "value"}), key_material, b"domain-a").unwrap();
+    let envelope = seal_envelope(&json!({"secret": "value"}), key_material, b"domain-a").unwrap();
     assert!(
-        open_private_json::<Value>(&envelope, key_material, b"domain-b").is_err(),
+        open_envelope::<Value>(&envelope, key_material, b"domain-b").is_err(),
         "an envelope must not open under a different protocol domain"
     );
     let mut bytes = envelope.into_bytes();
@@ -90,7 +89,7 @@ fn envelope_aad_is_domain_separated_and_tamper_evident() {
     bytes[index] = if bytes[index] == b'A' { b'B' } else { b'A' };
     let tampered = String::from_utf8(bytes).unwrap();
     assert!(
-        open_private_json::<Value>(&tampered, key_material, b"domain-a").is_err(),
+        open_envelope::<Value>(&tampered, key_material, b"domain-a").is_err(),
         "authenticated encryption must reject modified ciphertext"
     );
 }
@@ -314,7 +313,7 @@ fn compatible_http_schemas_preserve_explicit_timeout_without_a_local_upper_cap()
         let mut config = json!({"base_url":"https://example.com"});
         assert_eq!(
             provider.config_schema["properties"]["timeout_seconds"]["default"],
-            120
+            Value::Null
         );
         for timeout in [
             json!(1),
@@ -718,11 +717,18 @@ fn builtin_codex_routes_openai_and_verified_image_generation() {
             .pointer("/properties/transport_policy/properties/responses_output_limits/default"),
         Some(&json!("provider_default"))
     );
+    assert!(
+        codex
+            .config_schema
+            .pointer("/properties/transport_policy/properties/failover_deadline_millis")
+            .is_none()
+    );
     for (field, bound, expected) in [
         ("version", "enum", json!([1])),
         ("candidate_attempts", "minimum", json!(1)),
         ("candidate_attempts", "maximum", json!(8)),
-        ("failover_deadline_millis", "maximum", json!(300000)),
+        ("connect_timeout_millis", "default", Value::Null),
+        ("read_timeout_millis", "default", Value::Null),
         ("max_sse_event_bytes", "default", json!(8388608)),
         ("max_sse_event_bytes", "maximum", json!(16777216)),
         ("max_sse_framed_bytes", "maximum", json!(16842752)),

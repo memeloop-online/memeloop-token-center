@@ -1,4 +1,5 @@
 use super::*;
+use crate::plain_json::decode_json;
 
 mod bindings;
 mod groups;
@@ -11,7 +12,6 @@ pub(crate) use oauth::lock_oauth_transport_group;
 pub(crate) use types::*;
 
 pub(crate) const CONFIG_KEY: &str = "__mtc_transport_proxy_binding";
-const MEMBERS_AAD: &[u8] = b"mtc/transport-proxy-members/v1";
 
 fn conflict(code: &'static str) -> AppError {
     AppError::ProxyGroupConflict(code)
@@ -70,18 +70,13 @@ fn validate_name(value: &str) -> Result<(), AppError> {
 }
 
 /// Proxy members are stored as plain JSON so operators can read and repair
-/// them directly. Rows written before that change still hold a sealed
-/// envelope, so those are decrypted on read; the fallback is only needed
-/// until every row has been rewritten.
-pub(super) fn decode_members(stored: &str, key: &[u8]) -> Result<Vec<Member>, AppError> {
-    if let Ok(members) = serde_json::from_str::<Vec<Member>>(stored) {
-        return Ok(members);
-    }
-    open_private_json(stored, key, MEMBERS_AAD)
+/// them directly from the database.
+pub(super) fn decode_members(stored: &str) -> Result<Vec<Member>, AppError> {
+    decode_json(stored)
 }
 
-fn open_members(row: &AnyRow, key: &[u8]) -> Result<Vec<Member>, AppError> {
-    decode_members(&row.try_get::<String, _>("members_ciphertext")?, key)
+fn open_members(row: &AnyRow, _key: &[u8]) -> Result<Vec<Member>, AppError> {
+    decode_members(&row.try_get::<String, _>("members_ciphertext")?)
 }
 
 async fn available_name(

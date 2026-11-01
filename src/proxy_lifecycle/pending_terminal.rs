@@ -19,6 +19,16 @@ use crate::{
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+fn confirmed_not_executed(input: &FinishProxyRequest<'_>) -> bool {
+    use crate::model::{RequestTerminalCause, RequestUsageBasis};
+    matches!(
+        input.terminal_cause,
+        Some(RequestTerminalCause::GatewayPreAdmission)
+    ) && input.usage == TokenUsage::default()
+        && input.usage_basis == Some(RequestUsageBasis::NotObserved)
+        && (400..=599).contains(&input.status_code)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(remote = "UsageReservation")]
 struct ReservationWire {
@@ -351,6 +361,7 @@ pub(crate) struct Journal {
     pending: Mutex<HashMap<Uuid, Pending>>,
     claims: Mutex<HashMap<Uuid, ClaimState>>,
     wake: Notify,
+    progress: Notify,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tasks: Mutex<Vec<(Work, tokio::task::JoinHandle<()>)>>,
     #[cfg(test)]
@@ -380,6 +391,7 @@ impl Journal {
             pending: Mutex::new(HashMap::new()),
             claims: Mutex::new(HashMap::new()),
             wake: Notify::new(),
+            progress: Notify::new(),
             worker: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -397,6 +409,7 @@ impl Journal {
                 journal.start_operational(&database);
                 journal.start_pending(&database);
                 journal.start_unknown(&database);
+                journal.progress.notify_waiters();
                 tokio::select! {
                     _ = journal.wake.notified() => {},
                     _ = tokio::time::sleep(RETRY_INTERVAL) => {},
@@ -409,6 +422,44 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(worker);
         journal
+    }
+
+    pub(crate) async fn drain(&self) {
+        self.wake.notify_one();
+        loop {
+            let progress = self.progress.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            let drained = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .all(|entry| {
+                    entry.reconcile
+                        && !entry.running
+                        && !entry.operational_running
+                        && !entry.conversation_pending
+                        && (entry.snapshot.claim.is_none()
+                            || entry.operational_acknowledged
+                            || entry.operational_reconcile)
+                        && (!entry.unknown_annotated || entry.conversation_enqueued)
+                })
+                && self
+                    .claims
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty()
+                && self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty();
+            if drained {
+                return;
+            }
+            progress.await;
+        }
     }
 
     async fn reap(&self) {
@@ -1150,14 +1201,21 @@ impl Journal {
             let result = match snapshot.terminal() {
                 Ok(input) => {
                     if let Some(claim) = snapshot.claim.as_ref() {
-                        if input.usage_basis
-                            == Some(crate::model::RequestUsageBasis::ProviderReported)
-                        {
+                        let evidence = match input.usage_basis {
+                            Some(crate::model::RequestUsageBasis::ProviderReported) => {
+                                Some(crate::db::PendingProxySettlementEvidence::ProviderReported)
+                            }
+                            _ if confirmed_not_executed(&input) => Some(
+                                crate::db::PendingProxySettlementEvidence::ConfirmedNotExecuted,
+                            ),
+                            _ => None,
+                        };
+                        if let Some(evidence) = evidence {
                             database
                                 .finish_pending_proxy_settlement(
                                     claim,
                                     receipt_id,
-                                    crate::db::PendingProxySettlementEvidence::ProviderReported,
+                                    evidence,
                                     input,
                                     attribution,
                                 )

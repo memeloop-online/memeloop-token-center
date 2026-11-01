@@ -57,6 +57,17 @@ pub(super) fn snapshot_matches(
 const MAX_SEMANTIC_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) async fn persist_legacy_conversation_payload_for_test(
+        transaction: &mut Transaction<'_, Any>,
+        request_id: Uuid,
+        key: &AuthenticatedKey,
+        request: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        let (body, digest) = encode(request_id, key, request)?;
+        persist(transaction, request_id, key, &body, &digest).await
+    }
+
     /// Keyset-walk every outbox row, not an unindexed filter for completed
     /// snapshots. At most 32 rows and 128 KiB per snapshot leave the database.
     /// Pending jobs, malformed snapshots and missing retained paths are kept.
@@ -135,6 +146,7 @@ impl Database {
     }
 }
 
+#[cfg(test)]
 pub(super) fn encode(
     request_id: Uuid,
     key: &AuthenticatedKey,
@@ -161,6 +173,7 @@ pub(super) fn encode(
     Ok((body, digest))
 }
 
+#[cfg(test)]
 pub(super) async fn persist(
     transaction: &mut Transaction<'_, Any>,
     request_id: Uuid,
@@ -429,6 +442,14 @@ mod receipt_tests {
                     upstream_response_id: None,
                     observed_at: index as i64,
                 },
+            )
+            .await
+            .unwrap();
+            Database::persist_legacy_conversation_payload_for_test(
+                &mut tx,
+                Uuid::from_u128(index),
+                &key,
+                &body,
             )
             .await
             .unwrap();

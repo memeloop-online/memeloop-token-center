@@ -2320,7 +2320,7 @@ pub(crate) async fn allocate_request_event_cursor(
     )
     .fetch_optional(&mut **transaction)
     .await?;
-    let cursor = match last {
+    let mut cursor = match last {
         None => RequestEventCursor {
             event_id: fresh_v7_at(now)?,
             event_at: now,
@@ -2350,22 +2350,29 @@ pub(crate) async fn allocate_request_event_cursor(
         }
     };
 
-    let claimed = sqlx::query(
-        "INSERT INTO request_event_locators (id, created_at, tenant_id, key_id, request_id) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(&cursor.event_id)
-    .bind(cursor.event_at)
-    .bind(tenant_id)
-    .bind(key_id)
-    .bind(request_id)
-    .execute(&mut **transaction)
-    .await?;
-    if claimed.rows_affected() != 1 {
-        return Err(AppError::internal(
-            "lifecycle_allocate_request_event_cursor_2",
-        ));
+    loop {
+        let claimed = sqlx::query(
+            "INSERT INTO request_event_locators (id, created_at, tenant_id, key_id, request_id) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&cursor.event_id)
+        .bind(cursor.event_at)
+        .bind(tenant_id)
+        .bind(key_id)
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await?;
+        if claimed.rows_affected() == 1 {
+            return Ok(cursor);
+        }
+        if let Some(event_id) = increment_v7_random_b(&cursor.event_id, cursor.event_at) {
+            cursor.event_id = event_id;
+        } else {
+            cursor.event_at = cursor.event_at.checked_add(1).ok_or(AppError::internal(
+                "lifecycle_allocate_request_event_cursor_2",
+            ))?;
+            cursor.event_id = fresh_v7_at(cursor.event_at)?;
+        }
     }
-    Ok(cursor)
 }
 
 fn fresh_v7_at(event_at: i64) -> Result<String, AppError> {
@@ -2609,8 +2616,11 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .as_ref()
         .map(|usage| usage.billing_unit)
         .unwrap_or("");
+    // Archive binding and terminal persistence finish independently. A stale
+    // terminal placeholder must not downgrade a locator already bound by the
+    // archive owner; resolve this under the same row lock as terminal facts.
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19, cache_known_read_tokens = $20, cache_known_input_tokens = $21 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = CASE WHEN $10 LIKE 'gap://%' AND response_object IS NOT NULL AND response_object <> '' AND response_object NOT LIKE 'gap://%' THEN response_object ELSE $10 END, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19, cache_known_read_tokens = $20, cache_known_input_tokens = $21 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)

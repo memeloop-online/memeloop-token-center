@@ -8,7 +8,7 @@ import type { DogfoodWorld } from '../support/world.js';
 import { appPreferenceControls, openAppRoute } from './app-route.support.js';
 import { openIndividualAuthorization } from './form-disclosure.support.js';
 
-import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertUsageTotalTokens, assertVisible, catalogModelSearch, connectOperator, credentialGroupObservations, groupedModel, metric, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
+import { addTypedFilterCondition, assertAttribute, assertContains, assertCount, assertExactText, assertNoCount, assertNoHorizontalOverflow, assertNotContains, assertUsageTotalTokens, assertValue, assertVisible, catalogModelSearch, connectOperator, credentialGroupObservations, groupedModel, metric, openCatalogModelPicker, openTypedFilterDialog, operatorTrafficPanel, uuidPattern } from './dogfood.support.js';
 When('上游授权方式包含 Codex、Claude、Copilot 和 Cursor 且仅显示产品接入方式', async function (this: DogfoodWorld) {
   const page = this.requirePage();
   await page.route('**/internal/v1/provider-types', async (route) => {
@@ -70,7 +70,8 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
   const page = this.requirePage();
   const seed = runtime.requireSeed();
 
-  const usageResponse = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?'));
+  const usageResponse = page.waitForResponse((response) => response.url().includes('/internal/v1/usage-analysis?')
+    && new URL(response.url()).searchParams.get('projection') === 'overview');
   await openAppRoute(page, 'operator', 'usage');
   await assertUsageTotalTokens(page, await usageResponse);
   await assertNoCount(page.locator('.notice.error'));
@@ -103,7 +104,12 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
 
   const keyAlias = await addTypedFilterCondition(dialog, 'key_alias');
   await keyAlias.getByLabel('操作符').selectOption('contains');
-  await keyAlias.getByLabel('值').fill('Browser');
+  // The alias value editor is the shared credential combobox named by the
+  // field itself; free typed text commits on blur, keeping contains semantics.
+  const keyAliasValue = keyAlias.getByLabel('客户端凭据', { exact: true });
+  await keyAliasValue.fill('Browser');
+  await keyAliasValue.blur();
+  await assertValue(keyAliasValue, 'Browser');
   const principal = await addTypedFilterCondition(dialog, 'principal');
   await principal.getByLabel('操作符').selectOption('contains');
   await principal.getByLabel('值').fill('browser-e2e');
@@ -165,7 +171,7 @@ Then('请求列表的完整筛选和错误下钻均可用', async function (this
     'unknown cost must not have matched a minimum cost of zero');
   await assertCount(requestPanel.locator('tbody tr'), 1);
   await assertContains(requestPanel.locator('tbody'), '429');
-  await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务返回了错误状态');
+  await assertContains(requestPanel.locator('tbody'), '已记录原因: 上游服务在响应开始时返回了错误状态');
   assert.doesNotMatch(await requestPanel.locator('tbody').innerText(), /http_429/);
   await requestPanel.getByRole('button', { name: /请求详情$/ }).click();
   const requestDrawer = page.getByRole('dialog');

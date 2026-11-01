@@ -13,9 +13,10 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
+    plain_json::{decode_handle, encode_handle},
     provider::{
         OAuthAdapterContribution, OAuthFlowKind, OAuthIdentityContribution, OAuthResponseMode,
-        OAuthTokenEncoding, UpstreamCredential, open_private_json, seal_private_json,
+        OAuthTokenEncoding, UpstreamCredential,
     },
 };
 
@@ -122,9 +123,6 @@ pub fn deployment_client_default(provider: &str) -> Result<ClientConfig, AppErro
     validate_client(&client)?;
     Ok(client)
 }
-const TOKEN_AAD: &[u8] = b"memeloop-token-center/authorization-code/session/v1";
-const STATE_AAD: &[u8] = b"memeloop-token-center/authorization-code/state/v1";
-const READY_AAD: &[u8] = b"memeloop-token-center/authorization-code/ready/v1";
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -273,7 +271,7 @@ fn fragment_manual_code(pasted: &str, state: &str) -> Result<String, AppError> {
 /// Google owns both this fixed HTTPS endpoint and the returned account id.
 /// Never use a display email, Cloud project, or decoded/unverified JWT as identity.
 pub(crate) async fn bind_google_identity(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &mut UpstreamCredential,
 ) -> Result<(), AppError> {
     let identity = read_google_identity(http, credential, GOOGLE_USERINFO, false).await?;
@@ -292,13 +290,13 @@ pub(crate) async fn bind_google_identity(
 }
 
 async fn read_google_identity(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     endpoint: &str,
     test_loopback: bool,
 ) -> Result<GoogleIdentity, AppError> {
     let http = network::client_for_config_url_no_retry(
-        http,
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
         endpoint,
         &json!({"network_scope":"public"}),
         credential.proxy(),
@@ -306,11 +304,7 @@ async fn read_google_identity(
     )
     .await?;
     let response = credential
-        .apply(
-            http.get(endpoint)
-                .timeout(std::time::Duration::from_secs(20)),
-            crate::db::unix_millis(),
-        )?
+        .apply(http.get(endpoint), crate::db::unix_millis())?
         .send()
         .await
         .map_err(|_| AppError::upstream("google_account_identity_request_failed"))?;
@@ -339,7 +333,7 @@ async fn read_google_identity(
 /// account id. Mirrors the Google path: bounded body, provider network scope,
 /// and only the declared pointer is read.
 pub(crate) async fn bind_declared_identity(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &mut UpstreamCredential,
     contribution: &OAuthIdentityContribution,
     provider_config: &Value,
@@ -350,7 +344,7 @@ pub(crate) async fn bind_declared_identity(
 }
 
 async fn bind_declared_identity_with_transport(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &mut UpstreamCredential,
     contribution: &OAuthIdentityContribution,
     provider_config: &Value,
@@ -358,7 +352,7 @@ async fn bind_declared_identity_with_transport(
 ) -> Result<(), AppError> {
     contribution.headers.validate()?;
     let http = network::client_for_config_url_no_retry(
-        http,
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
         &contribution.url,
         provider_config,
         credential.proxy(),
@@ -367,10 +361,7 @@ async fn bind_declared_identity_with_transport(
     .await?;
     let response = credential
         .apply(
-            contribution.headers.apply(
-                http.get(&contribution.url)
-                    .timeout(std::time::Duration::from_secs(20)),
-            )?,
+            contribution.headers.apply(http.get(&contribution.url))?,
             crate::db::unix_millis(),
         )?
         .send()
@@ -606,13 +597,13 @@ pub enum CompleteResult {
 /// Validate the sealed session's authority before selecting its historical runtime.
 pub fn session_application_revision(
     token: &str,
-    key: &[u8],
+    _key: &[u8],
     required_tenant: Option<&str>,
     operator_service_id: Option<Uuid>,
     now: i64,
 ) -> Result<Option<i64>, AppError> {
-    let session: Session = open_private_json(token, key, TOKEN_AAD)
-        .map_err(|_| AppError::BadRequest("invalid OAuth session".into()))?;
+    let session: Session =
+        decode_handle(token).map_err(|_| AppError::BadRequest("invalid OAuth session".into()))?;
     if required_tenant.is_some_and(|tenant| tenant != session.tenant_external_id)
         || session.operator_service_id != operator_service_id
     {
@@ -626,10 +617,10 @@ pub fn session_application_revision(
 
 fn open_ready(
     ciphertext: &str,
-    key: &[u8],
+    _key: &[u8],
     session: &Session,
 ) -> Result<Box<ReadyLogin>, AppError> {
-    let ready: ReadyLogin = open_private_json(ciphertext, key, READY_AAD)?;
+    let ready: ReadyLogin = decode_handle(ciphertext)?;
     if ready.application_plugin_revision != session.application_plugin_revision
         || ready.transport_group != session.transport_group
         || ready.session_id != session.session_id
@@ -658,7 +649,7 @@ struct TokenResponse {
 pub async fn start(
     db: &Database,
     mut input: StartInput,
-    key: &[u8],
+    _key: &[u8],
     now: i64,
 ) -> Result<LoginStart, AppError> {
     validate_client(&input.client)?;
@@ -737,16 +728,12 @@ pub async fn start(
         flow_kind: FLOW.into(),
         tenant_external_id: session.tenant_external_id.clone(),
         operator_service_id: session.operator_service_id,
-        state_ciphertext: super::seal_oauth_login_state(
-            &LoginState {
-                exchange_started: false,
-                input,
-                state,
-                verifier,
-            },
-            key,
-            STATE_AAD,
-        )?,
+        state_ciphertext: super::seal_oauth_login_state(&LoginState {
+            exchange_started: false,
+            input,
+            state,
+            verifier,
+        })?,
         next_poll_at: now,
         expires_at: session.expires_at,
     })
@@ -754,7 +741,7 @@ pub async fn start(
     Ok(LoginStart {
         driver,
         login_url: url.into(),
-        session_token: seal_private_json(&session, key, TOKEN_AAD)?,
+        session_token: encode_handle(&session)?,
         expires_at: session.expires_at,
         recovery_expires_at: session.expires_at.saturating_add(READY_RECOVERY_MILLIS),
     })
@@ -763,7 +750,7 @@ pub async fn start(
 #[allow(clippy::too_many_arguments)]
 pub async fn complete(
     db: &Database,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     token: &str,
     callback_url: &str,
     required_tenant: Option<&str>,
@@ -772,8 +759,8 @@ pub async fn complete(
     now: i64,
     allow_test_loopback: bool,
 ) -> Result<CompleteResult, AppError> {
-    let session: Session = open_private_json(token, key, TOKEN_AAD)
-        .map_err(|_| AppError::BadRequest("invalid OAuth session".into()))?;
+    let session: Session =
+        decode_handle(token).map_err(|_| AppError::BadRequest("invalid OAuth session".into()))?;
     if required_tenant.is_some_and(|tenant| tenant != session.tenant_external_id)
         || session.operator_service_id != operator_service_id
     {
@@ -818,7 +805,7 @@ pub async fn complete(
                 state_ciphertext,
             } => (lease_owner, state_ciphertext),
         };
-    let mut login: LoginState = open_private_json(&ciphertext, key, STATE_AAD)?;
+    let mut login: LoginState = decode_handle(&ciphertext)?;
     if login.input.application_plugin_revision != session.application_plugin_revision {
         return Err(AppError::Conflict(
             "OAuth application revision binding changed".into(),
@@ -930,7 +917,7 @@ pub async fn complete(
     db.replace_oauth_login_poll_state_with_transport(
         session.session_id,
         lease_owner,
-        super::seal_oauth_login_state(&login, key, STATE_AAD)?,
+        super::seal_oauth_login_state(&login)?,
         login.input.transport_group.as_ref(),
         key,
     )
@@ -958,13 +945,8 @@ pub async fn complete(
         refresh_url: login.input.adapter.refresh_url,
         credential,
     };
-    db.stage_oauth_login_ready(
-        session.session_id,
-        lease_owner,
-        seal_private_json(&ready, key, READY_AAD)?,
-        now,
-    )
-    .await?;
+    db.stage_oauth_login_ready(session.session_id, lease_owner, encode_handle(&ready)?, now)
+        .await?;
     match db.claim_oauth_code_ready_recovery(&reference, now).await? {
         OAuthLoginClaim::Ready {
             lease_owner,
@@ -987,7 +969,7 @@ pub async fn complete(
 }
 
 pub async fn refresh(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     current: &UpstreamCredential,
     active_adapter: &OAuthAdapterContribution,
     now: i64,
@@ -1103,7 +1085,7 @@ fn credential_with_state(
 
 #[allow(clippy::too_many_arguments)]
 async fn token_request(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -1130,7 +1112,7 @@ async fn token_request(
 
 #[allow(clippy::too_many_arguments)]
 async fn prepare_token_request(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     endpoint: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -1138,12 +1120,16 @@ async fn prepare_token_request(
     encoding: OAuthTokenEncoding,
     allow_test_loopback: bool,
 ) -> Result<(reqwest::Client, reqwest::Request), AppError> {
-    let http =
-        network::client_for_config_url_no_retry(http, endpoint, config, proxy, allow_test_loopback)
-            .await?;
+    let http = network::client_for_config_url_no_retry(
+        &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
+        endpoint,
+        config,
+        proxy,
+        allow_test_loopback,
+    )
+    .await?;
     let request = http
         .post(endpoint)
-        .timeout(std::time::Duration::from_secs(20))
         .header(reqwest::header::ACCEPT, "application/json");
     let request = match encoding {
         OAuthTokenEncoding::Form => request
@@ -1530,9 +1516,9 @@ mod tests {
             )
             .is_err()
         );
-        let key = b"generic reauthorization fixture encryption key";
-        let cipher = seal_private_json(&original, key, STATE_AAD).unwrap();
-        let restored: StartInput = open_private_json(&cipher, key, STATE_AAD).unwrap();
+        let _key = b"generic reauthorization fixture encryption key";
+        let cipher = encode_handle(&original).unwrap();
+        let restored: StartInput = decode_handle(&cipher).unwrap();
         assert_eq!(restored.reauthorize, Some(target));
         let mut legacy = serde_json::to_value(&original).unwrap();
         legacy.as_object_mut().unwrap().remove("reauthorize");
@@ -1556,7 +1542,7 @@ mod tests {
         let key = b"fixture encryption key at least 32 bytes long";
         let input = input("https://tokens.example.com/token".into());
         let started = start(&db, input.clone(), key, 1000).await.unwrap();
-        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let session: Session = decode_handle(&started.session_token).unwrap();
         let reference = OAuthLoginSessionReference {
             session_id: session.session_id,
             flow_kind: FLOW.into(),
@@ -1598,7 +1584,7 @@ mod tests {
         db.stage_oauth_login_ready(
             session.session_id,
             lease_owner,
-            seal_private_json(&ready, key, READY_AAD).unwrap(),
+            encode_handle(&ready).unwrap(),
             started.expires_at - 500,
         )
         .await
@@ -1741,7 +1727,7 @@ mod tests {
                 .query_pairs()
                 .any(|(name, value)| name == "redirect_uri" && value == "https://client.example/")
         );
-        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let session: Session = decode_handle(&started.session_token).unwrap();
         let reference = OAuthLoginSessionReference {
             session_id: session.session_id,
             flow_kind: FLOW.into(),
@@ -1759,7 +1745,7 @@ mod tests {
         else {
             panic!("initial lease")
         };
-        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        let mut login: LoginState = decode_handle(&state_ciphertext).unwrap();
         let mock = MockServer::start().await;
         login.input.adapter.poll_url = format!("{}/token", mock.uri());
         let callback = format!(
@@ -1769,7 +1755,7 @@ mod tests {
         db.replace_oauth_login_poll_state(
             session.session_id,
             lease_owner,
-            seal_private_json(&login, key, STATE_AAD).unwrap(),
+            encode_handle(&login).unwrap(),
         )
         .await
         .unwrap();
@@ -1800,7 +1786,7 @@ mod tests {
         else {
             panic!("preflight remains retryable")
         };
-        let login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        let login: LoginState = decode_handle(&state_ciphertext).unwrap();
         assert!(!login.exchange_started);
         let issued = credential(
             TokenResponse {
@@ -1905,7 +1891,7 @@ mod tests {
         initial.proxy_url = Some("socks5h://10.20.30.40:1080".into());
         initial.proxy_network_scope = Some(OutboundScope::Private);
         let started = start(&db, initial, key, 1000).await.unwrap();
-        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let session: Session = decode_handle(&started.session_token).unwrap();
         let reference = OAuthLoginSessionReference {
             session_id: session.session_id,
             flow_kind: FLOW.into(),
@@ -1923,12 +1909,12 @@ mod tests {
         else {
             panic!("initial lease")
         };
-        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        let mut login: LoginState = decode_handle(&state_ciphertext).unwrap();
         login.input.adapter.poll_url = server.uri();
         db.replace_oauth_login_poll_state(
             reference.session_id,
             lease_owner,
-            seal_private_json(&login, key, STATE_AAD).unwrap(),
+            encode_handle(&login).unwrap(),
         )
         .await
         .unwrap();
@@ -2006,7 +1992,7 @@ mod tests {
             session_id: None,
         });
         let started = start(&db, initial, key, 1000).await.unwrap();
-        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let session: Session = decode_handle(&started.session_token).unwrap();
         let reference = OAuthLoginSessionReference {
             session_id: session.session_id,
             flow_kind: FLOW.into(),
@@ -2024,7 +2010,7 @@ mod tests {
         else {
             panic!("initial lease")
         };
-        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        let mut login: LoginState = decode_handle(&state_ciphertext).unwrap();
         assert!(login.input.transport_group == session.transport_group);
         let snapshot = login.input.transport_group.as_ref().unwrap();
         assert_eq!(snapshot.selected_member_id, selected_member_id);
@@ -2062,12 +2048,7 @@ mod tests {
             refresh_url: login.input.adapter.refresh_url.clone(),
             credential: issued,
         };
-        let identity_input = open_ready(
-            &seal_private_json(&ready, key, READY_AAD).unwrap(),
-            key,
-            &session,
-        )
-        .unwrap();
+        let identity_input = open_ready(&encode_handle(&ready).unwrap(), key, &session).unwrap();
         assert_eq!(
             identity_input.credential.proxy(),
             Some((backup, OutboundScope::Private))
@@ -2076,14 +2057,7 @@ mod tests {
             .credential
             .with_transport_proxy(primary.into())
             .unwrap();
-        assert!(
-            open_ready(
-                &seal_private_json(&ready, key, READY_AAD).unwrap(),
-                key,
-                &session
-            )
-            .is_err()
-        );
+        assert!(open_ready(&encode_handle(&ready).unwrap(), key, &session).is_err());
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(200))
@@ -2095,7 +2069,7 @@ mod tests {
         db.replace_oauth_login_poll_state(
             session.session_id,
             lease_owner,
-            seal_private_json(&login, key, STATE_AAD).unwrap(),
+            encode_handle(&login).unwrap(),
         )
         .await
         .unwrap();
@@ -2185,7 +2159,7 @@ mod tests {
             )
             .is_err()
         );
-        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let session: Session = decode_handle(&started.session_token).unwrap();
         let ready = ReadyLogin {
             transport_group: None,
             reauthorize: None,
@@ -2198,14 +2172,7 @@ mod tests {
             refresh_url: "https://tokens.example.com/token".into(),
             credential: UpstreamCredential::None,
         };
-        assert!(
-            open_ready(
-                &seal_private_json(&ready, key, READY_AAD).unwrap(),
-                key,
-                &session
-            )
-            .is_err()
-        );
+        assert!(open_ready(&encode_handle(&ready).unwrap(), key, &session).is_err());
         let reference = OAuthLoginSessionReference {
             session_id: session.session_id,
             flow_kind: FLOW.into(),
@@ -2223,12 +2190,12 @@ mod tests {
         else {
             panic!("expected initial lease")
         };
-        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        let mut login: LoginState = decode_handle(&state_ciphertext).unwrap();
         login.exchange_started = true;
         db.replace_oauth_login_poll_state(
             session.session_id,
             lease_owner,
-            seal_private_json(&login, key, STATE_AAD).unwrap(),
+            encode_handle(&login).unwrap(),
         )
         .await
         .unwrap();
@@ -2255,8 +2222,7 @@ mod tests {
         else {
             panic!("empty callback must not fail the session")
         };
-        let state_after_check: LoginState =
-            open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        let state_after_check: LoginState = decode_handle(&state_ciphertext).unwrap();
         assert!(state_after_check.exchange_started);
         db.release_oauth_login_poll(session.session_id, check_owner, 32_003)
             .await
@@ -2302,7 +2268,7 @@ mod tests {
             client_default: None,
         });
         let started = start(&db, input, key, 1000).await.unwrap();
-        let session: Session = open_private_json(&started.session_token, key, TOKEN_AAD).unwrap();
+        let session: Session = decode_handle(&started.session_token).unwrap();
         let reference = OAuthLoginSessionReference {
             session_id: session.session_id,
             flow_kind: FLOW.into(),
@@ -2320,14 +2286,14 @@ mod tests {
         else {
             panic!("initial lease")
         };
-        let mut login: LoginState = open_private_json(&state_ciphertext, key, STATE_AAD).unwrap();
+        let mut login: LoginState = decode_handle(&state_ciphertext).unwrap();
         login.input.adapter.poll_url = format!("{}/token", server.uri());
         login.input.adapter.refresh_url = login.input.adapter.poll_url.clone();
         let adapter = login.input.adapter.clone();
         db.replace_oauth_login_poll_state(
             session.session_id,
             lease_owner,
-            seal_private_json(&login, key, STATE_AAD).unwrap(),
+            encode_handle(&login).unwrap(),
         )
         .await
         .unwrap();

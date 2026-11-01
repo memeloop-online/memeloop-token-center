@@ -1,5 +1,14 @@
 use super::*;
 
+fn stats_window() -> StatsFilter {
+    let now = unix_millis();
+    StatsFilter {
+        from_created_at: Some(now - 60 * 60 * 1_000),
+        to_created_at: Some(now + 60 * 60 * 1_000),
+        ..StatsFilter::default()
+    }
+}
+
 pub(super) async fn drain_terminal(fixture: &Fixture) {
     let owner = Uuid::now_v7();
     let tasks = fixture
@@ -122,7 +131,7 @@ async fn correction_contract(
         drain_terminal(&fixture).await;
         let stats = fixture
             .database
-            .stats_filtered(fixture.key.key_id, StatsFilter::default())
+            .stats_filtered(fixture.key.key_id, stats_window())
             .await
             .unwrap();
         assert_eq!(stats.summary.total_requests, 1);
@@ -135,7 +144,7 @@ async fn correction_contract(
                 fixture.key.key_id,
                 StatsFilter {
                     max_cost_micros: Some(0),
-                    ..StatsFilter::default()
+                    ..stats_window()
                 },
             )
             .await
@@ -164,7 +173,7 @@ async fn correction_contract(
     fixture.finish(receipt_id).await.unwrap();
     let awaiting_projection = fixture
         .database
-        .stats_filtered(fixture.key.key_id, StatsFilter::default())
+        .stats_filtered(fixture.key.key_id, stats_window())
         .await
         .unwrap();
     assert_eq!(awaiting_projection.summary.total_requests, 1);
@@ -180,7 +189,7 @@ async fn correction_contract(
                 fixture.key.key_id,
                 StatsFilter {
                     max_cost_micros: Some(max_cost),
-                    ..StatsFilter::default()
+                    ..stats_window()
                 },
             )
             .await
@@ -252,7 +261,7 @@ async fn correction_contract(
     assert_eq!(events, 1);
     let stats = fixture
         .database
-        .stats_filtered(fixture.key.key_id, StatsFilter::default())
+        .stats_filtered(fixture.key.key_id, stats_window())
         .await
         .unwrap();
     assert_eq!(stats.summary.total_requests, 1);
@@ -286,7 +295,7 @@ async fn recovery_contract(fixture: Fixture) {
     drain_terminal(&fixture).await;
     let stats = fixture
         .database
-        .stats_filtered(fixture.key.key_id, StatsFilter::default())
+        .stats_filtered(fixture.key.key_id, stats_window())
         .await
         .unwrap();
     assert_eq!(stats.summary.total_requests, 1);
@@ -314,9 +323,12 @@ async fn isolation_contract(fixture: Fixture) {
         None,
         "foreign-tenant",
         EnforcementMode::MeteredUnlimited,
-        "EUR",
+        "CNY",
     )
     .await;
+    assert_eq!(fixture.key.currency, "USD");
+    assert_eq!(foreign.key.currency, "CNY");
+    assert_ne!(fixture.key.tenant_id, foreign.key.tenant_id);
     for current in [&fixture, &foreign] {
         let terminal = current.operational(499);
         let (recorded, marked) = tokio::join!(
@@ -333,7 +345,7 @@ async fn isolation_contract(fixture: Fixture) {
     drain_terminal(&fixture).await;
     let global = fixture
         .database
-        .global_operator_stats_filtered(StatsFilter::default())
+        .global_operator_stats_filtered(stats_window())
         .await
         .unwrap();
     assert_eq!(global.summary.total_requests, 2);
@@ -343,14 +355,14 @@ async fn isolation_contract(fixture: Fixture) {
     assert_eq!(global.summary.costs[0].currency, "USD");
     let own = fixture
         .database
-        .operator_stats_filtered("operational-test", StatsFilter::default())
+        .operator_stats_filtered("operational-test", stats_window())
         .await
         .unwrap();
     assert_eq!(own.summary.total_requests, 1);
     assert_eq!(own.summary.total_cost.as_deref(), Some("0.000012"));
     let unknown = fixture
         .database
-        .stats_filtered(foreign.key.key_id, StatsFilter::default())
+        .stats_filtered(foreign.key.key_id, stats_window())
         .await
         .unwrap();
     assert_eq!(unknown.summary.total_requests, 1);

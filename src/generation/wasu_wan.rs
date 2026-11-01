@@ -1,3 +1,4 @@
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -180,13 +181,21 @@ fn poll_output<'body>(body: &'body Value, task_id: &str) -> Result<&'body Value,
     Ok(output)
 }
 
+fn whole_seconds(value: &Value) -> Option<i64> {
+    let seconds = Decimal::from_str_exact(&value.as_number()?.to_string()).ok()?;
+    if !seconds.fract().is_zero() {
+        return None;
+    }
+    seconds.to_i64()
+}
+
 fn billed_seconds(body: &Value, reserved: i64) -> Result<i64, AppError> {
     let usage = body
         .get("usage")
         .or_else(|| body.pointer("/output/usage"))
         .ok_or_else(|| AppError::upstream("wasu_wan_query_response_has_no_usage"))?;
-    let duration = usage.get("duration").and_then(Value::as_i64);
-    let output_duration = usage.get("output_video_duration").and_then(Value::as_i64);
+    let duration = usage.get("duration").and_then(whole_seconds);
+    let output_duration = usage.get("output_video_duration").and_then(whole_seconds);
     if usage.get("video_count").and_then(Value::as_i64) != Some(1)
         || duration != output_duration
         || duration.is_none_or(|value| value <= 0 || value > reserved)
@@ -380,6 +389,54 @@ mod tests {
         body["usage"]["video_count"] = json!(2);
         assert!(billed_seconds(&body, 5).is_err());
         assert!(billed_seconds(&json!({}), 5).is_err());
+    }
+
+    #[test]
+    fn supplier_decimal_seconds_preserve_the_whole_seconds_contract() {
+        let body: Value = serde_json::from_str(
+            r#"{"usage":{"video_count":1,"duration":5.0,"SR":720,"output_video_duration":5.0,"input_video_duration":0,"fps":30,"ratio":"16:9"}}"#,
+        )
+        .unwrap();
+        assert!(body["usage"]["duration"].as_i64().is_none());
+        assert_eq!(billed_seconds(&body, 5).unwrap(), 5);
+        assert!(billed_seconds(&body, 4).is_err());
+        let mut mixed = body.clone();
+        mixed["usage"]["duration"] = json!(5);
+        assert_eq!(billed_seconds(&mixed, 5).unwrap(), 5);
+        assert_eq!(
+            billed_seconds(&json!({"output": {"usage": body["usage"]}}), 5).unwrap(),
+            5
+        );
+        for invalid in [
+            json!(4.5),
+            json!(0.0),
+            json!(-5.0),
+            json!(6.0),
+            json!("5.0"),
+            json!(null),
+            json!(true),
+            json!(1e30),
+        ] {
+            let mut rejected = body.clone();
+            rejected["usage"]["duration"] = invalid.clone();
+            rejected["usage"]["output_video_duration"] = invalid;
+            assert!(billed_seconds(&rejected, 5).is_err());
+        }
+        for (field, invalid) in [
+            ("duration", json!(4.0)),
+            ("output_video_duration", json!(4.0)),
+            ("video_count", json!(2)),
+            ("video_count", json!(null)),
+        ] {
+            let mut rejected = body.clone();
+            rejected["usage"][field] = invalid;
+            assert!(billed_seconds(&rejected, 5).is_err());
+        }
+        for field in ["duration", "output_video_duration", "video_count"] {
+            let mut rejected = body.clone();
+            rejected["usage"].as_object_mut().unwrap().remove(field);
+            assert!(billed_seconds(&rejected, 5).is_err());
+        }
     }
 
     #[test]

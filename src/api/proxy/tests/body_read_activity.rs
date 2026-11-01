@@ -75,7 +75,19 @@ async fn body_activity_counts_metered_and_gated_reads_and_releases_on_cancel() {
             0
         );
         if !gated {
-            assert!(fixture.state.proxy_memory_budget.snapshot().0 >= 12 * 1024 * 1024);
+            let retained = fixture.state.proxy_memory_budget.snapshot().0;
+            if matches!(
+                path,
+                "/v1/chat/completions" | "/v1/alpha/search" | "/v1/embeddings" | "/v1/messages"
+            ) {
+                assert!(
+                    (crate::gateway_body::request_spool::REQUEST_SPOOL_CHUNK_BYTES
+                        ..12 * 1024 * 1024)
+                        .contains(&retained)
+                );
+            } else {
+                assert!(retained >= 12 * 1024 * 1024);
+            }
         }
         body_metric(&fixture.state, &service.token, 1).await;
         drop(request);
@@ -99,6 +111,23 @@ async fn body_activity_counts_metered_and_gated_reads_and_releases_on_cancel() {
         assert!(response.status().is_client_error(), "{}", response.status());
         drop(response);
         assert_eq!(fixture.state.gateway_body_reads.load(Ordering::Acquire), 0);
+        // A completed spool's detached object write can outlive the response
+        // and retain ingress permits until its last owner exits.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture
+                .state
+                .responses_request_spool
+                .snapshot()
+                .active_files
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{path}: request spool owners must release after response drop")
+        });
         assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
     }
 }

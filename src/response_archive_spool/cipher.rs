@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::ArchiveSpoolIdentity,
     error::AppError,
-    provider::{open_private_json, seal_private_json, seal_private_json_with_nonce},
+    provider::{open_envelope, seal_envelope, seal_envelope_with_nonce},
 };
 
 const COMPRESSED_PREFIX: &str = "zstd1.";
@@ -74,7 +74,7 @@ pub(super) fn seal_for_purpose_with_compression(
     }
     let (envelope, compressed) = prepare_envelope(bytes, compression_enabled)?;
     let aad = aad(identity, seq, purpose, if compressed { 2 } else { 1 });
-    let ciphertext = seal_private_json(&envelope, pepper, aad.as_bytes())?;
+    let ciphertext = seal_envelope(&envelope, pepper, aad.as_bytes())?;
     Ok(if compressed {
         format!("{COMPRESSED_PREFIX}{ciphertext}")
     } else {
@@ -110,7 +110,7 @@ pub(super) fn seal_for_purpose_with_nonce_and_compression(
     }
     let (envelope, compressed) = prepare_envelope(bytes, compression_enabled)?;
     let aad = aad(identity, seq, purpose, if compressed { 2 } else { 1 });
-    let ciphertext = seal_private_json_with_nonce(&envelope, pepper, aad.as_bytes(), nonce)?;
+    let ciphertext = seal_envelope_with_nonce(&envelope, pepper, aad.as_bytes(), nonce)?;
     Ok(if compressed {
         format!("{COMPRESSED_PREFIX}{ciphertext}")
     } else {
@@ -208,7 +208,7 @@ pub(super) fn open_for_purpose(
     if !sealed.starts_with("v2.") {
         return Err(AppError::internal("cipher_open_for_purpose_2"));
     }
-    let value: Envelope = open_private_json(
+    let value: Envelope = open_envelope(
         sealed,
         pepper,
         aad(identity, seq, purpose, format_version).as_bytes(),
@@ -387,7 +387,7 @@ mod tests {
         assert_eq!(first, seal());
         let inner = first.strip_prefix(COMPRESSED_PREFIX).unwrap();
         assert!(
-            open_private_json::<Envelope>(
+            open_envelope::<Envelope>(
                 inner,
                 PEPPER,
                 aad(
@@ -407,7 +407,7 @@ mod tests {
     fn compressed_open_rejects_output_over_the_original_chunk_bound() {
         let expanded = vec![b'b'; super::super::CHUNK_BYTES + 1];
         let compressed = zstd::bulk::compress(&expanded, ZSTD_LEVEL).unwrap();
-        let sealed = seal_private_json_with_nonce(
+        let sealed = seal_envelope_with_nonce(
             &Envelope {
                 bytes: URL_SAFE_NO_PAD.encode(compressed),
             },

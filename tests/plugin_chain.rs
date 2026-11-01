@@ -1,4 +1,3 @@
-#[cfg(feature = "experimental-plugin-revisions")]
 use std::collections::BTreeMap;
 use std::{fs, path::Path};
 
@@ -101,7 +100,17 @@ fn write_policy_with_memory(root: &Path, id: &str, body: &str, large_memory: boo
     let (_, suffix) = tail.split_once(";; END POST-AUTH BODY").unwrap();
     let source = format!("{prefix}{body}{suffix}");
     let source = if large_memory {
-        source.replace("(memory $memory 1)", "(memory $memory 512)")
+        source.replace(
+            "global.set $heap",
+            r#"global.set $heap
+            global.get $heap i32.const 65535 i32.add i32.const 16 i32.shr_u
+            memory.size i32.gt_u
+            if
+                global.get $heap i32.const 65535 i32.add i32.const 16 i32.shr_u
+                memory.size i32.sub memory.grow
+                i32.const -1 i32.eq if unreachable end
+            end"#,
+        )
     } else {
         source
     };
@@ -208,77 +217,186 @@ async fn check_chain(
     if allow {
         assert_eq!(decision.request_json.as_ref(), last_rewrite, "{label}");
     }
+    #[cfg(feature = "experimental-plugin-revisions")]
+    {
+        let pinned = lifecycle_snapshot(runtime);
+        let decision = pinned
+            .apply_traffic_with_config(original_context, &original, &BTreeMap::new())
+            .unwrap();
+        assert_decision(&decision, allow, explicit, label);
+        if allow {
+            assert_eq!(decision.request_json.as_ref(), last_rewrite, "{label}");
+        }
+    }
+}
+
+#[cfg(feature = "experimental-plugin-revisions")]
+fn lifecycle_snapshot(
+    runtime: PluginRuntime,
+) -> std::sync::Arc<memeloop_token_center::plugin::lifecycle::RuntimeSnapshot> {
+    use memeloop_token_center::plugin::lifecycle::{
+        PluginGrant, RuntimeRevisions, manifest_digest,
+    };
+    let identities = runtime.package_identities();
+    let grants = runtime
+        .manifests()
+        .into_iter()
+        .map(|manifest| {
+            let grant = PluginGrant {
+                version: manifest.version.clone(),
+                capabilities: manifest.capabilities.clone(),
+                manifest_digest: manifest_digest(&manifest).unwrap(),
+                identity: identities[&manifest.id].clone(),
+            };
+            (manifest.id, vec![grant])
+        })
+        .collect();
+    RuntimeRevisions::new(runtime, grants)
+        .unwrap()
+        .pin()
+        .unwrap()
 }
 
 #[tokio::test]
-async fn traffic_input_error_has_fixed_413_public_response() {
-    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
-    use memeloop_token_center::error::AppError;
-    let response = AppError::PluginInputTooLarge.into_response();
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
-    let body: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
-    assert_eq!(body["error"]["code"], "plugin_input_too_large");
-    assert!(
-        body["error"]["message_en"]
-            .as_str()
-            .unwrap()
-            .contains("traffic plugin input limit")
-    );
+async fn traffic_chain_keeps_effective_models_rewrites_and_explicit_denials() {
+    check_chain(
+        "explicit model survives body rewrite",
+        &[
+            (Some("explicit-model"), None),
+            (None, Some(json!({"model":"body-model", "input":"kept"}))),
+        ],
+        "explicit-model",
+        true,
+    )
+    .await;
+    for allow in [true, false] {
+        check_chain(
+            "body model reaches the next policy",
+            &[(None, Some(json!({"model":"body-model", "input":"kept"})))],
+            "body-model",
+            allow,
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
-async fn rewritten_input_is_rechecked_before_the_next_hook_without_poisoning_circuits() {
+async fn traffic_request_and_configuration_cross_old_16_and_256_mib_limits() {
+    for threshold in [16 * 1024 * 1024, 256 * 1024 * 1024] {
+        for request_input in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let plugins = directory.path().join("plugins");
+            fs::create_dir(&plugins).unwrap();
+            let parameter = if request_input { 13 } else { 11 };
+            let body = format!(
+                "local.get {parameter} i32.const {threshold} i32.le_u if unreachable end\n{}",
+                decision_body(true, Some("observed-input"), None),
+            );
+            write_policy_with_memory(&plugins, "large-input", &body, true);
+            let database = Database::connect(&format!(
+                "sqlite://{}?mode=rwc",
+                directory.path().join("input.db").display()
+            ))
+            .await
+            .unwrap();
+            let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
+            let payload = Value::String("x".repeat(threshold + 1));
+            let (request, configurations) = if request_input {
+                (
+                    json!({"model":"requested-model", "input":payload}),
+                    BTreeMap::new(),
+                )
+            } else {
+                (
+                    json!({"model":"requested-model"}),
+                    BTreeMap::from([("large-input".to_owned(), payload)]),
+                )
+            };
+            let decision = runtime
+                .apply_traffic_with_config(context(), &request, &configurations)
+                .expect("valid canonical ABI allocation must reach the hook");
+            assert!(decision.allow);
+            assert_eq!(decision.model.as_deref(), Some("observed-input"));
+            assert!(decision.request_json.is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn traffic_guest_can_grow_past_old_512_mib_ceiling_but_not_wasm32_space() {
     let directory = tempfile::tempdir().unwrap();
     let plugins = directory.path().join("plugins");
     fs::create_dir(&plugins).unwrap();
-    let rewritten = json!({"model":"requested-model", "input":"x".repeat(512)});
-    write_policy(
-        &plugins,
-        "a-rewriter",
-        &decision_body(true, None, Some(&rewritten)),
+    let pages = 8193;
+    let last_byte = pages * 65536 - 1;
+    let body = format!(
+        r#"
+        i32.const 65536 memory.grow i32.const -1 i32.ne if unreachable end
+        i32.const {pages} memory.size i32.sub memory.grow
+        i32.const -1 i32.eq if unreachable end
+        i32.const {last_byte} i32.const 97 i32.store8
+        i32.const {last_byte} i32.load8_u i32.const 97 i32.ne if unreachable end
+        {}
+        "#,
+        decision_body(true, Some("allocation-observed"), None),
     );
-    write_policy_with_memory(&plugins, "z-next", &decision_body(true, None, None), true);
+    write_policy(&plugins, "memory-growth", &body);
     let database = Database::connect(&format!(
         "sqlite://{}?mode=rwc",
-        directory.path().join("rewrite.db").display()
+        directory.path().join("growth.db").display()
     ))
     .await
     .unwrap();
     let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
     let request = json!({"model":"requested-model"});
-    let outcome = runtime.apply_traffic(context(), &request).unwrap();
-    assert!(outcome.allow);
+    let decision = runtime.apply_traffic(context(), &request).unwrap();
+    assert!(decision.allow);
+    assert_eq!(decision.model.as_deref(), Some("allocation-observed"));
 }
 
+#[cfg(feature = "experimental-plugin-revisions")]
 #[tokio::test]
-async fn model_projection_invalidates_the_cached_json_input_size() {
-    let directory = tempfile::tempdir().unwrap();
-    let plugins = directory.path().join("plugins");
-    fs::create_dir(&plugins).unwrap();
-    let model = "m".repeat(200);
-    write_policy_with_memory(
-        &plugins,
-        "a-model",
-        &decision_body(true, Some(&model), None),
-        true,
-    );
-    write_policy_with_memory(&plugins, "z-next", &decision_body(true, None, None), true);
-    let database = Database::connect(&format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("model.db").display()
-    ))
-    .await
-    .unwrap();
-    let runtime = PluginRuntime::load(plugins.to_str(), database).unwrap();
-    let ctx = context();
-    let request = json!({"model":ctx.model, "input":"x".repeat(48 * 1024 * 1024)});
-    // The raw runtime may surface the guest's own allocation failure; the
-    // lifecycle layer above it fails open either way.
-    match runtime.apply_traffic(ctx.clone(), &request) {
-        Ok(decision) => assert!(decision.allow),
-        Err(error) => {
-            assert!(format!("{error:?}").contains("plugin_execution_failed"))
+async fn unavailable_hooks_preserve_prior_rewrites_and_run_later_denials() {
+    for allow in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let plugins = directory.path().join("plugins");
+        fs::create_dir(&plugins).unwrap();
+        let rewritten = json!({"model":"requested-model", "input":"kept"});
+        write_policy(
+            &plugins,
+            "a-rewriter",
+            &decision_body(true, None, Some(&rewritten)),
+        );
+        write_policy(&plugins, "b-unavailable", "unreachable");
+        write_policy(
+            &plugins,
+            "z-deny",
+            &observer_body("requested-model", &rewritten, allow),
+        );
+        let database = Database::connect(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("lifecycle.db").display()
+        ))
+        .await
+        .unwrap();
+        let pinned = lifecycle_snapshot(PluginRuntime::load(plugins.to_str(), database).unwrap());
+        for _ in 0..5 {
+            let decision = pinned
+                .apply_traffic_with_config(
+                    context(),
+                    &json!({"model":"requested-model"}),
+                    &BTreeMap::new(),
+                )
+                .unwrap();
+            assert_decision(
+                &decision,
+                allow,
+                None,
+                "failed or open hook must not skip a later denial",
+            );
+            if allow {
+                assert_eq!(decision.request_json.as_ref(), Some(&rewritten));
+            }
         }
     }
 }

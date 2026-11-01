@@ -810,12 +810,7 @@ async fn finish_openai_image_response(
             "billed_units": billed_units
         }))?
     } else {
-        crate::generation::seal_provider_asset_reference(
-            "request",
-            request_id,
-            &provider_assets,
-            state.config.key_pepper.as_bytes(),
-        )?
+        crate::generation::seal_provider_asset_reference(&provider_assets)?
     };
     match commit_synchronous_image_terminal(
         context,

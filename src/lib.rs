@@ -14,6 +14,7 @@ pub mod filter_ast;
 mod gateway_body;
 pub mod generation;
 mod group_routing;
+pub mod http_settings;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc_control;
 pub mod metrics;
@@ -22,6 +23,7 @@ pub mod model;
 pub mod native_cli;
 pub mod network;
 pub mod oauth;
+mod plain_json;
 pub mod plugin;
 #[cfg(feature = "plugin-distribution")]
 pub mod plugin_distribution;
@@ -64,7 +66,7 @@ mod upstream_quota;
 mod windows_dir;
 pub mod worker;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use archive::ArchiveStore;
 use config::Config;
@@ -72,18 +74,13 @@ use db::Database;
 use plugin::PluginRuntime;
 use provider::ProviderCatalog;
 
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-// Synchronous image providers may legitimately stay silent while generating.
-// The image path has its own 2-request concurrency and 16 MiB body bounds, so
-// matching the read timeout to the overall deadline does not make it unbounded.
-const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(600);
-const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 #[cfg(test)]
 pub(crate) use simple_http::{
     CODEX_HTTP2_KEEP_ALIVE_INTERVAL, build_codex_http_client, build_codex_http2_test_client,
     codex_http_client_builder, codex_http_client_builder_with_proxy,
     codex_http_protocol_test_builder,
 };
+#[cfg(test)]
 pub(crate) use simple_http::{
     build_codex_http_client_with_policy, build_codex_http_client_with_proxy,
 };
@@ -103,7 +100,7 @@ pub struct AppState {
     pub(crate) routing_persistence_db: Database,
     pub(crate) session_preferences: Arc<api::proxy::session_preferences::SessionPreferences>,
     pub archive: ArchiveStore,
-    pub http: reqwest::Client,
+    pub http: http_settings::HttpClient,
     pub(crate) codex_clients: Arc<codex_clients::CodexClients>,
     pub(crate) transport_proxy_groups: Arc<db::TransportProxyGroups>,
     pub providers: ProviderCatalog,
@@ -163,6 +160,20 @@ fn plugin_initialization_error(error: crate::error::AppError) -> InitializationE
 }
 
 impl AppState {
+    pub async fn drain_proxy_tasks(&self) {
+        self.proxy_lifecycles.wait_for_idle().await;
+        let _archives = self
+            .proxy_archive_stream_permits
+            .acquire_many(PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+            .await
+            .expect("proxy archive admission remains open during shutdown");
+        self.persistence.drain().await;
+        self.pending_terminals.drain().await;
+        self.early_requests.drain().await;
+        self.responses_request_spool.drain_uploads().await;
+        self.db.drain_gateway_persistence().await;
+    }
+
     pub async fn initialize(config: Config) -> Result<Self, InitializationError> {
         let transport_proxy_groups = db::TransportProxyGroups::parse(
             &config.transport_proxy_groups,
@@ -188,7 +199,7 @@ impl AppState {
             .await
             .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db
-                .migrate_with_credential_pepper(config.key_pepper.as_bytes())
+                .migrate()
                 .await
                 .map_err(|error| InitializationError::Database(error.into()))?;
             migration_db.close().await;
@@ -197,6 +208,21 @@ impl AppState {
             .await
             .map_err(|error| InitializationError::Database(error.into()))?
             .with_terminal_projection_enabled(config.terminal_projection_enabled);
+        db.refresh_http_settings()
+            .await
+            .map_err(InitializationError::Database)?;
+        db.start_http_settings_refresh();
+        let http_clients = db.http_clients.clone();
+        // Runs on every process start rather than behind the migration switch:
+        // a row that still holds a sealed envelope must be rewritten before the
+        // first request reads it, and the recorded schema version keeps every
+        // later start to a single SELECT. A failure here must not stop the
+        // process: an outage is worse than a few unreadable historic rows, and
+        // the next start retries because the version marker is only written on
+        // success.
+        if let Err(error) = db.convert_sealed_state(config.key_pepper.as_bytes()).await {
+            tracing::error!(%error, "converting sealed gateway state failed; serving existing rows");
+        }
         let archive = ArchiveStore::from_config(&config)
             .await
             .map_err(|_| InitializationError::Archive)?;
@@ -268,7 +294,8 @@ impl AppState {
             return Err(InitializationError::Plugin);
         }
 
-        let transport_proxy_groups = Arc::new(transport_proxy_groups);
+        let transport_proxy_groups =
+            Arc::new(transport_proxy_groups.with_http_clients(http_clients.clone()));
         transport_proxy_groups
             .start(&config.database_url)
             .map_err(|_| InitializationError::TransportProxyGroups)?;
@@ -314,8 +341,8 @@ impl AppState {
             proxy_archive_stream_permits: Arc::new(tokio::sync::Semaphore::new(
                 PROXY_ARCHIVE_STREAM_CONCURRENCY,
             )),
-            http: build_http_client().map_err(|_| InitializationError::HttpClient)?,
-            codex_clients: Arc::new(codex_clients::CodexClients::default()),
+            http: http_clients.handle(http_settings::HttpPurpose::General),
+            codex_clients: Arc::new(codex_clients::CodexClients::with_http_clients(http_clients)),
             transport_proxy_groups,
         })
     }
@@ -426,24 +453,19 @@ impl AppState {
     }
 }
 
+#[cfg(test)]
 fn base_http_client_builder() -> reqwest::ClientBuilder {
-    simple_http::install_ring_provider();
-    reqwest::Client::builder()
-        .connect_timeout(HTTP_CONNECT_TIMEOUT)
-        .read_timeout(HTTP_READ_TIMEOUT)
-        .timeout(HTTP_REQUEST_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        // An inherited proxy would perform its own DNS lookup and bypass
-        // resolve_to_addrs pinning. A future trusted proxy must be explicit.
-        .no_proxy()
-        .pool_max_idle_per_host(8)
-        .pool_idle_timeout(Duration::from_secs(30))
+    http_settings::HttpClientFactory::default()
+        .snapshot()
+        .builder(http_settings::HttpPurpose::General)
 }
 
+#[cfg(test)]
 pub(crate) fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
     base_http_client_builder().build()
 }
 
+#[cfg(test)]
 pub(crate) fn build_pinned_http_client(
     hostname: &str,
     addresses: &[std::net::SocketAddr],
@@ -456,6 +478,7 @@ pub(crate) fn build_pinned_http_client(
         .build()
 }
 
+#[cfg(test)]
 pub(crate) fn build_no_retry_http_client(
     proxy_url: Option<&str>,
     pinned_hosts: &[(&str, &[std::net::SocketAddr])],
@@ -463,6 +486,7 @@ pub(crate) fn build_no_retry_http_client(
     no_retry_http_client_builder(proxy_url, pinned_hosts)?.build()
 }
 
+#[cfg(test)]
 fn no_retry_http_client_builder(
     proxy_url: Option<&str>,
     pinned_hosts: &[(&str, &[std::net::SocketAddr])],
@@ -489,6 +513,7 @@ pub(crate) fn build_no_retry_http2_test_client() -> reqwest::Client {
         .unwrap()
 }
 
+#[cfg(test)]
 pub(crate) fn build_explicit_proxy_http_client(
     proxy_url: &str,
     pinned_hosts: &[(&str, &[std::net::SocketAddr])],

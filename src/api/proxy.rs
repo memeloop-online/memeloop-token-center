@@ -1048,7 +1048,10 @@ async fn proxy_with_cancellation_guard(
             RouteSelectionOptions {
                 upstream_account_hint: applied.upstream_account_hint,
                 avoid_route_account,
-                selection_seed,
+                // Native weighted rendezvous balances requests, including within
+                // a session. Session affinity is opt-in through a group policy;
+                // its stable seed is still passed to group_routing::prepare.
+                selection_seed: request_id,
             },
         )
         .await?;
@@ -1089,7 +1092,7 @@ async fn proxy_with_cancellation_guard(
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
-    let mut attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
+    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
     let route_preparation_recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     if let Some(mut candidates) = strategy_candidates {
@@ -1257,7 +1260,6 @@ async fn proxy_with_cancellation_guard(
     }
     let reservation = started_request.reservation;
     admission.finish("completed", None, Some(body.len()));
-    attempt_budget.arm();
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     let client_name = client_name(&headers);
@@ -2615,10 +2617,23 @@ async fn execute_component_provider(
             .await;
         }
     };
+    let timeout = match super::traffic::configured_http_timeout(config) {
+        Ok(timeout) => timeout,
+        Err(_) => {
+            return finish_component_provider_failure(
+                &request,
+                Some("component_request_timeout"),
+                "provider_invalid_config",
+            )
+            .await;
+        }
+    };
     let mut upstream_request = outbound_http
         .request(prepared.method, target)
-        .timeout(component_provider_timeout(config))
         .body(prepared.body);
+    if let Some(timeout) = timeout {
+        upstream_request = upstream_request.timeout(timeout);
+    }
     for (name, value) in prepared.headers {
         let name = match reqwest::header::HeaderName::from_bytes(name.as_bytes()) {
             Ok(name) => name,
@@ -3375,6 +3390,7 @@ async fn finish_buffered_request_before_deadline(
             },
             crate::response_archive_spool::BufferedArchivePurpose::Response,
             body.clone(),
+            request.memory.clone(),
         );
     }
     if let Some(identity) = request.session_preference {
