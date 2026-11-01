@@ -66,6 +66,7 @@ mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
+pub(crate) mod plugin_background_actions;
 mod plugin_configurations;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installations;

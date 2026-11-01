@@ -1,0 +1,31 @@
+package memeloop:background-actions@0.1.0;
+
+/// A pure planner. The guest receives no credential, network, inventory, or
+/// mutation imports. The worker validates every returned intent independently.
+interface planner {
+  record credit {
+    fingerprint: string,
+    granted-at-ms: s64,
+    expires-at-ms: s64,
+  }
+  record context {
+    now-ms: s64,
+    tenant-external-id: string,
+    upstream-account-id: string,
+    authorization-revision: s64,
+    config-json: string,
+    credits: list<credit>,
+    inventory-fingerprint: string,
+  }
+  record reset-credit-intent {
+    credit-fingerprint: string,
+    inventory-fingerprint: string,
+    not-before-ms: s64,
+    deadline-ms: s64,
+  }
+  plan: func(input: context) -> result<option<reset-credit-intent>, string>;
+}
+
+world background-actions-plugin {
+  export planner;
+}

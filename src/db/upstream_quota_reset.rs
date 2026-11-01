@@ -363,10 +363,70 @@ impl Database {
         confirmation_hash: &str,
         idempotency_hash: &str,
     ) -> Result<QuotaResetClaim, AppError> {
+        self.claim_quota_reset_guarded(
+            account,
+            id,
+            actor,
+            confirmation_hash,
+            idempotency_hash,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_quota_reset_guarded(
+        &self,
+        account: &UpstreamAccountView,
+        id: &str,
+        actor: &str,
+        confirmation_hash: &str,
+        idempotency_hash: &str,
+        guard: Option<&crate::upstream_quota::reset::BackgroundResetGuard>,
+    ) -> Result<QuotaResetClaim, AppError> {
         let now = unix_millis();
         let tenant = account.tenant_id.to_string();
         let account_id = account.id.to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write_transaction().await?;
+        if let Some(guard) = guard {
+            if guard.grant.tenant_id != tenant
+                || guard.grant.upstream_account_id != account_id
+                || actor != format!("plugin:{}", guard.grant.plugin_id)
+            {
+                return Err(AppError::Forbidden);
+            }
+            plugin_background_actions::require_grant(
+                &mut tx,
+                self.backend,
+                &guard.grant,
+                &guard.lease_owner,
+                guard.deadline_ms,
+                now,
+            )
+            .await?;
+            // Lock the account and tenant as well as the grant. Credential
+            // rotation, account disable and tenant disable serialize with the
+            // committed dispatch fence rather than racing an MVCC EXISTS read.
+            let query = if matches!(self.backend, DatabaseBackend::PostgreSql) {
+                "SELECT a.credential_generation FROM upstream_accounts a JOIN tenants t ON t.id=a.tenant_id WHERE a.id=$1 AND a.tenant_id=$2 AND a.status='active' AND t.status='active' AND a.driver='openai-codex' AND a.credential_generation=$3 AND a.updated_at=$4 FOR UPDATE OF a,t"
+            } else {
+                "SELECT a.credential_generation FROM upstream_accounts a JOIN tenants t ON t.id=a.tenant_id WHERE a.id=$1 AND a.tenant_id=$2 AND a.status='active' AND t.status='active' AND a.driver='openai-codex' AND a.credential_generation=$3 AND a.updated_at=$4"
+            };
+            sqlx::query_scalar::<_, i64>(query)
+                .bind(&account_id)
+                .bind(&tenant)
+                .bind(account.credential_generation)
+                .bind(account.updated_at)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(AppError::Forbidden)?;
+        }
+        let now = unix_millis();
+        if guard.is_some_and(|guard| now >= guard.deadline_ms) {
+            return Err(AppError::Conflict(
+                "background action deadline elapsed".into(),
+            ));
+        }
         let changed = sqlx::query(
             "UPDATE upstream_quota_reset_operations
              SET state = 'submitted', confirm_idempotency_hash = $1,
@@ -379,6 +439,8 @@ impl Database {
                  SELECT 1 FROM upstream_accounts account
                  WHERE account.id = upstream_account_id AND account.tenant_id = $5
                    AND account.credential_generation = $7 AND account.updated_at = $8
+                   AND account.status = 'active'
+                   AND EXISTS (SELECT 1 FROM tenants t WHERE t.id=$5 AND t.status='active')
                )",
         )
         .bind(idempotency_hash)

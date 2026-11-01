@@ -8,6 +8,193 @@ use crate::{
 
 const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
+// Test binaries alone can redirect the fixed supplier to a loopback fixture.
+// Production builds never read this config key or accept a caller URL.
+#[cfg(test)]
+fn test_supplier_url(account: &UpstreamAccountView, original: &str) -> String {
+    let Some(base) = account
+        .config
+        .get("reset_test_supplier_url")
+        .and_then(Value::as_str)
+    else {
+        return original.to_owned();
+    };
+    let base = url::Url::parse(base).unwrap();
+    assert!(base.scheme() == "http" && base.host_str() == Some("127.0.0.1"));
+    base.join(if original == CONSUME_URL {
+        "consume"
+    } else {
+        "credits"
+    })
+    .unwrap()
+    .to_string()
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CreditEvidence {
+    pub fingerprint: String,
+    pub granted_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+pub(crate) struct CreditInventory {
+    pub credits: Vec<CreditEvidence>,
+    pub fingerprint: String,
+}
+
+pub(crate) struct BackgroundResetGuard {
+    pub grant: crate::db::plugin_background_actions::BackgroundActionGrant,
+    pub lease_owner: String,
+    pub credit_fingerprint: String,
+    pub inventory_fingerprint: String,
+    pub not_before_ms: i64,
+    pub deadline_ms: i64,
+}
+
+pub(super) fn credit_fingerprint(credit: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    // Supplier credit identity, where present, distinguishes equal-count
+    // replacements with otherwise identical lifetime fields. consumeOne does
+    // not accept this identity; it is evidence for a fresh precondition only.
+    let field = |snake: &str, camel: &str| {
+        credit
+            .get(snake)
+            .or_else(|| credit.get(camel))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let evidence = json!({
+        "id": credit.get("id").cloned().unwrap_or_else(||field("credit_id","creditId")),
+        "type": field("reset_type","resetType"),
+        "status": credit.get("status"),
+        "granted": field("granted_at","grantedAt"),
+        "expires": field("expires_at","expiresAt"),
+    });
+    format!("{:x}", Sha256::digest(evidence.to_string().as_bytes()))
+}
+
+fn inventory(snapshot: &QuotaSnapshot, now: i64) -> CreditInventory {
+    use sha2::{Digest, Sha256};
+    let mut credits = snapshot
+        .reset_credits
+        .iter()
+        .filter_map(|credit| {
+            let granted = credit.granted_at?;
+            let expires = credit.expires_at?;
+            (credit.status.as_deref() == Some("available") && granted <= now && now < expires).then(
+                || CreditEvidence {
+                    fingerprint: credit.fingerprint.clone(),
+                    granted_at_ms: granted,
+                    expires_at_ms: expires,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    credits.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+    // Include multiplicity and supplier counts. A same-count replacement is
+    // insufficient evidence even when the selected credit is still present.
+    let evidence = json!({"credits":credits.iter().map(|c|&c.fingerprint).collect::<Vec<_>>(),
+        "available":snapshot.reset_capability.available_credits,
+        "applicable":snapshot.reset_capability.applicable_credits});
+    CreditInventory {
+        credits,
+        fingerprint: format!("{:x}", Sha256::digest(evidence.to_string().as_bytes())),
+    }
+}
+
+pub(crate) async fn background_credit_inventory(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+) -> Result<CreditInventory, AppError> {
+    let snapshot = fresh(state, account, credential, tenant).await?;
+    Ok(inventory(&snapshot, unix_millis()))
+}
+
+fn validate_background_evidence(
+    snapshot: &QuotaSnapshot,
+    guard: &BackgroundResetGuard,
+    now: i64,
+) -> Result<(), AppError> {
+    let current = inventory(snapshot, now);
+    let target = current
+        .credits
+        .iter()
+        .find(|credit| credit.fingerprint == guard.credit_fingerprint)
+        .ok_or_else(blocked)?;
+    if current.fingerprint != guard.inventory_fingerprint
+        || guard.not_before_ms > now
+        || guard.deadline_ms <= now
+        || guard.deadline_ms > target.expires_at_ms
+        || guard.not_before_ms < target.granted_at_ms
+        || guard.not_before_ms >= guard.deadline_ms
+    {
+        return Err(blocked());
+    }
+    Ok(())
+}
+
+/// Only an authorized worker can enter this path. Business identity excludes
+/// runtime/package/config/authorization revisions so upgrades and re-enabling
+/// cannot turn an ambiguous paid operation into a second dispatch.
+pub(crate) async fn background_reset(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    guard: &BackgroundResetGuard,
+) -> Result<QuotaResetOperation, AppError> {
+    let actor = format!("plugin:{}", guard.grant.plugin_id);
+    let key = format!(
+        "background-reset-credit-v1:{}:{}",
+        account.id, guard.credit_fingerprint
+    );
+    // Validate before creating durable work. Out-of-window or replaced credits
+    // never accumulate prepared operations on each scheduler tick.
+    let snapshot = fresh(state, account, credential, &guard.grant.tenant_external_id).await?;
+    validate_background_evidence(&snapshot, guard, unix_millis())?;
+    let prepared = prepare(
+        state,
+        account,
+        credential,
+        &guard.grant.tenant_external_id,
+        &actor,
+        &key,
+    )
+    .await?;
+    if matches!(prepared.operation.state.as_str(), "prepared" | "expired") {
+        state
+            .db
+            .refresh_background_quota_reset_prepare(
+                account,
+                &prepared.operation.id,
+                snapshot
+                    .reset_capability
+                    .available_credits
+                    .ok_or_else(blocked)?,
+                snapshot
+                    .reset_capability
+                    .applicable_credits
+                    .ok_or_else(blocked)?,
+                snapshot.observed_at.ok_or_else(blocked)?,
+                guard,
+            )
+            .await?;
+    }
+    confirm_guarded(
+        state,
+        account,
+        credential,
+        &guard.grant.tenant_external_id,
+        &actor,
+        &prepared.operation.id,
+        &prepared.confirmation_token,
+        &key,
+        Some(guard),
+    )
+    .await
+}
+
 #[derive(Serialize)]
 pub(crate) struct PreparedReset {
     operation: QuotaResetOperation,
@@ -73,13 +260,16 @@ async fn fresh_snapshot(
         proxy_url: credential.proxy().map(|(url, _)| url),
     };
     let refresh_started = tokio::time::Instant::now();
+    let credits_url = CREDITS_URL;
+    #[cfg(test)]
+    let credits_url = test_supplier_url(account, credits_url);
     let reset = match tokio::time::timeout(
         budget.total,
         get_codex_json(
             &state.codex_clients,
             policy,
             auth,
-            CREDITS_URL,
+            credits_url.as_ref(),
             QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
             budget,
             &session,
@@ -291,6 +481,32 @@ pub(crate) async fn confirm(
     token: &str,
     idempotency_key: &str,
 ) -> Result<QuotaResetOperation, AppError> {
+    confirm_guarded(
+        state,
+        account,
+        credential,
+        tenant,
+        actor,
+        operation,
+        token,
+        idempotency_key,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn confirm_guarded(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+    actor: &str,
+    operation: &str,
+    token: &str,
+    idempotency_key: &str,
+    guard: Option<&BackgroundResetGuard>,
+) -> Result<QuotaResetOperation, AppError> {
     if !(32..=256).contains(&token.len()) {
         return Err(blocked());
     }
@@ -321,6 +537,9 @@ pub(crate) async fn confirm(
         };
     }
     let snapshot = fresh(state, account, credential, tenant).await?;
+    if let Some(guard) = guard {
+        validate_background_evidence(&snapshot, guard, unix_millis())?;
+    }
     if snapshot.reset_capability.available_credits != Some(original.available_credits)
         || snapshot.reset_capability.applicable_credits != Some(original.applicable_credits)
         || original.applicable_credits < 1
@@ -355,14 +574,21 @@ pub(crate) async fn confirm(
     .await
     .map_err(|_| temporarily_unavailable("quota_reset_transport_timeout"))?
     .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
+    #[cfg(test)]
+    let http = if account.config.get("reset_test_supplier_url").is_some() {
+        crate::build_no_retry_http_client(None, &[]).unwrap()
+    } else {
+        http
+    };
     let claim = state
         .db
-        .claim_quota_reset(
+        .claim_quota_reset_guarded(
             account,
             operation,
             actor,
             &confirmation_hash,
             &confirm_idempotency_hash,
+            guard,
         )
         .await?;
     let redeem = match claim {
@@ -370,7 +596,21 @@ pub(crate) async fn confirm(
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
     // No automatic retry and no new redeem ID on any ambiguous outcome.
-    let result = dispatch_once(&http, credential, account_header, CONSUME_URL, &redeem).await;
+    let result = if guard.is_some_and(|guard| unix_millis() >= guard.deadline_ms) {
+        Err("quota_reset_deadline_elapsed")
+    } else {
+        let consume_url = CONSUME_URL;
+        #[cfg(test)]
+        let consume_url = test_supplier_url(account, consume_url);
+        dispatch_once(
+            &http,
+            credential,
+            account_header,
+            consume_url.as_ref(),
+            &redeem,
+        )
+        .await
+    };
     drop(_permit);
     let accepted = result.is_ok();
     state
