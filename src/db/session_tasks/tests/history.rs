@@ -151,8 +151,14 @@ async fn session_tasks_history_real_services_acceptance() {
     native(db, &owner, Some(&unrelated), 1_773_027_000_000, "USD").await;
     native(db, &owner, None, 1_773_027_000_000, "USD").await;
     native(db, &foreign_owner, Some(&foreign), 1_773_027_000_000, "USD").await;
+    let archive_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO session_archive_correlations (tenant_id,source,external_request_id,disposition,key_id,principal_id,record_digest,proof_digest,identity_proof_kind,identity_proof_digest,source_model,source_started_at,correlated_at) VALUES ($1,'session-history-fixture',$2,'unlinked',$3,$4,$5,$6,'credential',$7,'session-history',$8,1)")
+        .bind(owner.tenant_id.to_string()).bind(archive_id.to_string())
+        .bind(sibling_owner.key_id.to_string()).bind(sibling_owner.principal_id.to_string())
+        .bind("a".repeat(64)).bind("b".repeat(64)).bind("c".repeat(64))
+        .bind(1_773_030_600_000_i64).execute(&db.pool).await.unwrap();
     sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,protocol,model,input_tokens,output_tokens,imported_at) VALUES ($1,'session-history-fixture',$2,$2,$3,$4,$5,$6,'openai','session-history',3,4,1)")
-        .bind(owner.tenant_id.to_string()).bind(Uuid::now_v7().to_string()).bind(sibling_owner.key_id.to_string())
+        .bind(owner.tenant_id.to_string()).bind(archive_id.to_string()).bind(sibling_owner.key_id.to_string())
         .bind(sibling_owner.principal_id.to_string()).bind(child.session_id.to_string())
         .bind(1_773_030_600_000_i64).execute(&db.pool).await.unwrap();
     let app = crate::api::router(state.clone());
