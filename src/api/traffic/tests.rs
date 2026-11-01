@@ -228,6 +228,15 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
 struct NormalizeLogGate {
     entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    finished: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for NormalizeLogGate {
+    fn drop(&mut self) {
+        if let Some(finished) = self.finished.take() {
+            let _ = finished.send(());
+        }
+    }
 }
 
 impl<Subscriber: tracing::Subscriber> tracing_subscriber::Layer<Subscriber> for NormalizeLogGate {
@@ -269,9 +278,11 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
         };
         let (entered, started) = tokio::sync::oneshot::channel();
         let (release, blocked) = std::sync::mpsc::channel();
+        let (finished, mut exited) = tokio::sync::oneshot::channel();
         let subscriber = tracing_subscriber::registry().with(NormalizeLogGate {
             entered: std::sync::Mutex::new(Some(entered)),
             release: std::sync::Mutex::new(blocked),
+            finished: Some(finished),
         });
         let invocation_state = state.clone();
         let mut caller = Some(tokio::spawn(
@@ -302,17 +313,19 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
         assert_eq!(state.proxy_memory_budget.snapshot().0, admitted);
         let replacement = state.proxy_memory_budget.reservation();
         assert!(!replacement.try_grow(1024 * 1024, 1));
+        assert!(matches!(
+            exited.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         release.send(()).unwrap();
         if let Some(caller) = caller {
             assert_eq!(caller.await.unwrap().unwrap().status, 200);
         }
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while owner.upgrade().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("exited normalize guest releases the existing owner");
+        tokio::time::timeout(Duration::from_secs(5), exited)
+            .await
+            .expect("normalize blocking invocation tears down its dispatch after work exits")
+            .unwrap();
+        assert!(owner.upgrade().is_none());
         assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
         assert!(replacement.try_grow(1024 * 1024, 1));
         drop(replacement);
