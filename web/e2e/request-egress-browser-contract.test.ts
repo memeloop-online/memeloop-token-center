@@ -25,6 +25,8 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       await page.goto(`${origin}/e2e/fixtures/request-egress.html`);
       await page.getByRole('tab', { name: locale === 'zh-CN' ? '代理组' : 'Proxy groups', exact: true }).evaluate((tab: HTMLElement) => tab.click());
+      await page.waitForFunction(() => document.querySelector('.proxy-groups-page [role="tab"][value="groups"]')?.getAttribute('aria-selected') === 'true');
+      await page.getByRole('button', { name: locale === 'zh-CN' ? '新建代理组' : 'Create proxy group', exact: true }).waitFor();
       await page.getByText('Current exit · socks5h://current.proxy.test:1080', { exact: true }).waitFor();
       const summary = page.getByRole('region', { name: copy.title, exact: true });
       await summary.locator('[data-egress-summary]').first().waitFor();

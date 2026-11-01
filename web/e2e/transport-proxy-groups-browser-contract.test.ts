@@ -36,6 +36,10 @@ declare global {
 
 const privateProxySecret = 'socks5h://fixture-user:privateProxySecret@10.20.30.40:1080';
 
+function fieldLabel(label: string): RegExp {
+  return new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\*?$`);
+}
+
 async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab: 'proxies' | 'groups' | 'policies' = 'groups') {
   const copy = transportProxyGroupCopy(locale);
   const networkCopy = networkProxyCopy(locale);
@@ -215,7 +219,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
   if (allowed) {
     const tabName = tab === 'groups' ? copy.title : tab === 'policies' ? networkCopy.policiesTab : networkCopy.proxiesTab;
     await page.getByRole('tab', { name: tabName, exact: true }).click();
-    if (tab === 'policies') await page.getByLabel(networkCopy.account, { exact: true }).waitFor();
+    if (tab === 'policies') await page.getByLabel(fieldLabel(networkCopy.account)).waitFor();
     else await page.getByRole('button', { name: tab === 'groups' ? copy.create : networkCopy.create, exact: true }).waitFor();
   }
   else await page.getByText(copy.denied, { exact: true }).waitFor();
@@ -387,7 +391,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       const sidebar = page.getByRole('link', { name: '网络代理', exact: true });
       assert.equal(await sidebar.getAttribute('aria-current'), 'page');
       assert.match(await sidebar.getAttribute('href') ?? '', /view=proxy-groups/);
-      assert.equal(await workspace.getByLabel('账号', { exact: true }).count(), 0, 'account settings have one home in the policy workspace');
+      assert.equal(await workspace.getByLabel(fieldLabel('账号')).count(), 0, 'account settings have one home in the policy workspace');
       for (const width of [1440, 390]) {
         await page.setViewportSize({ width, height: 1000 });
         const bounds = await workspace.boundingBox();
@@ -443,7 +447,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       const workspace = page.locator('.transport-proxy-workspace');
       await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
       assert.equal(await workspace.count(), 1);
-      assert.equal(await workspace.getByLabel('账号', { exact: true }).inputValue(), 'account-native');
+      assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
       assert.match(page.url(), /view=proxy-groups/);
       const url = new URL(page.url());
       assert.equal(url.searchParams.get('account'), 'account-native');
@@ -454,13 +458,13 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.getByText(transportProxyGroupCopy('zh-CN').denied, { exact: true }).waitFor();
       await installFixture(page, true, 'zh-CN', 'policies');
       await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
-      assert.equal(await workspace.getByLabel('账号', { exact: true }).inputValue(), 'account-native');
+      assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
       await page.goBack();
       await row.waitFor();
       assert.equal(await workspace.count(), 0);
       await page.goForward();
       await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
-      assert.equal(await workspace.getByLabel('账号', { exact: true }).inputValue(), 'account-native');
+      assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
       await page.close();
     });
 
@@ -639,21 +643,21 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       }]; });
       await page.getByRole('tab', { name: copy.policiesTab, exact: true }).click();
       const policies = page.locator('.network-proxy-policy-workspace');
-      await policies.getByLabel(copy.account, { exact: true }).selectOption('account-native');
+      await policies.getByLabel(fieldLabel(copy.account)).selectOption('account-native');
       await policies.getByText(new RegExp(copy.policyLegacy)).waitFor();
-      await policies.getByLabel(copy.targetProxy, { exact: true }).selectOption({ label: 'CSIL 主出口' });
+      await policies.getByLabel(fieldLabel(copy.targetProxy)).selectOption({ label: 'CSIL 主出口' });
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await policies.getByText(copy.policySaved, { exact: true }).waitFor();
       await captureNavigationIdentity(page, 'proxy-groups', 'account-policy-manual', 'zh-CN');
 
-      await policies.getByLabel(copy.mode, { exact: true }).selectOption('auto');
-      await policies.getByLabel(copy.targetGroup, { exact: true }).selectOption({ label: 'CSIL 代理组' });
+      await policies.getByLabel(fieldLabel(copy.mode)).selectOption('auto');
+      await policies.getByLabel(fieldLabel(copy.targetGroup)).selectOption({ label: 'CSIL 代理组' });
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await policies.getByText(copy.policySaved, { exact: true }).waitFor();
-      await policies.getByLabel(copy.mode, { exact: true }).selectOption('plugin');
-      await policies.getByLabel(copy.strategy, { exact: true }).selectOption({ label: 'fixture-latency · 2' });
-      await policies.getByLabel(copy.targetGroup, { exact: true }).selectOption({ label: 'CSIL 代理组' });
-      await policies.getByLabel('minimum_samples', { exact: true }).fill('6');
+      await policies.getByLabel(fieldLabel(copy.mode)).selectOption('plugin');
+      await policies.getByLabel(fieldLabel(copy.strategy)).selectOption({ label: 'fixture-latency · 2' });
+      await policies.getByLabel(fieldLabel(copy.targetGroup)).selectOption({ label: 'CSIL 代理组' });
+      await policies.getByLabel(fieldLabel('minimum_samples')).fill('6');
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await policies.getByText(copy.policySaved, { exact: true }).waitFor();
       await page.waitForFunction(() => window.proxyGroupFixture.writes.length === 6);
@@ -673,18 +677,18 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
 
       await page.getByRole('tab', { name: '代理组', exact: true }).click();
       await page.getByRole('tab', { name: copy.policiesTab, exact: true }).click();
-      await policies.getByLabel(copy.account, { exact: true }).selectOption('account-native');
-      await policies.getByLabel(copy.mode, { exact: true }).waitFor();
-      assert.equal(await policies.getByLabel(copy.mode, { exact: true }).inputValue(), 'plugin');
-      assert.equal(await policies.getByLabel(copy.strategy, { exact: true }).inputValue(), 'fixture-latency\0' + '2');
-      assert.equal(await policies.getByLabel('minimum_samples', { exact: true }).inputValue(), '6');
+      await policies.getByLabel(fieldLabel(copy.account)).selectOption('account-native');
+      await policies.getByLabel(fieldLabel(copy.mode)).waitFor();
+      assert.equal(await policies.getByLabel(fieldLabel(copy.mode)).inputValue(), 'plugin');
+      assert.equal(await policies.getByLabel(fieldLabel(copy.strategy)).inputValue(), 'fixture-latency\0' + '2');
+      assert.equal(await policies.getByLabel(fieldLabel('minimum_samples')).inputValue(), '6');
       await page.evaluate(() => { window.proxyGroupFixture.selection.credential_generation = 20; });
-      await policies.getByLabel('minimum_samples', { exact: true }).fill('7');
+      await policies.getByLabel(fieldLabel('minimum_samples')).fill('7');
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await policies.getByText(copy.errors.selectionConflict, { exact: true }).waitFor();
       assert.equal(await policies.getByRole('button', { name: copy.savePolicy, exact: true }).isEnabled(), false);
       await policies.getByRole('button', { name: copy.refresh, exact: true }).click(); await confirm(page);
-      await policies.getByLabel('minimum_samples', { exact: true }).fill('7');
+      await policies.getByLabel(fieldLabel('minimum_samples')).fill('7');
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await page.waitForFunction(() => window.proxyGroupFixture.writes.length === 8);
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.at(-1)?.body.expected_credential_generation), 20);
