@@ -191,6 +191,12 @@ pub async fn run_until_shutdown_with_oauth_stop(
     let (oauth_stop, oauth_role_shutdown) = watch::channel(false);
     let mut roles = JoinSet::new();
     let mut oauth_refresh_roles = JoinSet::new();
+    let history_state = state.clone();
+    let history_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        crate::request_history::migration::run_worker(history_state, history_shutdown).await;
+        "request_history"
+    });
     let blocking_tasks = BlockingTasks::new();
     let oauth_blocking = blocking_tasks.clone();
     let service_data_blocking = blocking_tasks.clone();

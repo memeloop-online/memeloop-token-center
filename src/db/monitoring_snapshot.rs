@@ -293,6 +293,69 @@ impl Database {
         scope: MonitoringScope,
         filter: MonitoringSnapshotFilter,
     ) -> Result<OperatorMonitoringSnapshot, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let range = validate_monitoring_range_with_limits(filter, false)?;
+            let generated_at = unix_millis();
+            let history_scope = self.history_scope(scope.tenant_external_id()).await?;
+            let result = client
+                .monitoring(crate::request_history::HistoryQuery {
+                    scope: history_scope,
+                    from_created_at: Some(range.from_created_at),
+                    to_created_at: Some(range.to_created_at),
+                    cursor: None,
+                    limit: 500,
+                    predicates: vec![],
+                })
+                .await?;
+            let ids = result
+                .pairs
+                .iter()
+                .map(|p| p.upstream.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let mut transaction = self.pool.begin().await?;
+            let mut counter = MonitoringStatementCounter::default();
+            let healths = upstream_health_batch(&mut transaction, &ids, &mut counter).await?;
+            transaction.commit().await?;
+            let pairs = result
+                .pairs
+                .into_iter()
+                .map(|pair| {
+                    let (upstream_name, health) = healths
+                        .get(&pair.upstream)
+                        .cloned()
+                        .unwrap_or_else(|| ("__retired_upstream__".into(), unknown_health()));
+                    MonitoringUpstreamModel {
+                        upstream_account_id: pair.upstream,
+                        model: pair.model,
+                        upstream_name,
+                        health,
+                        metrics: pair.metrics,
+                        terminal_outcomes: pair.outcomes,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let health = aggregate_health(&result.summary, &pairs);
+            return Ok(OperatorMonitoringSnapshot {
+                contract_version: "v1".into(),
+                generated_at,
+                scope: scope.scope_name().into(),
+                tenant_external_id: scope.tenant_external_id().map(str::to_owned),
+                from_created_at: range.from_created_at,
+                to_created_at: range.to_created_at,
+                granularity: range.granularity.as_str().into(),
+                latency_is_approximate: true,
+                latency_method: "fixed_histogram_upper_bound_capped_60000ms".into(),
+                summary: result.summary,
+                freshness: MonitoringFreshness {
+                    latest_terminal_created_at: result.latest,
+                    age_millis: result.latest.map(|v| generated_at.saturating_sub(v)),
+                },
+                health,
+                top_upstream_models: pairs,
+            });
+        }
         let mut statement_counter = MonitoringStatementCounter::default();
         self.operator_monitoring_snapshot_inner(scope, filter, &mut statement_counter)
             .await
@@ -469,6 +532,13 @@ impl Database {
 fn validate_monitoring_range(
     filter: MonitoringSnapshotFilter,
 ) -> Result<MonitoringRange, AppError> {
+    validate_monitoring_range_with_limits(filter, true)
+}
+
+fn validate_monitoring_range_with_limits(
+    filter: MonitoringSnapshotFilter,
+    bounded: bool,
+) -> Result<MonitoringRange, AppError> {
     if filter.from_created_at < 0
         || filter.to_created_at < 0
         || filter.from_created_at > filter.to_created_at
@@ -478,7 +548,7 @@ fn validate_monitoring_range(
         ));
     }
     let width = filter.to_created_at.saturating_sub(filter.from_created_at);
-    if width > MAX_STATS_RANGE_MILLIS {
+    if bounded && width > MAX_STATS_RANGE_MILLIS {
         return Err(AppError::BadRequest(
             "monitoring snapshot range must not exceed 93 days".into(),
         ));

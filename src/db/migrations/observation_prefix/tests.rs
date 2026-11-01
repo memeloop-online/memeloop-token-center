@@ -63,6 +63,10 @@ async fn conversion_contract(url: &str) {
         "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
         "DROP TABLE application_plugin_release_resolutions",
         "DROP TABLE session_generated_titles",
+        "DROP TABLE session_relationships",
+        "DROP TABLE session_thread_parents",
+        "DROP INDEX conversation_observations_explicit_session_idx",
+        "DROP INDEX request_stats_facts_session_idx",
         "DROP TABLE session_response_summaries",
         "DROP TABLE plugin_installer_network_snapshots",
         "DROP TABLE plugin_installer_network_preferences",
@@ -73,6 +77,17 @@ async fn conversion_contract(url: &str) {
         "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_checked_at",
         "ALTER TABLE request_records DROP COLUMN in_flight_stage",
         "DROP TABLE conversation_media_parts",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    for statement in [
+        "DROP VIEW request_history_source_ids",
+        "DROP TABLE request_history_backfill",
+        "DROP TABLE request_history_export",
+        "DROP TABLE request_history_state",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)

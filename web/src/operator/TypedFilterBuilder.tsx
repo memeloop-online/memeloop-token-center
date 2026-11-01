@@ -37,6 +37,7 @@ const fields: FieldDefinition[] = [
   { id: 'cost_micros', type: 'money_micros', usage: false },
   { id: 'key_alias', type: 'text', usage: true },
   { id: 'principal', type: 'text', usage: false },
+  { id: 'session_association', type: 'text', usage: false },
 ];
 
 const numericOperators: TypedFilterOperator[] = [
@@ -86,6 +87,7 @@ function blankCondition(scope: BuilderScope): TypedFilterCondition {
 
 function operatorsFor(field: FieldDefinition, scope: BuilderScope): TypedFilterOperator[] {
   if (scope === 'usage') return field.id === 'created_at' ? ['between'] : ['equals'];
+  if (field.id === 'session_association') return exactOperators;
   if (field.type === 'timestamp' || field.type === 'integer' || field.type === 'money_micros') return numericOperators;
   if (field.type === 'text' || field.type === 'model') return textOperators;
   return exactOperators;
@@ -94,7 +96,7 @@ function operatorsFor(field: FieldDefinition, scope: BuilderScope): TypedFilterO
 function conditionLabel(condition: TypedFilterCondition, t: (key: string) => string) {
   const value = typeof condition.value.value === 'number'
     ? (condition.value.type === 'timestamp' ? new Date(condition.value.value).toLocaleString() : String(condition.value.value))
-    : condition.value.value;
+    : condition.field === 'session_association' ? t(`filter.association.${condition.value.value}`) : condition.value.value;
   const upper = condition.upper && typeof condition.upper.value === 'number'
     ? (condition.upper.type === 'timestamp' ? new Date(condition.upper.value).toLocaleString() : String(condition.upper.value))
     : condition.upper?.value;
@@ -243,7 +245,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   };
   const selectField = (index: number, fieldId: TypedFilterField) => {
     const field = fieldDefinition(fieldId); const options = operatorsFor(field, scope); const operator = options[0];
-    const value = blankValue(field.type);
+    const value: TypedFilterValue = field.id === 'session_association' ? { type: 'text', value: 'unlinked' } : blankValue(field.type);
     updateCondition(index, { field: field.id, operator, value, upper: operator === 'between' ? blankValue(field.type) : undefined });
     if (draft.conditions[index]?.field === 'created_at' || field.id === 'created_at') { setDraftPreset('custom'); setDraftUsage((current) => ({ ...current, preset: 'custom' })); }
   };
@@ -333,6 +335,7 @@ export function TypedFilterBuilder({ ast, onApply, onClear, scope, token, tenant
   const renderValue = (condition: TypedFilterCondition, index: number, side: 'value' | 'upper') => {
     const value = side === 'value' ? condition.value : condition.upper;
     if (!value) return null;
+    if (condition.field === 'session_association') return <Select value={String(value.value)} disabled={disabled} onChange={(_, data) => setValue(index, side, { type: 'text', value: data.value })}>{['unlinked', 'confirmed'].map(association => <option key={association} value={association}>{t(`filter.association.${association}`)}</option>)}</Select>;
     if (value.type === 'model') return <CatalogModelPicker disabled={disabled} onSelect={(model) => setValue(index, side, { type: 'model', value: model })} tenant={tenant} token={token} value={value.value} />;
     if (value.type === 'protocol') return <Select value={value.value} disabled={disabled} onChange={(_, data) => setValue(index, side, { type: 'protocol', value: data.value as 'openai' | 'anthropic' | 'openai-image' | 'audio-transcription' | 'generation' })}><option value="openai">OpenAI</option><option value="anthropic">Anthropic</option><option value="openai-image">OpenAI Images</option><option value="audio-transcription">OpenAI Audio</option><option value="generation">{t('routes.generation')}</option></Select>;
     if (value.type === 'status') return <Select value={value.value} disabled={disabled} onChange={(_, data) => setValue(index, side, { type: 'status', value: data.value as 'success' | 'error' | 'pending' })}><option value="success">{t('traffic.success')}</option><option value="error">{t('traffic.failure')}</option><option value="pending">{t('common.running')}</option></Select>;
