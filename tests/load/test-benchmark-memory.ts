@@ -22,7 +22,8 @@ test("asset measurement waits for both prior CAS writers and SQL projection, and
   database.exec("CREATE TABLE conversation_projection_outbox(projected_at INTEGER); INSERT INTO conversation_projection_outbox VALUES(NULL)");
   let reads = 0;
   let omitGauge = false;
-  const server = createServer((_request, response) => {
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, "Bearer synthetic-phase-token");
     reads += 1;
     if (reads >= 2) database.exec("UPDATE conversation_projection_outbox SET projected_at = 1");
     response.writeHead(200, { "content-type": "text/plain" });
