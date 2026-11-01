@@ -704,13 +704,27 @@ const zh = {
   'groups.memberCount': '{{count}} 个成员', 'groups.searchMembers': '搜索成员', 'groups.noMatches': '没有匹配项',
   'groups.removeMember': '移除 {{name}}', 'groups.membersSaved': '组成员已保存', 'groups.saveMembers': '保存成员',
   'routes.searchModels': '搜索模型名称', 'routes.noModelMatches': '没有匹配的模型，请尝试公开名称或上游模型名称。',
-  'schema.Preferred accounts, in priority order': '优先账号（按优先顺序）',
-  'schema.Only already-authorized healthy candidates are promoted. This does not read quota or reset times.': '按列表顺序优先选择可用账号，不按额度或重置时间排序。',
-  'schema.Exact provider driver (empty disables preference)': '提供商标识（精确匹配，留空停用偏好）',
-  'schema.Exact quota window ID (empty disables preference)': '额度窗口标识（精确匹配，留空停用偏好）',
-  'groups.strategy': '组路由策略', 'groups.strategyHelp': '选择组内成员的请求分配方式。默认排序适合沿用现有路由优先级的组。',
-  'groups.strategyNative': '默认排序', 'groups.strategyUnavailable': '此策略暂不可用，请重新选择或重试加载',
-  'groups.strategyPriority': '重叠组优先级', 'groups.strategyPriorityHelp': '成员属于多个组时，优先应用数值更大的组；相同时保持固定顺序。',
+  'resourceSelector.unavailable': '当前无法选择此类资源。请刷新页面或选择其他策略。',
+  'groups.strategyRestore': '恢复已保存的设置',
+  'resourceSelector.title': '账号使用顺序',
+  'resourceSelector.search': '搜索账号名称、上游或账号标识',
+  'resourceSelector.missing': '账号已不在可用成员中',
+  'resourceSelector.resolveMissing': '请移除列表中已不可用的账号，再保存策略。',
+  'resourceSelector.noMembers': '本组还没有可选择的账号。请先在上方添加并保存组成员。',
+  'resourceSelector.empty': '选择账号后，可调整优先使用的顺序。',
+  'resourceSelector.allAdded': '可选账号均已添加',
+  'resourceSelector.accountId': '账号标识',
+  'resourceSelector.moveUp': '提高 {{name}} 的优先级',
+  'resourceSelector.moveDown': '降低 {{name}} 的优先级',
+  'resourceSelector.moved': '{{name}} 已移至第 {{position}} 位',
+  'resourceSelector.added': '已添加 {{name}}',
+  'groups.strategyUnnamed': '已安装策略 {{number}}',
+  'groups.strategyCatalogFailed': '暂时无法加载策略。请重试，已填写的内容会保留。',
+  'groups.strategySaveFailed': '暂时无法保存策略。请重试，已填写的内容会保留。',
+  'groups.strategyRefreshAfterSave': '策略已保存，列表暂时无法刷新。可重试刷新。',
+  'groups.strategy': '组路由策略', 'groups.strategyHelp': '设置本组账号的使用顺序。请求会按所选策略分配给可用账号。',
+  'groups.strategyNative': '默认分配', 'groups.strategyUnavailable': '策略插件不可用，请重新选择或重试加载',
+  'groups.strategyPriority': '重叠组优先级', 'groups.strategyPriorityHelp': '账号同时属于多个组时，优先采用数值更大的组策略。',
   'groups.strategySave': '保存组策略', 'groups.strategySaved': '组策略已保存',
   'groups.strategyConflict': '组已被其他操作修改。已刷新版本并保留你的策略草稿，请确认后再次保存。',
   'groups.strategyRefreshFailed': '版本冲突后刷新失败。草稿已保留，请先重试刷新，再保存。', 'groups.strategyMissingGroup': '组已不存在，请刷新组列表。',
@@ -1508,13 +1522,27 @@ const en = {
   'groups.memberCount': '{{count}} members', 'groups.searchMembers': 'Search members', 'groups.noMatches': 'No matches',
   'groups.removeMember': 'Remove {{name}}', 'groups.membersSaved': 'Group members saved', 'groups.saveMembers': 'Save members',
   'routes.searchModels': 'Search model names', 'routes.noModelMatches': 'No matching models. Try a public name or upstream model name.',
-  'schema.Preferred accounts, in priority order': 'Preferred accounts, in priority order',
-  'schema.Only already-authorized healthy candidates are promoted. This does not read quota or reset times.': 'Prefer available accounts in the listed order; quota and reset times do not affect this order.',
-  'schema.Exact provider driver (empty disables preference)': 'Provider ID (exact match; leave empty to disable preference)',
-  'schema.Exact quota window ID (empty disables preference)': 'Quota window ID (exact match; leave empty to disable preference)',
-  'groups.strategy': 'Group routing strategy', 'groups.strategyHelp': 'Choose how requests are distributed among group members. Default ordering suits groups that use their existing route priorities.',
-  'groups.strategyNative': 'Default ordering', 'groups.strategyUnavailable': 'This strategy is unavailable; choose another or retry loading',
-  'groups.strategyPriority': 'Overlapping group priority', 'groups.strategyPriorityHelp': 'For overlapping memberships, higher numbers take precedence; ties keep a fixed order.',
+  'resourceSelector.unavailable': 'These resources are unavailable. Refresh the page or choose another strategy.',
+  'groups.strategyRestore': 'Restore saved settings',
+  'resourceSelector.title': 'Account order',
+  'resourceSelector.search': 'Search account name, provider or account ID',
+  'resourceSelector.missing': 'Account no longer available in this group',
+  'resourceSelector.resolveMissing': 'Remove unavailable accounts from the list before saving.',
+  'resourceSelector.noMembers': 'There are no accounts to choose from. Add and save group members above first.',
+  'resourceSelector.empty': 'Choose accounts, then arrange them in the order to try.',
+  'resourceSelector.allAdded': 'All available accounts have been added',
+  'resourceSelector.accountId': 'Account ID',
+  'resourceSelector.moveUp': 'Move {{name}} up',
+  'resourceSelector.moveDown': 'Move {{name}} down',
+  'resourceSelector.moved': '{{name}} moved to position {{position}}',
+  'resourceSelector.added': 'Added {{name}}',
+  'groups.strategyUnnamed': 'Installed strategy {{number}}',
+  'groups.strategyCatalogFailed': 'Could not load strategies. Retry loading; your changes are preserved.',
+  'groups.strategySaveFailed': 'Could not save the strategy. Retry saving; your changes are preserved.',
+  'groups.strategyRefreshAfterSave': 'Strategy saved, but the list could not refresh. Retry refreshing.',
+  'groups.strategy': 'Group routing strategy', 'groups.strategyHelp': 'Choose how available accounts in this group receive requests.',
+  'groups.strategyNative': 'Default allocation', 'groups.strategyUnavailable': 'Strategy plugin unavailable; choose another or retry loading',
+  'groups.strategyPriority': 'Overlapping group priority', 'groups.strategyPriorityHelp': 'When an account belongs to multiple groups, the strategy with the higher number takes precedence.',
   'groups.strategySave': 'Save group strategy', 'groups.strategySaved': 'Group strategy saved',
   'groups.strategyConflict': 'The group changed elsewhere. Its version was refreshed and your strategy draft was preserved. Review and save again.',
   'groups.strategyRefreshFailed': 'Could not refresh after a version conflict. Your draft is preserved; retry refreshing before saving.', 'groups.strategyMissingGroup': 'This group no longer exists. Refresh the group list.',
@@ -1679,9 +1707,12 @@ export function localizeSchema<T>(schema: T, locale: Locale): T {
   const schemaArrayKeywords = new Set(['allOf', 'anyOf', 'oneOf', 'prefixItems']);
   function visit(node: unknown): unknown {
     if (!node || typeof node !== 'object' || Array.isArray(node)) return node;
+    const metadata = (node as Record<string, unknown>)['x-i18n'];
+    const localized = metadata && typeof metadata === 'object' ? (metadata as Record<string, unknown>)[locale] : undefined;
+    const overrides = localized && typeof localized === 'object' ? localized as Record<string, unknown> : {};
     return Object.fromEntries(Object.entries(node).map(([key, value]) => {
       if ((key === 'title' || key === 'description') && typeof value === 'string') {
-        return [key, translationCatalogs[locale][`schema.${value}`] ?? value];
+        return [key, typeof overrides[key] === 'string' ? overrides[key] : translationCatalogs[locale][`schema.${value}`] ?? value];
       }
       if (schemaMapKeywords.has(key) && value && typeof value === 'object' && !Array.isArray(value)) {
         return [key, Object.fromEntries(Object.entries(value).map(([property, definition]) => {
