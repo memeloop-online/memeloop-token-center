@@ -14,6 +14,180 @@ struct Fixture {
 
 const PEPPER: &[u8] = b"gateway-persistence-acceptance-pepper-over-32-bytes";
 
+/// Delay only the TCP startup. Real PostgreSQL still performs authentication,
+/// session initialization and queries, including after a forced reconnect.
+struct DelayedPostgres {
+    url: url::Url,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DelayedPostgres {
+    async fn new() -> Self {
+        let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+            .expect("archive pool regression requires the CI PostgreSQL service");
+        let mut url = url::Url::parse(&database_url).unwrap();
+        let host = url.host_str().unwrap().to_owned();
+        let port = url.port().unwrap_or(5432);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        url.set_host(Some("127.0.0.1")).unwrap();
+        url.set_port(Some(listener.local_addr().unwrap().port()))
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let host = host.clone();
+                connections.spawn(async move {
+                    let mut server = tokio::net::TcpStream::connect((host.as_str(), port))
+                        .await
+                        .unwrap();
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                });
+            }
+        });
+        Self { url, task }
+    }
+}
+
+impl Drop for DelayedPostgres {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn postgres_archive_pool_cold_reconnect_and_wait_preserve_session_policy() {
+    let proxy = DelayedPostgres::new().await;
+    sqlx::any::install_default_drivers();
+    let persistence =
+        GatewayPersistence::new(proxy.url.as_str(), DatabaseBackend::PostgreSql).unwrap();
+    assert_eq!(persistence.pool.options().get_max_connections(), 1);
+    assert_eq!(persistence.pool.size(), 0, "the pool remains lazy");
+    for _ in 0..2 {
+        let started = tokio::time::Instant::now();
+        let mut connection = persistence.pool.acquire().await.unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(350));
+        for (setting, expected) in [
+            ("statement_timeout", "30s"),
+            ("lock_timeout", "10s"),
+            ("idle_in_transaction_session_timeout", "30s"),
+        ] {
+            let value: String = sqlx::query_scalar("SELECT current_setting($1)")
+                .bind(setting)
+                .fetch_one(&mut *connection)
+                .await
+                .unwrap();
+            assert_eq!(value, expected);
+        }
+        // A healthy statement above the old 250ms limit must finish.
+        sqlx::raw_sql("SELECT pg_sleep(0.35)")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+        let (waiting, ()) = tokio::join!(persistence.pool.acquire(), async {
+            tokio::time::sleep(Duration::from_millis(350)).await;
+            drop(connection);
+        });
+        let mut reused = waiting.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+                .fetch_one(&mut *reused)
+                .await
+                .unwrap(),
+            pid,
+            "waiting for metadata must reuse the connection, not grow the pool"
+        );
+        reused.close().await.unwrap();
+    }
+    persistence.pool.close().await;
+}
+
+#[tokio::test]
+async fn source_metadata_waits_past_two_seconds_without_cancellation_or_replay() {
+    let fixture = Fixture::new().await;
+    let request_id = Uuid::new_v4();
+    let locator =
+        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
+            .unwrap();
+    let body = b"{\"input\":\"metadata queue must not cancel a transaction\"}";
+    let digest = *blake3::hash(body).as_bytes();
+    let reservation = fixture
+        .database
+        .start_proxy_forwarding_request_with_output_limit(
+            StartProxyRequest {
+                request_id,
+                key: &fixture.key,
+                price: &fixture.price,
+                input_token_ceiling: 7,
+                output_token_ceiling: 11,
+                protocol: "openai",
+                model: "isolation",
+                request_object: &locator,
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            None,
+            Some(11),
+        )
+        .await
+        .unwrap();
+    let identity = ArchiveSpoolIdentity {
+        request_id,
+        tenant_id: fixture.key.tenant_id,
+        reservation_id: reservation.id,
+    };
+    let held = fixture
+        .database
+        .hold_gateway_archive_connection_for_test()
+        .await;
+    let pending =
+        fixture
+            .database
+            .persist_request_source(identity, &locator, body.len(), digest, Some(true));
+    let (result, ()) = tokio::join!(pending, async {
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        drop(held);
+    });
+    assert_eq!(result, Some(true), "the first attempt must reach COMMIT");
+    assert_eq!(fixture.database.request_source_write_failures_for_test(), 0);
+    assert_eq!(
+        fixture
+            .database
+            .persist_request_source(identity, &locator, body.len(), digest, Some(true),)
+            .await,
+        Some(false),
+        "a completed staging attempt must not be replayed"
+    );
+    let row = sqlx::query("SELECT state, bound_locator, body_byte_count, body_blake3 FROM request_archive_spools WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("state"), "bound");
+    assert_eq!(row.get::<String, _>("bound_locator"), locator);
+    assert_eq!(row.get::<i64, _>("body_byte_count"), body.len() as i64);
+    assert_eq!(
+        row.get::<String, _>("body_blake3"),
+        blake3::hash(body).to_hex().to_string()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_bound'")
+            .bind(request_id.to_string()).fetch_one(&fixture.database.pool).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM usage_reservations WHERE id = $1")
+            .bind(reservation.id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap(),
+        "reserved",
+        "optional metadata must not change financial responsibility"
+    );
+}
+
 impl Fixture {
     async fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
