@@ -53,7 +53,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await page.getByRole('button', { name: 'Cancel', exact: true }).click();
     await page.getByText('Historical snapshot', { exact: true }).waitFor();
     assert.equal(await page.getByRole('meter').count(), 1, 'unknown usage never renders a zero/full meter');
-    assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).isEnabled(), true);
+    assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).isEnabled(), false);
     for (const [theme, width] of [['light', 1440], ['dark', 390]] as const) {
       await page.evaluate((value) => { document.documentElement.dataset.theme = value; }, theme);
       const styles = await page.evaluate(() => {
