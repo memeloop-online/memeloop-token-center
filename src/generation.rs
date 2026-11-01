@@ -1318,9 +1318,10 @@ pub(crate) async fn provider_asset_is_obtainable(
         .get(reqwest::header::CONTENT_RANGE)
         .and_then(|value| value.to_str().ok())
         .and_then(parse_satisfied_content_range);
-    if GenerationProtocolAdapter::detect(&route.driver, &route.config, &route.upstream_model)
-        == Some(GenerationProtocolAdapter::WasuWanV1)
-        && !wasu_wan::is_mp4_response(response.headers())
+    if matches!(
+        GenerationProtocolAdapter::detect(&route.driver, &route.config, &route.upstream_model),
+        Some(GenerationProtocolAdapter::WasuWanV1 | GenerationProtocolAdapter::TkmarketSeedanceV1)
+    ) && !wasu_wan::is_mp4_response(response.headers())
     {
         return Ok(false);
     }

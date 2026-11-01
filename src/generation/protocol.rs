@@ -119,11 +119,15 @@ impl GenerationProtocolAdapter {
         input: &Value,
     ) -> Result<i64, AppError> {
         match (self, billing_unit) {
-            // No seconds/job conversion or guessed token estimate. The billing
-            // owner must supply reservation and receipt persistence together.
-            (Self::TkmarketSeedanceV1, _) => {
-                Err(super::tkmarket_seedance::settlement_unavailable())
+            // Zero means no supplier-guaranteed token ceiling. Admission requires
+            // the existing metered-unlimited policy, never a guessed hard cap.
+            (Self::TkmarketSeedanceV1, "million_tokens") => {
+                super::tkmarket_seedance::validate_input(input)?;
+                Ok(0)
             }
+            (Self::TkmarketSeedanceV1, _) => Err(AppError::BadRequest(
+                "tkmarket video requires million_tokens customer pricing".into(),
+            )),
             (Self::WasuWanV1, "second") => {
                 super::wasu_wan::validate_input(input)?;
                 Ok(5)

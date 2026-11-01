@@ -26,9 +26,13 @@ fn exact_models_require_an_explicit_profile_and_keep_text_protocols() {
         // A configured seconds/job price must not turn provider tokens into
         // seconds/jobs. Even a token price is insufficient without a native
         // reservation bound and durable supplier receipt in the lifecycle.
-        for unit in ["second", "job", "token", "million_tokens", "megapixel"] {
+        for unit in ["second", "job", "token", "megapixel"] {
             assert!(adapter.estimated_units(unit, &input()).is_err());
         }
+        assert_eq!(
+            adapter.estimated_units("million_tokens", &input()).unwrap(),
+            0
+        );
         let body = submit_body(model, &input()).unwrap();
         assert_eq!(body["model"], *model);
         assert_eq!(body["duration"], 5);

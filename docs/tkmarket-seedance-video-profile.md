@@ -10,26 +10,68 @@ The worker injects the authorized exact upstream model, sends `POST /v1/video/ge
 
 Submission uses the common no-retry HTTP client, common credential injection, durable unknown-delivery quarantine, ACK persistence and lease-fenced polling. It does not assume provider idempotency or cancellation. It never retries with another path after a possibly accepted POST. Asset origin checks use the existing common generation helper; capture, storage and audio contracts remain with PR707.
 
-## Billing integration required before availability
+## Customer billing and supplier audit
 
-The wire adapter is implemented, but admission deliberately rejects every existing generation price unit before reservation, archival or provider submission. The current MTC generation settlement takes a single billed-unit count and cannot durably preserve both native provider tokens and supplier quota alongside an independent customer price. This contribution does not mislabel tokens as seconds/jobs, invent a token estimate or install a synthetic price. It also leaves HTTP account configuration schema changes to that owner: the profile is not yet selectable in the operator form.
+Configure an explicit MTC generation price using the existing management API:
+`POST /internal/v1/generation-prices/{currency}/{public_model}` with
+`{"billing_unit":"million_tokens","price_per_unit":"<approved customer price per million tokens>"}`.
+The price is in the key account's currency. This is an operator-controlled customer
+price; the adapter does not install or derive one from supplier catalogue fees.
+The existing job's `billing_unit_snapshot` and `micros_per_unit_snapshot` freeze
+that price at admission. Later price changes cannot change the job's settlement.
+`billed_units` and usage aggregates count native tokens, as pixel counts do for
+megapixel pricing; `million_tokens` describes the price denominator. The existing
+billing arithmetic rounds the final customer charge up to one currency micro.
 
-The billing owner needs to connect these exact adapter outputs:
+This profile requires an explicitly authorized `metered_unlimited` key. The
+supplier publishes an estimator (`fps: 24`, `extra_frames: 1`), not a guaranteed
+upper bound, so `estimated_units: 0` means unbounded metered usage, with no prepaid
+hold. The existing policy intentionally does not enforce prepaid budget/rate
+limits. Prepaid keys are rejected before submission; no guessed hard token cap is
+introduced. Exact terminal `total_tokens` settles through the existing usage
+reservation, ledger, projection outbox and financial settlement feed.
 
-- `ProviderUsage.total_tokens`: the terminal provider's native video billing token count; positive integer on success.
-- `ProviderUsage.quota`: independent terminal supplier charge in quota units. Running responses are holds, not final charges. Zero is valid and does not imply zero tokens.
-- `ProviderUsage.supplier_usd_micros`: checked `quota * 2`, because the provider documents 500,000 quota per USD. This is supplier cost evidence, never an MTC customer price or invoice.
-- `CompletedVideo`: validated result URL, upstream implementation model name and optional expiry, associated with the already-persisted task ID.
-- `QueryResult::Failed { quota }`: failed-task supplier charge evidence must survive separately from the MTC customer's terminal policy.
+Before result validation or asset probing, the worker persists a task-bound,
+immutable terminal receipt in the existing job result. `result.provider_usage`
+contains `task_id`, `status`, native `total_tokens`, supplier `quota`, checked
+`supplier_usd_micros` (`quota * 2`), and implementation `provider_model_name`.
+Missing or invalid evidence is `null` (unknown), never an invented zero. This
+receipt is supplier-reported charge evidence, not an invoice. Running quota is a
+hold and is not recorded as final cost. `result.customer_price` exposes the frozen
+price denominator, micros and native usage unit. The supplier receipt survives
+malformed terminal output, unavailable assets and uncharged failure. Receipt
+replay must match the same job/task and values; a different receipt conflicts.
 
-Required shared integration: native token reservation using a documented bound and immutable customer price; durable receipt persistence keyed by MTC job/provider task; atomic idempotent settlement with independent supplier costs; then connect the completed receipt to existing provider-asset success and remove the admission guard. Do not merely delete the guard or substitute `total_tokens` for `billed_units` in the current whole-unit price contract. Existing account credentials, prices and quotas remain unchanged until the parent coordinates release and actual tests.
+Success requires valid usage and an obtainable MP4 asset, then atomically commits
+customer settlement and result metadata through the common idempotent terminal
+transaction. Failure charges the customer zero while retaining any known supplier
+cost independently. Unknown delivery remains quarantined with one submit identity.
+Signed asset URLs stay encrypted in the existing provider reference and never
+appear in public job JSON. Reads use the existing owned asset endpoint.
 
-The HTTP configuration owner needs to add this closed profile value, enforce `/v1`, exact allowed model IDs and explicit result origins. PR707 needs no new capture API for this adapter; after billing is connected, the existing provider-asset helper provides the deliverable. Repeatable reads, cross-origin credential isolation, bounded range validation and private signed references remain shared contracts.
+## HTTP account configuration
+
+The existing HTTP JSON schema exposes `video_api: "tkmarket-seedance-v1"`.
+Configuration requires a base URL ending exactly in `/v1`, a nonempty unique
+`video_models` subset of `seedance-2.0-idle-ts` and `seedance-2.5-idle-ts`, nonempty
+exact `result_origins`, and `provider_asset_reads_repeatable: true`. Other models
+on the account keep their existing protocols. Configure an authorized generation
+route and grant for each public model. The model catalogue publishes the closed
+text-only input schema shown above. No live account, credential, route, grant or
+price is changed by this source contribution.
 
 ## Primary evidence and verification boundary
 
 The provider's [documentation application](https://www.tkmarket.ai/docs.html) at immutable asset [index-BFnvIM08.js](https://www.tkmarket.ai/assets/index-BFnvIM08.js) documents the singular paths, envelope, token count and quota conversion. Its [pricing catalogue](https://api.tkmarket.ai/api/pricing) identifies the two exact IDs and PER_TOKEN tiers; catalogue pricing is not an account invoice or MTC customer price. On 2026-10-31, an authenticated GET with an intentionally nonexistent task ID reached the singular query handler (`task_not_exist`), while the plural query path returned HTTP 404. This supports the documented query path; no paid POST was used to probe either path.
 
-CI fixtures cover both exact model IDs through synthetic HTTP submit, queued ACK, in-progress poll, completed poll, output bytes and native token/quota evidence; negative contracts cover identity, input, usage, expiry and admission. The output bytes are synthetic and do not prove a playable video or MTC customer settlement. No production video has been submitted by this contribution.
+Existing GHA Cucumber fixtures exercise the actual MTC HTTP APIs, account validation,
+route/grant, customer price, metered key, idempotent create, provider submit/ACK,
+pending/terminal poll, usage/financial readback and repeatable output bytes for
+both exact IDs. They change the price after admission, replay terminal settlement,
+and reject different usage. Failure cases retain nonzero or unknown supplier
+cost, missing tokens/output, wrong task identity and unknown ACK. Fixtures use
+synthetic keys and bytes; they do not prove playable video. No paid video or
+production deployment is performed by this source contribution. Real minimal
+720p/5s acceptance follows source/CI acceptance in the parent's runtime window.
 
 For MiniMax H3, the [official V2 create](https://platform.minimax.io/docs/api-reference/video-generation-v2-create.md) and [query](https://platform.minimax.io/docs/api-reference/video-generation-v2-query.md) contracts use `MiniMax-H3`, native `768P`, duration 5, `POST /v2/video_generation` and `GET /v2/query/video_generation/{task_id}`. Domestic `hailuo` is not a verified H3 mapping. The existing account review found no configured official MiniMax origin credential; the domestic model lists did not expose an exact H3 ID. This source change therefore does not register an H3 adapter under a guessed alias.

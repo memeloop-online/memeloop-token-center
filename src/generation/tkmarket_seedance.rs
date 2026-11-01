@@ -1,7 +1,7 @@
 //! tkmarket's video-task dialect, deliberately independent of the Ark dialect.
 //! The provider receipt contains billing tokens AND quota; neither is seconds
-//! or an MTC customer price. Admission stays closed until native token
-//! reservation and receipt settlement are supplied by the billing lifecycle.
+//! or an MTC customer price. Native tokens settle against an immutable
+//! customer price through the existing metered-unlimited lifecycle.
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -130,6 +130,14 @@ fn nonnegative_integer(body: &Value, name: &str) -> Result<i64, AppError> {
 }
 
 pub(super) fn query_result(body: &Value, task_id: &str) -> Result<QueryResult, AppError> {
+    query_result_with_loopback(body, task_id, false)
+}
+
+fn query_result_with_loopback(
+    body: &Value,
+    task_id: &str,
+    allow_loopback: bool,
+) -> Result<QueryResult, AppError> {
     validated_upstream_job_id(task_id)?;
     let data = body
         .get("data")
@@ -164,7 +172,15 @@ pub(super) fn query_result(body: &Value, task_id: &str) -> Result<QueryResult, A
             let parsed = url::Url::parse(result_url)
                 .map_err(|_| AppError::upstream("tkmarket_video_invalid_asset"))?;
             if result_url.len() > 16 * 1024
-                || parsed.scheme() != "https"
+                || !(parsed.scheme() == "https"
+                    || (allow_loopback
+                        && parsed.scheme() == "http"
+                        && parsed.host_str().is_some_and(|host| {
+                            host == "localhost"
+                                || host
+                                    .parse::<std::net::IpAddr>()
+                                    .is_ok_and(|ip| ip.is_loopback())
+                        })))
                 || parsed.host_str().is_none()
                 || !parsed.username().is_empty()
                 || parsed.password().is_some()
@@ -207,10 +223,33 @@ pub(super) fn query_result(body: &Value, task_id: &str) -> Result<QueryResult, A
     }
 }
 
-pub(super) fn settlement_unavailable() -> AppError {
-    AppError::BadRequest(
-        "tkmarket video requires native token reservation and separate supplier quota settlement; this billing interface is not available".into(),
-    )
+/// Capture only task-fenced terminal evidence. Incomplete/invalid usage is
+/// unknown, and cannot erase known supplier cost if later validation fails.
+fn terminal_receipt(
+    body: &Value,
+    task_id: &str,
+) -> Option<crate::model::GenerationProviderReceipt> {
+    let data = body.get("data")?;
+    if body.get("code")?.as_str()? != "success" || data.get("task_id")?.as_str()? != task_id {
+        return None;
+    }
+    let status = data.get("status")?.as_str()?;
+    if !matches!(status, "SUCCESS" | "FAILURE") {
+        return None;
+    }
+    let quota = nonnegative_integer(data, "quota").ok();
+    Some(crate::model::GenerationProviderReceipt {
+        task_id: task_id.to_owned(),
+        status: status.to_owned(),
+        total_tokens: nonnegative_integer(data, "total_tokens").ok(),
+        quota,
+        supplier_usd_micros: quota.and_then(|v| v.checked_mul(2)),
+        provider_model_name: data
+            .get("model_name")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty() && v.len() <= 500)
+            .map(str::to_owned),
+    })
 }
 
 pub(super) async fn poll(
@@ -223,7 +262,27 @@ pub(super) async fn poll(
 ) -> Result<(), AppError> {
     let body =
         authenticated_json(state, route, url(&route.base_url, Some(task_id))?, attempt).await?;
-    let result = query_result(&body, task_id)?;
+    if let Some(receipt) = terminal_receipt(&body, task_id) {
+        state
+            .db
+            .record_generation_provider_receipt(job.job_id, worker_id, &receipt)
+            .await?;
+    }
+    let result = match if state.config.allow_oauth_loopback {
+        query_result_with_loopback(&body, task_id, true)
+    } else {
+        query_result(&body, task_id)
+    } {
+        Ok(result) => result,
+        Err(error) => {
+            if terminal_receipt(&body, task_id).is_some() {
+                attempt.invalid_response();
+                return terminal_failure(state, worker_id, job, "tkmarket_video_invalid_terminal")
+                    .await;
+            }
+            return Err(error);
+        }
+    };
     attempt.envelope_valid();
     match result {
         QueryResult::Pending => {
@@ -234,15 +293,34 @@ pub(super) async fn poll(
                 .await
         }
         QueryResult::Failed { quota } => {
-            // Do not discard a nonzero supplier charge by projecting a generic
-            // uncharged failure. No jobs may be admitted before this is wired.
-            let _supplier_quota = quota;
-            Err(settlement_unavailable())
+            debug_assert!(quota >= 0);
+            attempt.valid = true;
+            terminal_failure(state, worker_id, job, "tkmarket_video_generation_failed").await
         }
         QueryResult::Succeeded(video) => {
-            ensure_asset_origin(route, &video.result_url)?;
-            let _verified_receipt = (&video.usage, &video.provider_model_name, video.expires_at);
-            Err(settlement_unavailable())
+            debug_assert!(!video.provider_model_name.is_empty());
+            if ensure_asset_origin(route, &video.result_url).is_err() {
+                attempt.invalid_response();
+                return terminal_failure(state, worker_id, job, "generation_asset_unavailable")
+                    .await;
+            }
+            let asset = provider_generation_asset(
+                job.job_id,
+                0,
+                &video.result_url,
+                video.expires_at,
+                Some("video.mp4"),
+            )?;
+            attempt.valid = true;
+            terminal_provider_success(
+                state,
+                worker_id,
+                job,
+                route,
+                video.usage.total_tokens,
+                vec![asset],
+            )
+            .await
         }
     }
 }
