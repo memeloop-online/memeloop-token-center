@@ -97,8 +97,7 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
-            assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex"))
-                .await;
+            assert_settlement_once_with_inline_request(&fixture, rows[0].request_id).await;
             upstream.verify().await;
             pool.close().await;
         }

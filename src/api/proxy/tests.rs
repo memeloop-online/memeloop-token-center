@@ -3057,6 +3057,26 @@ async fn assert_exactly_once_side_effects_for(
     pool.close().await;
 }
 
+async fn assert_settlement_once_with_inline_request(fixture: &CodexRouteFixture, request_id: Uuid) {
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let row = sqlx::query(
+        "SELECT r.reservation_id, reservation.status AS reservation_status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.reservation_id AND l.kind = 'usage') AS charges, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = r.id) AS facts, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = r.id AND e.event_kind = 'finished') AS finished_events, o.request_json FROM request_records r JOIN usage_reservations reservation ON reservation.id = r.reservation_id LEFT JOIN conversation_projection_outbox o ON o.request_id = r.id WHERE r.id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("reservation_status"), "settled");
+    for field in ["charges", "facts", "finished_events"] {
+        assert_eq!(row.get::<i64, _>(field), 1, "{field}");
+    }
+    if let Some(request_json) = row.get::<Option<String>, _>("request_json") {
+        let request_json: Value = serde_json::from_str(&request_json).unwrap();
+        assert!(request_json.get("input").is_some());
+    }
+    pool.close().await;
+}
+
 fn completed_codex_sse(output: &str) -> String {
     format!(
         concat!(
@@ -4963,7 +4983,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_settlement_once_with_inline_request(&fixture, rows[0].request_id).await;
     let refs = fixture
         .state
         .db
