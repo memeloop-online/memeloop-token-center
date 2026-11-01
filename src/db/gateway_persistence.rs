@@ -440,7 +440,7 @@ impl Database {
             .await
     }
 
-    async fn record_request_source_state(
+    pub(super) async fn record_request_source_state(
         &self,
         identity: ArchiveSpoolIdentity,
         locator: &str,

@@ -1717,8 +1717,24 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
             .fetch_one(&inspection)
             .await
             .unwrap();
+            let reference: memeloop_token_center::archive::ConversationBodyReference =
+                serde_json::from_str(&content).unwrap();
+            let config = memeloop_token_center::config::Config::for_test(database_url.clone());
+            // This integration target links the production library: use the
+            // same fixture archive configuration to restore its actual CAS.
+            let archive = memeloop_token_center::archive::ArchiveStore::from_config(&config)
+                .await
+                .unwrap();
+            let restored = archive
+                .get_tenant_content(
+                    key.tenant_id,
+                    &reference.conversation_body_v1,
+                    reference.conversation_body_v1.size_bytes as usize,
+                )
+                .await
+                .unwrap();
             assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&content).unwrap(),
+                serde_json::from_slice::<serde_json::Value>(&restored).unwrap(),
                 atom.content
             );
         }

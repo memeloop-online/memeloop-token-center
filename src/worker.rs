@@ -1094,6 +1094,22 @@ pub(crate) async fn archive_session_body(
                     .await?;
                 return Ok(false);
             }
+            if locators.source_identity.is_some() {
+                // The writer's lease has been fenced and its actual source is
+                // absent. Keep explicit loss evidence; SQL snapshots are not
+                // substitutes for the missing original request.
+                state
+                    .archive
+                    .publish_raw_capture_failure(tenant_id, request_id, "request")
+                    .await?;
+                return skip_session_body(
+                    state,
+                    lease_owner,
+                    request_id,
+                    "session_body_skipped_missing_source",
+                )
+                .await;
+            }
             return Err(error);
         }
     };

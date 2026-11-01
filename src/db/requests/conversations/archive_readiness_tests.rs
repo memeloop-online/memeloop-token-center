@@ -626,6 +626,10 @@ async fn source_contract(database_url: String) {
         source.release_retained();
         drop(source);
         assert!(String::from_utf8_lossy(&original).contains("provider_secret_field"));
+        // Upload EOF precedes the independent metadata handoff. Drain the real
+        // writer before simulating deletion/restart, so it cannot recreate the
+        // metadata after the fixture removes it.
+        fixture.state.responses_request_spool.drain_uploads().await;
         fixture
             .state
             .db
@@ -973,20 +977,56 @@ async fn lost_source_writer_contract(database_url: String) {
     );
     sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
         .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
-    fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+    fixture.state.db = Database::connect_with_max(&database_url, 4)
+        .await
+        .unwrap()
+        .with_archive(fixture.state.archive.clone());
     assert!(fixture.state.archive.get(&locator).await.is_err());
-    fixture.assert_completed(true).await;
-    fixture
-        .state
-        .db
-        .complete_request_source(
-            fixture.identity,
-            &locator,
-            2,
-            *blake3::hash(b"{}").as_bytes(),
-            true,
-        )
-        .await;
+    let owner = fixture.claim().await;
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let skipped: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&skipped).unwrap()["session_body_skip"],
+        "session_body_skipped_missing_source"
+    );
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        observations, 0,
+        "an aborted original cannot become a fabricated training turn"
+    );
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_failed(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .record_request_source_state(
+                fixture.identity,
+                &locator,
+                2,
+                *blake3::hash(b"{}").as_bytes(),
+                Some(true),
+                false,
+            )
+            .await
+            .unwrap()
+    );
     let state: String =
         sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
             .bind(fixture.request_id.to_string())
