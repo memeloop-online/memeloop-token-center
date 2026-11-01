@@ -4,10 +4,17 @@ use uuid::Uuid;
 
 use super::{AppError, Database};
 
+mod supplier;
+pub(crate) use supplier::SupplierQuotaEvidence;
+#[cfg(test)]
+mod tests;
+
 pub(crate) struct ProbeAccountContext {
     pub(crate) tenant_external_id: String,
     pub(crate) driver: String,
     pub(crate) config: Value,
+    pub(crate) credential_generation: i64,
+    pub(crate) transport_revision: i64,
 }
 
 pub(crate) struct ProbeCatalogRow {
@@ -34,9 +41,9 @@ impl Database {
              LEFT JOIN upstream_service_probes p ON p.upstream_account_id = a.id
              WHERE a.status = 'active'
                AND (
-                 p.checked_at IS NULL
-                 OR (p.status = 'healthy' AND p.checked_at <= $1)
-                 OR (p.status <> 'healthy' AND p.checked_at <= $2)
+                 COALESCE(p.last_attempt_at, p.checked_at) IS NULL
+                 OR (p.status = 'healthy' AND COALESCE(p.last_attempt_at, p.checked_at) <= $1)
+                 OR (p.status <> 'healthy' AND COALESCE(p.last_attempt_at, p.checked_at) <= $2)
                )
              ORDER BY COALESCE(p.checked_at, 0), a.id
              LIMIT $3",
@@ -61,7 +68,8 @@ impl Database {
         account_id: Uuid,
     ) -> Result<Option<serde_json::Value>, AppError> {
         let row = sqlx::query(
-            "SELECT status, error_code, latency_ms, checked_at FROM upstream_service_probes WHERE upstream_account_id = $1",
+            "SELECT status, error_code, latency_ms, checked_at, result_json, last_attempt_json
+             FROM upstream_service_probes WHERE upstream_account_id = $1",
         )
         .bind(account_id.to_string())
         .fetch_optional(&self.pool)
@@ -73,14 +81,37 @@ impl Database {
         let error_code: Option<String> = row.try_get("error_code")?;
         let latency_ms: Option<i64> = row.try_get("latency_ms")?;
         let checked_at: i64 = row.try_get("checked_at")?;
-        Ok(Some(serde_json::json!({
+        let mut result = serde_json::json!({
             "account_id": account_id,
-            "status": status,
-            "error_code": error_code,
-            "latency_ms": latency_ms,
-            "source": "model_probe",
-            "checked_at": checked_at
-        })))
+            "status": "unknown",
+            "source": "legacy_unverified",
+            "checked_at": checked_at,
+            "historical_result": {
+                "status": status,
+                "error_code": error_code,
+                "latency_ms": latency_ms,
+                "checked_at": checked_at
+            }
+        });
+        if let Some(saved) = row.try_get::<Option<String>, _>("result_json")? {
+            result = serde_json::from_str(&saved)
+                .map_err(|_| AppError::internal("probe_result_json"))?;
+        }
+        // A first skipped attempt has no real result, nor historical evidence.
+        if result["source"] == "legacy_unverified" && status == "skipped" {
+            result["status"] = serde_json::json!("skipped");
+            result
+                .as_object_mut()
+                .expect("probe object")
+                .remove("historical_result");
+        }
+        let attempt: Option<String> = row.try_get("last_attempt_json")?;
+        result["last_attempt"] = attempt
+            .map(|saved| serde_json::from_str(&saved))
+            .transpose()
+            .map_err(|_| AppError::internal("probe_attempt_json"))?
+            .unwrap_or(Value::Null);
+        Ok(Some(result))
     }
 
     pub(crate) async fn store_upstream_service_probe(
@@ -102,72 +133,41 @@ impl Database {
             .and_then(|value| value.as_i64())
             .unwrap_or_else(super::unix_millis);
         sqlx::query(
-            "INSERT INTO upstream_service_probes (upstream_account_id, status, error_code, latency_ms, checked_at)
-             VALUES ($1, $2, $3, $4, $5)
+            "INSERT INTO upstream_service_probes
+             (upstream_account_id, status, error_code, latency_ms, checked_at,
+              result_json, last_attempt_json, last_attempt_at, actual_model,
+              credential_generation, transport_revision)
+             SELECT id, $2, $3, $4, $5,
+                    CASE WHEN $2 = 'skipped' THEN NULL ELSE $6 END, $6, $5, $9, $7, $8
+             FROM upstream_accounts WHERE id = $1 AND status = 'active'
+               AND credential_generation = $7 AND updated_at = $8
              ON CONFLICT (upstream_account_id) DO UPDATE SET
-               status = excluded.status,
-               error_code = excluded.error_code,
-               latency_ms = excluded.latency_ms,
-               checked_at = excluded.checked_at",
+               status = CASE WHEN excluded.status = 'skipped' THEN upstream_service_probes.status ELSE excluded.status END,
+               error_code = CASE WHEN excluded.status = 'skipped' THEN upstream_service_probes.error_code ELSE excluded.error_code END,
+               latency_ms = CASE WHEN excluded.status = 'skipped' THEN upstream_service_probes.latency_ms ELSE excluded.latency_ms END,
+               checked_at = CASE WHEN excluded.status = 'skipped' THEN upstream_service_probes.checked_at ELSE excluded.checked_at END,
+               result_json = COALESCE(excluded.result_json, upstream_service_probes.result_json),
+               actual_model = CASE WHEN excluded.status = 'skipped' THEN upstream_service_probes.actual_model ELSE excluded.actual_model END,
+               credential_generation = CASE WHEN excluded.status = 'skipped' THEN upstream_service_probes.credential_generation ELSE excluded.credential_generation END,
+               transport_revision = CASE WHEN excluded.status = 'skipped' THEN upstream_service_probes.transport_revision ELSE excluded.transport_revision END,
+               last_attempt_json = excluded.last_attempt_json,
+               last_attempt_at = excluded.last_attempt_at
+             WHERE COALESCE(upstream_service_probes.last_attempt_at, upstream_service_probes.checked_at) <= excluded.last_attempt_at",
         )
         .bind(account_id.to_string())
         .bind(status)
         .bind(error_code)
         .bind(latency_ms)
         .bind(checked_at)
+        .bind(body.to_string())
+        .bind(body["credential_generation"].as_i64().unwrap_or(-1))
+        .bind(body["transport_revision"].as_i64().unwrap_or(-1))
+        .bind(body["actual_model"].as_str())
         .execute(&self.pool)
         .await?;
+        self.recover_supplier_quota_from_probe(account_id, body)
+            .await?;
         Ok(())
-    }
-
-    /// A completed upstream response is availability evidence. Refresh the
-    /// service probe immediately so a later request is not still ranked or
-    /// badged from the failure this success already disproved.
-    pub(crate) async fn mark_upstream_service_available(
-        &self,
-        account_id: Uuid,
-    ) -> Result<(), AppError> {
-        let now = super::unix_millis();
-        let account_id = account_id.to_string();
-        sqlx::query(
-            "INSERT INTO upstream_service_probes (
-                 upstream_account_id, status, error_code, latency_ms, checked_at
-             ) VALUES ($1, 'healthy', NULL, NULL, $2)
-             ON CONFLICT (upstream_account_id) DO UPDATE SET
-               status = 'healthy',
-               error_code = NULL,
-               latency_ms = NULL,
-               checked_at = excluded.checked_at",
-        )
-        .bind(&account_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        // The exit badge is the same kind of availability. A request that just
-        // succeeded through this account is newer evidence than the last
-        // independent exit probe.
-        sqlx::query(
-            "UPDATE transport_proxy_groups
-                SET last_probe_status = 'healthy', last_probe_checked_at = $2
-              WHERE id = (
-                SELECT group_id FROM transport_proxy_bindings WHERE account_id = $1
-              )",
-        )
-        .bind(&account_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn note_service_available(&self, account_id: Uuid) {
-        if let Err(error) = self.mark_upstream_service_available(account_id).await {
-            tracing::warn!(
-                %account_id,
-                error_category = error.diagnostic_category(),
-                "successful upstream attempt did not refresh service availability"
-            );
-        }
     }
 
     pub(crate) async fn probe_account_context(
@@ -175,7 +175,8 @@ impl Database {
         account_id: Uuid,
     ) -> Result<ProbeAccountContext, AppError> {
         let row = sqlx::query(
-            "SELECT t.external_id, a.driver, a.config_json
+            "SELECT t.external_id, a.driver, a.config_json, a.credential_generation,
+                    a.updated_at AS transport_revision
              FROM upstream_accounts a
              JOIN tenants t ON t.id = a.tenant_id
              WHERE a.id = $1 AND a.status = 'active'",
@@ -190,6 +191,8 @@ impl Database {
             tenant_external_id: row.try_get("external_id")?,
             driver: row.try_get("driver")?,
             config,
+            credential_generation: row.try_get("credential_generation")?,
+            transport_revision: row.try_get("transport_revision")?,
         })
     }
 
@@ -253,7 +256,7 @@ impl Database {
                AND r.enabled = 1
                AND r.archived_at IS NULL
                AND r.protocol IN ('openai', 'anthropic')
-               AND (candidates.upstream_model = $2 OR r.public_model = $2)
+               AND candidates.upstream_model = $2
                AND (
                  EXISTS (
                    SELECT 1 FROM routing_grants g
@@ -268,8 +271,7 @@ impl Database {
                      AND g.route_group_id IS NOT NULL AND membership.model_route_id = r.id
                  )
                )
-             ORDER BY CASE WHEN candidates.upstream_model = $2 THEN 0 ELSE 1 END,
-                      r.priority ASC, r.id ASC
+             ORDER BY r.priority ASC, r.id ASC
              LIMIT 1",
         )
         .bind(account_id.to_string())

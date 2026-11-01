@@ -137,6 +137,7 @@ async fn upgrade_contract(database: &Database) {
         "DROP TABLE transport_proxy_management_audit",
         "DROP TABLE transport_proxy_management_lock",
         "DROP TABLE upstream_service_probes",
+        "DROP TABLE upstream_supplier_availability",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)
@@ -288,7 +289,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 146
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 146, 149
             ]
         );
     }

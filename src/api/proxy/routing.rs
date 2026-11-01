@@ -8,6 +8,8 @@ mod clock;
 mod codex;
 pub(super) mod diagnostics;
 mod http;
+#[cfg(test)]
+pub(super) use http::with_stalled_probe_preparation;
 pub(super) mod kimi;
 mod outcome;
 mod policy;
@@ -28,6 +30,7 @@ pub(super) use clock::credential_application_now;
 #[cfg(test)]
 pub(super) use clock::with_test_credential_application_now_once;
 pub(super) use codex::quota::classify_rate_limit;
+pub(super) use codex::quota::{classify_supplier_quota, quota_evidence};
 #[cfg(test)]
 pub(super) use codex::with_test_pre_delivery_connect_failures;
 #[cfg(test)]

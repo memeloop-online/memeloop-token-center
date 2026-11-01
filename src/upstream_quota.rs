@@ -5,6 +5,8 @@ mod kimi;
 mod normalize;
 pub(crate) mod observations;
 mod proxy;
+#[cfg(test)]
+mod r2_tests;
 pub(crate) mod reset;
 mod retry;
 
@@ -345,6 +347,18 @@ pub(crate) struct QuotaSnapshot {
     /// Low-sensitivity per-endpoint attempt history for this read (including errors).
     attempts: Vec<retry::Attempt>,
     cache_hit: bool,
+    /// Internal supplier-start identity survives singleflight/cache cloning.
+    /// Completion time is never a safe fence for a reset waiter.
+    #[serde(skip)]
+    verification_observation: Option<VerificationObservation>,
+}
+
+#[derive(Clone)]
+struct VerificationObservation {
+    account_id: Uuid,
+    generation: i64,
+    revision: i64,
+    started_at: i64,
 }
 
 #[derive(Clone, Serialize)]
@@ -493,6 +507,7 @@ impl QuotaSnapshot {
             error_code: error,
             attempts: Vec::new(),
             cache_hit: false,
+            verification_observation: None,
         }
     }
 }
@@ -550,8 +565,34 @@ impl QuotaCache {
         tenant: &str,
         trigger: QuotaReadTrigger,
     ) -> QuotaSnapshot {
-        self.read_inner(state, account, credential, tenant, true, trigger)
-            .await
+        let snapshot = self
+            .read_inner(state, account, credential, tenant, true, trigger)
+            .await;
+        // This effect belongs to the accepted-reset caller, not the supplier
+        // read owner (which can be manual/bulk/background). Coalescing stays on.
+        if trigger == QuotaReadTrigger::ResetWorkflow
+            && snapshot.conclusively_allows_codex()
+            && let Some(observation) = &snapshot.verification_observation
+            && observation.account_id == account.id
+            && observation.generation == account.credential_generation
+            && observation.revision == account.updated_at
+            && let Err(error) = state
+                .db
+                .schedule_supplier_quota_verification(
+                    observation.account_id,
+                    observation.generation,
+                    observation.revision,
+                    observation.started_at,
+                )
+                .await
+        {
+            tracing::warn!(
+                upstream_account_id = %account.id,
+                error_category = error.diagnostic_category(),
+                "fresh reset readback could not schedule exact-model verification"
+            );
+        }
+        snapshot
     }
 
     async fn read_inner(
@@ -600,6 +641,8 @@ impl QuotaCache {
         let total_deadline = tokio::time::Instant::now() + QUOTA_TOTAL_READ_BUDGET;
         let flight_deadline =
             total_deadline.min(tokio::time::Instant::now() + QUOTA_SINGLEFLIGHT_WAIT);
+        #[cfg(test)]
+        r2_tests::waiting_for_flight(trigger);
         let Ok(_flight) = tokio::time::timeout_at(flight_deadline, entry.flight.lock()).await
         else {
             tracing::warn!(
@@ -797,6 +840,8 @@ async fn read_codex(
     let credential = &credential;
     let routes = proxy::Routes::from_selection(selection).await?;
     let observation_started_at = unix_millis();
+    #[cfg(test)]
+    r2_tests::observation_started(observation_started_at);
     let recovery_fence = match state
         .db
         .upstream_quota_recovery_fence(
@@ -822,26 +867,32 @@ async fn read_codex(
         .map_err(|_| "credential_invalid")?;
     let account_header = crate::oauth::managed::codex::account_header_value(credential)
         .map_err(|_| "credential_invalid")?;
-    crate::network::validate_codex_transport(
-        USAGE_URL,
-        &json!({"network_scope":"public"}),
-        credential.proxy(),
-        false,
-    )
-    .await
-    .map_err(|_| {
-        tracing::warn!(
-            operation = "quota_supplier_read",
-            upstream_account_id = %account.id,
-            credential_generation = account.credential_generation,
-            endpoint_kind = "quota_client",
-            trigger = trigger.as_str(),
-            phase = "client",
-            error_kind = "destination_invalid",
-            "quota supplier client setup failed"
-        );
-        "quota_destination_invalid"
-    })?;
+    #[cfg(test)]
+    let fixture_transport = r2_tests::fixture_url(USAGE_URL).is_some();
+    #[cfg(not(test))]
+    let fixture_transport = false;
+    if !fixture_transport {
+        crate::network::validate_codex_transport(
+            USAGE_URL,
+            &json!({"network_scope":"public"}),
+            credential.proxy(),
+            false,
+        )
+        .await
+        .map_err(|_| {
+            tracing::warn!(
+                operation = "quota_supplier_read",
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                endpoint_kind = "quota_client",
+                trigger = trigger.as_str(),
+                phase = "client",
+                error_kind = "destination_invalid",
+                "quota supplier client setup failed"
+            );
+            "quota_destination_invalid"
+        })?;
+    }
     let budget = codex_quota_budget(&account.config)?;
     let policy = codex_quota_transport_policy(&account.config, budget)?;
     state
@@ -918,6 +969,14 @@ async fn read_codex(
     snapshot.observed_at = Some(observed_at);
     snapshot.stale_after = Some(observed_at + FRESH_MS);
     snapshot.finalize_reset_capability();
+    snapshot.verification_observation = Some(VerificationObservation {
+        account_id: account.id,
+        generation: account.credential_generation,
+        revision: account.updated_at,
+        started_at: observation_started_at,
+    });
+    #[cfg(test)]
+    r2_tests::before_publish().await;
     if snapshot.conclusively_allows_codex()
         && let Some(recovery_fence) = recovery_fence
     {
@@ -1052,6 +1111,10 @@ async fn get_codex_json_with_routes(
     session: &retry::ReadSession<'_>,
     routes: Option<&proxy::Routes>,
 ) -> Result<Value, &'static str> {
+    #[cfg(test)]
+    let fixture_url = r2_tests::fixture_url(url);
+    #[cfg(test)]
+    let url = fixture_url.as_deref().unwrap_or(url);
     let deadline = session.deadline;
     let route_index = std::sync::atomic::AtomicUsize::new(0);
     let attempt = std::sync::atomic::AtomicUsize::new(0);
@@ -1181,6 +1244,38 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{header, method, path},
     };
+
+    #[test]
+    fn reset_readback_requires_fresh_relevant_allowed_usage_not_credits_or_other_windows() {
+        let account: UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1), "tenant_id":Uuid::from_u128(2), "name":"readback",
+            "driver":"openai-codex", "auth_kind":"oauth", "connection_method":"native_oauth",
+            "credential_generation":1, "status":"active", "config":{}, "can_refresh":true,
+            "can_rotate":false, "can_reauthorize":true, "route_count":0, "created_at":0, "updated_at":10
+        })).unwrap();
+        for (usage, allowed) in [
+            (json!({"credits":{"has_credits":true}}), false),
+            (
+                json!({"code_review_rate_limit":{"allowed":true,"primary_window":{}}}),
+                false,
+            ),
+            (
+                json!({"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{}}}),
+                false,
+            ),
+            (
+                json!({"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{}}}),
+                true,
+            ),
+        ] {
+            let mut snapshot = QuotaSnapshot::empty(&account, "test", None);
+            normalize::usage(&mut snapshot, &usage, 20).unwrap();
+            snapshot.status = "ready";
+            assert_eq!(snapshot.conclusively_allows_codex(), allowed);
+            snapshot.stale = true;
+            assert!(!snapshot.conclusively_allows_codex());
+        }
+    }
 
     #[test]
     fn cache_identity_separates_tenant_rename_and_credential_generation() {

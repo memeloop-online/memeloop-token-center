@@ -68,6 +68,7 @@ async fn conversion_contract(url: &str) {
         "DROP TABLE pending_proxy_settlements",
         "DROP INDEX request_records_live_owner_expiry_idx",
         "DROP TABLE upstream_service_probes",
+        "DROP TABLE upstream_supplier_availability",
         "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_status",
         "ALTER TABLE transport_proxy_groups DROP COLUMN last_probe_checked_at",
         "ALTER TABLE request_records DROP COLUMN in_flight_stage",

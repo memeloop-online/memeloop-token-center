@@ -254,6 +254,7 @@ mod tests {
             error_code: None,
             attempts: Vec::new(),
             cache_hit: false,
+            verification_observation: None,
         }
     }
 
