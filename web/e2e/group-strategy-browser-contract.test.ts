@@ -250,20 +250,19 @@ test('quota choice automatically configures a unique real window and maps one ch
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
     const writes: Record<string, any>[] = [];
     let multiple = false;
+    let failMetadata = false;
     await page.route('**/internal/v1/**', async route => {
       const url = route.request().url();
       if (url.endsWith('/plugins/group-routing-strategies')) await route.fulfill({ json: [{ id: 'quota-order', version: 'group-routing-v1', default: { service: '', allowance: '' }, schema: {
         type: 'object', title: '优先使用即将重置的账号', description: '优先使用额度即将重置的账号', properties: { service: { type: 'string' }, allowance: { type: 'string' } },
         'x-resource-choice': { source: 'group-quota-windows', bindings: { service: 'provider', allowance: 'window_id' }, autoSelectSingle: true },
       } }] });
-      else if (url.endsWith('/upstreams/quota/batch')) {
-        assert.deepEqual(route.request().postDataJSON(), { account_ids: ['alpha', 'beta', 'gamma'], fresh: false, trigger: 'bulk' });
-        await route.fulfill({ json: { contract_version: 'upstream_quota_batch_v1', results: [{ status: 'success', upstream_account_id: 'alpha', snapshot: {
-          provider: 'openai-codex', upstream_account_id: 'alpha', windows: [
-            { id: 'code:primary_window', label: 'code:primary_window', period_seconds: 604800 },
-            ...(multiple ? [{ id: 'code:secondary_window', label: 'code:secondary_window', period_seconds: 18000 }] : []),
-          ],
-        } }] } });
+      else if (url.endsWith('/upstreams/quota/windows')) {
+        if (failMetadata) { await route.fulfill({ status: 503, json: { error: { message: 'unavailable' } } }); return; }
+        assert.deepEqual(route.request().postDataJSON(), { account_ids: ['alpha', 'beta', 'gamma'], tenant_external_id: 'tenant' });
+        await route.fulfill({ json: { results: ['alpha', 'beta', 'gamma'].map(upstream_account_id => ({ upstream_account_id, provider: 'openai-codex', windows: [{ id: 'code:primary_window', label: 'code:primary_window', period_seconds: 604800 }, ...(multiple ? [{ id: 'code:secondary_window', label: 'code:secondary_window', period_seconds: 18000 }] : [])] })) } });
+      } else if (url.endsWith('/upstreams/quota/batch')) {
+        throw new Error('Persisted windows must configure immediately without supplier discovery');
       } else if (route.request().method() === 'PUT') {
         writes.push(route.request().postDataJSON());
         await route.fulfill({ json: { id: 'group', name: 'Group', member_ids: ['alpha', 'beta', 'gamma'], member_count: 3, created_at: 1, updated_at: 2,
@@ -273,7 +272,7 @@ test('quota choice automatically configures a unique real window and maps one ch
     const url = `http://127.0.0.1:${address.port}/e2e/fixtures/group-strategy.html?resources`;
     await page.goto(url);
     await page.getByRole('combobox', { name: '组路由策略', exact: true }).selectOption('quota-order');
-    const choice = page.getByRole('combobox', { name: '额度窗口', exact: true });
+    const choice = page.getByRole('combobox', { name: '优先使用的额度', exact: true });
     await page.waitForFunction(() => document.querySelector<HTMLSelectElement>('.schema-resource-choice select')?.selectedOptions[0]?.textContent === 'Codex · 周额度');
     assert.equal(await page.locator('.group-strategy-editor input:not([type="hidden"]):not([type="number"])').count(), 0);
     await page.getByRole('button', { name: '查看分配方式' }).hover();
@@ -287,6 +286,15 @@ test('quota choice automatically configures a unique real window and maps one ch
     await page.getByRole('button', { name: '保存组策略', exact: true }).click();
     await page.getByText('组策略已保存', { exact: true }).waitFor();
     assert.deepEqual(writes[1].routing_strategy.config, { service: 'openai-codex', allowance: 'code:secondary_window' });
+    failMetadata = true;
+    await page.getByRole('button', { name: 'Remove Beta membership' }).click();
+    await page.getByText('额度窗口读取失败，请重试。').waitFor();
+    assert.match(await choice.locator('option:checked').innerText(), /Codex/);
+    await page.getByLabel('重叠组优先级', { exact: true }).fill('5');
+    await page.getByRole('button', { name: '保存组策略', exact: true }).click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[2].routing_strategy.config, { service: 'openai-codex', allowance: 'code:secondary_window' });
+    assert.equal(writes[2].routing_priority, 5);
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   } finally { await browser.close(); await server.close(); }

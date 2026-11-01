@@ -24,6 +24,39 @@ pub(in crate::api) struct QuotaBatchRequest {
     trigger: crate::upstream_quota::QuotaRequestTrigger,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct QuotaWindowMetadataRequest {
+    account_ids: Vec<Uuid>,
+    tenant_external_id: String,
+}
+
+pub(in crate::api) async fn upstream_quota_windows(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<QuotaWindowMetadataRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "providers:read").await?;
+    let tenant = body.tenant_external_id.trim();
+    if tenant.is_empty()
+        || body.account_ids.is_empty()
+        || body.account_ids.len() > MAX_QUOTA_BATCH_ACCOUNTS
+    {
+        return Err(AppError::BadRequest(
+            "quota window metadata requires a tenant and 1 to 100 account_ids".into(),
+        ));
+    }
+    require_service_tenant(&service, tenant)?;
+    let results = state
+        .db
+        .quota_window_metadata(&body.account_ids, tenant)
+        .await?;
+    Ok((
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({"results": results})),
+    ))
+}
+
 #[derive(Serialize)]
 struct QuotaBatchResponse {
     contract_version: &'static str,

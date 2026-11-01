@@ -27,6 +27,20 @@ pub(crate) struct RoutingQuotaWindow {
     pub exhausted: Option<bool>,
 }
 
+#[derive(Serialize)]
+pub(crate) struct QuotaWindowMetadata {
+    pub upstream_account_id: Uuid,
+    pub provider: String,
+    pub windows: Vec<QuotaWindowDescriptor>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct QuotaWindowDescriptor {
+    pub id: String,
+    pub label: String,
+    pub period_seconds: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct QuotaObservationTarget {
     pub account_id: Uuid,
