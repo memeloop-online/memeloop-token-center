@@ -288,8 +288,6 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
   const origin = `http://127.0.0.1:${address.port}`;
   const browser = await chromium.launch({ headless: true });
   const errors: string[] = [];
-  const expectedReloadWarnings: string[] = [];
-  const documentLifecyclePages = new WeakSet<Page>();
   let activePage: Page | undefined;
   context.afterEach(async child => {
     if (!activePage || activePage.isClosed()) return;
@@ -315,12 +313,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
     page.on('console', message => {
       if (message.type() !== 'error') return;
       const text = `${page.url()}: ${message.text()} @ ${JSON.stringify(message.location())}`;
-      // keyborg 2.14.1 emits this only outside production when browser
-      // document teardown has already removed its refs. Keep the exception
-      // scoped to the one hard-reload/back-forward journey; every other error fails.
-      if (documentLifecyclePages.has(page) && /^Keyborg instance k\d+ is being disposed incorrectly\.$/.test(message.text())
-        && message.location().url.includes('@fluentui_react-components.js')) expectedReloadWarnings.push(text);
-      else errors.push(text);
+      errors.push(text);
     });
     await page.route('**/*', route => {
       const url = new URL(route.request().url());
@@ -465,7 +458,6 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       assert.equal(url.searchParams.get('tenant'), 'fixture');
       assert.equal(await page.getByRole('dialog').count(), 0);
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
-      documentLifecyclePages.add(page);
       await page.reload();
       await page.getByText(transportProxyGroupCopy('zh-CN').denied, { exact: true }).waitFor();
       await installFixture(page, true, 'zh-CN', 'policies');
@@ -783,7 +775,12 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.close();
     });
     assert.doesNotMatch(errors.join('\n'), /privateProxySecret|fixture-user/);
-    assert.ok(expectedReloadWarnings.length <= 1, 'only the documented development-only keyborg teardown warning is tolerated');
-    assert.deepEqual(errors, []);
+    // keyborg 2.14.1 emits this only outside production when the deep-link
+    // page's document teardown has already removed its refs. Match the full
+    // URL, exact library sentence and source; every other error still fails.
+    const expectedReloadWarning = (text: string) => text.includes('/operator?view=proxy-groups&account=account-native&tenant=fixture')
+      && text.includes('Keyborg instance k2 is being disposed incorrectly.') && text.includes('@fluentui_react-components.js');
+    assert.ok(errors.filter(expectedReloadWarning).length <= 1, 'only the documented development-only keyborg teardown warning is tolerated');
+    assert.deepEqual(errors.filter(text => !expectedReloadWarning(text)), []);
   } finally { await browser.close(); await server.close(); }
 });
