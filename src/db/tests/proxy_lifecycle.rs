@@ -2077,7 +2077,18 @@ async fn buffered_settlement_enqueues_while_conversation_content_is_locked() {
     .fetch_one(&database.pool)
     .await
     .unwrap();
-    assert_eq!(queued, (1, 1, 0));
+    assert_eq!(queued, (1, 0, 0));
+    let queued_request: String = sqlx::query_scalar(
+        "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&queued_request).unwrap(),
+        request_json
+    );
 }
 
 #[tokio::test]

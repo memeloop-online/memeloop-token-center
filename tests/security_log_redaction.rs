@@ -46,7 +46,7 @@ impl ArchiveStagingObjectStore for CanaryWorkerStore {
         &self,
         _key: ArchiveStagingKey,
     ) -> Result<(), AppError> {
-        Err(AppError::storage("local_storage_failed"))
+        Err(AppError::BadRequest(WORKER_CANARY.to_owned()))
     }
 
     async fn archive_staging_segment_is_empty(
@@ -154,7 +154,9 @@ async fn proxy_oauth_database_and_object_store_never_log_or_return_canaries() {
             );
         }
         let staging_key = ArchiveStagingKey::new(
-            ArchiveStagingOwner::ProxyRequest(uuid::Uuid::now_v7()),
+            // Proxy request bodies remain protected until their conversation archive commits.
+            // An orphan generation attempt exercises the actual cleanup error boundary.
+            ArchiveStagingOwner::GenerationJob(uuid::Uuid::now_v7()),
             ArchiveStagingPurpose::Request,
             uuid::Uuid::now_v7(),
         )

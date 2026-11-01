@@ -177,7 +177,7 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
     let row = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(row) = sqlx::query(
-                "SELECT request_id, tenant_id, key_id FROM conversation_semantic_payloads",
+                "SELECT request_id, tenant_id, key_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND request_json LIKE '%durable semantic recovery%'",
             )
             .fetch_optional(&holder_pool)
             .await
@@ -189,7 +189,7 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
         }
     })
     .await
-    .expect("owned semantic payload must persist after delivery while content locks remain held");
+    .expect("owned inline outbox evidence must persist after delivery while content locks remain held");
     let request_id: String = row.get("request_id");
     let request_id = Uuid::parse_str(&request_id).unwrap();
     let charges: i64 =

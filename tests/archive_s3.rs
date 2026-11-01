@@ -90,7 +90,13 @@ async fn minio_put_get_list_missing_and_read_limit() {
         .get_bounded(&oversized_location, 1024)
         .await
         .expect_err("bounded read must reject an oversized object");
-    assert!(error.to_string().contains("read limit"));
+    assert!(matches!(
+        error,
+        memeloop_token_center::error::AppError::Storage {
+            code: "archive_object_exceeds_byte_read_limit",
+            ..
+        }
+    ));
 
     // Unsafe tenant/object input must be rejected locally, before it can become an S3 key.
     let unsafe_location = format!("tenants/{unique}/../another-tenant/object.bin");

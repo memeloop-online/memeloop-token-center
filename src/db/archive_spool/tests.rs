@@ -660,7 +660,10 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
     assert!(!task.successful_terminal);
     assert_eq!(task.chunk_count, 1);
     assert_eq!(task.byte_count, body.len() as i64);
-    let chunks = db.load_response_archive_spool_batch(&task, 0).await.unwrap();
+    let chunks = db
+        .load_response_archive_spool_batch(&task, 0)
+        .await
+        .unwrap();
     assert_eq!(chunks.len(), 1);
     assert_eq!(chunks[0].seq, 0);
     assert_eq!(chunks[0].byte_count, body.len() as i64);
@@ -1760,7 +1763,7 @@ async fn sqlite_concurrent_cleanup_workers_serialize_and_both_make_progress() {
 }
 
 #[tokio::test]
-async fn claims_require_terminal_gap_and_fence_old_leases() {
+async fn claims_require_sealed_source_and_fence_old_leases() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());
     assert!(
@@ -1781,13 +1784,6 @@ async fn claims_require_terminal_gap_and_fence_old_leases() {
     db.fail_response_archive_spool(id, "capture_timeout")
         .await
         .unwrap();
-    assert!(
-        db.claim_response_archive_spool(owner)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    terminal(&db, id).await;
     let first = db
         .claim_response_archive_spool(owner)
         .await
@@ -1807,6 +1803,14 @@ async fn claims_require_terminal_gap_and_fence_old_leases() {
     assert_eq!(chunk.seq, 0);
     assert_eq!(chunk.byte_count, 3);
     assert_eq!(chunk.ciphertext, "opaque");
+    assert!(!first.successful_terminal);
+    let completed: Option<i64> =
+        sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id = $1")
+            .bind(id.request_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(completed, None);
     assert!(db.heartbeat_response_archive_spool(&first).await.unwrap());
     let mut forged = first.clone();
     forged.identity.tenant_id = Uuid::new_v4();
