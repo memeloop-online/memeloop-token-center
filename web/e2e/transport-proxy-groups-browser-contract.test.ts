@@ -317,7 +317,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       const text = `${page.url()}: ${message.text()} @ ${JSON.stringify(message.location())}`;
       // keyborg 2.14.1 emits this only outside production when browser
       // document teardown has already removed its refs. Keep the exception
-      // scoped to the one hard-reload step; every other runtime error fails.
+      // scoped to the one hard-reload/back-forward journey; every other error fails.
       if (reloadingFluentPage && /^Keyborg instance k\d+ is being disposed incorrectly\.$/.test(message.text())
         && message.location().url.includes('@fluentui_react-components.js')) expectedReloadWarnings.push(text);
       else errors.push(text);
@@ -470,7 +470,6 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.getByText(transportProxyGroupCopy('zh-CN').denied, { exact: true }).waitFor();
       await installFixture(page, true, 'zh-CN', 'policies');
       await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
-      reloadingFluentPage = false;
       assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
       await page.goBack();
       await row.waitFor();
@@ -478,6 +477,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.goForward();
       await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
       assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
+      reloadingFluentPage = false;
       await page.close();
     });
 
