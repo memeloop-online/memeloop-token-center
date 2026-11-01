@@ -81,7 +81,7 @@ export function summarizeVisibleRequests(requests: readonly RequestView[]): Visi
       if (Number.isFinite(cost)) localCosts.set(currency, (localCosts.get(currency) ?? 0) + cost);
     }
     const outcome = requestOutcome(request);
-    if (outcome === 'running' || outcome === 'delivering') {
+    if (outcome === 'running' || outcome === 'waiting_upstream' || outcome === 'reading_body' || outcome === 'delivering') {
       running += 1;
       continue;
     }
@@ -274,6 +274,10 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     archive_state: mergeArchiveState(previous?.archive_state, event),
     session_context: mergeSessionContext(previous?.session_context, event),
   };
+  const inFlightStage = event.in_flight_stage === 'upstream_response_headers' || event.in_flight_stage === 'upstream_response_body' || event.in_flight_stage === 'response_delivery'
+    ? event.in_flight_stage
+    : previous?.in_flight_stage;
+  if (inFlightStage) request.in_flight_stage = inFlightStage;
   if (event.operational_terminal !== undefined) request.operational_terminal = event.operational_terminal;
   const supplierError = event.supplier_error ?? previous?.supplier_error;
   if (supplierError !== undefined || event.supplier_error === null) request.supplier_error = supplierError ?? null;

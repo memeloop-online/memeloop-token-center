@@ -23,7 +23,7 @@ fn invalid() -> std::io::Error {
 }
 
 fn storage(_: impl std::fmt::Debug) -> AppError {
-    AppError::Storage("archive compressed object integrity failure".into())
+    AppError::storage("archive_compressed_object_integrity_failure")
 }
 
 pub(super) fn frame(plain: &[u8]) -> Result<Bytes, AppError> {

@@ -184,6 +184,7 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     })
     .await
     .expect("large source-backed request must financially settle");
+    drain_completed_response_archive(&fixture).await;
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     assert_eq!(
         fixture.state.responses_request_spool.read_count_for_test(),
@@ -228,9 +229,27 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
         cluster.is_some(),
         "terminal projection must preserve source-backed conversation membership"
     );
-    let expected_atoms =
-        crate::conversation::extract_atoms(&json!({"input": "small semantic input"}));
-    let expected_prefix = crate::conversation::build_prefix(&expected_atoms);
+    let stored_atoms: Vec<String> = sqlx::query_scalar(
+        "SELECT content_json FROM semantic_atoms WHERE content_hash IN (SELECT atom_hash FROM context_nodes)",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        stored_atoms
+            .iter()
+            .all(|content| !content.contains(&"x".repeat(1024))),
+        "会话正文不能收下原始请求 JSON 里的填充"
+    );
+    let return_document = crate::conversation::raw_return_document(
+        completed_codex_sse("projected after EOF").as_bytes(),
+    )
+    .expect("原始返回 JSON");
+    let session_body = crate::conversation::session_body_from_documents(
+        &json!({"input": "small semantic input"}),
+        &return_document,
+    );
+    let (_atoms, nodes) = session_body.into_prefix();
     let leaf: Option<String> = sqlx::query_scalar(
         "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
     )
@@ -240,7 +259,7 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     .unwrap();
     assert_eq!(
         leaf.as_deref(),
-        Some(expected_prefix.last().unwrap().node_hash.as_str())
+        nodes.last().map(|node| node.node_hash.as_str())
     );
     pool.close().await;
     drop(retirement);
@@ -666,7 +685,7 @@ pub(super) async fn pending_response_archive(
             spool.get::<String, _>("tenant_id"),
             spool.get::<String, _>("reservation_id"),
         );
-        let envelope: Value = crate::provider::open_private_json(
+        let envelope: Value = crate::provider::open_envelope(
             sealed,
             fixture.state.config.key_pepper.as_bytes(),
             aad.as_bytes(),

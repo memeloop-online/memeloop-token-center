@@ -1,3 +1,4 @@
+use rust_decimal::{Decimal, prelude::ToPrimitive};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -133,10 +134,11 @@ pub(super) fn input_schema() -> Value {
 }
 
 pub(super) fn url(base: &str, path: &str) -> Result<String, AppError> {
-    let mut parsed = url::Url::parse(base).map_err(|_| AppError::Internal)?;
+    let mut parsed = url::Url::parse(base).map_err(|_| AppError::internal("wasu_wan_url_1"))?;
     if parsed.path() != "/v1" {
-        return Err(AppError::Upstream(
-            "Wasu Wan requires a /v1 base URL".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_url"),
         ));
     }
     parsed.set_path(path);
@@ -148,19 +150,20 @@ pub(super) fn url(base: &str, path: &str) -> Result<String, AppError> {
 pub(super) fn ack_output(body: &Value) -> Result<&Value, AppError> {
     let output = body
         .get("output")
-        .ok_or_else(|| AppError::Upstream("Wasu Wan submit response has no output".into()))?;
+        .ok_or_else(|| AppError::upstream("wasu_wan_submit_response_has_no_output"))?;
     if !matches!(
         output.get("task_status").and_then(Value::as_str),
         Some("PENDING" | "RUNNING" | "SUCCEEDED")
     ) {
-        return Err(AppError::Upstream(
-            "Wasu Wan submit response has no accepted task status".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_ack_output"),
         ));
     }
     let task_id = output
         .get("task_id")
         .and_then(Value::as_str)
-        .ok_or_else(|| AppError::Upstream("Wasu Wan submit response has no task id".into()))?;
+        .ok_or_else(|| AppError::upstream("wasu_wan_submit_response_has_no_task_id"))?;
     validated_upstream_job_id(task_id)?;
     Ok(output)
 }
@@ -168,31 +171,41 @@ pub(super) fn ack_output(body: &Value) -> Result<&Value, AppError> {
 fn poll_output<'body>(body: &'body Value, task_id: &str) -> Result<&'body Value, AppError> {
     let output = body
         .get("output")
-        .ok_or_else(|| AppError::Upstream("Wasu Wan query response has no output".into()))?;
+        .ok_or_else(|| AppError::upstream("wasu_wan_query_response_has_no_output"))?;
     if output.get("task_id").and_then(Value::as_str) != Some(task_id) {
-        return Err(AppError::Upstream(
-            "Wasu Wan query task identity mismatch".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_poll_output"),
         ));
     }
     Ok(output)
+}
+
+fn whole_seconds(value: &Value) -> Option<i64> {
+    let seconds = Decimal::from_str_exact(&value.as_number()?.to_string()).ok()?;
+    if !seconds.fract().is_zero() {
+        return None;
+    }
+    seconds.to_i64()
 }
 
 fn billed_seconds(body: &Value, reserved: i64) -> Result<i64, AppError> {
     let usage = body
         .get("usage")
         .or_else(|| body.pointer("/output/usage"))
-        .ok_or_else(|| AppError::Upstream("Wasu Wan query response has no usage".into()))?;
-    let duration = usage.get("duration").and_then(Value::as_i64);
-    let output_duration = usage.get("output_video_duration").and_then(Value::as_i64);
+        .ok_or_else(|| AppError::upstream("wasu_wan_query_response_has_no_usage"))?;
+    let duration = usage.get("duration").and_then(whole_seconds);
+    let output_duration = usage.get("output_video_duration").and_then(whole_seconds);
     if usage.get("video_count").and_then(Value::as_i64) != Some(1)
         || duration != output_duration
         || duration.is_none_or(|value| value <= 0 || value > reserved)
     {
-        return Err(AppError::Upstream(
-            "Wasu Wan usage violates the reserved seconds contract".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_billed_seconds"),
         ));
     }
-    duration.ok_or(AppError::Internal)
+    duration.ok_or(AppError::internal("wasu_wan_billed_seconds_1"))
 }
 
 pub(super) async fn poll(
@@ -246,8 +259,9 @@ pub(super) async fn poll(
             attempt.valid = true;
             terminal_provider_success(state, worker_id, job, route, billed_units, vec![asset]).await
         }
-        _ => Err(AppError::Upstream(
-            "unknown Wasu Wan generation status".into(),
+        _ => Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("wasu_wan_poll"),
         )),
     }
 }
@@ -375,6 +389,54 @@ mod tests {
         body["usage"]["video_count"] = json!(2);
         assert!(billed_seconds(&body, 5).is_err());
         assert!(billed_seconds(&json!({}), 5).is_err());
+    }
+
+    #[test]
+    fn supplier_decimal_seconds_preserve_the_whole_seconds_contract() {
+        let body: Value = serde_json::from_str(
+            r#"{"usage":{"video_count":1,"duration":5.0,"SR":720,"output_video_duration":5.0,"input_video_duration":0,"fps":30,"ratio":"16:9"}}"#,
+        )
+        .unwrap();
+        assert!(body["usage"]["duration"].as_i64().is_none());
+        assert_eq!(billed_seconds(&body, 5).unwrap(), 5);
+        assert!(billed_seconds(&body, 4).is_err());
+        let mut mixed = body.clone();
+        mixed["usage"]["duration"] = json!(5);
+        assert_eq!(billed_seconds(&mixed, 5).unwrap(), 5);
+        assert_eq!(
+            billed_seconds(&json!({"output": {"usage": body["usage"]}}), 5).unwrap(),
+            5
+        );
+        for invalid in [
+            json!(4.5),
+            json!(0.0),
+            json!(-5.0),
+            json!(6.0),
+            json!("5.0"),
+            json!(null),
+            json!(true),
+            json!(1e30),
+        ] {
+            let mut rejected = body.clone();
+            rejected["usage"]["duration"] = invalid.clone();
+            rejected["usage"]["output_video_duration"] = invalid;
+            assert!(billed_seconds(&rejected, 5).is_err());
+        }
+        for (field, invalid) in [
+            ("duration", json!(4.0)),
+            ("output_video_duration", json!(4.0)),
+            ("video_count", json!(2)),
+            ("video_count", json!(null)),
+        ] {
+            let mut rejected = body.clone();
+            rejected["usage"][field] = invalid;
+            assert!(billed_seconds(&rejected, 5).is_err());
+        }
+        for field in ["duration", "output_video_duration", "video_count"] {
+            let mut rejected = body.clone();
+            rejected["usage"].as_object_mut().unwrap().remove(field);
+            assert!(billed_seconds(&rejected, 5).is_err());
+        }
     }
 
     #[test]

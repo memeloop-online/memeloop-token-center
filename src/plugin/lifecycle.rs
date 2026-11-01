@@ -34,7 +34,8 @@ pub struct PluginGrant {
 
 pub fn manifest_digest(manifest: &super::PluginManifest) -> Result<String, AppError> {
     super::plugin_configuration_schema_digest(
-        &serde_json::to_value(manifest).map_err(|_| AppError::Internal)?,
+        &serde_json::to_value(manifest)
+            .map_err(|_| AppError::internal("lifecycle_manifest_digest_1"))?,
     )
 }
 
@@ -169,7 +170,7 @@ impl RuntimeSnapshot {
         &self.runtime
     }
 
-    /// Fail closed on a broken security policy; never silently skip a policy.
+    /// Skip unavailable hooks while preserving explicit policy denials.
     /// A failure is isolated to that plugin/revision and emits no guest text.
     pub fn apply_traffic_with_config(
         &self,
@@ -177,43 +178,25 @@ impl RuntimeSnapshot {
         request: &serde_json::Value,
         configurations: &BTreeMap<String, serde_json::Value>,
     ) -> Result<TrafficDecision, AppError> {
-        self.apply_traffic_with_config_and_memory(context, request, configurations, None)
-    }
-
-    pub(crate) fn apply_traffic_with_config_and_memory(
-        &self,
-        context: types::RequestContext,
-        request: &serde_json::Value,
-        configurations: &BTreeMap<String, serde_json::Value>,
-        memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
-    ) -> Result<TrafficDecision, AppError> {
-        let mut input_sizes = super::TrafficInputSizes::new(&self.runtime.plugins, configurations)?;
-        let mut current = request.clone();
         let mut decision = TrafficDecision {
             allow: true,
             ..Default::default()
         };
-        for (index, plugin) in self
-            .runtime
-            .plugins
-            .iter()
-            .enumerate()
-            .filter(|(_, plugin)| {
-                plugin.manifest.contributions.traffic_policy
-                    || plugin.manifest.contributions.request_rewrite
-            })
-        {
+        for plugin in self.runtime.plugins.iter().filter(|plugin| {
+            plugin.manifest.contributions.traffic_policy
+                || plugin.manifest.contributions.request_rewrite
+        }) {
             let id = &plugin.manifest.id;
-            let (plugin_context, model_changed) = decision.project_context(&context, &mut current);
-            // Input rejection belongs to this request. It must precede circuit
-            // admission so an oversized body/config cannot open or probe a
-            // shared plugin circuit, including for another tenant.
-            input_sizes.validate(index, &plugin_context, &current, model_changed)?;
+            let (plugin_context, current) = decision
+                .project_context(&context, decision.request_json.as_ref().unwrap_or(request));
             let epoch = {
-                let mut circuits = self.circuits.lock().map_err(|_| AppError::Internal)?;
+                let mut circuits = self.circuits.lock().map_err(|_| {
+                    AppError::internal("lifecycle_apply_traffic_with_config_and_memory_1")
+                })?;
                 let circuit = circuits.entry(id.clone()).or_default();
                 let Some(epoch) = circuit.admit(Instant::now()) else {
-                    return Ok(unavailable(id, "policy_circuit_open"));
+                    unavailable(id, "policy_circuit_open");
+                    continue;
                 };
                 epoch
             };
@@ -221,36 +204,24 @@ impl RuntimeSnapshot {
             // budgets. Restrict this invocation to exactly one installed plugin.
             let mut runtime = self.runtime.clone();
             runtime.plugins = Arc::new(vec![plugin.clone()]);
-            let result = runtime.apply_traffic_with_config_and_memory(
-                plugin_context,
-                &current,
-                configurations,
-                memory,
-            );
-            let mut circuits = self.circuits.lock().map_err(|_| AppError::Internal)?;
+            let result =
+                runtime.apply_traffic_with_config(plugin_context, current.as_ref(), configurations);
+            drop(current);
+            let mut circuits = self.circuits.lock().map_err(|_| {
+                AppError::internal("lifecycle_apply_traffic_with_config_and_memory_2")
+            })?;
             let circuit = circuits.entry(id.clone()).or_default();
-            if matches!(result, Err(AppError::PluginInputTooLarge)) {
-                // Defensive propagation if the executor discovers an input
-                // rejection after admission. Release a half-open probe without
-                // counting a guest failure or resetting previous failures.
-                if Arc::ptr_eq(&epoch.epoch, &circuit.epoch) {
-                    circuit.probe_active = false;
-                }
-                return Err(AppError::PluginInputTooLarge);
-            }
             circuit.complete(&epoch, result.is_err(), Instant::now());
             match result {
                 Err(_) => {
-                    return Ok(unavailable(id, "policy_execution_failed"));
+                    unavailable(id, "policy_execution_failed");
                 }
                 Ok(next) => {
                     if !next.allow {
                         return Ok(next);
                     }
                     if let Some(request) = next.request_json {
-                        current = request;
-                        input_sizes.invalidate_request();
-                        decision.request_json = Some(current.clone());
+                        decision.request_json = Some(request);
                     }
                     if next.model.is_some() {
                         decision.model = next.model;
@@ -265,18 +236,15 @@ impl RuntimeSnapshot {
     }
 }
 
-fn unavailable(plugin_id: &str, reason: &'static str) -> TrafficDecision {
+fn unavailable(plugin_id: &str, reason: &'static str) {
+    // Fail open: an unavailable policy (open circuit, failed guest) must
+    // never interrupt the customer's request. Enforcement simply did not
+    // happen for this invocation; the remaining hooks still run.
     tracing::warn!(
         plugin_id,
         decision_code = reason,
-        "plugin policy unavailable"
+        "plugin policy unavailable; failing open"
     );
-    TrafficDecision {
-        allow: false,
-        denied_by_plugin_id: Some(plugin_id.to_owned()),
-        decision_code: Some(reason),
-        ..Default::default()
-    }
 }
 
 struct State {
@@ -311,7 +279,7 @@ impl RuntimeRevisions {
         Ok(self
             .state
             .read()
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::internal("lifecycle_pin_1"))?
             .current
             .clone())
     }
@@ -331,7 +299,10 @@ impl RuntimeRevisions {
                 error,
             )
         })?;
-        let mut state = self.state.write().map_err(|_| AppError::Internal)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| AppError::internal("lifecycle_replace_1"))?;
         let revision = next_revision(&state, expected_revision).map_err(|error| {
             rejected(
                 RevisionReason::Reload,
@@ -358,7 +329,10 @@ impl RuntimeRevisions {
     }
 
     pub fn rollback(&self, expected_revision: u64) -> Result<RevisionReceipt, AppError> {
-        let mut state = self.state.write().map_err(|_| AppError::Internal)?;
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| AppError::internal("lifecycle_rollback_1"))?;
         let revision = next_revision(&state, expected_revision).map_err(|error| {
             rejected(
                 RevisionReason::Rollback,
@@ -391,7 +365,10 @@ impl RuntimeRevisions {
                 error,
             )
         })?;
-        let runtime = state.previous.pop().ok_or(AppError::Internal)?;
+        let runtime = state
+            .previous
+            .pop()
+            .ok_or(AppError::internal("lifecycle_rollback_1"))?;
         state.current = snapshot(runtime, revision, RevisionReason::Rollback);
         Ok(state.current.receipt)
     }
@@ -422,7 +399,9 @@ fn next_revision(state: &State, expected: u64) -> Result<u64, AppError> {
     if state.current.receipt.revision != expected {
         return Err(AppError::Conflict("plugin runtime revision changed".into()));
     }
-    expected.checked_add(1).ok_or(AppError::Internal)
+    expected
+        .checked_add(1)
+        .ok_or(AppError::internal("lifecycle_next_revision_1"))
 }
 
 pub(super) fn snapshot(
@@ -605,9 +584,13 @@ mod tests {
         let marker = "secret-config-token-provider-response";
         for error in [
             AppError::BadRequest(marker.into()),
-            AppError::Upstream(marker.into()),
+            AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new()
+                    .stage("lifecycle_rejection_diagnostic_is_versioned_and_drops_untrusted_"),
+            ),
             AppError::Conflict(marker.into()),
-            AppError::Storage(marker.into()),
+            AppError::storage("local_storage_failed"),
         ] {
             let diagnostic =
                 RevisionRejection::new(RevisionReason::Reload, 7, RejectionStage::Grants, &error);

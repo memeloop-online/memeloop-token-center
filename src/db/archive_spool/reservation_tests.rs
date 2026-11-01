@@ -148,7 +148,7 @@ async fn reserved_capture_rollback_restores_credit_and_release_refunds_only_once
 }
 
 #[tokio::test]
-async fn reservations_preserve_the_global_capacity_boundary() {
+async fn reservations_account_past_the_former_capacity_boundary() {
     let (_directory, db, id) = fixture().await;
     let body = bytes::Bytes::from_static(b"capacity boundary");
     let archive = crate::response_archive_spool::BufferedArchive::new(
@@ -168,12 +168,13 @@ async fn reservations_preserve_the_global_capacity_boundary() {
     .execute(&db.pool)
     .await
     .unwrap();
-    assert!(
-        db.reserve_buffered_archive_capacity(&archive)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let overflow = db
+        .reserve_buffered_archive_capacity(&archive)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT + 1);
+    overflow.release().await;
     assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT - amount + 1);
     sqlx::query(
         "UPDATE response_archive_spool_budget
@@ -189,18 +190,19 @@ async fn reservations_preserve_the_global_capacity_boundary() {
         .unwrap()
         .unwrap();
     assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT);
-    assert!(
-        db.reserve_buffered_archive_capacity(&archive)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let second = db
+        .reserve_buffered_archive_capacity(&archive)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT + amount);
+    second.release().await;
     reservation.release().await;
     assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT - amount);
 }
 
 #[tokio::test]
-async fn concurrent_request_reservations_cannot_cross_the_purpose_boundary() {
+async fn concurrent_request_reservations_account_every_body_across_the_former_boundary() {
     let (_directory, db, id) = fixture().await;
     let body = bytes::Bytes::from_static(b"one remaining request archive slot");
     let sample = crate::response_archive_spool::BufferedArchive::new(
@@ -249,9 +251,11 @@ async fn concurrent_request_reservations_cannot_cross_the_purpose_boundary() {
             reservations.push(reservation);
         }
     }
-    assert_eq!(reservations.len(), 1);
-    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT);
-    reservations[0].release().await;
+    assert_eq!(reservations.len(), 8);
+    assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT + 7 * amount);
+    for reservation in reservations {
+        reservation.release().await;
+    }
     assert_eq!(budget(&db).await, REQUEST_CIPHER_LIMIT - amount);
 }
 
@@ -292,18 +296,18 @@ async fn response_pressure_cannot_consume_request_archive_partition() {
         false,
     )
     .unwrap();
-    assert!(
-        db.reserve_buffered_archive_capacity(&response_archive)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let response_reservation = db
+        .reserve_buffered_archive_capacity(&response_archive)
+        .await
+        .unwrap()
+        .unwrap();
+    response_reservation.release().await;
     request_reservation.release().await;
     assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
 }
 
 #[tokio::test]
-async fn streaming_and_buffered_response_admission_share_one_slot_boundary() {
+async fn streaming_and_buffered_response_admission_continue_past_the_former_slot_boundary() {
     let (_directory, db, first_stream) = fixture().await;
     let second_stream = ArchiveSpoolIdentity {
         request_id: Uuid::new_v4(),
@@ -377,7 +381,7 @@ async fn streaming_and_buffered_response_admission_share_one_slot_boundary() {
     .unwrap();
     assert_eq!(active_slots, ARCHIVE_SLOT_LIMIT);
     assert!(
-        !db.begin_response_archive_spool(second_stream)
+        db.begin_response_archive_spool(second_stream)
             .await
             .unwrap()
     );

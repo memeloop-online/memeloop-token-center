@@ -597,7 +597,10 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
     assert!(matches!(
         db.start_proxy_request_with_archive(input(), &body, pepper)
             .await,
-        Err(AppError::Overloaded)
+        Err(AppError::Capacity {
+            code: "request_archive_capture_failed",
+            ..
+        })
     ));
     let reservations: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_reservations WHERE key_id = $1")
@@ -610,8 +613,13 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
         "request_records",
         "request_record_locators",
         "request_events",
+        "request_archive_spools",
+        "request_archive_spool_chunks",
     ] {
-        let column = if table == "request_events" {
+        let column = if matches!(
+            table,
+            "request_events" | "request_archive_spools" | "request_archive_spool_chunks"
+        ) {
             "request_id"
         } else {
             "id"
@@ -641,6 +649,23 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
         reservation.id.to_string()
     );
     assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
+    // Durable request capture is uploadable before settlement, including
+    // recovery after admission commits but its acknowledgement is lost.
+    let retained = budget(&db).await;
+    let task = db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("committed request capture is uploadable before settlement");
+    assert_eq!(task.identity.request_id, request_id);
+    assert_eq!(task.identity.tenant_id, key.tenant_id);
+    assert_eq!(task.identity.reservation_id, reservation.id);
+    assert_eq!(task.purpose, BufferedArchivePurpose::Request);
+    assert!(!task.successful_terminal);
+    assert_eq!(task.byte_count, body.len() as i64);
+    assert_eq!(task.chunk_count, 1);
+    assert!(retained > 0);
+    assert_eq!(budget(&db).await, retained);
     assert!(
         db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
             .await
@@ -650,7 +675,7 @@ async fn durable_admission_rolls_back_reservation_record_event_and_spool_togethe
 }
 
 #[tokio::test]
-async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool_capacity() {
+async fn request_above_legacy_plain_limit_archives_the_raw_bytes() {
     use crate::db::{CreateKeyInput, RequestArchiveAdmission, StartProxyRequest};
     let (_dir, db, _) = fixture().await;
     let pepper = b"archive-retention-limit-pepper-over-32-bytes";
@@ -681,7 +706,7 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
         .unwrap();
     let request_id = Uuid::new_v4();
     let locator = format!("gap://{request_id}/request");
-    let body = bytes::Bytes::from(vec![b'x'; REQUEST_ARCHIVE_PLAIN_LIMIT.saturating_add(1)]);
+    let body = bytes::Bytes::from(vec![b'x'; 16 * 1024 * 1024 + 1]);
     let admitted = db
         .start_proxy_request_with_archive(
             StartProxyRequest {
@@ -703,28 +728,22 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
         .unwrap();
     assert_eq!(
         admitted.archive_admission,
-        RequestArchiveAdmission::GapRetentionLimit
+        RequestArchiveAdmission::Captured
     );
-    assert_eq!(budget(&db).await, 0);
-    let gap = sqlx::query(
-        "SELECT state, last_error_code, gap_reason, body_byte_count, body_blake3, cipher_bytes,
-                cleaned_at
+    assert!(budget(&db).await > 0);
+    let stored = sqlx::query(
+        "SELECT state, byte_count, cipher_bytes, gap_reason, cleaned_at
          FROM request_archive_spools WHERE request_id = $1",
     )
     .bind(request_id.to_string())
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(gap.get::<String, _>("state"), "gap");
-    assert_eq!(gap.get::<String, _>("last_error_code"), "capacity");
-    assert_eq!(gap.get::<String, _>("gap_reason"), "retention_limit");
-    assert_eq!(gap.get::<i64, _>("body_byte_count"), body.len() as i64);
-    assert_eq!(
-        gap.get::<String, _>("body_blake3"),
-        blake3::hash(&body).to_hex().to_string()
-    );
-    assert_eq!(gap.get::<i64, _>("cipher_bytes"), 0);
-    assert!(gap.get::<Option<i64>, _>("cleaned_at").is_some());
+    assert_eq!(stored.get::<String, _>("state"), "pending");
+    assert_eq!(stored.get::<i64, _>("byte_count"), body.len() as i64);
+    assert!(stored.get::<i64, _>("cipher_bytes") > 0);
+    assert!(stored.get::<Option<String>, _>("gap_reason").is_none());
+    assert!(stored.get::<Option<i64>, _>("cleaned_at").is_none());
     sqlx::query(
         "UPDATE request_records
          SET completed_at = 2, status_code = 200,
@@ -741,15 +760,14 @@ async fn request_above_archive_retention_limit_keeps_auditable_gap_without_spool
         .unwrap();
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Gap
+        crate::model::RequestArchiveState::Pending
     );
-    assert_eq!(
-        refs.request_archive_reason.as_deref(),
-        Some("retention_limit")
-    );
+    assert!(refs.request_archive_reason.is_none());
+    let charged = budget(&db).await;
+    assert!(charged > 0);
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
     assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
-    assert_eq!(budget(&db).await, 0);
+    assert_eq!(budget(&db).await, charged);
 }
 
 #[tokio::test]
@@ -954,7 +972,7 @@ async fn buffered_atomic_capture_shares_budget_and_rolls_back_all_chunks() {
         .await
         .unwrap();
     assert!(
-        !db.capture_buffered_archive_spool(id, BufferedArchivePurpose::Response, &chunks)
+        db.capture_buffered_archive_spool(id, BufferedArchivePurpose::Response, &chunks)
             .await
             .unwrap()
     );
@@ -962,9 +980,9 @@ async fn buffered_atomic_capture_shares_budget_and_rolls_back_all_chunks() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(count, 0);
+    assert_eq!(count, 1);
     sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
-        .bind(request_budget)
+        .bind(request_budget * 2)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -1237,14 +1255,17 @@ async fn identity_sequence_replay_and_exact_quota() {
     );
     assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
     assert!(
-        !db.append_response_archive_spool(id, 2, 8, "x")
+        db.append_response_archive_spool(id, 2, 8, "x")
             .await
             .unwrap()
     );
-    assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
+    assert_eq!(
+        budget(&db).await,
+        RESPONSE_CIPHER_LIMIT + 1 + CHUNK_OVERHEAD
+    );
     assert!(!db.seal_response_archive_spool(id, 2, 15).await.unwrap());
-    assert!(db.seal_response_archive_spool(id, 2, 16).await.unwrap());
-    assert!(db.seal_response_archive_spool(id, 2, 16).await.unwrap());
+    assert!(db.seal_response_archive_spool(id, 3, 24).await.unwrap());
+    assert!(db.seal_response_archive_spool(id, 3, 24).await.unwrap());
     assert!(
         !db.append_response_archive_spool(id, 2, 1, "x")
             .await
@@ -1395,11 +1416,14 @@ async fn gap_cleanup_immediately_releases_exact_cipher_bytes_and_preserves_audit
             .unwrap()
     );
     assert!(
-        !db.append_response_archive_spool(id, 1, 1, "x")
+        db.append_response_archive_spool(id, 1, 1, "x")
             .await
             .unwrap()
     );
-    assert_eq!(budget(&db).await, SPOOL_OVERHEAD + 8 + CHUNK_OVERHEAD);
+    assert_eq!(
+        budget(&db).await,
+        SPOOL_OVERHEAD + 8 + CHUNK_OVERHEAD + 1 + CHUNK_OVERHEAD
+    );
     db.fail_response_archive_spool(id, "payload-bearing-untrusted-reason")
         .await
         .unwrap();
@@ -1424,12 +1448,12 @@ async fn gap_cleanup_immediately_releases_exact_cipher_bytes_and_preserves_audit
         .await
         .unwrap();
     assert_eq!(rows, 1);
-    let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE state = 'gap' AND cleaned_at IS NOT NULL AND byte_count = $1").bind(PLAIN_LIMIT).fetch_one(&db.pool).await.unwrap();
+    let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE state = 'gap' AND cleaned_at IS NOT NULL AND byte_count = $1").bind(PLAIN_LIMIT + 1).fetch_one(&db.pool).await.unwrap();
     assert_eq!(audit, 1);
 }
 
 #[tokio::test]
-async fn exhausted_upload_gap_is_immediately_cleanup_eligible() {
+async fn repeated_upload_failures_keep_ciphertext_retryable() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());
     assert!(
@@ -1458,21 +1482,18 @@ async fn exhausted_upload_gap_is_immediately_cleanup_eligible() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(row.get::<String, _>("state"), "gap");
+    assert_eq!(row.get::<String, _>("state"), "pending");
     assert_eq!(row.get::<String, _>("last_error_code"), "upload_failed");
-    assert_eq!(
-        row.get::<i64, _>("expires_at"),
-        row.get::<i64, _>("updated_at")
-    );
-    assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 1);
-    assert_eq!(budget(&db).await, 0);
+    assert!(row.get::<i64, _>("expires_at") > row.get::<i64, _>("updated_at"));
+    assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 0);
+    assert_eq!(budget(&db).await, SPOOL_OVERHEAD + CHUNK_OVERHEAD + 10);
     let audit: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM response_archive_spools WHERE state = 'gap' AND cleaned_at IS NOT NULL AND last_error_code = 'upload_failed'",
     )
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(audit, 1);
+    assert_eq!(audit, 0);
 }
 
 #[test]
@@ -1521,6 +1542,151 @@ async fn cleanup_time_budget_stops_between_committed_batches() {
 }
 
 #[tokio::test]
+async fn cleanup_preserves_unsettled_requests_until_their_retention_expires() {
+    let (_dir, db, abandoned) = fixture().await;
+    let fresh = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    let bound = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    let completed = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    let wrong_tenant = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    let wrong_reservation = ArchiveSpoolIdentity {
+        request_id: Uuid::new_v4(),
+        ..abandoned
+    };
+    for identity in [fresh, bound, completed, wrong_tenant, wrong_reservation] {
+        sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, reservation_id) VALUES ($1, $2, $3, 1, 'responses', 'test', 0, 0, 0, 'gap://test/request', $4)")
+            .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
+            .bind(Uuid::new_v4().to_string()).bind(identity.reservation_id.to_string())
+            .execute(&db.pool).await.unwrap();
+    }
+    for identity in [
+        abandoned,
+        fresh,
+        bound,
+        completed,
+        wrong_tenant,
+        wrong_reservation,
+    ] {
+        assert!(
+            db.capture_buffered_archive_spool(
+                identity,
+                BufferedArchivePurpose::Request,
+                &[ArchiveSpoolChunk {
+                    seq: 0,
+                    byte_count: 3,
+                    ciphertext: "opaque".into(),
+                }],
+            )
+            .await
+            .unwrap()
+        );
+    }
+    assert!(
+        db.capture_buffered_archive_spool(
+            abandoned,
+            BufferedArchivePurpose::Response,
+            &[ArchiveSpoolChunk {
+                seq: 0,
+                byte_count: 3,
+                ciphertext: "opaque".into(),
+            }],
+        )
+        .await
+        .unwrap()
+    );
+    sqlx::query("UPDATE request_archive_spools SET updated_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) - 2700001 WHERE request_id <> $1")
+        .bind(fresh.request_id.to_string()).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE response_archive_spools SET updated_at = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE request_archive_spools SET state = 'bound', updated_at = 0 WHERE request_id = $1",
+    )
+    .bind(bound.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    terminal(&db, completed).await;
+    sqlx::query("UPDATE request_archive_spools SET tenant_id = $1 WHERE request_id = $2")
+        .bind(Uuid::new_v4().to_string())
+        .bind(wrong_tenant.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_archive_spools SET reservation_id = $1 WHERE request_id = $2")
+        .bind(Uuid::new_v4().to_string())
+        .bind(wrong_reservation.request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let per_spool = SPOOL_OVERHEAD + CHUNK_OVERHEAD + 6;
+    assert_eq!(budget(&db).await, 7 * per_spool);
+    assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 1);
+    let row = sqlx::query("SELECT state, cleaned_at, cipher_bytes, attempts FROM request_archive_spools WHERE request_id = $1")
+        .bind(abandoned.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("state"), "pending");
+    assert!(row.get::<Option<i64>, _>("cleaned_at").is_none());
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), per_spool);
+    assert_eq!(row.get::<i64, _>("attempts"), 0);
+    let row = sqlx::query("SELECT cipher_bytes, request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1")
+        .fetch_one(&db.pool).await.unwrap();
+    assert_eq!(row.get::<i64, _>("cipher_bytes"), 6 * per_spool);
+    assert_eq!(row.get::<i64, _>("request_cipher_bytes"), 5 * per_spool);
+    let row =
+        sqlx::query("SELECT state, cleaned_at FROM request_archive_spools WHERE request_id = $1")
+            .bind(bound.request_id.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(row.get::<String, _>("state"), "bound");
+    assert!(row.get::<Option<i64>, _>("cleaned_at").is_some());
+
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
+    for identity in [fresh, completed, wrong_tenant, wrong_reservation] {
+        let row = sqlx::query("SELECT state, cleaned_at, cipher_bytes FROM request_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string()).fetch_one(&db.pool).await.unwrap();
+        assert_eq!(row.get::<String, _>("state"), "pending");
+        assert!(row.get::<Option<i64>, _>("cleaned_at").is_none());
+        assert_eq!(row.get::<i64, _>("cipher_bytes"), per_spool);
+    }
+    assert_eq!(
+        db.cleanup_archive_spool_batch(BufferedArchivePurpose::Response)
+            .await
+            .unwrap(),
+        None
+    );
+    let remaining_chunks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = $1",
+    )
+    .bind(abandoned.request_id.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(remaining_chunks, 1);
+    assert_eq!(budget(&db).await, 6 * per_spool);
+    let request_budget: i64 = sqlx::query_scalar(
+        "SELECT request_cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(request_budget, 5 * per_spool);
+}
+
+#[tokio::test]
 async fn sqlite_cleanup_preserves_oldest_eligible_fairness_across_classes() {
     let (_dir, db, identity) = fixture().await;
     let expired = identity.request_id.to_string();
@@ -1551,7 +1717,7 @@ async fn sqlite_cleanup_preserves_oldest_eligible_fairness_across_classes() {
         .await
         .unwrap();
 
-    for expected in [&expired, &bound, &exhausted] {
+    for expected in [&expired, &bound] {
         assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 1);
         let cleaned: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1 AND cleaned_at IS NOT NULL",
@@ -1562,7 +1728,8 @@ async fn sqlite_cleanup_preserves_oldest_eligible_fairness_across_classes() {
         .unwrap();
         assert_eq!(cleaned, 1, "oldest eligible class must win");
     }
-    assert_eq!(budget(&db).await, 0);
+    assert_eq!(db.cleanup_response_archive_spools(1).await.unwrap(), 0);
+    assert_eq!(budget(&db).await, SPOOL_OVERHEAD);
 }
 
 #[tokio::test]
@@ -1594,7 +1761,7 @@ async fn sqlite_concurrent_cleanup_workers_serialize_and_both_make_progress() {
 }
 
 #[tokio::test]
-async fn claims_require_terminal_gap_and_fence_old_leases() {
+async fn claims_require_sealed_unbound_body_and_fence_old_leases() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());
     assert!(
@@ -1615,18 +1782,12 @@ async fn claims_require_terminal_gap_and_fence_old_leases() {
     db.fail_response_archive_spool(id, "capture_timeout")
         .await
         .unwrap();
-    assert!(
-        db.claim_response_archive_spool(owner)
-            .await
-            .unwrap()
-            .is_none()
-    );
-    terminal(&db, id).await;
     let first = db
         .claim_response_archive_spool(owner)
         .await
         .unwrap()
         .unwrap();
+    assert!(!first.successful_terminal);
     assert!(
         db.claim_response_archive_spool(owner)
             .await
@@ -1848,25 +2009,22 @@ async fn binding_is_atomic_with_staging_and_preserves_terminal_facts() {
 }
 
 #[tokio::test]
-async fn empty_spool_admission_is_bounded_and_replay_does_not_recharge() {
+async fn empty_spool_admission_crosses_former_limit_and_replay_does_not_recharge() {
     let (_dir, db, id) = fixture().await;
     sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
         .bind(RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD + 1)
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(!db.begin_response_archive_spool(id).await.unwrap());
+    assert!(db.begin_response_archive_spool(id).await.unwrap());
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools")
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(rows, 0);
-    assert_eq!(
-        budget(&db).await,
-        RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD + 1
-    );
+    assert_eq!(rows, 1);
+    assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT + 1);
     sqlx::query("UPDATE response_archive_spool_budget SET cipher_bytes = $1")
-        .bind(RESPONSE_CIPHER_LIMIT - SPOOL_OVERHEAD)
+        .bind(RESPONSE_CIPHER_LIMIT)
         .execute(&db.pool)
         .await
         .unwrap();
@@ -1875,7 +2033,7 @@ async fn empty_spool_admission_is_bounded_and_replay_does_not_recharge() {
     assert!(db.begin_response_archive_spool(id).await.unwrap());
     assert_eq!(budget(&db).await, RESPONSE_CIPHER_LIMIT);
     assert!(
-        !db.append_response_archive_spool(id, 0, 1, "x")
+        db.append_response_archive_spool(id, 0, 1, "x")
             .await
             .unwrap()
     );
@@ -1961,7 +2119,7 @@ async fn lost_process_capturing_spool_expires_without_publishing_a_prefix() {
 }
 
 #[tokio::test]
-async fn exhausted_crash_lease_and_pending_retention_release_budget() {
+async fn expired_crash_lease_remains_claimable_after_ten_attempts() {
     let (_dir, db, id) = fixture().await;
     assert!(db.begin_response_archive_spool(id).await.unwrap());
     assert!(
@@ -1990,10 +2148,10 @@ async fn exhausted_crash_lease_and_pending_retention_release_budget() {
         db.claim_response_archive_spool(Uuid::new_v4())
             .await
             .unwrap()
-            .is_none()
+            .is_some()
     );
-    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
-    assert_eq!(budget(&db).await, 0);
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
+    assert_eq!(budget(&db).await, SPOOL_OVERHEAD + CHUNK_OVERHEAD + 1);
     assert!(
         db.load_response_archive_spool_chunk(&task, 0)
             .await

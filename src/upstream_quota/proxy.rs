@@ -47,10 +47,10 @@ impl Routes {
         self.0[index].proxy_url.as_deref()
     }
 
-    pub(super) fn advance_on_failure(&self, index: &AtomicUsize, error: &wreq::Error) {
+    pub(super) fn advance_on_failure(&self, index: &AtomicUsize, error: &reqwest::Error) {
         self.advance(
             index,
-            error.is_proxy_connect() || error.is_dns() || error.is_tls() || error.is_connect(),
+            crate::simple_http::classify_transport(error).pre_delivery(),
         );
     }
 
@@ -206,15 +206,13 @@ mod tests {
         let first_task = tokio::spawn(proxy_fixture(first, reject_connect, first_status));
         let second_task = tokio::spawn(proxy_fixture(second, false, 200));
         let budget = codex_quota_budget(&json!({})).unwrap();
-        let client = crate::build_codex_http_client_with_policy(
-            codex_quota_transport_policy(&json!({}), budget).unwrap(),
-        )
-        .unwrap();
+        let policy = codex_quota_transport_policy(&json!({}), budget).unwrap();
         let session = ReadSession::testing(budget);
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             get_codex_json_with_routes(
-                &client,
+                &crate::codex_clients::CodexClients::default(),
+                policy,
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,
                     credential_value: http::HeaderValue::from_static("Bearer fixture"),

@@ -111,6 +111,7 @@ async fn upgrade_contract(database: &Database) {
         "DROP TABLE plugin_installer_network_preferences",
         "DROP TABLE pending_proxy_settlements",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_token",
+        "DROP INDEX request_records_live_owner_expiry_idx",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_expires_at",
         "ALTER TABLE request_records DROP COLUMN cache_known_input_tokens",
         "ALTER TABLE request_records DROP COLUMN cache_known_read_tokens",
@@ -166,12 +167,28 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136)",
-    )
-    .execute(&database.pool)
-    .await
-    .unwrap();
+    sqlx::query("ALTER TABLE request_records DROP COLUMN in_flight_stage")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE conversation_media_parts")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for statement in [
+        "DROP INDEX IF EXISTS session_archive_unlinked_recent_idx",
+        "DROP INDEX IF EXISTS request_egress_attempts_request_idx",
+        "DROP INDEX IF EXISTS conversation_observations_compacted_probe_idx",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM schema_migrations WHERE version >= 115")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let maximum: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
         .fetch_one(&database.pool)
         .await
@@ -226,10 +243,11 @@ async fn upgrade_contract(database: &Database) {
     .unwrap();
     assert_eq!(
         tail,
-        vec![
-            117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133,
-            134, 135, 136
-        ]
+        migrations
+            .iter()
+            .filter(|migration| migration.version >= 117)
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>()
     );
     let policy: String = sqlx::query_scalar(
         "SELECT catalog_policy FROM model_route_included_provider_groups WHERE model_route_id = $1",
@@ -270,7 +288,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 146
             ]
         );
     }

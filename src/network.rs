@@ -8,6 +8,7 @@ use serde_json::Value;
 use url::{Host, Url};
 
 use crate::error::AppError;
+use crate::http_settings::{ClientOptions, HttpPurpose, scoped};
 
 /// The network authority attached to an administrator-owned outbound target.
 /// Public targets are resolved and pinned for every outbound operation. Private
@@ -41,7 +42,7 @@ pub fn scope_from_config(config: &Value) -> OutboundScope {
 /// original hostname. Pinned clients explicitly bypass environment proxies;
 /// otherwise a proxy could resolve the hostname again and undo this boundary.
 pub async fn client_for_url(
-    shared_http: &reqwest::Client,
+    shared_http: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     scope: OutboundScope,
     allow_test_loopback: bool,
@@ -81,14 +82,19 @@ pub async fn client_for_url(
         && addresses.iter().all(|address| address.ip().is_loopback());
     validate_addresses(&addresses, scope, test_loopback)?;
     validate_transport_security(url.scheme(), &addresses, scope, test_loopback)?;
-    crate::build_pinned_http_client(host_name, &addresses).map_err(|_| AppError::Internal)
+    shared_http
+        .http_client(ClientOptions {
+            pins: &[(host_name, &addresses)],
+            ..Default::default()
+        })
+        .map_err(|_| AppError::internal("network_client_for_url_1"))
 }
 
 /// Return a one-operation client that preserves the ordinary URL validation
 /// and DNS-pinning boundary but disables reqwest's implicit protocol retries.
 /// Use this when the caller cannot prove that replaying the request is safe.
 pub(crate) async fn client_for_url_no_retry(
-    _shared_http: &reqwest::Client,
+    shared_http: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     scope: OutboundScope,
     allow_test_loopback: bool,
@@ -102,11 +108,17 @@ pub(crate) async fn client_for_url_no_retry(
         .map(|host| (host, addresses.as_slice()))
         .into_iter()
         .collect();
-    crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
+    shared_http
+        .http_client(ClientOptions {
+            pins: &pins,
+            no_retry: true,
+            ..Default::default()
+        })
+        .map_err(|_| AppError::internal("network_client_for_url_no_retry_1"))
 }
 
 fn validated_literal_client(
-    shared_http: &reqwest::Client,
+    shared_http: &dyn crate::http_settings::HttpClientSource,
     address: IpAddr,
     scheme: &str,
     scope: OutboundScope,
@@ -116,7 +128,9 @@ fn validated_literal_client(
     let addresses = [SocketAddr::new(address, 0)];
     validate_addresses(&addresses, scope, test_loopback)?;
     validate_transport_security(scheme, &addresses, scope, test_loopback)?;
-    Ok(shared_http.clone())
+    shared_http
+        .http_client(ClientOptions::default())
+        .map_err(|_| AppError::internal("network_literal_client"))
 }
 
 fn validate_addresses(
@@ -173,7 +187,7 @@ fn validate_transport_security(
 }
 
 pub async fn client_for_config_url(
-    shared_private_client: &reqwest::Client,
+    shared_private_client: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -192,7 +206,7 @@ pub async fn client_for_config_url(
 
 /// Non-idempotent OAuth/media operations must not be retried by HTTP middleware.
 pub async fn client_for_config_url_no_retry(
-    shared_private_client: &reqwest::Client,
+    shared_private_client: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -214,11 +228,13 @@ pub async fn client_for_config_url_no_retry(
 /// this layer owns the SOCKS5H transport boundary. When a proxy is present the
 /// target hostname is deliberately not resolved locally.
 pub(crate) async fn client_for_oauth_url_no_retry(
-    shared_http: &reqwest::Client,
+    shared_http: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
+    let source = scoped(shared_http, HttpPurpose::Oauth);
+    let shared_http: &dyn crate::http_settings::HttpClientSource = &source;
     let target = checked_http_url(value)?;
     let Some((proxy_url, proxy_scope)) = proxy else {
         return client_for_url_no_retry(
@@ -252,11 +268,17 @@ pub(crate) async fn client_for_oauth_url_no_retry(
                 .into(),
         ));
     }
-    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+    shared_http
+        .http_client(ClientOptions {
+            proxy_url: Some(proxy_url),
+            no_retry: true,
+            ..Default::default()
+        })
+        .map_err(|_| AppError::internal("network_client_for_oauth_url_no_retry_1"))
 }
 
 async fn config_url_client(
-    shared_private_client: &reqwest::Client,
+    shared_private_client: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -326,12 +348,14 @@ async fn config_url_client(
     if let Some(host) = proxy_host.as_deref() {
         pins.push((host, &proxy_addresses));
     }
-    if no_retry {
-        crate::build_no_retry_http_client(Some(proxy_url), &pins)
-    } else {
-        crate::build_explicit_proxy_http_client(proxy_url, &pins)
-    }
-    .map_err(|_| AppError::Internal)
+    shared_private_client
+        .http_client(ClientOptions {
+            proxy_url: Some(proxy_url),
+            pins: &pins,
+            no_retry,
+            ..Default::default()
+        })
+        .map_err(|_| AppError::internal("network_config_url_client_1"))
 }
 
 /// Validate the fixed native Codex target and its remote-DNS proxy without
@@ -407,7 +431,7 @@ pub(crate) async fn validate_codex_transport(
 
 /// Mutation-only Codex control transport with no implicit HTTP retry.
 pub(crate) async fn client_for_codex_url_without_retries(
-    shared_test_client: &reqwest::Client,
+    shared_test_client: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -430,11 +454,13 @@ pub(crate) async fn client_for_codex_url_without_retries(
 /// account/session proxy owns target DNS; otherwise the fixed target is reached
 /// by a direct client that explicitly ignores environment proxy settings.
 pub(crate) async fn client_for_codex_oauth_url(
-    shared_test_client: &reqwest::Client,
+    shared_test_client: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     proxy: Option<(&str, OutboundScope)>,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
+    let source = scoped(shared_test_client, HttpPurpose::Oauth);
+    let shared_test_client: &dyn crate::http_settings::HttpClientSource = &source;
     let target = checked_http_url(value)?;
     let fixed_production_target = target.scheme() == "https"
         && target.host_str() == Some("auth.openai.com")
@@ -455,7 +481,8 @@ pub(crate) async fn client_for_codex_oauth_url(
 
     let Some((proxy_url, proxy_scope)) = proxy else {
         if fixed_production_target {
-            return pinned_no_retry_public_client(&target, allow_test_loopback).await;
+            return pinned_no_retry_public_client(shared_test_client, &target, allow_test_loopback)
+                .await;
         }
         let (_, target_addresses, target_test_loopback) =
             validated_endpoint(&target, OutboundScope::Public, allow_test_loopback).await?;
@@ -465,13 +492,17 @@ pub(crate) async fn client_for_codex_oauth_url(
             OutboundScope::Public,
             target_test_loopback,
         )?;
-        return target_test_loopback
-            .then(|| shared_test_client.clone())
-            .ok_or_else(|| {
-                AppError::BadRequest(
-                    "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
-                )
-            });
+        if target_test_loopback {
+            return shared_test_client
+                .http_client(ClientOptions {
+                    no_retry: true,
+                    ..Default::default()
+                })
+                .map_err(|_| AppError::internal("network_oauth_test_client"));
+        }
+        return Err(AppError::BadRequest(
+            "OpenAI Codex authorization requires an approved remote-DNS proxy".into(),
+        ));
     };
 
     if proxy_scope != OutboundScope::Private {
@@ -499,11 +530,17 @@ pub(crate) async fn client_for_codex_oauth_url(
             ));
         }
     }
-    crate::build_no_retry_http_client(Some(proxy_url), &[]).map_err(|_| AppError::Internal)
+    shared_test_client
+        .http_client(ClientOptions {
+            proxy_url: Some(proxy_url),
+            no_retry: true,
+            ..Default::default()
+        })
+        .map_err(|_| AppError::internal("network_client_for_codex_oauth_url_1"))
 }
 
 async fn codex_client_for_url(
-    shared_test_client: &reqwest::Client,
+    shared_test_client: &dyn crate::http_settings::HttpClientSource,
     value: &str,
     config: &Value,
     proxy: Option<(&str, OutboundScope)>,
@@ -514,19 +551,24 @@ async fn codex_client_for_url(
     let Some((proxy_url, _)) = proxy else {
         if checked_http_url(value)?.host_str() == Some("chatgpt.com") {
             let target = checked_http_url(value)?;
-            return pinned_no_retry_public_client(&target, allow_test_loopback).await;
+            return pinned_no_retry_public_client(shared_test_client, &target, allow_test_loopback)
+                .await;
         }
-        return Ok(shared_test_client.clone());
+        return shared_test_client
+            .http_client(ClientOptions::default())
+            .map_err(|_| AppError::internal("network_codex_client"));
     };
-    if no_retry {
-        crate::build_no_retry_http_client(Some(proxy_url), &[])
-    } else {
-        crate::build_explicit_proxy_http_client(proxy_url, &[])
-    }
-    .map_err(|_| AppError::Internal)
+    shared_test_client
+        .http_client(ClientOptions {
+            proxy_url: Some(proxy_url),
+            no_retry,
+            ..Default::default()
+        })
+        .map_err(|_| AppError::internal("network_codex_client_for_url_1"))
 }
 
 async fn pinned_no_retry_public_client(
+    source: &dyn crate::http_settings::HttpClientSource,
     target: &Url,
     allow_test_loopback: bool,
 ) -> Result<reqwest::Client, AppError> {
@@ -538,7 +580,13 @@ async fn pinned_no_retry_public_client(
         .map(|host| (host, addresses.as_slice()))
         .into_iter()
         .collect();
-    crate::build_no_retry_http_client(None, &pins).map_err(|_| AppError::Internal)
+    source
+        .http_client(ClientOptions {
+            pins: &pins,
+            no_retry: true,
+            ..Default::default()
+        })
+        .map_err(|_| AppError::internal("network_pinned_no_retry_public_client_1"))
 }
 
 pub(crate) async fn validate_managed_codex_proxy(value: &str) -> Result<(), AppError> {
@@ -787,7 +835,7 @@ pub(crate) fn preparation_failure_category(error: &AppError) -> &'static str {
             "dns_resolution"
         }
         AppError::BadRequest(_) => "destination_rejected",
-        AppError::Internal => "client_build",
+        AppError::Internal { .. } => "client_build",
         _ => "preparation_failed",
     }
 }
@@ -1060,9 +1108,22 @@ mod tests {
         let secret = "https://user:secret@example.test/?token=secret";
         for (error, expected) in [
             (AppError::BadRequest(secret.into()), "destination_rejected"),
-            (AppError::Upstream(secret.into()), "preparation_failed"),
-            (AppError::Storage(secret.into()), "preparation_failed"),
-            (AppError::Internal, "client_build"),
+            (
+                AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new()
+                        .stage("network_preparation_labels_never_include_free_text"),
+                ),
+                "preparation_failed",
+            ),
+            (
+                AppError::storage("local_storage_failed"),
+                "preparation_failed",
+            ),
+            (
+                AppError::internal("network_preparation_labels_never_include_free_text_1"),
+                "client_build",
+            ),
             (
                 AppError::BadRequest(DNS_TIMEOUT_MESSAGE.into()),
                 "dns_timeout",

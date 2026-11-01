@@ -52,8 +52,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("resolver_reload_prepared_upstream_snapshot_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -105,8 +105,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("resolver_reload_persisted_generation_upstream_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -456,7 +456,9 @@ impl Database {
         };
         let config_json: String = row.try_get("config_json")?;
         let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+            serde_json::from_str(&config_json).map_err(|_| {
+                AppError::internal("resolver_materialize_authorized_upstream_candidate_1")
+            })?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;
@@ -627,11 +629,11 @@ impl RoutingCandidate {
     fn from_row(row: AnyRow) -> Result<Self, AppError> {
         let scheduling_weight: i64 = row.try_get("scheduling_weight")?;
         if !(1..=1_000_000).contains(&scheduling_weight) {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("resolver_from_row_1"));
         }
         let probe_rank: i64 = row.try_get("probe_rank")?;
         if !(0..=2).contains(&probe_rank) {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("resolver_from_row_2"));
         }
         Ok(Self {
             route_id: parse_uuid(row.try_get("route_id")?)?,
@@ -641,7 +643,8 @@ impl RoutingCandidate {
             credential_generation: row.try_get("credential_generation")?,
             priority: row.try_get("priority")?,
             scheduling_weight,
-            probe_rank: u8::try_from(probe_rank).map_err(|_| AppError::Internal)?,
+            probe_rank: u8::try_from(probe_rank)
+                .map_err(|_| AppError::internal("resolver_from_row_1"))?,
         })
     }
 }
@@ -718,10 +721,11 @@ fn weighted_rendezvous_score(
     candidate: &RoutingCandidate,
 ) -> f64 {
     let mut digest = Sha256::new();
-    digest.update(b"memeloop-routing-rendezvous-v1");
+    // The same account may occur behind several authorized routes for one
+    // model. Those links are not extra scheduling weight for that account.
+    digest.update(b"memeloop-routing-account-rendezvous-v2");
     digest.update(key_id.as_bytes());
     digest.update(selection_seed.as_bytes());
-    digest.update(candidate.route_id.as_bytes());
     digest.update(candidate.account_id.as_bytes());
     let output = digest.finalize();
     let mut first = [0_u8; 8];
@@ -760,6 +764,32 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn duplicate_route_links_do_not_multiply_an_accounts_scheduling_weight() {
+        let account = Uuid::from_u128(101);
+        let peer = Uuid::from_u128(102);
+        for seed in 1..=256 {
+            let mut original = vec![candidate(account), candidate(peer)];
+            order_authorized_candidates(
+                &mut original,
+                Uuid::nil(),
+                Uuid::from_u128(seed),
+                None,
+                None,
+            );
+            let mut linked = vec![candidate(account), candidate(peer), candidate(account)];
+            linked[2].route_id = Uuid::from_u128(999);
+            order_authorized_candidates(
+                &mut linked,
+                Uuid::nil(),
+                Uuid::from_u128(seed),
+                None,
+                None,
+            );
+            assert_eq!(original[0].account_id, linked[0].account_id);
+        }
     }
 
     #[test]

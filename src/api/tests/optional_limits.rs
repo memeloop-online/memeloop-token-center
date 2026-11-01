@@ -48,7 +48,7 @@ async fn prepaid_rate_rejections_remain_distinct_from_service_and_database_failu
         (
             AppError::from(sqlx::Error::PoolTimedOut),
             StatusCode::SERVICE_UNAVAILABLE,
-            "service_overloaded",
+            "database_pool_exhausted",
         ),
         (
             AppError::Overloaded,
@@ -56,9 +56,9 @@ async fn prepaid_rate_rejections_remain_distinct_from_service_and_database_failu
             "service_overloaded",
         ),
         (
-            AppError::Upstream("fixture transport failure".into()),
+            AppError::upstream("fixture_transport_failure"),
             StatusCode::BAD_GATEWAY,
-            "upstream_error",
+            "fixture_transport_failure",
         ),
     ] {
         let response = error.into_response();

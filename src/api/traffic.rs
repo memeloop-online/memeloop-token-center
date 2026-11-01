@@ -10,7 +10,7 @@ use axum::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::{MAX_IMAGE_REQUEST_BODY, MAX_REPORTED_TOKENS};
+use super::MAX_REPORTED_TOKENS;
 use crate::{
     AppState,
     error::AppError,
@@ -23,6 +23,9 @@ use crate::{
 };
 
 use super::plugin_execution::{self, Phase};
+
+#[cfg(test)]
+mod tests;
 
 #[cfg(test)]
 tokio::task_local! {
@@ -68,7 +71,7 @@ pub(super) async fn proxy_openai_responses(
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
-        return Err(AppError::Overloaded);
+        return Err(AppError::capacity_error("proxy_memory_ingress"));
     }
     let body = spool.read_all().await.map_err(|_| {
         tracing::error!(
@@ -76,7 +79,7 @@ pub(super) async fn proxy_openai_responses(
             bytes = spool.len(),
             "authenticated Responses request spool could not be replayed"
         );
-        AppError::Overloaded
+        AppError::capacity_error("request_spool_read_failed")
     })?;
     super::proxy::proxy_spooled_responses(
         state,
@@ -106,7 +109,7 @@ pub(super) async fn proxy_openai_responses_compact(
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
-        return Err(AppError::Overloaded);
+        return Err(AppError::capacity_error("proxy_memory_ingress"));
     }
     let body = spool.read_all().await.map_err(|_| {
         tracing::error!(
@@ -114,7 +117,7 @@ pub(super) async fn proxy_openai_responses_compact(
             bytes = spool.len(),
             "authenticated Responses compact request spool could not be replayed"
         );
-        AppError::Overloaded
+        AppError::capacity_error("request_spool_read_failed")
     })?;
     super::proxy::proxy_spooled_responses(
         state,
@@ -441,27 +444,10 @@ async fn apply_traffic_plugin(
             request_rewrite_supplied: false,
         });
     }
-    let temporary_memory = if memory.is_some() {
-        let input_length =
-            crate::gateway_body::memory::json_encoded_length(&original_request_json)?;
-        Some(
-            state
-                .proxy_memory_budget
-                .temporary(64 * 1024 * 1024 + input_length.max(16 * 1024 * 1024).saturating_mul(5))
-                .map_err(|error| {
-                    state.metrics.observe_proxy_memory_error(
-                        crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                        error,
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
     let plugin_configurations = plugins
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
-    let plugin_request = original_request_json.clone();
+    let plugin_request = original_request_json;
     #[cfg(feature = "experimental-plugin-revisions")]
     let application_snapshot = state.pinned_application_plugins.clone();
     let plugin_context = RequestContext {
@@ -473,32 +459,35 @@ async fn apply_traffic_plugin(
         config_json: "{}".to_owned(),
     };
     let metrics = state.metrics.clone();
-    let plugin_decision =
+    let (plugin_decision, original_request_json) =
         plugin_execution::run(state.metrics.clone(), Phase::PostAuth, move || {
-            let _temporary_memory = temporary_memory;
+            let _memory = memory;
             let result = (|| {
                 #[cfg(feature = "experimental-plugin-revisions")]
                 if let Some(snapshot) = application_snapshot {
-                    return snapshot.runtime.apply_traffic_with_config_and_memory(
+                    return snapshot.runtime.apply_traffic_with_config(
                         plugin_context,
                         &plugin_request,
                         &plugin_configurations,
-                        memory.as_deref(),
                     );
                 }
-                plugins.apply_traffic_with_config_and_memory(
+                plugins.apply_traffic_with_config(
                     plugin_context,
                     &plugin_request,
                     &plugin_configurations,
-                    memory.as_deref(),
                 )
             })();
-            result.map_err(|error| {
-                metrics.observe_proxy_memory_error(
-                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                    error,
-                )
-            })
+            result
+                .map(|decision| (decision, plugin_request))
+                .map_err(|error| {
+                    named_memory_rejection(
+                        "proxy_memory_plugin",
+                        metrics.observe_proxy_memory_error(
+                            crate::metrics::ProxyMemoryRejectionStage::Plugin,
+                            error,
+                        ),
+                    )
+                })
         })
         .await?;
     if !plugin_decision.allow {
@@ -511,8 +500,9 @@ async fn apply_traffic_plugin(
         .request_json
         .unwrap_or(original_request_json);
     if !request_json.is_object() {
-        return Err(AppError::Upstream(
-            "plugin returned a request that is not a JSON object".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
         ));
     }
     let rewritten_model = request_json
@@ -525,22 +515,21 @@ async fn apply_traffic_plugin(
         .or(rewritten_model)
         .unwrap_or_else(|| requested_model.clone());
     if model.trim().is_empty() || model.len() > 200 {
-        return Err(AppError::Upstream(
-            "plugin returned an invalid model".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_apply_traffic_plugin"),
         ));
     }
     request_json["model"] = Value::String(model.clone());
-    if crate::gateway_body::memory::json_encoded_length(&request_json)? > MAX_IMAGE_REQUEST_BODY {
-        return Err(AppError::Upstream(
-            "plugin-rewritten request exceeds 16 MiB".into(),
-        ));
-    }
+    // Request size is enforced once, by ingress body admission. Re-checking it
+    // here with the image-generation ceiling rejected large Codex contexts with
+    // a misleading 502 "upstream_unavailable" even though the upstream was
+    // reachable and the body had already been admitted.
     let upstream_account_hint = plugin_decision
         .upstream_account_id
         .map(|value| {
-            Uuid::parse_str(&value).map_err(|_| {
-                AppError::Upstream("plugin returned an invalid upstream account id".into())
-            })
+            Uuid::parse_str(&value)
+                .map_err(|_| AppError::upstream("plugin_returned_an_invalid_upstream_account_id"))
         })
         .transpose()?;
     Ok(AppliedTraffic {
@@ -571,9 +560,7 @@ pub(super) async fn prepare_component_provider(
         plugins.prepare_provider_request(&provider_id, context, &config, &request_json)
     })
     .await?
-    .ok_or_else(|| {
-        AppError::Upstream("component provider adapter is declared but unavailable".into())
-    })
+    .ok_or_else(|| AppError::upstream("component_provider_adapter_is_declared_but_unavailable"))
 }
 
 pub(super) async fn normalize_component_provider(
@@ -583,45 +570,55 @@ pub(super) async fn normalize_component_provider(
     status: u16,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<NormalizedProviderResponse, AppError> {
-    let temporary_memory = state
-        .proxy_memory_budget
-        .temporary(64 * 1024 * 1024 + body.len().saturating_mul(6))
-        .map_err(|error| {
-            state.metrics.observe_proxy_memory_error(
-                crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                error,
-            )
-        })?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
-        let _temporary_memory = temporary_memory;
+        let _memory = memory;
         plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
     })
     .await?
-    .ok_or_else(|| {
-        AppError::Upstream("component provider adapter is declared but unavailable".into())
-    })
+    .ok_or_else(|| AppError::upstream("component_provider_adapter_is_declared_but_unavailable"))
 }
 
 pub(super) fn component_provider_url(base_url: &str, path: &str) -> Result<String, AppError> {
     let base = network::checked_http_url(base_url)?;
     let target = network::checked_http_url(&format!("{}{}", base_url.trim_end_matches('/'), path))?;
     if target.origin() != base.origin() {
-        return Err(AppError::Upstream(
-            "component provider path changed the configured upstream origin".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("traffic_component_provider_url"),
         ));
     }
     Ok(target.into())
 }
 
-pub(super) fn component_provider_timeout(config: &Value) -> Duration {
-    Duration::from_secs(
-        config
-            .get("timeout_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(120)
-            .clamp(1, 120),
-    )
+fn named_memory_rejection(stage: &'static str, error: AppError) -> AppError {
+    error.name_if_overloaded(stage)
+}
+
+/// Only explicit account configuration adds a request-local deadline. Shared
+/// client defaults and purpose overrides are installed by the HTTP factory.
+pub(super) fn configured_http_timeout(config: &Value) -> Result<Option<Duration>, &'static str> {
+    let Some(value) = config.get("timeout_seconds") else {
+        return Ok(None);
+    };
+    let seconds = value
+        .as_u64()
+        .or_else(|| {
+            value
+                .as_f64()
+                .filter(|seconds| {
+                    seconds.fract() == 0.0 && *seconds > 0.0 && *seconds < u64::MAX as f64
+                })
+                .map(|seconds| seconds as u64)
+        })
+        .filter(|seconds| *seconds > 0)
+        .ok_or("invalid_request_timeout")?;
+    let duration = Duration::from_secs(seconds);
+    tokio::time::Instant::now()
+        .checked_add(duration)
+        .ok_or("invalid_request_timeout")?;
+    Ok(Some(duration))
 }

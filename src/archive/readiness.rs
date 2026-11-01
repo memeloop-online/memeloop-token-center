@@ -374,7 +374,7 @@ impl super::ReadinessCache {
 }
 
 fn readiness_failure() -> AppError {
-    AppError::Storage("archive readiness canary failed".to_owned())
+    AppError::storage("archive_readiness_canary_failed")
 }
 
 impl ArchiveStore {

@@ -3,7 +3,6 @@ use super::super::archive_staging::bind_archive_staging_attempt_in_transaction;
 use super::super::*;
 use super::conversations::{
     ConversationProjectionEnqueueInput, enqueue_conversation_projection_in_transaction,
-    materialize_conversation_content_in_transaction,
 };
 use super::settlement::{
     reserve_metered_usage_with_id_in_transaction, resize_usage_reservation_in_transaction,
@@ -27,11 +26,15 @@ fn output_validity_price_snapshot(
     output_token_limit: Option<i64>,
 ) -> Result<String, AppError> {
     if output_token_limit.is_some_and(|limit| !(0..=1_000_000_000).contains(&limit)) {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "lifecycle_output_validity_price_snapshot_1",
+        ));
     }
-    let mut snapshot = serde_json::to_value(price).map_err(|_| AppError::Internal)?;
+    let mut snapshot = serde_json::to_value(price)
+        .map_err(|_| AppError::internal("lifecycle_output_validity_price_snapshot_1"))?;
     snapshot["output_token_limit"] = serde_json::json!(output_token_limit);
-    serde_json::to_string(&snapshot).map_err(|_| AppError::Internal)
+    serde_json::to_string(&snapshot)
+        .map_err(|_| AppError::internal("lifecycle_output_validity_price_snapshot_2"))
 }
 
 async fn persist_output_token_limit(
@@ -61,8 +64,8 @@ fn output_token_limit_from_snapshot(
     let Some(snapshot) = snapshot else {
         return Ok(Some(legacy_ceiling));
     };
-    let snapshot: serde_json::Value =
-        serde_json::from_str(snapshot).map_err(|_| AppError::Internal)?;
+    let snapshot: serde_json::Value = serde_json::from_str(snapshot)
+        .map_err(|_| AppError::internal("lifecycle_output_token_limit_from_snapshot_1"))?;
     match snapshot.get("output_token_limit") {
         None => Ok(Some(legacy_ceiling)),
         Some(serde_json::Value::Null) => Ok(None),
@@ -70,7 +73,9 @@ fn output_token_limit_from_snapshot(
             .as_i64()
             .filter(|limit| (0..=1_000_000_000).contains(limit))
             .map(Some)
-            .ok_or(AppError::Internal),
+            .ok_or(AppError::internal(
+                "lifecycle_output_token_limit_from_snapshot_1",
+            )),
     }
 }
 
@@ -272,8 +277,60 @@ pub struct StartProxyRequest<'a> {
 pub(crate) enum RequestArchiveAdmission {
     Captured,
     Queued,
-    GapCapacity,
-    GapRetentionLimit,
+}
+
+/// `session_dialogue_unavailable` means this settlement could not build 会话正文.
+/// The worker reads 原始请求 JSON and 原始返回 JSON from the object locators
+/// already stored on the request. 会话正文 is the cleaned training dialogue in CNPG.
+const SESSION_DIALOGUE_UNAVAILABLE: &str = "session_dialogue_unavailable";
+
+fn session_dialogue_unavailable(error: &AppError) -> bool {
+    match error {
+        AppError::Conflict(message) => message == "conversation semantic payload exceeds its bound",
+        AppError::Internal { code, .. } => matches!(
+            *code,
+            "semantic_payload_encode_1"
+                | "semantic_payload_encode_2"
+                | "memory_flush_1"
+                | "conversations_enqueue_conversation_projection_in_transaction_1"
+                | "conversations_enqueue_conversation_projection_in_transaction_2"
+        ),
+        _ => false,
+    }
+}
+
+async fn enqueue_conversation_task(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+    conversation: &ProxyConversationInput<'_>,
+    observed_at: i64,
+) -> Result<(), AppError> {
+    match enqueue_conversation_projection_in_transaction(
+        transaction,
+        ConversationProjectionEnqueueInput {
+            request_id,
+            key: conversation.key,
+            request_json: conversation.request_json,
+            hints: conversation.hints,
+            client_name: conversation.client_name,
+            upstream_response_id: conversation.upstream_response_id,
+            observed_at,
+        },
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) if session_dialogue_unavailable(&error) => {
+            tracing::warn!(
+                phase = "conversation_enqueue",
+                reason = SESSION_DIALOGUE_UNAVAILABLE,
+                error_code = error.diagnostic_category(),
+                "会话正文 could not be built; settlement continues"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug)]
@@ -440,7 +497,11 @@ impl Database {
             .await
             .map(|started| started.reservation)
             .map_err(|error| match error {
-                AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
+                error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
+                    .retarget_capacity(
+                        "request_record_persist_failed",
+                        crate::error::ErrorFacts::new().phase("request_record"),
+                    ),
                 other => other,
             })
     }
@@ -545,7 +606,11 @@ impl Database {
             )
             .await
             .map_err(|error| match error {
-                AppError::Storage(_) | AppError::Internal => AppError::Overloaded,
+                error @ (AppError::Storage { .. } | AppError::Internal { .. }) => error
+                    .retarget_capacity(
+                        "request_record_persist_failed",
+                        crate::error::ErrorFacts::new().phase("request_admission"),
+                    ),
                 other => other,
             });
         if let Err(error) = &result {
@@ -577,22 +642,37 @@ impl Database {
             reservation_id,
         };
         let purpose = crate::response_archive_spool::BufferedArchivePurpose::Request;
-        let exceeds_retention_limit = archive.is_some_and(|(body, _, _)| {
-            body.len() > super::super::archive_spool::REQUEST_ARCHIVE_PLAIN_LIMIT
-        });
-        let buffered_archive = archive
-            .filter(|_| !exceeds_retention_limit)
-            .map(|(body, pepper, compression_enabled)| {
-                crate::response_archive_spool::BufferedArchive::new(
+        // Admission passes the full request bytes to the spool. Prepare or
+        // capture capacity is recorded as spool_capacity and the client continues.
+        let buffered_archive = match archive {
+            Some((body, pepper, compression_enabled)) => {
+                match crate::response_archive_spool::BufferedArchive::new(
                     identity,
                     purpose,
                     body,
                     pepper,
                     compression_enabled,
-                )
-                .map_err(|_| AppError::Overloaded)
-            })
-            .transpose()?;
+                ) {
+                    Ok(prepared) => Some(prepared),
+                    Err(error @ AppError::Capacity { .. }) => {
+                        tracing::warn!(
+                            phase = "request_admission_capture",
+                            reason = "spool_capacity",
+                            error_code = error.diagnostic_category(),
+                            "request archive prepare reported spool capacity; admission continues"
+                        );
+                        None
+                    }
+                    Err(other) => {
+                        return Err(other.retarget_capacity(
+                            "request_archive_prepare_failed",
+                            crate::error::ErrorFacts::new().phase("request_admission"),
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
         // Prepare only the existing bounded first insert batch before taking
         // the shared budget lock. Cancellation here exposes no admission
         // facts, and capacity rejection drops this transient ciphertext.
@@ -607,21 +687,19 @@ impl Database {
             Some(archive) => self.reserve_buffered_archive_capacity(archive).await?,
             None => None,
         };
-        let archive_admission = if archive.is_none() {
-            RequestArchiveAdmission::Captured
-        } else if exceeds_retention_limit {
-            RequestArchiveAdmission::GapRetentionLimit
-        } else if budget_reservation.is_none() {
-            RequestArchiveAdmission::GapCapacity
-        } else {
-            RequestArchiveAdmission::Captured
-        };
+        let archive_admission = RequestArchiveAdmission::Captured;
         let (mut transaction, now, mut hold) =
             if let Some(reservation) = budget_reservation.as_ref() {
                 let (tx, now, hold) = self
                     .reserved_spool_transaction(reservation, "request_admission")
                     .await
-                    .map_err(|_| AppError::Overloaded)?;
+                    .map_err(|error| match error {
+                        error @ AppError::Capacity { .. } => error,
+                        other => other.retarget_capacity(
+                            "request_archive_reservation_failed",
+                            crate::error::ErrorFacts::new().phase("request_admission"),
+                        ),
+                    })?;
                 (tx, now, Some(hold))
             } else {
                 (self.begin_write_transaction().await?, unix_millis(), None)
@@ -659,58 +737,63 @@ impl Database {
                 .await?;
             if updated.rows_affected() != 1 {
                 BudgetHold::rollback_optional(transaction, hold).await?;
-                return Err(AppError::Internal);
+                return Err(AppError::internal("lifecycle_start_proxy_request_inner_1"));
             }
         }
-        if let (Some(archive), Some(_)) = (buffered_archive, budget_reservation.as_ref()) {
+        if let Some(archive_body) = buffered_archive.as_ref() {
             BudgetHold::set_phase(&mut hold, "archive_capture");
-            let prepared_request_batch = prepared_request_batch.ok_or(AppError::Internal)?;
+            let prepared_request_batch = prepared_request_batch
+                .ok_or(AppError::internal("lifecycle_start_proxy_request_inner_2"))?;
             let capture_started = std::time::Instant::now();
             let captured = self
                 .capture_reserved_buffered_archive_body_in_transaction(
                     &mut transaction,
                     now,
-                    &archive,
+                    archive_body,
                     Some(prepared_request_batch),
                     budget_reservation.as_ref(),
                 )
                 .await;
-            if !matches!(captured, Ok(true)) {
-                tracing::warn!(
-                    phase = "request_admission_capture",
-                    error_code = if captured.is_err() {
-                        "capture_failed"
-                    } else {
-                        "capacity"
-                    },
-                    elapsed_ms = capture_started.elapsed().as_millis() as u64,
-                    "durable request archive capture failed"
-                );
-                BudgetHold::rollback_optional(transaction, hold).await?;
-                if let Some(reservation) = budget_reservation.as_ref() {
-                    reservation.release().await;
+            match captured {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        phase = "request_admission_capture",
+                        reason = "spool_capacity",
+                        error_code = "capacity",
+                        elapsed_ms = capture_started.elapsed().as_millis() as u64,
+                        "request archive capture reported spool capacity; admission continues"
+                    );
                 }
-                return Err(AppError::Overloaded);
+                Err(error) => {
+                    tracing::warn!(
+                        phase = "request_admission_capture",
+                        error_code = "capture_failed",
+                        elapsed_ms = capture_started.elapsed().as_millis() as u64,
+                        "durable request archive capture failed"
+                    );
+                    BudgetHold::rollback_optional(transaction, hold).await?;
+                    if let Some(reservation) = budget_reservation.as_ref() {
+                        reservation.release().await;
+                    }
+                    let mut facts = crate::error::ErrorFacts::new()
+                        .phase("archive_capture")
+                        .stage("capture_failed");
+                    let sql_kind = match &error {
+                        AppError::Internal { facts, .. }
+                        | AppError::Capacity { facts, .. }
+                        | AppError::Storage { facts, .. }
+                        | AppError::Upstream { facts, .. } => facts.kind,
+                        _ => None,
+                    };
+                    if let Some(kind) = sql_kind {
+                        facts = facts.kind(kind);
+                    }
+                    return Err(AppError::capacity("request_archive_capture_failed", facts));
+                }
             }
-        } else if archive.is_some() {
-            let (body, _, _) = archive.ok_or(AppError::Internal)?;
-            let reason = match archive_admission {
-                RequestArchiveAdmission::GapCapacity => "capacity",
-                RequestArchiveAdmission::GapRetentionLimit => "retention_limit",
-                RequestArchiveAdmission::Captured | RequestArchiveAdmission::Queued => {
-                    return Err(AppError::Internal);
-                }
-            };
-            super::super::archive_spool::insert_request_archive_gap_in_transaction(
-                &mut transaction,
-                now,
-                identity,
-                body,
-                reason,
-            )
-            .await?;
         } else if prepared_request_batch.is_some() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("lifecycle_site_3"));
         }
         // Finish private archive writes before taking any financial hold.
         // Admission remains one atomic commit, but a slow archive batch cannot
@@ -744,10 +827,17 @@ impl Database {
         BudgetHold::commit_optional(transaction, hold)
             .await
             .map_err(|error| {
+                let kind = crate::error::sqlx_error_kind(&error);
+                let app = AppError::from(error);
                 if archive.is_some() {
-                    AppError::Overloaded
+                    app.retarget_capacity(
+                        "request_archive_commit_failed",
+                        crate::error::ErrorFacts::new()
+                            .phase("request_admission")
+                            .kind(kind),
+                    )
                 } else {
-                    error.into()
+                    app
                 }
             })?;
         if let Some(reservation) = budget_reservation.as_ref() {
@@ -858,7 +948,8 @@ impl Database {
                 .bind(input.reservation.id.to_string())
                 .fetch_one(&mut *transaction)
                 .await?;
-            retained_price = serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+            retained_price = serde_json::from_str(&snapshot)
+                .map_err(|_| AppError::internal("lifecycle_switch_pending_proxy_candidate_1"))?;
             &retained_price
         } else {
             input.price
@@ -1098,6 +1189,36 @@ impl Database {
         Ok(())
     }
 
+    /// Stores the stage a still-open proxy request has actually reached.
+    /// This is operator evidence for the request list. It is not delivery
+    /// preparation, not a settlement claim, and not a terminal cause.
+    /// A missing row or an already finished request is left unchanged.
+    pub(crate) async fn record_proxy_in_flight_stage(
+        &self,
+        request_id: Uuid,
+        tenant_id: Uuid,
+        key_id: Uuid,
+        reservation_id: Uuid,
+        stage: &'static str,
+    ) -> Result<(), AppError> {
+        if crate::model::recorded_in_flight_stage(Some(stage.to_owned())).is_none() {
+            return Err(AppError::internal(
+                "lifecycle_record_proxy_in_flight_stage_1",
+            ));
+        }
+        sqlx::query(
+            "UPDATE request_records SET in_flight_stage = $1 WHERE id = $2 AND tenant_id = $3 AND key_id = $4 AND reservation_id = $5 AND completed_at IS NULL AND (in_flight_stage IS NULL OR in_flight_stage <> $1)",
+        )
+        .bind(stage)
+        .bind(request_id.to_string())
+        .bind(tenant_id.to_string())
+        .bind(key_id.to_string())
+        .bind(reservation_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Converges an admitted stream after its in-process lifecycle deadline.
     ///
     /// The durable delivery marker, rather than the cancelled task's local
@@ -1180,7 +1301,9 @@ impl Database {
         let input_token_ceiling = if delivery_started {
             pending
                 .as_ref()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal(
+                    "lifecycle_finish_unobserved_proxy_request_1",
+                ))?
                 .try_get::<i64, _>("input_tokens")?
         } else {
             reservation.reserved_tokens
@@ -1188,7 +1311,9 @@ impl Database {
         let output_token_ceiling = if delivery_started {
             pending
                 .as_ref()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal(
+                    "lifecycle_finish_unobserved_proxy_request_2",
+                ))?
                 .try_get::<i64, _>("output_tokens")?
         } else {
             0
@@ -1203,7 +1328,9 @@ impl Database {
         let requested_service_tier = if delivery_started {
             pending
                 .as_ref()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal(
+                    "lifecycle_finish_unobserved_proxy_request_3",
+                ))?
                 .try_get::<Option<String>, _>("service_tier")?
         } else {
             None
@@ -1427,7 +1554,6 @@ impl Database {
         let tenant_id = input.tenant_id.to_string();
         let key_id = input.reservation.key_id.to_string();
         let reservation_id = input.reservation.id.to_string();
-        let mut content_materialized = false;
         let mut preparation_complete = input.conversation.is_none();
         // Match request admission: retain at most one existing insert batch,
         // and perform its compression/encryption before shared database locks.
@@ -1447,8 +1573,8 @@ impl Database {
             );
         }
         let (mut transaction, now, created_at, reservation_row, trusted_reservation, mut hold) = loop {
-            // Content preparation runs before taking the private reservation
-            // row and the final observation's explicit-session advisory lock.
+            // A buffered response archive takes its private reservation before
+            // the request owner row. Settlement does not build 会话正文 here.
             let (mut transaction, mut hold) = if let Some(reservation) =
                 budget_reservation.as_ref().filter(|_| preparation_complete)
             {
@@ -1557,23 +1683,20 @@ impl Database {
                         "request reservation ownership mismatch".into(),
                     ));
                 }
-                if existing
+                let completed_at = existing
                     .try_get::<Option<i64>, _>("completed_at")?
-                    .is_none()
-                {
-                    return Err(AppError::Conflict(
-                        "request terminal ownership changed".into(),
-                    ));
-                }
+                    .ok_or_else(|| {
+                        AppError::Conflict("request terminal ownership changed".into())
+                    })?;
                 let result = FinishProxyRequestResult::AlreadyFinished {
                     status_code: existing
                         .try_get::<Option<i64>, _>("status_code")?
-                        .ok_or(AppError::Internal)?,
+                        .ok_or(AppError::internal("lifecycle_site_4"))?,
                     cost_micros: existing.try_get("cost_micros")?,
                     error_code: existing.try_get("error_code")?,
                     response_object: existing
                         .try_get::<Option<String>, _>("response_object")?
-                        .ok_or(AppError::Internal)?,
+                        .ok_or(AppError::internal("lifecycle_site_5"))?,
                 };
                 // Repair feeds for terminal requests written before settlement
                 // publication existed. The publisher is idempotent for replays.
@@ -1582,9 +1705,9 @@ impl Database {
                     input.request_id,
                 )
                 .await?;
-                // The response path records the request before conversation
-                // preparation finishes. The later receipt still owns that body,
-                // and a returned status must not stay without its observation.
+                // A finished request can still be missing its conversation task.
+                // Enqueue that task. The worker reads 原始请求 JSON and 原始返回
+                // JSON from the object locators already on the request.
                 if let Some(conversation) = input.conversation.as_ref() {
                     if conversation.key.tenant_id != input.tenant_id
                         || conversation.key.key_id != input.reservation.key_id
@@ -1598,18 +1721,11 @@ impl Database {
                     .fetch_one(&mut *transaction)
                     .await?;
                     if observation_count == 0 {
-                        enqueue_conversation_projection_in_transaction(
+                        enqueue_conversation_task(
                             &mut transaction,
-                            ConversationProjectionEnqueueInput {
-                                request_id: input.request_id,
-                                key: conversation.key,
-                                request_json: conversation.request_json,
-                                hints: conversation.hints,
-                                client_name: conversation.client_name,
-                                upstream_response_id: conversation.upstream_response_id,
-                                observed_at: now,
-                                content_materialized: false,
-                            },
+                            input.request_id,
+                            conversation,
+                            completed_at,
                         )
                         .await?;
                     }
@@ -1653,8 +1769,8 @@ impl Database {
                 if metered.is_some() {
                     (0, 0, Vec::new())
                 } else if let Some(snapshot) = price_snapshot_json {
-                    let price: ModelPrice =
-                        serde_json::from_str(&snapshot).map_err(|_| AppError::Internal)?;
+                    let price: ModelPrice = serde_json::from_str(&snapshot)
+                        .map_err(|_| AppError::internal("lifecycle_site_1"))?;
                     (
                         price.input_micros_per_million,
                         price.output_micros_per_million,
@@ -1676,7 +1792,7 @@ impl Database {
                         .try_get::<String, _>("enforcement_mode")?
                         .as_str(),
                 )
-                .ok_or(AppError::Internal)?,
+                .ok_or(AppError::internal("lifecycle_site_6"))?,
                 reserved_micros: reservation_row.try_get("reserved_micros")?,
                 input_micros_per_million,
                 output_micros_per_million,
@@ -1734,33 +1850,10 @@ impl Database {
                     ));
                 }
                 if !preparation_complete {
-                    // Only a validated, still-pending terminal owner may prepare
-                    // immutable content. AlreadyFinished and forged replays must
-                    // never create tenant content. Commit its unique-key locks
-                    // before acquiring the session lock, including during rolling
-                    // upgrades with older session-before-content writers.
-                    if !defer_projection
-                        && trusted_reservation.enforcement_mode != EnforcementMode::MeteredUnlimited
-                    {
-                        let atoms = extract_atoms(conversation.request_json);
-                        let nodes = build_prefix(&atoms);
-                        materialize_conversation_content_in_transaction(
-                            &mut transaction,
-                            &tenant_id,
-                            &atoms,
-                            &nodes,
-                            now,
-                        )
-                        .await?;
-                        content_materialized = true;
-                    }
                     preparation_complete = true;
-                    // Reclaim and revalidate the owner in the final transaction.
-                    // A concurrent winner leaves only deduplicated, invisible
-                    // content, never an observation or a second ledger charge.
-                    // Buffered metered-unlimited finishes also restart to take
-                    // the private reservation before the request owner row.
-                    if content_materialized || buffered_archive.is_some() {
+                    // Restart once so a buffered response archive holds its
+                    // private reservation before the request owner row.
+                    if buffered_archive.is_some() {
                         BudgetHold::commit_optional(transaction, hold).await?;
                         continue;
                     }
@@ -1894,7 +1987,7 @@ impl Database {
                     input.response_object.to_owned(),
                     false,
                 ),
-                Err(AppError::Upstream(_)) => (
+                Err(AppError::Upstream { .. }) => (
                     TokenUsage::default(),
                     502,
                     Some("upstream_invalid_usage".to_owned()),
@@ -1924,63 +2017,19 @@ impl Database {
             .await?;
         }
 
-        // Metered-unlimited terminal traffic can complete in large bursts for
-        // one session. Its terminal transaction must remain insert-only with
-        // respect to conversation state: updating the shared cluster and
-        // key-cluster rows here would turn that session into a write hotspot.
-        // Persist the complete observation in the durable outbox instead; a
-        // bounded projector transaction later performs the semantic writes and
-        // reclassifies the initially-unlinked request fact atomically.
-        BudgetHold::set_phase(&mut hold, "conversation_projection");
+        // Settlement only enqueues the conversation task. The worker reads
+        // 原始请求 JSON and 原始返回 JSON from the object locators already on
+        // the request and builds 会话正文 in CNPG. A failure to build 会话正文
+        // records session_dialogue_unavailable and leaves settlement running.
+        BudgetHold::set_phase(&mut hold, "conversation_enqueue");
         if let Some(conversation) = input.conversation.as_ref() {
             if conversation.key.tenant_id != input.tenant_id
                 || conversation.key.key_id != input.reservation.key_id
             {
                 return Err(AppError::NotFound);
             }
-            if defer_projection
-                || trusted_reservation.enforcement_mode == EnforcementMode::MeteredUnlimited
-            {
-                enqueue_conversation_projection_in_transaction(
-                    &mut transaction,
-                    ConversationProjectionEnqueueInput {
-                        request_id: input.request_id,
-                        key: conversation.key,
-                        request_json: conversation.request_json,
-                        hints: conversation.hints,
-                        client_name: conversation.client_name,
-                        upstream_response_id: conversation.upstream_response_id,
-                        observed_at: now,
-                        content_materialized,
-                    },
-                )
+            enqueue_conversation_task(&mut transaction, input.request_id, conversation, now)
                 .await?;
-            } else {
-                self.record_conversation_observation_in_transaction(
-                    &mut transaction,
-                    ConversationObservationInput {
-                        key: conversation.key,
-                        request_id: input.request_id,
-                        request_json: conversation.request_json,
-                        hints: conversation.hints,
-                        client_name: conversation.client_name,
-                        upstream_response_id: conversation.upstream_response_id,
-                        observed_at: now,
-                        attach_request_record: true,
-                        content_materialized,
-                    },
-                )
-                .await?;
-                if let Some(response_id) = conversation.upstream_response_id {
-                    attach_conversation_upstream_response_in_transaction(
-                        &mut transaction,
-                        self.backend,
-                        input.request_id,
-                        response_id,
-                    )
-                    .await?;
-                }
-            }
         }
         BudgetHold::set_phase(&mut hold, "key_account_settlement");
         let reservation_status: String = reservation_row.try_get("status")?;
@@ -2022,7 +2071,7 @@ impl Database {
             // transaction publishes the complete terminal snapshot.
             "settled" => reservation_row
                 .try_get::<Option<i64>, _>("actual_micros")?
-                .ok_or(AppError::Internal)?,
+                .ok_or(AppError::internal("lifecycle_site_7"))?,
             _ => {
                 return Err(AppError::Conflict(
                     "request reservation is not finishable".into(),
@@ -2271,7 +2320,7 @@ pub(crate) async fn allocate_request_event_cursor(
     )
     .fetch_optional(&mut **transaction)
     .await?;
-    let cursor = match last {
+    let mut cursor = match last {
         None => RequestEventCursor {
             event_id: fresh_v7_at(now)?,
             event_at: now,
@@ -2290,7 +2339,9 @@ pub(crate) async fn allocate_request_event_cursor(
                     event_at: last_at,
                 }
             } else {
-                let event_at = last_at.checked_add(1).ok_or(AppError::Internal)?;
+                let event_at = last_at.checked_add(1).ok_or(AppError::internal(
+                    "lifecycle_allocate_request_event_cursor_1",
+                ))?;
                 RequestEventCursor {
                     event_id: fresh_v7_at(event_at)?,
                     event_at,
@@ -2299,26 +2350,36 @@ pub(crate) async fn allocate_request_event_cursor(
         }
     };
 
-    let claimed = sqlx::query(
-        "INSERT INTO request_event_locators (id, created_at, tenant_id, key_id, request_id) VALUES ($1, $2, $3, $4, $5)",
-    )
-    .bind(&cursor.event_id)
-    .bind(cursor.event_at)
-    .bind(tenant_id)
-    .bind(key_id)
-    .bind(request_id)
-    .execute(&mut **transaction)
-    .await?;
-    if claimed.rows_affected() != 1 {
-        return Err(AppError::Internal);
+    loop {
+        let claimed = sqlx::query(
+            "INSERT INTO request_event_locators (id, created_at, tenant_id, key_id, request_id) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&cursor.event_id)
+        .bind(cursor.event_at)
+        .bind(tenant_id)
+        .bind(key_id)
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await?;
+        if claimed.rows_affected() == 1 {
+            return Ok(cursor);
+        }
+        if let Some(event_id) = increment_v7_random_b(&cursor.event_id, cursor.event_at) {
+            cursor.event_id = event_id;
+        } else {
+            cursor.event_at = cursor.event_at.checked_add(1).ok_or(AppError::internal(
+                "lifecycle_allocate_request_event_cursor_2",
+            ))?;
+            cursor.event_id = fresh_v7_at(cursor.event_at)?;
+        }
     }
-    Ok(cursor)
 }
 
 fn fresh_v7_at(event_at: i64) -> Result<String, AppError> {
-    let millis = u64::try_from(event_at).map_err(|_| AppError::Internal)?;
+    let millis =
+        u64::try_from(event_at).map_err(|_| AppError::internal("lifecycle_fresh_v7_at_1"))?;
     if millis > 0x0000_ffff_ffff_ffff {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("lifecycle_fresh_v7_at_1"));
     }
     let timestamp = millis.to_be_bytes();
     let mut bytes = *Uuid::now_v7().as_bytes();
@@ -2555,8 +2616,11 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .as_ref()
         .map(|usage| usage.billing_unit)
         .unwrap_or("");
+    // Archive binding and terminal persistence finish independently. A stale
+    // terminal placeholder must not downgrade a locator already bound by the
+    // archive owner; resolve this under the same row lock as terminal facts.
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = $10, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19, cache_known_read_tokens = $20, cache_known_input_tokens = $21 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = CASE WHEN $10 LIKE 'gap://%' AND response_object IS NOT NULL AND response_object <> '' AND response_object NOT LIKE 'gap://%' THEN response_object ELSE $10 END, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19, cache_known_read_tokens = $20, cache_known_input_tokens = $21 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)
@@ -2585,7 +2649,15 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         return Ok(false);
     }
     super::super::billing::publish_text_settlement_in_transaction(tx, request.request_id).await?;
-    let Some(project_aggregates) = project_aggregates else {
+    let bridged: i64 = if project_aggregates.is_some() {
+        sqlx::query_scalar("SELECT COUNT(*) FROM terminal_projection_outbox WHERE request_id = $1")
+            .bind(&request_id)
+            .fetch_one(&mut **tx)
+            .await?
+    } else {
+        0
+    };
+    let Some(project_aggregates) = project_aggregates.filter(|_| bridged == 0) else {
         super::terminal_projection::enqueue_terminal_projection_in_transaction(tx, &request_id)
             .await?;
         return Ok(true);
@@ -2615,7 +2687,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .bind(&request_id)
         .execute(&mut **tx)
         .await?;
-        add_request_fact_to_session_projection_in_transaction(tx, &request_id).await?;
+        add_request_fact_to_session_projection_in_transaction(tx, &request_id, 1).await?;
         sqlx::query(
             r#"INSERT INTO usage_analysis_hourly (
                    tenant_id, key_id, hour_bucket, source_kind, model, protocol, status_class,
@@ -2791,7 +2863,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     .execute(&mut **tx)
     .await?;
     if inserted.rows_affected() != 1 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("lifecycle_site_8"));
     }
     Ok(true)
 }

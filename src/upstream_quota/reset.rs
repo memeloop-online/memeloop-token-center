@@ -21,8 +21,8 @@ fn blocked() -> AppError {
     )
 }
 
-fn temporarily_unavailable() -> AppError {
-    AppError::Overloaded
+fn temporarily_unavailable(code: &'static str) -> AppError {
+    AppError::capacity_error(code)
 }
 
 async fn fresh_snapshot(
@@ -45,8 +45,9 @@ async fn fresh_snapshot(
         .upstream_quota
         .permits
         .try_acquire()
-        .map_err(|_| temporarily_unavailable())?;
-    let mut budget = codex_quota_budget(&account.config).map_err(|_| temporarily_unavailable())?;
+        .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
+    let mut budget = codex_quota_budget(&account.config)
+        .map_err(|_| temporarily_unavailable("quota_reset_budget"))?;
     // Even the reset workflow's credit precheck remains a single attempt.
     // Consumption below is a separate no-retry transport and never enters the reader.
     budget.attempt_limit = 1;
@@ -58,10 +59,9 @@ async fn fresh_snapshot(
     let observed_started_at = unix_millis();
     let account_header =
         crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
-    let http = state
-        .codex_clients
-        .account_transport_snapshot(account, credential, selection.generation)
-        .map_err(|_| temporarily_unavailable())?;
+    let policy =
+        crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))
+            .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
     let (credential_header, credential_value) = credential
         .request_header(observed_started_at)
         .map_err(|_| blocked())?
@@ -76,7 +76,8 @@ async fn fresh_snapshot(
     let reset = match tokio::time::timeout(
         budget.total,
         get_codex_json(
-            &http,
+            &state.codex_clients,
+            policy,
             auth,
             CREDITS_URL,
             QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
@@ -95,7 +96,7 @@ async fn fresh_snapshot(
                 error,
                 refresh_started,
             );
-            return Err(temporarily_unavailable());
+            return Err(temporarily_unavailable("quota_reset_read_failed"));
         }
         Err(_) => {
             log_quota_read_completed(
@@ -105,7 +106,7 @@ async fn fresh_snapshot(
                 "quota_timeout",
                 refresh_started,
             );
-            return Err(temporarily_unavailable());
+            return Err(temporarily_unavailable("quota_reset_timeout"));
         }
     };
     let observed_at = unix_millis();
@@ -118,7 +119,7 @@ async fn fresh_snapshot(
             error,
             refresh_started,
         );
-        return Err(temporarily_unavailable());
+        return Err(temporarily_unavailable("quota_reset_normalize"));
     }
     snapshot.status = "ready";
     snapshot.freshness = "fresh";
@@ -148,7 +149,7 @@ async fn fresh(
         || available.is_none_or(|value| value < 0)
         || applicable.is_none_or(|value| value < 0)
     {
-        return Err(temporarily_unavailable());
+        return Err(temporarily_unavailable("quota_reset_credits_unavailable"));
     }
     Ok(snapshot)
 }
@@ -167,7 +168,8 @@ pub(crate) async fn prepare(
         .quota_reset_prepare_replay(account, actor, &prepare_idempotency_hash)
         .await?
     {
-        let operation_id = Uuid::parse_str(&operation.id).map_err(|_| AppError::Internal)?;
+        let operation_id =
+            Uuid::parse_str(&operation.id).map_err(|_| AppError::internal("reset_prepare_1"))?;
         return Ok(PreparedReset {
             operation,
             confirmation_token: confirmation_token(
@@ -220,7 +222,7 @@ pub(crate) async fn prepare(
         state,
         account,
         actor,
-        Uuid::parse_str(&result.operation.id).map_err(|_| AppError::Internal)?,
+        Uuid::parse_str(&result.operation.id).map_err(|_| AppError::internal("reset_prepare_2"))?,
         idempotency_key,
     );
     Ok(PreparedReset {
@@ -315,7 +317,7 @@ pub(crate) async fn confirm(
             .await?
         {
             QuotaResetClaim::Replayed(operation) => Ok(*operation),
-            QuotaResetClaim::Claimed { .. } => Err(AppError::Internal),
+            QuotaResetClaim::Claimed { .. } => Err(AppError::internal("reset_confirm_1")),
         };
     }
     let snapshot = fresh(state, account, credential, tenant).await?;
@@ -339,7 +341,7 @@ pub(crate) async fn confirm(
         .upstream_quota
         .permits
         .try_acquire()
-        .map_err(|_| temporarily_unavailable())?;
+        .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
     let http = tokio::time::timeout(
         Duration::from_secs(5),
         crate::network::client_for_codex_url_without_retries(
@@ -351,8 +353,8 @@ pub(crate) async fn confirm(
         ),
     )
     .await
-    .map_err(|_| temporarily_unavailable())?
-    .map_err(|_| temporarily_unavailable())?;
+    .map_err(|_| temporarily_unavailable("quota_reset_transport_timeout"))?
+    .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
     let claim = state
         .db
         .claim_quota_reset(
