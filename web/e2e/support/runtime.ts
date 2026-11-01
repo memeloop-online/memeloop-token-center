@@ -214,6 +214,7 @@ export interface SeedState {
   otherClientKeyId: string;
   globalServiceCredential: string;
   serviceCredential: string;
+  sessionObserverCredential: string;
   upstreamId: string;
   upstreamName: string;
   otherUpstreamId: string;
@@ -535,6 +536,16 @@ async function seedThroughHttp(): Promise<SeedState> {
       ],
     },
   });
+  // The browser operator reuses its four-stream service quota across scenarios.
+  // Give the independent durable-event observer its own tenant-scoped identity.
+  const sessionObserver = await requestJson<{ token: string }>('/internal/v1/service-tokens', {
+    method: 'POST', credential: bootstrapToken,
+    body: {
+      name: 'Browser session-ready observer',
+      tenant_external_id: tenant,
+      scopes: ['requests:read'],
+    },
+  });
 
   // Response delivery precedes background financial acknowledgement. Wait for
   // each seed's concurrency reservation before issuing the next non-idempotent POST.
@@ -600,6 +611,7 @@ async function seedThroughHttp(): Promise<SeedState> {
     globalServiceCredential: globalService.token,
     otherClientKeyId: otherClient.key_id,
     serviceCredential: service.token,
+    sessionObserverCredential: sessionObserver.token,
     upstreamId: upstream.id,
     upstreamName: 'Browser mock upstream',
     otherUpstreamId: otherUpstream.id,

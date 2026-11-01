@@ -208,6 +208,10 @@ pub(crate) struct RequestSpoolAdmission {
 }
 
 impl RequestSpoolAdmission {
+    pub(crate) async fn drain_uploads(&self) {
+        self.usage.uploads.wait_for_idle().await;
+    }
+
     pub(crate) fn source(&self, request_id: uuid::Uuid) -> Option<Arc<RequestSpool>> {
         self.usage.sources.lock().ok()?.get(&request_id)?.upgrade()
     }
@@ -472,6 +476,7 @@ pub(crate) struct RequestSpoolSnapshot {
 
 #[derive(Default)]
 struct RequestSpoolUsage {
+    uploads: Arc<crate::proxy_lifecycle::ProxyLifecycleCounter>,
     used_bytes: AtomicUsize,
     active_files: AtomicUsize,
     durable: Option<DurableRequestBodies>,
@@ -811,7 +816,15 @@ fn publish_durable(shared: &Arc<SharedBody>) {
     let residency = shared.residency.clone();
     let outcome = shared.outcome.clone();
     let source = shared.clone();
+    let activity = shared
+        .lease
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .usage
+        .uploads
+        .start();
     let handle = tokio::spawn(async move {
+        let _activity = activity;
         let (cancel, cancelled) = tokio::sync::oneshot::channel::<()>();
         let upload = async {
             let retry_upload = async {
@@ -1018,6 +1031,9 @@ pub(crate) struct RequestSpoolReadError;
 
 #[cfg(test)]
 mod archive_source_tests;
+
+#[cfg(test)]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod tests {

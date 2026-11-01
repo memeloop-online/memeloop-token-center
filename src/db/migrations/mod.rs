@@ -767,6 +767,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
             include_str!("../../../migrations/sqlite/0145_request_history_export.sql"),
         ),
     },
+    Migration {
+        version: 146,
+        name: "live request owner lease observation index",
+        sql: include_str!("../../../migrations/common/0146_request_live_owner_index.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1512,6 +1517,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
             "\n",
             include_str!("../../../migrations/postgres/0145_request_history_export.sql"),
         ),
+    },
+    Migration {
+        version: 146,
+        name: "live request owner lease observation index",
+        sql: include_str!("../../../migrations/common/0146_request_live_owner_index.sql"),
     },
 ];
 
