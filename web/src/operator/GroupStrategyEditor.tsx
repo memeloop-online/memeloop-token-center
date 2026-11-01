@@ -69,8 +69,9 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
     const current = groups.find(value => value.id === group.id);
     if (!current) throw new Error(t('groups.strategyMissingGroup'));
     if (!mounted.current) return;
-    setSnapshot(current); onSaved?.(current); setNeedsRefresh(false);
+    setSnapshot(current); onSaved?.(current);
     await onChanged();
+    if (mounted.current) setNeedsRefresh(false);
   }
   async function save(formData: Record<string, unknown>) {
     if (saving || !token || !tenant || !validPriority || needsRefresh || (pluginId && (!option || loading || catalogError || hasInvalidResources(schema, formData, formContext)))) return;

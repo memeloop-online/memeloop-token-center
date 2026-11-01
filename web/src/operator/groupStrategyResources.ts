@@ -1,8 +1,7 @@
-import type { GroupView, ModelRouteView } from '../types';
-import type { ComboboxOption } from './MultiCombobox';
+import type { GroupView, ModelRouteView } from '../types.js';
 
 /** Use the server's resolved route range whenever it is available, including an empty range. */
-export function strategyAccounts(group: GroupView, kind: 'provider' | 'route', accounts: ComboboxOption[], routes: ModelRouteView[], providerGroups: GroupView[]) {
+export function strategyAccounts<T extends { value: string }>(group: GroupView, kind: 'provider' | 'route', accounts: T[], routes: ModelRouteView[], providerGroups: GroupView[]) {
   const ids = new Set(kind === 'provider' ? group.member_ids : routes.filter(route => group.member_ids.includes(route.id)).flatMap(route => {
     if (route.candidate_upstream_account_ids !== undefined) return route.candidate_upstream_account_ids;
     const excluded = new Set(providerGroups.filter(value => route.excluded_provider_group_ids?.includes(value.id)).flatMap(value => value.member_ids));
