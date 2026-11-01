@@ -15,6 +15,8 @@ window.fetch = async input => {
   const tenant = url.searchParams.get('tenant_external_id');
   if (url.pathname.endsWith('/access')) return json({ can_manage: true });
   if (url.pathname === '/internal/v1/upstreams') return json([]);
+  if (url.pathname === '/internal/v1/transport-proxies') return json({ items: [] });
+  if (url.pathname === '/internal/v1/upstream-concurrency') return json({ error: { code: 'fixture_unavailable' } }, 503);
   if (url.pathname === '/internal/v1/transport-proxy-groups') return json({ items: tenant === 'tenant-b' ? [] : [{
     id: 'group-a', tenant_external_id: tenant, name: 'Research now', version: 3, bound_account_count: 0,
     members: [{ id: 'member-a', label: 'Current exit', scheme: 'socks5h', host: 'current.proxy.test', port: 1080, remote_dns: true, has_auth: true }],
