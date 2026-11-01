@@ -1334,7 +1334,11 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
     let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
     let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
     let database = Database::connect_with_max(isolated.url(), 8).await.unwrap();
-    let database = attach_fixture_archive(database, isolated.url()).await;
+    let archive_config = memeloop_token_center::config::Config::for_test(isolated.url().to_owned());
+    let archive = memeloop_token_center::archive::ArchiveStore::from_config(&archive_config)
+        .await
+        .unwrap();
+    let database = database.with_archive(archive.clone());
     database.migrate().await.unwrap();
     let inspection = PgPool::connect(isolated.url()).await.unwrap();
     let unique = Uuid::now_v7();
@@ -1719,12 +1723,6 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
             .unwrap();
             let reference: memeloop_token_center::archive::ConversationBodyReference =
                 serde_json::from_str(&content).unwrap();
-            let config = memeloop_token_center::config::Config::for_test(database_url.clone());
-            // This integration target links the production library: use the
-            // same fixture archive configuration to restore its actual CAS.
-            let archive = memeloop_token_center::archive::ArchiveStore::from_config(&config)
-                .await
-                .unwrap();
             let restored = archive
                 .get_tenant_content(
                     key.tenant_id,
