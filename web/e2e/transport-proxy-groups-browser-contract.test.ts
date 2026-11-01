@@ -7,6 +7,9 @@ import { operatorFixturePlugin } from './support/navigation-fixture-server.js';
 import { captureNavigationIdentity, seedNavigationIdentity } from './support/navigation-identity-artifacts.js';
 import type { TransportProxyBinding, TransportProxyGroup } from '../src/operator/transportProxyGroups.js';
 import { transportProxyGroupCopy } from '../src/operator/transportProxyGroupCopy.js';
+import type { NetworkProxy, NetworkProxySelection } from '../src/operator/NetworkProxies.js';
+import { networkProxyCopy } from '../src/operator/NetworkProxyCopy.js';
+import { concurrencySnapshot, csilProxy, legacySelection, networkProxyStrategies, proxyObservations } from './fixtures/transport-proxy-entities.js';
 
 interface ProxyGroupFixture {
   allowed: boolean;
@@ -23,6 +26,8 @@ interface ProxyGroupFixture {
   releaseRead?: () => void;
   readFailure?: boolean;
   policies: boolean[];
+  proxies: NetworkProxy[];
+  selection: NetworkProxySelection;
 }
 
 declare global {
@@ -31,12 +36,14 @@ declare global {
 
 const privateProxySecret = 'socks5h://fixture-user:privateProxySecret@10.20.30.40:1080';
 
-async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
+async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab: 'proxies' | 'groups' = 'groups') {
   const copy = transportProxyGroupCopy(locale);
-  await page.evaluate(({ allowed, secret }) => {
+  const networkCopy = networkProxyCopy(locale);
+  await page.evaluate(({ allowed, secret, proxy, selection, strategies, concurrency, observations }) => {
     const previousFetch = window.fetch;
     const state: ProxyGroupFixture = window.proxyGroupFixture = {
       allowed, groups: [], reads: 0, accessReads: 0, writes: [], holdNext: false, policies: [],
+      proxies: [proxy], selection,
       binding: {
         account_id: 'account-native', tenant_external_id: 'fixture', binding_version: 0,
         group_id: null, group_version: null, initial_member_id: null, credential_generation: 7, updated_at: 100,
@@ -45,8 +52,77 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
     };
     window.fetch = async (input, init) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
-      if (!url.pathname.includes('transport-proxy-group')) return previousFetch(input, init);
       const method = init?.method ?? 'GET';
+      const entityApi = url.pathname === '/internal/v1/transport-proxies' || url.pathname.startsWith('/internal/v1/transport-proxies/')
+        || url.pathname === '/internal/v1/transport-proxy-strategies' || url.pathname === '/internal/v1/upstream-concurrency'
+        || url.pathname.endsWith('/transport-proxy-selection');
+      if (entityApi) {
+        state.policies.push(init?.cache === 'no-store' && init?.credentials === 'omit' && init?.referrerPolicy === 'no-referrer');
+        if (!state.allowed) return new Response(JSON.stringify({ error: { code: 'forbidden', message: secret } }), { status: 403 });
+        if (method === 'GET') {
+          if (url.searchParams.get('tenant_external_id') !== 'fixture') throw new Error('missing entity read tenant');
+          state.reads += 1;
+          if (url.pathname === '/internal/v1/transport-proxies') {
+            return new Response(JSON.stringify({ items: state.proxies.map(proxy => {
+              const item: NetworkProxy = { ...proxy };
+              delete item.group_ids; delete item.bound_account_count;
+              return item;
+            }) }));
+          }
+          if (url.pathname.endsWith('/observations')) {
+            const id = url.pathname.split('/')[4];
+            const proxy = state.proxies.find(item => item.id === id);
+            return proxy ? new Response(JSON.stringify({ ...observations, proxy_id: proxy.id, proxy_version: proxy.version, active_health: proxy.active_health })) : new Response(null, { status: 404 });
+          }
+          if (url.pathname === '/internal/v1/transport-proxy-strategies') return new Response(JSON.stringify({ items: strategies }));
+          if (url.pathname === '/internal/v1/upstream-concurrency') return new Response(JSON.stringify(concurrency));
+          if (url.pathname.endsWith('/transport-proxy-selection')) return new Response(JSON.stringify(state.selection));
+        }
+        const body = JSON.parse(String(init?.body ?? '{}'));
+        state.writes.push({ path: `${url.pathname}${url.search}`, method, body });
+        if (body.tenant_external_id !== 'fixture') throw new Error('missing entity write tenant');
+        if (url.pathname.endsWith('/probe')) return new Response(JSON.stringify({ queued: true }), { status: 202 });
+        if (url.pathname.endsWith('/transport-proxy-selection')) {
+          if (body.expected_selection_version !== state.selection.selection_version || body.expected_binding_version !== state.selection.binding_version
+            || body.expected_credential_generation !== state.selection.credential_generation || body.expected_updated_at !== state.selection.account_updated_at) {
+            return new Response(JSON.stringify({ error: { code: 'network_proxy_selection_version_conflict' } }), { status: 409 });
+          }
+          state.selection = {
+            ...state.selection, selection_version: state.selection.selection_version + 1, binding_version: state.selection.binding_version + 1,
+            credential_generation: state.selection.credential_generation + 1, account_updated_at: state.selection.account_updated_at + 1,
+            configuration_revision: state.selection.selection_version + 1,
+            desired: {
+              mode: body.mode, proxy_id: body.proxy_id ?? null, group_id: body.group_id ?? null,
+              plugin_id: body.plugin_id ?? null, plugin_version: body.plugin_version ?? null, config: body.config,
+            },
+            applied: { pending: true, scope: 'this_process' },
+          };
+          return new Response(JSON.stringify(state.selection), { status: 202 });
+        }
+        if (method === 'DELETE') {
+          state.proxies = state.proxies.filter(proxy => proxy.id !== url.pathname.split('/').at(-1));
+          return new Response(null, { status: 204 });
+        }
+        const id = method === 'POST' ? '10000000-0000-4000-8000-000000000002' : url.pathname.split('/').at(-1);
+        const old = state.proxies.find(proxy => proxy.id === id);
+        if (method === 'PUT' && (!old || body.expected_version !== old.version)) {
+          return new Response(JSON.stringify({ error: { code: 'network_proxy_version_conflict' } }), { status: 409 });
+        }
+        const parsed = body.proxy_url ? new URL(body.proxy_url) : undefined;
+        const saved: NetworkProxy = {
+          id: id!, tenant_external_id: 'fixture', name: body.name, version: (old?.version ?? 0) + 1,
+          address: {
+            scheme: parsed?.protocol.slice(0, -1) ?? old?.address.scheme ?? 'socks5h',
+            host: parsed?.hostname ?? old?.address.host ?? '10.20.30.40', port: parsed ? Number(parsed.port) : old?.address.port ?? 1080,
+            remote_dns: true, has_auth: parsed ? Boolean(parsed.username || parsed.password) : old?.address.has_auth ?? false,
+          },
+          probe: body.probe, active_health: { status: 'unknown', checked_at: null, latency_ms: null, scope: 'process' },
+          group_ids: [], bound_account_count: 0, created_at: old?.created_at ?? 1_793_510_000_000, updated_at: 1_793_510_600_000,
+        };
+        state.proxies = [...state.proxies.filter(proxy => proxy.id !== id), saved];
+        return new Response(JSON.stringify(saved), { status: method === 'POST' ? 201 : 200 });
+      }
+      if (!url.pathname.includes('transport-proxy-group')) return previousFetch(input, init);
       state.policies.push(init?.cache === 'no-store' && init?.credentials === 'omit' && init?.referrerPolicy === 'no-referrer');
       if (url.pathname === '/internal/v1/transport-proxy-groups/access') {
         if (method !== 'GET' || url.search) throw new Error('capability must read the credential scope, not the selected tenant');
@@ -124,7 +200,8 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
       }
       return response;
     };
-  }, { allowed, secret: privateProxySecret });
+  }, { allowed, secret: privateProxySecret, proxy: csilProxy, selection: legacySelection,
+    strategies: networkProxyStrategies, concurrency: concurrencySnapshot, observations: proxyObservations(csilProxy) });
   const probe = await page.evaluate(async () => {
     const response = await window.fetch('/internal/v1/transport-proxy-groups/access', {
       cache: 'no-store', credentials: 'omit', referrerPolicy: 'no-referrer',
@@ -135,7 +212,11 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
   assert.equal(probe.status, 200, 'fixture self-capability response must be ready before UI interaction');
   assert.equal(probe.canManage, allowed);
   await page.locator('.proxy-groups-page').getByRole('button', { name: copy.retry, exact: true }).click();
-  if (allowed) await page.getByRole('button', { name: copy.create, exact: true }).waitFor();
+  if (allowed) {
+    const tabName = tab === 'groups' ? copy.title : networkCopy.proxiesTab;
+    await page.getByRole('tab', { name: tabName, exact: true }).click();
+    await page.getByRole('button', { name: tab === 'groups' ? copy.create : networkCopy.create, exact: true }).waitFor();
+  }
   else await page.getByText(copy.denied, { exact: true }).waitFor();
   assert.equal(await page.getByText('已具备代理组管理权限。', { exact: true }).count(), 0);
   if (!allowed) assert.equal(await page.evaluate(() => window.proxyGroupFixture.reads), 0, 'denied capability checks must not read group or binding data');
@@ -143,6 +224,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
 
 async function openManager(page: Page) {
   await page.getByRole('link', { name: '网络代理', exact: true }).click();
+  await page.getByRole('tab', { name: '代理组', exact: true }).click();
   await page.getByRole('button', { name: '新建代理组', exact: true }).waitFor();
 }
 
@@ -219,7 +301,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
     child.diagnostic(JSON.stringify(state));
     await activePage.close();
   });
-  async function prepare(allowed = true, locale = 'zh-CN') {
+  async function prepare(allowed = true, locale = 'zh-CN', tab: 'proxies' | 'groups' = 'groups') {
     const page = await browser.newPage();
     activePage = page;
     page.on('pageerror', error => errors.push(error.message));
@@ -231,7 +313,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
     await seedNavigationIdentity(page, locale);
     await page.goto(`${origin}/operator?view=proxy-groups`);
     await page.getByText(transportProxyGroupCopy(locale).denied, { exact: true }).waitFor();
-    await installFixture(page, allowed, locale);
+    await installFixture(page, allowed, locale, tab);
     return page;
   }
   try {
@@ -500,6 +582,113 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       }
       assert.equal(writes[4].body.expected_version, 4);
       await captureNavigationIdentity(page, 'proxy-groups', 'saved-replacement', 'zh-CN');
+      await page.close();
+    });
+
+    await context.test('standalone network exits show real health, success rates, traffic and concurrency in both languages', async () => {
+      for (const locale of ['zh-CN', 'en']) {
+        const copy = networkProxyCopy(locale);
+        const page = await prepare(true, locale, 'proxies');
+        const workspace = page.locator('.network-proxy-workspace');
+        await workspace.getByRole('button', { name: copy.edit('CSIL'), exact: true }).waitFor();
+        assert.equal(await workspace.getByText('socks5h://100.64.0.16:1080', { exact: true }).count(), 1);
+        if (locale === 'zh-CN') assert.equal(await workspace.getByText(/0个组引用/).count(), 0, 'missing list references are not rendered as zero');
+        await captureNavigationIdentity(page, 'proxy-groups', 'network-exits-ready', locale);
+        await workspace.getByRole('button', { name: copy.details, exact: true }).click();
+        await workspace.getByText(new RegExp(`${copy.requestSuccessRate}: 90%`)).waitFor();
+        const details = await workspace.locator('.network-proxy-item').innerText();
+        assert.match(details, new RegExp(`${copy.transportSuccessRate}: 95%`));
+        assert.match(details, /4,096 B/);
+        assert.match(details, /16,384 B/);
+        assert.match(details, new RegExp(`${copy.concurrency}: 1`));
+        assert.match(details, new RegExp(`${copy.healthTitle}: ${copy.health.healthy}`));
+        await captureNavigationIdentity(page, 'proxy-groups', 'network-exits-details', locale);
+        await workspace.getByRole('button', { name: copy.edit('CSIL'), exact: true }).click();
+        const address = workspace.getByLabel(copy.address, { exact: true });
+        assert.equal(await address.inputValue(), 'socks5h://100.64.0.16:1080');
+        assert.equal(await address.getAttribute('type'), 'text');
+        await captureNavigationIdentity(page, 'proxy-groups', 'network-exit-edit-address', locale);
+        await page.close();
+      }
+    });
+
+    await context.test('entity address edits and manual, automatic and plugin policies save and reload through existing APIs', async () => {
+      const page = await prepare(true, 'zh-CN', 'proxies');
+      const copy = networkProxyCopy('zh-CN');
+      const workspace = page.locator('.network-proxy-workspace');
+      await workspace.getByRole('button', { name: copy.edit('CSIL'), exact: true }).click();
+      await workspace.getByRole('textbox', { name: /^出口名称\s*\*?$/ }).fill('CSIL 主出口');
+      await workspace.getByRole('button', { name: copy.save, exact: true }).click();
+      await workspace.getByText(copy.saved, { exact: true }).waitFor();
+      let writes = await page.evaluate(() => window.proxyGroupFixture.writes);
+      assert.equal(writes.length, 1);
+      assert.equal(writes[0].method, 'PUT');
+      assert.equal(Object.hasOwn(writes[0].body, 'proxy_url'), false, 'unchanged redacted address preserves stored authentication');
+      assert.equal(writes[0].body.expected_version, 1);
+
+      await workspace.getByRole('button', { name: copy.create, exact: true }).click();
+      await workspace.getByRole('textbox', { name: /^出口名称\s*\*?$/ }).fill('研发备用');
+      await workspace.getByLabel(copy.requiredAddress, { exact: true }).fill(privateProxySecret);
+      await workspace.getByRole('button', { name: copy.save, exact: true }).click();
+      await workspace.getByRole('button', { name: copy.edit('研发备用'), exact: true }).waitFor();
+      await workspace.getByRole('button', { name: copy.edit('研发备用'), exact: true }).click();
+      const replacement = workspace.getByLabel(copy.address, { exact: true });
+      assert.equal(await replacement.inputValue(), 'socks5h://10.20.30.40:1080');
+      await replacement.fill('socks5h://10.20.30.41:1080');
+      await workspace.getByRole('button', { name: copy.save, exact: true }).click();
+      await workspace.getByText(copy.saved, { exact: true }).waitFor();
+      writes = await page.evaluate(() => window.proxyGroupFixture.writes);
+      assert.equal(writes.length, 3);
+      assert.equal(writes[1].method, 'POST');
+      assert.equal(writes[1].body.proxy_url, privateProxySecret);
+      assert.equal(writes[2].method, 'PUT');
+      assert.equal(writes[2].body.proxy_url, 'socks5h://10.20.30.41:1080');
+      await assertSecretsAbsent(page);
+
+      await page.evaluate(() => { window.proxyGroupFixture.groups = [{
+        id: 'raw-group-id', tenant_external_id: 'fixture', name: 'CSIL 代理组', version: 1, bound_account_count: 0,
+        members: [{ id: 'raw-member-id-0', label: 'CSIL', scheme: 'socks5h', host: '100.64.0.16', port: 1080, remote_dns: true, has_auth: false }],
+      }]; });
+      await page.getByRole('tab', { name: copy.policiesTab, exact: true }).click();
+      const policies = page.locator('.network-proxy-policy-workspace');
+      await policies.getByLabel(copy.account, { exact: true }).selectOption('account-native');
+      await policies.getByText(new RegExp(copy.policyLegacy)).waitFor();
+      await policies.getByLabel(copy.targetProxy, { exact: true }).selectOption({ label: 'CSIL 主出口' });
+      await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
+      await policies.getByText(copy.policySaved, { exact: true }).waitFor();
+      await captureNavigationIdentity(page, 'proxy-groups', 'account-policy-manual', 'zh-CN');
+
+      await policies.getByLabel(copy.mode, { exact: true }).selectOption('auto');
+      await policies.getByLabel(copy.targetGroup, { exact: true }).selectOption({ label: 'CSIL 代理组' });
+      await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
+      await policies.getByText(copy.policySaved, { exact: true }).waitFor();
+      await policies.getByLabel(copy.mode, { exact: true }).selectOption('plugin');
+      await policies.getByLabel(copy.strategy, { exact: true }).selectOption({ label: 'fixture-latency · 2' });
+      await policies.getByLabel(copy.targetGroup, { exact: true }).selectOption({ label: 'CSIL 代理组' });
+      await policies.getByLabel('minimum_samples', { exact: true }).fill('6');
+      await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
+      await policies.getByText(copy.policySaved, { exact: true }).waitFor();
+      writes = await page.evaluate(() => window.proxyGroupFixture.writes);
+      const policyWrites = writes.slice(3);
+      assert.deepEqual(policyWrites.map(write => write.body.mode), ['manual', 'auto', 'plugin']);
+      assert.equal(policyWrites[0].body.proxy_id, csilProxy.id);
+      assert.deepEqual(policyWrites[0].body.config, {});
+      assert.equal(policyWrites[1].body.group_id, 'raw-group-id');
+      assert.equal(policyWrites[1].body.expected_group_version, 1);
+      assert.equal(policyWrites[1].body.config.minimum_samples, 8);
+      assert.equal(policyWrites[2].body.plugin_id, 'fixture-latency');
+      assert.equal(policyWrites[2].body.plugin_version, '2');
+      assert.deepEqual(policyWrites[2].body.config, { minimum_samples: 6, prefer_healthy: true });
+      assert.deepEqual(policyWrites.map(write => write.body.expected_selection_version), [0, 1, 2]);
+      assert.ok((await page.evaluate(() => window.proxyGroupFixture.policies)).every(Boolean));
+
+      await page.getByRole('tab', { name: '代理组', exact: true }).click();
+      await page.getByRole('tab', { name: copy.policiesTab, exact: true }).click();
+      await policies.getByLabel(copy.account, { exact: true }).selectOption('account-native');
+      await policies.getByLabel(copy.mode, { exact: true }).waitFor();
+      assert.equal(await policies.getByLabel(copy.mode, { exact: true }).inputValue(), 'plugin');
+      assert.equal(await policies.getByLabel(copy.strategy, { exact: true }).inputValue(), 'fixture-latency\0' + '2');
+      assert.equal(await policies.getByLabel('minimum_samples', { exact: true }).inputValue(), '6');
       await page.close();
     });
 

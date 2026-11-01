@@ -25,7 +25,7 @@ interface MemberDraft {
   originalProxyUrl?: string;
 }
 
-function ProxyAddressInput({ id, value, disabled, required, placeholder, onChange }: {
+export function ProxyAddressInput({ id, value, disabled, required, placeholder, onChange }: {
   id: string; value: string; disabled: boolean; required: boolean; placeholder: string;
   onChange: (value: string) => void;
 }) {

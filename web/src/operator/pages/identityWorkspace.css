@@ -38,6 +38,11 @@
   min-width: 0;
 }
 
+.proxy-groups-page > [role="tabpanel"] {
+  margin-top: 16px;
+  min-width: 0;
+}
+
 .proxy-groups-page .transport-proxy-workspace > fieldset {
   display: grid;
   gap: 24px;
@@ -54,6 +59,26 @@
 
 .proxy-groups-page .proxy-group-list {
   min-block-size: 112px;
+}
+
+.proxy-groups-page .network-proxy-item {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding-block: 12px;
+  border-bottom: 1px solid var(--colorNeutralStroke2);
+}
+
+.proxy-groups-page .network-proxy-item:last-child {
+  border-bottom: 0;
+}
+
+.proxy-groups-page .network-proxy-outcomes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  margin: 0;
+  padding-inline-start: 20px;
 }
 
 .proxy-groups-page .proxy-address-field {
