@@ -14,3 +14,16 @@ test('strategy account choices respect group membership, server empty candidate 
   assert.deepEqual(strategyAccounts(group, 'route', accounts, [{ ...route, candidate_upstream_account_ids: ['b', 'missing'] }], providers).map(value => value.value), ['b']);
   assert.deepEqual(strategyAccounts({ member_ids: ['other'] } as GroupView, 'route', accounts, [route], providers), []);
 });
+
+test('presentation annotations preserve validation of real resource arrays', async () => {
+  const { safeValidator } = await import('../src/safeValidator.js');
+  const schema = {
+    type: 'object' as const, additionalProperties: false, required: ['accounts'],
+    title: 'Preferred accounts', 'x-i18n': { 'zh-CN': { title: '优先账号' } },
+    properties: { accounts: { type: 'array' as const, uniqueItems: true, items: { type: 'string' as const, minLength: 1 },
+      'x-resource-selector': { source: 'group-accounts', ordered: true } } },
+  };
+  assert.deepEqual(safeValidator.rawValidation(schema, { accounts: ['alpha', 'beta'] }).errors, []);
+  assert.ok(safeValidator.rawValidation(schema, { accounts: ['alpha', 'alpha'] }).errors.length);
+  assert.ok(safeValidator.rawValidation(schema, { accounts: [5] }).errors.length);
+});

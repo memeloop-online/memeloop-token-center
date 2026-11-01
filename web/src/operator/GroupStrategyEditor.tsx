@@ -34,6 +34,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [needsRefresh, setNeedsRefresh] = useState(false);
+  const [needsListRefresh, setNeedsListRefresh] = useState(false);
   const mounted = useRef(true);
   useEffect(() => {
     // Rename/member writes share updated_at but do not change strategy content.
@@ -52,9 +53,15 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
     return () => controller.abort();
   }, [token, reload]);
   const option = catalog.find(value => value.id === pluginId);
-  const schema = localizeSchema(option?.schema ?? { type: 'object', properties: {} }, locale);
+  const schema = localizeSchema<RJSFSchema>(option?.schema ?? { type: 'object', properties: {} }, locale);
   const formContext = { resources: { 'group-accounts': accounts } };
   const invalidResources = hasInvalidResources(schema, config, formContext);
+  const dirty = pluginId !== (snapshot.routing_strategy?.plugin_id ?? '') || priority !== String(snapshot.routing_priority ?? 0)
+    || JSON.stringify(config) !== JSON.stringify(snapshot.routing_strategy?.config ?? {});
+  function restore() {
+    setPluginId(snapshot.routing_strategy?.plugin_id ?? ''); setConfig(snapshot.routing_strategy?.config ?? {});
+    setPriority(String(snapshot.routing_priority ?? 0)); setMessage(''); if (!needsRefresh) setError('');
+  }
   const validPriority = /^-?\d+$/.test(priority) && Number(priority) >= -2147483648 && Number(priority) <= 2147483647;
   async function refresh() {
     const query = new URLSearchParams({ tenant_external_id: tenant });
@@ -76,7 +83,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
       });
       if (!mounted.current) return;
       setSnapshot(saved); onSaved?.(saved); setMessage(t('groups.strategySaved'));
-      try { await onChanged(); } catch { if (mounted.current) setError(t('groups.strategyRefreshAfterSave')); }
+      try { await onChanged(); if (mounted.current) setNeedsListRefresh(false); } catch { if (mounted.current) { setNeedsListRefresh(true); setError(t('groups.strategyRefreshAfterSave')); } }
     } catch (reason) {
       if (!mounted.current) return;
       if (reason instanceof ApiError && reason.status === 409) {
@@ -93,6 +100,12 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
     {catalogError && <div role="alert">{catalogError}<button type="button" onClick={() => setReload(value => value + 1)}>{t('common.retry')}</button></div>}
     {error && <div className="notice error" role="alert">{error}</div>}
     {message && <div className="notice success" role="status">{message}</div>}
+    {needsListRefresh && <button type="button" disabled={saving} onClick={async () => {
+      setSaving(true);
+      try { await onChanged(); if (mounted.current) { setNeedsListRefresh(false); setError(''); } }
+      catch { if (mounted.current) setError(t('groups.strategyRefreshAfterSave')); }
+      finally { if (mounted.current) setSaving(false); }
+    }}>{t('common.retry')}</button>}
     {needsRefresh && <button type="button" disabled={saving} onClick={async () => {
       setSaving(true);
       try { await refresh(); if (mounted.current) setError(t('groups.strategyConflict')); }
@@ -108,6 +121,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
     {option && schema.description && <p className="field-hint">{schema.description}</p>}
     <label>{t('groups.strategyPriority')}<input type="number" step="1" min={-2147483648} max={2147483647} value={priority} disabled={saving} onChange={event => { setPriority(event.target.value); setMessage(''); }} /></label>
     <p className="muted">{t('groups.strategyPriorityHelp')}</p>
+    {dirty && <button type="button" className="secondary" disabled={saving} onClick={restore}>{t('groups.strategyRestore')}</button>}
     {pluginId ? <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={{ ...schema, title: undefined, description: undefined }} uiSchema={resourceSelectorUiSchema(schema)}
       fields={{ OrderedResources: SchemaResourceSelector }} formContext={formContext}
       formData={config} validator={safeValidator} templates={schemaFormTemplates} disabled={saving}

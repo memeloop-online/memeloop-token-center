@@ -178,7 +178,7 @@ test('localized resource strategy searches real group accounts, orders by keyboa
       } else if (route.request().method() === 'PUT') {
         writes.push(route.request().postDataJSON());
         await route.fulfill(writes.length === 1 ? { status: 503, json: { error: { message: 'unavailable' } } } : { json: {
-          id: 'group', name: 'Group', member_ids: ['alpha', 'beta', 'gamma'], member_count: 3, created_at: 1, updated_at: 2, strategy_version: 3,
+          id: 'group', name: 'Group', member_ids: ['alpha', 'beta', 'gamma'], member_count: 3, created_at: 1, updated_at: 2, strategy_version: 3, routing_strategy: writes.at(-1)?.routing_strategy, routing_priority: writes.at(-1)?.routing_priority,
         } });
       } else await route.fulfill({ json: [] });
     });
@@ -212,6 +212,14 @@ test('localized resource strategy searches real group accounts, orders by keyboa
     await save.click();
     await page.getByText('组策略已保存', { exact: true }).waitFor();
     assert.deepEqual(writes[1].routing_strategy.config, { ordered: ['alpha'] });
+    await page.getByLabel('重叠组优先级', { exact: true }).fill('7');
+    await strategy.selectOption('');
+    await page.getByRole('button', { name: '恢复已保存的设置', exact: true }).click();
+    assert.equal(await strategy.inputValue(), 'arbitrary-plugin');
+    assert.equal(await page.getByLabel('重叠组优先级', { exact: true }).inputValue(), '0');
+    assert.match(await rows.nth(0).innerText(), /Alpha account/);
+    assert.equal(await rows.count(), 1);
+    assert.equal(await page.getByRole('button', { name: '恢复已保存的设置', exact: true }).count(), 0);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
   } finally { await browser.close(); await server.close(); }
 });

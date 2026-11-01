@@ -1,6 +1,6 @@
 import { useId, useRef, useState } from 'react';
 import type { FieldProps, RJSFSchema, UiSchema } from '@rjsf/utils';
-import { Button, Combobox, Option } from './design-system';
+import { Button, Combobox, DetailTooltip, Option } from './design-system';
 import { useI18n } from './i18n';
 import type { ComboboxOption } from './operator/MultiCombobox';
 
@@ -22,20 +22,23 @@ export function hasInvalidResources(schema: RJSFSchema, data: Record<string, unk
   return Object.entries(schema.properties ?? {}).some(([name, property]) => {
     const source = typeof property === 'object' ? resourceSelectorSource(property) : undefined;
     if (!source) return false;
+    if (!Object.hasOwn(context.resources, source)) return true;
     const value = data[name];
     return value !== undefined && (!Array.isArray(value) || value.some(id => typeof id !== 'string' || !context.resources[source]?.some(option => option.value === id)));
   });
 }
 
-export function SchemaResourceSelector({ schema, formData, onChange, fieldPathId, disabled, readonly, registry }: FieldProps<string[], RJSFSchema, ResourceSelectorContext>) {
+export function SchemaResourceSelector({ schema, formData, onChange, fieldPathId, disabled, readonly, registry }: FieldProps) {
   const { t } = useI18n();
   const id = useId();
   const picker = useRef<HTMLInputElement>(null);
   const rowsRef = useRef<HTMLOListElement>(null);
   const [query, setQuery] = useState('');
   const [announcement, setAnnouncement] = useState('');
-  const options = registry.formContext.resources[resourceSelectorSource(schema) ?? ''] ?? [];
-  const values = Array.isArray(formData) ? formData : [];
+  const resources = (registry.formContext as ResourceSelectorContext | undefined)?.resources ?? {};
+  const sourceAvailable = Object.hasOwn(resources, resourceSelectorSource(schema) ?? '');
+  const options: ComboboxOption[] = resources[resourceSelectorSource(schema) ?? ''] ?? [];
+  const values: string[] = Array.isArray(formData) ? formData : [];
   const selected = new Set(values);
   const available = options.filter(option => !selected.has(option.value) && !option.disabled);
   const matches = available.filter(option => `${option.label} ${option.description ?? ''} ${option.value}`.toLocaleLowerCase().includes(query.toLocaleLowerCase()));
@@ -55,16 +58,16 @@ export function SchemaResourceSelector({ schema, formData, onChange, fieldPathId
     <label id={`${id}-label`} htmlFor={id}>{schema.title ?? t('resourceSelector.title')}</label>
     {schema.description && <p className="field-hint" id={`${id}-help`}>{schema.description}</p>}
     <Combobox id={id} ref={picker} aria-labelledby={`${id}-label`} aria-describedby={schema.description ? `${id}-help` : undefined}
-      placeholder={t('resourceSelector.search')} value={query} selectedOptions={[]} disabled={locked || full || options.length === 0}
+      placeholder={t('resourceSelector.search')} value={query} selectedOptions={[]} disabled={locked || full || !sourceAvailable || options.length === 0}
       onChange={event => setQuery(event.target.value)} onOptionSelect={(_, data) => {
         const choice = available.find(option => option.value === data.optionValue);
         if (!choice || locked || full) return;
         update([...values, choice.value]); setQuery(''); setAnnouncement(t('resourceSelector.added', { name: choice.label }));
       }}>
-      {matches.map(option => <Option key={option.value} value={option.value} text={option.label}><span className="resource-selector-option"><strong>{option.label}</strong><small>{option.description}</small><small>{t('resourceSelector.accountId')}: {option.value}</small></span></Option>)}
+      {matches.map(option => <Option key={option.value} value={option.value} text={option.label} title={`${t('resourceSelector.accountId')}: ${option.value}`}><span className="resource-selector-option"><strong>{option.label}</strong><small>{option.description}</small></span></Option>)}
       {matches.length === 0 && <Option disabled value="__empty">{available.length ? t('groups.noMatches') : t('resourceSelector.allAdded')}</Option>}
     </Combobox>
-    {options.length === 0 && <p className="field-hint">{t('resourceSelector.noMembers')}</p>}
+    {!sourceAvailable ? <p className="notice error" role="alert">{t('resourceSelector.unavailable')}</p> : options.length === 0 && <p className="field-hint">{t('resourceSelector.noMembers')}</p>}
     {values.length === 0 && options.length > 0 && <p className="field-hint">{t('resourceSelector.empty')}</p>}
     {missing && <p className="notice error" role="alert">{t('resourceSelector.resolveMissing')}</p>}
     <ol ref={rowsRef} className="resource-selector-order" aria-label={schema.title ?? t('resourceSelector.title')}>
@@ -73,7 +76,7 @@ export function SchemaResourceSelector({ schema, formData, onChange, fieldPathId
         const name = option?.label ?? t('resourceSelector.missing');
         return <li key={`${value}-${values.indexOf(value) === index ? '' : index}`} data-position={index} className={option ? '' : 'resource-selector-missing'}>
           <span className="resource-selector-rank" aria-hidden="true">{index + 1}</span>
-          <span className="resource-selector-name" tabIndex={-1}><strong>{name}</strong><small>{option?.description}</small><small>{t('resourceSelector.accountId')}: {value}</small></span>
+          <DetailTooltip content={`${t('resourceSelector.accountId')}: ${value}`}><span className="resource-selector-name" tabIndex={0}><strong>{name}</strong><small>{option?.description}</small></span></DetailTooltip>
           <div className="resource-selector-actions">
             <Button type="button" appearance="subtle" disabled={locked || index === 0} aria-label={t('resourceSelector.moveUp', { name })} onClick={() => move(index, -1)}>↑</Button>
             <Button type="button" appearance="subtle" disabled={locked || index === values.length - 1} aria-label={t('resourceSelector.moveDown', { name })} onClick={() => move(index, 1)}>↓</Button>
