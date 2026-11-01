@@ -80,21 +80,51 @@ pub(super) async fn assert_readable_source_without_spool(
             .await
             .unwrap();
     assert_eq!(rejected, 0);
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, request_id)
-        .await
-        .unwrap();
+    let refs = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let refs = fixture
+                .state
+                .db
+                .request_archive_refs(fixture.key_id, request_id)
+                .await
+                .unwrap();
+            if refs.request_archive_state == crate::model::RequestArchiveState::Bound {
+                break refs;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable raw root does not wait for DB capture metadata");
     assert_eq!(
         refs.request_archive_state,
         crate::model::RequestArchiveState::Bound
     );
     assert!(refs.request_archive_reason.is_none());
-    assert_eq!(
-        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
-        Some(request_id)
-    );
+    let tenant: String = sqlx::query_scalar("SELECT tenant_id FROM request_records WHERE id = $1")
+        .bind(request_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let tenant = Uuid::parse_str(&tenant).unwrap();
+    assert!(crate::archive::is_tenant_cas_location(
+        tenant,
+        &refs.request_object
+    ));
+    let root = fixture
+        .state
+        .archive
+        .raw_capture_reference(tenant, request_id, "request")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(root.object_locator, refs.request_object);
+    fixture
+        .state
+        .archive
+        .verify_tenant_content(tenant, &root)
+        .await
+        .unwrap();
     let raw = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Ok(raw) = fixture.state.archive.get(&refs.request_object).await {

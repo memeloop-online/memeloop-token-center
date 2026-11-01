@@ -923,8 +923,6 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
     }
 }
 
-const SESSION_BODY_ARCHIVE_READ_LIMIT: usize = 128 * 1024 * 1024;
-
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
     if let Err(error) = state
         .db
@@ -970,14 +968,16 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
     }
 }
 
-/// 读取原始请求 JSON 和原始返回 JSON 的 locator，整理会话正文并写入 CNPG。
+/// 读取原始请求/返回，正文写对象存储，CNPG 仅记录引用和投影元数据。
 /// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
 pub(crate) async fn archive_session_body(
     state: &AppState,
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
-    let Some(locators) = state.db.session_body_locators(request_id).await? else {
+    let (tenant_id, hints, response_complete) =
+        state.db.conversation_object_context(request_id).await?;
+    let Some(mut locators) = state.db.session_body_locators(request_id).await? else {
         return skip_session_body(
             state,
             lease_owner,
@@ -986,32 +986,94 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
-    if locators.pending {
+    if let Some(response) = state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "response")
+        .await?
+    {
+        state
+            .db
+            .bind_raw_capture(tenant_id, request_id, "response", &response)
+            .await?;
+        locators.response = Some(response.object_locator);
+        locators.pending = false;
+    } else if state
+        .archive
+        .raw_capture_failed(tenant_id, request_id, "response")
+        .await?
+    {
+        locators.response = None;
+        locators.pending = false;
+    }
+    if let Some(request) = state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "request")
+        .await?
+    {
+        state
+            .db
+            .bind_raw_capture(tenant_id, request_id, "request", &request)
+            .await?;
+        locators.request = request.object_locator;
+        locators.source_identity = None;
+    }
+    let request_capture_pending = locators.request == format!("gap://{request_id}/request")
+        && !state
+            .archive
+            .raw_capture_failed(tenant_id, request_id, "request")
+            .await?;
+    if locators.pending || request_capture_pending {
         state
             .db
             .defer_pending_session_body_archive(lease_owner, request_id)
             .await?;
         return Ok(false);
     }
-    let request_bytes = match load_raw_document(state, &locators.request).await {
-        Ok(bytes) => {
-            if let Some(identity) = locators.source_identity
-                && !locators.source_recorded
-            {
-                state
-                    .db
-                    .record_request_source(
-                        identity,
-                        &locators.request,
-                        bytes.len(),
-                        *blake3::hash(&bytes).as_bytes(),
-                        true,
-                    )
-                    .await?;
+    if missing_raw_document(&locators.request) {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_request_locator",
+        )
+        .await;
+    }
+    let projection = state.archive.prepare_session_body_streamed(
+        tenant_id,
+        request_id,
+        hints,
+        locators.request.clone(),
+        locators
+            .response
+            .clone()
+            .filter(|locator| !missing_raw_document(locator)),
+        response_complete,
+    );
+    tokio::pin!(projection);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.tick().await;
+    let prepared = loop {
+        tokio::select! {
+            result = &mut projection => break result,
+            _ = heartbeat.tick() => {
+                if !state.db.renew_session_body_archive(lease_owner, request_id).await? {
+                    return Ok(false);
+                }
             }
-            bytes
         }
-        Err(_) => {
+    };
+    let prepared = match prepared {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            return skip_session_body(
+                state,
+                lease_owner,
+                request_id,
+                "session_body_skipped_archive_unreadable",
+            )
+            .await;
+        }
+        Err(error) => {
             let retry = if let Some(identity) = locators.source_identity {
                 state
                     .archive
@@ -1032,117 +1094,60 @@ pub(crate) async fn archive_session_body(
                     .await?;
                 return Ok(false);
             }
-            let inline = state
-                .db
-                .session_body_inline_request(lease_owner, request_id)
-                .await?;
-            match inline {
-                Some(json) if json != "{}" && !json.is_empty() => bytes::Bytes::from(json),
-                _ => {
-                    return skip_session_body(
-                        state,
-                        lease_owner,
-                        request_id,
-                        "session_body_skipped_missing_request_locator",
-                    )
-                    .await;
-                }
-            }
-        }
-    };
-    let Ok(mut request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes)
-    else {
-        return skip_session_body(
-            state,
-            lease_owner,
-            request_id,
-            "session_body_skipped_archive_unreadable",
-        )
-        .await;
-    };
-    drop(request_bytes);
-    // locator 读出来的占位文档没有对话字段时，改用结算时留下的缩减请求 JSON。
-    if request_document.get("messages").is_none()
-        && request_document.get("input").is_none()
-        && let Some(json) = state
-            .db
-            .session_body_inline_request(lease_owner, request_id)
-            .await?
-        && json != "{}"
-        && !json.is_empty()
-        && let Ok(fallback) = serde_json::from_str::<serde_json::Value>(&json)
-        && (fallback.get("messages").is_some() || fallback.get("input").is_some())
-    {
-        request_document = fallback;
-    }
-    // Release the request JSON (including unused schemas/private fields) before
-    // loading/parsing the response. Public text moves into the body.
-    let mut body = crate::conversation::SessionBody::from_request_document(request_document);
-    // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
-    // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
-    let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
-        Some(locator) => match load_raw_document(state, &locator).await {
-            Ok(bytes) => bytes,
-            Err(_) if missing_raw_document(&locator) => bytes::Bytes::from_static(b"{}"),
-            Err(_) => {
+            if locators.source_identity.is_some() {
+                // The writer's lease has been fenced and its actual source is
+                // absent. Keep explicit loss evidence; SQL snapshots are not
+                // substitutes for the missing original request.
                 state
-                    .db
-                    .defer_session_body_archive(lease_owner, request_id)
+                    .archive
+                    .publish_raw_capture_failure(tenant_id, request_id, "request")
                     .await?;
-                return Ok(false);
+                return skip_session_body(
+                    state,
+                    lease_owner,
+                    request_id,
+                    "session_body_skipped_missing_source",
+                )
+                .await;
             }
-        },
-        None => bytes::Bytes::from_static(b"{}"),
+            return Err(error);
+        }
     };
-    let return_document = crate::conversation::raw_return_document(&return_bytes)
-        .unwrap_or_else(|| serde_json::json!({}));
-    drop(return_bytes);
-    body.append_return_document(return_document);
-    let pending_media = body.take_media_bytes();
-    let mut media_staging = Vec::new();
-    let mut uploaded_media = std::collections::HashMap::new();
-    for (turn_index, part_index, bytes) in pending_media {
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        if let Some(locator) = uploaded_media.get(&hash) {
-            body.set_media_locator(turn_index, part_index, String::clone(locator));
-            continue;
-        }
-        let attempt = crate::proxy_lifecycle::begin_proxy_archive_attempt(
-            &state.db,
-            request_id,
-            crate::archive_staging::ArchiveStagingPurpose::Media,
-        )
-        .await?;
-        let locator = crate::archive_staging::conversation_media_locator(attempt.lease.key, &hash)?;
-        media_staging.push(attempt.lease);
-        {
-            let upload = state.archive.put(&locator, bytes::Bytes::from(bytes));
-            tokio::pin!(upload);
-            let mut heartbeat = tokio::time::interval(Duration::from_millis(
-                crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
-            ));
-            loop {
-                tokio::select! {
-                    result = &mut upload => {
-                        result?;
-                        break;
-                    }
-                    _ = heartbeat.tick() => {
-                        for lease in &mut media_staging {
-                            if !state.db.heartbeat_archive_staging_write(lease).await? {
-                                return Err(AppError::Conflict("session media staging writer was fenced".into()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        body.set_media_locator(turn_index, part_index, locator.clone());
-        uploaded_media.insert(hash, locator);
+    if let Some(identity) = locators.source_identity
+        && !locators.source_recorded
+    {
+        state
+            .db
+            .record_request_source(
+                identity,
+                &locators.request,
+                prepared.request_size,
+                prepared.request_digest,
+                true,
+            )
+            .await?;
     }
+    for side in ["request", "response"] {
+        if let Some(object) = state
+            .archive
+            .raw_capture_reference(tenant_id, request_id, side)
+            .await?
+        {
+            state
+                .db
+                .bind_raw_capture(tenant_id, request_id, side, &object)
+                .await?;
+        }
+    }
+    let crate::archive::PreparedSessionBody {
+        atoms,
+        nodes,
+        media,
+        ..
+    } = prepared;
     if !state
         .db
-        .prepare_staged_session_body_archive(lease_owner, request_id, body, &media_staging)
+        .prepare_archived_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
         .await?
     {
         return Ok(false);
@@ -1172,23 +1177,6 @@ fn missing_raw_document(locator: &str) -> bool {
         || locator.starts_with("gap://")
         || locator.starts_with("metadata-only-json:")
         || locator.starts_with("provider-reference-json:")
-}
-
-async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
-    if missing_raw_document(locator) {
-        return Err("session_body_skipped_archive_unreadable");
-    }
-    if let Some(inline) = locator.strip_prefix("inline-json:") {
-        return Ok(bytes::Bytes::copy_from_slice(inline.as_bytes()));
-    }
-    match state
-        .archive
-        .get_bounded(locator, SESSION_BODY_ARCHIVE_READ_LIMIT)
-        .await
-    {
-        Ok(bytes) => Ok(bytes),
-        Err(_) => Err("session_body_skipped_archive_unreadable"),
-    }
 }
 
 #[cfg(test)]

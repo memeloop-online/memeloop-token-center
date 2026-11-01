@@ -4,8 +4,11 @@ use serde::{Deserialize, Serialize};
 use crate::{
     db::ArchiveSpoolIdentity,
     error::AppError,
-    provider::{open_envelope, seal_envelope, seal_envelope_with_nonce},
+    provider::{open_envelope, seal_envelope_with_nonce},
 };
+
+#[cfg(test)]
+use crate::provider::seal_envelope;
 
 const COMPRESSED_PREFIX: &str = "zstd1.";
 const ZSTD_LEVEL: i32 = 1;
@@ -59,6 +62,7 @@ pub(super) fn seal_for_purpose(
     seal_for_purpose_with_compression(identity, seq, bytes, pepper, purpose, false)
 }
 
+#[cfg(test)]
 pub(super) fn seal_for_purpose_with_compression(
     identity: ArchiveSpoolIdentity,
     seq: i64,

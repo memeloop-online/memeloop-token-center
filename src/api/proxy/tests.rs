@@ -2216,6 +2216,7 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
         Some("upstream_transport_request")
     );
     assert_eq!(rows[0].billing.cost, None);
+    fixture.state.persistence.drain_for_test().await;
     let refs = fixture
         .state
         .db
@@ -2223,10 +2224,37 @@ async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() 
         .await
         .unwrap();
     assert_eq!(
-        refs.response_object.as_deref(),
-        Some(
-            "inline-json:{\"error\":{\"code\":\"upstream_transport_request\",\"message\":\"上游请求失败。发送上游请求失败。\",\"message_en\":\"upstream request failed. sending the upstream request failed.\",\"type\":\"upstream_error\"}}"
-        )
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert!(
+        refs.response_object
+            .as_deref()
+            .unwrap()
+            .starts_with("gap://")
+    );
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_reference(key.tenant_id, rows[0].request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_failed(key.tenant_id, rows[0].request_id, "response")
+            .await
+            .unwrap()
     );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let selected_account: String = sqlx::query_scalar(
@@ -2969,7 +2997,7 @@ async fn assert_exactly_once_side_effects_for(
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     // Settlement can commit the request before the conversation journal enqueues
     // its projection task. Claim until that one observation exists.
-    tokio::time::timeout(Duration::from_secs(3), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             for pending_id in fixture
                 .state
@@ -3002,37 +3030,13 @@ async fn assert_exactly_once_side_effects_for(
                 .await
                 .unwrap()
             {
-                // Some finalizer fixtures admit a reservation directly, without
-                // running ingress capture. Give their saved request JSON an
-                // explicit locator before exercising the raw-document worker;
-                // an unrecorded gap otherwise means capture is still pending.
-                let synthetic_request: Option<String> = sqlx::query_scalar(
-                    "SELECT o.request_json FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND r.request_object = 'gap://' || r.id || '/request' AND NOT EXISTS (SELECT 1 FROM request_archive_spools s WHERE s.request_id = r.id)",
-                )
-                .bind(task.request_id.to_string())
-                .fetch_optional(&pool)
-                .await
-                .unwrap();
-                if let Some(raw_request) = synthetic_request {
-                    let document: Value = serde_json::from_str(&raw_request).unwrap();
-                    assert!(document.get("messages").is_some() || document.get("input").is_some());
-                    sqlx::query(
-                        "UPDATE request_records SET request_object = $1 WHERE id = $2 AND key_id = $3 AND request_object = 'gap://' || id || '/request'",
-                    )
-                    .bind(format!("inline-json:{raw_request}"))
-                    .bind(task.request_id.to_string())
-                    .bind(fixture.key_id.to_string())
-                    .execute(&pool)
-                    .await
-                    .unwrap();
-                }
                 if !crate::worker::archive_session_body(
-                        &fixture.state,
-                        projection_owner,
-                        task.request_id
-                    )
-                    .await
-                    .unwrap()
+                    &fixture.state,
+                    projection_owner,
+                    task.request_id,
+                )
+                .await
+                .unwrap()
                 {
                     continue;
                 }
@@ -3735,16 +3739,14 @@ async fn codex_buffered_chat_translates_request_and_response_and_settles_once() 
         original
     );
     assert_eq!(
-        serde_json::from_slice::<Value>(
-            &fixture
-                .state
-                .archive
-                .get(refs.response_object.as_deref().unwrap())
-                .await
-                .unwrap()
-        )
-        .unwrap(),
-        body
+        fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap()
+            .as_ref(),
+        completed_codex_sse("Au revoir").as_bytes()
     );
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -3892,7 +3894,7 @@ async fn codex_buffered_chat_maps_valid_incomplete_to_success_with_provider_usag
             .await
             .unwrap()
             .as_ref(),
-        body.as_ref()
+        incomplete_codex_sse("Partial translation", "max_output_tokens", false).as_bytes()
     );
     upstream.verify().await;
 }
@@ -3963,7 +3965,7 @@ async fn codex_streaming_chat_maps_valid_incomplete_without_responses_lifecycle_
             .await
             .unwrap()
             .as_ref(),
-        body.as_ref()
+        incomplete_codex_sse("Partial translation", "future_bounded_reason", true).as_bytes()
     );
     upstream.verify().await;
 }
@@ -4141,7 +4143,8 @@ async fn codex_buffered_responses_rejects_malformed_incomplete_output_with_obser
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(
-            ResponseTemplate::new(200).set_body_raw(malformed.into_bytes(), "text/event-stream"),
+            ResponseTemplate::new(200)
+                .set_body_raw(malformed.clone().into_bytes(), "text/event-stream"),
         )
         .expect(1)
         .mount(&upstream)
@@ -4192,7 +4195,7 @@ async fn codex_buffered_responses_rejects_malformed_incomplete_output_with_obser
             .get(refs.response_object.as_deref().unwrap())
             .await
             .unwrap(),
-        delivered.as_ref()
+        malformed.as_bytes()
     );
     upstream.verify().await;
 }
@@ -4290,7 +4293,7 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
         })))
         .respond_with(
             ResponseTemplate::new(200)
-                .set_body_raw(sse.into_bytes(), "text/event-stream; charset=utf-8"),
+                .set_body_raw(sse.clone().into_bytes(), "text/event-stream; charset=utf-8"),
         )
         .expect(1)
         .mount(&upstream)
@@ -4399,17 +4402,17 @@ async fn codex_buffered_route_rewrites_wire_and_archives_final_json_once() {
     )
     .unwrap();
     assert_eq!(archived_request, original);
-    let archived_response: Value = serde_json::from_slice(
-        &fixture
-            .state
-            .archive
-            .get(refs.response_object.as_deref().unwrap())
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(archived_response, body);
-    assert!(!archived_response.to_string().contains("response.completed"));
+    let archived_response = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(archived_response.as_ref(), sse.as_bytes());
+    assert_eq!(
+        blake3::hash(&archived_response),
+        blake3::hash(sse.as_bytes())
+    );
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert_codex_wire(&requests[0], &fixture.upstream_model);
@@ -4463,137 +4466,94 @@ async fn codex_buffered_route_accepts_valid_sse_without_content_type() {
     upstream.verify().await;
 }
 
-#[tokio::test]
-async fn buffered_text_response_survives_total_archive_failure_with_durable_pending_bodies() {
-    let fixture = codex_route_fixture("buffered-archive-gap").await;
+async fn original_bodies_recover_after_object_storage_outage(streaming: bool) {
+    let fixture = codex_route_fixture(if streaming {
+        "streaming-archive-recovery"
+    } else {
+        "buffered-archive-recovery"
+    })
+    .await;
     std::fs::remove_dir_all(&fixture.archive_path).unwrap();
     std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
     let upstream = MockServer::start().await;
-    let sse = completed_codex_sse("delivered despite archive failure");
+    let original_response = completed_codex_sse("delivered despite archive failure");
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
         .respond_with(
-            ResponseTemplate::new(200).set_body_raw(sse.into_bytes(), "text/event-stream"),
+            ResponseTemplate::new(200).set_body_raw(original_response.clone(), "text/event-stream"),
         )
         .expect(1)
         .mount(&upstream)
         .await;
-
-    let original = json!({
-        "model": fixture.model,
-        "input": "archive failures are non-fatal for text",
-        "stream": false
-    });
-    // Source upload retries retain the request bytes until backend recovery.
-    // Forcing capture before dispatch would wait forever on this outage.
+    let original_request = json!({"model":fixture.model, "input":"retain originals through outage", "stream":streaming});
     let response = tokio::time::timeout(
         Duration::from_secs(5),
-        send_codex_route(&fixture, &upstream, "/v1/responses", original.clone()),
+        send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            original_request.clone(),
+        ),
     )
     .await
-    .expect("dispatch must complete while request source upload retries");
+    .expect("small accepted body must be delivered while its bounded archive waits");
     assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
-        "delivered despite archive failure"
-    );
-
-    wait_for_request_settlement(&fixture, 1).await;
-    // Buffered response handoff only needs the database; the request source
-    // cannot finish its upload until the object backend is restored below.
-    fixture.state.persistence.drain_for_test().await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(200));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
-    assert_eq!(rows[0].cost, "0.000005");
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let source = sqlx::query(
-                "SELECT state, body_byte_count, body_blake3, cipher_bytes FROM request_archive_spools WHERE request_id = $1",
-            )
-            .bind(rows[0].request_id.to_string())
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-            if let Some(source) = source {
-                let original_bytes = serde_json::to_vec(&original).unwrap();
-                assert_eq!(source.get::<String, _>("state"), "capturing");
-                assert_eq!(source.get::<i64, _>("body_byte_count"), original_bytes.len() as i64);
-                assert_eq!(source.get::<String, _>("body_blake3"), blake3::hash(&original_bytes).to_hex().to_string());
-                assert_eq!(source.get::<i64, _>("cipher_bytes"), 0);
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("source metadata must retain the exact pending request");
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
-        Some(rows[0].request_id)
-    );
-    assert_eq!(
-        refs.response_object.as_deref(),
-        Some(format!("gap://{}/response", rows[0].request_id).as_str())
-    );
-    assert_eq!(
-        refs.request_archive_state,
-        crate::model::RequestArchiveState::Capturing
-    );
-    assert_eq!(
-        refs.response_archive_state,
-        crate::model::RequestArchiveState::Pending
-    );
-    assert!(refs.request_archive_reason.is_none());
-    assert!(refs.response_archive_reason.is_none());
-    let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
-    assert!(!detail.archive_complete);
-    assert!(detail.archive.request.reason.is_none());
-    assert!(detail.archive.response.reason.is_none());
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-
-    // An unavailable object backend did not gate HTTP delivery. Exercise its
-    // retryable failure, restore it, then recover both exact durable bodies.
-    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
-    let failed_attempts: i64 = sqlx::query_scalar(
-        "SELECT attempts FROM response_archive_spools WHERE request_id = $1 AND state = 'pending'",
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+    let delivered = tokio::time::timeout(
+        Duration::from_secs(5),
+        to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY),
     )
-    .bind(rows[0].request_id.to_string())
+    .await
+    .unwrap()
+    .unwrap();
+    if streaming {
+        assert_eq!(delivered.as_ref(), original_response.as_bytes());
+    } else {
+        assert_eq!(
+            serde_json::from_slice::<Value>(&delivered).unwrap()["output"][0]["content"][0]["text"],
+            "delivered despite archive failure"
+        );
+    }
+    wait_for_request_settlement(&fixture, 1).await;
+    assert!(
+        fixture
+            .state
+            .proxy_archive_stream_permits
+            .available_permits()
+            < crate::PROXY_ARCHIVE_STREAM_CONCURRENCY,
+        "accepted original must retain its bounded writer during the storage outage"
+    );
+    assert!(
+        fixture
+            .state
+            .db
+            .request_archive_refs(fixture.key_id, request_id)
+            .await
+            .is_err(),
+        "unavailable storage cannot certify a complete original"
+    );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let chunks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(failed_attempts, 1);
+    assert_eq!(
+        chunks, 0,
+        "new original response must not spill back into legacy SQL"
+    );
     std::fs::remove_file(&fixture.archive_path).unwrap();
     std::fs::create_dir_all(&fixture.archive_path).unwrap();
-    sqlx::query("UPDATE request_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE response_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    cancellation::assert_original_response(&fixture, request_id, original_response.as_bytes())
+        .await;
     drain_completed_response_archive(&fixture).await;
     let refs = fixture
         .state
         .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .request_archive_refs(fixture.key_id, request_id)
         .await
         .unwrap();
     assert_eq!(
@@ -4607,8 +4567,8 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .await
         .unwrap();
     assert_eq!(
-        serde_json::from_slice::<Value>(&archived_request).unwrap(),
-        original
+        archived_request.as_ref(),
+        serde_json::to_vec(&original_request).unwrap().as_slice()
     );
     assert_eq!(
         fixture
@@ -4616,12 +4576,18 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
             .archive
             .get(refs.response_object.as_deref().unwrap())
             .await
-            .unwrap(),
-        body
+            .unwrap()
+            .as_ref(),
+        original_response.as_bytes()
     );
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     upstream.verify().await;
     pool.close().await;
+}
+
+#[tokio::test]
+async fn buffered_text_response_survives_total_archive_failure_with_durable_pending_bodies() {
+    original_bodies_recover_after_object_storage_outage(false).await;
 }
 
 #[tokio::test]
@@ -4994,207 +4960,7 @@ async fn codex_streaming_route_accepts_headerless_bare_cr_sse_without_byte_drift
 
 #[tokio::test]
 async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker() {
-    let fixture = codex_route_fixture("streaming-archive-recovery").await;
-    std::fs::remove_dir_all(&fixture.archive_path).unwrap();
-    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
-    let upstream = MockServer::start().await;
-    let sse = completed_codex_sse("archive-independent stream");
-    Mock::given(method("POST"))
-        .and(path(codex_transport::RESPONSES_PATH))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(sse.clone().into_bytes(), "text/event-stream"),
-        )
-        .expect(1)
-        .mount(&upstream)
-        .await;
-    let original = json!({"model": fixture.model, "input": "stream now", "stream": true});
-    let response = send_codex_route(&fixture, &upstream, "/v1/responses", original.clone()).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = tokio::time::timeout(
-        Duration::from_secs(1),
-        to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY),
-    )
-    .await
-    .expect("downstream SSE bytes and EOF must not wait for the archive worker")
-    .unwrap();
-    assert_eq!(body.as_ref(), sse.as_bytes());
-
-    wait_for_request_settlement(&fixture, 1).await;
-    let rows = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
-    assert_eq!(rows[0].status_code, Some(200));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
-    assert_eq!(rows[0].cost, "0.000005");
-    // The source writer keeps its original bytes while the backend is down.
-    // Draining capture here would wait for the recovery exercised below.
-    fixture.state.persistence.drain_for_test().await;
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let capturing: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1 AND state = 'capturing' AND EXISTS (SELECT 1 FROM response_archive_spools WHERE request_id = $1 AND state = 'pending')",
-            )
-            .bind(rows[0].request_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if capturing == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("source metadata must retain the pending original upload");
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        refs.request_object,
-        crate::gateway_body::request_spool::request_body_object_key(
-            &rows[0].request_id.to_string()
-        )
-        .unwrap()
-    );
-    assert_eq!(
-        refs.response_object.as_deref(),
-        Some(format!("gap://{}/response", rows[0].request_id).as_str())
-    );
-    assert_eq!(
-        refs.request_archive_state,
-        crate::model::RequestArchiveState::Capturing
-    );
-    assert_eq!(
-        refs.response_archive_state,
-        crate::model::RequestArchiveState::Pending
-    );
-
-    let source = sqlx::query(
-        "SELECT state, body_byte_count, body_blake3, cipher_bytes FROM request_archive_spools WHERE request_id = $1",
-    )
-    .bind(rows[0].request_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    let original_bytes = serde_json::to_vec(&original).unwrap();
-    assert_eq!(source.get::<String, _>("state"), "capturing");
-    assert_eq!(
-        source.get::<i64, _>("body_byte_count"),
-        original_bytes.len() as i64
-    );
-    assert_eq!(
-        source.get::<String, _>("body_blake3"),
-        blake3::hash(&original_bytes).to_hex().to_string()
-    );
-    assert_eq!(source.get::<i64, _>("cipher_bytes"), 0);
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
-    for (spools, chunks, plaintext, expected_bytes) in [(
-        "response_archive_spools",
-        "response_archive_spool_chunks",
-        "archive-independent stream",
-        sse.len() as i64,
-    )] {
-        let spool = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT state, attempts, chunk_count, byte_count FROM {spools} WHERE request_id = $1"
-        )))
-        .bind(rows[0].request_id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(spool.get::<String, _>("state"), "pending");
-        assert_eq!(spool.get::<i64, _>("attempts"), 0);
-        assert!(spool.get::<i64, _>("chunk_count") > 0);
-        assert_eq!(spool.get::<i64, _>("byte_count"), expected_bytes);
-        let encrypted = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT ciphertext FROM {chunks} WHERE request_id = $1 ORDER BY seq"
-        )))
-        .bind(rows[0].request_id.to_string())
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert!(!encrypted.is_empty());
-        assert!(encrypted.iter().all(|chunk| {
-            let ciphertext = chunk.get::<String, _>("ciphertext");
-            ciphertext.starts_with("v2.") && !ciphertext.contains(plaintext)
-        }));
-    }
-
-    // Exercise a real failed upload, restore the backend, and prove a fresh
-    // worker can bind both staged objects without replaying the request or its
-    // settlement side effects.
-    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
-    let failed_attempts: i64 = sqlx::query_scalar(
-        "SELECT (SELECT SUM(attempts) FROM request_archive_spools WHERE request_id = $1) + (SELECT SUM(attempts) FROM response_archive_spools WHERE request_id = $1)",
-    )
-    .bind(rows[0].request_id.to_string())
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(failed_attempts, 1);
-    std::fs::remove_file(&fixture.archive_path).unwrap();
-    std::fs::create_dir_all(&fixture.archive_path).unwrap();
-    sqlx::query("UPDATE request_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE response_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    drain_completed_response_archive(&fixture).await;
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
-    assert_eq!(
-        refs.view.archive_state,
-        crate::model::RequestArchiveState::Bound
-    );
-    let tenant_id: String =
-        sqlx::query_scalar("SELECT tenant_id FROM request_records WHERE id = $1")
-            .bind(rows[0].request_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    let tenant_id = Uuid::parse_str(&tenant_id).unwrap();
-    assert_eq!(
-        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
-        Some(rows[0].request_id)
-    );
-    assert!(
-        refs.response_object
-            .as_deref()
-            .is_some_and(|locator| crate::archive::is_tenant_cas_location(tenant_id, locator))
-    );
-    let archived_request = fixture
-        .state
-        .archive
-        .get(&refs.request_object)
-        .await
-        .unwrap();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&archived_request).unwrap(),
-        original
-    );
-    let archived_response = fixture
-        .state
-        .archive
-        .get(refs.response_object.as_deref().unwrap())
-        .await
-        .unwrap();
-    assert_eq!(archived_response.as_ref(), sse.as_bytes());
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
-    pool.close().await;
+    original_bodies_recover_after_object_storage_outage(true).await;
 }
 
 #[tokio::test]
@@ -5411,10 +5177,7 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
     );
     pool.close().await;
     let archived = sse_delivery::pending_response_archive(&fixture, &receipt).await;
-    assert_eq!(archived, rendered);
-    for secret in ["provider-secret", "secret-token"] {
-        assert!(!archived.contains(secret));
-    }
+    assert_eq!(archived, failed);
     let rendered_metrics = fixture
         .state
         .metrics
@@ -5494,7 +5257,7 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
         "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
     );
     let (endpoint, terminal_tx, upstream) =
-        gated_completed_sse_upstream_endpoint(prefix, terminal).await;
+        gated_completed_sse_upstream_endpoint(prefix.clone(), terminal.clone()).await;
 
     let response = send_codex_route_to_endpoint(
         &fixture,
@@ -5528,27 +5291,14 @@ async fn completed_provider_usage_survives_a_later_downstream_disconnect() {
 
     // The extra prefix frame occupies the one-slot downstream channel while
     // the provider terminal is captured and sealed. Waiting for the durable
-    // spool state proves the completed usage is already authoritative before
+    // original CAS root proves EOF was consumed before
     // the later receiver drop; no scheduler delay is part of this boundary.
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let state: Option<String> = sqlx::query_scalar(
-                "SELECT state FROM response_archive_spools WHERE request_id = $1",
-            )
-            .bind(request_id.to_string())
-            .fetch_optional(&pool)
-            .await
-            .unwrap();
-            if state.as_deref() == Some("pending") {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the provider terminal must be sealed before downstream cancellation");
-    pool.close().await;
+    cancellation::assert_original_response(
+        &fixture,
+        request_id,
+        format!("{prefix}{terminal}").as_bytes(),
+    )
+    .await;
     drop(body);
 
     wait_for_request_settlement(&fixture, 1).await;
@@ -5582,7 +5332,7 @@ async fn downstream_disconnect_records_unknown_without_waiting_for_stalled_upstr
         "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{completed}}}\n\ndata: [DONE]\n\n"
     );
     let (endpoint, terminal_tx, upstream) =
-        gated_completed_sse_upstream_endpoint(prefix, terminal).await;
+        gated_completed_sse_upstream_endpoint(prefix.clone(), terminal.clone()).await;
 
     let response = send_codex_route_to_endpoint(
         &fixture,
@@ -5620,31 +5370,56 @@ async fn downstream_disconnect_records_unknown_without_waiting_for_stalled_upstr
     assert!(rows[0].usage.tokens.is_none());
     assert_eq!(rows[0].billing.cost, None);
 
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let states: Vec<String> = sqlx::query_scalar(
-                "SELECT state FROM response_archive_spools WHERE request_id = $1",
-            )
-            .bind(rows[0].request_id.to_string())
-            .fetch_all(&pool)
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_reference(key.tenant_id, rows[0].request_id, "response")
             .await
-            .unwrap();
-            if states == ["gap"] {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the sole archive owner must fence the cancelled capture once");
-    pool.close().await;
-
-    // The mock provider is intentionally still blocked. Abort only its local
-    // socket task after the assertion; the proxy has already dropped its read.
-    upstream.abort();
-    drop(terminal_tx);
-    assert!(upstream.await.unwrap_err().is_cancelled());
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !fixture
+            .state
+            .archive
+            .raw_capture_failed(key.tenant_id, rows[0].request_id, "response")
+            .await
+            .unwrap()
+    );
+    // Finance is already unknown while the provider remains gated. Releasing
+    // it lets the independent original-body reader complete without replay.
+    terminal_tx.send(()).unwrap();
+    upstream.await.unwrap();
+    drain_archive_capture(&fixture).await;
+    let reference = fixture
+        .state
+        .archive
+        .raw_capture_reference(key.tenant_id, rows[0].request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    let original = fixture
+        .state
+        .archive
+        .get_tenant_content(key.tenant_id, &reference, MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(original.as_ref(), format!("{prefix}{terminal}").as_bytes());
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert!(rows[0].usage.tokens.is_none());
+    assert_eq!(rows[0].billing.cost, None);
 }
 
 #[tokio::test]

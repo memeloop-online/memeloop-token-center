@@ -282,60 +282,41 @@ async fn wait_for_bound_proxy_archives(world: &TokenCenterWorld, request_ids: &[
         !request_ids.is_empty(),
         "archive barrier requires a request"
     );
-    let response = world
-        .client
-        .get(format!(
-            "{}/internal/v1/request-events?after_event_at=0",
-            world.service_url
-        ))
-        .bearer_auth("test-service-token")
-        .send()
-        .await
-        .expect("proxy archive event stream");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let mut pending = request_ids.to_vec();
-    let mut stream = response.bytes_stream();
+    let token = if world.matrix_global_service_token.is_empty() {
+        "test-service-token"
+    } else {
+        &world.matrix_global_service_token
+    };
+    // A raw root may bind before terminal completion, so its archive event can
+    // precede the finished event. Verify durable completed references through
+    // the authorized detail API rather than depending on event arrival order.
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut buffered = String::new();
-        while let Some(chunk) = stream.next().await {
-            buffered.push_str(&String::from_utf8_lossy(
-                &chunk.expect("proxy archive SSE chunk"),
-            ));
-            while let Some(end) = buffered.find("\n\n") {
-                let frame = buffered[..end].to_owned();
-                buffered.drain(..end + 2);
-                let Some(data) = frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
-                else {
-                    continue;
-                };
-                let Ok(event) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-                if event["event_kind"] != "archive_bound" || event["archive_state"] != "bound" {
-                    continue;
-                }
-                let Some(request_id) = event["request_id"]
-                    .as_str()
-                    .and_then(|value| Uuid::parse_str(value).ok())
-                else {
-                    continue;
-                };
-                pending.retain(|candidate| *candidate != request_id);
-                if pending.is_empty() {
-                    return;
+        let mut pending = request_ids.to_vec();
+        while !pending.is_empty() {
+            let mut remaining = Vec::new();
+            for request_id in pending {
+                let response = world
+                    .client
+                    .get(format!(
+                        "{}/internal/v1/requests/{request_id}",
+                        world.service_url
+                    ))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .expect("proxy archive detail");
+                assert_eq!(response.status(), StatusCode::OK);
+                let detail: Value = response.json().await.expect("proxy archive detail JSON");
+                if detail["archive_complete"] != true {
+                    remaining.push(request_id);
                 }
             }
+            pending = remaining;
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("proxy archives reached a terminal bound event");
-    assert!(
-        pending.is_empty(),
-        "missing bound archive events: {pending:?}"
-    );
+    .expect("proxy originals reached durable completed references");
 }
 
 fn panic_message(panic: Box<dyn Any + Send>) -> String {
@@ -7363,10 +7344,7 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .await
         .expect("authenticate test key");
     let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-    assert_eq!(
-        refs.request_object,
-        format!("staging/proxy/{request_uuid}/request/{request_uuid}/body.json")
-    );
+    assert!(refs.request_object.starts_with(&cas_prefix));
     let original_request = state
         .archive
         .get(&refs.request_object)
@@ -7384,6 +7362,10 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         "messages": [{"role": "user", "content": "hi"}]
     }))
     .expect("original request JSON bytes");
+    assert!(
+        refs.request_object
+            .ends_with(&blake3::hash(&original_body).to_hex().to_string())
+    );
     assert_eq!(original_request.as_ref(), original_body.as_slice());
     assert_eq!(
         upstream_requests

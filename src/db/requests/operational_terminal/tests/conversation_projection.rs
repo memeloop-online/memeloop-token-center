@@ -76,6 +76,16 @@ async fn enqueue_contract(fixture: Fixture) {
         .unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].request_id, fixture.claim.request_id);
+    let (atoms, nodes) =
+        crate::conversation::session_body_from_documents(&body, &serde_json::json!({}))
+            .into_prefix();
+    assert!(
+        fixture
+            .database
+            .prepare_session_body_archive(owner, fixture.claim.request_id, atoms, &nodes, &[])
+            .await
+            .unwrap()
+    );
     assert!(
         fixture
             .database
@@ -120,7 +130,6 @@ async fn contract(fixture: Fixture) {
         ConversationProjectionEnqueueInput {
             request_id,
             key: &fixture.key,
-            request_json: &serde_json::json!({}),
             hints: &hints,
             client_name: Some("Codex"),
             upstream_response_id: None,

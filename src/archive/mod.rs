@@ -20,14 +20,34 @@ use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 mod backend;
 mod cas;
 mod compressed;
+mod conversation;
+mod conversation_capture;
+#[cfg(test)]
+mod conversation_capture_tests;
+mod conversation_stream;
 mod download;
+mod durable_roots;
 mod multipart;
 mod objects;
 mod path;
+mod raw_capture;
+#[cfg(test)]
+mod raw_capture_tests;
 mod readiness;
+#[cfg(test)]
+mod rustfs_contract_tests;
+mod session_projection;
 mod staging;
+mod supplier_summary;
+mod text;
 
 pub use cas::CasArchiveObject;
+pub use conversation::{
+    ConversationBodyReference, ConversationEvent, ConversationManifest, ConversationMedia,
+    ConversationPrefix, RawConversationCapture, RawConversationFormat,
+};
+#[cfg(test)]
+pub use conversation::{ConversationExport, ConversationReadLimits};
 pub use download::ArchiveDownload;
 #[cfg(test)]
 use download::{validate_download_range, verified_download_stream};
@@ -36,6 +56,8 @@ pub use multipart::{ArchiveWriter, StagedArchiveObject};
 #[cfg(test)]
 use path::content_location;
 pub(crate) use path::is_tenant_cas_location;
+pub use raw_capture::{RawResponseAttempt, RawResponseAttemptCapture};
+pub(crate) use session_projection::PreparedSessionBody;
 pub use staging::ArchiveStagingObjectStore;
 
 #[derive(Clone)]

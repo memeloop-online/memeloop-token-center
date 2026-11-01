@@ -97,7 +97,16 @@ impl Fixture {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("gap://{request_id}/request"));
         let response_locator = if source.is_some() {
-            r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#.to_owned()
+            let object = state.archive.put_tenant_content(
+                key.tenant_id,
+                Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#),
+            ).await.unwrap();
+            state
+                .archive
+                .publish_raw_capture(key.tenant_id, request_id, "response", &object)
+                .await
+                .unwrap();
+            object.object_locator
         } else {
             format!("gap://{request_id}/response")
         };
@@ -264,9 +273,6 @@ impl Fixture {
             (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
             (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
         ] {
-            // Terminal projection has already completed the request. Use the
-            // deferred writer's matching-gap fence instead of recapturing it
-            // through the pre-terminal compatibility helper.
             let archive = BufferedArchive::new(
                 self.identity,
                 purpose,
@@ -275,13 +281,17 @@ impl Fixture {
                 self.state.config.archive_spool_compression_enabled,
             )
             .unwrap();
+            let mut transaction = self.state.db.begin_write_transaction().await.unwrap();
             assert!(
                 self.state
                     .db
-                    .capture_deferred_archive(&archive)
+                    .capture_buffered_archive_body_in_transaction(
+                        &mut transaction, unix_millis(), &archive, None,
+                    )
                     .await
                     .unwrap()
             );
+            transaction.commit().await.unwrap();
         }
     }
 
@@ -537,6 +547,28 @@ async fn sqlite_final_archive_gap_keeps_request_turn() {
     )
     .await;
     fixture.capture().await;
+    // This fixture knows the original request. Persist those exact bytes;
+    // the empty SQL outbox cannot stand in for a missing original.
+    let object = fixture
+        .state
+        .archive
+        .put_tenant_content(
+            fixture.identity.tenant_id,
+            Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .publish_raw_capture(
+            fixture.identity.tenant_id,
+            fixture.request_id,
+            "request",
+            &object,
+        )
+        .await
+        .unwrap();
     sqlx::query("UPDATE request_archive_spools SET state = 'gap' WHERE request_id = $1")
         .bind(fixture.request_id.to_string())
         .execute(&fixture.state.db.pool)
@@ -594,6 +626,10 @@ async fn source_contract(database_url: String) {
         source.release_retained();
         drop(source);
         assert!(String::from_utf8_lossy(&original).contains("provider_secret_field"));
+        // Upload EOF precedes the independent metadata handoff. Drain the real
+        // writer before simulating deletion/restart, so it cannot recreate the
+        // metadata after the fixture removes it.
+        fixture.state.responses_request_spool.drain_uploads().await;
         fixture
             .state
             .db
@@ -622,18 +658,42 @@ async fn source_contract(database_url: String) {
             .execute(&fixture.state.db.pool)
             .await
             .unwrap();
-        fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+        fixture.state.db = Database::connect_with_max(&database_url, 4)
+            .await
+            .unwrap()
+            .with_archive(fixture.state.archive.clone());
         fixture.assert_completed(true).await;
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
+        let root = fixture
+            .state
+            .archive
+            .raw_capture_reference(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.size_bytes, original.len() as u64);
+        assert_eq!(
+            root.blake3_digest,
+            blake3::hash(&original).to_hex().to_string()
+        );
+        assert_eq!(
+            fixture
+                .state
+                .archive
+                .get_tenant_content(fixture.identity.tenant_id, &root, original.len())
+                .await
+                .unwrap(),
+            original
+        );
+        let recreated: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1")
                 .bind(fixture.request_id.to_string())
                 .fetch_one(&fixture.state.db.pool)
                 .await
                 .unwrap();
-        assert_eq!(state, "bound");
-        let archived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'cleanup_pending'")
-            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
-        assert_eq!(archived, 1);
+        assert_eq!(
+            recreated, 0,
+            "immutable roots restore content without recreating retired spools"
+        );
         let chunks: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = $1",
         )
@@ -917,20 +977,56 @@ async fn lost_source_writer_contract(database_url: String) {
     );
     sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
         .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
-    fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+    fixture.state.db = Database::connect_with_max(&database_url, 4)
+        .await
+        .unwrap()
+        .with_archive(fixture.state.archive.clone());
     assert!(fixture.state.archive.get(&locator).await.is_err());
-    fixture.assert_completed(true).await;
-    fixture
-        .state
-        .db
-        .complete_request_source(
-            fixture.identity,
-            &locator,
-            2,
-            *blake3::hash(b"{}").as_bytes(),
-            true,
-        )
-        .await;
+    let owner = fixture.claim().await;
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let skipped: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&skipped).unwrap()["session_body_skip"],
+        "session_body_skipped_missing_source"
+    );
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        observations, 0,
+        "an aborted original cannot become a fabricated training turn"
+    );
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_failed(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .record_request_source_state(
+                fixture.identity,
+                &locator,
+                2,
+                *blake3::hash(b"{}").as_bytes(),
+                Some(true),
+                false,
+            )
+            .await
+            .unwrap()
+    );
     let state: String =
         sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
             .bind(fixture.request_id.to_string())

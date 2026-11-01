@@ -298,6 +298,14 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(internal_session_context),
         )
         .route(
+            "/internal/v1/sessions/{session_id}/requests/{request_id}/training",
+            get(super::super::session_reading::internal_session_training),
+        )
+        .route(
+            "/internal/v1/sessions/{session_id}/requests/{request_id}/training/raw/{side}",
+            get(super::super::session_reading::internal_session_training_raw),
+        )
+        .route(
             "/internal/v1/sessions/{session_id}/requests/{request_id}/dialogue",
             get(internal_session_dialogue),
         )

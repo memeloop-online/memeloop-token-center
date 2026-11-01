@@ -13,6 +13,11 @@ use crate::{
 };
 
 impl ArchiveStore {
+    #[cfg(test)]
+    pub(crate) fn memory_for_test() -> Self {
+        super::tests::memory_store()
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self, AppError> {
         config
             .s3_timeouts

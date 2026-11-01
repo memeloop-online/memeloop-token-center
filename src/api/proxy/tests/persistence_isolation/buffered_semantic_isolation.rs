@@ -270,9 +270,7 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
             .any(|task| task.request_id == request_id)
     );
     assert!(
-        state
-            .db
-            .project_claimed_conversation_projection_task(owner, request_id)
+        crate::worker::archive_session_body(&state, owner, request_id)
             .await
             .unwrap()
     );
