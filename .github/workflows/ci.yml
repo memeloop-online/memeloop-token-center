@@ -333,7 +333,7 @@ jobs:
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           repository: memeloop-online/memeloop-token-center-example-plugins
-          ref: 4007e743388f65284605e20c7d538d564a4a2290
+          ref: 38e8ff32d209c2b57a7c93cf1a1c3e336386f6e7
           path: .codex-reset-examples
           persist-credentials: false
       - name: Build the real independent reset-credit component
