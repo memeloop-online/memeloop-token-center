@@ -309,8 +309,8 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
   async function prepare(allowed = true, locale = 'zh-CN', tab: 'proxies' | 'groups' | 'policies' = 'groups') {
     const page = await browser.newPage();
     activePage = page;
-    page.on('pageerror', error => errors.push(error.message));
-    page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
+    page.on('pageerror', error => errors.push(`${page.url()}: ${error.message}`));
+    page.on('console', message => { if (message.type() === 'error') errors.push(`${page.url()}: ${message.text()} @ ${JSON.stringify(message.location())}`); });
     await page.route('**/*', route => {
       const url = new URL(route.request().url());
       return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
