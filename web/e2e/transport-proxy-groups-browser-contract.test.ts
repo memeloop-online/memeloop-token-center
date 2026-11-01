@@ -289,7 +289,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
   const browser = await chromium.launch({ headless: true });
   const errors: string[] = [];
   const expectedReloadWarnings: string[] = [];
-  let reloadingFluentPage = false;
+  const documentLifecyclePages = new WeakSet<Page>();
   let activePage: Page | undefined;
   context.afterEach(async child => {
     if (!activePage || activePage.isClosed()) return;
@@ -318,7 +318,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       // keyborg 2.14.1 emits this only outside production when browser
       // document teardown has already removed its refs. Keep the exception
       // scoped to the one hard-reload/back-forward journey; every other error fails.
-      if (reloadingFluentPage && /^Keyborg instance k\d+ is being disposed incorrectly\.$/.test(message.text())
+      if (documentLifecyclePages.has(page) && /^Keyborg instance k\d+ is being disposed incorrectly\.$/.test(message.text())
         && message.location().url.includes('@fluentui_react-components.js')) expectedReloadWarnings.push(text);
       else errors.push(text);
     });
@@ -465,7 +465,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       assert.equal(url.searchParams.get('tenant'), 'fixture');
       assert.equal(await page.getByRole('dialog').count(), 0);
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
-      reloadingFluentPage = true;
+      documentLifecyclePages.add(page);
       await page.reload();
       await page.getByText(transportProxyGroupCopy('zh-CN').denied, { exact: true }).waitFor();
       await installFixture(page, true, 'zh-CN', 'policies');
@@ -477,7 +477,6 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.goForward();
       await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
       assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
-      reloadingFluentPage = false;
       await page.close();
     });
 
