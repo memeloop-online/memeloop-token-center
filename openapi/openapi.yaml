@@ -1475,6 +1475,150 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /internal/v1/plugins/{plugin_id}/background-actions/{account_id}: {
+    "parameters": [
+      {
+        "name": "plugin_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]{1,64}$"
+        }
+      },
+      {
+        "name": "account_id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "format": "uuid"
+        }
+      },
+      {
+        "name": "tenant_external_id",
+        "in": "query",
+        "required": true,
+        "schema": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200
+        }
+      }
+    ],
+    "get": {
+      "tags": [
+        "System"
+      ],
+      "operationId": "getPluginBackgroundActionGrant",
+      "summary": "Read account-scoped background-action authorization and durable result",
+      "security": [
+        {
+          "serviceBearer": []
+        }
+      ],
+      "x-required-scopes": [
+        "plugins:read",
+        "providers:read"
+      ],
+      "description": "Tenant and account ownership are checked. This read never dispatches a reset.",
+      "responses": {
+        "200": {
+          "description": "Current persisted authority and the associated reset operation, if any.",
+          "headers": {
+            "Cache-Control": {
+              "schema": {
+                "type": "string",
+                "const": "private, no-store"
+              }
+            }
+          },
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginBackgroundActionStatus"
+              }
+            }
+          }
+        },
+        "400": {
+          "$ref": "#/components/responses/InvalidRequest"
+        },
+        "401": {
+          "$ref": "#/components/responses/Unauthorized"
+        },
+        "403": {
+          "$ref": "#/components/responses/Forbidden"
+        },
+        "404": {
+          "$ref": "#/components/responses/NotFound"
+        }
+      }
+    },
+    "put": {
+      "tags": [
+        "System"
+      ],
+      "operationId": "putPluginBackgroundActionGrant",
+      "summary": "Enable or disable background reset-credit authority for one account",
+      "security": [
+        {
+          "serviceBearer": []
+        }
+      ],
+      "x-required-scopes": [
+        "plugins:write",
+        "providers:write"
+      ],
+      "description": "Explicit opt-in binds the current actor and credential generation. Revision zero creates the grant. Revocation fences future dispatch claims; requests already claimed may complete. Unknown or submitted operations remain non-dispatchable after re-enabling. This endpoint only saves authority and never directly consumes a credit.",
+      "responses": {
+        "200": {
+          "description": "Current persisted authority and the associated reset operation, if any.",
+          "headers": {
+            "Cache-Control": {
+              "schema": {
+                "type": "string",
+                "const": "private, no-store"
+              }
+            }
+          },
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PluginBackgroundActionStatus"
+              }
+            }
+          }
+        },
+        "400": {
+          "$ref": "#/components/responses/InvalidRequest"
+        },
+        "401": {
+          "$ref": "#/components/responses/Unauthorized"
+        },
+        "403": {
+          "$ref": "#/components/responses/Forbidden"
+        },
+        "404": {
+          "$ref": "#/components/responses/NotFound"
+        },
+        "409": {
+          "$ref": "#/components/responses/Conflict"
+        }
+      },
+      "requestBody": {
+        "required": true,
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/PutPluginBackgroundActionGrant"
+            }
+          }
+        }
+      }
+    }
+  }
+
   /internal/v1/plugins/{plugin_id}/configuration:
     parameters:
       - name: plugin_id
@@ -7702,6 +7846,130 @@ components:
           schema: { type: object, additionalProperties: true }
 
   schemas:
+    PluginBackgroundActionGrant: {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "plugin_id",
+        "tenant_id",
+        "tenant_external_id",
+        "upstream_account_id",
+        "enabled",
+        "revision",
+        "last_attempt_at",
+        "last_error_code",
+        "last_result",
+        "last_operation_id"
+      ],
+      "properties": {
+        "plugin_id": {
+          "type": "string"
+        },
+        "tenant_id": {
+          "type": "string"
+        },
+        "tenant_external_id": {
+          "type": "string"
+        },
+        "upstream_account_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "last_attempt_at": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "last_error_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_result": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "no_action",
+            "retryable_error",
+            "blocked",
+            "prepared",
+            "submitted",
+            "accepted",
+            "unknown",
+            "expired",
+            null
+          ]
+        },
+        "last_operation_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+    PluginBackgroundActionStatus: {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "grant",
+        "can_write",
+        "operation"
+      ],
+      "properties": {
+        "grant": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/PluginBackgroundActionGrant"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "can_write": {
+          "type": "boolean"
+        },
+        "operation": {
+          "anyOf": [
+            {
+              "$ref": "#/components/schemas/UpstreamQuotaResetOperation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+    PutPluginBackgroundActionGrant: {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "expected_revision"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "expected_revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
     "UpstreamConcurrencySnapshot":
       "type": "object"
       "required": ["contract_version", "scope", "generated_at", "observed_at", "last_attempt_at", "last_error_at", "stale", "expired_and_missing_request_leases_excluded", "sample_interval_ms", "retention_ms", "peak_is_sampled_lower_bound", "samples_truncated", "recommendation", "application_mode", "series", "samples", "metadata_gaps"]

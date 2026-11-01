@@ -262,14 +262,16 @@ async fn fresh_snapshot(
     let refresh_started = tokio::time::Instant::now();
     let credits_url = CREDITS_URL;
     #[cfg(test)]
-    let credits_url = test_supplier_url(account, credits_url);
+    let fixture_url = test_supplier_url(account, credits_url);
+    #[cfg(test)]
+    let credits_url = fixture_url.as_str();
     let reset = match tokio::time::timeout(
         budget.total,
         get_codex_json(
             &state.codex_clients,
             policy,
             auth,
-            credits_url.as_ref(),
+            credits_url,
             QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
             budget,
             &session,
@@ -601,15 +603,10 @@ async fn confirm_guarded(
     } else {
         let consume_url = CONSUME_URL;
         #[cfg(test)]
-        let consume_url = test_supplier_url(account, consume_url);
-        dispatch_once(
-            &http,
-            credential,
-            account_header,
-            consume_url.as_ref(),
-            &redeem,
-        )
-        .await
+        let fixture_url = test_supplier_url(account, consume_url);
+        #[cfg(test)]
+        let consume_url = fixture_url.as_str();
+        dispatch_once(&http, credential, account_header, consume_url, &redeem).await
     };
     drop(_permit);
     let accepted = result.is_ok();

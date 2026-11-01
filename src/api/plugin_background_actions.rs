@@ -4,7 +4,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, header},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use uuid::Uuid;
@@ -38,7 +38,7 @@ async fn response(
     account: Uuid,
     tenant: &str,
     service: &AuthenticatedService,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     let grant = state
         .db
         .background_action_grant(plugin, tenant, &account.to_string())
@@ -65,7 +65,7 @@ async fn response(
         Json(serde_json::json!({
             "grant":grant,"can_write":service.allows("providers:write")&&service.allows("plugins:write"),"operation":operation,
         })),
-    ))
+    ).into_response())
 }
 
 pub(super) async fn get(
