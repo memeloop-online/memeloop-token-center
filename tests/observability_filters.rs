@@ -593,6 +593,225 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     );
     assert_eq!(text_detail["usage"]["tokens"]["input_tokens"], 4);
     assert_eq!(text_detail["billing"]["cost"], "0.125");
+
+    // The same credential has linked native usage alongside unlinked generation/archive usage.
+    let confirmed_cluster = state
+        .db
+        .record_conversation_observation(
+            &key,
+            text_id,
+            &json!({"input": "explicitly linked request"}),
+            &ConversationHints {
+                session_id: Some(Uuid::now_v7().to_string()),
+                ..Default::default()
+            },
+            Some("association-filter-contract"),
+        )
+        .await
+        .unwrap();
+    let unlinked = state
+        .db
+        .list_all_requests_filtered(
+            "projection-a",
+            memeloop_token_center::db::RequestListFilter {
+                limit: 100,
+                key_id: Some(key.key_id),
+                typed_ast: Some(TypedFilterAst {
+                    logical_operator: TypedFilterLogicalOperator::And,
+                    conditions: vec![TypedFilterCondition {
+                        field: TypedFilterField::SessionAssociation,
+                        operator: TypedFilterOperator::Equals,
+                        value: TypedFilterValue::Text("unlinked".into()),
+                        upper: None,
+                    }],
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(unlinked.iter().all(|row| row.request_id != text_id));
+    assert!(unlinked.iter().any(|row| row.request_id == generation_id));
+    assert!(unlinked.iter().any(|row| row.request_id == archive_id));
+    assert!(unlinked.iter().all(|row| {
+        row.session_context.as_ref().is_none_or(|context| {
+            context.association == memeloop_token_center::model::RequestSessionAssociation::Unlinked
+        })
+    }));
+
+    // Archive/native correlation remains unlinked even when the archive has
+    // an exact session identity. It must navigate just like the native row.
+    let confirmed_archive_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO session_archive_correlations (tenant_id,source,external_request_id,disposition,key_id,principal_id,record_digest,proof_digest,identity_proof_kind,identity_proof_digest,source_model,source_started_at,correlated_at) SELECT tenant_id,source,$1,disposition,key_id,principal_id,record_digest,$4,identity_proof_kind,identity_proof_digest,source_model,source_started_at,correlated_at FROM session_archive_correlations WHERE tenant_id=$2 AND external_request_id=$3")
+        .bind(confirmed_archive_id.to_string()).bind(key.tenant_id.to_string()).bind(archive_id.to_string()).bind("d".repeat(64)).execute(&inspection).await.unwrap();
+    sqlx::query("INSERT INTO session_archive_unlinked_requests (tenant_id,source,external_request_id,archive_request_id,key_id,principal_id,conversation_cluster_id,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,error_code,request_object,response_object,imported_at,source_session_id) SELECT tenant_id,source,$1,$1,key_id,principal_id,$2,source_started_at,source_completed_at,protocol,model,status_code,duration_ms,7,9,error_code,request_object,response_object,imported_at,source_session_id FROM session_archive_unlinked_requests WHERE tenant_id=$3 AND archive_request_id=$4")
+        .bind(confirmed_archive_id.to_string()).bind(confirmed_cluster.to_string()).bind(key.tenant_id.to_string()).bind(archive_id.to_string()).execute(&inspection).await.unwrap();
+    for (operator, value, confirmed) in [
+        (TypedFilterOperator::Equals, "confirmed", true),
+        (TypedFilterOperator::NotEquals, "unlinked", true),
+        (TypedFilterOperator::Equals, "unlinked", false),
+        (TypedFilterOperator::NotEquals, "confirmed", false),
+    ] {
+        let filter = memeloop_token_center::db::RequestListFilter {
+            limit: 100,
+            key_id: Some(key.key_id),
+            typed_ast: Some(TypedFilterAst {
+                logical_operator: TypedFilterLogicalOperator::And,
+                conditions: vec![TypedFilterCondition {
+                    field: TypedFilterField::SessionAssociation,
+                    operator,
+                    value: TypedFilterValue::Text(value.into()),
+                    upper: None,
+                }],
+            }),
+            ..Default::default()
+        };
+        for rows in [
+            state
+                .db
+                .list_requests_filtered(key.key_id, filter.clone())
+                .await
+                .unwrap(),
+            state
+                .db
+                .list_all_requests_filtered("projection-a", filter.clone())
+                .await
+                .unwrap(),
+            state
+                .db
+                .list_global_requests_filtered(filter)
+                .await
+                .unwrap(),
+        ] {
+            let expected = if confirmed {
+                [text_id, confirmed_archive_id]
+            } else {
+                [generation_id, archive_id]
+            };
+            assert_eq!(
+                rows.iter()
+                    .map(|row| row.request_id)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                expected.into_iter().collect()
+            );
+            for row in rows {
+                if let Some(context) = row.session_context {
+                    assert_eq!(
+                        context.association
+                            == memeloop_token_center::model::RequestSessionAssociation::Confirmed,
+                        confirmed
+                    );
+                    assert_eq!(
+                        context.session_id,
+                        confirmed.then(|| confirmed_cluster.to_string())
+                    );
+                } else {
+                    assert!(!confirmed);
+                }
+            }
+        }
+    }
+    for (request, expected_session) in [
+        (archive_id, None),
+        (confirmed_archive_id, Some(confirmed_cluster.to_string())),
+    ] {
+        for detail in [
+            state
+                .db
+                .request_archive_refs(key.key_id, request)
+                .await
+                .unwrap(),
+            state
+                .db
+                .request_archive_refs_for_tenant("projection-a", request)
+                .await
+                .unwrap(),
+            state.db.request_archive_refs_global(request).await.unwrap(),
+        ] {
+            let context = detail.view.session_context.as_ref().unwrap();
+            assert_eq!(context.session_id, expected_session);
+            assert_eq!(
+                context.association
+                    == memeloop_token_center::model::RequestSessionAssociation::Confirmed,
+                expected_session.is_some()
+            );
+            assert!(!detail.view.billing.billable);
+            assert!(detail.view.billing.cost.is_none());
+            assert!(detail.view.billing.currency.is_none());
+            assert!(detail.view.completed_at.is_none());
+            assert_eq!(detail.view.source_completed_at, Some(archive_completed_at));
+            let provenance = detail.provenance.unwrap();
+            assert_eq!(provenance.disposition, "unlinked");
+            assert!(provenance.unlinked);
+            assert_eq!(
+                provenance.proof_digest,
+                if request == confirmed_archive_id {
+                    "d"
+                } else {
+                    "b"
+                }
+                .repeat(64)
+            );
+        }
+        assert!(
+            state
+                .db
+                .request_archive_refs(foreign.key_id, request)
+                .await
+                .is_err()
+        );
+        assert!(
+            state
+                .db
+                .request_archive_refs_for_tenant("projection-b", request)
+                .await
+                .is_err()
+        );
+        let (status, detail) = get_json(
+            &state,
+            &format!("/internal/v1/requests/{request}"),
+            &service.token,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            detail["session_context"]["session_id"],
+            json!(expected_session)
+        );
+        assert_eq!(
+            detail["session_context"]["association"],
+            if expected_session.is_some() {
+                "confirmed"
+            } else {
+                "unlinked"
+            }
+        );
+    }
+    let (status, session_detail) = get_json(
+        &state,
+        &format!(
+            "/internal/v1/sessions/{confirmed_cluster}?key_id={}",
+            key.key_id
+        ),
+        &service.token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(session_detail["session_id"], confirmed_cluster.to_string());
+    assert_eq!(session_detail["unlinked"], false);
+    let archived = session_detail["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["request_id"] == confirmed_archive_id.to_string())
+        .unwrap();
+    assert_eq!(archived["session_context"]["association"], "confirmed");
+    assert_eq!(
+        archived["session_context"]["session_id"],
+        confirmed_cluster.to_string()
+    );
+    assert_eq!(archived["unlinked"], true); // Archive correlation stays independent.
+    assert_eq!(archived["billing"]["billable"], false);
 }
 
 #[tokio::test]
@@ -708,6 +927,35 @@ async fn postgres_observability_queries_use_the_same_bound_contract() {
         memeloop_token_center::model::RequestSessionAssociation::Unlinked
     );
     assert!(unlinked.session_id.is_none());
+    for (association, expected, excluded) in [
+        ("unlinked", unlinked_request, confirmed_request),
+        ("confirmed", confirmed_request, unlinked_request),
+    ] {
+        let requests = state
+            .db
+            .list_all_requests_filtered(
+                &tenant,
+                memeloop_token_center::db::RequestListFilter {
+                    limit: 100,
+                    key_id: Some(key.key_id),
+                    typed_ast: Some(TypedFilterAst {
+                        logical_operator: TypedFilterLogicalOperator::And,
+                        conditions: vec![TypedFilterCondition {
+                            field: TypedFilterField::SessionAssociation,
+                            operator: TypedFilterOperator::Equals,
+                            value: TypedFilterValue::Text(association.into()),
+                            upper: None,
+                        }],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(requests.iter().any(|row| row.request_id == expected));
+        assert!(requests.iter().all(|row| row.request_id != excluded));
+    }
+
     let filter = memeloop_token_center::db::RequestListFilter {
         limit: 10,
         route_id: Some(route_id),

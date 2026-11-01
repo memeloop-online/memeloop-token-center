@@ -593,6 +593,8 @@ async fn source_contract(database_url: String) {
         let original = fixture.state.archive.get(&locator).await.unwrap();
         source.release_retained();
         drop(source);
+        fixture.state.responses_request_spool.drain_uploads().await;
+        fixture.state.db.drain_gateway_persistence_for_test().await;
         assert!(String::from_utf8_lossy(&original).contains("provider_secret_field"));
         fixture
             .state
@@ -616,6 +618,15 @@ async fn source_contract(database_url: String) {
             .execute(&fixture.state.db.pool)
             .await
             .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1)
+                  + (SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1)",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "recovery must start without either binding");
         sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
             .bind(unix_millis() - 24 * 60 * 60 * 1000)
             .bind(fixture.request_id.to_string())

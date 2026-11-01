@@ -69,7 +69,7 @@ impl SelectedEgress {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestEgressAttempt {
     pub request_id: Uuid,
     pub attempt_id: Uuid,
@@ -88,6 +88,7 @@ pub struct RequestEgressAttempt {
     pub completed: bool,
     pub final_response: bool,
     pub response_body_complete: bool,
+    #[serde(skip_deserializing, default = "payload_measurement_basis")]
     pub measurement_basis: &'static str,
 }
 
@@ -190,6 +191,26 @@ impl Database {
         &self,
         request_id: Uuid,
     ) -> Result<Vec<RequestEgressAttempt>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let Some(snapshot) = client
+                .request_snapshot(
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    request_id,
+                )
+                .await?
+            else {
+                return Ok(Vec::new());
+            };
+            return serde_json::from_value(snapshot.read_model["egress_attempts"].clone())
+                .map_err(|_| AppError::internal("history_egress_projection_missing"));
+        }
+        self.source_request_egress_attempts(request_id).await
+    }
+
+    pub(crate) async fn source_request_egress_attempts(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Vec<RequestEgressAttempt>, AppError> {
         let rows = sqlx::query(
             "SELECT * FROM request_egress_attempts WHERE request_id = $1
              ORDER BY observed_at, attempt_id",
@@ -249,6 +270,11 @@ impl Database {
             return Err(AppError::BadRequest(
                 "invalid egress observation window".into(),
             ));
+        }
+        if let Some(client) = self.history_reader().await? {
+            return Ok(client
+                .egress_summary(self.history_scope(tenant_external_id).await?, start, end)
+                .await?);
         }
         let rows = if let Some(external_id) = tenant_external_id {
             sqlx::query(
@@ -314,3 +340,7 @@ fn decode_selected(snapshot: &str) -> Result<SelectedEgress, AppError> {
 #[cfg(test)]
 #[path = "egress_tests.rs"]
 mod tests;
+
+fn payload_measurement_basis() -> &'static str {
+    "application_payload_estimate"
+}

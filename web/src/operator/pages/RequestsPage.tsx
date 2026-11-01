@@ -9,9 +9,13 @@ import { AnalyticsMetric } from '../AnalyticsMetric';
 import { ImageGenerationQuarantine } from '../ImageGenerationQuarantine';
 import { displayTimeZone } from '../../charts/displayTimeZone';
 import { useI18n } from '../../i18n';
+import { useSessionParentLabel } from '../sessionTasks';
+import { unnamedSessionName } from '../../sessionTitles';
+import { credentialDisplayName } from '../../identityPresentation';
 import type { RequestDetail, RequestEvent, RequestListResponse, RequestView, TypedFilterAst, UpstreamAccount } from '../../types';
 import { RequestEgressDetails } from '../RequestEgressDetails';
 import type { SessionStreamState } from '../SessionMonitor';
+import { restoreRequestSessionOrigin, type SessionRequestOrigin } from '../sessionNavigation';
 import { queryForTenant } from '../scope/operatorShared';
 import { TypedFilterBuilder } from '../TypedFilterBuilder';
 import { RequestWorkspaceTabs } from '../RequestWorkspaceTabs';
@@ -32,9 +36,9 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   streamState: SessionStreamState;
   streamError: string;
   onOpenSessions: () => void;
-  onOpenSession: (sessionId: string) => void;
+  onOpenSession: (sessionId: string, keyId?: string, origin?: SessionRequestOrigin) => void;
   onOpenGenerations?: () => void;
-  requestFocus?: { requestId: string; revision: number };
+  requestFocus?: { requestId: string; revision: number; restore?: { scrollY: number; openDetail: boolean } };
   onRequestFocusHandled?: (revision: number) => void;
   requestDrilldown?: { ast: TypedFilterAst; revision: number };
   onRequestDrilldownHandled?: (revision: number) => void;
@@ -84,6 +88,7 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
   const detailSequence = useRef(0);
   const detailAbort = useRef<AbortController | null>(null);
   const selectedRequestId = useRef<string | undefined>(undefined);
+  const pendingRequestReturn = useRef<SessionRequestOrigin | undefined>(undefined);
   // State mirror of the open detail so the protection effect reruns on
   // selection changes; a ref alone would not trigger React.
   const [selectedRequest, setSelectedRequest] = useState<string | undefined>(undefined);
@@ -401,7 +406,16 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
 
   useEffect(() => {
     if (!requestFocus) return;
-    void openRequestDetail(requestFocus.requestId);
+    if (requestFocus.restore) {
+      pendingRequestReturn.current = {
+        route: 'requests', requestId: requestFocus.requestId,
+        scrollY: requestFocus.restore.scrollY, openDetail: requestFocus.restore.openDetail,
+      };
+      if (!requestFocus.restore.openDetail) closeRequestDetail();
+    } else {
+      pendingRequestReturn.current = undefined;
+      void openRequestDetail(requestFocus.requestId);
+    }
     onRequestFocusHandled?.(requestFocus.revision);
   }, [requestFocus?.revision, tenant, token]);
 
@@ -414,6 +428,25 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     onRequestDrilldownHandled?.(requestDrilldown.revision);
   }, [requestDrilldown?.revision, tenant, token]);
 
+  useEffect(() => {
+    const origin = pendingRequestReturn.current;
+    const requestId = origin?.requestId;
+    if (!origin || !requestId || !requests.some(request => request.request_id === requestId)) return;
+    if (origin.openDetail && detail?.request_id !== origin.requestId) {
+      if (selectedRequestId.current !== requestId) void openRequestDetail(requestId);
+      return;
+    }
+    pendingRequestReturn.current = undefined;
+    restoreRequestSessionOrigin(origin);
+  }, [requests, detail?.request_id]);
+
+  const openSession = (sessionId: string, keyId?: string, requestId?: string) => {
+    onOpenSession(sessionId, keyId, {
+      route: 'requests', requestId, filters, scrollY: window.scrollY,
+      openDetail: Boolean(requestId && selectedRequestId.current === requestId && detail?.request_id === requestId),
+    });
+  };
+
   return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0${writeTenant}\0requests`} label={t('common.loading')}>
     {error && <div className="notice error" role="alert">{t(errorSource.current === 'detail' ? 'request.detail' : 'request.listSource')}: {error}</div>}
     {upstreamError && <div className="notice error" role="alert">{t('request.upstreamSource')}: {upstreamError}</div>}
@@ -421,11 +454,11 @@ export function RequestsPage({ token, tenant, writeTenant = tenant, liveEvents, 
     <RequestsPanel requests={requests} upstreams={upstreams} filters={filters} loading={loading} hasOlder={hasOlder} streamState={streamState} token={token} tenant={tenant} filteredResultsStale={filteredResultsStale} requestRefresh={requestRefresh} refreshPaused={userPaused} onToggleRefreshPaused={() => setUserPaused((value) => !value)} historyLoaded={loadedHistoryIds.current.size > 0} imageReviewOpen={imageReviewOpen} onToggleImageReview={() => setImageReviewOpen((open) => !open)}
       onApply={(next) => { setFilters(next); scope.current = { token, tenant, filters: next }; void load(next); }}
       onClear={() => { setFilters(emptyTypedFilterAst); scope.current = { token, tenant, filters: emptyTypedFilterAst }; void load(emptyTypedFilterAst); }}
-      onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={onOpenSession} onOpenGenerations={onOpenGenerations} />
+      onLoadOlder={() => void load(filters, true)} onRefreshFilteredResults={() => void load(filters)} onSelect={selectRequest} onOpenSessions={onOpenSessions} onOpenSession={openSession} onOpenGenerations={onOpenGenerations} />
     {imageReviewOpen && <section className="request-image-review" aria-label={t('quarantine.title')}>
       <ImageGenerationQuarantine token={token} tenant={tenant} writeTenant={writeTenant} />
     </section>}
-    {detail && <RequestDrawer detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={onOpenSession} onClose={closeRequestDetail} />}
+    {detail && <RequestDrawer token={token} tenant={tenant} detail={detail} upstreamName={upstreams.find((account) => account.id === detail.upstream_account_id)?.name} accountNames={new Map(upstreams.map(account => [account.id, account.name]))} onOpenSession={openSession} onClose={closeRequestDetail} />}
   </PageLoadingRegion>;
 }
 
@@ -448,7 +481,7 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   onRefreshFilteredResults: () => void;
   onSelect: (request: RequestView) => Promise<void>;
   onOpenSessions: () => void;
-  onOpenSession: (sessionId: string) => void;
+  onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void;
   onOpenGenerations?: () => void;
   requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
   refreshPaused?: boolean;
@@ -487,12 +520,13 @@ function RequestsPanel({ requests, upstreams, filters, loading, hasOlder, stream
   </article>;
 }
 
-function RequestDrawer({ detail, upstreamName, accountNames, onOpenSession, onClose }: { detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string) => void; onClose: () => void }) {
+function RequestDrawer({ token, tenant, detail, upstreamName, accountNames, onOpenSession, onClose }: { token: string; tenant: string; detail: RequestDetail; upstreamName?: string; accountNames: ReadonlyMap<string, string>; onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void; onClose: () => void }) {
   const { locale, t } = useI18n();
   const [technicalOpen, setTechnicalOpen] = useState(false);
   const technicalId = useId();
+  const parent = useSessionParentLabel(tenant, token, detail.credential_identity?.key_id, detail.session_context?.association === 'confirmed' ? detail.session_context.session_id : null, session => session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credentialDisplayName(session.key_alias, t), true));
   return <DrawerFrame title={detail.model} eyebrow={t('request.operatorDiagnosis')} onClose={onClose}>
-    <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} />
+    <RequestDiagnostics request={detail} onOpenSession={onOpenSession} upstreamName={upstreamName} sessionParent={parent ? { label: parent.label, sessionId: parent.identity.session_id, keyId: parent.identity.key_id } : undefined} />
     <RequestEgressDetails attempts={detail.egress_attempts} accountNames={accountNames} />
     <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
       <span><b>{t('self.archive')}</b>{detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>
