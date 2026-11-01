@@ -225,7 +225,7 @@ async fn retry_contract(database_url: &str) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::raw_sql("CREATE FUNCTION reject_retry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'injected scheduling failure'; END $$; CREATE TRIGGER reject_retry BEFORE UPDATE OF terminal_lease_expires_at ON conversation_projection_outbox FOR EACH ROW EXECUTE FUNCTION reject_retry();")
+    sqlx::raw_sql("CREATE FUNCTION reject_retry() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.terminal_lease_expires_at IS NOT NULL AND NEW.terminal_lease_expires_at > OLD.terminal_lease_expires_at THEN RAISE EXCEPTION USING ERRCODE = '23514', MESSAGE = 'injected scheduling failure'; END IF; RETURN NEW; END $$; CREATE TRIGGER reject_retry BEFORE UPDATE OF terminal_lease_expires_at ON conversation_projection_outbox FOR EACH ROW EXECUTE FUNCTION reject_retry();")
         .execute(&blockers).await.unwrap();
     assert!(
         !database
