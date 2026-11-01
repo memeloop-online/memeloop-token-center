@@ -1721,20 +1721,25 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
             .fetch_one(&inspection)
             .await
             .unwrap();
-            let reference: memeloop_token_center::archive::ConversationBodyReference =
-                serde_json::from_str(&content).unwrap();
-            let restored = archive
-                .get_tenant_content(
-                    key.tenant_id,
-                    &reference.conversation_body_v1,
-                    reference.conversation_body_v1.size_bytes as usize,
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                serde_json::from_slice::<serde_json::Value>(&restored).unwrap(),
-                atom.content
-            );
+            let stored: serde_json::Value = serde_json::from_str(&content).unwrap();
+            let restored = if stored.get("conversation_body_v1").is_some() {
+                let reference: memeloop_token_center::archive::ConversationBodyReference =
+                    serde_json::from_value(stored).unwrap();
+                let bytes = archive
+                    .get_tenant_content(
+                        key.tenant_id,
+                        &reference.conversation_body_v1,
+                        reference.conversation_body_v1.size_bytes as usize,
+                    )
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            } else {
+                // The row-lock fixture deliberately pre-seeds legacy atoms.
+                // Their exact existing content must also survive projection.
+                stored
+            };
+            assert_eq!(restored, atom.content);
         }
     }
     let reservation_b = started_b
