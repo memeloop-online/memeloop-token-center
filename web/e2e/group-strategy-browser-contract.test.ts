@@ -251,6 +251,9 @@ test('quota choice automatically configures a unique real window and maps one ch
     const writes: Record<string, any>[] = [];
     let multiple = false;
     let failMetadata = false;
+    let emptyMetadata = false;
+    let releaseSlow!: () => void;
+    const slowAccounts = new Promise<void>(resolve => { releaseSlow = resolve; });
     await page.route('**/internal/v1/**', async route => {
       const url = route.request().url();
       if (url.endsWith('/plugins/group-routing-strategies')) await route.fulfill({ json: [{ id: 'quota-order', version: 'group-routing-v1', default: { service: '', allowance: '' }, schema: {
@@ -259,10 +262,16 @@ test('quota choice automatically configures a unique real window and maps one ch
       } }] });
       else if (url.endsWith('/upstreams/quota/windows')) {
         if (failMetadata) { await route.fulfill({ status: 503, json: { error: { message: 'unavailable' } } }); return; }
+        if (emptyMetadata) { await route.fulfill({ json: { results: [] } }); return; }
         assert.deepEqual(route.request().postDataJSON(), { account_ids: ['alpha', 'beta', 'gamma'], tenant_external_id: 'tenant' });
         await route.fulfill({ json: { results: ['alpha', 'beta', 'gamma'].map(upstream_account_id => ({ upstream_account_id, provider: 'openai-codex', windows: [{ id: 'code:primary_window', label: 'code:primary_window', period_seconds: 604800 }, ...(multiple ? [{ id: 'code:secondary_window', label: 'code:secondary_window', period_seconds: 18000 }] : [])] })) } });
-      } else if (url.endsWith('/upstreams/quota/batch') || url.includes('/quota?')) {
-        throw new Error('Persisted windows must configure immediately without supplier discovery');
+      } else if (url.includes('/quota?')) {
+        assert.ok(emptyMetadata, 'persisted windows configure directly');
+        const upstream_account_id = /upstreams\/([^/]+)\/quota/.exec(url)![1];
+        if (upstream_account_id !== 'alpha') await slowAccounts;
+        await route.fulfill({ json: { upstream_account_id, provider: 'openai-codex', windows: [{ id: 'code:primary_window', label: 'code:primary_window', period_seconds: 604800 }] } });
+      } else if (url.endsWith('/upstreams/quota/batch')) {
+        throw new Error('Window discovery publishes each account result independently');
       } else if (route.request().method() === 'PUT') {
         writes.push(route.request().postDataJSON());
         await route.fulfill({ json: { id: 'group', name: 'Group', member_ids: ['alpha', 'beta', 'gamma'], member_count: 3, created_at: 1, updated_at: 2,
@@ -295,6 +304,15 @@ test('quota choice automatically configures a unique real window and maps one ch
     await page.getByText('组策略已保存', { exact: true }).waitFor();
     assert.deepEqual(writes[2].routing_strategy.config, { service: 'openai-codex', allowance: 'code:secondary_window' });
     assert.equal(writes[2].routing_priority, 5);
+    failMetadata = false; emptyMetadata = true; multiple = false;
+    await page.goto(url);
+    await page.getByRole('combobox', { name: '组路由策略', exact: true }).selectOption('quota-order');
+    await page.waitForFunction(() => document.querySelector<HTMLSelectElement>('.schema-resource-choice select')?.selectedOptions[0]?.textContent === 'Codex · 周额度');
+    await page.getByRole('button', { name: '保存组策略', exact: true }).click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[3].routing_strategy.config, { service: 'openai-codex', allowance: 'code:primary_window' });
+    releaseSlow();
+    await page.waitForFunction(() => !document.querySelector('.schema-resource-choice [role="status"]'));
     await page.setViewportSize({ width: 390, height: 844 });
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
   } finally { await browser.close(); await server.close(); }
