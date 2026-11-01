@@ -1,10 +1,10 @@
 import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
-import { Button, Disclosure, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select } from '../design-system';
+import { Button, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select } from '../design-system';
 import { useI18n } from '../i18n';
 import type { UpstreamAccount } from '../types';
 import { useConfirmDialog } from '../useConfirmDialog';
 import { useOperatorResource } from './hooks/useOperatorResource';
-import { transportProxyError, transportProxyFailureKind, transportProxyGroupsPath, transportProxyRequest, type TransportProxyBinding, type TransportProxyGroup } from './transportProxyGroups';
+import { transportProxyError, transportProxyFailureKind, transportProxyGroupsPath, transportProxyRequest, type TransportProxyGroup } from './transportProxyGroups';
 import { transportProxyGroupCopy } from './transportProxyGroupCopy';
 import { egressAddress } from './requestEgress';
 import './requestEgress.css';
@@ -108,11 +108,9 @@ export function TransportProxyGroupFields({ groups, groupId, initialMember, onGr
   </>;
 }
 
-export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = 'ready', onChanged, closeRequest, initialAccountId }: Props & { initialAccountId?: string; closeRequest: RefObject<(() => Promise<boolean>) | null> }) {
+export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: Pick<Props, 'token' | 'tenant' | 'onChanged'> & { closeRequest: RefObject<(() => Promise<boolean>) | null> }) {
   const { locale, t } = useI18n();
   const copy = transportProxyGroupCopy(locale);
-  const eligibleAccounts = accounts.filter(account => account.driver === 'openai-codex' && account.auth_kind === 'oauth'
-    && account.can_update_transport_proxy === true && (!account.tenant_external_id || account.tenant_external_id === tenant));
   const inputPrefix = useId();
   const [failureKind, setFailureKind] = useState<ReturnType<typeof transportProxyFailureKind>>();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, failureKind === 'denied']);
@@ -126,26 +124,16 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   const [probeUrl, setProbeUrl] = useState('');
   const [probeAttempts, setProbeAttempts] = useState('2');
   const [members, setMembers] = useState<MemberDraft[]>([]);
-  const [accountId, setAccountId] = useState(() => eligibleAccounts.find(account => account.id === initialAccountId)?.id ?? '');
-  const [binding, setBinding] = useState<TransportProxyBinding>();
-  const [groupId, setGroupId] = useState('');
-  const [initialMember, setInitialMember] = useState('');
-  const [singleMember, setSingleMember] = useState('');
   const alive = useRef(false);
   const locked = useRef(false);
   const pendingWrite = useRef<AbortController | null>(null);
   const feedback = useRef<HTMLDivElement>(null);
-  const bindingRead = useRef(0);
   const query = `?${new URLSearchParams({ tenant_external_id: tenant })}`;
-  const selectedGroup = groups.find(group => group.id === groupId);
-  const boundGroup = groups.find(group => group.id === binding?.group_id);
-  const bindingDirty = Boolean(groupId || initialMember || singleMember);
   const validMembers = members.length >= 1 && members.length <= 4 && members.every(member => member.label.trim()
     && (member.id && !member.proxyUrl.trim() || member.proxyUrl.trim().startsWith('socks5h://')));
   const probeAttemptCount = Number(probeAttempts);
   const validProbe = Number.isInteger(probeAttemptCount) && probeAttemptCount >= 1 && probeAttemptCount <= 8
     && (probeUrl.trim() === '' || /^https?:\/\//.test(probeUrl.trim()));
-  const bindingPath = (id: string) => `/internal/v1/upstreams/${encodeURIComponent(id)}/transport-proxy-group`;
   const request = <Result,>(path: string, init: RequestInit = {}) => transportProxyRequest<Result>(path, token, {
     ...init, signal: pendingWrite.current?.signal,
   });
@@ -154,7 +142,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
     if (pendingWrite.current) {
       if (!await confirm(copy.closePending)) return false;
       pendingWrite.current?.abort();
-    } else if ((editing !== undefined || bindingDirty) && !await confirm(copy.closeDraft)) return false;
+    } else if (editing !== undefined && !await confirm(copy.closeDraft)) return false;
     return true;
   }
 
@@ -170,30 +158,28 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   useEffect(() => {
     alive.current = true;
     void refresh();
-    return () => { alive.current = false; bindingRead.current += 1; pendingWrite.current?.abort(); };
+    return () => { alive.current = false; pendingWrite.current?.abort(); };
   }, []);
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (editing === undefined && !bindingDirty && !pendingWrite.current) return;
+      if (editing === undefined && !pendingWrite.current) return;
       event.preventDefault();
       event.returnValue = '';
     };
     window.addEventListener('beforeunload', beforeUnload);
     return () => window.removeEventListener('beforeunload', beforeUnload);
-  }, [editing, bindingDirty]);
+  }, [editing]);
 
   async function refresh() {
     if (locked.current) return;
     locked.current = true;
-    bindingRead.current += 1;
-    setBusy(true); setReady(false); setError(''); setBinding(undefined); setEditing(undefined);
-    setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); setGroupId(''); setInitialMember(''); setSingleMember('');
+    setBusy(true); setReady(false); setError(''); setEditing(undefined);
+    setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2');
     try {
       const result = await request<{ items: TransportProxyGroup[] }>(`${transportProxyGroupsPath}${query}`);
-      const current = accountId ? await request<TransportProxyBinding>(`${bindingPath(accountId)}${query}`) : undefined;
       if (!alive.current) return;
-      setGroups(result.items); setBinding(current); setReady(true);
+      setGroups(result.items); setReady(true);
       if (failureKind === 'unknown') setMessage(copy.refreshedUnknown);
       setFailureKind(undefined);
     } catch (reason) {
@@ -205,20 +191,9 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
     finally { locked.current = false; if (alive.current) setBusy(false); }
   }
 
-  async function selectAccount(id: string) {
-    if (bindingDirty && !await confirm(copy.switchAccountDraft)) return;
-    const revision = ++bindingRead.current;
-    setAccountId(id); setBinding(undefined); setGroupId(''); setInitialMember(''); setSingleMember(''); setError(''); setMessage('');
-    if (!id) return;
-    try {
-      const result = await request<TransportProxyBinding>(`${bindingPath(id)}${query}`);
-      if (alive.current && revision === bindingRead.current) setBinding(result);
-    } catch (reason) { if (alive.current && revision === bindingRead.current) setError(transportProxyError(reason, locale, 'read')); }
-  }
-
   async function mutate(action: () => Promise<void>, success: string) {
     if (locked.current || !ready) return;
-    locked.current = true; bindingRead.current += 1;
+    locked.current = true;
     pendingWrite.current = new AbortController();
     setBusy(true); setError(''); setMessage(''); setFailureKind(undefined);
     try {
@@ -237,8 +212,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   }
 
   function clearRestrictedState() {
-    setGroups([]); setBinding(undefined); setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2');
-    setGroupId(''); setInitialMember(''); setSingleMember(''); setAccountId('');
+    setGroups([]); setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2');
   }
 
   function editGroup(group: TransportProxyGroup | null) {
@@ -269,37 +243,8 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
       });
       if (!alive.current) return;
       setGroups(current => [...current.filter(group => group.id !== saved.id), saved]);
-      setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); setBinding(undefined);
-      if (accountId) {
-        try {
-          const latest = await request<TransportProxyBinding>(`${bindingPath(accountId)}${query}`);
-          if (alive.current) setBinding(latest);
-        } catch { if (alive.current) setError(copy.errors.load); }
-      }
+      setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2');
     }, copy.saved);
-  }
-
-  async function changeBinding(unbind: boolean) {
-    if (!binding || binding.account_id !== accountId || !eligibleAccounts.some(account => account.id === accountId)) return;
-    if (unbind ? !boundGroup || !boundGroup.members.some(member => member.id === singleMember)
-      : !selectedGroup || !selectedGroup.members.some(member => member.id === initialMember)) return;
-    if (unbind && !await confirm(copy.confirmUnlink)) return;
-    const previousGroup = binding.group_id;
-    await mutate(async () => {
-      const saved = await request<TransportProxyBinding>(bindingPath(accountId), {
-        method: unbind ? 'DELETE' : 'PUT',
-        body: JSON.stringify({
-          tenant_external_id: tenant, expected_binding_version: binding.binding_version,
-          expected_credential_generation: binding.credential_generation, expected_updated_at: binding.updated_at,
-          ...(unbind ? { expected_group_version: boundGroup!.version, single_proxy_member_id: singleMember }
-            : { group_id: selectedGroup!.id, expected_group_version: selectedGroup!.version, initial_member_id: initialMember }),
-        }),
-      });
-      if (!alive.current) return;
-      setBinding(saved); setGroupId(''); setInitialMember(''); setSingleMember('');
-      setGroups(current => current.map(group => ({ ...group, bound_account_count: group.bound_account_count
-        - (group.id === previousGroup ? 1 : 0) + (group.id === saved.group_id ? 1 : 0) })));
-    }, unbind ? copy.unbound : copy.bound);
   }
 
   return <div className="transport-proxy-workspace">
@@ -307,7 +252,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
     <p>{copy.purpose}</p>
     <div className="button-row">
       <Button type="button" disabled={busy} onClick={async () => {
-        if ((editing !== undefined || bindingDirty) && !await confirm(copy.refreshDraft)) return;
+        if (editing !== undefined && !await confirm(copy.refreshDraft)) return;
         setMessage(''); void refresh();
       }}>{busy ? t('common.loading') : copy.refresh}</Button>
     </div>
@@ -329,7 +274,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
             if (!await confirm(copy.confirmDelete(group.name))) return;
             void mutate(async () => {
               await request(`${transportProxyGroupsPath}/${encodeURIComponent(group.id)}`, { method: 'DELETE', body: JSON.stringify({ tenant_external_id: tenant, expected_version: group.version }) });
-              if (alive.current) { setGroups(current => current.filter(value => value.id !== group.id)); setGroupId(''); setInitialMember(''); }
+              if (alive.current) setGroups(current => current.filter(value => value.id !== group.id));
             }, copy.deleted);
           }}>{t('common.remove')}</Button>
         </div>)}
@@ -369,34 +314,6 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
           </div>
         </FormSection>
       </form>}
-      <fieldset disabled={editing !== undefined} style={{ border: 0, padding: 0, minWidth: 0 }}>
-        <FormSection title={copy.bindingTitle} description={copy.bindingHint}>
-          <Field label={copy.account}><Select value={accountId} disabled={accountsState !== 'ready'} onChange={event => void selectAccount(event.target.value)}>
-            <option value="">{copy.selectAccount}</option>
-            {eligibleAccounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}
-          </Select></Field>
-          {accountsState === 'loading' && <LoadingState label={copy.loadingBinding} variant="compact" />}
-          {ready && accountsState === 'ready' && eligibleAccounts.length === 0 && <p>{copy.noAccounts}</p>}
-          {accountId && !binding && !error && <LoadingState label={copy.loadingBinding} variant="compact" />}
-          {binding && <>
-            <p>{copy.currentGroup}: {binding.group_id ? boundGroup?.name ?? copy.refreshRequired : copy.noGroup}</p>
-            <Disclosure title={copy.connectionDetails}>
-              <p>{copy.runtime[binding.runtime.configuration_state]}</p>
-              <p>{copy.observedAt}: {new Date(binding.runtime.observed_at).toLocaleString(locale)}</p>
-              <p>{copy.observedExit}: {binding.runtime.selected_member_id ? boundGroup?.members.find(member => member.id === binding.runtime.selected_member_id)?.label ?? copy.refreshRequired : copy.noSelection}</p>
-              <p className="muted">{copy.runtimeHint}</p>
-            </Disclosure>
-            <TransportProxyGroupFields groups={groups} groupId={groupId} initialMember={initialMember} onGroupChange={value => { setGroupId(value); setInitialMember(''); }} onMemberChange={setInitialMember} />
-            <Button type="button" appearance="primary" disabled={!selectedGroup || !initialMember} onClick={() => void changeBinding(false)}>{copy.saveBinding}</Button>
-            {boundGroup && <>
-              <Field label={copy.retainedExit}><Select value={singleMember} onChange={event => setSingleMember(event.target.value)}>
-                <option value="">{copy.selectRetained}</option>{boundGroup.members.map(member => <option key={member.id} value={member.id}>{member.label}</option>)}
-              </Select></Field>
-              <Button type="button" disabled={!singleMember} onClick={() => void changeBinding(true)}>{copy.unlink}</Button>
-            </>}
-          </>}
-        </FormSection>
-      </fieldset>
     </fieldset>
   </div>;
 }

@@ -23,10 +23,10 @@ export function ProxyGroupsPage({ token, tenant, initialAccountId, onBack }: {
   const copy = transportProxyGroupCopy(locale);
   const networkCopy = networkProxyCopy(locale);
   const prefix = useId();
-  const [tab, setTab] = useState<'proxies' | 'groups' | 'policies'>(initialAccountId ? 'groups' : 'proxies');
+  const [tab, setTab] = useState<'proxies' | 'groups' | 'policies'>(initialAccountId ? 'policies' : 'proxies');
   const closeRequest = useRef<(() => Promise<boolean>) | null>(null);
   const switching = useRef(false);
-  useEffect(() => { if (initialAccountId) setTab('groups'); }, [initialAccountId]);
+  useEffect(() => { if (initialAccountId) setTab('policies'); }, [initialAccountId]);
   useNavigationGuard(async () => closeRequest.current ? closeRequest.current() : true);
   const access = useOperatorResource(Boolean(token), token, async signal => {
     try {
@@ -77,8 +77,7 @@ export function ProxyGroupsPage({ token, tenant, initialAccountId, onBack }: {
       <div key={tab} id={`${prefix}-panel`} role="tabpanel" aria-labelledby={`${prefix}-${tab}`} tabIndex={0}>
         {initialAccountId && (accounts.state.kind === 'idle' || accounts.state.kind === 'loading') ? <LoadingState label={copy.loadingBinding} level="page" variant="compact" />
           : tab === 'proxies' ? <NetworkProxyWorkspace key={`${token}\0${tenant}`} token={token} tenant={tenant} onChanged={accounts.reload} closeRequest={closeRequest} />
-            : tab === 'groups' ? <ProxyGroupWorkspace key={`${token}\0${tenant}\0${requestedAccount?.id ?? ''}`} token={token} tenant={tenant} accounts={accountsValue}
-              initialAccountId={requestedAccount?.id} accountsState={accounts.state.kind === 'ready' ? 'ready' : accounts.state.kind === 'failed' ? 'failed' : 'loading'} onChanged={accounts.reload} closeRequest={closeRequest} />
+            : tab === 'groups' ? <ProxyGroupWorkspace key={`${token}\0${tenant}`} token={token} tenant={tenant} onChanged={accounts.reload} closeRequest={closeRequest} />
               : <NetworkProxyPolicyWorkspace key={`${token}\0${tenant}\0${requestedAccount?.id ?? ''}`} token={token} tenant={tenant} accounts={accountsValue}
                 initialAccountId={requestedAccount?.id} accountsState={accounts.state.kind === 'ready' ? 'ready' : accounts.state.kind === 'failed' ? 'failed' : 'loading'} onChanged={accounts.reload} closeRequest={closeRequest} />}
       </div>
