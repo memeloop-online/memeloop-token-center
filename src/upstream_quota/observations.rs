@@ -1,4 +1,4 @@
-//! Cross-process quota evidence. This read path never performs supplier I/O.
+//! Background quota publication and request-time reads of persisted routing evidence.
 use crate::{AppState, error::AppError, provider::AuthorizedUpstreamCandidate};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
@@ -40,15 +40,32 @@ pub(crate) struct QuotaObservationTarget {
     pub previous_next_refresh_at: i64,
 }
 
+const SCHEDULING_SLACK_MS: i64 = 1_000;
+
+fn publication_horizon(interval_millis: i64, timeout_millis: i64) -> i64 {
+    interval_millis
+        .max(1_000)
+        .saturating_add(timeout_millis.max(0))
+        .saturating_add(SCHEDULING_SLACK_MS)
+}
+
 fn next_refresh_at(
     target: &QuotaObservationTarget,
-    observation_succeeded: bool,
+    observation: Option<&RoutingQuotaObservation>,
+    tick_at: i64,
     now: i64,
     interval_millis: i64,
+    timeout_millis: i64,
 ) -> i64 {
     let base = interval_millis.max(1_000);
-    if observation_succeeded {
-        return now.saturating_add(base);
+    if let Some(observation) = observation {
+        let next_tick = tick_at
+            .saturating_add(base)
+            .saturating_sub(SCHEDULING_SLACK_MS);
+        let refresh_before = observation
+            .valid_until
+            .saturating_sub(publication_horizon(base, timeout_millis));
+        return next_tick.min(refresh_before).max(tick_at);
     }
     let previous_delay = target
         .previous_next_refresh_at
@@ -168,20 +185,22 @@ pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Recei
     ));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        let tick = tokio::select! { biased;
+            _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
+            tick = ticks.tick() => tick
+        };
+        let elapsed = i64::try_from(tick.elapsed().as_millis()).unwrap_or(i64::MAX);
+        let tick_at = crate::db::unix_millis().saturating_sub(elapsed);
         tokio::select! { biased;
             _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
-            _ = ticks.tick() => {}
-        }
-        tokio::select! { biased;
-            _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
-            result = refresh_batch(&state) => if let Err(error) = result {
+            result = refresh_batch(&state, tick_at) => if let Err(error) = result {
                 tracing::warn!(%error, "quota observation batch failed");
             }
         }
     }
 }
 
-async fn refresh_batch(state: &AppState) -> Result<(), AppError> {
+async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
     // Core Codex recovery must remain available even when an optional
     // application-plugin snapshot cannot be pinned. In that case only the
     // plugin-owned observation targets are skipped for this batch.
@@ -252,26 +271,41 @@ async fn refresh_batch(state: &AppState) -> Result<(), AppError> {
                     } else {
                         state
                             .upstream_quota
-                            .read(
+                            .read_for_publication(
                                 state,
                                 &account,
                                 &credential,
                                 &target.tenant_external_id,
-                                super::QuotaReadTrigger::BackgroundRecovery,
+                                publication_horizon(i64::from(state.config.quota_observation_interval_millis), timeout_ms),
                             )
                             .await
                     };
-                    project(&account, &snapshot, crate::db::unix_millis())
+                    let projection = project(&account, &snapshot, crate::db::unix_millis());
+                    if projection.is_none() {
+                        tracing::warn!(operation = "quota_observation_refresh", upstream_account_id = %account.id,
+                            snapshot_status = snapshot.status, freshness = snapshot.freshness,
+                            error_code = snapshot.error_code.unwrap_or("projection_unavailable"),
+                            "quota observation refresh produced unavailable evidence");
+                    }
+                    projection
                 })
-                .await
-                .ok()
-                .flatten();
+                .await;
+            let observation = match observation {
+                Ok(value) => value,
+                Err(_) => {
+                    tracing::warn!(operation = "quota_observation_refresh", upstream_account_id = %account.id,
+                        timeout_ms, error_code = "observation_timeout", "quota observation refresh timed out");
+                    None
+                }
+            };
             let finished_at = crate::db::unix_millis();
             let next_refresh = next_refresh_at(
                 &target,
-                observation.is_some(),
+                observation.as_ref(),
+                tick_at,
                 finished_at,
                 i64::from(state.config.quota_observation_interval_millis),
+                timeout_ms,
             );
             state
                 .db
@@ -360,13 +394,150 @@ mod tests {
             previous_attempt_at: 0,
             previous_next_refresh_at: 0,
         };
-        assert_eq!(next_refresh_at(&target, false, 100, 10_000), 10_100);
+        assert_eq!(
+            next_refresh_at(&target, None, 0, 100, 10_000, 10_000),
+            10_100
+        );
         target.previous_attempt_at = 100;
         target.previous_next_refresh_at = 10_100;
-        assert_eq!(next_refresh_at(&target, false, 200, 10_000), 20_200);
+        assert_eq!(
+            next_refresh_at(&target, None, 0, 200, 10_000, 10_000),
+            20_200
+        );
         target.previous_next_refresh_at = 300_100;
-        assert_eq!(next_refresh_at(&target, false, 300, 10_000), 60_300);
-        assert_eq!(next_refresh_at(&target, true, 400, 10_000), 10_400);
+        assert_eq!(
+            next_refresh_at(&target, None, 0, 300, 10_000, 10_000),
+            60_300
+        );
+        let observation = RoutingQuotaObservation {
+            account_id: target.account_id,
+            generation: 1,
+            config_revision: 10,
+            provider: "openai-codex".into(),
+            observed_at: 400,
+            valid_until: 30_400,
+            windows: Vec::new(),
+        };
+        assert_eq!(
+            next_refresh_at(&target, Some(&observation), 0, 400, 10_000, 10_000),
+            9_000
+        );
+        assert_eq!(
+            next_refresh_at(&target, Some(&observation), 10_000, 10_500, 10_000, 10_000),
+            10_000
+        );
+    }
+
+    #[test]
+    fn thirty_second_observations_stay_fresh_across_ten_second_ticks_and_slow_reads() {
+        use super::super::{CacheReadPolicy, cached_snapshot_usable};
+        let account: crate::provider::UpstreamAccountView = serde_json::from_value(json!({
+            "id":Uuid::from_u128(1),"tenant_id":Uuid::from_u128(2),"name":"fixture","driver":"openai-codex",
+            "auth_kind":"oauth","connection_method":"native_oauth","credential_generation":1,"status":"active",
+            "config":{},"can_refresh":true,"can_rotate":false,"can_reauthorize":true,"route_count":0,"created_at":0,"updated_at":10
+        })).unwrap();
+        let target = QuotaObservationTarget {
+            account_id: account.id,
+            tenant_id: account.tenant_id,
+            tenant_external_id: "tenant".into(),
+            generation: 1,
+            config_revision: 10,
+            recovering_quota: false,
+            recovery_mark: 0,
+            previous_attempt_at: 0,
+            previous_next_refresh_at: 0,
+        };
+        let mut snapshot = super::super::QuotaSnapshot::empty(&account, "tenant", None);
+        snapshot.windows.push(super::super::QuotaWindow {
+            id: "weekly".into(),
+            label: "Weekly".into(),
+            used_percent: Some(25.0),
+            used: None,
+            remaining: None,
+            limit: None,
+            unit: None,
+            reset_at: Some(1_000_000),
+            period_seconds: Some(604800),
+            source: "fixture",
+            reset_is_estimated: false,
+            allowed: None,
+            limit_reached: None,
+        });
+        let mut next_due = 0;
+        let mut valid_until = 0;
+        let mut supplier_ticks = Vec::new();
+        for tick_at in (0..=120_000).step_by(10_000) {
+            assert!(
+                tick_at == 0 || valid_until > tick_at,
+                "projection expired before a scheduling tick"
+            );
+            if tick_at < next_due {
+                continue;
+            }
+            let cached = cached_snapshot_usable(
+                &snapshot,
+                valid_until,
+                CacheReadPolicy::FreshFor(publication_horizon(10_000, 10_000)),
+                tick_at,
+                false,
+            );
+            let finished_at = if cached { tick_at + 4 } else { tick_at + 8_000 };
+            if !cached {
+                assert!(
+                    tick_at == 0 || valid_until > finished_at,
+                    "projection expired while its successor was read"
+                );
+                supplier_ticks.push(tick_at);
+                snapshot.status = "ready";
+                snapshot.freshness = "fresh";
+                snapshot.observed_at = Some(finished_at);
+                snapshot.stale_after = Some(finished_at + 30_000);
+            }
+            let observation = project(&account, &snapshot, finished_at).unwrap();
+            valid_until = observation.valid_until;
+            next_due = next_refresh_at(
+                &target,
+                Some(&observation),
+                tick_at,
+                finished_at,
+                10_000,
+                10_000,
+            );
+            assert!(next_due <= tick_at + 10_000);
+        }
+        assert_eq!(
+            supplier_ticks,
+            vec![0, 20_000, 40_000, 60_000, 80_000, 100_000, 120_000]
+        );
+        assert!(cached_snapshot_usable(
+            &snapshot,
+            valid_until,
+            CacheReadPolicy::Cached,
+            valid_until - 1,
+            false
+        ));
+        assert!(!cached_snapshot_usable(
+            &snapshot,
+            valid_until,
+            CacheReadPolicy::FreshFor(21_000),
+            valid_until - 1,
+            false
+        ));
+        assert!(cached_snapshot_usable(
+            &snapshot,
+            valid_until,
+            CacheReadPolicy::FreshFor(21_000),
+            valid_until - 1,
+            true
+        ));
+        snapshot.windows[0].reset_at = Some(129_000);
+        assert!(!cached_snapshot_usable(
+            &snapshot,
+            valid_until,
+            CacheReadPolicy::FreshFor(21_000),
+            128_000,
+            false
+        ));
     }
 
     #[test]

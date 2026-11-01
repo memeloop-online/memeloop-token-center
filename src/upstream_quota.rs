@@ -497,6 +497,42 @@ impl QuotaSnapshot {
     }
 }
 
+#[derive(Clone, Copy)]
+enum CacheReadPolicy {
+    Cached,
+    Fresh,
+    FreshFor(i64),
+}
+
+fn cached_snapshot_usable(
+    value: &QuotaSnapshot,
+    refresh_after: i64,
+    policy: CacheReadPolicy,
+    now: i64,
+    refreshed: bool,
+) -> bool {
+    if refreshed {
+        return true;
+    }
+    if now >= refresh_after || matches!(policy, CacheReadPolicy::Fresh) {
+        return false;
+    }
+    let CacheReadPolicy::FreshFor(minimum_remaining) = policy else {
+        return true;
+    };
+    let valid_until = value
+        .windows
+        .iter()
+        .filter_map(|window| window.reset_at)
+        .fold(value.stale_after.unwrap_or(0), i64::min);
+    value.status == "ready"
+        && value.error_code.is_none()
+        && !value.stale
+        && value.freshness == "fresh"
+        && value.observed_at.is_some_and(|observed| observed <= now)
+        && valid_until > now.saturating_add(minimum_remaining.max(0))
+}
+
 #[derive(Default)]
 struct Cached {
     value: Option<QuotaSnapshot>,
@@ -533,8 +569,15 @@ impl QuotaCache {
         tenant: &str,
         trigger: QuotaReadTrigger,
     ) -> QuotaSnapshot {
-        self.read_inner(state, account, credential, tenant, false, trigger)
-            .await
+        self.read_inner(
+            state,
+            account,
+            credential,
+            tenant,
+            CacheReadPolicy::Cached,
+            trigger,
+        )
+        .await
     }
 
     /// Performs a supplier read even when the account has a recent cached
@@ -550,8 +593,35 @@ impl QuotaCache {
         tenant: &str,
         trigger: QuotaReadTrigger,
     ) -> QuotaSnapshot {
-        self.read_inner(state, account, credential, tenant, true, trigger)
-            .await
+        self.read_inner(
+            state,
+            account,
+            credential,
+            tenant,
+            CacheReadPolicy::Fresh,
+            trigger,
+        )
+        .await
+    }
+
+    /// Keeps the background publication fresh through its next scheduling opportunity.
+    pub(crate) async fn read_for_publication(
+        &self,
+        state: &AppState,
+        account: &UpstreamAccountView,
+        credential: &UpstreamCredential,
+        tenant: &str,
+        minimum_remaining_millis: i64,
+    ) -> QuotaSnapshot {
+        self.read_inner(
+            state,
+            account,
+            credential,
+            tenant,
+            CacheReadPolicy::FreshFor(minimum_remaining_millis),
+            QuotaReadTrigger::BackgroundRecovery,
+        )
+        .await
     }
 
     async fn read_inner(
@@ -560,7 +630,7 @@ impl QuotaCache {
         account: &UpstreamAccountView,
         credential: &UpstreamCredential,
         tenant: &str,
-        force_refresh: bool,
+        policy: CacheReadPolicy,
         trigger: QuotaReadTrigger,
     ) -> QuotaSnapshot {
         let empty = |error| QuotaSnapshot::empty(account, tenant, error);
@@ -588,9 +658,8 @@ impl QuotaCache {
         let now = unix_millis();
         let (previous, observed_refresh_generation) = {
             let cached = entry.cached.lock().await;
-            if !force_refresh
-                && now < cached.refresh_after
-                && let Some(value) = &cached.value
+            if let Some(value) = &cached.value
+                && cached_snapshot_usable(value, cached.refresh_after, policy, now, false)
             {
                 return retry::cached(value.clone(), trigger);
             }
@@ -613,14 +682,17 @@ impl QuotaCache {
             );
             return fallback("quota_refresh_in_progress");
         };
-        // A task can finish while we await the singleflight owner. Its result
-        // satisfies this caller even when the caller requested a forced read:
-        // it is newer than the evidence visible when this call began.
+        // Concurrent callers share the supplier result produced by the flight owner.
         {
             let cached = entry.cached.lock().await;
             if let Some(value) = &cached.value
-                && (cached.refresh_generation != observed_refresh_generation
-                    || (!force_refresh && unix_millis() < cached.refresh_after))
+                && cached_snapshot_usable(
+                    value,
+                    cached.refresh_after,
+                    policy,
+                    unix_millis(),
+                    cached.refresh_generation != observed_refresh_generation,
+                )
             {
                 return retry::cached(value.clone(), trigger);
             }
