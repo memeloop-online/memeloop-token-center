@@ -11,6 +11,9 @@ const MAX_SCHEMA_NODES: usize = 4_096;
 const MAX_SCHEMA_CHOICES: usize = 64;
 const MAX_SCHEMA_PROPERTIES: usize = 512;
 const MAX_PATTERN_BYTES: usize = 1_024;
+const MAX_DISPLAY_LOCALES: usize = 32;
+const MAX_DISPLAY_TEXT_BYTES: usize = 4_096;
+const MAX_DISPLAY_KEY_BYTES: usize = 64;
 const MAX_INSTANCE_BYTES: usize = 1024 * 1024;
 
 /// A compiled, reusable schema from the declarative subset supported by both
@@ -93,6 +96,8 @@ fn inspect_schema(schema: &Value, depth: usize, nodes: &mut usize) -> Result<(),
         "$id",
         "$ref",
         "$defs",
+        "x-i18n",
+        "x-resource-selector",
         "title",
         "description",
         "default",
@@ -135,6 +140,7 @@ fn inspect_schema(schema: &Value, depth: usize, nodes: &mut usize) -> Result<(),
             "unsupported JSON Schema keyword: {keyword}"
         )));
     }
+    inspect_display_annotations(object)?;
     if let Some(reference) = object.get("$ref").and_then(Value::as_str)
         && !reference.starts_with("#/")
     {
@@ -203,6 +209,65 @@ fn inspect_schema(schema: &Value, depth: usize, nodes: &mut usize) -> Result<(),
     for keyword in ["additionalProperties", "items"] {
         if let Some(child) = object.get(keyword) {
             inspect_schema(child, depth + 1, nodes)?;
+        }
+    }
+    Ok(())
+}
+
+// These extensions only describe presentation. Never resolve resources or derive
+// instance validation/authorization rules from their contents.
+fn inspect_display_annotations(object: &serde_json::Map<String, Value>) -> Result<(), AppError> {
+    let invalid = || AppError::BadRequest("invalid JSON Schema display annotation".into());
+    if let Some(translations) = object.get("x-i18n") {
+        let translations = translations.as_object().ok_or_else(invalid)?;
+        if translations.is_empty() || translations.len() > MAX_DISPLAY_LOCALES {
+            return Err(invalid());
+        }
+        for (locale, labels) in translations {
+            if locale.is_empty()
+                || locale.len() > MAX_DISPLAY_KEY_BYTES
+                || !locale
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            {
+                return Err(invalid());
+            }
+            let labels = labels.as_object().ok_or_else(invalid)?;
+            if labels.is_empty()
+                || labels.iter().any(|(key, value)| {
+                    !matches!(key.as_str(), "title" | "description")
+                        || value
+                            .as_str()
+                            .is_none_or(|text| text.len() > MAX_DISPLAY_TEXT_BYTES)
+                })
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    if let Some(selector) = object.get("x-resource-selector") {
+        let selector = selector.as_object().ok_or_else(invalid)?;
+        if object.get("type").and_then(Value::as_str) != Some("array")
+            || object
+                .get("items")
+                .and_then(Value::as_object)
+                .and_then(|items| items.get("type"))
+                .and_then(Value::as_str)
+                != Some("string")
+            || selector.len() != 2
+            || !selector.get("ordered").is_some_and(Value::is_boolean)
+            || selector
+                .get("source")
+                .and_then(Value::as_str)
+                .is_none_or(|source| {
+                    source.is_empty()
+                        || source.len() > MAX_DISPLAY_KEY_BYTES
+                        || !source
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                })
+        {
+            return Err(invalid());
         }
     }
     Ok(())
@@ -381,6 +446,85 @@ mod tests {
         let error = validate_instance(&json!({"type": "integer"}), &json!("secret-token"))
             .expect_err("invalid value");
         assert!(!error.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn display_annotations_preserve_instance_validation() {
+        let schema = json!({"type": "object", "additionalProperties": false,
+            "x-i18n": {"zh-CN": {"title": "策略", "description": "展示"}},
+            "properties": {"accounts": {"type": "array", "maxItems": 2, "uniqueItems": true,
+                "items": {"type": "string", "minLength": 1},
+                "x-i18n": {"en": {"title": "Accounts"}},
+                "x-resource-selector": {"source": "group-accounts", "ordered": true}}}});
+        let validator = compile(&schema).unwrap();
+        // An unknown resource is still a valid string; resource access remains
+        // the caller's responsibility, independent of presentation metadata.
+        validator
+            .validate(&json!({"accounts": ["unknown-resource"]}))
+            .unwrap();
+        for value in [
+            json!({"accounts": [""]}),
+            json!({"accounts": [1]}),
+            json!({"accounts": ["a", "a"]}),
+            json!({"accounts": ["a", "b", "c"]}),
+            json!({"secret": "secret-token"}),
+        ] {
+            let error = validator.validate(&value).unwrap_err();
+            assert!(!error.to_string().contains("secret-token"));
+        }
+        let mut unordered = schema["properties"]["accounts"].clone();
+        unordered["x-resource-selector"]["ordered"] = json!(false);
+        validate_definition(&unordered).unwrap();
+    }
+
+    #[test]
+    fn rejects_malformed_or_oversized_display_annotations() {
+        for hint in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"en": "secret-token"}),
+            json!({"en": {}}),
+            json!({"en": {"title": 1}}),
+            json!({"en": {"default": "secret-token"}}),
+            json!({"bad_locale": {"title": "label"}}),
+            json!({"en": {"description": "x".repeat(MAX_DISPLAY_TEXT_BYTES + 1)}}),
+        ] {
+            let error =
+                validate_definition(&json!({"type": "string", "x-i18n": hint})).unwrap_err();
+            assert!(!error.to_string().contains("secret-token"));
+        }
+        let locales: serde_json::Map<String, Value> = (0..=MAX_DISPLAY_LOCALES)
+            .map(|index| (format!("locale-{index}"), json!({"title": "label"})))
+            .collect();
+        assert!(validate_definition(&json!({"x-i18n": locales})).is_err());
+        for hint in [
+            json!(null),
+            json!([]),
+            json!({}),
+            json!({"source": "group-accounts", "ordered": "true"}),
+            json!({"source": "", "ordered": true}),
+            json!({"source": "x".repeat(MAX_DISPLAY_KEY_BYTES + 1), "ordered": true}),
+            json!({"source": "https://secret-token", "ordered": true}),
+            json!({"source": "group-accounts", "ordered": true, "permissions": []}),
+        ] {
+            let error = validate_definition(&json!({"type": "array", "items": {"type": "string"},
+                "x-resource-selector": hint}))
+            .unwrap_err();
+            assert!(!error.to_string().contains("secret-token"));
+        }
+        for shape in [
+            json!({}),
+            json!({"type": "string"}),
+            json!({"type": "array"}),
+            json!({"type": "array", "items": true}),
+            json!({"type": "array", "items": {"type": "integer"}}),
+        ] {
+            let mut schema = shape;
+            schema["x-resource-selector"] = json!({"source": "group-accounts", "ordered": true});
+            assert!(validate_definition(&schema).is_err());
+        }
+        assert!(validate_definition(&json!({"x-other": {"title": "unknown"}})).is_err());
     }
 
     #[derive(Deserialize)]
