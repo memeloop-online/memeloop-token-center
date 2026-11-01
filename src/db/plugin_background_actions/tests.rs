@@ -244,7 +244,7 @@ async fn contract(db: &Database) {
             "actor_tenant" => sqlx::query("UPDATE service_credentials SET tenant_external_id='wrong-tenant' WHERE service_principal_id=$1").bind(actor),
             "credential" => sqlx::query("UPDATE upstream_accounts SET credential_generation=credential_generation+1 WHERE id=$1").bind(account.id.to_string()),
             "account" => sqlx::query("UPDATE upstream_accounts SET status='disabled' WHERE id=$1").bind(account.id.to_string()),
-            _ => sqlx::query("UPDATE tenants SET status='disabled' WHERE id=$1").bind(account.tenant_id.to_string()),
+            _ => sqlx::query("UPDATE tenants SET status='archived' WHERE id=$1").bind(account.tenant_id.to_string()),
         };
         query.execute(&db.pool).await.unwrap();
         assert!(
