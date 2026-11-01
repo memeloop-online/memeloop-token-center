@@ -200,6 +200,15 @@ test('localized resource strategy searches real group accounts, orders by keyboa
     await page.getByRole('button', { name: '提高 Alpha account 的优先级', exact: true }).focus();
     await page.keyboard.press('Enter');
     assert.match(await rows.nth(0).innerText(), /Alpha account/);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.locator('.group-strategy-editor').evaluate(element => { element.style.width = '384px'; element.style.maxWidth = '100%'; });
+    const geometry = await rows.nth(0).evaluate(element => ({
+      rowHeight: element.getBoundingClientRect().height,
+      nameWidth: element.querySelector('.resource-selector-name')!.getBoundingClientRect().width,
+    }));
+    assert.ok(geometry.nameWidth >= 200, 'account names remain readable inside a narrow desktop form column');
+    assert.ok(geometry.rowHeight < 180, 'account labels must not wrap into a vertical column of single characters');
+    await page.setViewportSize({ width: 390, height: 844 });
     const save = page.getByRole('button', { name: '保存组策略', exact: true });
     await save.click();
     await page.getByText('暂时无法保存策略。请重试，已填写的内容会保留。').waitFor();

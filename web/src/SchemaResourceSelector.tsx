@@ -78,8 +78,8 @@ export function SchemaResourceSelector({ schema, formData, onChange, fieldPathId
           <span className="resource-selector-rank" aria-hidden="true">{index + 1}</span>
           <DetailTooltip content={`${t('resourceSelector.accountId')}: ${value}`}><span className="resource-selector-name" tabIndex={0}><strong>{name}</strong><small>{option?.description}</small></span></DetailTooltip>
           <div className="resource-selector-actions">
-            <Button type="button" appearance="subtle" disabled={locked || index === 0} aria-label={t('resourceSelector.moveUp', { name })} onClick={() => move(index, -1)}>↑</Button>
-            <Button type="button" appearance="subtle" disabled={locked || index === values.length - 1} aria-label={t('resourceSelector.moveDown', { name })} onClick={() => move(index, 1)}>↓</Button>
+            <Button type="button" appearance="subtle" disabled={locked || index === 0} aria-label={t('resourceSelector.moveUp', { name })} onClick={() => move(index, -1)}>{t('common.moveUp')}</Button>
+            <Button type="button" appearance="subtle" disabled={locked || index === values.length - 1} aria-label={t('resourceSelector.moveDown', { name })} onClick={() => move(index, 1)}>{t('common.moveDown')}</Button>
             <Button type="button" appearance="subtle" disabled={locked} aria-label={t('groups.removeMember', { name })} onClick={() => { update(values.filter((_, position) => position !== index)); picker.current?.focus(); }}>{t('common.remove')}</Button>
           </div>
         </li>;

@@ -7,15 +7,12 @@
 .schema-resource-selector .field-hint { margin: 0; }
 .schema-resource-selector > .fui-Combobox { width: 100%; min-width: 0; }
 .resource-selector-order { display: grid; gap: 8px; padding: 0; margin: 0; list-style: none; }
-.resource-selector-order > li { display: flex; align-items: center; gap: 12px; padding: 12px; border: 1px solid var(--colorNeutralStroke2, #e0e0e0); border-radius: 8px; }
+.resource-selector-order > li { display: grid; grid-template-columns: 28px minmax(0, 1fr); align-items: start; gap: 12px; padding: 12px; border: 1px solid var(--colorNeutralStroke2, #e0e0e0); border-radius: 8px; }
 .resource-selector-rank { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: var(--colorNeutralBackground3, #f5f5f5); font-variant-numeric: tabular-nums; flex-shrink: 0; }
 .resource-selector-name, .resource-selector-option { display: grid; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
 .resource-selector-name { flex: 1; }
 .resource-selector-name small, .resource-selector-option small { color: var(--colorNeutralForeground2, #616161); }
-.resource-selector-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.resource-selector-actions { grid-column: 2; display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 2px; }
+.resource-selector-actions > .fui-Button { min-width: 44px; min-height: 36px; padding-inline: 10px; }
 .resource-selector-missing { border-color: var(--colorPaletteRedBorder2, #d13438) !important; }
 .resource-selector-announcement { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-@media (max-width: 600px) {
-  .resource-selector-order > li { flex-wrap: wrap; }
-  .resource-selector-actions { width: 100%; justify-content: flex-end; }
-}
