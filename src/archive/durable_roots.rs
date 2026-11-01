@@ -1,6 +1,6 @@
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt};
-use object_store::{ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path};
+use object_store::{PutMode, PutOptions, PutPayload, path::Path};
 
 use super::{
     ArchiveStore,

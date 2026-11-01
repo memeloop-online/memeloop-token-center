@@ -28,7 +28,7 @@ async fn conversation_stream_reads_large_opaque_event_without_document_budget() 
         .append_conversation_event(tenant, None, &event, 65536)
         .await
         .unwrap();
-    let manifest = super::ConversationManifest {
+    let mut manifest = super::ConversationManifest {
         format_version: 1,
         tenant_id: tenant,
         session_id: "session".into(),
@@ -52,6 +52,30 @@ async fn conversation_stream_reads_large_opaque_event_without_document_budget() 
     let entry: serde_json::Value = serde_json::from_slice(&lines[1]).unwrap();
     assert_eq!(entry["ordinal"], 0);
     assert!(entry["object"]["size_bytes"].as_u64().unwrap() > 2 * 1024 * 1024);
+    // Manifest metadata can also exceed the old aggregate 1 MiB ceiling.
+    // The body remains an independent streamed CAS object.
+    manifest.session_id = "s".repeat(1024 * 1024 + 1);
+    let large_manifest = store.put_conversation_manifest(&manifest).await.unwrap();
+    assert!(large_manifest.size_bytes > 1024 * 1024);
+    store
+        .publish_request_conversation(tenant, Uuid::now_v7(), &large_manifest)
+        .await
+        .unwrap();
+    let restored = store
+        .get_conversation_manifest_streamed(tenant, &large_manifest)
+        .await
+        .unwrap();
+    assert_eq!(restored.session_id, manifest.session_id);
+    let lines: Vec<Bytes> = store
+        .stream_conversation_export(tenant, &large_manifest)
+        .await
+        .unwrap()
+        .try_collect()
+        .await
+        .unwrap();
+    assert_eq!(lines.len(), 3);
+    let first: serde_json::Value = serde_json::from_slice(&lines[0]).unwrap();
+    assert_eq!(first["manifest"]["session_id"], manifest.session_id);
 }
 
 #[tokio::test]

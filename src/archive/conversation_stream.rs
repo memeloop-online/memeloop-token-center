@@ -2,7 +2,7 @@ use std::{io::Read, pin::Pin};
 
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use uuid::Uuid;
 
 use super::{
@@ -61,16 +61,15 @@ fn line(value: serde_json::Value) -> Result<Bytes, AppError> {
 }
 
 impl ArchiveStore {
-    async fn event_references(
+    async fn read_tenant_json_streamed<T: DeserializeOwned + Send + 'static>(
         &self,
         tenant: Uuid,
         object: &CasArchiveObject,
-        require_complete: bool,
-    ) -> Result<EventReferences, AppError> {
+    ) -> Result<T, AppError> {
         let mut source = self.open_tenant_content(tenant, object).await?.stream;
         let (sender, receiver) = tokio::sync::mpsc::channel(2);
         let parsed = tokio::task::spawn_blocking(move || {
-            serde_json::from_reader::<_, EventReferences>(Chunks {
+            serde_json::from_reader::<_, T>(Chunks {
                 receiver,
                 current: Bytes::new(),
             })
@@ -94,6 +93,26 @@ impl ArchiveStore {
             .map_err(|_| AppError::storage("conversation_event_parse_failed"))?
             .map_err(|_| AppError::storage("conversation_event_invalid"))?;
         result?;
+        Ok(parsed)
+    }
+
+    pub async fn get_conversation_manifest_streamed(
+        &self,
+        tenant: Uuid,
+        object: &CasArchiveObject,
+    ) -> Result<ConversationManifest, AppError> {
+        let manifest = self.read_tenant_json_streamed(tenant, object).await?;
+        validate_manifest(tenant, &manifest)?;
+        Ok(manifest)
+    }
+
+    async fn event_references(
+        &self,
+        tenant: Uuid,
+        object: &CasArchiveObject,
+        require_complete: bool,
+    ) -> Result<EventReferences, AppError> {
+        let parsed: EventReferences = self.read_tenant_json_streamed(tenant, object).await?;
         if parsed.event_id.is_empty()
             || parsed.branch_id.is_empty()
             || (require_complete && !parsed.gaps.is_empty())
@@ -166,7 +185,7 @@ impl ArchiveStore {
         object: &CasArchiveObject,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<Bytes, AppError>> + Send>>, AppError> {
         let manifest = self
-            .get_conversation_manifest(tenant, object, 1024 * 1024)
+            .get_conversation_manifest_streamed(tenant, object)
             .await?;
         validate_manifest(tenant, &manifest)?;
         if !manifest.gaps.is_empty() || manifest.head.is_none() {

@@ -1075,12 +1075,10 @@ impl Context {
                             .request_conversation_reference(self.tenant, request),
                     )?;
                     Some(
-                        self.runtime
-                            .block_on(self.archive.get_conversation_manifest(
-                                self.tenant,
-                                &reference,
-                                1024 * 1024,
-                            ))?,
+                        self.runtime.block_on(
+                            self.archive
+                                .get_conversation_manifest_streamed(self.tenant, &reference),
+                        )?,
                     )
                 }
                 Err(object_store::Error::NotFound { .. }) => None,

@@ -10,7 +10,8 @@ use super::{
 };
 use crate::{conversation::ConversationHints, error::AppError};
 
-const MAX_OBJECT_BYTES: usize = 128 * 1024 * 1024;
+// Fixed-size prefix reference metadata, independent of event/body length.
+const PREFIX_REFERENCE_BYTES: usize = 4096;
 
 fn request_root(tenant_id: Uuid, request_id: Uuid) -> String {
     format!("tenants/{tenant_id}/conversations/v1/requests/{request_id}.json")
@@ -228,7 +229,7 @@ impl ArchiveStore {
                     .await?,
             });
         }
-        self.append_conversation_event(tenant_id, head, &event, MAX_OBJECT_BYTES)
+        self.append_conversation_event(tenant_id, head, &event, PREFIX_REFERENCE_BYTES)
             .await
     }
 
@@ -239,7 +240,7 @@ impl ArchiveStore {
         manifest: &CasArchiveObject,
     ) -> Result<(), AppError> {
         let next = self
-            .get_conversation_manifest(tenant_id, manifest, MAX_OBJECT_BYTES)
+            .get_conversation_manifest_streamed(tenant_id, manifest)
             .await?;
         let encoded = serde_json::to_vec(manifest)
             .map_err(|_| AppError::internal("conversation_root_encode"))?;
@@ -277,7 +278,7 @@ impl ArchiveStore {
                     return Ok(());
                 }
                 let previous = self
-                    .get_conversation_manifest(tenant_id, &reference, MAX_OBJECT_BYTES)
+                    .get_conversation_manifest_streamed(tenant_id, &reference)
                     .await?;
                 let preserves_raw = previous.raw_captures.iter().all(|old| {
                     next.raw_captures.iter().any(|new| {
@@ -299,7 +300,7 @@ impl ArchiveStore {
                             tenant_id,
                             next.head.clone(),
                             &previous.head,
-                            MAX_OBJECT_BYTES,
+                            PREFIX_REFERENCE_BYTES,
                         )
                         .await?
                 {
