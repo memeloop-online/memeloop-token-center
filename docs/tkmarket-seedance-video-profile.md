@@ -29,7 +29,9 @@ upper bound, so `estimated_units: 0` means unbounded metered usage, with no prep
 hold. The existing policy intentionally does not enforce prepaid budget/rate
 limits. Prepaid keys are rejected before submission; no guessed hard token cap is
 introduced. Exact terminal `total_tokens` settles through the existing usage
-reservation, ledger, projection outbox and financial settlement feed.
+reservation, ledger and projection outbox. Financial readback uses the existing
+account ledger endpoint; metered-unlimited charges intentionally do not enter
+the prepaid settlement feed.
 
 Before result validation or asset probing, the worker persists a task-bound,
 immutable terminal receipt in the existing job result. `result.provider_usage`

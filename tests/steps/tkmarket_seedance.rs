@@ -278,33 +278,36 @@ async fn settled(world: &mut TokenCenterWorld, terminal: String) {
             .await
             .unwrap();
         let account_id = world.stable_account_id.unwrap();
-        let mut feed = Value::Null;
-        for _ in 0..80 {
-            feed = world
-                .client
-                .get(format!(
-                    "{}/internal/v1/accounts/{account_id}/settlements",
-                    world.service_url
-                ))
-                .bearer_auth("test-service-token")
-                .send()
+        let ledger: Value = world
+            .client
+            .get(format!(
+                "{}/internal/v1/accounts/{account_id}/ledger",
+                world.service_url
+            ))
+            .bearer_auth("test-service-token")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let items = ledger.as_array().unwrap();
+        let usage: Vec<_> = items
+            .iter()
+            .filter(|item| item["kind"] == "usage")
+            .collect();
+        assert_eq!(usage.len(), 1, "{ledger}");
+        assert_eq!(usage[0]["amount"], if success { "-1.306788" } else { "0" });
+        assert_eq!(usage[0]["currency"], "USD");
+        let reservation_id: String =
+            sqlx::query("SELECT reservation_id FROM generation_jobs WHERE id = $1")
+                .bind(job_id.to_string())
+                .fetch_one(&pool)
                 .await
                 .unwrap()
-                .json()
-                .await
+                .try_get("reservation_id")
                 .unwrap();
-            if feed["items"]
-                .as_array()
-                .is_some_and(|items| !items.is_empty())
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        let items = feed["items"].as_array().unwrap();
-        assert_eq!(items.len(), 1, "{feed}");
-        assert_eq!(items[0]["request_id"], job_id.to_string());
-        assert_eq!(items[0]["cost"], value["cost"]);
+        assert_eq!(usage[0]["source"], reservation_id);
         let row = sqlx::query("SELECT COUNT(*) AS count, COALESCE(SUM(actual_micros),0) AS cost FROM usage_reservations WHERE key_id = $1 AND status = 'settled'")
             .bind(key_id.to_string()).fetch_one(&pool).await.unwrap();
         assert_eq!(row.try_get::<i64, _>("count").unwrap(), 1);
