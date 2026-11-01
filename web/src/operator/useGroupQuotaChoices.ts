@@ -3,7 +3,7 @@ import { api, ApiError } from '../api';
 import { useI18n } from '../i18n';
 import type { ResourceChoiceOption } from '../resourceChoice';
 import type { ComboboxOption } from './MultiCombobox';
-import { quotaWindowPresentation, upstreamQuotaBatchPath, UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, type UpstreamQuotaBatchResponse, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaWindowPresentation, upstreamQuotaPath, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, type UpstreamQuotaSnapshot } from './upstreamQuota';
 
 type WindowSnapshot = Pick<UpstreamQuotaSnapshot, 'provider' | 'upstream_account_id'> & { windows: Pick<UpstreamQuotaSnapshot['windows'][number], 'id' | 'label' | 'period_seconds'>[] };
 
@@ -50,24 +50,28 @@ export function useGroupQuotaChoices(enabled: boolean, discover: boolean, accoun
         return;
       }
       if (!discover) return;
-      for (let index = 0; index < missing.length; index += 100) {
-        const account_ids = missing.slice(index, index + 100);
-        setResult({ scope, snapshots, busy: true, error: '' });
-        try {
-          const response = await api<UpstreamQuotaBatchResponse>(upstreamQuotaBatchPath(), token, {
-            method: 'POST', body: JSON.stringify({ account_ids, fresh: false, trigger: 'bulk' }),
-            signal: AbortSignal.any([controller.signal, AbortSignal.timeout(UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS)]),
-          });
-          if (controller.signal.aborted) return;
-          const fresh = response.results.flatMap(row => row.status === 'success' && account_ids.includes(row.upstream_account_id) ? [row.snapshot] : []);
-          snapshots = [...snapshots.filter(row => !fresh.some(value => value.upstream_account_id === row.upstream_account_id)), ...fresh];
-          setResult({ scope, snapshots, busy: false, error: response.results.some(row => row.status === 'error') ? 'resourceChoice.partial' : '' });
-        } catch (error) {
-          if (controller.signal.aborted) return;
-          setResult({ scope, snapshots, busy: false, error: error instanceof ApiError && [401, 403].includes(error.status) ? 'quota.errorPermission' : 'resourceChoice.loadFailed' });
-          return;
+      let next = 0;
+      let pending = missing.length;
+      let failed = false;
+      if (pending) setResult({ scope, snapshots, busy: true, error: '' });
+      await Promise.all(Array.from({ length: Math.min(3, missing.length) }, async () => {
+        while (next < missing.length && !controller.signal.aborted) {
+          const accountId = missing[next++];
+          try {
+            const snapshot = await api<UpstreamQuotaSnapshot>(upstreamQuotaPath(accountId, tenant, { trigger: 'bulk' }), token, {
+              signal: AbortSignal.any([controller.signal, AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS)]),
+            });
+            if (controller.signal.aborted) return;
+            if (snapshot.upstream_account_id === accountId) snapshots = [...snapshots.filter(row => row.upstream_account_id !== accountId), snapshot];
+            else failed = true;
+          } catch {
+            if (controller.signal.aborted) return;
+            failed = true;
+          }
+          pending--;
+          setResult({ scope, snapshots, busy: pending > 0, error: failed ? 'resourceChoice.partial' : '' });
         }
-      }
+      }));
     })();
     return () => controller.abort();
   }, [enabled, discover, token, tenant, accountKey, reload]);

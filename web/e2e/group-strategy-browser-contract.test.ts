@@ -261,7 +261,7 @@ test('quota choice automatically configures a unique real window and maps one ch
         if (failMetadata) { await route.fulfill({ status: 503, json: { error: { message: 'unavailable' } } }); return; }
         assert.deepEqual(route.request().postDataJSON(), { account_ids: ['alpha', 'beta', 'gamma'], tenant_external_id: 'tenant' });
         await route.fulfill({ json: { results: ['alpha', 'beta', 'gamma'].map(upstream_account_id => ({ upstream_account_id, provider: 'openai-codex', windows: [{ id: 'code:primary_window', label: 'code:primary_window', period_seconds: 604800 }, ...(multiple ? [{ id: 'code:secondary_window', label: 'code:secondary_window', period_seconds: 18000 }] : [])] })) } });
-      } else if (url.endsWith('/upstreams/quota/batch')) {
+      } else if (url.endsWith('/upstreams/quota/batch') || url.includes('/quota?')) {
         throw new Error('Persisted windows must configure immediately without supplier discovery');
       } else if (route.request().method() === 'PUT') {
         writes.push(route.request().postDataJSON());
