@@ -255,7 +255,7 @@ fn inspect_display_annotations(object: &serde_json::Map<String, Value>) -> Resul
                 .and_then(Value::as_str)
                 != Some("string")
             || selector.len() != 2
-            || !selector.get("ordered").is_some_and(Value::is_boolean)
+            || selector.get("ordered").and_then(Value::as_bool) != Some(true)
             || selector
                 .get("source")
                 .and_then(Value::as_str)
@@ -472,9 +472,6 @@ mod tests {
             let error = validator.validate(&value).unwrap_err();
             assert!(!error.to_string().contains("secret-token"));
         }
-        let mut unordered = schema["properties"]["accounts"].clone();
-        unordered["x-resource-selector"]["ordered"] = json!(false);
-        validate_definition(&unordered).unwrap();
     }
 
     #[test]
@@ -503,6 +500,7 @@ mod tests {
             json!([]),
             json!({}),
             json!({"source": "group-accounts", "ordered": "true"}),
+            json!({"source": "group-accounts", "ordered": false}),
             json!({"source": "", "ordered": true}),
             json!({"source": "x".repeat(MAX_DISPLAY_KEY_BYTES + 1), "ordered": true}),
             json!({"source": "https://secret-token", "ordered": true}),
