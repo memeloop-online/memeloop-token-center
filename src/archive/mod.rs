@@ -26,6 +26,7 @@ mod conversation_capture;
 mod conversation_capture_tests;
 mod conversation_stream;
 mod download;
+mod durable_roots;
 mod multipart;
 mod objects;
 mod path;

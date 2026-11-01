@@ -83,6 +83,7 @@ jobs:
       - run: cargo test --locked --lib archive::compressed_tests
       - run: cargo test --locked --lib archive::text
       - run: cargo test --locked --lib archive::supplier_summary
+      - run: cargo test --locked --lib archive::durable_roots
       - run: cargo test --locked --lib archive::raw_capture
       - run: cargo test --locked --lib db::requests::conversations::archive_readiness_tests -- --test-threads=1
       - run: cargo test --locked --test proxy_atomic_postgres postgres_proxy_conversation_content_wait_does_not_hold_session_lock
