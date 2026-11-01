@@ -110,6 +110,7 @@ async fn body_activity_counts_metered_and_gated_reads_and_releases_on_cancel() {
             .unwrap();
         assert!(response.status().is_client_error(), "{}", response.status());
         drop(response);
+        drain_archive_capture(&fixture).await;
         assert_eq!(fixture.state.gateway_body_reads.load(Ordering::Acquire), 0);
         assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);
     }
