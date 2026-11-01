@@ -121,8 +121,8 @@ test('service credential creation validates the draft and issues only a read-onl
   const hints = await form.locator('.service-credential-scope-hint').allTextContents();
   assert.equal(hints.length, hintCount, 'every permission shows its capability description inline');
   for (const hint of hints) assert.ok(hint.trim());
-  const requestsHint = '读取请求记录、监控快照和用量分析；不允许写入。';
-  assert.ok(hints.includes(requestsHint), 'the requests permission explains that it covers usage analysis without write access');
+  const requestsHint = '请求记录、监控快照与用量分析。';
+  assert.ok(hints.includes(requestsHint), 'the requests permission explains that it covers request records, monitoring snapshots, and usage analysis');
 
   await metrics.uncheck();
   await requests.uncheck();
