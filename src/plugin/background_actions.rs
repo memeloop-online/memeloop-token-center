@@ -51,7 +51,7 @@ pub(super) fn prepare_component(
     }
     let component = component
         .ok_or_else(|| AppError::BadRequest("background action component missing".into()))?;
-    // No host imports are linked: a planner cannot make HTTP calls or mutate KV.
+    // The guest links only its planner export and receives host-validated context.
     let linker = Linker::<HostState>::new(engine);
     let pre = linker.instantiate_pre(component).map_err(|_| {
         AppError::BadRequest(

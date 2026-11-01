@@ -8,8 +8,8 @@ use crate::{
 
 const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
-// Test binaries alone can redirect the fixed supplier to a loopback fixture.
-// Production builds never read this config key or accept a caller URL.
+// Test binaries may redirect the fixed supplier to a loopback fixture.
+// Production builds retain the fixed supplier endpoints.
 #[cfg(test)]
 fn test_supplier_url(account: &UpstreamAccountView, original: &str) -> String {
     let Some(base) = account
@@ -44,7 +44,7 @@ pub(crate) struct CreditInventory {
 
 pub(crate) struct BackgroundResetGuard {
     pub grant: crate::db::plugin_background_actions::BackgroundActionGrant,
-    /// Exact host-validated plugin snapshot; never part of business identity.
+    /// Exact host-validated plugin snapshot, separate from business identity.
     pub runtime_revision: Option<i64>,
     pub lease_owner: String,
     pub credit_fingerprint: String,
@@ -56,8 +56,8 @@ pub(crate) struct BackgroundResetGuard {
 pub(super) fn credit_fingerprint(credit: &Value) -> String {
     use sha2::{Digest, Sha256};
     // Supplier credit identity, where present, distinguishes equal-count
-    // replacements with otherwise identical lifetime fields. consumeOne does
-    // not accept this identity; it is evidence for a fresh precondition only.
+    // replacements with otherwise identical lifetime fields. The host uses
+    // this identity as a fresh precondition; the supplier body carries a redeem ID.
     let field = |snake: &str, camel: &str| {
         credit
             .get(snake)
@@ -148,9 +148,9 @@ fn validate_background_evidence(
     Ok(())
 }
 
-/// Only an authorized worker can enter this path. Business identity excludes
-/// runtime/package/config/authorization revisions so upgrades and re-enabling
-/// cannot turn an ambiguous paid operation into a second dispatch.
+/// An authorized worker enters this path. Stable business identity spans
+/// runtime, package, configuration and authorization revisions, preserving
+/// one dispatch identity through upgrades and re-enablement.
 pub(crate) async fn background_reset(
     state: &AppState,
     account: &UpstreamAccountView,
@@ -162,8 +162,8 @@ pub(crate) async fn background_reset(
         "background-reset-credit-v1:{}:{}",
         account.id, guard.credit_fingerprint
     );
-    // Validate before creating durable work. Out-of-window or replaced credits
-    // never accumulate prepared operations on each scheduler tick.
+    // Validate before creating durable work. Scheduler ticks outside the window
+    // or with replaced credits leave the durable operation set unchanged.
     let snapshot = fresh(state, account, credential, &guard.grant.tenant_external_id).await?;
     validate_background_evidence(&snapshot, guard, unix_millis())?;
     let prepared = prepare(
@@ -248,8 +248,8 @@ async fn fresh_snapshot(
         .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
     let mut budget = codex_quota_budget(&account.config)
         .map_err(|_| temporarily_unavailable("quota_reset_budget"))?;
-    // Even the reset workflow's credit precheck remains a single attempt.
-    // Consumption below is a separate no-retry transport and never enters the reader.
+    // The reset workflow's credit precheck uses one attempt. Consumption below
+    // uses its own fixed transport after the fresh read completes.
     budget.attempt_limit = 1;
     let session = retry::ReadSession::new(
         Some(state),
@@ -610,7 +610,7 @@ async fn confirm_guarded(
         QuotaResetClaim::Claimed { redeem_request_id } => redeem_request_id,
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
-    // No automatic retry and no new redeem ID on any ambiguous outcome.
+    // Each durable operation keeps one redeem ID and one supplier dispatch.
     let result = if guard.is_some_and(|guard| unix_millis() >= guard.deadline_ms) {
         Err("quota_reset_deadline_elapsed")
     } else {
@@ -637,8 +637,8 @@ async fn confirm_guarded(
         // The consume response proves only that the reset was accepted. A
         // separate fresh supplier read is the evidence that may clear the
         // exact quota-exhausted health row through the existing fenced CAS.
-        // Recovery failure must never replay the paid reset or change its
-        // accepted durable result.
+        // Recovery updates supplier evidence while preserving the accepted
+        // durable result and operation identity.
         match fresh_snapshot(state, account, credential, tenant).await {
             Ok(_) => tracing::info!(
                 upstream_account_id = %account.id,
@@ -652,11 +652,11 @@ async fn confirm_guarded(
                 trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
                 error = %error,
                 error_code = "quota_reset_recovery_pending",
-                "accepted quota reset could not refresh supplier evidence"
+                "accepted quota reset supplier evidence refresh is pending"
             ),
         }
     }
-    // Accepted means only supplier HTTP 2xx. It does not assert window state.
+    // Accepted records the supplier HTTP 2xx response; quota windows remain independently observed.
     state
         .db
         .quota_reset_operation(

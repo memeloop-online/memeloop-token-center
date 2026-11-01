@@ -1,7 +1,6 @@
 package memeloop:background-actions@0.1.0;
 
-/// A pure planner. The guest receives no credential, network, inventory, or
-/// mutation imports. The worker validates every returned intent independently.
+/// A pure planner receives typed context and returns intent for independent host validation.
 interface planner {
   record credit {
     fingerprint: string,

@@ -191,7 +191,7 @@ impl Database {
         let account = input.account.id.to_string();
         let tenant = input.account.tenant_id.to_string();
         let mut tx = self.pool.begin().await?;
-        // Expiration cannot reopen submitted/unknown operations.
+        // Expiration transitions prepared operations while submitted and unknown rows keep their state.
         sqlx::query(
             "UPDATE upstream_quota_reset_operations
              SET state = 'expired', updated_at = $1
@@ -354,7 +354,7 @@ impl Database {
     }
 
     /// CAS is committed before dispatch. An exact confirmation replay returns
-    /// durable state and can never send a second supplier request.
+    /// durable state and preserves the operation's single dispatch identity.
     pub(crate) async fn claim_quota_reset(
         &self,
         account: &UpstreamAccountView,
@@ -409,9 +409,8 @@ impl Database {
                 unix_millis(),
             )
             .await?;
-            // Lock the account and tenant as well as the grant. Credential
-            // rotation, account disable and tenant disable serialize with the
-            // committed dispatch fence rather than racing an MVCC EXISTS read.
+            // Lock account and tenant alongside the grant so credential
+            // rotation and status changes serialize with the committed fence.
             let query = if matches!(self.backend, DatabaseBackend::PostgreSql) {
                 "SELECT a.credential_generation FROM upstream_accounts a JOIN tenants t ON t.id=a.tenant_id WHERE a.id=$1 AND a.tenant_id=$2 AND a.status='active' AND t.status='active' AND a.driver='openai-codex' AND a.credential_generation=$3 AND a.updated_at=$4 FOR UPDATE OF a,t"
             } else {
@@ -433,7 +432,7 @@ impl Database {
                     "background action has not started".into(),
                 ));
             }
-            // A lock wait must not preserve an already-expired lease/deadline.
+            // Recheck lease and deadline after lock waits using the current time.
             plugin_background_actions::require_grant(
                 &mut tx,
                 self.backend,
@@ -583,12 +582,11 @@ impl Database {
         applicable: i64,
         observed_at: i64,
     ) -> Result<(), AppError> {
-        // Read evidence alone cannot attribute a changed balance to this
-        // operation. In particular, unknown never becomes accepted here. A
-        // supplier-accepted operation may release its account lock once the
-        // old available balance no longer applies. Credential generation and
-        // transport revision are dispatch fences, not settlement fences: an
-        // OAuth refresh or proxy edit must not hide later supplier evidence.
+        // Read evidence records current supplier balance. Supplier acceptance
+        // remains the evidence for an accepted operation, while unknown rows
+        // retain their state. Accepted operations settle after a balance change.
+        // Settlement uses fresh supplier observations across OAuth refreshes
+        // and proxy edits; credential and transport revisions fence dispatch.
         let mut tx = self.pool.begin().await?;
         let changed = sqlx::query(
             "UPDATE upstream_quota_reset_operations

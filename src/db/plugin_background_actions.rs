@@ -53,9 +53,8 @@ impl Database {
         Ok(())
     }
 
-    /// Recover a pre-dispatch crash without creating a new business operation.
-    /// Only a demonstrably unconfirmed prepare can be refreshed. Submitted and
-    /// ambiguous operations retain their original irreversible dispatch claim.
+    /// Refresh evidence and expiry on the same operation after a pre-dispatch crash.
+    /// Unconfirmed rows qualify while submitted and ambiguous rows retain dispatch state.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn refresh_background_quota_reset_prepare(
         &self,
@@ -180,9 +179,9 @@ impl Database {
 }
 
 /// Serialize dispatch with runtime publication, including insertion of the first
-/// head. A row lock alone cannot fence an absent head. The short SHARE table lock
-/// conflicts with publication's INSERT/UPDATE and is held only through the local
-/// claim transaction; no supplier or component execution occurs under it.
+/// head. The SHARE table lock fences both first-head insertion and publication
+/// updates. It remains held through the local claim transaction; supplier and
+/// component work runs outside this lock.
 pub(super) async fn require_runtime(
     tx: &mut Transaction<'_, Any>,
     backend: DatabaseBackend,

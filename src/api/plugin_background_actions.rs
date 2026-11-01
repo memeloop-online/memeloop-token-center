@@ -101,7 +101,7 @@ pub(super) async fn put(
     };
     if body.enabled && !state.plugins.has_background_actions(&plugin) {
         return Err(AppError::BadRequest(
-            "plugin has no installed background action contribution".into(),
+            "plugin lacks an installed background action contribution".into(),
         ));
     }
     let hash = if service.service_id.is_none() {

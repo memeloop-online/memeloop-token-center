@@ -539,7 +539,7 @@ async fn run_plugin_background_actions(
     let pinned = match state.clone().pin_application_plugins().await {
         Ok(state) => state,
         Err(error) => {
-            tracing::warn!(%error,"worker could not pin background action plugins");
+            tracing::warn!(%error,"worker background action runtime pin failed");
             return;
         }
     };
@@ -548,7 +548,7 @@ async fn run_plugin_background_actions(
         let grants = match pinned.db.due_background_action_grants(&plugin, now).await {
             Ok(grants) => grants,
             Err(error) => {
-                tracing::warn!(%error,"worker could not enumerate background action grants");
+                tracing::warn!(%error,"worker background action grant enumeration failed");
                 continue;
             }
         };
@@ -570,7 +570,7 @@ async fn run_plugin_background_actions(
                 Ok(true) => {}
                 Ok(false) => continue,
                 Err(error) => {
-                    tracing::warn!(%error,"worker could not claim background action tick");
+                    tracing::warn!(%error,"worker background action tick claim failed");
                     continue;
                 }
             }
@@ -622,7 +622,7 @@ async fn run_plugin_background_actions(
                 )
                 .await
             {
-                tracing::warn!(%error,"worker could not complete background action tick");
+                tracing::warn!(%error,"worker background action tick completion failed");
             }
             if let Err(error) = result {
                 tracing::warn!(plugin_id=%plugin,upstream_account_id=%grant.upstream_account_id,error_category=error.diagnostic_category(),"plugin background action tick failed");
