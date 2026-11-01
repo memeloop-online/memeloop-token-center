@@ -16,7 +16,7 @@ export function quotaChoiceLabel(provider: string, window: WindowSnapshot['windo
 }
 
 /** Persisted window names are shown immediately; missing metadata is discovered in the background. */
-export function useGroupQuotaChoices(enabled: boolean, accounts: ComboboxOption[], token: string, tenant: string) {
+export function useGroupQuotaChoices(enabled: boolean, discover: boolean, accounts: ComboboxOption[], token: string, tenant: string) {
   const { t } = useI18n();
   const accountKey = JSON.stringify([...new Set(accounts.map(account => account.value))].sort());
   const scope = JSON.stringify([token, tenant, accountKey]);
@@ -30,7 +30,7 @@ export function useGroupQuotaChoices(enabled: boolean, accounts: ComboboxOption[
     if (!ids.length) return;
     const batches = Array.from({ length: Math.ceil(ids.length / 100) }, (_, index) => ids.slice(index * 100, index * 100 + 100));
     void (async () => {
-      let snapshots: WindowSnapshot[] = [];
+      let snapshots: WindowSnapshot[] = result.scope === scope ? result.snapshots : [];
       const missing: string[] = [];
       try {
         for (const account_ids of batches) {
@@ -40,7 +40,7 @@ export function useGroupQuotaChoices(enabled: boolean, accounts: ComboboxOption[
           });
           if (controller.signal.aborted) return;
           const known = metadata.results.filter(row => account_ids.includes(row.upstream_account_id));
-          snapshots = [...snapshots, ...known];
+          snapshots = [...snapshots.filter(row => !account_ids.includes(row.upstream_account_id)), ...known];
           missing.push(...account_ids.filter(id => !known.some(row => row.upstream_account_id === id && row.windows.length)));
           setResult({ scope, snapshots, busy: false, error: '' });
         }
@@ -49,6 +49,7 @@ export function useGroupQuotaChoices(enabled: boolean, accounts: ComboboxOption[
         setResult({ scope, snapshots, busy: false, error: error instanceof ApiError && [401, 403].includes(error.status) ? 'quota.errorPermission' : 'resourceChoice.loadFailed' });
         return;
       }
+      if (!discover) return;
       for (let index = 0; index < missing.length; index += 100) {
         const account_ids = missing.slice(index, index + 100);
         setResult({ scope, snapshots, busy: true, error: '' });
@@ -69,7 +70,7 @@ export function useGroupQuotaChoices(enabled: boolean, accounts: ComboboxOption[
       }
     })();
     return () => controller.abort();
-  }, [enabled, token, tenant, accountKey, reload]);
+  }, [enabled, discover, token, tenant, accountKey, reload]);
   const visible = result.scope === scope ? result : { snapshots: [], busy: enabled && Boolean(accounts.length), error: '' };
   const choices = new Map<string, ResourceChoiceOption>();
   for (const snapshot of visible.snapshots) for (const window of snapshot.windows) {

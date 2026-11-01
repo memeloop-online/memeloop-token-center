@@ -58,7 +58,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
   const option = catalog.find(value => value.id === pluginId);
   const schema = localizeSchema<RJSFSchema>(option?.schema ?? { type: 'object', properties: {} }, locale);
   const choice = resourceChoiceHint(schema);
-  const quotaChoices = useGroupQuotaChoices(catalog.some(item => resourceChoiceHint(item.schema)?.source === 'group-quota-windows'), accounts, token, tenant);
+  const quotaChoices = useGroupQuotaChoices(catalog.some(item => resourceChoiceHint(item.schema)?.source === 'group-quota-windows'), choice?.source === 'group-quota-windows', accounts, token, tenant);
   const choiceOptions = choice?.source === 'group-quota-windows' ? quotaChoices.options : [];
   const savedChoiceMatches = (data: Record<string, unknown>) => Boolean(choice && pluginId === snapshot.routing_strategy?.plugin_id
     && Object.keys(choice.bindings).every(field => typeof data[field] === 'string' && (data[field] as string).length > 0 && data[field] === snapshot.routing_strategy?.config[field]));
