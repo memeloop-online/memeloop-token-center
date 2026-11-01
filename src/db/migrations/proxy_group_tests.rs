@@ -136,6 +136,11 @@ async fn upgrade_contract(database: &Database) {
         "ALTER TABLE conversation_projection_outbox DROP COLUMN semantic_snapshot_json",
         "ALTER TABLE conversation_projection_outbox DROP COLUMN terminal_lease_owner",
         "ALTER TABLE conversation_projection_outbox DROP COLUMN terminal_lease_expires_at",
+        "DROP TABLE network_proxy_attempt_signals",
+        "DROP TABLE network_proxy_selection_policies",
+        "DROP TABLE network_proxy_group_members",
+        "DROP TABLE network_proxies",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN members_normalized",
         "DROP TABLE transport_proxy_bindings",
         "DROP TABLE transport_proxy_groups",
         "DROP TABLE transport_proxy_management_audit",
@@ -244,6 +249,7 @@ async fn upgrade_contract(database: &Database) {
         .unwrap();
     transaction.commit().await.unwrap();
     database.migrate().await.unwrap();
+    database.migrate().await.unwrap();
     let replayed_at: i64 =
         sqlx::query_scalar("SELECT applied_at FROM schema_migrations WHERE version = 116")
             .fetch_one(&database.pool)
@@ -281,6 +287,23 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     assert_eq!(count, 0);
+    for table in [
+        "network_proxies",
+        "network_proxy_group_members",
+        "network_proxy_selection_policies",
+        "network_proxy_attempt_signals",
+    ] {
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "{table} rebuilt by migration 148");
+    }
+    sqlx::query("SELECT members_normalized FROM transport_proxy_groups LIMIT 1")
+        .fetch_optional(&database.pool)
+        .await
+        .unwrap();
     sqlx::query("SELECT terminal_cause_code, proxy_owner_token, proxy_owner_expires_at FROM request_records LIMIT 1")
         .fetch_optional(&database.pool)
         .await

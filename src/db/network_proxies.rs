@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 mod members;
 pub(crate) mod signals;
 #[cfg(test)]
@@ -108,7 +109,70 @@ async fn proxy_lock(tx: &mut Transaction<'_, Any>) -> Result<(), AppError> {
     Ok(())
 }
 
+#[derive(Default)]
+struct ProxyReferences {
+    group_ids: Vec<String>,
+    bound_account_count: i64,
+}
+
+fn with_references(mut proxy: Value, references: ProxyReferences) -> Value {
+    proxy["group_ids"] = serde_json::json!(references.group_ids);
+    proxy["bound_account_count"] = serde_json::json!(references.bound_account_count);
+    proxy
+}
+
 impl Database {
+    async fn network_proxy_references(
+        &self,
+        external: &str,
+        id: Option<Uuid>,
+    ) -> Result<HashMap<String, ProxyReferences>, AppError> {
+        let rows = sqlx::query(
+            "WITH proxies AS (
+                SELECT p.id, p.tenant_id FROM network_proxies p
+                JOIN tenants t ON t.id = p.tenant_id
+                WHERE t.external_id = $1 AND (CAST($2 AS TEXT) IS NULL OR p.id = $2)
+             ), memberships AS (
+                SELECT p.id AS proxy_id, p.tenant_id, m.group_id
+                FROM proxies p
+                JOIN network_proxy_group_members m ON m.proxy_id = p.id
+                JOIN transport_proxy_groups g ON g.id = m.group_id AND g.tenant_id = p.tenant_id
+             ), bound_accounts AS (
+                SELECT m.proxy_id, b.account_id FROM memberships m
+                JOIN transport_proxy_bindings b ON b.group_id = m.group_id
+                JOIN upstream_accounts a ON a.id = b.account_id AND a.tenant_id = m.tenant_id
+                UNION
+                SELECT p.id AS proxy_id, b.account_id FROM proxies p
+                JOIN network_proxy_selection_policies s
+                  ON s.proxy_id = p.id AND s.tenant_id = p.tenant_id AND s.mode = 'manual'
+                JOIN transport_proxy_bindings b ON b.account_id = s.account_id
+                JOIN upstream_accounts a ON a.id = b.account_id AND a.tenant_id = p.tenant_id
+             ), counts AS (
+                SELECT proxy_id, COUNT(*) AS bound_account_count
+                FROM bound_accounts GROUP BY proxy_id
+             )
+             SELECT p.id AS proxy_id, m.group_id,
+                    COALESCE(c.bound_account_count, CAST(0 AS BIGINT)) AS bound_account_count
+             FROM proxies p
+             LEFT JOIN memberships m ON m.proxy_id = p.id
+             LEFT JOIN counts c ON c.proxy_id = p.id
+             ORDER BY p.id, m.group_id",
+        )
+        .bind(external)
+        .bind(id.map(|id| id.to_string()))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut references = HashMap::<String, ProxyReferences>::new();
+        for row in rows {
+            let reference = references.entry(row.try_get("proxy_id")?).or_default();
+            reference.bound_account_count = row.try_get("bound_account_count")?;
+            if let Some(group_id) = row.try_get::<Option<String>, _>("group_id")? {
+                reference.group_ids.push(group_id);
+            }
+        }
+        Ok(references)
+    }
+
     pub(crate) async fn list_network_proxies(
         &self,
         external: &str,
@@ -117,10 +181,17 @@ impl Database {
         normalize_legacy_members(&self.pool, key).await?;
         let rows = sqlx::query("SELECT p.* FROM network_proxies p JOIN tenants t ON t.id = p.tenant_id WHERE t.external_id = $1 ORDER BY p.name, p.id")
             .bind(external).fetch_all(&self.pool).await?;
+        let mut references = self.network_proxy_references(external, None).await?;
         let items = rows
             .iter()
-            .map(|row| proxy_view(row, external, key))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(|row| {
+                let id: String = row.try_get("id")?;
+                Ok(with_references(
+                    proxy_view(row, external, key)?,
+                    references.remove(&id).unwrap_or_default(),
+                ))
+            })
+            .collect::<Result<Vec<_>, AppError>>()?;
         Ok(serde_json::json!({"items": items}))
     }
 
@@ -133,14 +204,11 @@ impl Database {
         normalize_legacy_members(&self.pool, key).await?;
         let row = sqlx::query("SELECT p.* FROM network_proxies p JOIN tenants t ON t.id = p.tenant_id WHERE p.id = $1 AND t.external_id = $2")
             .bind(id.to_string()).bind(external).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;
-        let mut result = proxy_view(&row, external, key)?;
-        let groups: Vec<String> = sqlx::query_scalar("SELECT group_id FROM network_proxy_group_members WHERE proxy_id = $1 ORDER BY group_id")
-            .bind(id.to_string()).fetch_all(&self.pool).await?;
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_bindings b WHERE EXISTS (SELECT 1 FROM network_proxy_group_members m WHERE m.group_id = b.group_id AND m.proxy_id = $1) OR EXISTS (SELECT 1 FROM network_proxy_selection_policies p WHERE p.account_id = b.account_id AND p.mode = 'manual' AND p.proxy_id = $1)")
-            .bind(id.to_string()).fetch_one(&self.pool).await?;
-        result["group_ids"] = serde_json::json!(groups);
-        result["bound_account_count"] = serde_json::json!(count);
-        Ok(result)
+        let mut references = self.network_proxy_references(external, Some(id)).await?;
+        Ok(with_references(
+            proxy_view(&row, external, key)?,
+            references.remove(&id.to_string()).unwrap_or_default(),
+        ))
     }
 
     pub(crate) async fn create_network_proxy(

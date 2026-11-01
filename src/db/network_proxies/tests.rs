@@ -29,6 +29,9 @@ async fn contract(database: &Database) {
     assert!(!proxy.to_string().contains("password"));
     assert!(!proxy.to_string().contains("user:"));
     assert_eq!(proxy["probe"]["target_url"], "https://openai.com/");
+    assert_eq!(proxy["group_ids"], serde_json::json!([]));
+    assert_eq!(proxy["bound_account_count"], 0);
+    assert_list_references(database, &external).await;
     assert!(matches!(
         database.get_network_proxy(id, "other-tenant", KEY).await,
         Err(AppError::NotFound)
@@ -126,6 +129,15 @@ async fn contract(database: &Database) {
         .await
         .unwrap();
     let runtime = TransportProxyGroups::parse("[]", KEY).unwrap();
+    assert_list_references(database, &external).await;
+    let grouped = database
+        .get_network_proxy(id, &external, KEY)
+        .await
+        .unwrap();
+    let mut groups = vec![group_id.to_string(), shared_group_id.to_string()];
+    groups.sort();
+    assert_eq!(grouped["group_ids"], serde_json::json!(groups));
+    assert_eq!(grouped["bound_account_count"], 1);
     runtime
         .synchronize_managed_for_test(&database.pool)
         .await
@@ -251,6 +263,7 @@ async fn contract(database: &Database) {
             .unwrap()["bound_account_count"],
         1
     );
+    reference_contract(database, &external, id, account.id, group_id).await;
     let observations = database
         .network_proxy_observations(id, &external, 1, 2, KEY)
         .await
@@ -413,6 +426,111 @@ async fn contract(database: &Database) {
     assert_eq!(state["applied"]["selected_proxy_id"], id.to_string());
     signal_contract(database, id, account.id, &external).await;
     legacy_contract(database, &external).await;
+}
+
+async fn assert_list_references(database: &Database, external: &str) {
+    let listed = database.list_network_proxies(external, KEY).await.unwrap();
+    for item in listed["items"].as_array().unwrap() {
+        let id = parse_uuid(item["id"].as_str().unwrap().to_owned()).unwrap();
+        let individual = database.get_network_proxy(id, external, KEY).await.unwrap();
+        assert!(item["group_ids"].is_array());
+        assert!(item["bound_account_count"].is_i64());
+        assert_eq!(item, &individual);
+    }
+}
+
+async fn reference_contract(
+    database: &Database,
+    external: &str,
+    proxy: Uuid,
+    account: Uuid,
+    group: Uuid,
+) {
+    assert_list_references(database, external).await;
+    sqlx::query("UPDATE transport_proxy_bindings SET group_id = $1 WHERE account_id = $2")
+        .bind(group.to_string())
+        .bind(account.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        database
+            .get_network_proxy(proxy, external, KEY)
+            .await
+            .unwrap()["bound_account_count"],
+        1
+    );
+    assert_list_references(database, external).await;
+    sqlx::query("UPDATE transport_proxy_bindings SET group_id = NULL WHERE account_id = $1")
+        .bind(account.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let unused = database
+        .create_network_proxy(
+            CreateProxy {
+                tenant_external_id: external.into(),
+                name: "Unbound".into(),
+                proxy_url: PRIMARY.into(),
+                probe: ProxyProbe {
+                    enabled: false,
+                    ..Default::default()
+                },
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unused["group_ids"], serde_json::json!([]));
+    assert_eq!(unused["bound_account_count"], 0);
+    let other = format!("other-{}", Uuid::now_v7());
+    database.create_tenant(&other, None).await.unwrap();
+    let foreign_group = database
+        .create_transport_group(
+            serde_json::from_value(serde_json::json!({
+                "tenant_external_id":other, "name":"Other tenant",
+                "members":[{"label":"Other", "proxy_url":PRIMARY}]
+            }))
+            .unwrap(),
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO network_proxy_group_members (group_id, proxy_id, position) VALUES ($1, $2, 1)",
+    )
+    .bind(foreign_group["id"].as_str().unwrap())
+    .bind(proxy.to_string())
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    let own = database
+        .get_network_proxy(proxy, external, KEY)
+        .await
+        .unwrap();
+    assert_eq!(own["group_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(own["bound_account_count"], 1);
+    assert_list_references(database, external).await;
+    assert_list_references(database, &other).await;
+    let own_list = database.list_network_proxies(external, KEY).await.unwrap();
+    assert_eq!(own_list["items"].as_array().unwrap().len(), 2);
+    let other_list = database.list_network_proxies(&other, KEY).await.unwrap();
+    assert_eq!(other_list["items"].as_array().unwrap().len(), 1);
+    assert_ne!(other_list["items"][0]["id"], proxy.to_string());
+    assert_eq!(other_list["items"][0]["bound_account_count"], 0);
+    sqlx::query("DELETE FROM network_proxy_group_members WHERE group_id = $1 AND proxy_id = $2")
+        .bind(foreign_group["id"].as_str().unwrap())
+        .bind(proxy.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let missing = database
+        .list_network_proxies("missing-tenant", KEY)
+        .await
+        .unwrap();
+    assert_eq!(missing["items"], serde_json::json!([]));
 }
 
 async fn signal_contract(database: &Database, proxy: Uuid, account: Uuid, external: &str) {
