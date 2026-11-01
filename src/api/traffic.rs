@@ -570,10 +570,12 @@ pub(super) async fn normalize_component_provider(
     status: u16,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<NormalizedProviderResponse, AppError> {
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
+        let _memory = memory;
         plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
     })
     .await?

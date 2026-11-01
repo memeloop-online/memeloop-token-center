@@ -10,17 +10,33 @@ use crate::{
 use rust_decimal::Decimal;
 use serde_json::json;
 use std::sync::Arc;
+use tracing::instrument::WithSubscriber;
+use tracing_subscriber::layer::SubscriberExt;
 use wit_component::{ComponentEncoder, StringEncoding, embed_component_metadata};
 use wit_parser::Resolve;
 
 async fn fixture(post_auth: Option<&str>) -> (tempfile::TempDir, AppState, AuthenticatedKey) {
+    fixture_with_normalize_log(post_auth, false).await
+}
+
+async fn fixture_with_normalize_log(
+    post_auth: Option<&str>,
+    normalize_log: bool,
+) -> (tempfile::TempDir, AppState, AuthenticatedKey) {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("plugins");
     let package = root.join("example-policy-rewrite");
     std::fs::create_dir_all(&package).unwrap();
+    let mut manifest: Value = serde_json::from_str(include_str!(
+        "../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.json"
+    ))
+    .unwrap();
+    if normalize_log {
+        manifest["capabilities"] = json!([{"kind":"log"}]);
+    }
     std::fs::write(
         package.join("plugin.json"),
-        include_str!("../../../.plugin-examples/examples/plugins/policy-rewrite/plugin.json"),
+        serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
     let mut source =
@@ -30,6 +46,13 @@ async fn fixture(post_auth: Option<&str>) -> (tempfile::TempDir, AppState, Authe
         let (prefix, remaining) = source.split_once(";; BEGIN POST-AUTH BODY").unwrap();
         let (_, suffix) = remaining.split_once(";; END POST-AUTH BODY").unwrap();
         source = format!("{prefix}{body}{suffix}");
+    }
+    if normalize_log {
+        source = source.replace(
+            ";; BEGIN NORMALIZE BODY",
+            ";; BEGIN NORMALIZE BODY
+             i32.const 0 i32.const 0 i32.const 0 i32.const 0 call $log",
+        );
     }
     let mut module = wat::parse_str(source).unwrap();
     let mut resolve = Resolve::default();
@@ -170,6 +193,8 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
         serde_json::from_slice::<Value>(&prepared.body).unwrap(),
         json!({"prompt":"from-component", "model":"vendor-model"})
     );
+    let memory = state.proxy_memory_budget.reservation();
+    let owner = Arc::downgrade(&memory);
     let normalized = normalize_component_provider(
         &state,
         "example-oauth-http",
@@ -177,9 +202,11 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
         207,
         BTreeMap::from([("content-type".into(), "application/vnd.vendor+json".into())]),
         vec![b'x'; 1024 * 1024],
+        memory,
     )
     .await
     .unwrap();
+    assert!(owner.upgrade().is_none());
     assert_eq!(normalized.status, 200);
     assert_eq!(normalized.headers["content-type"], "application/json");
     assert_eq!(normalized.input_tokens, 7);
@@ -196,6 +223,101 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
     assert_eq!(state.proxy_memory_budget.snapshot().0, 1024 * 1024);
     drop(held);
     assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+}
+
+struct NormalizeLogGate {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl<Subscriber: tracing::Subscriber> tracing_subscriber::Layer<Subscriber> for NormalizeLogGate {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _context: tracing_subscriber::layer::Context<'_, Subscriber>,
+    ) {
+        if event.metadata().target() == "memeloop_token_center::plugin"
+            && event.metadata().fields().field("decision_code").is_some()
+            && let Some(entered) = self.entered.lock().unwrap().take()
+        {
+            entered.send(()).unwrap();
+            self.release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .expect("test releases the real normalize guest hostcall");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_caller_abort() {
+    let (_directory, state, key) = fixture_with_normalize_log(None, true).await;
+    for cancel in [false, true] {
+        let memory = state.proxy_memory_budget.reservation();
+        assert!(memory.try_grow(64 * 1024, 1));
+        assert!(memory.reserve_buffered_response(64 * 1024, tokio::time::Instant::now()));
+        let owner = Arc::downgrade(&memory);
+        let admitted = state.proxy_memory_budget.snapshot().0;
+        let context = RequestContext {
+            tenant_id: key.tenant_id.to_string(),
+            principal_id: key.principal_id.to_string(),
+            key_id: key.key_id.to_string(),
+            protocol: "openai".into(),
+            model: "example-rewritten".into(),
+            config_json: "{}".into(),
+        };
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let subscriber = tracing_subscriber::registry().with(NormalizeLogGate {
+            entered: std::sync::Mutex::new(Some(entered)),
+            release: std::sync::Mutex::new(blocked),
+        });
+        let invocation_state = state.clone();
+        let mut caller = Some(tokio::spawn(
+            async move {
+                normalize_component_provider(
+                    &invocation_state,
+                    "example-oauth-http",
+                    context,
+                    200,
+                    BTreeMap::new(),
+                    vec![b'x'; 64 * 1024],
+                    memory,
+                )
+                .await
+            }
+            .with_subscriber(subscriber),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .expect("real normalize guest enters its log hostcall")
+            .unwrap();
+        if cancel {
+            let caller = caller.take().unwrap();
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+        }
+        assert!(owner.upgrade().is_some());
+        assert_eq!(state.proxy_memory_budget.snapshot().0, admitted);
+        let replacement = state.proxy_memory_budget.reservation();
+        assert!(!replacement.try_grow(1024 * 1024, 1));
+        release.send(()).unwrap();
+        if let Some(caller) = caller {
+            assert_eq!(caller.await.unwrap().unwrap().status, 200);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("exited normalize guest releases the existing owner");
+        assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+        assert!(replacement.try_grow(1024 * 1024, 1));
+        drop(replacement);
+        assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+    }
 }
 
 #[tokio::test]
