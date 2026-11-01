@@ -380,6 +380,37 @@ async function disconnectChat(url: string, key: string, bytes: number): Promise<
 async function oversizeChat(url: string, key: string, bytes: number): Promise<[number, number, string | undefined]> { const target = new URL("/v1/chat/completions", url); const body = Buffer.from(JSON.stringify(chatPayload("oversize", bytes))); return await new Promise((resolveResponse) => { let status = 0; let received = 0; let settled = false; const finish = (error?: unknown): void => { if (settled) return; settled = true; resolveResponse([status, received, error === undefined ? undefined : error instanceof Error ? error.name : String(error)]); }; const request = requestForURL(target, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json", "content-length": body.length, connection: "close" } }, (response) => { status = response.statusCode ?? 0; void (async () => { try { for await (const raw of response) received += Buffer.byteLength(raw); finish(); } catch (error) { finish(error); } })(); }); request.setTimeout(180_000, () => request.destroy(new HarnessFailure("oversize chat timed out after 180000 ms"))); request.once("error", finish); request.end(body); }); }
 async function waitForRequestErrors(url: string, key: string, errorCode: string, minimum: number): Promise<number> { const deadline = performance.now() + 20_000; while (performance.now() < deadline) { const values = await apiJson(url, "GET", `/self/v1/requests?${new URLSearchParams({ status: "error", error_code: errorCode, limit: "100" })}`, key); if (Array.isArray(values) && values.length >= minimum) return values.length; await delay(200); } return 0; }
 
+export async function waitForPriorArchivePhase(databasePath: string, gateway: string, token: string): Promise<Obj> {
+  const reader = new DatabaseSync(databasePath, { readOnly: true, timeout: 1000 });
+  const started = performance.now();
+  const required = {
+    archive_workers: 'memeloop_token_center_background_work_items{queue="proxy_archive_streams",state="active"}',
+    deferred_jobs: 'memeloop_token_center_deferred_persistence_jobs',
+    request_jobs: 'memeloop_token_center_request_persistence_jobs',
+    lifecycles: 'memeloop_token_center_background_work_items{queue="proxy_lifecycles",state="active"}',
+  };
+  let last: Obj = {};
+  try {
+    while (performance.now() - started < 120_000) {
+      const pending = Number((reader.prepare("SELECT COUNT(*) AS pending FROM conversation_projection_outbox WHERE projected_at IS NULL").get() as Obj).pending);
+      const metrics = await apiRequest(gateway, "GET", "/metrics", token, undefined, 2000);
+      if (metrics.status !== 200) throw new HarnessFailure("prior archive phase metrics unavailable");
+      const lines = metrics.body.toString("utf8").split("\n");
+      const gauges = Object.fromEntries(Object.entries(required).map(([name, prefix]) => {
+        const line = lines.find((line) => line.startsWith(`${prefix} `));
+        if (!line) throw new HarnessFailure(`prior archive phase gauge absent: ${name}`);
+        const value = Number(line.slice(prefix.length + 1));
+        if (!Number.isFinite(value) || value < 0) throw new HarnessFailure(`invalid prior archive phase gauge: ${name}`);
+        return [name, value];
+      }));
+      last = { pending_projections: pending, gauges, wait_ms: round(performance.now() - started) };
+      if (pending === 0 && Object.values(gauges).every((value) => value === 0)) return last;
+      await delay(100);
+    }
+    throw new HarnessFailure(`prior archive phase did not drain: ${JSON.stringify(last)}`);
+  } finally { reader.close(); }
+}
+
 function walkFiles(root: string, current = root): string[] { return readdirSync(current, { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? walkFiles(root, resolve(current, entry.name)) : [resolve(current, entry.name)]); }
 function archiveInventory(root: string): Record<string, number> {
   const inventory: Record<string, number> = {};
@@ -463,8 +494,9 @@ export async function execute(args: Arguments): Promise<[number, Obj]> {
     const responsesImage = await runSynchronousImages(urls.gateway!, key, children.gateway!.pid!, responsesImageBaseline.rss_mib_median, { name: "codex-responses-tool", model: "benchmark-responses-image", results: 1, upstreamRequests: () => state.responsesToolImageRequests }); responsesImage.gateway_phase_start = responsesImageBaseline;
     const disconnectAttempts = Math.max(2, Math.min(4, values.concurrency)); const disconnect = await withSampler({ gateway: children.gateway!.pid! }, async (sampler) => { const disconnected = await Promise.all(Array.from({ length: disconnectAttempts }, () => disconnectChat(urls.gateway!, key, 16 * MIB))); const errors = await waitForRequestErrors(urls.gateway!, key, "client_cancelled", disconnectAttempts); return { attempts: disconnectAttempts, client_bytes_before_close: disconnected.reduce((a, b) => a + b, 0), recorded_client_cancelled_errors: errors, gateway_peak_rss_mib: round(sampler.maxCurrentRss("gateway")), gateway_lifetime_high_water: sampler.lifetimeHighWaterEvidence("gateway"), sample_count: sampler.samples.length }; });
     const responseLimit = await withSampler({ gateway: children.gateway!.pid! }, async (sampler) => { const [status, received, clientError] = await oversizeChat(urls.gateway!, key, RESPONSE_LIMIT_BYTES + MIB); const errors = await waitForRequestErrors(urls.gateway!, key, "upstream_response_too_large", 1); return { upstream_bytes: RESPONSE_LIMIT_BYTES + MIB, configured_limit_bytes: RESPONSE_LIMIT_BYTES, http_status_before_stream_abort: status, client_bytes_received: received, client_error: clientError, recorded_upstream_response_too_large_errors: errors, gateway_peak_rss_mib: round(sampler.maxCurrentRss("gateway")), gateway_lifetime_high_water: sampler.lifetimeHighWaterEvidence("gateway"), sample_count: sampler.samples.length }; });
+    const priorArchiveDrain = await waitForPriorArchivePhase(database, urls.gateway!, serviceToken);
     const preCooldown = processMemory(children.gateway!.pid!); await delay(2000); const phaseSummary = await memorySummary(children.gateway!.pid!); const phaseStart: Obj = { pre_cooldown_rss_mib: round(preCooldown.rss_mib), cooldown_seconds: 2, sample_duration_seconds: 1, sample_interval_seconds: 0.1, ...phaseSummary };
-    const asset = await runAsset(urls.gateway!, key, values.asset_mib, { gateway: children.gateway!.pid!, worker: children.worker!.pid! }, archiveRoot); asset.gateway_phase_start = phaseStart; Object.assign(asset, assetGatewayRssEvidence(asset.gateway_peak_rss_mib, phaseSummary.rss_mib_median, idleGateway)); asset.gateway_delta_rss_mib = asset.gateway_cumulative_delta_from_original_idle_mib; asset.worker_delta_rss_mib = round(asset.worker_peak_rss_mib - idleWorker);
+    const asset = await runAsset(urls.gateway!, key, values.asset_mib, { gateway: children.gateway!.pid!, worker: children.worker!.pid! }, archiveRoot); asset.prior_archive_phase_drain = priorArchiveDrain; asset.gateway_phase_start = phaseStart; Object.assign(asset, assetGatewayRssEvidence(asset.gateway_peak_rss_mib, phaseSummary.rss_mib_median, idleGateway)); asset.gateway_delta_rss_mib = asset.gateway_cumulative_delta_from_original_idle_mib; asset.worker_delta_rss_mib = round(asset.worker_peak_rss_mib - idleWorker);
     const routeRecovery = await waitForTextRouteRecovery(() => smallChat(urls.gateway!, key));
     const preSoak = processMemory(children.gateway!.pid!).rss_mib as number; const soak = await runSoak(urls.gateway!, key, values.soak_seconds, Math.min(4, values.concurrency), args.targetRps, children.gateway!.pid!, () => ({ classification: readSoakFailureClassification(database, Date.now() - 60_000), diagnostic_log_tails: diagnosticLogTails(temporary) })); await delay(5000); const cooldown = await memorySummary(children.gateway!.pid!); soak.route_recovery_after_response_limit = routeRecovery; soak.pre_soak_gateway_rss_mib = round(preSoak); soak.cooldown_gateway_rss_mib = cooldown.rss_mib_median; soak.retained_delta_from_idle_mib = round(cooldown.rss_mib_median - idleGateway);
     const checks: Obj[] = [
