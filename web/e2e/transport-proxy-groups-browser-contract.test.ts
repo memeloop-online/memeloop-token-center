@@ -288,6 +288,8 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
   const origin = `http://127.0.0.1:${address.port}`;
   const browser = await chromium.launch({ headless: true });
   const errors: string[] = [];
+  const expectedReloadWarnings: string[] = [];
+  let reloadingFluentPage = false;
   let activePage: Page | undefined;
   context.afterEach(async child => {
     if (!activePage || activePage.isClosed()) return;
@@ -310,7 +312,16 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
     const page = await browser.newPage();
     activePage = page;
     page.on('pageerror', error => errors.push(`${page.url()}: ${error.message}`));
-    page.on('console', message => { if (message.type() === 'error') errors.push(`${page.url()}: ${message.text()} @ ${JSON.stringify(message.location())}`); });
+    page.on('console', message => {
+      if (message.type() !== 'error') return;
+      const text = `${page.url()}: ${message.text()} @ ${JSON.stringify(message.location())}`;
+      // keyborg 2.14.1 emits this only outside production when browser
+      // document teardown has already removed its refs. Keep the exception
+      // scoped to the one hard-reload step; every other runtime error fails.
+      if (reloadingFluentPage && /^Keyborg instance k\d+ is being disposed incorrectly\.$/.test(message.text())
+        && message.location().url.includes('@fluentui_react-components.js')) expectedReloadWarnings.push(text);
+      else errors.push(text);
+    });
     await page.route('**/*', route => {
       const url = new URL(route.request().url());
       return url.origin === origin && !url.pathname.startsWith('/internal/') ? route.continue() : route.abort();
@@ -454,10 +465,12 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       assert.equal(url.searchParams.get('tenant'), 'fixture');
       assert.equal(await page.getByRole('dialog').count(), 0);
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
+      reloadingFluentPage = true;
       await page.reload();
       await page.getByText(transportProxyGroupCopy('zh-CN').denied, { exact: true }).waitFor();
       await installFixture(page, true, 'zh-CN', 'policies');
       await workspace.getByText(/沿用旧版绑定，尚未设置新策略/).waitFor();
+      reloadingFluentPage = false;
       assert.equal(await workspace.getByLabel(fieldLabel('账号')).inputValue(), 'account-native');
       await page.goBack();
       await row.waitFor();
@@ -771,6 +784,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.close();
     });
     assert.doesNotMatch(errors.join('\n'), /privateProxySecret|fixture-user/);
+    assert.ok(expectedReloadWarnings.length <= 1, 'only the documented development-only keyborg teardown warning is tolerated');
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await server.close(); }
 });
