@@ -102,11 +102,11 @@ test('real route forms submit explicit model intent, preserve edit policies and 
       await page.getByLabel(/Public model/).fill('renamed-route');
       await page.getByRole('button', { name: 'Routing priority', exact: true }).click();
       const priority = page.getByRole('spinbutton', { name: 'Priority', exact: true });
+      const save = page.getByRole('region', { name: 'Edit saved-route', exact: true }).getByRole('button', { name: 'Save', exact: true });
       await priority.fill('7.5');
-      assert.equal(await page.getByRole('button', { name: 'Save', exact: true }).isDisabled(), true);
+      assert.equal(await save.isDisabled(), true);
       await priority.fill('7');
       assert.match(await page.locator('.model-combobox').innerText(), /trusted model metadata or a verified reservation bound/);
-      const save = page.getByRole('button', { name: 'Save', exact: true });
       assert.equal(await save.isEnabled(), true);
       if (confirmed) await capture(page, 'codex-unchanged-en-1440');
       await save.click();
