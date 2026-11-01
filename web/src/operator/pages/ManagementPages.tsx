@@ -1473,8 +1473,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       <div className="journey-actions"><p>{t('routes.description')}</p><Button appearance="primary" type="button" disabled={Boolean(busy) || !canSubmit(editing ? editForm : form, editing ? editCatalog.valid : formCatalog.valid)} onClick={() => void (editing ? saveEdit() : createRoute())}>{t(editing ? 'common.save' : 'routes.create')}</Button></div>
     </CreateJourney>
   </section><section className="routing-group-managers">
-    <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
-    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={credentialRouteOptions(routes.filter(canManage), scopedUpstreams, providers, locale)} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
+    <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: providerDisplayName(value.driver, providers, locale) }))} onChanged={providerGroups.load} />
+    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} accounts={scopedUpstreams.map(value => ({ value: value.id, label: value.name, description: providerDisplayName(value.driver, providers, locale) }))} routes={routes.filter(canManage)} providerGroups={providerGroups.groups} resources={credentialRouteOptions(routes.filter(canManage), scopedUpstreams, providers, locale)} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
   </section></>;
 }
 

@@ -5,6 +5,9 @@ import { api, ApiError } from '../api';
 import { localizeSchema, useI18n } from '../i18n';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator } from '../safeValidator';
+import { hasInvalidResources, resourceSelectorUiSchema, SchemaResourceSelector } from '../SchemaResourceSelector';
+import type { ComboboxOption } from './MultiCombobox';
+import './groupStrategy.css';
 import type { GroupView } from '../types';
 
 export interface GroupRoutingStrategyOption {
@@ -15,8 +18,8 @@ export interface GroupRoutingStrategyOption {
 }
 
 /** Parent keys by tenant, token, kind and group. Refresh never discards edits. */
-export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onSaved }: {
-  kind: 'provider' | 'route'; token: string; tenant: string; group: GroupView; onChanged: () => Promise<void>; onSaved?: (group: GroupView) => void;
+export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [], onChanged, onSaved }: {
+  kind: 'provider' | 'route'; token: string; tenant: string; group: GroupView; accounts?: ComboboxOption[]; onChanged: () => Promise<void>; onSaved?: (group: GroupView) => void;
 }) {
   const { locale, t } = useI18n();
   const [catalog, setCatalog] = useState<GroupRoutingStrategyOption[]>([]);
@@ -44,11 +47,14 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onS
     void api<GroupRoutingStrategyOption[]>('/internal/v1/plugins/group-routing-strategies', token,
       { signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) })
       .then(value => { if (!controller.signal.aborted) setCatalog(value.filter(item => item.version === 'group-routing-v1')); })
-      .catch(reason => { if (!controller.signal.aborted) setCatalogError(reason instanceof Error ? reason.message : t('common.requestFailed')); })
+      .catch(reason => { if (!controller.signal.aborted) setCatalogError(t('groups.strategyCatalogFailed')); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [token, reload]);
   const option = catalog.find(value => value.id === pluginId);
+  const schema = localizeSchema(option?.schema ?? { type: 'object', properties: {} }, locale);
+  const formContext = { resources: { 'group-accounts': accounts } };
+  const invalidResources = hasInvalidResources(schema, config, formContext);
   const validPriority = /^-?\d+$/.test(priority) && Number(priority) >= -2147483648 && Number(priority) <= 2147483647;
   async function refresh() {
     const query = new URLSearchParams({ tenant_external_id: tenant });
@@ -60,7 +66,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onS
     await onChanged();
   }
   async function save(formData: Record<string, unknown>) {
-    if (saving || !validPriority || needsRefresh || (pluginId && !option)) return;
+    if (saving || !token || !tenant || !validPriority || needsRefresh || (pluginId && (!option || loading || catalogError || hasInvalidResources(schema, formData, formContext)))) return;
     setSaving(true); setError(''); setMessage('');
     try {
       const saved = await api<GroupView>(`/internal/v1/${kind}-groups/${encodeURIComponent(group.id)}/routing-strategy`, token, {
@@ -70,14 +76,14 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onS
       });
       if (!mounted.current) return;
       setSnapshot(saved); onSaved?.(saved); setMessage(t('groups.strategySaved'));
-      await onChanged();
+      try { await onChanged(); } catch { if (mounted.current) setError(t('groups.strategyRefreshAfterSave')); }
     } catch (reason) {
       if (!mounted.current) return;
       if (reason instanceof ApiError && reason.status === 409) {
         setNeedsRefresh(true);
         try { await refresh(); if (mounted.current) setError(t('groups.strategyConflict')); }
         catch { if (mounted.current) setError(t('groups.strategyRefreshFailed')); }
-      } else setError(reason instanceof Error ? reason.message : t('common.requestFailed'));
+      } else setError(t('groups.strategySaveFailed'));
     } finally { if (mounted.current) setSaving(false); }
   }
   return <section className="form-panel group-strategy-editor" aria-label={t('groups.strategy')}>
@@ -93,18 +99,20 @@ export function GroupStrategyEditor({ kind, token, tenant, group, onChanged, onS
       catch { if (mounted.current) setError(t('groups.strategyRefreshFailed')); }
       finally { if (mounted.current) setSaving(false); }
     }}>{t('common.retry')}</button>}
-    <label>{t('groups.strategy')}<select disabled={saving} value={pluginId} onChange={event => { setPluginId(event.target.value); setConfig(catalog.find(value => value.id === event.target.value)?.default ?? {}); setMessage(''); }}>
+    <label>{t('groups.strategy')}<select disabled={saving || loading || Boolean(catalogError)} value={pluginId} onChange={event => { setPluginId(event.target.value); setConfig(catalog.find(value => value.id === event.target.value)?.default ?? {}); setMessage(''); }}>
       <option value="">{t('groups.strategyNative')}</option>
-      {pluginId && !option && <option value={pluginId} disabled>{pluginId} — {t('groups.strategyUnavailable')}</option>}
-      {catalog.map(value => <option key={value.id} value={value.id}>{value.id}</option>)}
+      {pluginId && !option && <option value={pluginId} disabled>{t('groups.strategyUnavailable')}</option>}
+      {catalog.map((value, index) => <option key={value.id} value={value.id}>{localizeSchema(value.schema, locale).title || t('groups.strategyUnnamed', { number: index + 1 })}</option>)}
     </select></label>
     {pluginId && !option && !loading && <p role="alert">{t('groups.strategyUnavailable')}</p>}
-    <label>{t('groups.strategyPriority')}<input type="number" step="1" min={-2147483648} max={2147483647} value={priority} disabled={saving} onChange={event => setPriority(event.target.value)} /></label>
+    {option && schema.description && <p className="field-hint">{schema.description}</p>}
+    <label>{t('groups.strategyPriority')}<input type="number" step="1" min={-2147483648} max={2147483647} value={priority} disabled={saving} onChange={event => { setPriority(event.target.value); setMessage(''); }} /></label>
     <p className="muted">{t('groups.strategyPriorityHelp')}</p>
-    {pluginId ? <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={localizeSchema(option?.schema ?? { type: 'object', properties: {} }, locale)}
+    {pluginId ? <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={{ ...schema, title: undefined, description: undefined }} uiSchema={resourceSelectorUiSchema(schema)}
+      fields={{ OrderedResources: SchemaResourceSelector }} formContext={formContext}
       formData={config} validator={safeValidator} templates={schemaFormTemplates} disabled={saving}
-      noHtml5Validate onChange={({ formData }) => setConfig(formData ?? {})} onSubmit={({ formData }) => void save(formData ?? {})}>
-      <button type="submit" disabled={saving || !token || !tenant || !validPriority || needsRefresh || Boolean(pluginId && (!option || loading || catalogError))}>{t('groups.strategySave')}</button>
+      noHtml5Validate onChange={({ formData }) => { setConfig(formData ?? {}); setMessage(''); }} onSubmit={({ formData }) => void save(formData ?? {})}>
+      <button type="submit" disabled={saving || !token || !tenant || !validPriority || invalidResources || needsRefresh || Boolean(pluginId && (!option || loading || catalogError))}>{t('groups.strategySave')}</button>
     </RjsfForm> : <button type="button" disabled={saving || !token || !tenant || !validPriority || needsRefresh} onClick={() => void save({})}>{t('groups.strategySave')}</button>}
   </section>;
 }

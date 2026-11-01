@@ -150,3 +150,68 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     assert.equal(await page.locator('.selection-chip-label').count(), 0);
   } finally { await browser.close(); await server.close(); }
 });
+
+test('localized resource strategy searches real group accounts, orders by keyboard, preserves failed saves and rejects removed members', { timeout: 45_000 }, async context => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    context.skip('Chromium not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    const writes: Record<string, any>[] = [];
+    let failCatalog = true;
+    await page.route('**/internal/v1/**', async route => {
+      if (route.request().url().endsWith('/plugins/group-routing-strategies')) {
+        if (failCatalog) { failCatalog = false; await route.fulfill({ status: 503, json: { error: { message: 'unavailable' } } }); return; }
+        await route.fulfill({ json: [{ id: 'arbitrary-plugin', version: 'group-routing-v1', default: { ordered: [] }, schema: {
+          type: 'object', title: 'Account preference', 'x-i18n': { 'zh-CN': { title: '优先使用指定账号' } }, properties: {
+            ordered: { type: 'array', title: 'Preferred order', 'x-i18n': { 'zh-CN': { title: '账号使用顺序' } }, items: { type: 'string' }, uniqueItems: true,
+              'x-resource-selector': { source: 'group-accounts', ordered: true } },
+          },
+        } }] });
+      } else if (route.request().method() === 'PUT') {
+        writes.push(route.request().postDataJSON());
+        await route.fulfill(writes.length === 1 ? { status: 503, json: { error: { message: 'unavailable' } } } : { json: {
+          id: 'group', name: 'Group', member_ids: ['alpha', 'beta', 'gamma'], member_count: 3, created_at: 1, updated_at: 2, strategy_version: 3,
+        } });
+      } else await route.fulfill({ json: [] });
+    });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/group-strategy.html?resources`);
+    await page.getByText('暂时无法加载策略。请重试，已填写的内容会保留。').waitFor();
+    await page.getByRole('button', { name: '重试', exact: true }).click();
+    const strategy = page.getByRole('combobox', { name: '组路由策略', exact: true });
+    await strategy.selectOption({ label: '优先使用指定账号' });
+    assert.equal(await strategy.locator('option').filter({ hasText: 'arbitrary-plugin' }).count(), 0);
+    const picker = page.getByRole('combobox', { name: '账号使用顺序', exact: true });
+    await picker.fill('outside');
+    assert.equal(await page.getByRole('option', { name: /Outside group/ }).count(), 0);
+    await picker.fill('Anthropic');
+    await picker.press('ArrowDown'); await picker.press('Enter');
+    await picker.fill('alpha');
+    await picker.press('ArrowDown'); await picker.press('Enter');
+    const rows = page.locator('.resource-selector-order li');
+    assert.match(await rows.nth(0).innerText(), /Beta account/);
+    await page.getByRole('button', { name: '提高 Alpha account 的优先级', exact: true }).focus();
+    await page.keyboard.press('Enter');
+    assert.match(await rows.nth(0).innerText(), /Alpha account/);
+    const save = page.getByRole('button', { name: '保存组策略', exact: true });
+    await save.click();
+    await page.getByText('暂时无法保存策略。请重试，已填写的内容会保留。').waitFor();
+    assert.equal(await rows.count(), 2);
+    assert.deepEqual(writes[0].routing_strategy.config, { ordered: ['alpha', 'beta'] });
+    await page.getByRole('button', { name: 'Remove Beta membership' }).click();
+    await page.getByText('请移除列表中已不可用的账号，再保存策略。').waitFor();
+    assert.equal(await save.isDisabled(), true);
+    await page.getByRole('button', { name: '移除 账号已不在可用成员中', exact: true }).click();
+    await save.click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[1].routing_strategy.config, { ordered: ['alpha'] });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+  } finally { await browser.close(); await server.close(); }
+});
