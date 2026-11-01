@@ -2,6 +2,8 @@ use super::*;
 use crate::conversation::ConversationHints;
 use crate::db::requests::conversations::prefix_storage::tests::{key, observe};
 
+mod history;
+
 async fn session(
     db: &Database,
     key: &crate::model::AuthenticatedKey,

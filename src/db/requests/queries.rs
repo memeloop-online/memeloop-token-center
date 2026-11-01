@@ -114,6 +114,16 @@ impl Database {
         after_event_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<RequestEventView>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return Ok(client
+                .events(
+                    self.history_scope(Some(tenant_external_id)).await?,
+                    after_event_at,
+                    after_event_id,
+                    limit.clamp(1, 500) as usize,
+                )
+                .await?);
+        }
         let after_event_id = after_event_id
             .map(|event_id| event_id.to_string())
             .unwrap_or_default();
@@ -136,6 +146,16 @@ impl Database {
         after_event_id: Option<Uuid>,
         limit: i64,
     ) -> Result<Vec<RequestEventView>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return Ok(client
+                .events(
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    after_event_at,
+                    after_event_id,
+                    limit.clamp(1, 500) as usize,
+                )
+                .await?);
+        }
         let after_event_id = after_event_id
             .map(|event_id| event_id.to_string())
             .unwrap_or_default();
@@ -149,6 +169,62 @@ impl Database {
         .fetch_all(&self.pool)
         .await?;
         request_event_views(rows)
+    }
+
+    pub(crate) async fn source_history_event(
+        &self,
+        event_id: Uuid,
+    ) -> Result<Option<RequestEventView>, AppError> {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(enriched_request_events_sql(
+            "SELECT e.* FROM request_events e WHERE e.event_id = $1",
+        )))
+        .bind(event_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        let Some(mut event) = request_event_views(rows)?.into_iter().next() else {
+            return Ok(None);
+        };
+        let row = sqlx::query("SELECT source, request_id, tenant_id, key_id, created_at FROM request_history_source_ids WHERE source IN ('native', 'generation') AND request_id = $1 AND key_id = $2 AND tenant_id = (SELECT tenant_id FROM request_events WHERE event_id = $3)")
+            .bind(event.request_id.to_string()).bind(event.key_id.to_string()).bind(event_id.to_string()).fetch_optional(&self.pool).await?;
+        if let Some(row) = row {
+            let identity = crate::request_history::HistoryIdentity {
+                source: row.try_get("source")?,
+                request_id: event.request_id,
+                tenant_id: parse_uuid(row.try_get("tenant_id")?)?,
+                key_id: event.key_id,
+                created_at: row.try_get("created_at")?,
+            };
+            if let Some(view) = self.request_history_view(&identity).await? {
+                event.created_at = Some(view.created_at);
+                event.completed_at = view.completed_at;
+                event.lifecycle_state = view.lifecycle_state;
+                event.upstream_model = view.upstream_model;
+                event.upstream_account_id = view.upstream_account_id;
+                event.route_id = view.route_id;
+                event.status_code = view.status_code;
+                event.duration_ms = view.duration_ms;
+                event.first_output_ms = view.first_output_ms;
+                event.generation_duration_ms = view.generation_duration_ms;
+                event.usage_basis = view.usage_basis;
+                event.compaction = view.compaction;
+                event.input_tokens = view.input_tokens;
+                event.output_tokens = view.output_tokens;
+                event.cached_input_tokens = view.cached_input_tokens;
+                event.cache_write_tokens = view.cache_write_tokens;
+                event.currency = view.currency;
+                event.cost = view.cost;
+                event.usage = view.usage;
+                event.billing = view.billing;
+                event.error_code = view.error_code;
+                event.terminal_cause_code = view.terminal_cause_code;
+                event.in_flight_stage = view.in_flight_stage;
+                event.supplier_error = view.supplier_error;
+                event.archive_state = view.archive_state;
+                event.session_context = view.session_context;
+                event.credential_identity = view.credential_identity;
+            }
+        }
+        Ok(Some(event))
     }
 
     pub async fn list_requests(
@@ -172,6 +248,11 @@ impl Database {
         filter: RequestListFilter,
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_request_list(&client, self.history_key_scope(key_id).await?, &filter)
+                .await;
+        }
         let query = build_request_list_query(RequestListScope::Key(key_id), &filter);
         self.fetch_request_list(query).await
     }
@@ -197,6 +278,15 @@ impl Database {
         filter: RequestListFilter,
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_request_list(
+                    &client,
+                    self.history_scope(Some(tenant_external_id)).await?,
+                    &filter,
+                )
+                .await;
+        }
         let query = build_request_list_query(RequestListScope::Tenant(tenant_external_id), &filter);
         self.fetch_request_list(query).await
     }
@@ -214,8 +304,25 @@ impl Database {
         filter: RequestListFilter,
     ) -> Result<Vec<RequestView>, AppError> {
         validate_request_filter(&filter)?;
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_request_list(
+                    &client,
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    &filter,
+                )
+                .await;
+        }
         let query = build_request_list_query(RequestListScope::Global, &filter);
         self.fetch_request_list(query).await
+    }
+
+    pub(crate) async fn source_history_list(
+        &self,
+        filter: &RequestListFilter,
+    ) -> Result<Vec<RequestView>, AppError> {
+        self.fetch_request_list(build_request_list_query(RequestListScope::Global, filter))
+            .await
     }
 
     async fn fetch_request_list(
@@ -249,7 +356,35 @@ impl Database {
         Ok(views)
     }
 
+    pub(crate) async fn request_history_view(
+        &self,
+        identity: &crate::request_history::HistoryIdentity,
+    ) -> Result<Option<RequestView>, AppError> {
+        let query = build_request_list_query_for_history(
+            RequestListScope::Global,
+            &RequestListFilter {
+                limit: 1,
+                ..RequestListFilter::default()
+            },
+            Some(identity),
+        );
+        Ok(self.fetch_request_list(query).await?.into_iter().next())
+    }
+
     pub async fn request_archive_refs(
+        &self,
+        key_id: Uuid,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_archive_refs(&client, self.history_key_scope(key_id).await?, request_id)
+                .await;
+        }
+        self.source_request_archive_refs(key_id, request_id).await
+    }
+
+    pub(crate) async fn source_request_archive_refs(
         &self,
         key_id: Uuid,
         request_id: Uuid,
@@ -287,6 +422,24 @@ impl Database {
         tenant_external_id: &str,
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_archive_refs(
+                    &client,
+                    self.history_scope(Some(tenant_external_id)).await?,
+                    request_id,
+                )
+                .await;
+        }
+        self.source_request_archive_refs_for_tenant(tenant_external_id, request_id)
+            .await
+    }
+
+    pub(crate) async fn source_request_archive_refs_for_tenant(
+        &self,
+        tenant_external_id: &str,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
         let request_id_string = request_id.to_string();
         let locator = self.request_record_locator(&request_id_string).await?;
         if let Some(locator) = locator {
@@ -310,7 +463,7 @@ impl Database {
                 )
                 .await?;
             let mut refs = self
-                .request_archive_refs(
+                .source_request_archive_refs(
                     parse_uuid(locator.key_id.clone())?,
                     parse_uuid(request_id_string.clone())?,
                 )
@@ -367,6 +520,22 @@ impl Database {
         &self,
         request_id: Uuid,
     ) -> Result<RequestArchiveRefs, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            return self
+                .history_archive_refs(
+                    &client,
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    request_id,
+                )
+                .await;
+        }
+        self.source_request_archive_refs_global(request_id).await
+    }
+
+    pub(crate) async fn source_request_archive_refs_global(
+        &self,
+        request_id: Uuid,
+    ) -> Result<RequestArchiveRefs, AppError> {
         let request_id = request_id.to_string();
         if let Some(locator) = self.request_record_locator(&request_id).await? {
             let row = sqlx::query(
@@ -383,7 +552,7 @@ impl Database {
                 .historical_credential_identity(&locator.tenant_id, &locator.key_id, None)
                 .await?;
             let mut refs = self
-                .request_archive_refs(
+                .source_request_archive_refs(
                     parse_uuid(locator.key_id.clone())?,
                     parse_uuid(request_id.clone())?,
                 )
@@ -587,6 +756,14 @@ fn build_request_list_query(
     scope: RequestListScope<'_>,
     filter: &RequestListFilter,
 ) -> PortableRequestListQuery {
+    build_request_list_query_for_history(scope, filter, None)
+}
+
+fn build_request_list_query_for_history(
+    scope: RequestListScope<'_>,
+    filter: &RequestListFilter,
+    identity: Option<&crate::request_history::HistoryIdentity>,
+) -> PortableRequestListQuery {
     let maximum = if matches!(scope, RequestListScope::Key(_)) {
         100
     } else {
@@ -601,6 +778,7 @@ fn build_request_list_query(
     push_identity_filter_joins(&mut query, "r", filter);
     query.push(" WHERE 1 = 1");
     push_request_record_filters(&mut query, scope, filter);
+    push_history_identity(&mut query, identity, "native", "r.id");
     query.push(" ORDER BY r.created_at DESC, r.id DESC LIMIT ");
     query.bind_i64(page_limit);
     query.push(" OFFSET 0) r LEFT JOIN proxy_operational_terminals op ON op.request_id = r.id AND op.request_created_at = r.created_at AND op.tenant_id = r.tenant_id AND op.key_id = r.key_id AND op.reservation_id = r.reservation_id LEFT JOIN pending_proxy_settlements financial ON financial.request_id = r.id AND financial.tenant_id = r.tenant_id AND financial.key_id = r.key_id AND financial.reservation_id = r.reservation_id");
@@ -620,6 +798,7 @@ fn build_request_list_query(
         push_identity_filter_joins(&mut query, "g", filter);
         query.push(" WHERE 1 = 1");
         push_generation_job_filters(&mut query, scope, filter);
+        push_history_identity(&mut query, identity, "generation", "g.id");
         query.push(" ORDER BY g.created_at DESC, g.id DESC LIMIT ");
         query.bind_i64(page_limit);
         query.push(" OFFSET 0) g LEFT JOIN generation_stats_facts facts ON facts.job_id = g.id AND facts.tenant_id = g.tenant_id AND facts.key_id = g.key_id");
@@ -636,6 +815,7 @@ fn build_request_list_query(
         push_identity_filter_joins(&mut query, "u", filter);
         query.push(" WHERE 1 = 1");
         push_archive_request_filters(&mut query, scope, filter);
+        push_history_identity(&mut query, identity, "archive", "u.archive_request_id");
         push_identity_eligibility(&mut query, scope, "u");
         query.push(" ORDER BY u.source_started_at DESC, u.archive_request_id DESC LIMIT ");
         query.bind_i64(page_limit);
@@ -647,6 +827,22 @@ fn build_request_list_query(
     query.push(") AS all_requests ORDER BY created_at DESC, id DESC LIMIT ");
     query.bind_i64(page_limit);
     query
+}
+
+fn push_history_identity(
+    query: &mut PortableRequestListQuery,
+    identity: Option<&crate::request_history::HistoryIdentity>,
+    source: &str,
+    column: &str,
+) {
+    if let Some(identity) = identity {
+        if identity.source != source {
+            query.push(" AND 1 = 0");
+        } else {
+            query.push(&format!(" AND {column} = "));
+            query.bind_text(identity.request_id.to_string());
+        }
+    }
 }
 
 fn push_identity_projection(

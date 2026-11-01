@@ -5,7 +5,7 @@ use serde::{
 
 const MAX_INLINE_JSON_BYTES: usize = 2048;
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupplierError {
     pub code: String,
     pub message: String,

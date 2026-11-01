@@ -270,6 +270,44 @@ impl Database {
         tenant_external_id: &str,
         filter: UpstreamAccountAvailabilityFilter,
     ) -> Result<UpstreamAccountAvailabilityWindow, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let range = validate_range_with_limits(filter, false)?;
+            let mut metrics = client
+                .account_availability(crate::request_history::HistoryQuery {
+                    scope: self.history_scope(Some(tenant_external_id)).await?,
+                    from_created_at: Some(range.from_created_at),
+                    to_created_at: Some(range.to_created_at),
+                    cursor: None,
+                    limit: 500,
+                    predicates: vec![],
+                })
+                .await?;
+            let ids:Vec<String>=sqlx::query_scalar("SELECT a.id FROM upstream_accounts a JOIN tenants t ON t.id=a.tenant_id WHERE t.external_id=$1 ORDER BY a.id")
+                .bind(tenant_external_id).fetch_all(&self.pool).await?;
+            let accounts = ids
+                .into_iter()
+                .map(|upstream_account_id| {
+                    let (metrics, terminal_outcomes) =
+                        metrics.remove(&upstream_account_id).unwrap_or_default();
+                    UpstreamAccountAvailability {
+                        upstream_account_id,
+                        metrics,
+                        terminal_outcomes,
+                    }
+                })
+                .collect();
+            return Ok(UpstreamAccountAvailabilityWindow {
+                contract_version: "upstream_account_availability_v1".into(),
+                generated_at: unix_millis(),
+                tenant_external_id: tenant_external_id.into(),
+                from_created_at: range.from_created_at,
+                to_created_at: range.to_created_at,
+                granularity: range.granularity.as_str().into(),
+                latency_is_approximate: true,
+                latency_method: "fixed_histogram_upper_bound_capped_60000ms".into(),
+                accounts,
+            });
+        }
         let range = validate_range(filter)?;
         let plan = BucketPlan::new(
             range.from_created_at,
@@ -365,6 +403,13 @@ impl Database {
 fn validate_range(
     filter: UpstreamAccountAvailabilityFilter,
 ) -> Result<AvailabilityRange, AppError> {
+    validate_range_with_limits(filter, true)
+}
+
+fn validate_range_with_limits(
+    filter: UpstreamAccountAvailabilityFilter,
+    bounded: bool,
+) -> Result<AvailabilityRange, AppError> {
     if filter.from_created_at < 0
         || filter.to_created_at < 0
         || filter.from_created_at > filter.to_created_at
@@ -374,7 +419,7 @@ fn validate_range(
         ));
     }
     let width = filter.to_created_at.saturating_sub(filter.from_created_at);
-    if width > MAX_STATS_RANGE_MILLIS {
+    if bounded && width > MAX_STATS_RANGE_MILLIS {
         return Err(AppError::BadRequest(
             "upstream availability window must not exceed 93 days".into(),
         ));
