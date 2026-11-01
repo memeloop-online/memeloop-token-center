@@ -1979,6 +1979,7 @@ async fn buffered_settlement_enqueues_while_conversation_content_is_locked() {
     let (response_presealed, release_response_preseal) =
         crate::response_archive_spool::pause_next_request_preseal_for_test(request_id);
     let finish_database = database.clone();
+    let expected_request_json = request_json.clone();
     let mut finish = tokio::spawn(async move {
         use crate::response_archive_spool::{BufferedArchive, BufferedArchivePurpose};
         let body = bytes::Bytes::from_static(b"buffered response");
@@ -2087,7 +2088,7 @@ async fn buffered_settlement_enqueues_while_conversation_content_is_locked() {
     .unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&queued_request).unwrap(),
-        request_json
+        expected_request_json
     );
 }
 
