@@ -24,6 +24,9 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       await page.goto(`${origin}/e2e/fixtures/request-egress.html`);
+      await page.getByRole('tab', { name: locale === 'zh-CN' ? '代理组' : 'Proxy groups', exact: true }).evaluate((tab: HTMLElement) => tab.click());
+      await page.waitForFunction(() => document.querySelector('.proxy-groups-page [role="tab"][value="groups"]')?.getAttribute('aria-selected') === 'true');
+      await page.getByRole('button', { name: locale === 'zh-CN' ? '新建代理组' : 'Create proxy group', exact: true }).waitFor();
       await page.getByText('Current exit · socks5h://current.proxy.test:1080', { exact: true }).waitFor();
       const summary = page.getByRole('region', { name: copy.title, exact: true });
       await summary.locator('[data-egress-summary]').first().waitFor();
@@ -140,7 +143,7 @@ test('request list exit lines render only real recorded exits with exact text an
       };
       const proxyLine = row('model-c').locator('.request-egress-line');
       await proxyLine.waitFor();
-      assert.equal(await proxyLine.innerText(), 'edge-01 · socks5h://192.0.2.10:1080');
+      assert.equal(await proxyLine.innerText(), 'edge-01');
       assert.equal(await proxyLine.getAttribute('data-egress'), 'proxy');
       const directLine = row('model-d').locator('.request-egress-line');
       assert.equal(await directLine.innerText(), zh ? '直连' : 'Direct');

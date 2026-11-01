@@ -170,6 +170,114 @@ async fn projection_contract(database: &Database) {
     assert_eq!(summary.response_payload_bytes, None);
 }
 
+async fn tenant_summary_contract(database: &Database) {
+    let external = format!("egress-query-{}", Uuid::now_v7());
+    let other = format!("egress-other-{}", Uuid::now_v7());
+    database.create_tenant(&external, None).await.unwrap();
+    database.create_tenant(&other, None).await.unwrap();
+    let tenant: String = sqlx::query_scalar("SELECT id FROM tenants WHERE external_id = $1")
+        .bind(&external)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let other_tenant: String = sqlx::query_scalar("SELECT id FROM tenants WHERE external_id = $1")
+        .bind(&other)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+    let prefix = Uuid::now_v7().to_string();
+    sqlx::query("WITH RECURSIVE numbered(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM numbered WHERE value < 20000) INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) SELECT $1 || CAST(value AS TEXT), 0, $2, 'egress-query-fixture' FROM numbered")
+        .bind(&prefix).bind(&tenant).execute(&database.pool).await.unwrap();
+    let start = unix_millis();
+    let mut included = attempt();
+    included.observed_at = start;
+    included.request_payload_bytes = Some(42);
+    let mut excluded = included.clone();
+    excluded.request_id = Uuid::now_v7();
+    excluded.request_payload_bytes = Some(777);
+    let mut boundary = included.clone();
+    boundary.request_id = Uuid::now_v7();
+    boundary.observed_at = start + 1;
+    for (attempt, owner) in [
+        (&included, &tenant),
+        (&excluded, &other_tenant),
+        (&boundary, &tenant),
+    ] {
+        sqlx::query("INSERT INTO request_record_locators (id, created_at, tenant_id, key_id) VALUES ($1,0,$2,'egress-query-fixture')")
+            .bind(attempt.request_id.to_string()).bind(owner).execute(&database.pool).await.unwrap();
+        database
+            .record_request_egress_attempt(attempt)
+            .await
+            .unwrap();
+    }
+    let started = std::time::Instant::now();
+    let summaries = database
+        .request_egress_summary_for_tenant(start, start + 1, Some(&external))
+        .await
+        .unwrap();
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].recorded_attempts, 1);
+    assert_eq!(summaries[0].request_payload_bytes, Some(42));
+    assert!(summaries[0].response_payload_bytes.is_none());
+    println!(
+        "egress tenant equality query: 20000 unrelated locators, 1 included/1 other tenant/1 end-boundary, elapsed={:?}",
+        started.elapsed()
+    );
+    let global = database
+        .request_egress_summary(start, start + 1)
+        .await
+        .unwrap();
+    let matching = global
+        .iter()
+        .find(|summary| summary.selected == included.selected)
+        .unwrap();
+    assert_eq!(matching.recorded_attempts, 2);
+    assert_eq!(matching.request_payload_bytes, Some(819));
+    assert!(
+        database
+            .request_egress_summary_for_tenant(start, start + 1, Some("missing-tenant"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    if matches!(database.backend, DatabaseBackend::PostgreSql) {
+        let plan = sqlx::query("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT e.snapshot_json, COUNT(*) FROM request_egress_attempts e JOIN request_record_locators locator ON locator.id = e.request_id JOIN tenants tenant ON tenant.id = locator.tenant_id WHERE e.observed_at >= $1 AND e.observed_at < $2 AND tenant.external_id = $3 GROUP BY e.snapshot_json")
+            .bind(start).bind(start + 1).bind(&external).fetch_all(&database.pool).await.unwrap();
+        for row in plan {
+            println!("{}", row.try_get::<String, _>("QUERY PLAN").unwrap());
+        }
+    }
+    sqlx::query("DELETE FROM request_record_locators WHERE tenant_id = $1 OR tenant_id = $2")
+        .bind(&tenant)
+        .bind(&other_tenant)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn sqlite_egress_summary_is_tenant_scoped_and_half_open_with_many_unrelated_locators() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = Database::connect(&format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("egress-tenants.db").display()
+    ))
+    .await
+    .unwrap();
+    database.migrate().await.unwrap();
+    tenant_summary_contract(&database).await;
+}
+
+#[tokio::test]
+async fn postgres_egress_summary_is_tenant_scoped_and_records_the_actual_query_plan() {
+    let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let database = Database::connect(&url).await.unwrap();
+    database.migrate().await.unwrap();
+    tenant_summary_contract(&database).await;
+}
+
 #[tokio::test]
 async fn sqlite_egress_attempts_preserve_retries_snapshots_and_unknown_coverage() {
     let directory = tempfile::tempdir().unwrap();

@@ -73,6 +73,7 @@ impl Database {
         actor: Option<Uuid>,
         key: &[u8],
     ) -> Result<Value, AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         let mut tx = self.begin_write_transaction().await?;
         lock(&mut tx).await?;
         let tenant_id = tenant(&mut tx, external).await?;
@@ -101,7 +102,7 @@ impl Database {
         if row.try_get::<i64, _>("version")? != group_version {
             return Err(conflict("proxy_group_version_conflict"));
         }
-        let members = open_members(&row, key)?;
+        let members = load_group_members(&mut *tx, &group_id, key).await?;
         let requested = members
             .iter()
             .find(|candidate| candidate.id == member)
@@ -147,6 +148,10 @@ impl Database {
             .bind(id.to_string()).bind(target.map(|id| id.to_string())).bind(version)
             .bind(target.map(|_| selected.id.to_string())).bind(unix_millis()).execute(&mut *tx).await?;
         budget(&mut tx, key).await?;
+        sqlx::query("DELETE FROM network_proxy_selection_policies WHERE account_id = $1")
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
         audit(
             &mut tx,
             &tenant_id,

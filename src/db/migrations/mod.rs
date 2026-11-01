@@ -777,6 +777,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "session task relationships and explicit names",
         sql: include_str!("../../../migrations/common/0147_session_task_relationships.sql"),
     },
+    Migration {
+        version: 148,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0148_network_proxies.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1532,6 +1537,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 147,
         name: "session task relationships and explicit names",
         sql: include_str!("../../../migrations/common/0147_session_task_relationships.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0148_network_proxies.sql"),
     },
 ];
 

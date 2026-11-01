@@ -418,7 +418,7 @@ export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'):
   const member = selected.member_name?.trim();
   const group = selected.group_name?.trim();
   const name = member || group || '';
-  const summary = [name, address !== copy.unknown ? address : ''].filter(Boolean).join(' · ');
+  const summary = name || (address !== copy.unknown ? address : '');
   if (!summary) return null;
   const groupDisplay = group || (selected.group_id ? copy.unnamedGroup : copy.ungrouped);
   const version = typeof selected.group_version === 'number' && Number.isFinite(selected.group_version)
