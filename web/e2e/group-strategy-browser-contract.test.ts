@@ -174,7 +174,7 @@ test('localized resource strategy searches real group accounts, orders by keyboa
             ordered: { type: 'array', title: 'Preferred order', 'x-i18n': { 'zh-CN': { title: '账号使用顺序' } }, items: { type: 'string' }, uniqueItems: true,
               'x-resource-selector': { source: 'group-accounts', ordered: true } },
           },
-        } }] });
+        } }, { id: 'unknown-source', version: 'group-routing-v1', default: { ordered: [] }, schema: { type: 'object', title: 'Unavailable source', properties: { ordered: { type: 'array', title: 'Unavailable accounts', items: { type: 'string' }, 'x-resource-selector': { source: 'future-resources', ordered: true } } } } }] });
       } else if (route.request().method() === 'PUT') {
         writes.push(route.request().postDataJSON());
         await route.fulfill(writes.length === 1 ? { status: 503, json: { error: { message: 'unavailable' } } } : { json: {
@@ -220,6 +220,9 @@ test('localized resource strategy searches real group accounts, orders by keyboa
     assert.match(await rows.nth(0).innerText(), /Alpha account/);
     assert.equal(await rows.count(), 1);
     assert.equal(await page.getByRole('button', { name: '恢复已保存的设置', exact: true }).count(), 0);
+    await strategy.selectOption('unknown-source');
+    await page.getByText('当前无法选择此类资源。请刷新页面或选择其他策略。').waitFor();
+    assert.equal(await save.isDisabled(), true, 'an unknown resource source cannot save even an empty selection');
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
   } finally { await browser.close(); await server.close(); }
 });
