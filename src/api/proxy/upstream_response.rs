@@ -414,12 +414,39 @@ impl UpstreamResponse {
         state: &crate::AppState,
         identity: crate::db::ArchiveSpoolIdentity,
     ) -> Self {
+        self.with_archive_target(
+            state,
+            identity,
+            crate::response_archive_spool::CaptureTarget::Response,
+        )
+    }
+
+    pub(super) fn with_discarded_attempt_capture(
+        self,
+        state: &crate::AppState,
+        identity: crate::db::ArchiveSpoolIdentity,
+        attempt: crate::archive::RawResponseAttempt,
+    ) -> Self {
+        self.with_archive_target(
+            state,
+            identity,
+            crate::response_archive_spool::CaptureTarget::DiscardedAttempt(attempt),
+        )
+    }
+
+    fn with_archive_target(
+        self,
+        state: &crate::AppState,
+        identity: crate::db::ArchiveSpoolIdentity,
+        target: crate::response_archive_spool::CaptureTarget,
+    ) -> Self {
         let parts = self.into_parts();
         // Register before returning headers. The waiting capture must remain
         // owned during shutdown even before it needs an upload envelope.
         let activity = state.persistence.register_archive();
-        let admission =
-            crate::response_archive_spool::ResponseArchiveProducer::admit_original(state, identity);
+        let admission = crate::response_archive_spool::ResponseArchiveProducer::admit_target(
+            state, identity, target,
+        );
         Self::Prefetched {
             status: parts.status,
             headers: parts.headers,

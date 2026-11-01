@@ -1649,6 +1649,26 @@ async fn proxy_with_cancellation_guard(
             // A candidate transition is different: release before selection
             // can wait on health/database admission, then rejoin the new lane.
             drop(dispatch_permit.take());
+            if let Ok(discarded) = result {
+                let attempt = crate::archive::RawResponseAttempt {
+                    outbound_attempt,
+                    upstream_account_id: active_route.route.account_id,
+                    model_route_id: active_route.route.route_id,
+                    status_code: discarded.response.status().as_u16(),
+                };
+                // A definite supplier rejection remains original evidence even
+                // if the next candidate fails local admission. The immutable
+                // attempt root is independent of the final response root.
+                drop(discarded.response.with_discarded_attempt_capture(
+                    &state,
+                    crate::db::ArchiveSpoolIdentity {
+                        request_id,
+                        tenant_id: key.tenant_id,
+                        reservation_id: buffered_request.reservation.id,
+                    },
+                    attempt,
+                ));
+            }
             next_failover_reason = Some(reason);
             continue;
         }

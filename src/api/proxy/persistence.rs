@@ -177,15 +177,23 @@ impl Persistence {
 }
 
 pub(crate) fn record_capture_failure(state: &AppState, identity: crate::db::ArchiveSpoolIdentity) {
+    record_capture_failure_target(
+        state,
+        identity,
+        crate::response_archive_spool::CaptureTarget::Response,
+    );
+}
+
+pub(crate) fn record_capture_failure_target(
+    state: &AppState,
+    identity: crate::db::ArchiveSpoolIdentity,
+    target: crate::response_archive_spool::CaptureTarget,
+) {
     let background = state.clone();
     state.persistence.archives.fetch_add(1, Ordering::Release);
     tokio::spawn(async move {
         loop {
-            match background
-                .archive
-                .publish_raw_capture_failure(identity.tenant_id, identity.request_id, "response")
-                .await
-            {
+            match target.publish_failure(&background.archive, identity).await {
                 Ok(()) => break,
                 Err(error) => {
                     tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),

@@ -111,6 +111,7 @@ jobs:
           test "$ready" = true
           MTC_RUSTFS_RESTORE_ONLY=1 cargo test --locked --lib rustfs_multipart_cas_promotion_and_restart_reconstruction -- --ignored
       - run: cargo test --locked --lib api::proxy::tests::archive_terminal
+      - run: cargo test --locked --lib failover_dispatch_overload_preserves_response_archive_and_releases_old_lane
       - run: cargo test --locked --lib sixty_five_small_streams_keep_activity_and_settle_once
       - run: cargo test --locked --lib api::proxy::tests::shutdown_durability
       - run: cargo test --locked --lib buffered_text_response_survives_total_archive_failure_with_durable_pending_bodies

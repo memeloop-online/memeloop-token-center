@@ -55,6 +55,7 @@ pub use multipart::{ArchiveWriter, StagedArchiveObject};
 #[cfg(test)]
 use path::content_location;
 pub(crate) use path::is_tenant_cas_location;
+pub use raw_capture::{RawResponseAttempt, RawResponseAttemptCapture};
 pub(crate) use session_projection::PreparedSessionBody;
 pub use staging::ArchiveStagingObjectStore;
 

@@ -15,6 +15,7 @@ use std::{
 
 use crate::error::AppError;
 
+pub(crate) use producer::CaptureTarget;
 pub(crate) use producer::ResponseArchiveProducer;
 #[cfg(test)]
 pub(crate) use producer::ResponseArchiveSettlement;

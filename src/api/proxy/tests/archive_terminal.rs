@@ -1,6 +1,101 @@
 use super::*;
 
 #[tokio::test]
+async fn discarded_attempts_retain_distinct_originals_without_overwriting_final_response() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("attempt-originals.db").display()
+    )))
+    .await
+    .unwrap();
+    let identity = crate::db::ArchiveSpoolIdentity {
+        tenant_id: Uuid::now_v7(),
+        request_id: Uuid::now_v7(),
+        reservation_id: Uuid::now_v7(),
+    };
+    let final_body = Bytes::from_static(b"data: final supplier response\n\n");
+    for ordinal in 1..=3 {
+        let body = if ordinal == 3 {
+            final_body.clone()
+        } else {
+            Bytes::from(vec![ordinal as u8; 256 * 1024])
+        };
+        let response = UpstreamResponse::Prefetched {
+            status: if ordinal == 3 {
+                StatusCode::OK
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            },
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_11,
+            content_length: None,
+            stream: Box::pin(futures_util::stream::iter(
+                body.chunks(8192)
+                    .map(Bytes::copy_from_slice)
+                    .map(Ok)
+                    .collect::<Vec<_>>(),
+            )),
+        };
+        if ordinal == 3 {
+            drop(response.with_original_archive_capture(&state, identity));
+        } else {
+            drop(response.with_discarded_attempt_capture(
+                &state,
+                identity,
+                crate::archive::RawResponseAttempt {
+                    outbound_attempt: ordinal,
+                    upstream_account_id: Uuid::now_v7(),
+                    model_route_id: Uuid::now_v7(),
+                    status_code: 429,
+                },
+            ));
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(10), state.drain_proxy_tasks())
+        .await
+        .unwrap();
+    for ordinal in 1..=2 {
+        let capture = state
+            .archive
+            .response_attempt(identity.tenant_id, identity.request_id, ordinal)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(capture.attempt.outbound_attempt, ordinal);
+        let expected = vec![ordinal as u8; 256 * 1024];
+        assert_eq!(capture.response.size_bytes, expected.len() as u64);
+        assert_eq!(
+            capture.response.blake3_digest,
+            blake3::hash(&expected).to_hex().to_string()
+        );
+        assert_eq!(
+            state
+                .archive
+                .get_tenant_content(identity.tenant_id, &capture.response, expected.len())
+                .await
+                .unwrap()
+                .as_ref(),
+            expected.as_slice()
+        );
+    }
+    let final_object = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state
+            .archive
+            .get_tenant_content(identity.tenant_id, &final_object, final_body.len())
+            .await
+            .unwrap(),
+        final_body
+    );
+}
+
+#[tokio::test]
 async fn original_capture_owns_silent_and_empty_bodies_through_shutdown() {
     for empty in [false, true] {
         let directory = tempfile::tempdir().unwrap();

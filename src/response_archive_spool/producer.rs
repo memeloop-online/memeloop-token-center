@@ -501,13 +501,11 @@ impl Drop for CaptureQueueMemory {
 async fn fence_failed_capture(
     state: &AppState,
     identity: ArchiveSpoolIdentity,
+    target: CaptureTarget,
 ) -> Result<(), AppError> {
     #[cfg(test)]
     super::fence_probe::observe(state).await;
-    let result = state
-        .archive
-        .publish_raw_capture_failure(identity.tenant_id, identity.request_id, "response")
-        .await;
+    let result = target.publish_failure(&state.archive, identity).await;
     if let Err(error) = &result {
         tracing::warn!(
             request_id = %identity.request_id,
@@ -522,6 +520,71 @@ async fn fence_failed_capture(
 struct OriginalAdmission {
     state: Option<AppState>,
     identity: ArchiveSpoolIdentity,
+    target: CaptureTarget,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CaptureTarget {
+    Response,
+    DiscardedAttempt(crate::archive::RawResponseAttempt),
+}
+
+impl CaptureTarget {
+    pub(crate) async fn publish_failure(
+        self,
+        archive: &crate::archive::ArchiveStore,
+        identity: ArchiveSpoolIdentity,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Response => {
+                archive
+                    .publish_raw_capture_failure(
+                        identity.tenant_id,
+                        identity.request_id,
+                        "response",
+                    )
+                    .await
+            }
+            Self::DiscardedAttempt(attempt) => {
+                archive
+                    .publish_response_attempt_failure(
+                        identity.tenant_id,
+                        identity.request_id,
+                        attempt,
+                    )
+                    .await
+            }
+        }
+    }
+    async fn publish(
+        self,
+        archive: &crate::archive::ArchiveStore,
+        identity: ArchiveSpoolIdentity,
+        object: &crate::archive::CasArchiveObject,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Response => {
+                archive
+                    .publish_raw_capture(
+                        identity.tenant_id,
+                        identity.request_id,
+                        "response",
+                        object,
+                    )
+                    .await
+            }
+            Self::DiscardedAttempt(attempt) => {
+                archive
+                    .publish_response_attempt(
+                        identity.tenant_id,
+                        identity.request_id,
+                        attempt,
+                        object,
+                    )
+                    .await
+            }
+        }
+    }
 }
 
 impl OriginalAdmission {
@@ -533,7 +596,11 @@ impl OriginalAdmission {
 impl Drop for OriginalAdmission {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            crate::api::proxy::persistence::record_capture_failure(&state, self.identity);
+            crate::api::proxy::persistence::record_capture_failure_target(
+                &state,
+                self.identity,
+                self.target,
+            );
         }
     }
 }
@@ -547,14 +614,24 @@ impl ResponseArchiveProducer {
         Self::admit_original(state, identity).await
     }
 
+    #[cfg(test)]
     pub(crate) fn admit_original(
         state: &AppState,
         identity: ArchiveSpoolIdentity,
+    ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
+        Self::admit_target(state, identity, CaptureTarget::Response)
+    }
+
+    pub(crate) fn admit_target(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+        target: CaptureTarget,
     ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
         let state = state.clone();
         let admission = OriginalAdmission {
             state: Some(state.clone()),
             identity,
+            target,
         };
         async move {
             // Keep the supplier stream unpolled while a bounded writer is busy.
@@ -574,7 +651,7 @@ impl ResponseArchiveProducer {
                     crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
                 )
                 .await?;
-            let producer = Self::begin_admitted(&state, identity, memory, archive_permit);
+            let producer = Self::begin_admitted(&state, identity, memory, archive_permit, target);
             admission.disarm();
             Some(producer)
         }
@@ -609,6 +686,7 @@ impl ResponseArchiveProducer {
             identity,
             memory,
             archive_permit,
+            CaptureTarget::Response,
         ))
     }
 
@@ -617,6 +695,7 @@ impl ResponseArchiveProducer {
         identity: ArchiveSpoolIdentity,
         memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
         archive_permit: tokio::sync::OwnedSemaphorePermit,
+        target: CaptureTarget,
     ) -> Self {
         let queue_memory = Arc::new(CaptureQueueMemory {
             reservation: memory,
@@ -647,6 +726,7 @@ impl ResponseArchiveProducer {
                     receiver,
                     terminal_receiver,
                     writer_active,
+                    target,
                 )
                 .await
                 {
@@ -655,11 +735,11 @@ impl ResponseArchiveProducer {
                     // after its producer disappears. A successful gap fence
                     // is not a failed database operation.
                     Ok(WriterOutcome::Abandoned) => {
-                        fence_failed_capture(&writer_state, identity).await
+                        fence_failed_capture(&writer_state, identity, target).await
                     }
                     Err(error) => {
                         failure_active.store(false, Ordering::Release);
-                        let _ = fence_failed_capture(&writer_state, identity).await;
+                        let _ = fence_failed_capture(&writer_state, identity, target).await;
                         Err(error)
                     }
                 }
@@ -1008,6 +1088,7 @@ async fn run_response_archive_writer(
     mut receiver: tokio::sync::mpsc::Receiver<QueuedArchiveChunk>,
     terminal: tokio::sync::oneshot::Receiver<Bytes>,
     active: Arc<AtomicBool>,
+    target: CaptureTarget,
 ) -> Result<WriterOutcome, AppError> {
     #[cfg(test)]
     pause_begin_for_test(&state).await;
@@ -1071,11 +1152,7 @@ async fn run_response_archive_writer(
         }
     };
     loop {
-        match state
-            .archive
-            .publish_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
-            .await
-        {
+        match target.publish(&state.archive, identity, &object).await {
             Ok(()) => break,
             Err(error @ AppError::Storage { .. }) => {
                 tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
@@ -1088,6 +1165,9 @@ async fn run_response_archive_writer(
     if let Err(error) = state.archive.delete(&staged.object_locator).await {
         tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
             "complete original retains its temporary staging object for cleanup");
+    }
+    if matches!(target, CaptureTarget::DiscardedAttempt(_)) {
+        return Ok(WriterOutcome::Sealed);
     }
     state.db.refresh_closed_persistence_pool();
     if let Err(error) = state
