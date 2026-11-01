@@ -103,8 +103,9 @@ mod session_titles;
 pub(crate) use session_titles::{
     SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
 };
+pub(crate) mod network_proxies;
 mod tenants;
-mod transport_proxy_groups;
+pub(crate) mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;

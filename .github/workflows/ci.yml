@@ -383,6 +383,46 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  network-proxy-contracts:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_network_proxy_test
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: memeloop_network_proxy_test
+          POSTGRES_USER: token_center
+          POSTGRES_PASSWORD: token_center
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U token_center -d memeloop_network_proxy_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Validate canonical proxies, legacy saves, snapshots, policies and tenant query plans
+        uses: ./.github/actions/checkout-plugin-examples
+      - name: Run network proxy contracts on both SQL backends
+        run: |
+          cargo test --locked --all-features --lib db::network_proxies:: -- --nocapture
+          cargo test --locked --all-features --lib db::transport_proxy_management:: -- --nocapture
+          cargo test --locked --all-features --lib db::transport_proxy_groups:: -- --nocapture
+          cargo test --locked --all-features --lib db::routing::egress:: -- --nocapture
+          cargo test --locked --all-features --lib plugin::network_proxy_strategy:: -- --nocapture
+
   rust-suite:
     needs: changes
     if: needs.changes.outputs.rust == 'true'

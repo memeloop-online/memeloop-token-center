@@ -66,6 +66,10 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
         }
         return response;
       }
+      if (method === 'POST' && url.pathname.endsWith('/probe')) {
+        state.writes.push({ path: `${url.pathname}${url.search}`, method, body: {} });
+        return new Response(null, { status: 202 });
+      }
       const body = JSON.parse(String(init?.body));
       state.writes.push({ path: url.pathname, method, body });
       if (body.tenant_external_id !== 'fixture') throw new Error('missing write tenant');
@@ -99,9 +103,17 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
         const group: TransportProxyGroup = {
           id: 'raw-group-id', tenant_external_id: 'fixture', name: body.name, version: (old?.version ?? 0) + 1,
           bound_account_count: old?.bound_account_count ?? 0,
-          members: body.members.map((member: { id?: string; label: string }, index: number) => ({
-            id: member.id ?? `raw-member-id-${index}`, label: member.label, scheme: 'socks5h', host: '10.20.30.40', port: 1080, remote_dns: true, has_auth: true,
-          })),
+          probe_url: body.probe_url, probe_attempts: body.probe_attempts,
+          members: body.members.map((member: { id?: string; label: string; proxy_url?: string }, index: number) => {
+            const saved = old?.members.find(saved => saved.id === member.id);
+            const address = member.proxy_url ? new URL(member.proxy_url) : undefined;
+            return {
+              id: member.id ?? (old ? `raw-member-id-${old.version + 1}-${index}` : `raw-member-id-${index}`),
+              label: member.label, scheme: 'socks5h', host: address?.hostname ?? saved?.host ?? '10.20.30.40',
+              port: address ? Number(address.port) : saved?.port ?? 1080, remote_dns: true,
+              has_auth: address ? Boolean(address.username || address.password) : saved?.has_auth ?? false,
+            };
+          }),
         };
         state.groups = [group];
         response = new Response(JSON.stringify(group), { status: method === 'POST' ? 201 : 200 });
@@ -130,7 +142,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN') {
 }
 
 async function openManager(page: Page) {
-  await page.getByRole('link', { name: '代理组', exact: true }).click();
+  await page.getByRole('link', { name: '网络代理', exact: true }).click();
   await page.getByRole('button', { name: '新建代理组', exact: true }).waitFor();
 }
 
@@ -151,7 +163,10 @@ async function confirm(page: Page) {
 
 async function assertSecretsAbsent(page: Page) {
   const serialized = await page.evaluate(() => ({ html: document.documentElement.outerHTML, local: JSON.stringify(localStorage), session: JSON.stringify(sessionStorage) }));
-  for (const value of Object.values(serialized)) assert.doesNotMatch(value, /privateProxySecret|fixture-user/);
+  for (const value of Object.values(serialized)) {
+    const leak = value.search(/privateProxySecret|fixture-user/);
+    assert.equal(leak, -1, `secret serialized near: ${JSON.stringify(value.slice(Math.max(0, leak - 200), leak + 100))}`);
+  }
   assert.doesNotMatch(await page.locator('.transport-proxy-workspace').innerText(), /raw-group-id|raw-member-id|account-native/);
 }
 
@@ -233,6 +248,17 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
         await page.getByRole('button', { name: copy.refresh, exact: true }).click();
         await page.getByRole('button', { name: copy.edit('Research exits'), exact: true }).waitFor();
         await captureNavigationIdentity(page, 'proxy-groups', 'ready', locale);
+        const heading = page.getByRole('heading', { name: copy.pageTitle, exact: true });
+        const back = page.getByRole('button', { name: copy.backToAccounts, exact: true });
+        const [headingBox, backBox] = await Promise.all([heading.boundingBox(), back.boundingBox()]);
+        assert.ok(headingBox && backBox && backBox.x < headingBox.x, 'back navigation stays at the upper left');
+        assert.equal(await page.locator('.proxy-groups-page').evaluate(element => getComputedStyle(element).borderTopWidth), '0px');
+        await page.getByRole('button', { name: copy.edit('Research exits'), exact: true }).click();
+        assert.equal(await page.getByLabel(copy.replaceAddress, { exact: true }).getAttribute('placeholder'), 'socks5h://10.20.30.40:1080');
+        await captureNavigationIdentity(page, 'proxy-groups', 'edit-address', locale);
+        await page.getByRole('button', { name: copy.cancelEdit, exact: true }).click();
+        await page.locator('.app-confirm-dialog button').last().click();
+        await page.getByRole('button', { name: copy.create, exact: true }).waitFor({ state: 'visible' });
         await page.evaluate(() => { window.proxyGroupFixture.holdNextRead = true; });
         await page.getByRole('button', { name: copy.refresh, exact: true }).click();
         await page.waitForFunction(() => Boolean(window.proxyGroupFixture.releaseRead));
@@ -275,7 +301,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.equal(await workspace.count(), 1);
       assert.equal(await page.getByRole('button', { name: '管理代理组', exact: true }).count(), 0);
       assert.equal(await page.getByRole('dialog').count(), 0);
-      const sidebar = page.getByRole('link', { name: '代理组', exact: true });
+      const sidebar = page.getByRole('link', { name: '网络代理', exact: true });
       assert.equal(await sidebar.getAttribute('aria-current'), 'page');
       assert.match(await sidebar.getAttribute('href') ?? '', /view=proxy-groups/);
       await workspace.getByLabel('账号', { exact: true }).selectOption('account-native');
@@ -366,7 +392,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       assert.doesNotMatch(await workspace.innerText(), /代理组|私网代理地址|已具备|permission granted|worklog|raw-group-id/);
       await workspace.getByRole('button', { name: 'Create proxy group', exact: true }).click();
       assert.equal(await workspace.getByLabel('Proxy group name', { exact: false }).count(), 1);
-      assert.equal(await workspace.getByLabel('Private proxy address (required)', { exact: true }).getAttribute('type'), 'password');
+      assert.equal(await workspace.getByLabel('Private proxy address (required)', { exact: true }).getAttribute('type'), 'text');
       await page.setViewportSize({ width: 390, height: 1000 });
       const bounds = await workspace.boundingBox();
       assert.ok(bounds && bounds.x >= -1 && bounds.x + bounds.width <= 391);
@@ -378,7 +404,7 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
     await context.test('names, private secret handling, CRUD and bind/unbind CAS payloads', async () => {
       const page = await prepare();
       await openManager(page); await enterDraft(page);
-      assert.equal(await page.getByLabel('私网代理地址（必填）', { exact: true }).getAttribute('type'), 'password');
+      assert.equal(await page.getByLabel('私网代理地址（必填）', { exact: true }).getAttribute('type'), 'text');
       await assertSecretsAbsent(page);
       await page.getByRole('button', { name: '保存代理组', exact: true }).click();
       await page.getByText(/代理组配置已保存/).waitFor();
@@ -413,6 +439,67 @@ test('transport proxy groups: CRUD, binding, validation, CAS, secrets, permissio
       await page.getByRole('button', { name: '返回上游账号', exact: true }).click();
       assert.equal(await page.locator('.transport-proxy-workspace').count(), 0);
       await assertAccountDirectoryReturn(page);
+      await page.close();
+    });
+
+    await context.test('bound exits can be viewed, edited, removed and fully replaced in one save while probes remain available', async () => {
+      const page = await prepare();
+      const copy = transportProxyGroupCopy('zh-CN');
+      await page.evaluate(() => {
+        window.proxyGroupFixture.groups = [{
+          id: 'raw-group-id', tenant_external_id: 'fixture', name: 'CSIL', version: 1, bound_account_count: 1,
+          probe_url: 'https://example.com/', probe_attempts: 3, last_probe_status: 'healthy', last_probe_checked_at: 100,
+          members: [
+            { id: 'raw-member-id-0', label: '主出口', scheme: 'socks5h', host: '100.64.0.16', port: 1080, remote_dns: true, has_auth: false },
+            { id: 'raw-member-id-1', label: '备用出口', scheme: 'socks5h', host: '100.64.0.17', port: 1080, remote_dns: true, has_auth: false },
+          ],
+        }];
+      });
+      await page.getByRole('button', { name: copy.refresh, exact: true }).click();
+      const edit = page.getByRole('button', { name: copy.edit('CSIL'), exact: true });
+      await edit.click();
+      const address = page.getByLabel(copy.address, { exact: true });
+      assert.equal(await address.first().inputValue(), 'socks5h://100.64.0.16:1080');
+      assert.equal(await address.first().getAttribute('type'), 'text');
+      assert.equal(await page.getByText(/上次独立探测：可达/).count(), 1);
+      await captureNavigationIdentity(page, 'proxy-groups', 'bound-edit', 'zh-CN');
+      await page.getByRole('button', { name: copy.probeNow, exact: true }).click();
+      await page.getByText(copy.probeQueued, { exact: true }).waitFor();
+      const save = page.getByRole('button', { name: copy.save, exact: true });
+      await save.click();
+      await edit.click();
+      let writes = await page.evaluate(() => window.proxyGroupFixture.writes);
+      assert.match(writes[0].path, /\/probe\?tenant_external_id=fixture$/);
+      assert.deepEqual(writes[1].body.members, [{ id: 'raw-member-id-0', label: '主出口' }, { id: 'raw-member-id-1', label: '备用出口' }]);
+      await page.getByRole('button', { name: copy.removeMember, exact: true }).first().click();
+      assert.equal(await page.getByLabel('移除当前出口后使用', { exact: false }).count(), 0);
+      await save.click();
+      await edit.click();
+      writes = await page.evaluate(() => window.proxyGroupFixture.writes);
+      assert.deepEqual(writes[2].body.members, [{ id: 'raw-member-id-1', label: '备用出口' }]);
+      assert.equal(await address.inputValue(), 'socks5h://100.64.0.17:1080');
+      await address.fill('socks5h://100.64.0.18:1080');
+      await save.click();
+      await edit.click();
+      assert.equal(await address.inputValue(), 'socks5h://100.64.0.18:1080');
+      await page.getByRole('button', { name: copy.addMember, exact: true }).click();
+      await page.getByRole('textbox', { name: /^出口名称\s*\*?$/ }).last().fill('新出口');
+      await page.getByLabel(copy.requiredAddress, { exact: true }).fill('socks5h://100.64.0.16:1080');
+      await page.getByRole('button', { name: copy.removeMember, exact: true }).first().click();
+      assert.equal(await save.isEnabled(), true);
+      await save.click();
+      await page.getByText(copy.saved, { exact: true }).waitFor();
+      writes = await page.evaluate(() => window.proxyGroupFixture.writes);
+      assert.equal(writes.length, 5, 'each edit submits exactly once');
+      assert.deepEqual(writes[3].body.members, [{ id: 'raw-member-id-1', label: '备用出口', proxy_url: 'socks5h://100.64.0.18:1080' }]);
+      assert.deepEqual(writes[4].body.members, [{ label: '新出口', proxy_url: 'socks5h://100.64.0.16:1080' }]);
+      for (const write of writes.slice(1)) {
+        assert.equal(Object.hasOwn(write.body, 'replacement_member_id'), false);
+        assert.equal(write.body.probe_url, 'https://example.com/');
+        assert.equal(write.body.probe_attempts, 3);
+      }
+      assert.equal(writes[4].body.expected_version, 4);
+      await captureNavigationIdentity(page, 'proxy-groups', 'saved-replacement', 'zh-CN');
       await page.close();
     });
 

@@ -1,6 +1,5 @@
 import { createContext, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
-import { Button, Disclosure, Field, FormSection, Input, LoadingProgress, LoadingState, Select } from '../design-system';
-import { SecretInput } from '../SecretInput';
+import { Button, Disclosure, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select } from '../design-system';
 import { useI18n } from '../i18n';
 import type { UpstreamAccount } from '../types';
 import { useConfirmDialog } from '../useConfirmDialog';
@@ -23,6 +22,20 @@ interface MemberDraft {
   id?: string;
   label: string;
   proxyUrl: string;
+  originalProxyUrl?: string;
+}
+
+function ProxyAddressInput({ id, value, disabled, required, placeholder, onChange }: {
+  id: string; value: string; disabled: boolean; required: boolean; placeholder: string;
+  onChange: (value: string) => void;
+}) {
+  const input = useRef<HTMLInputElement>(null);
+  useLayoutEffect(() => {
+    if (input.current && input.current.value !== value) input.current.value = value;
+  }, [value]);
+  return <input id={id} ref={input} className="proxy-address-input" type="text" autoComplete="off" autoCapitalize="none" spellCheck={false}
+    disabled={disabled} required={required} placeholder={placeholder}
+    onChange={event => onChange(event.target.value)} />;
 }
 
 const newMember = (): MemberDraft => ({ key: crypto.randomUUID(), label: '', proxyUrl: '' });
@@ -113,7 +126,6 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   const [probeUrl, setProbeUrl] = useState('');
   const [probeAttempts, setProbeAttempts] = useState('2');
   const [members, setMembers] = useState<MemberDraft[]>([]);
-  const [replacement, setReplacement] = useState('');
   const [accountId, setAccountId] = useState(() => eligibleAccounts.find(account => account.id === initialAccountId)?.id ?? '');
   const [binding, setBinding] = useState<TransportProxyBinding>();
   const [groupId, setGroupId] = useState('');
@@ -128,10 +140,6 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   const selectedGroup = groups.find(group => group.id === groupId);
   const boundGroup = groups.find(group => group.id === binding?.group_id);
   const bindingDirty = Boolean(groupId || initialMember || singleMember);
-  const requiresReplacement = Boolean(editing?.bound_account_count && editing.members.some(member => {
-    const draft = members.find(value => value.id === member.id);
-    return !draft || Boolean(draft.proxyUrl.trim());
-  }));
   const validMembers = members.length >= 1 && members.length <= 4 && members.every(member => member.label.trim()
     && (member.id && !member.proxyUrl.trim() || member.proxyUrl.trim().startsWith('socks5h://')));
   const probeAttemptCount = Number(probeAttempts);
@@ -180,7 +188,7 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
     locked.current = true;
     bindingRead.current += 1;
     setBusy(true); setReady(false); setError(''); setBinding(undefined); setEditing(undefined);
-    setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); setReplacement(''); setGroupId(''); setInitialMember(''); setSingleMember('');
+    setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); setGroupId(''); setInitialMember(''); setSingleMember('');
     try {
       const result = await request<{ items: TransportProxyGroup[] }>(`${transportProxyGroupsPath}${query}`);
       const current = accountId ? await request<TransportProxyBinding>(`${bindingPath(accountId)}${query}`) : undefined;
@@ -229,13 +237,16 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   }
 
   function clearRestrictedState() {
-    setGroups([]); setBinding(undefined); setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); setReplacement('');
+    setGroups([]); setBinding(undefined); setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2');
     setGroupId(''); setInitialMember(''); setSingleMember(''); setAccountId('');
   }
 
   function editGroup(group: TransportProxyGroup | null) {
-    setEditing(group); setName(group?.name ?? ''); setProbeUrl(group?.probe_url ?? ''); setProbeAttempts(String(group?.probe_attempts ?? 2)); setReplacement(''); setError(''); setMessage('');
-    setMembers(group ? group.members.map(member => ({ key: member.id, id: member.id, label: member.label, proxyUrl: '' })) : [newMember()]);
+    setEditing(group); setName(group?.name ?? ''); setProbeUrl(group?.probe_url ?? ''); setProbeAttempts(String(group?.probe_attempts ?? 2)); setError(''); setMessage('');
+    setMembers(group ? group.members.map(member => {
+      const address = member.has_auth ? '' : egressAddress(member, locale);
+      return { key: member.id, id: member.id, label: member.label, proxyUrl: address, originalProxyUrl: address };
+    }) : [newMember()]);
   }
 
   function updateMember(key: string, change: Partial<MemberDraft>) {
@@ -243,14 +254,14 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
   }
 
   async function saveGroup() {
-    if (editing === undefined || !name.trim() || !validMembers || !validProbe || requiresReplacement && !members.some(member => member.id === replacement)) return;
+    if (editing === undefined || !name.trim() || !validMembers || !validProbe) return;
     const body = {
       tenant_external_id: tenant, name: name.trim(),
       ...(editing ? { expected_version: editing.version } : {}),
-      ...(requiresReplacement ? { replacement_member_id: replacement } : {}),
       probe_url: probeUrl.trim() || null,
       probe_attempts: Number(probeAttempts),
-      members: members.map(member => ({ ...(member.id ? { id: member.id } : {}), label: member.label.trim(), ...(member.proxyUrl.trim() ? { proxy_url: member.proxyUrl.trim() } : {}) })),
+      members: members.map(member => ({ ...(member.id ? { id: member.id } : {}), label: member.label.trim(),
+        ...(member.proxyUrl.trim() && member.proxyUrl.trim() !== member.originalProxyUrl ? { proxy_url: member.proxyUrl.trim() } : {}) })),
     };
     await mutate(async () => {
       const saved = await request<TransportProxyGroup>(editing ? `${transportProxyGroupsPath}/${encodeURIComponent(editing.id)}` : transportProxyGroupsPath, {
@@ -328,31 +339,31 @@ export function ProxyGroupWorkspace({ token, tenant, accounts, accountsState = '
       {editing !== undefined && <form onSubmit={event => { event.preventDefault(); void saveGroup(); }}>
         <FormSection title={editing ? copy.edit(editing.name) : copy.create}>
           <Field label={copy.name} required><Input required maxLength={64} value={name} onChange={(_, data) => setName(data.value)} /></Field>
-          {members.map((member, index) => <FormSection key={member.key} title={copy.candidate(index + 1)}>
+          {members.map((member, index) => {
+            const savedMember = editing?.members.find(saved => saved.id === member.id);
+            return <FormSection key={member.key} title={copy.candidate(index + 1)}>
             <Field label={copy.memberName} required><Input required maxLength={64} value={member.label} onChange={(_, data) => updateMember(member.key, { label: data.value })} /></Field>
-            <label htmlFor={`${inputPrefix}-${member.key}`}>{member.id ? copy.replaceAddress : copy.requiredAddress}</label>
-            <SecretInput fluent id={`${inputPrefix}-${member.key}`} label={copy.address} value={member.proxyUrl} disabled={busy || !ready} required={!member.id} onChange={event => updateMember(member.key, { proxyUrl: event.target.value })} placeholder="socks5h://mihomo.egress.svc:1080" />
+            <div className="proxy-address-field">
+              <Label htmlFor={`${inputPrefix}-${member.key}`}>{savedMember?.has_auth ? copy.replaceAddress : member.id ? copy.address : copy.requiredAddress}</Label>
+              <ProxyAddressInput id={`${inputPrefix}-${member.key}`} value={member.proxyUrl} disabled={busy || !ready} required={!member.id}
+                onChange={value => updateMember(member.key, { proxyUrl: value })}
+                placeholder={savedMember ? egressAddress(savedMember, locale) : 'socks5h://mihomo.egress.svc:1080'} />
+            </div>
             <div className="button-row">
               <Button type="button" disabled={index === 0} onClick={() => setMembers(current => { const next = [...current]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; return next; })}>{t('common.moveUp')}</Button>
               <Button type="button" disabled={index === members.length - 1} onClick={() => setMembers(current => { const next = [...current]; [next[index], next[index + 1]] = [next[index + 1], next[index]]; return next; })}>{t('common.moveDown')}</Button>
-              <Button type="button" disabled={members.length <= 1} onClick={() => { setMembers(current => current.filter(value => value.key !== member.key)); if (replacement === member.id) setReplacement(''); }}>{copy.removeMember}</Button>
+              <Button type="button" disabled={members.length <= 1} onClick={() => setMembers(current => current.filter(value => value.key !== member.key))}>{copy.removeMember}</Button>
             </div>
-          </FormSection>)}
+          </FormSection>;
+          })}
           <p>{copy.addressHint}</p>
           <Button type="button" disabled={members.length >= 4} onClick={() => setMembers(current => [...current, newMember()])}>{copy.addMember}</Button>
           <Field label={copy.probeUrl}><Input maxLength={200} value={probeUrl} onChange={(_, data) => setProbeUrl(data.value)} placeholder="https://example.com/" /></Field>
           <Field label={copy.probeAttempts}><Input type="number" required min={1} max={8} value={probeAttempts} onChange={(_, data) => setProbeAttempts(data.value)} /></Field>
           <p>{copy.probeHint}</p>
           {editing && editing.last_probe_checked_at ? <p>{copy.lastProbe(editing.last_probe_status ?? '', new Date(editing.last_probe_checked_at).toLocaleString(locale))}</p> : null}
-          {requiresReplacement && <Field label={copy.replacement} required>
-            <Select value={replacement} onChange={event => setReplacement(event.target.value)} required>
-              <option value="">{copy.selectSavedMember}</option>
-              {members.filter(member => member.id).map(member => <option key={member.id} value={member.id}>{member.label || copy.unnamed}</option>)}
-            </Select>
-            <p>{copy.replacementHint}</p>
-          </Field>}
           <div className="button-row">
-            <Button type="submit" appearance="primary" disabled={!name.trim() || !validMembers || !validProbe || requiresReplacement && !replacement}>{copy.save}</Button>
+            <Button type="submit" appearance="primary" disabled={!name.trim() || !validMembers || !validProbe}>{copy.save}</Button>
             {editing?.id ? <Button type="button" disabled={busy || !editing?.probe_url} onClick={() => { const groupId = editing?.id; if (!groupId) return; void mutate(async () => { await request(`${transportProxyGroupsPath}/${encodeURIComponent(groupId)}/probe${query}`, { method: 'POST' }); }, copy.probeQueued); }}>{copy.probeNow}</Button> : null}
             <Button type="button" onClick={async () => { if (await confirm(copy.discardEdit)) { setEditing(undefined); setMembers([]); setName(''); setProbeUrl(''); setProbeAttempts('2'); } }}>{copy.cancelEdit}</Button>
           </div>

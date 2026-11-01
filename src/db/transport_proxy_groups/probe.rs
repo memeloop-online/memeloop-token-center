@@ -138,7 +138,7 @@ async fn probe_current_member(
 /// Any HTTP response means the proxy reached the configured address. Only a
 /// failed socket, tunnel, DNS, or TLS handshake counts as unreachable. This
 /// client carries no customer body and does not call the Responses API.
-async fn proxy_reaches(
+pub(super) async fn proxy_reaches(
     http: &dyn crate::http_settings::HttpClientSource,
     proxy_url: &str,
     target: &str,
