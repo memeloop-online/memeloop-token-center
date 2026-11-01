@@ -42,7 +42,7 @@ async fn native(
 ) -> Uuid {
     let request_id = Uuid::now_v7();
     let session_id = identity.map(|identity| identity.session_id.to_string());
-    sqlx::query("INSERT INTO request_records (id,tenant_id,key_id,created_at,completed_at,protocol,model,status_code,duration_ms,input_tokens,output_tokens,cost_micros,currency,request_object,response_object,reservation_id,conversation_cluster_id) VALUES ($1,$2,$3,$4,$4,'openai','session-history',200,17,10,20,7,$5,'gap://fixture/request','gap://fixture/response',$6,$7)")
+    sqlx::query("INSERT INTO request_records (id,tenant_id,key_id,created_at,protocol,model,currency,request_object,reservation_id,conversation_cluster_id) VALUES ($1,$2,$3,$4,'openai','session-history',$5,'gap://fixture/request',$6,$7)")
         .bind(request_id.to_string()).bind(owner.tenant_id.to_string()).bind(owner.key_id.to_string())
         .bind(timestamp).bind(currency).bind(Uuid::now_v7().to_string()).bind(&session_id)
         .execute(&db.pool).await.unwrap();
@@ -56,9 +56,23 @@ async fn native(
     .execute(&db.pool)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO request_stats_facts (request_id,tenant_id,key_id,session_id,created_at,model,protocol,status_class,error_code,upstream_account_id,model_route_id,duration_ms,input_tokens,output_tokens,currency,cost_micros) VALUES ($1,$2,$3,$4,$5,'session-history','openai','success','','','',17,10,20,$6,7)")
-        .bind(request_id.to_string()).bind(owner.tenant_id.to_string()).bind(owner.key_id.to_string())
-        .bind(session_id.unwrap_or_else(|| format!("unlinked:{}", owner.key_id))).bind(timestamp).bind(currency).execute(&db.pool).await.unwrap();
+    db.record_request_finished(crate::db::FinishRequest {
+        request_id,
+        first_output_ms: None,
+        generation_duration_ms: None,
+        status_code: 200,
+        duration_ms: 17,
+        input_tokens: 10,
+        cached_input_tokens: 0,
+        cache_write_tokens: 0,
+        output_tokens: 20,
+        service_tier: None,
+        cost_micros: 7,
+        error_code: None,
+        response_object: "gap://fixture/response".into(),
+    })
+    .await
+    .unwrap();
     request_id
 }
 
