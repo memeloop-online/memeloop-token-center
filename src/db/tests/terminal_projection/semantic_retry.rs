@@ -17,6 +17,29 @@ async fn pending(database: &Database) -> (AuthenticatedKey, UsageReservation, Uu
         upstream_response_id: None,
     });
     database.finish_proxy_request_deferred(input).await.unwrap();
+    let encoded = body.to_string();
+    let mut digest = blake3::Hasher::new_derive_key("MTC conversation semantic payload v1");
+    for value in [
+        request_id.to_string(),
+        key.tenant_id.to_string(),
+        key.key_id.to_string(),
+        key.principal_id.to_string(),
+        encoded.clone(),
+    ] {
+        digest.update(&(value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)")
+        .bind(request_id.to_string())
+        .bind(key.tenant_id.to_string())
+        .bind(key.key_id.to_string())
+        .bind(key.principal_id.to_string())
+        .bind(encoded.len() as i64)
+        .bind(digest.finalize().to_hex().to_string())
+        .bind(encoded)
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let terminal_owner = Uuid::now_v7();
     assert!(
         database
