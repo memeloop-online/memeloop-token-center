@@ -8353,8 +8353,8 @@
           "Routes and pricing"
         ],
         "operationId": "deleteModelRoute",
-        "summary": "Delete a disabled, unreferenced model route",
-        "description": "The route must first be disabled and must not be referenced by request history.\nA stale `expected_updated_at`, enabled route, or historical reference returns\n409. A missing route, including a repeated successful delete, returns 204.\n",
+        "summary": "Delete disabled route configuration while preserving history",
+        "description": "The route must first be disabled. Deletion removes the live configuration, grants and memberships. Request and financial snapshots retain their original route UUID, model, account, usage and cost and do not require a configuration foreign key. A stale `expected_updated_at` or enabled route returns 409. A missing route, including a repeated successful delete, returns 204.\n",
         "security": [
           {
             "serviceBearer": []

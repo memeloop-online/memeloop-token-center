@@ -428,17 +428,6 @@ impl Database {
                 "reload the model route before deleting it".into(),
             ));
         }
-        let referenced =
-            sqlx::query("SELECT id FROM request_records WHERE model_route_id = $1 LIMIT 1")
-                .bind(route_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
-        if referenced {
-            return Err(AppError::Conflict(
-                "the route has request history and must be retained in a disabled state".into(),
-            ));
-        }
         let active_create_claim = sqlx::query(
             "SELECT 1 FROM model_route_create_operations \
              WHERE tenant_id = $1 AND route_id = $2 AND expires_at > $3 LIMIT 1",

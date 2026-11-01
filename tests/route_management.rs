@@ -7,8 +7,8 @@ use memeloop_token_center::{
     config::{Config, RuntimeRole},
     db::{
         CreateGroupInput, CreateKeyInput, CreateModelRouteInput, CreateServiceTokenInput,
-        CreateUpstreamAccountInput, GroupKind, NewRequest, ReplaceCredentialRoutingInput,
-        ReplaceGroupMembersInput,
+        CreateUpstreamAccountInput, FinishRequest, GroupKind, NewRequest,
+        ReplaceCredentialRoutingInput, ReplaceGroupMembersInput,
     },
     model::KeyPolicy,
     provider::{ModelRouteView, UpstreamCredential},
@@ -461,20 +461,6 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let historical_route = route_from(value);
-    let (status, _) = json_request(
-        &state,
-        "DELETE",
-        &format!(
-            "/internal/v1/model-routes/{}?tenant_external_id=route-tenant-a&expected_updated_at={}",
-            historical_route.id, historical_route.updated_at
-        ),
-        &tenant_service.token,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-    // Archiving is distinct from destructive deletion: historical identities
-    // survive while everyday management can no longer resurrect the route.
     let archive_path = format!("/internal/v1/model-routes/{}/archive", historical_route.id);
     let archive_body = json!({
         "tenant_external_id": "route-tenant-a",
@@ -641,4 +627,146 @@ async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
         )
         .await
         .unwrap();
+
+    let deleted_route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: "route-tenant-a".into(),
+            public_model: "deleted-historical-public".into(),
+            upstream_account_id: upstream.id,
+            upstream_model: "deleted-historical-upstream".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let deleted_price = state
+        .db
+        .upsert_model_price(
+            "deleted-historical-public",
+            "USD",
+            Decimal::ONE,
+            Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    let deleted_reservation = state
+        .db
+        .reserve_usage(&authenticated_key, &deleted_price, 11, 7)
+        .await
+        .unwrap();
+    let deleted_request_id = Uuid::now_v7();
+    state
+        .db
+        .record_request_started(NewRequest {
+            request_id: deleted_request_id,
+            key_id: authenticated_key.key_id,
+            tenant_id: authenticated_key.tenant_id,
+            protocol: "openai-chat".into(),
+            model: "deleted-historical-public".into(),
+            request_object: "inline-json:{}".into(),
+            reservation_id: deleted_reservation.id,
+            upstream_account_id: Some(upstream.id),
+            model_route_id: Some(deleted_route.id),
+        })
+        .await
+        .unwrap();
+    let deleted_cost = state
+        .db
+        .settle_usage(&deleted_reservation, 11, 7)
+        .await
+        .unwrap();
+    state
+        .db
+        .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id: deleted_request_id,
+            status_code: 200,
+            duration_ms: 42,
+            input_tokens: 11,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 7,
+            service_tier: None,
+            cost_micros: deleted_cost,
+            error_code: None,
+            response_object: "inline-json:{}".into(),
+        })
+        .await
+        .unwrap();
+    let deleted_route = state
+        .db
+        .set_model_route_enabled(
+            deleted_route.id,
+            "route-tenant-a",
+            false,
+            deleted_route.updated_at,
+        )
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let (status, _) = json_request(
+            &state,
+            "DELETE",
+            &format!(
+                "/internal/v1/model-routes/{}?tenant_external_id=route-tenant-a&expected_updated_at={}",
+                deleted_route.id, deleted_route.updated_at
+            ),
+            &tenant_service.token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let remaining_route: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM model_routes WHERE id = $1")
+            .bind(deleted_route.id.to_string())
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(remaining_route, 0);
+    let history = state
+        .db
+        .list_requests(authenticated_key.key_id, 20)
+        .await
+        .unwrap();
+    let historical = history
+        .iter()
+        .find(|request| request.request_id == deleted_request_id)
+        .unwrap();
+    assert_eq!(historical.route_id, Some(deleted_route.id));
+    assert_eq!(historical.input_tokens, 11);
+    assert_eq!(historical.output_tokens, 7);
+    assert!(!historical.cost.is_empty());
+    let stored_history: (String, i64, i64) = sqlx::query_as(
+        "SELECT model_route_id, input_tokens + output_tokens, cost_micros FROM request_records WHERE id = $1",
+    )
+    .bind(deleted_request_id.to_string())
+    .fetch_one(&state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_history,
+        (deleted_route.id.to_string(), 18, deleted_cost)
+    );
+    let stored_settlement: (String, i64) =
+        sqlx::query_as("SELECT status, actual_micros FROM usage_reservations WHERE id = $1")
+            .bind(deleted_reservation.id.to_string())
+            .fetch_one(&state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored_settlement, ("settled".into(), deleted_cost));
+    let (status, _) = json_request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/archived-model-routes/{}?tenant_external_id=route-tenant-a",
+            deleted_route.id
+        ),
+        &tenant_service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

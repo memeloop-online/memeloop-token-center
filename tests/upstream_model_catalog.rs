@@ -1943,6 +1943,137 @@ async fn postgres_route_then_catalog_keeps_missing_custom_bound_unknown() {
 }
 
 #[tokio::test]
+async fn kimi_builtin_sync_retires_old_models_and_repeats_the_same_catalog() {
+    let (state, _directory) = state("kimi-current-catalog").await;
+    let tenant = "kimi-current-catalog";
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: "Kimi current catalog".into(),
+                driver: "kimi-oauth".into(),
+                config: json!({
+                    "base_url": "https://api.kimi.com/coding",
+                    "network_scope": "public",
+                    "reservation_token_bounds": {}
+                }),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "catalog-fixture-access".into(),
+                    refresh_token: Some("catalog-fixture-refresh".into()),
+                    expires_at: Some(4_070_908_800_000),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: Some(json!({
+                        "schema": "kimi-oauth-v1",
+                        "device_id": "catalog-fixture-device",
+                        "scope": "coding",
+                        "token_type": "Bearer"
+                    })),
+                    proxy_url: None,
+                    proxy_network_scope: None,
+                },
+                oauth_session_id: Some(Uuid::now_v7()),
+                oauth_driver: Some("kimi-oauth".into()),
+                oauth_refresh_url: Some("https://auth.kimi.com/api/oauth/token".into()),
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
+    let retired = ["kimi-k2", "kimi-k2-thinking", "kimi-k2.5", "kimi-k2.6"];
+    let previous = retired
+        .iter()
+        .flat_map(|model| {
+            ["openai", "anthropic"].map(|protocol| DiscoveredUpstreamModel {
+                model_id: (*model).into(),
+                protocol: protocol.into(),
+                context_window: Some(262_144),
+                reservation_token_bound: Some(65_536),
+                reservation_bound_source: Some("provider_max_output_tokens".into()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let lease = Uuid::now_v7();
+    assert!(
+        state
+            .db
+            .claim_upstream_model_catalog_sync(account.id, tenant, 1, lease)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        state
+            .db
+            .replace_upstream_model_catalog(account.id, tenant, 1, lease, "openai_v1", &previous)
+            .await
+            .unwrap(),
+        ReplaceModelCatalogResult::Replaced
+    );
+    let mut snapshots = Vec::new();
+    for _ in 0..2 {
+        let (status, catalog) = request(
+            &state,
+            "POST",
+            &format!(
+                "/internal/v1/upstreams/{}/models/sync?tenant_external_id={tenant}",
+                account.id
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{catalog}");
+        assert_eq!(catalog["status"], "ready");
+        snapshots.push(catalog);
+    }
+    assert_eq!(snapshots[0]["models"], snapshots[1]["models"]);
+    assert_eq!(
+        snapshots[0]["disabled_models"],
+        snapshots[1]["disabled_models"]
+    );
+    let active = snapshots[0]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["id"].as_str().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        active,
+        [
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k3",
+            "kimi-k3-256k",
+            "kimi-k3.1-pro",
+            "kimi-k3.1-pro-highspeed",
+        ]
+        .into_iter()
+        .collect()
+    );
+    let disabled = snapshots[0]["disabled_models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| {
+            assert_eq!(model["reason"], "removed_from_upstream");
+            model["id"].as_str().unwrap()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(disabled, retired.into_iter().collect());
+    let (status, readback) = request(
+        &state,
+        "GET",
+        &format!(
+            "/internal/v1/upstreams/{}/models?tenant_external_id={tenant}&limit=1000",
+            account.id
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(readback["models"], snapshots[1]["models"]);
+    assert_eq!(readback["disabled_models"], snapshots[1]["disabled_models"]);
+}
+
+#[tokio::test]
 async fn postgres_catalog_then_route_keeps_missing_custom_bound_unknown() {
     let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         eprintln!("skipping PostgreSQL catalog/route interleaving: MTC_TEST_POSTGRES_URL is unset");
