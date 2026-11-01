@@ -200,7 +200,7 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
 
 #[tokio::test]
 async fn occupied_budget_never_grants_requested_rewritten_or_cross_tenant_models() {
-    let (_directory, state, key) = fixture(None).await;
+    let (_directory, state, _key) = fixture(None).await;
     let held = state.proxy_memory_budget.reservation();
     assert!(held.try_grow(1024 * 1024, 1));
     let account = state
