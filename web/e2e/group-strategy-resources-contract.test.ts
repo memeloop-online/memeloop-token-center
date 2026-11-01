@@ -27,3 +27,16 @@ test('presentation annotations preserve validation of real resource arrays', asy
   assert.ok(safeValidator.rawValidation(schema, { accounts: ['alpha', 'alpha'] }).errors.length);
   assert.ok(safeValidator.rawValidation(schema, { accounts: [5] }).errors.length);
 });
+
+test('a resource choice binds plugin-declared fields and preserves unrelated configuration', async () => {
+  const { resourceChoiceHint, applyResourceChoice, emptyResourceChoice, matchesResourceChoice } = await import('../src/resourceChoice.js');
+  const schema = { type: 'object' as const, properties: { service: { type: 'string' as const }, allowance: { type: 'string' as const } },
+    'x-resource-choice': { source: 'group-quota-windows', bindings: { service: 'provider', allowance: 'window_id' }, autoSelectSingle: true } };
+  const hint = resourceChoiceHint(schema)!;
+  const option = { value: 'pair', label: 'Codex · Weekly quota', data: { provider: 'openai-codex', window_id: 'code:primary_window' } };
+  assert.ok(emptyResourceChoice(hint, { service: '', allowance: '' }));
+  const next = applyResourceChoice(hint, option, { factor: 7 });
+  assert.deepEqual(next, { factor: 7, service: 'openai-codex', allowance: 'code:primary_window' });
+  assert.ok(matchesResourceChoice(hint, option, next));
+  assert.ok(!emptyResourceChoice(hint, next));
+});

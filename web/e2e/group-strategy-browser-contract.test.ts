@@ -235,3 +235,59 @@ test('localized resource strategy searches real group accounts, orders by keyboa
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
   } finally { await browser.close(); await server.close(); }
 });
+
+test('quota choice automatically configures a unique real window and maps one choice to both stored fields', { timeout: 45_000 }, async context => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    context.skip('Chromium not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    const writes: Record<string, any>[] = [];
+    let multiple = false;
+    await page.route('**/internal/v1/**', async route => {
+      const url = route.request().url();
+      if (url.endsWith('/plugins/group-routing-strategies')) await route.fulfill({ json: [{ id: 'quota-order', version: 'group-routing-v1', default: { service: '', allowance: '' }, schema: {
+        type: 'object', title: '优先使用即将重置的账号', description: '优先使用额度即将重置的账号', properties: { service: { type: 'string' }, allowance: { type: 'string' } },
+        'x-resource-choice': { source: 'group-quota-windows', bindings: { service: 'provider', allowance: 'window_id' }, autoSelectSingle: true },
+      } }] });
+      else if (url.endsWith('/upstreams/quota/batch')) {
+        assert.deepEqual(route.request().postDataJSON(), { account_ids: ['alpha', 'beta', 'gamma'], fresh: false, trigger: 'bulk' });
+        await route.fulfill({ json: { contract_version: 'upstream_quota_batch_v1', results: [{ status: 'success', upstream_account_id: 'alpha', snapshot: {
+          provider: 'openai-codex', upstream_account_id: 'alpha', windows: [
+            { id: 'code:primary_window', label: 'code:primary_window', period_seconds: 604800 },
+            ...(multiple ? [{ id: 'code:secondary_window', label: 'code:secondary_window', period_seconds: 18000 }] : []),
+          ],
+        } }] } });
+      } else if (route.request().method() === 'PUT') {
+        writes.push(route.request().postDataJSON());
+        await route.fulfill({ json: { id: 'group', name: 'Group', member_ids: ['alpha', 'beta', 'gamma'], member_count: 3, created_at: 1, updated_at: 2,
+          strategy_version: 3, routing_strategy: writes.at(-1)?.routing_strategy, routing_priority: 0 } });
+      } else await route.fulfill({ json: [] });
+    });
+    const url = `http://127.0.0.1:${address.port}/e2e/fixtures/group-strategy.html?resources`;
+    await page.goto(url);
+    await page.getByRole('combobox', { name: '组路由策略', exact: true }).selectOption('quota-order');
+    const choice = page.getByRole('combobox', { name: '额度窗口', exact: true });
+    await page.waitForFunction(() => document.querySelector<HTMLSelectElement>('.schema-resource-choice select')?.selectedOptions[0]?.textContent === 'Codex · 周额度');
+    assert.equal(await page.locator('.group-strategy-editor input:not([type="hidden"]):not([type="number"])').count(), 0);
+    await page.getByRole('button', { name: '查看分配方式' }).hover();
+    await page.getByRole('tooltip').filter({ hasText: '优先使用额度即将重置的账号' }).waitFor();
+    await page.getByRole('button', { name: '保存组策略', exact: true }).click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[0].routing_strategy.config, { service: 'openai-codex', allowance: 'code:primary_window' });
+    multiple = true; await page.goto(url);
+    await page.getByRole('combobox', { name: '组路由策略', exact: true }).selectOption('quota-order');
+    await choice.selectOption({ label: 'Codex · 5 小时额度' });
+    await page.getByRole('button', { name: '保存组策略', exact: true }).click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[1].routing_strategy.config, { service: 'openai-codex', allowance: 'code:secondary_window' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  } finally { await browser.close(); await server.close(); }
+});

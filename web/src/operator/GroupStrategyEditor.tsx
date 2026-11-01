@@ -6,6 +6,9 @@ import { localizeSchema, useI18n } from '../i18n';
 import { schemaFormTemplates } from '../SchemaTemplates';
 import { safeValidator } from '../safeValidator';
 import { hasInvalidResources, resourceSelectorUiSchema, SchemaResourceSelector } from '../SchemaResourceSelector';
+import { SchemaResourceChoice } from '../SchemaResourceChoice';
+import { applyResourceChoice, emptyResourceChoice, matchesResourceChoice, resourceChoiceHint } from '../resourceChoice';
+import { useGroupQuotaChoices } from './useGroupQuotaChoices';
 import type { ComboboxOption } from './MultiCombobox';
 import './groupStrategy.css';
 import type { GroupView } from '../types';
@@ -37,8 +40,8 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
   const [needsListRefresh, setNeedsListRefresh] = useState(false);
   const mounted = useRef(true);
   useEffect(() => {
-    // Rename/member writes share updated_at but do not change strategy content.
-    // A different strategy version must still conflict with our retained draft.
+    // Rename/member writes advance the revision while retaining the strategy version.
+    // Strategy changes retain the draft's revision for conflict detection.
     setSnapshot(current => group.updated_at > current.updated_at && (group.strategy_version ?? 0) === (current.strategy_version ?? 0) ? group : current);
   }, [group]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
@@ -54,6 +57,17 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
   }, [token, reload]);
   const option = catalog.find(value => value.id === pluginId);
   const schema = localizeSchema<RJSFSchema>(option?.schema ?? { type: 'object', properties: {} }, locale);
+  const choice = resourceChoiceHint(schema);
+  const quotaChoices = useGroupQuotaChoices(catalog.some(item => resourceChoiceHint(item.schema)?.source === 'group-quota-windows'), accounts, token, tenant);
+  const choiceOptions = choice?.source === 'group-quota-windows' ? quotaChoices.options : [];
+  const selectedChoice = choice && choiceOptions.find(item => matchesResourceChoice(choice, item, config));
+  const invalidChoice = Boolean(choice && !selectedChoice);
+  useEffect(() => {
+    if (choice?.autoSelectSingle && emptyResourceChoice(choice, config) && choiceOptions.length === 1 && !quotaChoices.busy && !quotaChoices.error) {
+      setConfig(current => emptyResourceChoice(choice, current) ? applyResourceChoice(choice, choiceOptions[0], current) : current);
+    }
+  }, [choice, choiceOptions, quotaChoices.busy, quotaChoices.error, config]);
+  const uiSchema = { ...resourceSelectorUiSchema(schema), ...Object.fromEntries(Object.keys(choice?.bindings ?? {}).map(field => [field, { 'ui:widget': 'hidden' }])) };
   const formContext = { resources: { 'group-accounts': accounts } };
   const invalidResources = hasInvalidResources(schema, config, formContext);
   const dirty = pluginId !== (snapshot.routing_strategy?.plugin_id ?? '') || priority !== String(snapshot.routing_priority ?? 0)
@@ -74,7 +88,7 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
     if (mounted.current) setNeedsRefresh(false);
   }
   async function save(formData: Record<string, unknown>) {
-    if (saving || !token || !tenant || !validPriority || needsRefresh || (pluginId && (!option || loading || catalogError || hasInvalidResources(schema, formData, formContext)))) return;
+    if (saving || !token || !tenant || !validPriority || needsRefresh || (pluginId && (!option || loading || catalogError || (choice && !choiceOptions.some(item => matchesResourceChoice(choice, item, formData))) || hasInvalidResources(schema, formData, formContext)))) return;
     setSaving(true); setError(''); setMessage('');
     try {
       const saved = await api<GroupView>(`/internal/v1/${kind}-groups/${encodeURIComponent(group.id)}/routing-strategy`, token, {
@@ -119,15 +133,18 @@ export function GroupStrategyEditor({ kind, token, tenant, group, accounts = [],
       {catalog.map((value, index) => <option key={value.id} value={value.id}>{localizeSchema(value.schema, locale).title || t('groups.strategyUnnamed', { number: index + 1 })}</option>)}
     </select></label>
     {pluginId && !option && !loading && <p role="alert">{t('groups.strategyUnavailable')}</p>}
-    {option && schema.description && <p className="field-hint">{schema.description}</p>}
+    {option && schema.description && !choice && <p className="field-hint">{schema.description}</p>}
     <label>{t('groups.strategyPriority')}<input type="number" step="1" min={-2147483648} max={2147483647} value={priority} disabled={saving} onChange={event => { setPriority(event.target.value); setMessage(''); }} /></label>
     <p className="muted">{t('groups.strategyPriorityHelp')}</p>
     {dirty && <button type="button" className="secondary" disabled={saving} onClick={restore}>{t('groups.strategyRestore')}</button>}
-    {pluginId ? <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={{ ...schema, title: undefined, description: undefined }} uiSchema={resourceSelectorUiSchema(schema)}
+    {pluginId ? <RjsfForm key={pluginId} idPrefix={`group-strategy-${group.id}`} schema={{ ...schema, title: undefined, description: undefined }} uiSchema={uiSchema}
       fields={{ OrderedResources: SchemaResourceSelector }} formContext={formContext}
       formData={config} validator={safeValidator} templates={schemaFormTemplates} disabled={saving}
       noHtml5Validate onChange={({ formData }) => { setConfig(formData ?? {}); setMessage(''); }} onSubmit={({ formData }) => void save(formData ?? {})}>
-      <button type="submit" disabled={saving || !token || !tenant || !validPriority || invalidResources || needsRefresh || Boolean(pluginId && (!option || loading || catalogError))}>{t('groups.strategySave')}</button>
+      {choice && <SchemaResourceChoice options={choiceOptions} value={selectedChoice?.value} description={schema.description}
+        busy={quotaChoices.busy} error={choice.source === 'group-quota-windows' ? quotaChoices.error : t('resourceSelector.unavailable')} disabled={saving}
+        onRetry={quotaChoices.retry} onChange={item => { setConfig(current => applyResourceChoice(choice, item, current)); setMessage(''); }} />}
+      <button type="submit" disabled={saving || !token || !tenant || !validPriority || invalidResources || invalidChoice || needsRefresh || Boolean(pluginId && (!option || loading || catalogError))}>{t('groups.strategySave')}</button>
     </RjsfForm> : <button type="button" disabled={saving || !token || !tenant || !validPriority || needsRefresh} onClick={() => void save({})}>{t('groups.strategySave')}</button>}
   </section>;
 }

@@ -98,6 +98,7 @@ fn inspect_schema(schema: &Value, depth: usize, nodes: &mut usize) -> Result<(),
         "$defs",
         "x-i18n",
         "x-resource-selector",
+        "x-resource-choice",
         "title",
         "description",
         "default",
@@ -214,8 +215,7 @@ fn inspect_schema(schema: &Value, depth: usize, nodes: &mut usize) -> Result<(),
     Ok(())
 }
 
-// These extensions only describe presentation. Never resolve resources or derive
-// instance validation/authorization rules from their contents.
+// Presentation annotations describe labels and resource bindings for configuration editors.
 fn inspect_display_annotations(object: &serde_json::Map<String, Value>) -> Result<(), AppError> {
     let invalid = || AppError::BadRequest("invalid JSON Schema display annotation".into());
     if let Some(translations) = object.get("x-i18n") {
@@ -243,6 +243,47 @@ fn inspect_display_annotations(object: &serde_json::Map<String, Value>) -> Resul
             {
                 return Err(invalid());
             }
+        }
+    }
+    if let Some(choice) = object.get("x-resource-choice") {
+        let choice = choice.as_object().ok_or_else(invalid)?;
+        let bindings = choice
+            .get("bindings")
+            .and_then(Value::as_object)
+            .ok_or_else(invalid)?;
+        let properties = object
+            .get("properties")
+            .and_then(Value::as_object)
+            .ok_or_else(invalid)?;
+        let valid_key = |value: &str| {
+            !value.is_empty()
+                && value.len() <= MAX_DISPLAY_KEY_BYTES
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        };
+        if object.get("type").and_then(Value::as_str) != Some("object")
+            || choice.len() != 3
+            || choice
+                .get("source")
+                .and_then(Value::as_str)
+                .is_none_or(|value| !valid_key(value))
+            || !choice
+                .get("autoSelectSingle")
+                .is_some_and(Value::is_boolean)
+            || bindings.is_empty()
+            || bindings.len() > MAX_DISPLAY_KEY_BYTES
+            || bindings.iter().any(|(field, attribute)| {
+                properties
+                    .get(field)
+                    .and_then(Value::as_object)
+                    .and_then(|property| property.get("type"))
+                    .and_then(Value::as_str)
+                    != Some("string")
+                    || attribute.as_str().is_none_or(|value| !valid_key(value))
+            })
+        {
+            return Err(invalid());
         }
     }
     if let Some(selector) = object.get("x-resource-selector") {
@@ -471,6 +512,34 @@ mod tests {
         ] {
             let error = validator.validate(&value).unwrap_err();
             assert!(!error.to_string().contains("secret-token"));
+        }
+    }
+
+    #[test]
+    fn resource_choices_bind_existing_string_fields() {
+        let schema = json!({"type":"object","required":["provider","window"],"additionalProperties":false,
+            "properties":{"provider":{"type":"string"},"window":{"type":"string"}},
+            "x-resource-choice":{"source":"group-quota-windows","bindings":{"provider":"provider","window":"window_id"},"autoSelectSingle":true}});
+        let validator = compile(&schema).unwrap();
+        validator
+            .validate(&json!({"provider":"openai-codex","window":"code:primary_window"}))
+            .unwrap();
+        assert!(
+            validator
+                .validate(&json!({"provider":42,"window":"x"}))
+                .is_err()
+        );
+        for choice in [
+            json!(null),
+            json!({"source":"group-quota-windows","bindings":{},"autoSelectSingle":true}),
+            json!({"source":"group-quota-windows","bindings":{"missing":"provider"},"autoSelectSingle":true}),
+            json!({"source":"group-quota-windows","bindings":{"provider":42},"autoSelectSingle":true}),
+            json!({"source":"group-quota-windows","bindings":{"provider":"provider"},"autoSelectSingle":"true"}),
+            json!({"source":"group-quota-windows","bindings":{"provider":"provider"},"autoSelectSingle":true,"extra":true}),
+        ] {
+            let mut invalid = schema.clone();
+            invalid["x-resource-choice"] = choice;
+            assert!(validate_definition(&invalid).is_err());
         }
     }
 

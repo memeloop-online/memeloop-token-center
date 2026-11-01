@@ -16,3 +16,8 @@
 .resource-selector-actions > .fui-Button { min-width: 44px; min-height: 36px; padding-inline: 10px; }
 .resource-selector-missing { border-color: var(--colorPaletteRedBorder2, #d13438) !important; }
 .resource-selector-announcement { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+
+.schema-resource-choice { display: grid; gap: 8px; margin: 16px 0; min-width: 0; }
+.resource-choice-heading { display: flex; align-items: center; gap: 4px; }
+.resource-choice-heading > label { font-weight: 600; }
+.schema-resource-choice > .fui-Select { width: 100%; min-width: 0; }
