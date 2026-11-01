@@ -299,11 +299,6 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND $17 >= 0 AND $18 >= 0
 "#;
 
-// Every request the user observed must land in the success-rate denominator, so
-// requests without a terminal fact (still pending settlement, cancelled without a
-// fact, or otherwise lacking terminal evidence) are counted as failures here. The
-// aggregate only appends this source when the status filter is '' or 'error'; the
-// 'pending' operational view keeps its dedicated source below.
 pub(crate) const FILTERED_ACTIVITY_SOURCE_UNSETTLED: &str = r#"
 SELECT r.created_at,
        r.model,
@@ -337,9 +332,10 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($8 = '' OR COALESCE(r.error_code, '') = $8)
   AND ($9 = '' OR COALESCE(r.upstream_account_id, '') = $9)
   AND ($10 = '' OR COALESCE(r.model_route_id, '') = $10)
-  AND $11 < 0 AND $12 < 0
-  AND ($13 < 0 OR r.cost_micros >= $13)
-  AND ($14 < 0 OR r.cost_micros <= $14)
+  AND ($11 < 0 OR r.duration_ms >= $11)
+  AND ($12 < 0 OR r.duration_ms <= $12)
+  AND ($13 < 0 OR (r.completed_at IS NOT NULL AND r.cost_micros >= $13))
+  AND ($14 < 0 OR (r.completed_at IS NOT NULL AND r.cost_micros <= $14))
   AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
   AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
 "#;
@@ -348,8 +344,7 @@ pub(crate) const FILTERED_ACTIVITY_SOURCE_PENDING: &str = r#"
 SELECT r.created_at,
        r.model,
        r.protocol,
-       CASE WHEN r.status_code BETWEEN 200 AND 399 THEN 'success'
-            WHEN r.status_code IS NULL THEN 'pending' ELSE 'failure' END AS status_class,
+       'pending' AS status_class,
        COALESCE(r.error_code, '') AS error_code,
        CASE WHEN r.protocol = 'audio-transcription' THEN 0 ELSE r.input_tokens END AS input_tokens,
        CASE WHEN r.protocol = 'audio-transcription' THEN 0 ELSE r.output_tokens END AS output_tokens,
@@ -360,7 +355,7 @@ SELECT r.created_at,
        CAST(0 AS BIGINT) AS cache_reported_read_tokens,
        CAST(0 AS BIGINT) AS cache_reported_requests,
        r.currency,
-       r.cost_micros,
+       CAST(NULL AS BIGINT) AS cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM request_records r
 LEFT JOIN key_records k ON k.id = r.key_id AND k.tenant_id = r.tenant_id
@@ -372,15 +367,17 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND ($5 = '' OR r.model = $5)
   AND ($6 = '' OR r.protocol = $6)
   AND $7 = 'pending'
+  AND r.completed_at IS NULL
   AND r.status_code IS NULL
+  AND COALESCE(r.error_code, '') = ''
+  AND NOT EXISTS (SELECT 1 FROM request_stats_facts fact WHERE fact.request_id = r.id)
   AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals operational WHERE operational.request_id = r.id AND operational.tenant_id = r.tenant_id AND operational.key_id = r.key_id AND operational.reservation_id = r.reservation_id)
   AND ($8 = '' OR r.error_code = $8)
   AND ($9 = '' OR r.upstream_account_id = $9)
   AND ($10 = '' OR r.model_route_id = $10)
   AND ($11 < 0 OR r.duration_ms >= $11)
   AND ($12 < 0 OR r.duration_ms <= $12)
-  AND ($13 < 0 OR r.cost_micros >= $13)
-  AND ($14 < 0 OR r.cost_micros <= $14)
+  AND $13 < 0 AND $14 < 0
   AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
   AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
 UNION ALL
@@ -398,7 +395,7 @@ SELECT g.created_at,
        CAST(0 AS BIGINT) AS cache_reported_read_tokens,
        CAST(0 AS BIGINT) AS cache_reported_requests,
        COALESCE(k.currency, '') AS currency,
-       g.cost_micros,
+       CAST(NULL AS BIGINT) AS cost_micros,
        CAST(1 AS BIGINT) AS requests
 FROM generation_jobs g
 LEFT JOIN key_records k ON k.id = g.key_id AND k.tenant_id = g.tenant_id
@@ -416,8 +413,7 @@ WHERE ($1 = '' OR t.external_id = $1)
   AND $10 = ''
   AND $11 < 0
   AND $12 < 0
-  AND ($13 < 0 OR g.cost_micros >= $13)
-  AND ($14 < 0 OR g.cost_micros <= $14)
+  AND $13 < 0 AND $14 < 0
   AND ($15 = '' OR LOWER(COALESCE(k.alias, '__retired_credential__')) LIKE $15 ESCAPE '\')
   AND ($16 = '' OR LOWER(COALESCE(p.external_id, '__retired_principal__')) LIKE $16 ESCAPE '\')
   AND $17 >= 0 AND $18 >= 0
