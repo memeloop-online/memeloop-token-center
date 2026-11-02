@@ -619,13 +619,15 @@ impl Database {
         let row = sqlx::query(
             "SELECT r.request_object, r.response_object, r.tenant_id, r.reservation_id, q.state AS source_state,
              CAST(CASE WHEN s.state IN ('capturing', 'pending', 'uploading')
-                OR (s.request_id IS NULL AND r.response_object = 'gap://' || r.id || '/response')
+                OR (s.request_id IS NULL AND r.response_object = 'gap://' || r.id || '/response'
+                    AND NOT EXISTS (SELECT 1 FROM request_events e WHERE e.request_id = r.id AND e.tenant_id = r.tenant_id AND e.event_kind = 'archive_gap' AND e.error_code = 'response_capture_failed'))
                 THEN 1 ELSE 0 END AS BIGINT) AS response_pending,
              CAST(CASE WHEN
                 q.state IN ('capturing', 'pending', 'uploading')
                 OR s.state IN ('capturing', 'pending', 'uploading')
                 OR (q.request_id IS NULL AND r.request_object = 'gap://' || r.id || '/request')
-                OR (s.request_id IS NULL AND r.response_object = 'gap://' || r.id || '/response')
+                OR (s.request_id IS NULL AND r.response_object = 'gap://' || r.id || '/response'
+                    AND NOT EXISTS (SELECT 1 FROM request_events e WHERE e.request_id = r.id AND e.tenant_id = r.tenant_id AND e.event_kind = 'archive_gap' AND e.error_code = 'response_capture_failed'))
                 THEN 1 ELSE 0 END AS BIGINT) AS archives_pending
              FROM request_records r
              LEFT JOIN request_archive_spools q ON q.request_id = r.id AND q.tenant_id = r.tenant_id AND q.reservation_id = r.reservation_id

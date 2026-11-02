@@ -179,15 +179,54 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
     );
     budget_holder.commit().await.unwrap();
     upstream.verify().await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        state.responses_request_spool.drain_uploads_for_test(),
+    )
+    .await
+    .expect("bounded PostgreSQL request source upload drain");
     state.db.drain_gateway_persistence_for_test().await;
     state.persistence.drain_for_test().await;
 
+    let projection_owner = Uuid::now_v7();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
+            crate::response_archive_spool::process_one_for_test(&state).await;
+            for request_id in state
+                .db
+                .claim_terminal_projection_tasks(projection_owner, 32)
+                .await
+                .unwrap()
+            {
+                assert!(
+                    state
+                        .db
+                        .project_claimed_terminal_projection_task(projection_owner, request_id)
+                        .await
+                        .unwrap()
+                );
+                assert!(
+                    !state
+                        .db
+                        .project_claimed_terminal_projection_task(projection_owner, request_id)
+                        .await
+                        .unwrap()
+                );
+            }
+            for task in state
+                .db
+                .claim_conversation_projection_tasks(projection_owner, 32)
+                .await
+                .unwrap()
+            {
+                crate::worker::archive_session_body(&state, projection_owner, task.request_id)
+                    .await
+                    .unwrap();
+            }
             let outstanding: i64 = sqlx::query_scalar(
                 "SELECT
                    (SELECT COUNT(*) FROM request_archive_spools
-                    WHERE state IN ('capturing', 'pending', 'uploading'))
+                    WHERE state IN ('pending', 'uploading') OR (state = 'capturing' AND cipher_bytes > 0))
                    +
                    (SELECT COUNT(*) FROM response_archive_spools
                     WHERE state IN ('capturing', 'pending', 'uploading'))",
@@ -198,7 +237,6 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
             if outstanding == 0 {
                 break;
             }
-            crate::response_archive_spool::process_one_for_test(&state).await;
             tokio::task::yield_now().await;
         }
     })

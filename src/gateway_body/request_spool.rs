@@ -447,6 +447,24 @@ impl RequestSpoolAdmission {
     pub(crate) fn read_count_for_test(&self) -> usize {
         self.read_count.load(Ordering::Acquire)
     }
+
+    #[cfg(test)]
+    pub(crate) async fn drain_uploads_for_test(&self) {
+        let residents = self
+            .usage
+            .residents
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect::<Vec<_>>();
+        for resident in residents {
+            let writer = resident.durable_write.lock().unwrap().take();
+            if let Some(writer) = writer {
+                writer.await.unwrap();
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -686,15 +704,8 @@ impl Drop for RequestSpool {
         if self.shared.archived.load(Ordering::Acquire) {
             return;
         }
-        // Detach the writer. Aborting it lets a late PutObject land after the
-        // delete and leave a body no request still owns.
-        drop(
-            self.shared
-                .durable_write
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take(),
-        );
+        // Keep the writer alive until it resolves a late PutObject and removes
+        // the unowned object.
         let claimed = self.shared.durable_phase.compare_exchange(
             DURABLE_IN_FLIGHT,
             DURABLE_DROPPED,
@@ -818,24 +829,20 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                 .take();
             if let Some((database, identity)) = owner {
                 let permit = if wrote {
-                    database.try_request_source_completion()
+                    None
                 } else {
                     Some(database.request_source_completion().await)
                 };
                 release_resident_memory(&source);
                 residency.durable_settled.store(true, Ordering::Release);
                 residency.release_if_idle();
-                if let Some(_permit) = permit {
-                    database
-                        .complete_request_source(
-                            identity,
-                            &key,
-                            source.length,
-                            source.digest,
-                            wrote,
-                        )
-                        .await;
-                }
+                let _permit = match permit {
+                    Some(permit) => permit,
+                    None => database.request_source_completion().await,
+                };
+                database
+                    .complete_request_source(identity, &key, source.length, source.digest, wrote)
+                    .await;
                 break;
             }
             if source.source_dropped.load(Ordering::Acquire) {

@@ -2890,6 +2890,15 @@ async fn assert_only_early_request_failures(fixture: &CodexRouteFixture) {
 }
 
 async fn drain_archive_capture(fixture: &CodexRouteFixture) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture
+            .state
+            .responses_request_spool
+            .drain_uploads_for_test(),
+    )
+    .await
+    .expect("bounded request source upload drain");
     fixture.state.db.drain_gateway_persistence_for_test().await;
     fixture.state.persistence.drain_for_test().await;
     let _writers = tokio::time::timeout(
@@ -2913,7 +2922,7 @@ async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         loop {
             let outstanding: i64 = sqlx::query_scalar(
-                "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE state IN ('capturing', 'pending', 'uploading')) + (SELECT COUNT(*) FROM response_archive_spools WHERE state IN ('capturing', 'pending', 'uploading'))",
+                "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE state IN ('pending', 'uploading') OR (state = 'capturing' AND cipher_bytes > 0)) + (SELECT COUNT(*) FROM response_archive_spools WHERE state IN ('capturing', 'pending', 'uploading'))",
             ).fetch_one(&pool).await.unwrap();
             if outstanding == 0 {
                 break;
@@ -4973,8 +4982,6 @@ async fn codex_streaming_route_accepts_headerless_bare_cr_sse_without_byte_drift
 #[tokio::test]
 async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker() {
     let fixture = codex_route_fixture("streaming-archive-recovery").await;
-    std::fs::remove_dir_all(&fixture.archive_path).unwrap();
-    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
     let upstream = MockServer::start().await;
     let sse = completed_codex_sse("archive-independent stream");
     Mock::given(method("POST"))
@@ -5009,6 +5016,29 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
     assert_settlement_once_with_inline_request(&fixture, rows[0].request_id).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let request_bytes = serde_json::to_vec(&original).unwrap();
+    let source = sqlx::query("SELECT state, bound_locator, body_byte_count, body_blake3 FROM request_archive_spools WHERE request_id = $1")
+        .bind(rows[0].request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source.get::<String, _>("state"), "bound");
+    assert_eq!(
+        source.get::<Option<String>, _>("bound_locator").as_deref(),
+        crate::gateway_body::request_spool::request_body_object_key(
+            &rows[0].request_id.to_string()
+        )
+        .as_deref()
+    );
+    assert_eq!(
+        source.get::<i64, _>("body_byte_count"),
+        request_bytes.len() as i64
+    );
+    assert_eq!(
+        source.get::<String, _>("body_blake3"),
+        blake3::hash(&request_bytes).to_hex().to_string()
+    );
     let refs = fixture
         .state
         .db
@@ -5017,7 +5047,10 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
         .unwrap();
     assert_eq!(
         refs.request_object,
-        format!("gap://{}/request", rows[0].request_id)
+        crate::gateway_body::request_spool::request_body_object_key(
+            &rows[0].request_id.to_string()
+        )
+        .unwrap()
     );
     assert_eq!(
         refs.response_object.as_deref(),
@@ -5025,67 +5058,50 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     );
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Bound
     );
     assert_eq!(
         refs.response_archive_state,
         crate::model::RequestArchiveState::Pending
     );
 
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    for (spools, chunks, plaintext, expected_bytes) in [
-        (
-            "request_archive_spools",
-            "request_archive_spool_chunks",
-            "stream now",
-            serde_json::to_vec(&original).unwrap().len() as i64,
-        ),
-        (
-            "response_archive_spools",
-            "response_archive_spool_chunks",
-            "archive-independent stream",
-            sse.len() as i64,
-        ),
-    ] {
-        let spool = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT state, attempts, chunk_count, byte_count FROM {spools} WHERE request_id = $1"
-        )))
+    let response_spool = sqlx::query("SELECT state, attempts, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1")
         .bind(rows[0].request_id.to_string())
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(spool.get::<String, _>("state"), "pending");
-        assert_eq!(spool.get::<i64, _>("attempts"), 0);
-        assert!(spool.get::<i64, _>("chunk_count") > 0);
-        assert_eq!(spool.get::<i64, _>("byte_count"), expected_bytes);
-        let encrypted = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT ciphertext FROM {chunks} WHERE request_id = $1 ORDER BY seq"
-        )))
-        .bind(rows[0].request_id.to_string())
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert!(!encrypted.is_empty());
-        assert!(encrypted.iter().all(|chunk| {
-            let ciphertext = chunk.get::<String, _>("ciphertext");
-            ciphertext.starts_with("v2.") && !ciphertext.contains(plaintext)
-        }));
-    }
-
-    // Exercise a real failed upload, restore the backend, and prove a fresh
-    // worker can bind both staged objects without replaying the request or its
-    // settlement side effects.
-    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
-    let failed_attempts: i64 = sqlx::query_scalar(
-        "SELECT (SELECT SUM(attempts) FROM request_archive_spools WHERE request_id = $1) + (SELECT SUM(attempts) FROM response_archive_spools WHERE request_id = $1)",
+    assert_eq!(response_spool.get::<String, _>("state"), "pending");
+    assert_eq!(response_spool.get::<i64, _>("attempts"), 0);
+    assert!(response_spool.get::<i64, _>("chunk_count") > 0);
+    assert_eq!(response_spool.get::<i64, _>("byte_count"), sse.len() as i64);
+    let encrypted = sqlx::query(
+        "SELECT ciphertext FROM response_archive_spool_chunks WHERE request_id = $1 ORDER BY seq",
     )
     .bind(rows[0].request_id.to_string())
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .unwrap();
+    assert!(!encrypted.is_empty());
+    assert!(encrypted.iter().all(|chunk| {
+        let ciphertext = chunk.get::<String, _>("ciphertext");
+        ciphertext.starts_with("v2.") && !ciphertext.contains("archive-independent stream")
+    }));
+
+    // Preserve the committed source while response uploads cannot reach the
+    // backend, then restore it and bind the response without replaying billing.
+    let saved_archive = fixture.archive_path.with_extension("source-backup");
+    std::fs::rename(&fixture.archive_path, &saved_archive).unwrap();
+    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
+    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
+    let failed_attempts: i64 =
+        sqlx::query_scalar("SELECT attempts FROM response_archive_spools WHERE request_id = $1")
+            .bind(rows[0].request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(failed_attempts, 1);
     std::fs::remove_file(&fixture.archive_path).unwrap();
-    std::fs::create_dir_all(&fixture.archive_path).unwrap();
+    std::fs::rename(saved_archive, &fixture.archive_path).unwrap();
     sqlx::query("UPDATE request_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
         .execute(&pool)
         .await
@@ -5112,10 +5128,10 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
             .await
             .unwrap();
     let tenant_id = Uuid::parse_str(&tenant_id).unwrap();
-    assert!(crate::archive::is_tenant_cas_location(
-        tenant_id,
-        &refs.request_object
-    ));
+    assert_eq!(
+        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
+        Some(rows[0].request_id)
+    );
     assert!(
         refs.response_object
             .as_deref()

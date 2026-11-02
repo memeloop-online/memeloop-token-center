@@ -1,10 +1,132 @@
 use super::*;
 use crate::{
     config::Config,
-    db::{ArchiveSpoolIdentity, Database},
+    db::{ArchiveSpoolIdentity, CreateKeyInput, Database, StartProxyRequest},
     gateway_body::memory::ProxyMemoryBudget,
 };
+use sqlx::Row;
 use std::time::Duration;
+
+#[tokio::test]
+async fn successful_source_completion_waits_for_gateway_persistence_capacity() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("completion.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 4).await.unwrap();
+    database.migrate().await.unwrap();
+    let pool = sqlx::AnyPool::connect(&database_url).await.unwrap();
+    let pepper = b"source-completion-test-pepper-with-more-than-thirty-two-bytes";
+    let issued = database
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: "source-completion".into(),
+                principal_external_id: "member".into(),
+                alias: "source-completion".into(),
+                currency: "USD".into(),
+                policy: crate::model::KeyPolicy::default(),
+                initial_balance: rust_decimal::Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = database
+        .authenticate_key(&issued.key, pepper)
+        .await
+        .unwrap();
+    let price = database
+        .upsert_model_price(
+            "source-completion-model",
+            "USD",
+            rust_decimal::Decimal::ONE,
+            rust_decimal::Decimal::ONE,
+        )
+        .await
+        .unwrap();
+    let store = MemoryObjectStore::new();
+    let release = store.pause_next_write();
+    let admission =
+        RequestSpoolAdmission::new(directory.path().to_owned()).with_memory_store(store);
+    let request_id = uuid::Uuid::now_v7();
+    let body = Bytes::from_static(b"{\"input\":\"retained source\"}");
+    let source = Arc::new(
+        admission
+            .capture_with_memory(
+                Body::from(body.clone()),
+                body.len(),
+                Some(body.len()),
+                None,
+                0,
+                Some(&request_id.to_string()),
+            )
+            .await
+            .unwrap(),
+    );
+    let held = database.saturate_gateway_persistence_for_test().await;
+    database
+        .start_proxy_request_with_source(
+            StartProxyRequest {
+                request_id,
+                key: &key,
+                price: &price,
+                input_token_ceiling: 10,
+                output_token_ceiling: 10,
+                protocol: "openai",
+                model: "source-completion-model",
+                request_object: source.object_locator().unwrap(),
+                upstream_account_id: None,
+                model_route_id: None,
+            },
+            &source,
+            None,
+            Some(10),
+        )
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !source.durable_settled_for_test() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("source upload completes while metadata capacity is occupied");
+    drop(held);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let row = sqlx::query("SELECT state, bound_locator, body_byte_count, body_blake3 FROM request_archive_spools WHERE request_id = $1")
+                .bind(request_id.to_string())
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+            if let Some(row) = row
+                && row.try_get::<String, _>("state").unwrap() == "bound"
+            {
+                assert_eq!(
+                    row.get::<Option<String>, _>("bound_locator").as_deref(),
+                    source.object_locator()
+                );
+                assert_eq!(row.get::<i64, _>("body_byte_count"), body.len() as i64);
+                assert_eq!(
+                    row.get::<String, _>("body_blake3"),
+                    blake3::hash(&body).to_hex().to_string()
+                );
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful source metadata is written after capacity returns");
+    database.drain_gateway_persistence_for_test().await;
+    drop(source);
+    pool.close().await;
+    database.close().await;
+}
 
 #[tokio::test]
 async fn archive_source_survives_request_drop_without_pinning_upload_bytes_on_database() {

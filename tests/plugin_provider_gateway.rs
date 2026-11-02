@@ -594,6 +594,7 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut pending = request_ids.to_vec();
+    let mut archive_event_pending = request_ids.to_vec();
     let mut financial_pending = request_ids.to_vec();
     let mut stream = response.into_body().into_data_stream();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -618,13 +619,19 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
                 else {
                     continue;
                 };
-                if event["event_kind"] == "archive_bound" && event["archive_state"] == "bound" {
+                if event["archive_state"] == "bound" {
                     pending.retain(|candidate| *candidate != request_id);
+                }
+                if event["event_kind"] == "archive_bound" {
+                    archive_event_pending.retain(|candidate| *candidate != request_id);
                 }
                 if event["event_kind"] == "finished" {
                     financial_pending.retain(|candidate| *candidate != request_id);
                 }
-                if pending.is_empty() && financial_pending.is_empty() {
+                if pending.is_empty()
+                    && archive_event_pending.is_empty()
+                    && financial_pending.is_empty()
+                {
                     return;
                 }
             }
@@ -633,6 +640,10 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
     .await
     .expect("plugin requests reached financial completion and bound archives");
     assert!(pending.is_empty(), "missing archive bindings: {pending:?}");
+    assert!(
+        archive_event_pending.is_empty(),
+        "missing archive bound events: {archive_event_pending:?}"
+    );
     assert!(
         financial_pending.is_empty(),
         "missing financial completions: {financial_pending:?}"

@@ -166,9 +166,25 @@ pub(super) fn capture(
             identity, purpose, &body, background.config.key_pepper.as_bytes(),
             background.config.archive_spool_compression_enabled,
         )?;
-        if !db.capture_deferred_archive(&archive).await?
-            && purpose == crate::response_archive_spool::BufferedArchivePurpose::Request {
-            background.metrics.record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity);
+        let captured = if purpose == crate::response_archive_spool::BufferedArchivePurpose::Response {
+            crate::response_archive_spool::retry_capture_database(&background, None, || {
+                db.capture_deferred_archive(&archive)
+            }).await
+        } else {
+            db.capture_deferred_archive(&archive).await
+        };
+        match captured {
+            Ok(false) if purpose == crate::response_archive_spool::BufferedArchivePurpose::Request => {
+                background.metrics.record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity);
+            }
+            Ok(false) => db.fail_response_archive_spool(identity, "capacity").await?,
+            Err(error) => {
+                if purpose == crate::response_archive_spool::BufferedArchivePurpose::Response {
+                    db.fail_response_archive_spool(identity, "capture_failed").await?;
+                }
+                return Err(error);
+            }
+            Ok(true) => {}
         }
         Ok(())
     });

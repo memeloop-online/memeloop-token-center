@@ -7,6 +7,8 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
     for mode in [
         "normal",
         "failure",
+        "response_failure",
+        "response_failure_persistent",
         "saturation",
         "pool_starvation",
         "pool_closed",
@@ -29,11 +31,19 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                 fixture.state.persistence_db.close().await;
             }
             if mode == "failure" {
-                for table in ["request_archive_spools", "response_archive_spools"] {
-                    sqlx::query(sqlx::AssertSqlSafe(format!(
-                        "CREATE TRIGGER reject_{table} BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'archive failure'); END"
-                    ))).execute(&pool).await.unwrap();
-                }
+                sqlx::query("CREATE TRIGGER reject_request_archive_spools BEFORE INSERT ON request_archive_spools BEGIN SELECT RAISE(ABORT, 'archive failure'); END")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            if matches!(
+                mode,
+                "failure" | "response_failure" | "response_failure_persistent"
+            ) {
+                sqlx::query("CREATE TRIGGER reject_response_archive_spools BEFORE INSERT ON response_archive_spools BEGIN SELECT RAISE(ABORT, 'archive failure'); END")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
             } else if mode == "saturation" {
                 for _ in 0..4 {
                     let release = release.clone();
@@ -49,6 +59,15 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                     entering.await.unwrap();
                 }
             }
+            let begin_failure = if matches!(mode, "failure" | "response_failure") {
+                Some(
+                    crate::response_archive_spool::pause_next_begin_failure_for_test(
+                        &fixture.state,
+                    ),
+                )
+            } else {
+                None
+            };
             let upstream = MockServer::start().await;
             let request = json!({"model": fixture.model, "input": "isolation", "stream": stream});
             Mock::given(method("POST"))
@@ -74,6 +93,15 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                     .unwrap()
                     .contains("forwarding stays available")
             );
+            let release_begin_failure = if let Some((entered, release)) = begin_failure {
+                tokio::time::timeout(Duration::from_secs(3), entered)
+                    .await
+                    .expect("response spool begin must report its database failure")
+                    .unwrap();
+                Some(release)
+            } else {
+                None
+            };
             if mode == "saturation" {
                 assert!(
                     fixture
@@ -94,6 +122,15 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                 .unwrap();
             assert_eq!(rows.len(), 1);
             assert_settlement_once_with_inline_request(&fixture, rows[0].request_id).await;
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                fixture
+                    .state
+                    .responses_request_spool
+                    .drain_uploads_for_test(),
+            )
+            .await
+            .expect("request source upload must finish independently of response metadata");
             match mode {
                 "normal" | "saturation" | "pool_starvation" => {
                     assert_exactly_once_side_effects(
@@ -103,21 +140,129 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                     )
                     .await;
                 }
-                "failure" => {
-                    for table in ["request_archive_spools", "response_archive_spools"] {
-                        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER reject_{table}")))
+                "failure" | "response_failure" => {
+                    assert!(
+                        fixture
+                            .state
+                            .db
+                            .session_body_locators(rows[0].request_id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .pending
+                    );
+                    let failed_refs = fixture
+                        .state
+                        .db
+                        .request_archive_refs(fixture.key_id, rows[0].request_id)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        failed_refs.response_archive_state,
+                        crate::model::RequestArchiveState::Gap
+                    );
+                    if mode == "response_failure" {
+                        assert_eq!(
+                            failed_refs.request_archive_state,
+                            crate::model::RequestArchiveState::Bound
+                        );
+                    }
+                    if mode == "failure" {
+                        gateway_persistence::assert_readable_source_without_spool(
+                            &fixture,
+                            &pool,
+                            rows[0].request_id,
+                            &request,
+                        )
+                        .await;
+                        sqlx::query("DROP TRIGGER reject_request_archive_spools")
                             .execute(&pool)
                             .await
                             .unwrap();
                     }
+                    sqlx::query("DROP TRIGGER reject_response_archive_spools")
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                    release_begin_failure.unwrap().send(()).unwrap();
                     fixture.state.db.drain_gateway_persistence_for_test().await;
-                    gateway_persistence::assert_readable_source_without_spool(
+                    assert_exactly_once_side_effects(
                         &fixture,
-                        &pool,
                         rows[0].request_id,
-                        &request,
+                        Some("resp-codex"),
                     )
                     .await;
+                    let refs = fixture
+                        .state
+                        .db
+                        .request_archive_refs(fixture.key_id, rows[0].request_id)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        refs.request_archive_state,
+                        crate::model::RequestArchiveState::Bound
+                    );
+                    assert_eq!(
+                        refs.response_archive_state,
+                        crate::model::RequestArchiveState::Bound
+                    );
+                    let captured = fixture
+                        .state
+                        .archive
+                        .get(refs.response_object.as_deref().unwrap())
+                        .await
+                        .unwrap();
+                    let expected = if stream {
+                        Bytes::from(completed_codex_sse("forwarding stays available"))
+                    } else {
+                        delivered.clone()
+                    };
+                    assert_eq!(captured, expected);
+                    assert_eq!(blake3::hash(&captured), blake3::hash(&expected));
+                    assert_eq!(
+                        fixture
+                            .state
+                            .archive
+                            .get(&refs.request_object)
+                            .await
+                            .unwrap()
+                            .as_ref(),
+                        serde_json::to_vec(&request).unwrap().as_slice()
+                    );
+                }
+                "response_failure_persistent" => {
+                    drain_archive_capture(&fixture).await;
+                    let gaps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE request_id = $1 AND event_kind = 'archive_gap' AND error_code = 'response_capture_failed'")
+                        .bind(rows[0].request_id.to_string())
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                    assert_eq!(gaps, 1);
+                    assert!(
+                        !fixture
+                            .state
+                            .db
+                            .session_body_locators(rows[0].request_id)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .pending
+                    );
+                    assert_settlement_once_with_inline_request(&fixture, rows[0].request_id).await;
+                    let refs = fixture
+                        .state
+                        .db
+                        .request_archive_refs(fixture.key_id, rows[0].request_id)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        refs.request_archive_state,
+                        crate::model::RequestArchiveState::Bound
+                    );
+                    assert_eq!(
+                        refs.response_archive_state,
+                        crate::model::RequestArchiveState::Gap
+                    );
                     assert_exactly_once_side_effects(
                         &fixture,
                         rows[0].request_id,
@@ -132,11 +277,14 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                         .request_archive_refs(fixture.key_id, rows[0].request_id)
                         .await
                         .unwrap();
-                    assert!(matches!(
+                    assert_eq!(
                         refs.request_archive_state,
-                        crate::model::RequestArchiveState::Pending
-                            | crate::model::RequestArchiveState::Gap
-                    ));
+                        crate::model::RequestArchiveState::Bound
+                    );
+                    assert_eq!(
+                        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
+                        Some(rows[0].request_id)
+                    );
                     assert!(matches!(
                         refs.response_archive_state,
                         crate::model::RequestArchiveState::Pending

@@ -328,6 +328,11 @@ static PAUSE_NEXT_BEGIN: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
 #[cfg(test)]
+static PAUSE_NEXT_BEGIN_FAILURE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, BeginAckPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
 pub(crate) fn pause_next_begin_for_test(
     state: &AppState,
 ) -> (
@@ -350,6 +355,38 @@ pub(crate) fn pause_next_begin_for_test(
 #[cfg(test)]
 async fn pause_begin_for_test(state: &AppState) {
     let pause = PAUSE_NEXT_BEGIN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&state.config.database_url);
+    if let Some((entered, released)) = pause {
+        let _ = entered.send(());
+        let _ = released.await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pause_next_begin_failure_for_test(
+    state: &AppState,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered, entering) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let mut pauses = PAUSE_NEXT_BEGIN_FAILURE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        pauses
+            .insert(state.config.database_url.clone(), (entered, released))
+            .is_none()
+    );
+    (entering, release)
+}
+
+#[cfg(test)]
+async fn pause_begin_failure_for_test(state: &AppState) {
+    let pause = PAUSE_NEXT_BEGIN_FAILURE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .remove(&state.config.database_url);
@@ -610,7 +647,9 @@ impl ResponseArchiveProducer {
         state: &AppState,
         identity: ArchiveSpoolIdentity,
     ) -> Result<ResponseArchiveWriter, AppError> {
-        ResponseArchiveWriter::begin_inner(state.clone(), identity).await
+        ResponseArchiveWriter::begin_inner(state.clone(), identity)
+            .await?
+            .ok_or(AppError::internal("producer_begin_for_test_1"))
     }
 
     pub(crate) fn append(&mut self, chunks: Vec<Bytes>) -> bool {
@@ -709,7 +748,7 @@ impl ResponseArchiveWriter {
     async fn begin_inner(
         state: AppState,
         identity: ArchiveSpoolIdentity,
-    ) -> Result<Self, AppError> {
+    ) -> Result<Option<Self>, AppError> {
         let compression_enabled = state.config.archive_spool_compression_enabled;
         if !observe_writer_database(
             identity,
@@ -719,9 +758,9 @@ impl ResponseArchiveWriter {
         )
         .await?
         {
-            return Err(AppError::internal("producer_begin_inner_1"));
+            return Ok(None);
         }
-        Ok(Self {
+        Ok(Some(Self {
             state,
             identity,
             compression_enabled,
@@ -730,7 +769,7 @@ impl ResponseArchiveWriter {
             append_attempts: 0,
             append_wait: std::time::Duration::ZERO,
             max_append_wait: std::time::Duration::ZERO,
-        })
+        }))
     }
 
     async fn append_chunks(&mut self, chunks: Vec<QueuedArchiveChunk>) -> Result<(), AppError> {
@@ -894,6 +933,38 @@ enum WriterOutcome {
     Abandoned,
 }
 
+// The existing capture owner retains its bounded body/queue reservation while
+// database admission recovers. Semantic rejection remains a successful return
+// value and does not enter this retry loop.
+pub(crate) async fn retry_capture_database<T, F, Fut>(
+    _state: &AppState,
+    active: Option<&AtomicBool>,
+    mut operation: F,
+) -> Result<T, AppError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, AppError>>,
+{
+    let mut attempt = 0_u32;
+    loop {
+        match operation().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                attempt += 1;
+                #[cfg(test)]
+                pause_begin_failure_for_test(_state).await;
+                if attempt >= 8 || active.is_some_and(|active| !active.load(Ordering::Acquire)) {
+                    return Err(error);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    25_u64 << (attempt - 1).min(4),
+                ))
+                .await;
+            }
+        }
+    }
+}
+
 async fn run_response_archive_writer(
     state: AppState,
     identity: ArchiveSpoolIdentity,
@@ -903,7 +974,11 @@ async fn run_response_archive_writer(
 ) -> Result<WriterOutcome, AppError> {
     #[cfg(test)]
     pause_begin_for_test(&state).await;
-    let mut writer = ResponseArchiveWriter::begin_inner(state.clone(), identity).await?;
+    let mut writer = retry_capture_database(&state, Some(&active), || {
+        ResponseArchiveWriter::begin_inner(state.clone(), identity)
+    })
+    .await?
+    .ok_or(AppError::internal("producer_begin_inner_1"))?;
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
     while let Some(first) = receiver.recv().await {
