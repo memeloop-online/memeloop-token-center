@@ -1,16 +1,13 @@
 //! Read-only classification of definite HTTP 429 rejection, never a supplier
 //! retry or quota reset. SSE failures do not establish that execution was free.
 use super::super::super::*;
-use crate::db::UpstreamFailureKind;
+use crate::db::{SupplierQuotaEvidence, UpstreamFailureKind};
 use futures_util::{StreamExt, stream};
 
 const MAX_BODY: usize = 64 * 1024;
 const MAX_CHUNKS: usize = 256;
-const MAX_COOLDOWN: i64 = 7 * 24 * 60 * 60 * 1_000;
-const UNKNOWN_RESET_COOLDOWN: i64 = 15 * 60 * 1_000;
-
 fn bounded_future(deadline: i64, now: i64) -> Option<i64> {
-    (deadline > now).then(|| deadline.min(now.saturating_add(MAX_COOLDOWN)))
+    (deadline > now).then_some(deadline)
 }
 
 fn retry_after(headers: &HeaderMap, now: i64) -> Option<i64> {
@@ -26,13 +23,29 @@ fn retry_after(headers: &HeaderMap, now: i64) -> Option<i64> {
     }
     if value.bytes().all(|byte| byte.is_ascii_digit()) {
         let seconds: i64 = value.parse().ok()?;
-        return bounded_future(now.saturating_add(seconds.saturating_mul(1_000)), now);
+        return bounded_future(now.checked_add(seconds.checked_mul(1_000)?)?, now);
     }
     let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
     bounded_future(date.timestamp_millis(), now)
 }
 
 fn classify(headers: &HeaderMap, body: Option<&[u8]>, now: i64) -> UpstreamFailureKind {
+    let evidence = quota_evidence(headers, body, now);
+    match (evidence.exhausted, evidence.reset_at) {
+        (false, None) => UpstreamFailureKind::RateLimited,
+        (exhausted, deadline) => UpstreamFailureKind::RateLimitedUntil {
+            exhausted,
+            // Diagnostic compatibility only. Durable evidence retains None.
+            until: deadline.unwrap_or(0),
+        },
+    }
+}
+
+pub(in crate::api::proxy) fn quota_evidence(
+    headers: &HeaderMap,
+    body: Option<&[u8]>,
+    now: i64,
+) -> SupplierQuotaEvidence {
     let header_deadline = retry_after(headers, now);
     let value = body.and_then(|body| crate::api::sse::parse_unique_json(body).ok());
     let error = value.as_ref().and_then(|value| {
@@ -55,16 +68,19 @@ fn classify(headers: &HeaderMap, body: Option<&[u8]>, now: i64) -> UpstreamFailu
                     .and_then(Value::as_i64)
                     .filter(|seconds| *seconds > 0)
                     .and_then(|seconds| {
-                        bounded_future(now.saturating_add(seconds.saturating_mul(1_000)), now)
+                        bounded_future(now.checked_add(seconds.checked_mul(1_000)?)?, now)
                     })
             })
     });
     let deadline = header_deadline.into_iter().chain(reset).max();
-    match (error.is_some(), deadline) {
-        (false, None) => UpstreamFailureKind::RateLimited,
-        (exhausted, deadline) => UpstreamFailureKind::RateLimitedUntil {
-            exhausted,
-            until: deadline.unwrap_or_else(|| now.saturating_add(UNKNOWN_RESET_COOLDOWN)),
+    SupplierQuotaEvidence {
+        exhausted: error.is_some(),
+        reset_at: deadline,
+        reset_source: match (header_deadline, reset) {
+            (Some(header), Some(reset)) if reset > header => "provider_reset",
+            (Some(_), _) => "retry_after",
+            (_, Some(_)) => "provider_reset",
+            _ => "unknown",
         },
     }
 }
@@ -72,8 +88,16 @@ fn classify(headers: &HeaderMap, body: Option<&[u8]>, now: i64) -> UpstreamFailu
 pub(in crate::api::proxy) async fn classify_rate_limit(
     response: UpstreamResponse,
 ) -> (UpstreamResponse, UpstreamFailureKind) {
+    let (response, kind, _) = classify_supplier_quota(response).await;
+    (response, kind)
+}
+
+pub(in crate::api::proxy) async fn classify_supplier_quota(
+    response: UpstreamResponse,
+) -> (UpstreamResponse, UpstreamFailureKind, SupplierQuotaEvidence) {
     if response.status() != StatusCode::TOO_MANY_REQUESTS {
-        return (response, UpstreamFailureKind::RateLimited);
+        let evidence = quota_evidence(response.headers(), None, unix_millis());
+        return (response, UpstreamFailureKind::RateLimited, evidence);
     }
     let mut parts = response.into_parts();
     let mut prefix = Vec::new();
@@ -115,11 +139,9 @@ pub(in crate::api::proxy) async fn classify_rate_limit(
     let complete = tokio::time::timeout_at(deadline, read)
         .await
         .unwrap_or(false);
-    let kind = classify(
-        &parts.headers,
-        complete.then_some(body.as_slice()),
-        unix_millis(),
-    );
+    let now = unix_millis();
+    let kind = classify(&parts.headers, complete.then_some(body.as_slice()), now);
+    let evidence = quota_evidence(&parts.headers, complete.then_some(body.as_slice()), now);
     // Preserve the entire original stream including errors and unread suffix.
     // No secret error JSON enters logs, metrics, health rows or new archives.
     let response = UpstreamResponse::Prefetched {
@@ -129,7 +151,7 @@ pub(in crate::api::proxy) async fn classify_rate_limit(
         content_length: parts.content_length,
         stream: Box::pin(stream::iter(prefix).chain(parts.stream)),
     };
-    (response, kind)
+    (response, kind, evidence)
 }
 
 #[cfg(test)]
@@ -137,6 +159,43 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn unknown_malformed_and_duplicate_resets_remain_unknown() {
+        let mut headers = HeaderMap::new();
+        let exhausted = br#"{"error":{"type":"usage_limit_reached","resets_at":"tomorrow","resets_in_seconds":-3}}"#;
+        for value in ["", "-1", "garbage", "9999999999999999999999999999"] {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            let evidence = quota_evidence(&headers, Some(exhausted), NOW);
+            assert!(evidence.exhausted);
+            assert_eq!(evidence.reset_at, None);
+            assert_eq!(evidence.reset_source, "unknown");
+        }
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("120"));
+        let evidence = quota_evidence(&headers, Some(exhausted), NOW);
+        assert_eq!(evidence.reset_at, Some(NOW + 120_000));
+        assert_eq!(evidence.reset_source, "retry_after");
+        headers.append(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        assert_eq!(
+            quota_evidence(&headers, Some(exhausted), NOW).reset_at,
+            None
+        );
+        let evidence = quota_evidence(
+            &HeaderMap::new(),
+            Some(br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":42}}"#),
+            NOW,
+        );
+        assert_eq!(evidence.reset_at, Some(NOW + 42_000));
+        assert_eq!(evidence.reset_source, "provider_reset");
+        assert!(
+            !quota_evidence(
+                &HeaderMap::new(),
+                Some(br#"{"error":{"type":"rate_limit_error"}}"#),
+                NOW
+            )
+            .exhausted
+        );
+    }
 
     #[test]
     fn exact_exhaustion_reset_and_header_are_bounded_and_distinct_from_throttling() {
@@ -150,7 +209,6 @@ mod tests {
                 r#"{"type":"usage_limit_reached","resets_in_seconds":123}"#,
                 123,
             ),
-            (r#"{"error":{"type":"usage_limit_reached"}}"#, 900),
         ] {
             assert_eq!(
                 classify(&headers, Some(body.as_bytes()), NOW),
@@ -177,7 +235,7 @@ mod tests {
             classify(&headers, None, NOW),
             UpstreamFailureKind::RateLimitedUntil {
                 exhausted: false,
-                until: NOW + MAX_COOLDOWN
+                until: NOW + 999999999000
             }
         );
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("-1"));

@@ -114,8 +114,6 @@ pub(crate) async fn admit(
     {
         return Err(AppError::Forbidden);
     }
-    // A customer generation uses the selected account. Its success refreshes
-    // service availability through the same attempt terminal as a proxy send.
     Ok(MediaAttemptGuard::new(
         state,
         request_id,

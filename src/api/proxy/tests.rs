@@ -67,6 +67,7 @@ mod shutdown_durability;
 mod soonest_reset;
 mod source_r2;
 mod sse_delivery;
+mod supplier_quota;
 mod upstream_error_details;
 
 fn pinned_request_envelope_changed(

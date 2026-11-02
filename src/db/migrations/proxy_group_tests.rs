@@ -147,6 +147,7 @@ async fn upgrade_contract(database: &Database) {
         "DROP TABLE transport_proxy_management_audit",
         "DROP TABLE transport_proxy_management_lock",
         "DROP TABLE upstream_service_probes",
+        "DROP TABLE upstream_supplier_availability",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)
@@ -293,14 +294,20 @@ async fn upgrade_contract(database: &Database) {
         "network_proxy_group_members",
         "network_proxy_selection_policies",
         "network_proxy_attempt_signals",
+        "plugin_background_action_grants",
+        "upstream_supplier_availability",
     ] {
         let count: i64 =
             sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
                 .fetch_one(&database.pool)
                 .await
                 .unwrap();
-        assert_eq!(count, 0, "{table} rebuilt by migration 150");
+        assert_eq!(count, 0, "{table} rebuilt by migrations 148 through 150");
     }
+    sqlx::query("SELECT result_json, last_attempt_json, last_attempt_at, actual_model, credential_generation, transport_revision FROM upstream_service_probes LIMIT 1")
+        .fetch_optional(&database.pool)
+        .await
+        .unwrap();
     sqlx::query("SELECT members_normalized FROM transport_proxy_groups LIMIT 1")
         .fetch_optional(&database.pool)
         .await
@@ -392,7 +399,8 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148, 150, 151
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148, 149,
+                150, 151
             ]
         );
     }

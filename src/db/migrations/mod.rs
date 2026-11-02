@@ -783,6 +783,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/common/0148_plugin_background_actions.sql"),
     },
     Migration {
+        version: 149,
+        name: "scoped supplier availability and independent probe provenance",
+        sql: include_str!("../../../migrations/common/0149_scoped_supplier_availability.sql"),
+    },
+    Migration {
         version: 150,
         name: "first class network proxies",
         sql: include_str!("../../../migrations/common/0150_network_proxies.sql"),
@@ -1552,6 +1557,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 148,
         name: "account-scoped plugin background action authority",
         sql: include_str!("../../../migrations/common/0148_plugin_background_actions.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "scoped supplier availability and independent probe provenance",
+        sql: include_str!("../../../migrations/common/0149_scoped_supplier_availability.sql"),
     },
     Migration {
         version: 150,
