@@ -17,11 +17,11 @@ pub(super) fn prepare_component(
     manifest: &PluginManifest,
     component: Option<&Component>,
 ) -> Result<Option<PreparedGroupRouting>, AppError> {
-    if !manifest
+    if manifest
         .contributions
         .group_routing
         .as_ref()
-        .is_some_and(|routing| routing.allocation_context.is_some())
+        .is_none_or(|routing| routing.allocation_context.is_none())
     {
         return Ok(None);
     }

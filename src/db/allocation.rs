@@ -346,6 +346,46 @@ mod tests {
             .unwrap();
         assert!(usage.iter().all(|row| row.hour >= midnight / HOUR_MS - 23));
         assert!(usage.iter().any(|row| row.requests >= 90));
+        let concurrent_tenant = Uuid::now_v7();
+        let mut committed = 0_i64;
+        for index in 0..16 {
+            let request = Uuid::now_v7();
+            let projection_time = now + index * 5001;
+            let (projection, reservation) = tokio::join!(
+                second.refresh_allocation_usage(concurrent_tenant, Uuid::nil(), projection_time),
+                restarted.allocation_reserve(concurrent_tenant, None, request, None, ("a", 1), now),
+            );
+            if matches!(reservation, Ok(true)) {
+                committed += 1;
+            }
+            let ledger: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM group_allocation_reservations WHERE tenant_id=$1",
+            )
+            .bind(concurrent_tenant.to_string())
+            .fetch_one(&restarted.pool)
+            .await
+            .unwrap();
+            let pending:i64=sqlx::query_scalar("SELECT CAST(COALESCE(SUM(requests),0) AS BIGINT) FROM group_allocation_pending WHERE tenant_id=$1")
+                .bind(concurrent_tenant.to_string()).fetch_one(&restarted.pool).await.unwrap();
+            assert_eq!(ledger, committed);
+            assert_eq!(
+                pending,
+                ledger,
+                "snapshot refresh and existing-session append preserve exact pending counts; refresh_ok={}",
+                projection.is_ok()
+            );
+        }
+        restarted
+            .refresh_allocation_usage(concurrent_tenant, Uuid::nil(), now + 100000)
+            .await
+            .unwrap();
+        let pending:i64=sqlx::query_scalar("SELECT CAST(COALESCE(SUM(requests),0) AS BIGINT) FROM group_allocation_pending WHERE tenant_id=$1")
+            .bind(concurrent_tenant.to_string()).fetch_one(&restarted.pool).await.unwrap();
+        assert_eq!(pending, committed);
+        assert!(
+            committed > 0,
+            "at least one concurrent old-session count commits"
+        );
         let backlog_tenant = Uuid::now_v7();
         sqlx::query("WITH RECURSIVE sequence(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<25000) INSERT INTO group_allocation_reservations(tenant_id,request_id,account_id,session_key,generation,created_at) SELECT $1,CAST(n AS TEXT),'a','',1,$2 FROM sequence")
             .bind(backlog_tenant.to_string()).bind(now).execute(&restarted.pool).await.unwrap();
