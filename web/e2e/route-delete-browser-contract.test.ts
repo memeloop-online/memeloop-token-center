@@ -22,7 +22,7 @@ test('route deletion permanently removes configuration and explains retained his
     const confirmation = page.getByRole('dialog');
     await confirmation.getByText(/永久删除路由 saved-route 的配置/).waitFor();
     await confirmation.getByText(/历史请求和费用记录保留/).waitFor();
-    await confirmation.getByRole('button', { name: '删除', exact: true }).click();
+    await confirmation.getByRole('button', { name: '确认继续', exact: true }).click();
     await page.getByText('路由配置已删除，历史请求和费用记录保留', { exact: true }).waitFor();
     assert.deepEqual(await page.evaluate(() => window.routeScopeDeletes), [{
       path: '/internal/v1/model-routes/existing-route',
