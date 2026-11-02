@@ -61,6 +61,9 @@ impl Reservation {
                 preferred,
             });
         }
+        if input.quota_context.is_none() {
+            return Err(AppError::internal("allocation_quota_context_unavailable"));
+        }
         let revision = state.db.allocation_revision(tenant).await?;
         let identities: BTreeMap<_, _> = input
             .candidates

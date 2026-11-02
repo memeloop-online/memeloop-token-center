@@ -1,6 +1,6 @@
 //! Shared request reservations, session affinity and compact hourly history.
 use super::{AppError, Database, DatabaseBackend};
-use sqlx::{Any, Row};
+use sqlx::Row;
 use uuid::Uuid;
 
 pub(crate) const HOUR_MS: i64 = 3_600_000;
@@ -166,32 +166,20 @@ impl Database {
         if accounts.is_empty() {
             return Ok(Vec::new());
         }
-        let mut query = sqlx::QueryBuilder::<Any>::new(
-            "SELECT account_id,hour_bucket,CAST(SUM(requests) AS BIGINT) AS requests,CAST(SUM(tokens) AS BIGINT) AS tokens FROM (SELECT account_id,hour_bucket,requests,tokens FROM group_allocation_usage WHERE tenant_id=",
+        let placeholders = (3..accounts.len() + 3)
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT account_id,hour_bucket,CAST(SUM(requests) AS BIGINT) AS requests,CAST(SUM(tokens) AS BIGINT) AS tokens FROM (SELECT account_id,hour_bucket,requests,tokens FROM group_allocation_usage WHERE tenant_id=$1 AND hour_bucket>=$2 AND account_id IN ({placeholders}) UNION ALL SELECT account_id,hour_bucket,requests,CAST(0 AS BIGINT) AS tokens FROM group_allocation_pending WHERE tenant_id=$1 AND hour_bucket>=$2 AND account_id IN ({placeholders})) AS history GROUP BY account_id,hour_bucket"
         );
-        query
-            .push_bind(tenant.to_string())
-            .push(" AND hour_bucket>=")
-            .push_bind(now / HOUR_MS - 23)
-            .push(" AND account_id IN (");
-        {
-            let mut list = query.separated(",");
-            for account in accounts {
-                list.push_bind(account);
-            }
-            list.push_unseparated(")");
-        }
-        query.push(" UNION ALL SELECT account_id,hour_bucket,requests,CAST(0 AS BIGINT) AS tokens FROM group_allocation_pending WHERE tenant_id=")
-            .push_bind(tenant.to_string()).push(" AND hour_bucket>=").push_bind(now/HOUR_MS-23).push(" AND account_id IN (");
-        {
-            let mut list = query.separated(",");
-            for account in accounts {
-                list.push_bind(account);
-            }
-            list.push_unseparated(") ) AS history GROUP BY account_id,hour_bucket");
+        let mut query = sqlx::query(&sql)
+            .bind(tenant.to_string())
+            .bind(now / HOUR_MS - 23);
+        for account in accounts {
+            query = query.bind(account);
         }
         Ok(query
-            .build()
             .fetch_all(&self.pool)
             .await?
             .into_iter()

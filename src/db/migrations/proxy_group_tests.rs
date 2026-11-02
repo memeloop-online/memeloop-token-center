@@ -108,6 +108,11 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     for statement in [
+        "DROP TABLE group_allocation_pending",
+        "DROP TABLE group_allocation_reservations",
+        "DROP TABLE group_allocation_sessions",
+        "DROP TABLE group_allocation_usage",
+        "DROP TABLE group_allocation_revisions",
         "DROP TABLE plugin_background_action_grants",
         "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
         "DROP TABLE proxy_operational_terminals",
