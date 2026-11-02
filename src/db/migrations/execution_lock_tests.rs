@@ -36,10 +36,7 @@ impl Fixture {
             include_str!("../../../migrations/common/0106_archive_budget_reservations.sql"),
             include_str!("../../../migrations/common/0112_request_archive_gap_evidence.sql"),
         ] {
-            sqlx::raw_sql(source)
-                .execute(&database.pool)
-                .await
-                .unwrap();
+            sqlx::raw_sql(source).execute(&database.pool).await.unwrap();
         }
         Some(Self {
             database,
