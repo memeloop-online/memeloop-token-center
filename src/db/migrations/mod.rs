@@ -1781,6 +1781,11 @@ pub(super) async fn apply_migration_range(
             continue;
         }
         if migration.version == 143 && transaction.as_mut().backend_name() == "PostgreSQL" {
+            if last >= 146 && migrations.iter().any(|pending| pending.version == 146) {
+                sqlx::query("LOCK TABLE request_records IN SHARE MODE NOWAIT")
+                    .execute(&mut **transaction)
+                    .await?;
+            }
             sqlx::query(
                 "LOCK TABLE request_archive_spools, response_archive_spools, response_archive_spool_budget, archive_budget_reservations IN ACCESS EXCLUSIVE MODE NOWAIT",
             )
