@@ -574,7 +574,11 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     );
     assert!(authority_a.pin_historical(1).await.is_err());
     assert!(authority_a.stage("a").await.is_err());
-    assert!(second.refresh_application_plugins().await.is_err());
+    second.refresh_application_plugins().await.unwrap();
+    assert!(Arc::ptr_eq(
+        &warm_other,
+        &authority_b.current_snapshot().unwrap().unwrap()
+    ));
     let retained = second.clone().pin_application_plugins().await.unwrap();
     assert_policy(&retained, false).await;
     assert_provider_phases(&retained, false).await;
