@@ -1943,7 +1943,7 @@ async fn postgres_route_then_catalog_keeps_missing_custom_bound_unknown() {
 }
 
 #[tokio::test]
-async fn kimi_builtin_sync_retires_old_models_and_repeats_the_same_catalog() {
+async fn kimi_builtin_sync_permanently_removes_old_models_and_repeats_the_same_catalog() {
     let (state, _directory) = state("kimi-current-catalog").await;
     let tenant = "kimi-current-catalog";
     let account = state
@@ -2049,16 +2049,7 @@ async fn kimi_builtin_sync_retires_old_models_and_repeats_the_same_catalog() {
         .into_iter()
         .collect()
     );
-    let disabled = snapshots[0]["disabled_models"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|model| {
-            assert_eq!(model["reason"], "removed_from_upstream");
-            model["id"].as_str().unwrap()
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(disabled, retired.into_iter().collect());
+    assert_eq!(snapshots[0]["disabled_models"], json!([]));
     let (status, readback) = request(
         &state,
         "GET",
@@ -2071,6 +2062,19 @@ async fn kimi_builtin_sync_retires_old_models_and_repeats_the_same_catalog() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(readback["models"], snapshots[1]["models"]);
     assert_eq!(readback["disabled_models"], snapshots[1]["disabled_models"]);
+    let observer = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    let retired_disabled_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_model_catalog_disabled \
+         WHERE upstream_account_id = $1 AND protocol IN ('openai', 'anthropic') \
+           AND model_id IN ('kimi-k2', 'kimi-k2-thinking', 'kimi-k2.5', 'kimi-k2.6')",
+    )
+    .bind(account.id.to_string())
+    .fetch_one(&observer)
+    .await
+    .unwrap();
+    assert_eq!(retired_disabled_rows, 0);
 }
 
 #[tokio::test]

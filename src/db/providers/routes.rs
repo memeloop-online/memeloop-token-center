@@ -396,7 +396,7 @@ impl Database {
     ) -> Result<(), AppError> {
         let mut tx = self.begin_write_transaction().await?;
         let tenant_id = sqlx::query(
-            "SELECT r.tenant_id FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL",
+            "SELECT r.tenant_id FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)

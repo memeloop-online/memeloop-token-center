@@ -60,6 +60,235 @@ fn route_from(value: Value) -> ModelRouteView {
     serde_json::from_value(value).unwrap()
 }
 
+async fn exercise_archived_route_delete_preserving_history(state: &AppState, tenant: &str) {
+    let pepper = state.config.key_pepper.as_bytes();
+    let upstream = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant.into(),
+                name: "archived-delete-history".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url": "https://upstream.example.test"}),
+                credential: UpstreamCredential::ApiKey {
+                    value: "not-a-real-secret".into(),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let key = state
+        .db
+        .create_key(
+            CreateKeyInput {
+                tenant_external_id: tenant.into(),
+                principal_external_id: "archived-delete-member".into(),
+                alias: "archived-delete-history".into(),
+                currency: "USD".into(),
+                policy: KeyPolicy {
+                    allowed_models: vec!["*".into()],
+                    ..KeyPolicy::default()
+                },
+                initial_balance: Decimal::ONE,
+                idempotency_key: None,
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let authenticated_key = state.db.authenticate_key(&key.key, pepper).await.unwrap();
+    let service = state
+        .db
+        .create_service_token(
+            CreateServiceTokenInput {
+                name: "archived-delete-manager".into(),
+                scopes: vec!["routes:read".into(), "routes:write".into()],
+                tenant_external_id: Some(tenant.into()),
+            },
+            pepper,
+        )
+        .await
+        .unwrap();
+    let route = state
+        .db
+        .create_model_route(CreateModelRouteInput {
+            tenant_external_id: tenant.into(),
+            public_model: "archived-delete-public".into(),
+            upstream_account_id: upstream.id,
+            upstream_model: "archived-delete-upstream".into(),
+            protocol: "openai".into(),
+            priority: 0,
+        })
+        .await
+        .unwrap();
+    let price = state
+        .db
+        .upsert_model_price("archived-delete-public", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let reservation = state
+        .db
+        .reserve_usage(&authenticated_key, &price, 11, 7)
+        .await
+        .unwrap();
+    let request_id = Uuid::now_v7();
+    state
+        .db
+        .record_request_started(NewRequest {
+            request_id,
+            key_id: authenticated_key.key_id,
+            tenant_id: authenticated_key.tenant_id,
+            protocol: "openai-chat".into(),
+            model: "archived-delete-public".into(),
+            request_object: "inline-json:{}".into(),
+            reservation_id: reservation.id,
+            upstream_account_id: Some(upstream.id),
+            model_route_id: Some(route.id),
+        })
+        .await
+        .unwrap();
+    let cost = state.db.settle_usage(&reservation, 11, 7).await.unwrap();
+    state
+        .db
+        .record_request_finished(FinishRequest {
+            first_output_ms: None,
+            generation_duration_ms: None,
+            request_id,
+            status_code: 200,
+            duration_ms: 42,
+            input_tokens: 11,
+            cached_input_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 7,
+            service_tier: None,
+            cost_micros: cost,
+            error_code: None,
+            response_object: "inline-json:{}".into(),
+        })
+        .await
+        .unwrap();
+    let route = state
+        .db
+        .set_model_route_enabled(route.id, tenant, false, route.updated_at)
+        .await
+        .unwrap();
+    let (status, _) = json_request(
+        state,
+        "POST",
+        &format!("/internal/v1/model-routes/{}/archive", route.id),
+        &service.token,
+        Some(json!({
+            "tenant_external_id": tenant,
+            "expected_updated_at": route.updated_at
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let archived_path = format!(
+        "/internal/v1/archived-model-routes/{}?tenant_external_id={tenant}",
+        route.id
+    );
+    let (status, audit) = json_request(state, "GET", &archived_path, &service.token, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let archived_version = audit["archived_at"].as_i64().unwrap();
+    let delete_path = format!(
+        "/internal/v1/model-routes/{}?tenant_external_id={tenant}&expected_updated_at=",
+        route.id
+    );
+    let (status, _) = json_request(
+        state,
+        "DELETE",
+        &format!("{delete_path}{}", archived_version - 1),
+        &service.token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    for _ in 0..2 {
+        let (status, _) = json_request(
+            state,
+            "DELETE",
+            &format!("{delete_path}{archived_version}"),
+            &service.token,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let observer = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
+    let remaining_route: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM model_routes WHERE id = $1")
+            .bind(route.id.to_string())
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+    assert_eq!(remaining_route, 0);
+    let history = state
+        .db
+        .list_requests(authenticated_key.key_id, 20)
+        .await
+        .unwrap();
+    let historical = history
+        .iter()
+        .find(|request| request.request_id == request_id)
+        .unwrap();
+    assert_eq!(historical.route_id, Some(route.id));
+    assert_eq!(historical.input_tokens, 11);
+    assert_eq!(historical.output_tokens, 7);
+    assert!(!historical.cost.is_empty());
+    let stored_history: (String, i64, i64) = sqlx::query_as(
+        "SELECT model_route_id, input_tokens + output_tokens, cost_micros FROM request_records WHERE id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&observer)
+    .await
+    .unwrap();
+    assert_eq!(stored_history, (route.id.to_string(), 18, cost));
+    let stored_settlement: (String, i64) =
+        sqlx::query_as("SELECT status, actual_micros FROM usage_reservations WHERE id = $1")
+            .bind(reservation.id.to_string())
+            .fetch_one(&observer)
+            .await
+            .unwrap();
+    assert_eq!(stored_settlement, ("settled".into(), cost));
+    let (status, _) = json_request(state, "GET", &archived_path, &service.token, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn sqlite_archived_route_delete_preserves_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("archived-route-delete.db").display()
+    );
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    exercise_archived_route_delete_preserving_history(&state, "archived-delete-sqlite").await;
+}
+
+#[tokio::test]
+async fn postgres_archived_route_delete_preserves_history() {
+    let Ok(database_url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        eprintln!("skipping PostgreSQL archived route deletion: MTC_TEST_POSTGRES_URL is unset");
+        return;
+    };
+    let state = AppState::initialize(Config::for_test(database_url))
+        .await
+        .unwrap();
+    let tenant = format!("archived-delete-postgres-{}", Uuid::now_v7());
+    exercise_archived_route_delete_preserving_history(&state, &tenant).await;
+}
+
 #[tokio::test]
 async fn route_mutations_are_scoped_optimistic_idempotent_and_history_safe() {
     let directory = tempfile::tempdir().unwrap();

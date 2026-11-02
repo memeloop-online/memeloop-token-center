@@ -3894,9 +3894,9 @@ paths:
     delete:
       tags: [Routes and pricing]
       operationId: deleteModelRoute
-      summary: Delete disabled route configuration while preserving history
+      summary: Delete disabled or archived route configuration while preserving history
       description: |
-        The route must first be disabled. Deletion removes the live configuration,
+        The route must first be disabled. Deletion removes active or archived configuration,
         grants and memberships. Request and financial snapshots retain their original
         route UUID, model, account, usage and cost and do not require a configuration
         foreign key. A stale `expected_updated_at` or enabled route returns 409. A
