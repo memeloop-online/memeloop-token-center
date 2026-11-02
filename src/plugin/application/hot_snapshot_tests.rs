@@ -276,19 +276,29 @@ async fn background_refresh_timeout_keeps_serving_verified_snapshot() {
     publish(&authority, "a", 0).await;
     authority.refresh_current().await.unwrap();
     let original = authority.current_snapshot().unwrap().unwrap();
-    let _cache = authority.snapshots.lock().await;
-    tokio::time::pause();
+    let cache = authority.snapshots.lock().await;
+    let (waiting, entered) = tokio::sync::oneshot::channel();
+    *authority.snapshot_cache_waiting.lock().unwrap() = Some(waiting);
     let refresh = authority.refresh_current();
     tokio::pin!(refresh);
+    tokio::select! {
+        result = refresh.as_mut() => panic!("refresh completed before waiting for the held snapshot cache: {result:?}"),
+        result = entered => result.unwrap(),
+    }
+    tokio::time::pause();
     assert!(futures_util::poll!(refresh.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(46)).await;
-    assert!(matches!(
-        refresh.await,
-        Err(AppError::Capacity {
-            code: "plugin_snapshot_refresh_timeout",
-            ..
-        })
-    ));
+    let result = refresh.await;
+    assert!(
+        matches!(
+            &result,
+            Err(AppError::Capacity {
+                code: "plugin_snapshot_refresh_timeout",
+                ..
+            })
+        ),
+        "unexpected refresh result: {result:?}"
+    );
     assert!(Arc::ptr_eq(
         &original,
         &authority.current_snapshot().unwrap().unwrap()
@@ -298,6 +308,14 @@ async fn background_refresh_timeout_keeps_serving_verified_snapshot() {
         authority.refresh_status()["error"],
         "snapshot_refresh_failed"
     );
+    drop(cache);
+    tokio::time::resume();
+    authority.refresh_current().await.unwrap();
+    assert_eq!(authority.refresh_status()["error"], serde_json::Value::Null);
+    assert!(Arc::ptr_eq(
+        &original,
+        &authority.current_snapshot().unwrap().unwrap()
+    ));
 }
 
 #[tokio::test]
