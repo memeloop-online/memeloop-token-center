@@ -400,6 +400,18 @@ impl Database {
         .bind(snapshot_id.to_string())
         .execute(&mut *transaction)
         .await?;
+        if driver == "kimi-oauth" && source_kind == "kimi_builtin" {
+            sqlx::query(
+                "DELETE FROM upstream_model_catalog_disabled \
+                 WHERE tenant_id = $1 AND upstream_account_id = $2 \
+                   AND protocol IN ('openai', 'anthropic') \
+                   AND model_id IN ('kimi-k2', 'kimi-k2-thinking', 'kimi-k2.5', 'kimi-k2.6')",
+            )
+            .bind(&tenant_id)
+            .bind(account_id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        }
 
         // Once discovery has confirmed a custom association, its availability
         // belongs to the catalog. Include the previous snapshot so the first

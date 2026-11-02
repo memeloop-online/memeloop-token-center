@@ -1458,7 +1458,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     if (route.enabled || !await confirm(t('routes.confirmDelete', { model: route.public_model }))) return;
     setBusy(route.id); setMessage(''); setError('');
     try {
-      await api(`/internal/v1/model-routes/${route.id}/archive`, token, { method: 'POST', body: JSON.stringify({ tenant_external_id: writeTenant, expected_updated_at: route.updated_at }) });
+      const query = new URLSearchParams({ tenant_external_id: writeTenant, expected_updated_at: String(route.updated_at) });
+      await api(`/internal/v1/model-routes/${route.id}?${query}`, token, { method: 'DELETE' });
       setEditing(undefined); setMessage(t('routes.deleted')); await load();
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
