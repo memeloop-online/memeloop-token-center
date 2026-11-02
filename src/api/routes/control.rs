@@ -173,6 +173,11 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(poll_cursor_oauth),
         )
         .route(
+            "/internal/v1/plugins/{plugin_id}/background-actions/{account_id}",
+            get(super::super::plugin_background_actions::get)
+                .put(super::super::plugin_background_actions::put),
+        )
+        .route(
             "/internal/v1/upstreams",
             get(list_upstreams).post(create_upstream),
         )
