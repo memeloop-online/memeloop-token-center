@@ -784,8 +784,23 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 149,
+        name: "scoped supplier availability and independent probe provenance",
+        sql: include_str!("../../../migrations/common/0149_scoped_supplier_availability.sql"),
+    },
+    Migration {
+        version: 150,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0150_network_proxies.sql"),
+    },
+    Migration {
+        version: 151,
+        name: "transport proxy member indices without four member limit",
+        sql: include_str!("../../../migrations/common/0151_transport_proxy_member_indices.sql"),
+    },
+    Migration {
+        version: 152,
         name: "group allocation usage projection",
-        sql: include_str!("../../../migrations/common/0149_group_allocation_usage.sql"),
+        sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
     },
 ];
 
@@ -1550,8 +1565,23 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 149,
+        name: "scoped supplier availability and independent probe provenance",
+        sql: include_str!("../../../migrations/common/0149_scoped_supplier_availability.sql"),
+    },
+    Migration {
+        version: 150,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0150_network_proxies.sql"),
+    },
+    Migration {
+        version: 151,
+        name: "transport proxy member indices without four member limit",
+        sql: include_str!("../../../migrations/common/0151_transport_proxy_member_indices.sql"),
+    },
+    Migration {
+        version: 152,
         name: "group allocation usage projection",
-        sql: include_str!("../../../migrations/common/0149_group_allocation_usage.sql"),
+        sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
     },
 ];
 

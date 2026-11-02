@@ -33,7 +33,6 @@ fn configuration_is_bounded_private_and_redacted() {
     assert!(TransportProxyGroups::parse("[]", KEY).is_ok());
     for proxies in [
         vec![],
-        vec![PRIMARY; 5],
         vec![PRIMARY, PRIMARY],
         vec!["socks5h://public.example:1080"],
         vec!["socks5://10.20.30.41:1080"],
@@ -107,6 +106,17 @@ fn selection_and_failover_need_no_database_or_queue() {
 
 #[test]
 fn packed_generation_and_epoch_cannot_wrap_into_an_old_ticket() {
+    let wide = Snapshot {
+        credential_generation: u32::MAX,
+        epoch: MAX_EPOCH,
+        base: 1024,
+        selected: 2048,
+    };
+    let decoded = Snapshot::decode(wide.encode().unwrap());
+    assert_eq!(decoded.credential_generation, wide.credential_generation);
+    assert_eq!(decoded.epoch, wide.epoch);
+    assert_eq!(decoded.base, wide.base);
+    assert_eq!(decoded.selected, wide.selected);
     let account_id = Uuid::nil();
     let groups = groups(account_id, 1);
     let source = credential();
@@ -162,6 +172,8 @@ fn request_local_exclusion_visits_untried_members_without_changing_global_sticki
         BACKUP,
         "socks5h://10.20.30.42:1080",
         "socks5h://10.20.30.43:1080",
+        "socks5h://10.20.30.44:1080",
+        "socks5h://10.20.30.45:1080",
     ];
     let groups = TransportProxyGroups::parse(
         &serde_json::json!([{
@@ -174,12 +186,12 @@ fn request_local_exclusion_visits_untried_members_without_changing_global_sticki
     let source = credential();
     let global = groups.select(account_id, 1, &source).unwrap();
     let mut attempted = Vec::new();
-    for (index, proxy) in proxies.into_iter().enumerate() {
+    for (index, proxy) in proxies.iter().copied().enumerate() {
         let mut selected = groups.select(account_id, 1, &source).unwrap();
         assert!(selected.select_unattempted(&attempted).unwrap());
         assert_eq!(selected.member(), Some(index));
         assert_eq!(selected.member_index(), Some(index));
-        assert_eq!(selected.member_count(), 4);
+        assert_eq!(selected.member_count(), proxies.len());
         assert_eq!(selected.group_selection_version(), Some(1));
         assert_eq!(selected.generation, global.generation);
         assert_eq!(selected.credential.proxy().unwrap().0, proxy);
@@ -539,7 +551,14 @@ async fn delayed_postgres_bootstrap_loads_managed_cache_without_blocking_cached_
     isolated_url.set_port(Some(address.port())).unwrap();
     let cached_account_id = Uuid::new_v4();
     let runtime = Arc::new(groups(cached_account_id, 1));
-    runtime.start(isolated_url.as_str()).unwrap();
+    runtime
+        .start(
+            isolated_url.as_str(),
+            crate::plugin::PluginRuntime::default(),
+            #[cfg(feature = "experimental-plugin-revisions")]
+            None,
+        )
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(5), receive)
         .await
         .unwrap()

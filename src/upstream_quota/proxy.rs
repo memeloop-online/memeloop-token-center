@@ -14,6 +14,13 @@ impl Routes {
     pub(super) async fn from_selection(
         mut selection: ProxySelection,
     ) -> Result<Self, &'static str> {
+        #[cfg(test)]
+        if super::r2_tests::fixture_url(USAGE_URL).is_some() {
+            return Ok(Self(vec![Route {
+                proxy_url: None,
+                egress: None,
+            }]));
+        }
         let mut routes = Vec::new();
         let mut attempted = Vec::new();
         loop {

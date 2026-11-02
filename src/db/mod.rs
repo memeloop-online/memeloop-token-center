@@ -107,15 +107,17 @@ mod session_titles;
 pub(crate) use session_titles::{
     SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
 };
+pub(crate) mod network_proxies;
 mod tenants;
-mod transport_proxy_groups;
+pub(crate) mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
 pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
-mod upstream_service_probes;
+pub(crate) mod upstream_service_probes;
+pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
 mod usage_analysis;
 mod validation;
 

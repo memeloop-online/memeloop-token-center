@@ -196,19 +196,44 @@ impl Database {
         protocol: &str,
         selection: RouteSelectionOptions,
     ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
+        self.list_upstream_candidates_for_dispatch(
+            key_id,
+            tenant_id,
+            public_model,
+            protocol,
+            selection,
+            false,
+        )
+        .await
+    }
+
+    /// Recovery pins may inspect unavailable candidates, but still pass the
+    /// same active account, grants, materialization and credential checks.
+    pub(crate) async fn list_upstream_candidates_for_dispatch(
+        &self,
+        key_id: Uuid,
+        tenant_id: Uuid,
+        public_model: &str,
+        protocol: &str,
+        selection: RouteSelectionOptions,
+        recovery_probe: bool,
+    ) -> Result<Vec<AuthorizedUpstreamCandidate>, AppError> {
         let RouteSelectionOptions {
             upstream_account_hint,
             avoid_route_account,
             selection_seed,
         } = selection;
-        // Only an unhealthy probe sorts last. A healthy result and a missing
-        // probe share a rank so configured priority still chooses; excluding
-        // a non-healthy account made the probe unable to reach it again.
+        // Availability is read in the existing candidate snapshot, never by a
+        // remote probe or a new per-attempt health query.
         let rows = sqlx::query(
              "SELECT r.id AS route_id, r.priority, candidates.scheduling_weight,
                      a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                      a.credential_generation,
                      CAST(CASE
+                       WHEN (quota.reset_at > $6 OR
+                             (quota.reset_at IS NULL AND quota.failure_kind = 'quota_exhausted'))
+                         OR (legacy.cooldown_until > $6 AND legacy.last_failure_kind IN ('quota_exhausted', 'rate_limited'))
+                         THEN 2
                        WHEN service_probe.status = 'unhealthy' THEN 1
                        ELSE 0
                      END AS BIGINT) AS probe_rank
@@ -218,6 +243,15 @@ impl Database {
              JOIN upstream_accounts a ON a.id = candidates.upstream_account_id AND a.tenant_id = r.tenant_id
              LEFT JOIN upstream_service_probes service_probe
                ON service_probe.upstream_account_id = a.id
+              AND service_probe.credential_generation = a.credential_generation
+              AND service_probe.transport_revision = a.updated_at
+              AND service_probe.actual_model = candidates.upstream_model
+             LEFT JOIN upstream_supplier_availability quota
+               ON quota.upstream_account_id = a.id AND quota.upstream_model = candidates.upstream_model
+              AND quota.credential_generation = a.credential_generation AND quota.transport_revision = a.updated_at
+             LEFT JOIN upstream_account_health legacy
+               ON legacy.upstream_account_id = a.id AND legacy.credential_generation = a.credential_generation
+              AND legacy.transport_revision = a.updated_at
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND r.archived_at IS NULL AND a.status = 'active'
                AND (
@@ -238,6 +272,7 @@ impl Database {
         .bind(protocol)
         .bind(key_id.to_string())
         .bind(PROXY_ROUTING_POLICY.candidate_query_limit())
+        .bind(unix_millis())
         .fetch_all(&self.pool)
         .await?;
         let rows = if rows.is_empty() {
@@ -263,6 +298,9 @@ impl Database {
         let mut candidates = BTreeMap::<(Uuid, Uuid), RoutingCandidate>::new();
         for row in rows {
             let candidate = RoutingCandidate::from_row(row)?;
+            if !recovery_probe && candidate.probe_rank == 2 {
+                continue;
+            }
             let key = (candidate.route_id, candidate.account_id);
             match candidates.get(&key) {
                 Some(existing) if existing.scheduling_weight >= candidate.scheduling_weight => {}
@@ -321,6 +359,10 @@ impl Database {
                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                     a.credential_generation,
                     CAST(CASE
+                      WHEN (quota.reset_at > $6 OR
+                            (quota.reset_at IS NULL AND quota.failure_kind = 'quota_exhausted'))
+                        OR (legacy.cooldown_until > $6 AND legacy.last_failure_kind IN ('quota_exhausted', 'rate_limited'))
+                        THEN 2
                       WHEN service_probe.status = 'unhealthy' THEN 1
                       ELSE 0
                     END AS BIGINT) AS probe_rank
@@ -343,6 +385,15 @@ impl Database {
               AND a.status = 'active'
              LEFT JOIN upstream_service_probes service_probe
                ON service_probe.upstream_account_id = a.id
+              AND service_probe.credential_generation = a.credential_generation
+              AND service_probe.transport_revision = a.updated_at
+              AND service_probe.actual_model = r.upstream_model
+             LEFT JOIN upstream_supplier_availability quota
+               ON quota.upstream_account_id = a.id AND quota.upstream_model = r.upstream_model
+              AND quota.credential_generation = a.credential_generation AND quota.transport_revision = a.updated_at
+             LEFT JOIN upstream_account_health legacy
+               ON legacy.upstream_account_id = a.id AND legacy.credential_generation = a.credential_generation
+              AND legacy.transport_revision = a.updated_at
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND r.archived_at IS NULL
                AND (
@@ -363,6 +414,7 @@ impl Database {
         .bind(protocol)
         .bind(limit)
         .bind(key_id.to_string())
+        .bind(unix_millis())
         .fetch_all(&self.pool)
         .await?;
         if !configured.is_empty() {
@@ -378,6 +430,10 @@ impl Database {
                     a.id AS account_id, a.driver, a.updated_at AS transport_revision,
                     a.credential_generation,
                     CAST(CASE
+                      WHEN (quota.reset_at > $6 OR
+                            (quota.reset_at IS NULL AND quota.failure_kind = 'quota_exhausted'))
+                        OR (legacy.cooldown_until > $6 AND legacy.last_failure_kind IN ('quota_exhausted', 'rate_limited'))
+                        THEN 2
                       WHEN service_probe.status = 'unhealthy' THEN 1
                       ELSE 0
                     END AS BIGINT) AS probe_rank
@@ -388,6 +444,15 @@ impl Database {
               AND a.status = 'active'
              LEFT JOIN upstream_service_probes service_probe
                ON service_probe.upstream_account_id = a.id
+              AND service_probe.credential_generation = a.credential_generation
+              AND service_probe.transport_revision = a.updated_at
+              AND service_probe.actual_model = r.upstream_model
+             LEFT JOIN upstream_supplier_availability quota
+               ON quota.upstream_account_id = a.id AND quota.upstream_model = r.upstream_model
+              AND quota.credential_generation = a.credential_generation AND quota.transport_revision = a.updated_at
+             LEFT JOIN upstream_account_health legacy
+               ON legacy.upstream_account_id = a.id AND legacy.credential_generation = a.credential_generation
+              AND legacy.transport_revision = a.updated_at
              WHERE r.tenant_id = $1 AND r.public_model = $2 AND r.protocol = $3
                AND r.enabled = 1 AND r.archived_at IS NULL
                AND (
@@ -408,6 +473,7 @@ impl Database {
         .bind(protocol)
         .bind(limit)
         .bind(key_id.to_string())
+        .bind(unix_millis())
         .fetch_all(&self.pool)
         .await
         .map_err(AppError::from)
@@ -1019,7 +1085,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_authorized_set_still_dispatches_and_success_clears_probe() {
+    async fn empty_authorized_set_still_dispatches_without_rewriting_probe() {
         let directory = tempfile::tempdir().unwrap();
         let database = Database::connect(&format!(
             "sqlite://{}?mode=rwc",
@@ -1135,7 +1201,6 @@ mod tests {
             "a granted route still dispatches when catalog eligibility is empty"
         );
         assert_eq!(found[0].account_id, account.id);
-        database.note_service_available(account.id).await;
         let status: String = sqlx::query_scalar(
             "SELECT status FROM upstream_service_probes WHERE upstream_account_id = $1",
         )
@@ -1143,7 +1208,7 @@ mod tests {
         .fetch_one(&database.pool)
         .await
         .unwrap();
-        assert_eq!(status, "healthy");
+        assert_eq!(status, "unhealthy");
         sqlx::query("UPDATE upstream_accounts SET status = 'disabled' WHERE id = $1")
             .bind(account.id.to_string())
             .execute(&database.pool)
