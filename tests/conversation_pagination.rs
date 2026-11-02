@@ -1508,6 +1508,30 @@ async fn out_of_order_explicit_session_merges_without_reversing_ancestry() {
         ..ConversationHints::default()
     };
     let future_request = fixture.start_request("memory://future-full-context").await;
+    let compacted_request = fixture
+        .start_request("memory://older-compacted-context")
+        .await;
+    let older_observed_at = chrono::Utc::now().timestamp_millis();
+    let future_observed_at = older_observed_at + 60_000;
+    // Native ancestry follows request admission time. Apply the later request's
+    // observation first while keeping both source timestamps consistent.
+    for (request_id, created_at) in [
+        (future_request, future_observed_at),
+        (compacted_request, older_observed_at),
+    ] {
+        for statement in [
+            "UPDATE request_records SET created_at = $1 WHERE id = $2",
+            "UPDATE request_record_locators SET created_at = $1 WHERE id = $2",
+        ] {
+            let updated = sqlx::query(statement)
+                .bind(created_at)
+                .bind(request_id.to_string())
+                .execute(&fixture.pool)
+                .await
+                .expect("set source admission time");
+            assert_eq!(updated.rows_affected(), 1);
+        }
+    }
     let future_cluster = fixture
         .state
         .db
@@ -1525,11 +1549,6 @@ async fn out_of_order_explicit_session_merges_without_reversing_ancestry() {
         .await
         .expect("record future full-context observation");
 
-    // Archive rows are applied in completed-at order but observations use the
-    // source started-at timestamp. Model that inversion explicitly: the row
-    // already present in the database occurred after the observation that will
-    // be recorded next.
-    let future_observed_at = chrono::Utc::now().timestamp_millis() + 60_000;
     sqlx::query("UPDATE conversation_observations SET created_at = $1 WHERE request_id = $2")
         .bind(future_observed_at)
         .bind(future_request.to_string())
@@ -1537,9 +1556,6 @@ async fn out_of_order_explicit_session_merges_without_reversing_ancestry() {
         .await
         .expect("move first observation into the source-time future");
 
-    let compacted_request = fixture
-        .start_request("memory://older-compacted-context")
-        .await;
     let compacted_cluster = fixture
         .state
         .db
@@ -1560,6 +1576,22 @@ async fn out_of_order_explicit_session_merges_without_reversing_ancestry() {
         )
         .await
         .expect("record older compacted observation after future row");
+    sqlx::query("UPDATE conversation_observations SET created_at = $1 WHERE request_id = $2")
+        .bind(older_observed_at)
+        .bind(compacted_request.to_string())
+        .execute(&fixture.pool)
+        .await
+        .expect("set older observation source time");
+
+    let consistent_source_times: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_observations o JOIN request_records r ON r.id = o.request_id JOIN request_record_locators l ON l.id = o.request_id WHERE o.created_at = r.created_at AND o.created_at = l.created_at AND (o.request_id = $1 OR o.request_id = $2)",
+    )
+    .bind(future_request.to_string())
+    .bind(compacted_request.to_string())
+    .fetch_one(&fixture.pool)
+    .await
+    .expect("verify source admission and observation times");
+    assert_eq!(consistent_source_times, 2);
 
     assert_eq!(
         compacted_cluster, future_cluster,

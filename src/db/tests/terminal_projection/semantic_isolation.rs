@@ -48,10 +48,10 @@ async fn recovery_contract(database_url: &str) {
     });
     let reject_payload = match database.backend {
         DatabaseBackend::Sqlite => {
-            "CREATE TRIGGER reject_semantic_payload BEFORE INSERT ON conversation_semantic_payloads BEGIN SELECT RAISE(ABORT, 'injected payload failure'); END;"
+            "CREATE TRIGGER reject_semantic_payload BEFORE INSERT ON conversation_projection_outbox BEGIN SELECT RAISE(ABORT, 'injected payload failure'); END;"
         }
         DatabaseBackend::PostgreSql => {
-            "CREATE FUNCTION reject_semantic_payload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected payload failure'; END $$; CREATE TRIGGER reject_semantic_payload BEFORE INSERT ON conversation_semantic_payloads FOR EACH ROW EXECUTE FUNCTION reject_semantic_payload();"
+            "CREATE FUNCTION reject_semantic_payload() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected payload failure'; END $$; CREATE TRIGGER reject_semantic_payload BEFORE INSERT ON conversation_projection_outbox FOR EACH ROW EXECUTE FUNCTION reject_semantic_payload();"
         }
     };
     sqlx::raw_sql(reject_payload)
@@ -73,7 +73,7 @@ async fn recovery_contract(database_url: &str) {
     let drop_payload = match database.backend {
         DatabaseBackend::Sqlite => "DROP TRIGGER reject_semantic_payload",
         DatabaseBackend::PostgreSql => {
-            "DROP TRIGGER reject_semantic_payload ON conversation_semantic_payloads; DROP FUNCTION reject_semantic_payload();"
+            "DROP TRIGGER reject_semantic_payload ON conversation_projection_outbox; DROP FUNCTION reject_semantic_payload();"
         }
     };
     sqlx::raw_sql(drop_payload)
@@ -88,6 +88,35 @@ async fn recovery_contract(database_url: &str) {
         database.finish_proxy_request_deferred(input).await.unwrap(),
         FinishProxyRequestResult::AlreadyFinished { .. }
     ));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1"
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap(),
+        0,
+        "new terminal enqueues must not duplicate dialogue in legacy payload storage"
+    );
+    // Legacy retries still recover a payload after source deletion. New
+    // terminal enqueues intentionally keep only bounded inline JSON.
+    let encoded = body.to_string();
+    let mut digest = blake3::Hasher::new_derive_key("MTC conversation semantic payload v1");
+    for value in [
+        request_id.to_string(),
+        key.tenant_id.to_string(),
+        key.key_id.to_string(),
+        key.principal_id.to_string(),
+        encoded.clone(),
+    ] {
+        digest.update(&(value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7)")
+        .bind(request_id.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string())
+        .bind(key.principal_id.to_string()).bind(encoded.len() as i64)
+        .bind(digest.finalize().to_hex().to_string()).bind(&encoded).execute(&database.pool).await.unwrap();
     let payload = sqlx::query("SELECT request_json, encoded_bytes, digest FROM conversation_semantic_payloads WHERE request_id = $1")
         .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
     let encoded: String = payload.get("request_json");

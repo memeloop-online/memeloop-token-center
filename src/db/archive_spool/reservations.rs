@@ -16,11 +16,6 @@ pub(crate) struct ArchiveBudgetReservation {
 }
 
 impl ArchiveBudgetReservation {
-    pub(super) fn recover_refund_on_expiry(&self) {
-        self.released
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-    }
-
     pub(super) async fn consume(
         &self,
         tx: &mut Transaction<'_, Any>,
@@ -102,6 +97,7 @@ impl Database {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn reserve_deferred_archive_capacity(
         &self,
         archive: &crate::response_archive_spool::BufferedArchive<'_>,

@@ -115,6 +115,9 @@ fn connection_builder(limits: ServerLimits) -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
+        // A completed upload may end with a write FIN while authentication or
+        // response generation is still pending. Preserve the response side.
+        .half_close(true)
         .timer(TokioTimer::new())
         .header_read_timeout(limits.header_read_timeout)
         .max_headers(limits.max_http1_headers)
@@ -407,6 +410,53 @@ mod tests {
             .unwrap();
         });
         (address, shutdown_sender, task)
+    }
+
+    #[tokio::test]
+    async fn completed_http1_upload_write_fin_preserves_response_and_recovery() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        // Queue the complete request and FIN before the server accepts it.
+        client.shutdown().await.unwrap();
+        let (shutdown, receive) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            serve(
+                listener,
+                Router::new().route("/", get(|| async { "ok" })),
+                async {
+                    let _ = receive.await;
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert!(response.ends_with(b"ok"), "{response:?}");
+
+        let mut healthy = TcpStream::connect(address).await.unwrap();
+        healthy
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        response.clear();
+        tokio::time::timeout(Duration::from_secs(1), healthy.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+        assert!(response.ends_with(b"ok"), "{response:?}");
+        let _ = shutdown.send(());
+        task.await.unwrap();
     }
 
     #[tokio::test]

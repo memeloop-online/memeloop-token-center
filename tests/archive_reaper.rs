@@ -436,7 +436,14 @@ async fn bound_and_exactly_referenced_attempts_are_never_deleted() {
 #[tokio::test]
 async fn object_failures_release_the_lease_and_persist_fixed_retry_codes() {
     let fixture = Fixture::new(ArchiveBackend::Memory).await;
-    let lease = fixture.make_attempt(Uuid::now_v7(), Uuid::now_v7()).await;
+    // Generic cleanup must use reclaimable debris; proxy request bodies remain
+    // protected until their conversation archive commits.
+    let lease = fixture
+        .make_attempt_with_owner(
+            ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+            Uuid::now_v7(),
+        )
+        .await;
     fixture
         .database
         .abandon_archive_staging_attempt(&lease)
@@ -483,7 +490,14 @@ async fn object_failures_release_the_lease_and_persist_fixed_retry_codes() {
 #[tokio::test]
 async fn a_long_generation_task_does_not_block_the_independent_reaper() {
     let fixture = Fixture::new(ArchiveBackend::Memory).await;
-    let lease = fixture.make_attempt(Uuid::now_v7(), Uuid::now_v7()).await;
+    // Generic cleanup must use reclaimable debris; proxy request bodies remain
+    // protected until their conversation archive commits.
+    let lease = fixture
+        .make_attempt_with_owner(
+            ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+            Uuid::now_v7(),
+        )
+        .await;
     fixture
         .database
         .abandon_archive_staging_attempt(&lease)
@@ -523,7 +537,14 @@ async fn reaper_loop_stops_cleanly_on_shutdown() {
 #[tokio::test]
 async fn shutdown_cancels_a_blocked_store_pass_without_finalizing_its_lease() {
     let fixture = Fixture::new(ArchiveBackend::Memory).await;
-    let lease = fixture.make_attempt(Uuid::now_v7(), Uuid::now_v7()).await;
+    // Generic cleanup must use reclaimable debris; proxy request bodies remain
+    // protected until their conversation archive commits.
+    let lease = fixture
+        .make_attempt_with_owner(
+            ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+            Uuid::now_v7(),
+        )
+        .await;
     fixture
         .database
         .abandon_archive_staging_attempt(&lease)

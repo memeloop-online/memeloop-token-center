@@ -163,7 +163,7 @@ async fn oauth_only_provider_rejects_raw_oauth_on_the_direct_creation_api() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"]["code"], "invalid_request");
     assert!(
-        error["error"]["message"]
+        error["error"]["message_en"]
             .as_str()
             .is_some_and(|message| message.contains("authorization flow"))
     );
@@ -466,7 +466,14 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .await
             .unwrap();
         let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-        assert!(refs.request_object.starts_with(&cas_prefix));
+        // The request locator retains the canonical captured JSON source.
+        assert_eq!(
+            refs.request_object,
+            format!(
+                "staging/proxy/{0}/request/{0}/body.json",
+                request.request_id
+            )
+        );
         let response_object = refs.response_object.as_deref().unwrap();
         assert!(response_object.starts_with(&cas_prefix));
         let archived_request = state
@@ -587,6 +594,7 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut pending = request_ids.to_vec();
+    let mut archive_event_pending = request_ids.to_vec();
     let mut financial_pending = request_ids.to_vec();
     let mut stream = response.into_body().into_data_stream();
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -611,13 +619,19 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
                 else {
                     continue;
                 };
-                if event["event_kind"] == "archive_bound" && event["archive_state"] == "bound" {
+                if event["archive_state"] == "bound" {
                     pending.retain(|candidate| *candidate != request_id);
+                }
+                if event["event_kind"] == "archive_bound" {
+                    archive_event_pending.retain(|candidate| *candidate != request_id);
                 }
                 if event["event_kind"] == "finished" {
                     financial_pending.retain(|candidate| *candidate != request_id);
                 }
-                if pending.is_empty() && financial_pending.is_empty() {
+                if pending.is_empty()
+                    && archive_event_pending.is_empty()
+                    && financial_pending.is_empty()
+                {
                     return;
                 }
             }
@@ -626,6 +640,10 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
     .await
     .expect("plugin requests reached financial completion and bound archives");
     assert!(pending.is_empty(), "missing archive bindings: {pending:?}");
+    assert!(
+        archive_event_pending.is_empty(),
+        "missing archive bound events: {archive_event_pending:?}"
+    );
     assert!(
         financial_pending.is_empty(),
         "missing financial completions: {financial_pending:?}"

@@ -536,17 +536,9 @@ async function seedThroughHttp(): Promise<SeedState> {
     },
   });
 
-  await requestJson('/v1/chat/completions', {
-    method: 'POST', credential: client.key,
-    body: {
-      model,
-      messages: [{ role: 'user', content: 'Create one observable browser test request.' }],
-      max_tokens: 32,
-    },
-  });
-  // This is browser workflow coverage, not SQLite write-concurrency coverage.
-  // Sequential traffic prevents a temporary SQLite finalizer from outliving a slow shared runner.
-  for (let requestNumber = 2; requestNumber <= 50; requestNumber += 1) {
+  // HTTP delivery precedes background accounting. Observe each committed
+  // terminal before the next seed request consumes a concurrency reservation.
+  for (let requestNumber = 1; requestNumber <= 50; requestNumber += 1) {
     await requestJson('/v1/chat/completions', {
       method: 'POST', credential: client.key,
       body: {
@@ -555,6 +547,17 @@ async function seedThroughHttp(): Promise<SeedState> {
         max_tokens: 32,
       },
     });
+    await eventually(async () => {
+      const requests = await requestJson<Array<{
+        completed_at: number | null;
+        status_code: number | null;
+      }>>('/self/v1/requests?limit=100', { credential: client.key });
+      assert.equal(requests.length, requestNumber);
+      for (const request of requests) {
+        assert.notEqual(request.completed_at, null);
+        assert.equal(request.status_code, 200);
+      }
+    }, 10_000, `browser seed request ${requestNumber} did not commit accounting`);
   }
   const failed = await fetch(new URL('/v1/chat/completions', baseURL), {
     method: 'POST',

@@ -3919,9 +3919,24 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
     let stored_reference = response_refs
         .response_object
         .as_deref()
-        .expect("encrypted provider reference");
-    assert!(!stored_reference.contains("must-not-leak"));
-    assert!(!stored_reference.contains("SECRET_TOKEN"));
+        .expect("plain JSON provider reference");
+    let provider_reference: Value = serde_json::from_str(
+        stored_reference
+            .strip_prefix("provider-reference-json:")
+            .expect("typed provider reference"),
+    )
+    .expect("readable production provider reference JSON");
+    assert_eq!(
+        provider_reference["assets"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        provider_reference["assets"][0]["url"],
+        format!(
+            "{}/generated/SECRET_TOKEN.png?token=must-not-leak",
+            world.mock.as_ref().expect("mock server").uri()
+        )
+    );
     let detail = world
         .client
         .get(format!(
@@ -3934,6 +3949,8 @@ async fn openai_url_image_is_archived(world: &mut TokenCenterWorld) {
         .expect("URL-backed image request detail");
     assert_eq!(detail.status(), StatusCode::OK);
     let detail: Value = detail.json().await.expect("URL-backed image detail JSON");
+    assert!(!detail.to_string().contains("must-not-leak"));
+    assert!(!detail.to_string().contains("SECRET_TOKEN"));
     let rendered = detail["response_body"].to_string();
     assert!(!rendered.contains("must-not-leak"));
     assert!(!rendered.contains("objects/blake3/"));
@@ -7314,7 +7331,10 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .await
         .expect("authenticate test key");
     let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-    assert!(refs.request_object.starts_with(&cas_prefix));
+    assert_eq!(
+        refs.request_object,
+        format!("staging/proxy/{request_uuid}/request/{request_uuid}/body.json")
+    );
     let response_object = refs.response_object.expect("response object");
     assert!(response_object.starts_with(&cas_prefix));
 }
@@ -8039,6 +8059,12 @@ async fn own_conversation_detail(world: &TokenCenterWorld) -> Value {
         .expect("conversation detail JSON")
 }
 
+// Production 61d defers projection for 5 seconds when archive upload is not
+// ready, and polls projection every second. Permit two normal deferral rounds
+// plus their polling ticks; all projection/lineage assertions remain required.
+const CONVERSATION_ARCHIVE_PROJECTION_DEADLINE: Duration =
+    Duration::from_millis(2 * 5_000 + 2 * 1_000);
+
 async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expected: usize) {
     let key_id = world
         .stable_key_id
@@ -8058,7 +8084,7 @@ async fn wait_for_projected_conversation_requests(world: &TokenCenterWorld, expe
 
     let mut stream = response.bytes_stream();
     let mut projected = std::collections::HashSet::new();
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(CONVERSATION_ARCHIVE_PROJECTION_DEADLINE, async {
         let mut frame = String::new();
         while let Some(chunk) = stream.next().await {
             frame.push_str(&String::from_utf8_lossy(
@@ -8121,7 +8147,7 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
     // EOF precedes asynchronous terminal/projection work. Wait for both
     // requests to be represented, not for the desired number of clusters:
     // an incorrect merged cluster must still fail the lineage assertion.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + CONVERSATION_ARCHIVE_PROJECTION_DEADLINE;
     let clusters = loop {
         let snapshot = world
             .client
@@ -8206,7 +8232,7 @@ async fn failed_responses_id_is_not_a_parent(world: &mut TokenCenterWorld) {
 #[then("the delivered invalid stream is an unobserved failure without response lineage")]
 async fn invalid_stream_is_unobserved_failure(world: &mut TokenCenterWorld) {
     assert_eq!(world.status, Some(StatusCode::OK));
-    let requests = tokio::time::timeout(Duration::from_secs(2), async {
+    let requests = tokio::time::timeout(CONVERSATION_ARCHIVE_PROJECTION_DEADLINE, async {
         let (requests, ()) = tokio::join!(wait_for_invalid_stream_terminal_request(world), async {
             loop {
                 let clusters = world
@@ -8234,7 +8260,7 @@ async fn invalid_stream_is_unobserved_failure(world: &mut TokenCenterWorld) {
         requests
     })
     .await
-    .expect("invalid stream terminal and conversation projection before original deadline");
+    .expect("invalid stream terminal and conversation projection within archive retry deadline");
     assert_eq!(requests.as_array().map(Vec::len), Some(1), "{requests}");
     assert_eq!(requests[0]["status_code"], 502, "{requests}");
     assert_eq!(

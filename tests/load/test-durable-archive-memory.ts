@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { allocatorEvidence, archiveDrainReady, assertArchiveGapEvidence, assertArchiveReplayGapEvidence, assertUnknownFinancialEvidence, assertUnknownSemanticEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
+import { allocatorEvidence, archiveDrainReady, assertUnknownArchiveEvidence, assertArchiveGapEvidence, assertArchiveReplayGapEvidence, assertUnknownFinancialEvidence, assertUnknownSemanticEvidence, deferredPersistenceEvidence, requestPersistenceEvidence, inputPlan, memoryVerdict, nativeAllocatorEnvironment, nativeAllocatorEvidence, NATIVE_MMAP_THRESHOLD_BYTES, outputPlan, permitEvidence, planHash, requestPath, responsesInputPlan, responsesOutputPlan } from "./benchmark-durable-archive-memory.ts";
 import { processMemoryFromProc } from "./benchmark-memory.ts";
 
 test("request and response plans have exact wire sizes and valid JSON", () => {
@@ -55,6 +55,32 @@ test("drain exempts only one explicitly owned unknown hold and its exact durable
   }
   assert.throws(() => archiveDrainReady(retained, NaN), /retained archive bytes/u);
   assert.throws(() => archiveDrainReady(retained, -1), /retained archive bytes/u);
+});
+
+test("61d bound source requires canonical metadata and real cleanup ownership", () => {
+  const row = {
+    request_id: "request", tenant_id: "tenant", reservation_id: "reservation",
+    spool_tenant_id: "tenant", spool_reservation_id: "reservation", spool_state: "bound",
+    request_object: "staging/proxy/request/request/request/body.json",
+    bound_locator: "staging/proxy/request/request/request/body.json",
+    body_byte_count: 512, body_blake3: "a".repeat(64),
+    spool_plain_bytes: 0, spool_cipher_bytes: 0, spool_chunk_count: 0, chunk_count: 0, chunk_plain_bytes: null,
+    staging_attempt_id: "request", staging_owner_id: "request", staging_owner_kind: "proxy_request",
+    staging_purpose: "request", staging_writer_owner: "gateway-source", staging_writer_token: "request",
+    staging_intent_digest: "a".repeat(64), staging_state: "cleanup_pending",
+    staging_bound_locator: null, staging_bound_at: 1234,
+  };
+  assert.equal(assertUnknownArchiveEvidence(row), 0);
+  const budget = { pending_requests: 1, unsettled_reservations: 1, cipher_bytes: 0, request_cipher_bytes: 0 };
+  assert.equal(archiveDrainReady(budget, assertUnknownArchiveEvidence(row)), true);
+  for (const field of Object.keys(budget)) {
+    assert.equal(archiveDrainReady({ ...budget, [field]: budget[field as keyof typeof budget] + 1 }, 0), false);
+  }
+  for (const field of Object.keys(row)) {
+    assert.throws(() => assertUnknownArchiveEvidence({ ...row, [field]: "wrong" }), /archive|source cleanup/u);
+  }
+  assert.throws(() => assertUnknownArchiveEvidence({ ...row, body_byte_count: 511 }), /body metadata/u);
+  assert.throws(() => assertUnknownArchiveEvidence({ ...row, staging_bound_at: 0 }), /actual gateway ownership/u);
 });
 
 test("unknown requires owned semantics exactly once while retaining its receipt, hold and no financial ACK", () => {

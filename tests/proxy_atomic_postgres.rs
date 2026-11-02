@@ -1390,7 +1390,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
             session_id: Some(format!("admission-lock-{unique}")),
             ..ConversationHints::default()
         };
-        finish_a_database
+        let result = finish_a_database
             .finish_proxy_request(FinishProxyRequest {
                 terminal_cause: None,
                 usage_basis: None,
@@ -1421,7 +1421,23 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                     upstream_response_id: Some("resp-postgres-admission-lock-a"),
                 }),
             })
-            .await
+            .await?;
+        // Recreate a legacy outbox body to exercise the independent content
+        // projector. Financial finalization now enqueues projection work.
+        let projector = Uuid::now_v7();
+        let pool = PgPool::connect(&database_url).await.unwrap();
+        sqlx::query("UPDATE conversation_projection_outbox SET request_json = $1, hints_json = $2, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL, lease_owner = $3, lease_expires_at = $4, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $5")
+            .bind(serde_json::to_string(&finish_a_request_json).unwrap())
+            .bind(serde_json::to_string(&hints).unwrap())
+            .bind(projector.to_string()).bind(unix_millis() + 30_000)
+            .bind(request_a.to_string()).execute(&pool).await.unwrap();
+        assert!(
+            finish_a_database
+                .project_claimed_conversation_projection_task(projector, request_a)
+                .await?
+        );
+        pool.close().await;
+        Ok::<_, AppError>(result)
     });
 
     let blocked_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1450,7 +1466,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
                 finish_a.abort();
                 let _ = finish_a.await;
             }
-            panic!("finish A never reached the semantic INSERT lock wait: {finish_result:?}");
+            panic!("A projector never reached the semantic INSERT lock wait: {finish_result:?}");
         }
     };
     assert!(blocked_pid > 0);
@@ -1528,6 +1544,27 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
         None
     };
 
+    if matches!(
+        &finished_b,
+        Some(Ok(Ok(FinishProxyRequestResult::Finished { .. })))
+    ) {
+        let projector = Uuid::now_v7();
+        sqlx::query("UPDATE conversation_projection_outbox SET request_json = $1, hints_json = $2, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL, lease_owner = $3, lease_expires_at = $4, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL WHERE request_id = $5")
+            .bind(serde_json::to_string(&request_b_json).unwrap())
+            .bind(serde_json::to_string(&hints_b).unwrap())
+            .bind(projector.to_string()).bind(unix_millis() + 30_000)
+            .bind(request_b.to_string()).execute(&inspection).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                database.project_claimed_conversation_projection_task(projector, request_b)
+            )
+            .await
+            .expect("same-session B projects while A waits for immutable content")
+            .unwrap()
+        );
+    }
+
     // Always release the blocker before interpreting B's result so a regression fails
     // promptly instead of leaving the spawned finish waiting on test teardown.
     blocker.rollback().await.unwrap();
@@ -1537,7 +1574,7 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
             Err(_) => {
                 finish_a.abort();
                 let _ = finish_a.await;
-                panic!("finish A must resume after the semantic row blocker is released");
+                panic!("A projector must resume after the semantic row blocker is released");
             }
         };
     assert_eq!(

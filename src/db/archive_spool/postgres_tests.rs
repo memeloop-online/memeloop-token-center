@@ -457,14 +457,19 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
         gateway_persistence: isolated_gateway_persistence(&fixture.url, &fixture.schema),
         oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
     };
-    assert!(
-        fixture
-            .db
-            .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let source = fixture
+        .db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("committed source survives an unknown admission ACK");
+    assert!(!source.successful_terminal);
+    assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 0);
+    sqlx::query("UPDATE request_archive_spools SET lease_expires_at = 0 WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&fixture.db.pool)
+        .await
+        .unwrap();
     sqlx::query("UPDATE usage_reservations SET created_at = 0 WHERE id = (SELECT reservation_id FROM request_records WHERE id = $1)").bind(request_id.to_string()).execute(&fixture.db.pool).await.unwrap();
     assert_eq!(
         fixture.db.release_orphaned_reservations(32).await.unwrap(),
@@ -671,12 +676,18 @@ async fn postgres_durable_admission_rollback_ha_and_archive_bind() {
         reservation.id.to_string()
     );
     assert_eq!(row.get::<Option<i64>, _>("completed_at"), None);
-    assert!(
-        db.claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
-            .await
-            .unwrap()
-            .is_none()
-    );
+    let preterminal = db
+        .claim_archive_spool_if(Uuid::new_v4(), BufferedArchivePurpose::Request, || true)
+        .await
+        .unwrap()
+        .expect("durable request source uploads before settlement");
+    assert!(!preterminal.successful_terminal);
+    assert_eq!(preterminal.byte_count, body.len() as i64);
+    sqlx::query("UPDATE request_archive_spools SET lease_expires_at = 0 WHERE request_id = $1")
+        .bind(request_id.to_string())
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
     sqlx::query("UPDATE request_records SET completed_at = created_at + 1, status_code = 200, cost_micros = 123 WHERE id = $1").bind(request_id.to_string()).execute(&db.pool).await.unwrap();
     let (left, right) = tokio::join!(

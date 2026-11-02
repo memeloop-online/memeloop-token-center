@@ -931,7 +931,7 @@ async fn authentication_precedes_body_parsing(world: &mut TokenCenterWorld) {
 }
 
 async fn wait_for_own_conversation_cluster(world: &TokenCenterWorld, key: &str) -> String {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    let deadline = tokio::time::Instant::now() + CONVERSATION_ARCHIVE_PROJECTION_DEADLINE;
     loop {
         let response = world
             .client
@@ -954,7 +954,7 @@ async fn wait_for_own_conversation_cluster(world: &TokenCenterWorld, key: &str) 
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "credential conversation finalization exceeded three seconds: {conversations}"
+            "credential conversation finalization exceeded archive retry deadline: {conversations}"
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }

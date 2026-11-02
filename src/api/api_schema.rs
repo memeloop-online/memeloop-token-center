@@ -53,8 +53,41 @@ mod tests {
             .unwrap();
         let document: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(document["openapi"], "3.1.0");
-        assert!(document["paths"]["/internal/v1/inference/chat/completions"]["post"].is_object());
         let schemas = &document["components"]["schemas"];
+        for path in [
+            "/internal/v1/inference/chat/completions",
+            "/internal/v1/inference/messages",
+            "/internal/v1/inference/responses",
+        ] {
+            let operation = &document["paths"][path]["post"];
+            assert_eq!(operation["x-required-scope"], "keys:write");
+            let request = &operation["requestBody"]["content"]["application/json"]["schema"];
+            assert_eq!(request["additionalProperties"], false);
+            assert_eq!(
+                request["properties"]["conversation"]["$ref"],
+                "#/components/schemas/OperatorInferenceConversation"
+            );
+        }
+        assert_eq!(
+            schemas["OperatorInferenceConversation"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schemas["OperatorInferenceConversation"]["required"],
+            json!(["id"])
+        );
+        assert_eq!(
+            schemas["OperatorInferenceConversationIdentifier"]["minLength"],
+            1
+        );
+        assert_eq!(
+            schemas["OperatorInferenceConversationIdentifier"]["maxLength"],
+            128
+        );
+        assert_eq!(
+            schemas["OperatorInferenceConversationIdentifier"]["pattern"],
+            "^[A-Za-z0-9._:-]+$"
+        );
         assert_eq!(
             schemas["RequestSummary"]["properties"]["operational_terminal"]["oneOf"],
             serde_json::json!([

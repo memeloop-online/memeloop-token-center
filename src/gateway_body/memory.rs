@@ -349,6 +349,36 @@ impl ProxyMemoryReservation {
         bounded_json_fits(bytes, self.response_bytes.load(Ordering::Acquire))
     }
 
+    /// After response transformation releases its working buffers, keep the
+    /// delivered bytes and JSON footprint charged while returning unused
+    /// maximum-envelope capacity. Request and projection owners remain charged.
+    pub(crate) fn shrink_buffered_response(&self, body: &[u8]) {
+        let nodes = JsonMemoryScanner::default().observe(body);
+        let retained = body
+            .len()
+            .saturating_mul(CAPTURE_MEMORY_WEIGHT)
+            .saturating_add(nodes.saturating_mul(256))
+            .max(UNIT_BYTES)
+            .div_ceil(UNIT_BYTES)
+            .saturating_mul(UNIT_BYTES);
+        let Ok(mut held) = self.held.lock() else {
+            return;
+        };
+        let previous = self.response_bytes.load(Ordering::Acquire);
+        if retained >= previous {
+            return;
+        }
+        let released = previous - retained;
+        let Some(total) = held.0.checked_sub(released) else {
+            return;
+        };
+        if let Some(permit) = held.1.as_mut() {
+            drop(permit.split(released / UNIT_BYTES));
+        }
+        held.0 = total;
+        self.response_bytes.store(retained, Ordering::Release);
+    }
+
     pub(crate) fn release(&self, bytes: usize, weight: usize) {
         let Ok(mut held) = self.held.lock() else {
             return;
@@ -507,6 +537,45 @@ pub(crate) fn json_encoded_length(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_response_releases_unused_maximum_with_request_owner_retained() {
+        let budget = ProxyMemoryBudget::new(crate::config::DEFAULT_PROXY_MEMORY_BUDGET_BYTES);
+        let first = budget.reservation();
+        assert!(first.try_grow(UNIT_BYTES, REQUEST_MEMORY_WEIGHT));
+        assert!(first.finalize_request(tokio::time::Instant::now()));
+        assert!(
+            first.reserve_buffered_response(
+                MAX_BUFFERED_RESPONSE_BYTES,
+                tokio::time::Instant::now()
+            )
+        );
+        let retained_request = budget.snapshot().2;
+        let second = budget.reservation();
+        assert!(
+            !second.reserve_buffered_response(
+                MAX_BUFFERED_RESPONSE_BYTES,
+                tokio::time::Instant::now()
+            )
+        );
+        let body = br#"{"id":"complete","output":[{"text":"complete"}]}"#;
+        first.shrink_buffered_response(body);
+        assert_eq!(budget.snapshot().2, retained_request);
+        assert!(first.response_json_fits(body));
+        assert!(first.response_capture_fits(body.len()));
+        assert_eq!(budget.snapshot().0, retained_request + UNIT_BYTES);
+        assert!(
+            second.reserve_buffered_response(
+                MAX_BUFFERED_RESPONSE_BYTES,
+                tokio::time::Instant::now()
+            )
+        );
+        drop(second);
+        assert_eq!(budget.snapshot().0, retained_request + UNIT_BYTES);
+        drop(first);
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(budget.snapshot().2, 0);
+    }
 
     #[test]
     fn unaligned_budget_snapshot_reports_actual_units_and_returns_to_zero() {

@@ -670,6 +670,9 @@ async fn finish_non_sse_proxy_response(
             crate::model::RequestUsageBasis::NotObserved,
         )
     };
+    buffered_request
+        .memory
+        .shrink_buffered_response(&response_body);
     let mut result = finish_buffered_request(
         buffered_request,
         status,
@@ -1558,6 +1561,15 @@ async fn proxy_with_cancellation_guard(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
         );
+        // Only the transport's pre-delivery classification proves that an
+        // attempted send did not execute. Preserve uncertainty from any prior
+        // candidate even if the final connection fails before delivery.
+        cancellation.record_transport_non_delivery(matches!(
+            &result,
+            Err(ProxySendError::RetryableConnection(_)
+                | ProxySendError::CandidateUnavailable
+                | ProxySendError::CredentialUnavailable)
+        ));
         if consumed_outbound_attempt {
             outbound_attempts += 1;
             last_dispatch = Some((active_route.route.account_id, active_route.route.route_id));
@@ -2041,6 +2053,9 @@ async fn proxy_with_cancellation_guard(
             buffered
         };
         buffer_phase.finish("completed", Some(200), Some(buffered.body.len()));
+        buffered_request
+            .memory
+            .shrink_buffered_response(&buffered.body);
         let result = finish_buffered_request(
             &buffered_request,
             StatusCode::OK,
@@ -2938,6 +2953,7 @@ async fn execute_component_provider(
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.as_str())
         .unwrap_or("application/json");
+    request.memory.shrink_buffered_response(&normalized.body);
     let result = finish_buffered_request(
         &request,
         status,
@@ -3304,8 +3320,22 @@ async fn finish_buffered_request_before_deadline(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
-    let stored_response =
+    let mut stored_response =
         inline_response_object.unwrap_or_else(|| format!("gap://{request_id}/response"));
+    if archive_response
+        && !persistence::capture(
+            request.state,
+            crate::db::ArchiveSpoolIdentity {
+                request_id,
+                tenant_id: request.tenant_id,
+                reservation_id: request.reservation.id,
+            },
+            crate::response_archive_spool::BufferedArchivePurpose::Response,
+            body.clone(),
+        )
+    {
+        stored_response = format!("gap://{request_id}/response/capacity");
+    }
     let routing_session_id = request
         .conversation
         .as_ref()
@@ -3363,18 +3393,6 @@ async fn finish_buffered_request_before_deadline(
             %request_id,
             error_category = error.diagnostic_category(),
             "runtime terminal was not durable before the client response returned"
-        );
-    }
-    if archive_response {
-        persistence::capture(
-            request.state,
-            crate::db::ArchiveSpoolIdentity {
-                request_id,
-                tenant_id: request.tenant_id,
-                reservation_id: request.reservation.id,
-            },
-            crate::response_archive_spool::BufferedArchivePurpose::Response,
-            body.clone(),
         );
     }
     if let Some(identity) = request.session_preference {

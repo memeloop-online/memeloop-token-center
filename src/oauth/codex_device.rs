@@ -141,7 +141,6 @@ struct CodexDeviceEndpoints {
 }
 
 struct CodexDevicePollRuntime<'a> {
-    key_material: &'a [u8],
     now: i64,
     scope: CodexDevicePollScope<'a>,
     allow_test_loopback: bool,
@@ -333,7 +332,7 @@ pub async fn poll_codex_device_login(
     db: &Database,
     http: &reqwest::Client,
     session_token: &str,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     scope: CodexDevicePollScope<'_>,
     allow_test_loopback: bool,
@@ -343,7 +342,6 @@ pub async fn poll_codex_device_login(
         db,
         session_token,
         CodexDevicePollRuntime {
-            key_material,
             now,
             scope,
             allow_test_loopback,
@@ -391,7 +389,6 @@ async fn poll_codex_device_login_at(
     runtime: CodexDevicePollRuntime<'_>,
 ) -> Result<CodexDevicePollResult, AppError> {
     let CodexDevicePollRuntime {
-        key_material: _,
         now,
         scope,
         allow_test_loopback,
@@ -1014,7 +1011,6 @@ mod tests {
             &restarted_database,
             &recovered_token,
             CodexDevicePollRuntime {
-                key_material,
                 now: now + 1_000,
                 scope: CodexDevicePollScope {
                     required_tenant: Some("codex-device-test"),

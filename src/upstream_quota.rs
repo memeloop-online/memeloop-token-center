@@ -1358,7 +1358,9 @@ mod tests {
                 model_policy.connect_timeout_millis,
                 config["transport_policy"]["connect_timeout_millis"]
                     .as_u64()
-                    .unwrap_or(5_000)
+                    .unwrap_or(
+                        crate::provider::CodexTransportPolicy::default().connect_timeout_millis
+                    )
             );
         }
     }

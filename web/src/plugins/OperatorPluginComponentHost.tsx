@@ -10,6 +10,8 @@ import {
   type ReactNode,
 } from 'react';
 import * as ReactRuntime from 'react';
+import * as ReactDOMRuntime from 'react-dom';
+import * as ReactJSXRuntime from 'react/jsx-runtime';
 import * as FluentRuntime from '@fluentui/react-components';
 import { api } from '../api.js';
 import { createOperatorApiBridge } from './operatorApiBridge.js';
@@ -89,6 +91,8 @@ async function loadPackage(url: string): Promise<OperatorUiPackageV1> {
   const packageValue = await loaded.activateOperatorUi(Object.freeze({
     apiVersion: OPERATOR_UI_PACKAGE_API_V1,
     React: ReactRuntime,
+    ReactDOM: ReactDOMRuntime,
+    ReactJSXRuntime,
     Fluent: FluentRuntime,
     defineOperatorUiPackage,
   }));

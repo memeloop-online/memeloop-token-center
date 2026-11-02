@@ -1,5 +1,7 @@
 import type { ComponentType } from 'react';
 import type * as ReactRuntime from 'react';
+import type * as ReactDOMRuntime from 'react-dom';
+import type * as ReactJSXRuntime from 'react/jsx-runtime';
 import type * as FluentRuntime from '@fluentui/react-components';
 
 export declare const OPERATOR_UI_PACKAGE_API_V1: 'operator-ui-package-v1';
@@ -73,6 +75,10 @@ export interface OperatorUiPackageV1 {
 export interface OperatorUiModuleHostV1 {
   apiVersion: typeof OPERATOR_UI_PACKAGE_API_V1;
   React: typeof ReactRuntime;
+  /** The host's complete React DOM namespace; available in hosts supporting shared portals. */
+  ReactDOM?: typeof ReactDOMRuntime;
+  /** The host's automatic JSX runtime, backed by the same React instance. */
+  ReactJSXRuntime?: typeof ReactJSXRuntime;
   Fluent: typeof FluentRuntime;
   defineOperatorUiPackage: typeof defineOperatorUiPackage;
 }

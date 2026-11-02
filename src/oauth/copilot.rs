@@ -2259,7 +2259,7 @@ mod tests {
             .await
             .unwrap_err();
             let text = error.to_string();
-            assert!(text.contains("GitHub Copilot authorization failed"));
+            assert!(text.contains("github_copilot_authorization_failed"));
             assert!(!text.contains("secret"));
             assert!(!text.contains("raw-super-secret"));
         }

@@ -23,7 +23,9 @@ use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingWriteLease};
 #[cfg_attr(not(test), allow(dead_code))]
 const PLAIN_LIMIT: i64 = 64 * 1024 * 1024;
 const CIPHER_CHUNK_LIMIT: usize = 512 * 1024;
-const CIPHER_LIMIT: i64 = 2 * 1024 * 1024 * 1024;
+// Match the deployed budget CHECK so exhaustion is rejected before SQL writes.
+// Keep equal request/response partitions within that shared durable capacity.
+const CIPHER_LIMIT: i64 = 256 * 1024 * 1024;
 pub(super) const REQUEST_CIPHER_LIMIT: i64 = CIPHER_LIMIT / 2;
 pub(super) const RESPONSE_CIPHER_LIMIT: i64 = CIPHER_LIMIT - REQUEST_CIPHER_LIMIT;
 pub(super) const ARCHIVE_SLOT_LIMIT: i64 = 4096;
@@ -133,22 +135,27 @@ impl Database {
             }
             return Ok(false);
         };
-        reservation.recover_refund_on_expiry();
-        let (mut transaction, now, hold) = self
-            .reserved_spool_transaction(&reservation, "deferred_capture")
-            .await?;
-        let captured = self
-            .capture_reserved_buffered_archive_body_in_transaction(
-                &mut transaction,
-                now,
-                archive,
-                Some(prepared),
-                Some(&reservation),
-            )
-            .await?;
-        BudgetHold::commit_optional(transaction, Some(hold)).await?;
+        let captured = async {
+            let (mut transaction, now, hold) = self
+                .reserved_spool_transaction(&reservation, "deferred_capture")
+                .await?;
+            let captured = self
+                .capture_reserved_buffered_archive_body_in_transaction(
+                    &mut transaction,
+                    now,
+                    archive,
+                    Some(prepared),
+                    Some(&reservation),
+                )
+                .await?;
+            BudgetHold::commit_optional(transaction, Some(hold)).await?;
+            Ok(captured)
+        }
+        .await;
+        // Refund this attempt after commit/rollback before a background retry
+        // reserves capacity for the same retained body.
         reservation.release().await;
-        Ok(captured)
+        captured
     }
 
     pub(crate) async fn record_deferred_request_retention_gap(
@@ -891,6 +898,8 @@ impl Database {
                 "archive_gap",
             )
             .await?;
+        } else {
+            emit_response_archive_gap_without_spool_in_transaction(&mut tx, identity, now).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1555,6 +1564,52 @@ impl Database {
     async fn archive_state_transaction(&self) -> Result<Transaction<'_, Any>, AppError> {
         Ok(self.begin_write_transaction().await?)
     }
+}
+
+async fn emit_response_archive_gap_without_spool_in_transaction(
+    tx: &mut Transaction<'_, Any>,
+    identity: ArchiveSpoolIdentity,
+    now: i64,
+) -> Result<(), AppError> {
+    // A failed first insert leaves no spool audit row. Record the response
+    // terminal fence on its request owner so session projection can distinguish
+    // this outcome from a writer that is still acquiring database capacity.
+    let existing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&mut **tx)
+            .await?;
+    if existing != 0 {
+        return Ok(());
+    }
+    let owner = sqlx::query("SELECT r.tenant_id, locator.key_id FROM request_records r JOIN request_record_locators locator ON locator.id = r.id AND locator.tenant_id = r.tenant_id WHERE r.id = $1 AND r.tenant_id = $2 AND r.reservation_id = $3 AND (r.response_object IS NULL OR r.response_object = $4) AND NOT EXISTS (SELECT 1 FROM response_archive_spools s WHERE s.request_id = r.id) AND NOT EXISTS (SELECT 1 FROM request_events e WHERE e.request_id = r.id AND e.tenant_id = r.tenant_id AND e.event_kind = 'archive_gap' AND e.error_code = 'response_capture_failed')")
+        .bind(identity.request_id.to_string())
+        .bind(identity.tenant_id.to_string())
+        .bind(identity.reservation_id.to_string())
+        .bind(format!("gap://{}/response", identity.request_id))
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let tenant_id: String = owner.try_get("tenant_id")?;
+    let key_id: String = owner.try_get("key_id")?;
+    let request_id = identity.request_id.to_string();
+    let cursor = allocate_request_event_cursor(tx, now, &tenant_id, &key_id, &request_id).await?;
+    let inserted = sqlx::query("INSERT INTO request_events (event_id, tenant_id, key_id, request_id, event_at, event_kind, protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, error_code) SELECT $1, tenant_id, key_id, id, $2, 'archive_gap', protocol, model, status_code, duration_ms, input_tokens, output_tokens, cost_micros, 'response_capture_failed' FROM request_records WHERE id = $3 AND tenant_id = $4 AND key_id = $5")
+        .bind(cursor.event_id)
+        .bind(cursor.event_at)
+        .bind(request_id)
+        .bind(tenant_id)
+        .bind(key_id)
+        .execute(&mut **tx)
+        .await?;
+    if inserted.rows_affected() != 1 {
+        return Err(AppError::internal(
+            "archive_spool_emit_response_archive_gap_without_spool_1",
+        ));
+    }
+    Ok(())
 }
 
 async fn archive_clock(

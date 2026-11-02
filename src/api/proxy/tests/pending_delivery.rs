@@ -72,7 +72,7 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
     );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let retained_body: String = sqlx::query_scalar(
-        "SELECT p.request_json FROM conversation_semantic_payloads p JOIN conversation_projection_outbox o ON o.request_id = p.request_id AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.principal_id = p.principal_id WHERE p.request_id = $1 AND p.tenant_id = $2 AND p.key_id = $3 AND o.projected_at IS NULL",
+        "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1 AND tenant_id = $2 AND key_id = $3 AND projected_at IS NULL",
     )
     .bind(receipt["request_id"].as_str().unwrap())
     .bind(receipt["claim"]["tenant_id"].as_str().unwrap())
@@ -1370,7 +1370,7 @@ async fn unknown_failure_retries_operational_projection() {
     let payload: String = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(payload) = sqlx::query_scalar::<_, String>(
-                "SELECT request_json FROM conversation_semantic_payloads WHERE request_id = $1",
+                "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1",
             )
             .bind(request_id.to_string())
             .fetch_optional(&pool)
@@ -1522,7 +1522,7 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
     let enqueued: String = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if let Some(payload) = sqlx::query_scalar::<_, String>(
-                "SELECT request_json FROM conversation_semantic_payloads WHERE request_id = $1",
+                "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1",
             )
             .bind(record.request_id.to_string())
             .fetch_optional(&pool)

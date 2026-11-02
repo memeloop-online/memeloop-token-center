@@ -615,12 +615,22 @@ async fn codex_route_fixture_with_archive_directory(
     label: &str,
     archive_directory: &str,
 ) -> CodexRouteFixture {
+    codex_route_fixture_with_database(label, archive_directory, None).await
+}
+
+async fn codex_route_fixture_with_database(
+    label: &str,
+    archive_directory: &str,
+    database_url: Option<&str>,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join(archive_directory);
-    let database_url = crate::db::Database::sqlite_database_url(&format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join(format!("codex-{label}.db")).display()
-    ));
+    let database_url = database_url.map(str::to_owned).unwrap_or_else(|| {
+        crate::db::Database::sqlite_database_url(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join(format!("codex-{label}.db")).display()
+        ))
+    });
     let mut config = Config::for_test(database_url.clone());
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(archive_path.display().to_string());
@@ -2145,6 +2155,43 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
 }
 
 #[tokio::test]
+async fn native_codex_refused_connection_settles_zero_once() {
+    let fixture = codex_route_fixture("native-connect-not-delivered").await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "connection was not established", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("upstream_connect_failed")
+    );
+    wait_for_request_settlement(&fixture, 1).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let zero = sqlx::query("SELECT r.cost_micros, u.status, u.actual_micros, p.state, p.unknown_reason, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.reservation_id AND l.kind = 'usage' AND l.amount_micros = 0) AS settlements FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id JOIN pending_proxy_settlements p ON p.request_id = r.id WHERE r.id = $1")
+        .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(zero.get::<i64, _>("cost_micros"), 0);
+    assert_eq!(zero.get::<String, _>("status"), "settled");
+    assert_eq!(zero.get::<Option<i64>, _>("actual_micros"), Some(0));
+    assert_eq!(zero.get::<String, _>("state"), "applied");
+    assert_eq!(zero.get::<Option<String>, _>("unknown_reason"), None);
+    assert_eq!(zero.get::<i64, _>("settlements"), 1);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn native_codex_ambiguous_transport_after_request_bytes_is_not_replayed() {
     use tokio::io::AsyncReadExt as _;
 
@@ -2430,6 +2477,107 @@ async fn refused_connection_fails_over_to_the_next_authorized_candidate() {
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     healthy.verify().await;
+}
+
+#[tokio::test]
+async fn cancellation_after_connect_failover_keeps_dispatched_candidate_finance_unknown() {
+    use tokio::io::AsyncReadExt as _;
+    let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused_uri = format!("http://{}", refused.local_addr().unwrap());
+    drop(refused);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dispatched_uri = format!("http://{}", listener.local_addr().unwrap());
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let accepted = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let count = connection.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "candidate must receive the complete request");
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .expect("buffered request has a content length");
+                if bytes.len() >= end + 4 + length {
+                    let body = &bytes[end + 4..end + 4 + length];
+                    assert!(
+                        std::str::from_utf8(body)
+                            .unwrap()
+                            .contains("cancel after delivery")
+                    );
+                    received_tx.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(connection);
+                    return;
+                }
+            }
+        }
+    });
+    let fixture = resilient_route_fixture(
+        "cancel-after-connect-failover",
+        &[(refused_uri, 0), (dispatched_uri, 10)],
+    )
+    .await;
+    let original = serde_json::to_vec(&json!({"model": fixture.model, "messages": [{"role": "user", "content": "cancel after delivery"}], "stream": false})).unwrap();
+    let request = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+        .body(Body::from(original.clone()))
+        .unwrap();
+    let dispatched =
+        tokio::spawn(router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(request));
+    tokio::time::timeout(Duration::from_secs(3), received_rx)
+        .await
+        .expect("second candidate must receive the body")
+        .unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let request_id = rows[0].request_id;
+    dispatched.abort();
+    assert!(dispatched.await.unwrap_err().is_cancelled());
+    cancellation::assert_unknown_request_state(
+        &fixture.state,
+        &fixture.database_url,
+        fixture.key_id,
+        request_id,
+        0,
+    )
+    .await;
+    fixture
+        .state
+        .responses_request_spool
+        .drain_uploads_for_test()
+        .await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, request_id)
+        .await
+        .unwrap();
+    let captured = fixture
+        .state
+        .archive
+        .get(&refs.request_object)
+        .await
+        .unwrap();
+    assert_eq!(captured.as_ref(), original.as_slice());
+    assert_eq!(blake3::hash(&captured), blake3::hash(&original));
+    accepted.abort();
+    assert!(accepted.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test]
@@ -2890,6 +3038,15 @@ async fn assert_only_early_request_failures(fixture: &CodexRouteFixture) {
 }
 
 async fn drain_archive_capture(fixture: &CodexRouteFixture) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture
+            .state
+            .responses_request_spool
+            .drain_uploads_for_test(),
+    )
+    .await
+    .expect("bounded request source upload drain");
     fixture.state.db.drain_gateway_persistence_for_test().await;
     fixture.state.persistence.drain_for_test().await;
     let _writers = tokio::time::timeout(
@@ -2913,7 +3070,7 @@ async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         loop {
             let outstanding: i64 = sqlx::query_scalar(
-                "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE state IN ('capturing', 'pending', 'uploading')) + (SELECT COUNT(*) FROM response_archive_spools WHERE state IN ('capturing', 'pending', 'uploading'))",
+                "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE state IN ('pending', 'uploading') OR (state = 'capturing' AND cipher_bytes > 0)) + (SELECT COUNT(*) FROM response_archive_spools WHERE state IN ('capturing', 'pending', 'uploading'))",
             ).fetch_one(&pool).await.unwrap();
             if outstanding == 0 {
                 break;
@@ -2949,6 +3106,7 @@ async fn assert_exactly_once_side_effects_for(
     expected_account_id: Uuid,
     expected_route_id: Uuid,
 ) {
+    drain_completed_response_archive(fixture).await;
     let projection_owner = Uuid::now_v7();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     // Settlement can commit the request before the conversation journal enqueues
@@ -3053,6 +3211,51 @@ async fn assert_exactly_once_side_effects_for(
         row.get::<i64, _>("response_observation_count"),
         i64::from(expected_response_id.is_some())
     );
+    pool.close().await;
+}
+
+async fn assert_settlement_once_with_inline_request(fixture: &CodexRouteFixture, request_id: Uuid) {
+    let owner = Uuid::now_v7();
+    for pending_id in fixture
+        .state
+        .db
+        .claim_terminal_projection_tasks(owner, 32)
+        .await
+        .unwrap()
+    {
+        assert!(
+            fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(owner, pending_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(owner, pending_id)
+                .await
+                .unwrap()
+        );
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let row = sqlx::query(
+        "SELECT r.reservation_id, reservation.status AS reservation_status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.reservation_id AND l.kind = 'usage') AS charges, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = r.id) AS facts, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = r.id AND e.event_kind = 'finished') AS finished_events, o.request_json FROM request_records r JOIN usage_reservations reservation ON reservation.id = r.reservation_id LEFT JOIN conversation_projection_outbox o ON o.request_id = r.id WHERE r.id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("reservation_status"), "settled");
+    for field in ["charges", "facts", "finished_events"] {
+        assert_eq!(row.get::<i64, _>(field), 1, "{field}");
+    }
+    if let Some(request_json) = row.get::<Option<String>, _>("request_json") {
+        let request_json: Value = serde_json::from_str(&request_json).unwrap();
+        assert!(request_json.get("input").is_some());
+    }
     pool.close().await;
 }
 
@@ -4424,10 +4627,8 @@ async fn codex_buffered_route_accepts_valid_sse_without_content_type() {
 }
 
 #[tokio::test]
-async fn buffered_text_response_survives_total_archive_failure_with_durable_pending_bodies() {
+async fn buffered_text_response_upload_retry_restores_full_archive_and_settles_once() {
     let fixture = codex_route_fixture("buffered-archive-gap").await;
-    std::fs::remove_dir_all(&fixture.archive_path).unwrap();
-    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
     let upstream = MockServer::start().await;
     let sse = completed_codex_sse("delivered despite archive failure");
     Mock::given(method("POST"))
@@ -4439,9 +4640,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .mount(&upstream)
         .await;
 
-    // This test requires exact durable bodies for the later upload retry.
-    // Finish optional database capture before SQLite settlement can race its
-    // bounded writer; the unavailable object backend is still exercised below.
+    // Preserve source and response capture before injecting an upload outage.
     let response = fixture
         .state
         .db
@@ -4476,7 +4675,6 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     let refs = fixture
         .state
         .db
@@ -4484,8 +4682,8 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .await
         .unwrap();
     assert_eq!(
-        refs.request_object,
-        format!("gap://{}/request", rows[0].request_id)
+        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
+        Some(rows[0].request_id)
     );
     assert_eq!(
         refs.response_object.as_deref(),
@@ -4493,7 +4691,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Bound
     );
     assert_eq!(
         refs.response_archive_state,
@@ -4507,11 +4705,12 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     assert!(detail.archive.response.reason.is_none());
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 
-    // An unavailable object backend did not gate HTTP delivery. Exercise its
-    // retryable failure, restore it, then recover both exact durable bodies.
-    crate::response_archive_spool::process_one_for_test(&fixture.state).await;
+    let saved_archive = fixture.archive_path.with_extension("source-backup");
+    std::fs::rename(&fixture.archive_path, &saved_archive).unwrap();
+    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
+    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
     std::fs::remove_file(&fixture.archive_path).unwrap();
-    std::fs::create_dir_all(&fixture.archive_path).unwrap();
+    std::fs::rename(saved_archive, &fixture.archive_path).unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("UPDATE request_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
         .execute(&pool)
@@ -4928,8 +5127,6 @@ async fn codex_streaming_route_accepts_headerless_bare_cr_sse_without_byte_drift
 #[tokio::test]
 async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker() {
     let fixture = codex_route_fixture("streaming-archive-recovery").await;
-    std::fs::remove_dir_all(&fixture.archive_path).unwrap();
-    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
     let upstream = MockServer::start().await;
     let sse = completed_codex_sse("archive-independent stream");
     Mock::given(method("POST"))
@@ -4963,7 +5160,30 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_settlement_once_with_inline_request(&fixture, rows[0].request_id).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let request_bytes = serde_json::to_vec(&original).unwrap();
+    let source = sqlx::query("SELECT state, bound_locator, body_byte_count, body_blake3 FROM request_archive_spools WHERE request_id = $1")
+        .bind(rows[0].request_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(source.get::<String, _>("state"), "bound");
+    assert_eq!(
+        source.get::<Option<String>, _>("bound_locator").as_deref(),
+        crate::gateway_body::request_spool::request_body_object_key(
+            &rows[0].request_id.to_string()
+        )
+        .as_deref()
+    );
+    assert_eq!(
+        source.get::<i64, _>("body_byte_count"),
+        request_bytes.len() as i64
+    );
+    assert_eq!(
+        source.get::<String, _>("body_blake3"),
+        blake3::hash(&request_bytes).to_hex().to_string()
+    );
     let refs = fixture
         .state
         .db
@@ -4972,7 +5192,10 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
         .unwrap();
     assert_eq!(
         refs.request_object,
-        format!("gap://{}/request", rows[0].request_id)
+        crate::gateway_body::request_spool::request_body_object_key(
+            &rows[0].request_id.to_string()
+        )
+        .unwrap()
     );
     assert_eq!(
         refs.response_object.as_deref(),
@@ -4980,67 +5203,50 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     );
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Bound
     );
     assert_eq!(
         refs.response_archive_state,
         crate::model::RequestArchiveState::Pending
     );
 
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    for (spools, chunks, plaintext, expected_bytes) in [
-        (
-            "request_archive_spools",
-            "request_archive_spool_chunks",
-            "stream now",
-            serde_json::to_vec(&original).unwrap().len() as i64,
-        ),
-        (
-            "response_archive_spools",
-            "response_archive_spool_chunks",
-            "archive-independent stream",
-            sse.len() as i64,
-        ),
-    ] {
-        let spool = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT state, attempts, chunk_count, byte_count FROM {spools} WHERE request_id = $1"
-        )))
+    let response_spool = sqlx::query("SELECT state, attempts, chunk_count, byte_count FROM response_archive_spools WHERE request_id = $1")
         .bind(rows[0].request_id.to_string())
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(spool.get::<String, _>("state"), "pending");
-        assert_eq!(spool.get::<i64, _>("attempts"), 0);
-        assert!(spool.get::<i64, _>("chunk_count") > 0);
-        assert_eq!(spool.get::<i64, _>("byte_count"), expected_bytes);
-        let encrypted = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT ciphertext FROM {chunks} WHERE request_id = $1 ORDER BY seq"
-        )))
-        .bind(rows[0].request_id.to_string())
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        assert!(!encrypted.is_empty());
-        assert!(encrypted.iter().all(|chunk| {
-            let ciphertext = chunk.get::<String, _>("ciphertext");
-            ciphertext.starts_with("v2.") && !ciphertext.contains(plaintext)
-        }));
-    }
-
-    // Exercise a real failed upload, restore the backend, and prove a fresh
-    // worker can bind both staged objects without replaying the request or its
-    // settlement side effects.
-    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
-    let failed_attempts: i64 = sqlx::query_scalar(
-        "SELECT (SELECT SUM(attempts) FROM request_archive_spools WHERE request_id = $1) + (SELECT SUM(attempts) FROM response_archive_spools WHERE request_id = $1)",
+    assert_eq!(response_spool.get::<String, _>("state"), "pending");
+    assert_eq!(response_spool.get::<i64, _>("attempts"), 0);
+    assert!(response_spool.get::<i64, _>("chunk_count") > 0);
+    assert_eq!(response_spool.get::<i64, _>("byte_count"), sse.len() as i64);
+    let encrypted = sqlx::query(
+        "SELECT ciphertext FROM response_archive_spool_chunks WHERE request_id = $1 ORDER BY seq",
     )
     .bind(rows[0].request_id.to_string())
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
     .unwrap();
+    assert!(!encrypted.is_empty());
+    assert!(encrypted.iter().all(|chunk| {
+        let ciphertext = chunk.get::<String, _>("ciphertext");
+        ciphertext.starts_with("v2.") && !ciphertext.contains("archive-independent stream")
+    }));
+
+    // Preserve the committed source while response uploads cannot reach the
+    // backend, then restore it and bind the response without replaying billing.
+    let saved_archive = fixture.archive_path.with_extension("source-backup");
+    std::fs::rename(&fixture.archive_path, &saved_archive).unwrap();
+    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
+    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
+    let failed_attempts: i64 =
+        sqlx::query_scalar("SELECT attempts FROM response_archive_spools WHERE request_id = $1")
+            .bind(rows[0].request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(failed_attempts, 1);
     std::fs::remove_file(&fixture.archive_path).unwrap();
-    std::fs::create_dir_all(&fixture.archive_path).unwrap();
+    std::fs::rename(saved_archive, &fixture.archive_path).unwrap();
     sqlx::query("UPDATE request_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
         .execute(&pool)
         .await
@@ -5067,10 +5273,10 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
             .await
             .unwrap();
     let tenant_id = Uuid::parse_str(&tenant_id).unwrap();
-    assert!(crate::archive::is_tenant_cas_location(
-        tenant_id,
-        &refs.request_object
-    ));
+    assert_eq!(
+        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
+        Some(rows[0].request_id)
+    );
     assert!(
         refs.response_object
             .as_deref()
@@ -5099,7 +5305,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
 }
 
 #[tokio::test]
-async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream() {
+async fn full_response_archive_budget_preserves_request_source_and_dispatches_once() {
     let fixture = codex_route_fixture("archive-capacity-degradation").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query(
@@ -5157,8 +5363,8 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(gap.get::<String, _>("state"), "gap");
-    assert_eq!(gap.get::<String, _>("gap_reason"), "capacity");
+    assert_eq!(gap.get::<String, _>("state"), "bound");
+    assert!(gap.get::<Option<String>, _>("gap_reason").is_none());
     assert_eq!(
         gap.get::<i64, _>("body_byte_count"),
         request_bytes.len() as i64
@@ -5169,6 +5375,30 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     );
     assert_eq!(gap.get::<i64, _>("cipher_bytes"), 0);
     assert!(gap.get::<Option<i64>, _>("cleaned_at").is_some());
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_archive_state,
+        crate::model::RequestArchiveState::Bound
+    );
+    assert_eq!(
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get(&refs.request_object)
+            .await
+            .unwrap()
+            .as_ref(),
+        request_bytes.as_slice()
+    );
     upstream.verify().await;
     pool.close().await;
 }

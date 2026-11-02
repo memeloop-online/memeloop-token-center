@@ -237,14 +237,6 @@ impl Database {
         }
     }
 
-    pub(crate) fn try_request_source_completion(&self) -> Option<OwnedSemaphorePermit> {
-        self.gateway_persistence
-            .slots
-            .clone()
-            .try_acquire_owned()
-            .ok()
-    }
-
     pub(crate) async fn request_source_completion(&self) -> OwnedSemaphorePermit {
         self.gateway_persistence
             .slots
@@ -262,12 +254,9 @@ impl Database {
         digest: [u8; 32],
         success: bool,
     ) {
-        let Some(permit) = self.try_request_source_completion() else {
-            return;
-        };
         let database = self.clone();
         tokio::spawn(async move {
-            let _permit = permit;
+            let _permit = database.request_source_completion().await;
             database
                 .complete_request_source(identity, &locator, length, digest, success)
                 .await;

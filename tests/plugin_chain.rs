@@ -1,5 +1,3 @@
-#[cfg(feature = "experimental-plugin-revisions")]
-use std::collections::BTreeMap;
 use std::{fs, path::Path};
 
 use memeloop_token_center::{
@@ -208,6 +206,24 @@ async fn check_chain(
     if allow {
         assert_eq!(decision.request_json.as_ref(), last_rewrite, "{label}");
     }
+}
+
+#[tokio::test]
+async fn downstream_policy_observes_effective_model_and_canonical_body() {
+    check_chain(
+        "allow without rewrite",
+        &[(None, None)],
+        "requested-model",
+        true,
+    )
+    .await;
+    check_chain(
+        "deny without rewrite",
+        &[(None, None)],
+        "requested-model",
+        false,
+    )
+    .await;
 }
 
 #[tokio::test]

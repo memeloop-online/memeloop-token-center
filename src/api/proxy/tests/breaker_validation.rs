@@ -88,6 +88,17 @@ async fn codex_connect_failure_does_not_replay_and_keeps_transport_observation()
         .await
         .unwrap();
     assert!(upstream.received_requests().await.unwrap().is_empty());
+    wait_for_request_settlement(&fixture, 1).await;
+    let settlement_pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let zero = sqlx::query("SELECT r.completed_at, u.status, u.actual_micros, p.state, p.unknown_reason, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.reservation_id AND l.kind = 'usage') AS settlements FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id JOIN pending_proxy_settlements p ON p.request_id = r.id WHERE r.id = $1")
+        .bind(request_id.to_string()).fetch_one(&settlement_pool).await.unwrap();
+    assert!(zero.get::<Option<i64>, _>("completed_at").is_some());
+    assert_eq!(zero.get::<String, _>("status"), "settled");
+    assert_eq!(zero.get::<Option<i64>, _>("actual_micros"), Some(0));
+    assert_eq!(zero.get::<String, _>("state"), "applied");
+    assert_eq!(zero.get::<Option<String>, _>("unknown_reason"), None);
+    assert_eq!(zero.get::<i64, _>("settlements"), 1);
+    settlement_pool.close().await;
     fixture.state.routing_persistence.drain_for_test().await;
     let diagnostics = fixture
         .state

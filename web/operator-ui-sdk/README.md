@@ -2,6 +2,8 @@
 
 This package defines the versioned React contract for MTC Operator extensions. The signed plugin artifact carries one self-contained ESM entry. MTC loads that exact module after installation and passes its own React and Fluent runtimes to `activateOperatorUi`, so installing or upgrading a plugin does not rebuild MTC.
 
+Hosts also provide optional `ReactDOM` and `ReactJSXRuntime` bindings containing the complete `react-dom` and `react/jsx-runtime` namespaces. Packages that use portals or automatic JSX should check these bindings during activation and map their bundled externals to the host bindings before evaluating component libraries. This keeps hooks, contexts and portals on the host's React instance. Existing packages that only read `React` and `Fluent` keep the same activation contract.
+
 ```tsx
 export function activateOperatorUi({ React, Fluent, defineOperatorUiPackage }) {
   function Workspace({ contribution }) {

@@ -2239,11 +2239,11 @@ mod tests {
                 &account,
                 &credential,
                 false,
-                |selected, generation| {
+                |selected, _generation| {
                     attempts.push(selected.proxy().unwrap().0.to_owned());
-                    let client = state
-                        .codex_clients
-                        .account_transport_snapshot(&account, selected, generation)?;
+                    // Track each selected member and send to the local closed
+                    // endpoint to produce a deterministic connect failure.
+                    let client = direct_catalog_client(&account)?;
                     Ok(client.get(&endpoint))
                 },
             )
@@ -2539,6 +2539,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_explicit_budget_allows_headers_after_legacy_deadline() {
         let budget = codex_catalog_budget(&json!({"transport_policy":{
+            "connect_timeout_millis":1000,
             "request_timeout_millis":20000,"read_timeout_millis":1000
         }}))
         .unwrap();

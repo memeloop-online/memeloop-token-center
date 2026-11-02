@@ -151,10 +151,12 @@ async fn delayed_ping_server(
     (endpoint, posts, server)
 }
 
-fn policy(read_timeout: Duration, request_timeout: Duration) -> CodexTransportPolicy {
+fn policy(request_timeout: Duration) -> CodexTransportPolicy {
     CodexTransportPolicy {
         connect_timeout_millis: 100,
-        read_timeout_millis: Some(read_timeout.as_millis() as u64),
+        // These tests isolate the PING ACK timer; an optional read deadline
+        // would expire while the server deliberately withholds response headers.
+        read_timeout_millis: None,
         request_timeout_millis: request_timeout.as_millis() as u64,
         ..CodexTransportPolicy::default()
     }
@@ -164,11 +166,8 @@ fn policy(read_timeout: Duration, request_timeout: Duration) -> CodexTransportPo
 async fn delayed_http2_ping_ack_completes_one_quiet_post_within_request_budget() {
     let request_timeout = Duration::from_secs(15);
     let (endpoint, posts, server) = delayed_ping_server(Some(Duration::from_secs(11))).await;
-    let client = build_codex_http2_test_client(
-        policy(Duration::from_millis(1_000), request_timeout),
-        Duration::from_millis(10),
-    )
-    .unwrap();
+    let client =
+        build_codex_http2_test_client(policy(request_timeout), Duration::from_millis(10)).unwrap();
 
     let response = tokio::time::timeout(
         request_timeout,
@@ -188,11 +187,8 @@ async fn delayed_http2_ping_ack_completes_one_quiet_post_within_request_budget()
 async fn unacknowledged_http2_ping_stops_at_request_budget_without_replaying_post() {
     let request_timeout = Duration::from_millis(1_000);
     let (endpoint, posts, server) = delayed_ping_server(None).await;
-    let client = build_codex_http2_test_client(
-        policy(Duration::from_millis(1_000), request_timeout),
-        Duration::from_millis(10),
-    )
-    .unwrap();
+    let client =
+        build_codex_http2_test_client(policy(request_timeout), Duration::from_millis(10)).unwrap();
 
     let result = tokio::time::timeout(
         Duration::from_secs(2),

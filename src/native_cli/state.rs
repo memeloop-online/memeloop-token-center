@@ -53,20 +53,6 @@ fn invalid() -> AppError {
     AppError::BadRequest("native CLI state carrier is invalid".into())
 }
 
-fn aad(binding: &StateBinding) -> Result<Vec<u8>, AppError> {
-    if binding.tenant_external_id.is_empty()
-        || binding.tenant_external_id.len() > 200
-        || binding.tenant_external_id.trim() != binding.tenant_external_id
-        || binding.tenant_external_id.chars().any(char::is_control)
-        || binding.account_id.is_nil()
-    {
-        return Err(invalid());
-    }
-    let mut aad = b"memeloop-token-center/native-cli-state/v1\0".to_vec();
-    aad.extend(serde_json::to_vec(binding).map_err(|_| invalid())?);
-    Ok(aad)
-}
-
 fn validate(state: &AccountState) -> Result<(), AppError> {
     if state.source_handle.is_empty()
         || state.source_handle.len() > 80
@@ -113,8 +99,8 @@ fn validate(state: &AccountState) -> Result<(), AppError> {
 
 pub fn seal(
     state: &AccountState,
-    binding: &StateBinding,
-    key_material: &[u8],
+    _binding: &StateBinding,
+    _key_material: &[u8],
 ) -> Result<String, AppError> {
     validate(state)?;
     encode_json(state)
@@ -122,8 +108,8 @@ pub fn seal(
 
 pub fn open(
     envelope: &str,
-    expected_binding: &StateBinding,
-    key_material: &[u8],
+    _expected_binding: &StateBinding,
+    _key_material: &[u8],
 ) -> Result<AccountState, AppError> {
     if envelope.len() > MAX_ENVELOPE {
         return Err(invalid());
@@ -157,26 +143,34 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_state_is_bound_to_account_tenant_generation_and_provider() {
+    fn plain_json_state_round_trips_independently_of_legacy_binding_and_key() {
         let binding = binding();
         let envelope = seal(&fixture(), &binding, b"synthetic-key").unwrap();
-        assert!(!envelope.contains("synthetic-secret"));
+        let stored: serde_json::Value = serde_json::from_str(&envelope).unwrap();
+        assert_eq!(stored["source_handle"], "FixtureHandle123");
+        assert_eq!(stored["files"][0]["relative_path"], ".copilot/account.json");
         assert_eq!(
-            open(&envelope, &binding, b"synthetic-key").unwrap().files[0].content,
-            b"synthetic-secret"
+            stored["files"][0]["content"],
+            serde_json::json!(b"synthetic-secret".to_vec())
         );
-        let mut wrong = binding.clone();
-        wrong.tenant_external_id = "tenant-b".into();
-        assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
-        wrong = binding.clone();
-        wrong.account_id = Uuid::now_v7();
-        assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
-        wrong = binding.clone();
-        wrong.generation += 1;
-        assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
-        wrong = binding;
-        wrong.provider = CliProvider::Cursor;
-        assert!(open(&envelope, &wrong, b"synthetic-key").is_err());
+        let changed_binding = StateBinding {
+            tenant_external_id: "tenant-b".into(),
+            account_id: Uuid::now_v7(),
+            generation: binding.generation + 1,
+            provider: CliProvider::Cursor,
+        };
+        for (expected, key) in [
+            (&binding, b"synthetic-key".as_slice()),
+            (&changed_binding, b"different-key".as_slice()),
+        ] {
+            let restored = open(&envelope, expected, key).unwrap();
+            assert_eq!(restored.source_handle, "FixtureHandle123");
+            assert_eq!(restored.files[0].content, b"synthetic-secret");
+        }
+        assert!(open("not JSON", &binding, b"synthetic-key").is_err());
+        let mut invalid = stored;
+        invalid["files"][0]["relative_path"] = serde_json::json!("../state");
+        assert!(open(&invalid.to_string(), &binding, b"synthetic-key").is_err());
     }
 
     #[test]

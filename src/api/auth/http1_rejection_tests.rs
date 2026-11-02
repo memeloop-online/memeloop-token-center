@@ -35,6 +35,12 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        let (server, accept) = Self::prepare().await;
+        accept.send(()).unwrap();
+        server
+    }
+
+    async fn prepare() -> (Self, oneshot::Sender<()>) {
         let (state, directory) = crate::api::tests::test_state().await;
         let issued = state
             .db
@@ -78,22 +84,27 @@ impl Server {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown, receive) = oneshot::channel();
+        let (accept, ready) = oneshot::channel();
         let task = tokio::spawn(async move {
+            ready.await.unwrap();
             crate::server::serve(listener, app, async {
                 let _ = receive.await;
             })
             .await
             .unwrap();
         });
-        Self {
-            address,
-            key: issued.key,
-            reached_handler,
-            state,
-            _directory: directory,
-            shutdown,
-            task,
-        }
+        (
+            Self {
+                address,
+                key: issued.key,
+                reached_handler,
+                state,
+                _directory: directory,
+                shutdown,
+                task,
+            },
+            accept,
+        )
     }
 
     fn headers(&self, framing: &str) -> Vec<u8> {
@@ -144,6 +155,25 @@ fn assert_rejection(response: &[u8]) {
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(json["error"]["code"], "request_body_too_large");
     assert!(headers.contains("connection: close"));
+}
+
+#[tokio::test]
+async fn http1_oversize_upload_write_fin_preserves_413_and_recovery() {
+    let (server, accept) = Server::prepare().await;
+    let mut socket = TcpStream::connect(server.address).await.unwrap();
+    let mut request = server.headers(&format!("Content-Length: {}\r\n", LIMIT + 1024));
+    request.extend_from_slice(&[b'x'; 1024]);
+    socket.write_all(&request).await.unwrap();
+    // Admission can reject the declared size even when the sender ends its
+    // upload early. Both the request and FIN precede the server's first read.
+    socket.shutdown().await.unwrap();
+    accept.send(()).unwrap();
+    assert_rejection(&read_response(&mut socket).await);
+    assert_eq!(server.reached_handler.load(Ordering::Relaxed), 0);
+    assert_eq!(server.state.gateway_body_reads.load(Ordering::Acquire), 0);
+    server.normal_request().await;
+    assert_eq!(server.reached_handler.load(Ordering::Relaxed), 1);
+    server.stop().await;
 }
 
 #[tokio::test]
