@@ -1,5 +1,4 @@
-//! Read-only classification of definite quota rejection, never a supplier
-//! retry or quota reset. SSE failures do not establish that execution was free.
+//! Classify structured supplier quota rejections while preserving response ownership.
 use super::super::super::*;
 use crate::db::{SupplierQuotaEvidence, UpstreamFailureKind};
 use futures_util::{StreamExt, stream};
@@ -11,7 +10,6 @@ fn bounded_future(deadline: i64, now: i64) -> Option<i64> {
 }
 
 fn retry_after(headers: &HeaderMap, now: i64) -> Option<i64> {
-    // Duplicate timing headers are ambiguous; never choose one arbitrarily.
     let mut values = headers.get_all(header::RETRY_AFTER).iter();
     let value = values.next()?;
     if values.next().is_some() {
@@ -159,44 +157,31 @@ pub(in crate::api::proxy) async fn classify_supplier_quota(
     } else {
         MAX_BODY
     };
-    let deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_millis(if forbidden { 100 } else { 500 });
-    let read = async {
-        loop {
-            // Empty and permanently-ready chunks consume work and metadata
-            // even when the byte budget is unchanged. Bound both, and yield
-            // so a ready stream cannot starve the timeout/cancellation owner.
-            if prefix.len() >= MAX_CHUNKS || tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            if !prefix.is_empty() && prefix.len().is_multiple_of(16) {
-                tokio::task::yield_now().await;
-                if tokio::time::Instant::now() >= deadline {
-                    return false;
+    let complete = loop {
+        if prefix.len() >= MAX_CHUNKS {
+            break false;
+        }
+        if !prefix.is_empty() && prefix.len().is_multiple_of(16) {
+            tokio::task::yield_now().await;
+        }
+        match parts.stream.next().await {
+            Some(Ok(chunk)) => {
+                let fits = body.len().saturating_add(chunk.len()) <= max_body;
+                if fits {
+                    body.extend_from_slice(&chunk);
+                }
+                prefix.push(Ok(chunk));
+                if !fits {
+                    break false;
                 }
             }
-            match parts.stream.next().await {
-                Some(Ok(chunk)) => {
-                    let fits = body.len().saturating_add(chunk.len()) <= max_body;
-                    if fits {
-                        body.extend_from_slice(&chunk);
-                    }
-                    prefix.push(Ok(chunk));
-                    if !fits {
-                        return false;
-                    }
-                }
-                Some(Err(error)) => {
-                    prefix.push(Err(error));
-                    return false;
-                }
-                None => return true,
+            Some(Err(error)) => {
+                prefix.push(Err(error));
+                break false;
             }
+            None => break true,
         }
     };
-    let complete = tokio::time::timeout_at(deadline, read)
-        .await
-        .unwrap_or(false);
     let now = unix_millis();
     let evidence = quota_evidence(&parts.headers, complete.then_some(body.as_slice()), now);
     let kind = if forbidden && !evidence.exhausted {
@@ -204,8 +189,6 @@ pub(in crate::api::proxy) async fn classify_supplier_quota(
     } else {
         classify(&parts.headers, complete.then_some(body.as_slice()), now)
     };
-    // Preserve the entire original stream including errors and unread suffix.
-    // No secret error JSON enters logs, metrics, health rows or new archives.
     let response = UpstreamResponse::Prefetched {
         status: parts.status,
         headers: parts.headers,
@@ -296,11 +279,59 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn incomplete403_cannot_grant_failover_and_keeps_unread_suffix() {
-        let chunks = vec![Ok(Bytes::from_static(
-            br#"{"error":{"code":"insufficient_quota"}}"#,
-        ))];
-        let suffix = chunks.clone();
+    async fn interrupted_rejection_preserves_shared_transport_deadline_and_read_errors() {
+        use crate::api::proxy::upstream_response::{
+            UPSTREAM_READ_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT,
+        };
+        for status in [StatusCode::FORBIDDEN, StatusCode::TOO_MANY_REQUESTS] {
+            for (request_seconds, read_seconds, error) in [
+                (5, 1, UPSTREAM_READ_TIMEOUT),
+                (1, 5, UPSTREAM_REQUEST_TIMEOUT),
+            ] {
+                let prefix = Bytes::from_static(br#"{"error":{"code":"insufficient_quota""#);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                let response = UpstreamResponse::Prefetched {
+                    status,
+                    headers,
+                    version: http::Version::HTTP_2,
+                    content_length: None,
+                    stream: Box::pin(stream::iter([Ok(prefix.clone())]).chain(stream::once(
+                        async {
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            Ok(Bytes::from_static(b"}}"))
+                        },
+                    ))),
+                }
+                .with_body_timeouts(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(request_seconds),
+                    std::time::Duration::from_secs(read_seconds),
+                );
+                let (response, kind, evidence) = classify_supplier_quota(response).await;
+                assert!(!evidence.exhausted);
+                assert_eq!(
+                    kind,
+                    if status == StatusCode::FORBIDDEN {
+                        UpstreamFailureKind::Authentication
+                    } else {
+                        UpstreamFailureKind::RateLimited
+                    }
+                );
+                assert_eq!(
+                    response.bytes_stream().collect::<Vec<_>>().await,
+                    vec![Ok(prefix), Err(error)]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_the_owned_rejection_body() {
+        let (polled, body_polled) = tokio::sync::oneshot::channel();
+        let (owned, body_dropped) = tokio::sync::oneshot::channel::<()>();
         let mut headers = HeaderMap::new();
         headers.insert(
             header::CONTENT_TYPE,
@@ -311,15 +342,17 @@ mod tests {
             headers,
             version: http::Version::HTTP_2,
             content_length: None,
-            stream: Box::pin(stream::iter(chunks.clone()).chain(stream::once(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                suffix[0].clone()
-            }))),
+            stream: Box::pin(stream::once(async move {
+                let _owned = owned;
+                polled.send(()).unwrap();
+                std::future::pending::<Result<Bytes, &'static str>>().await
+            })),
         };
-        let (response, kind, evidence) = classify_supplier_quota(response).await;
-        assert_eq!(kind, UpstreamFailureKind::Authentication);
-        assert!(!evidence.exhausted);
-        assert_eq!(response.bytes_stream().collect::<Vec<_>>().await.len(), 2);
+        let task = tokio::spawn(classify_supplier_quota(response));
+        body_polled.await.unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(body_dropped.await.is_err());
     }
 
     #[test]
@@ -478,7 +511,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timeout_restores_captured_prefix_and_delayed_unread_suffix() {
+    async fn delayed429_body_uses_transport_policy_and_preserves_original_chunks() {
         let prefix = Bytes::from_static(b"{\"error\":");
         let suffix = Bytes::from_static(b"{\"type\":\"usage_limit_reached\"}}");
         let expected = vec![Ok(prefix.clone()), Ok(suffix.clone())];
@@ -494,11 +527,13 @@ mod tests {
             stream: Box::pin(stream::once(async move { Ok(prefix) }).chain(delayed)),
         };
         let (response, kind) = classify_rate_limit(response).await;
-        assert_eq!(
+        assert!(matches!(
             kind,
-            UpstreamFailureKind::RateLimited,
-            "partial JSON is not exhaustion evidence"
-        );
+            UpstreamFailureKind::RateLimitedUntil {
+                exhausted: true,
+                ..
+            }
+        ));
         assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, expected);
     }
 }

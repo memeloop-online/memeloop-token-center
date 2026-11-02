@@ -1,6 +1,54 @@
 use super::*;
 
 #[tokio::test]
+async fn delayed_complete403_body_fails_over_only_for_definite_quota() {
+    for (code, expected, standby_requests) in [
+        ("insufficient_quota", StatusCode::OK, 1),
+        ("invalid_api_key", StatusCode::FORBIDDEN, 0),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let upstream = axum::Router::new().fallback(move || async move {
+            let body = futures_util::stream::once(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok::<_, std::io::Error>(Bytes::from(
+                    serde_json::to_vec(&json!({"error":{"code":code}})).unwrap(),
+                ))
+            });
+            (
+                StatusCode::FORBIDDEN,
+                [(header::CONTENT_TYPE, "application/json")],
+                Body::from_stream(body),
+            )
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let standby = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(successful_chat_response())
+            .expect(standby_requests)
+            .mount(&standby)
+            .await;
+        let fixture = resilient_route_fixture(code, &[(endpoint, 0), (standby.uri(), 10)]).await;
+        let response = send_resilient_chat(&fixture, None, false).await;
+        assert_eq!(response.status(), expected);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        if expected == StatusCode::OK {
+            assert_eq!(body["choices"][0]["message"]["content"], "ok");
+            assert_eq!(body["usage"]["total_tokens"], 3);
+        } else {
+            assert_eq!(body["error"]["code"], "authentication_invalid");
+        }
+        standby.verify().await;
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn explicit403_quota_fails_over_avoids_failed_model_and_recovers_only_from_real_probe() {
     let exhausted = MockServer::start().await;
     let healthy = MockServer::start().await;
