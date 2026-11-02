@@ -2,6 +2,8 @@ use super::*;
 
 #[cfg(test)]
 mod archive_numbering_tests;
+#[cfg(test)]
+mod execution_lock_tests;
 mod observation_prefix;
 mod plaintext_sweep;
 #[cfg(test)]
@@ -1777,6 +1779,13 @@ pub(super) async fn apply_migration_range(
             .is_some();
         if applied {
             continue;
+        }
+        if migration.version == 143 && transaction.as_mut().backend_name() == "PostgreSQL" {
+            sqlx::query(
+                "LOCK TABLE request_archive_spools, response_archive_spools, response_archive_spool_budget, archive_budget_reservations IN ACCESS EXCLUSIVE MODE NOWAIT",
+            )
+            .execute(&mut **transaction)
+            .await?;
         }
         if let Err(error) = sqlx::raw_sql(migration.sql)
             .execute(&mut **transaction)
