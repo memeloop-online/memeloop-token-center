@@ -49,10 +49,10 @@ impl Database {
         revision: i64,
         request: Uuid,
         session: Option<Uuid>,
-        account: &str,
-        generation: u64,
+        selected: (&str, u64),
         now: i64,
     ) -> Result<bool, AppError> {
+        let (account, generation) = selected;
         let mut tx = self.begin_write_transaction().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SET LOCAL lock_timeout='5ms'")
@@ -93,10 +93,9 @@ impl Database {
     pub(crate) async fn refresh_allocation_usage(
         &self,
         tenant: Uuid,
-        account: Uuid,
+        _account: Uuid,
         now: i64,
     ) -> Result<(), AppError> {
-        let _ = account;
         let mut tx = self.begin_write_transaction().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SET LOCAL lock_timeout='5ms'")
@@ -211,8 +210,7 @@ mod tests {
                     revision,
                     left_request,
                     Some(session),
-                    "a",
-                    1,
+                    ("a", 1),
                     now + index
                 ),
                 second.allocation_reserve(
@@ -220,8 +218,7 @@ mod tests {
                     revision,
                     right_request,
                     None,
-                    "a",
-                    1,
+                    ("a", 1),
                     now + index
                 ),
             );
@@ -252,7 +249,7 @@ mod tests {
             let revision = loser.allocation_revision(tenant).await.unwrap();
             assert!(
                 loser
-                    .allocation_reserve(tenant, revision, request, None, "b", 1, now + index)
+                    .allocation_reserve(tenant, revision, request, None, ("b", 1), now + index)
                     .await
                     .unwrap()
             );
@@ -289,7 +286,14 @@ mod tests {
         let revision = first.allocation_revision(tenant).await.unwrap();
         assert!(
             first
-                .allocation_reserve(tenant, revision, request, Some(session), "a", 1, now + 100)
+                .allocation_reserve(
+                    tenant,
+                    revision,
+                    request,
+                    Some(session),
+                    ("a", 1),
+                    now + 100
+                )
                 .await
                 .unwrap()
         );
@@ -316,6 +320,27 @@ mod tests {
             .unwrap();
         assert!(usage.iter().all(|row| row.hour >= midnight / HOUR_MS - 23));
         assert!(usage.iter().any(|row| row.requests >= 90));
+        let backlog_tenant = Uuid::now_v7();
+        sqlx::query("WITH RECURSIVE sequence(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM sequence WHERE n<25000) INSERT INTO group_allocation_reservations(tenant_id,request_id,account_id,session_key,generation,created_at) SELECT $1,CAST(n AS TEXT),'a','',1,$2 FROM sequence")
+            .bind(backlog_tenant.to_string()).bind(now).execute(&restarted.pool).await.unwrap();
+        sqlx::query("INSERT INTO group_allocation_pending(tenant_id,account_id,hour_bucket,requests) VALUES($1,'a',$2,25000)")
+            .bind(backlog_tenant.to_string()).bind(now/HOUR_MS).execute(&restarted.pool).await.unwrap();
+        let started = std::time::Instant::now();
+        for _ in 0..32 {
+            let usage = tokio::time::timeout(
+                std::time::Duration::from_millis(25),
+                restarted.allocation_usage(backlog_tenant, &accounts, now),
+            )
+            .await
+            .expect("compact history stays inside allocation budget with 25000 pending requests")
+            .unwrap();
+            assert_eq!(usage.len(), 1);
+            assert_eq!(usage[0].requests, 25000);
+        }
+        eprintln!(
+            "allocation compact reads: 32/32 in budget, 25000 pending requests, elapsed_ms={}",
+            started.elapsed().as_millis()
+        );
         assert!(
             restarted
                 .allocation_session(tenant, session, now + DAY_MS + 102)

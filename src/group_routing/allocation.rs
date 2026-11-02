@@ -8,7 +8,7 @@ pub(super) struct Reservation {
     request: Uuid,
     session: Option<Uuid>,
     now: i64,
-    pub context: Value,
+    pub context: Option<Value>,
     pub preferred: Option<String>,
 }
 
@@ -39,6 +39,17 @@ impl Reservation {
         } else {
             None
         };
+        if preferred.is_some() {
+            return Ok(Self {
+                tenant,
+                revision,
+                request,
+                session,
+                now,
+                context: None,
+                preferred,
+            });
+        }
         let identities: BTreeMap<_, _> = input
             .candidates
             .iter()
@@ -94,7 +105,7 @@ impl Reservation {
             request,
             session,
             now,
-            context,
+            context: Some(context),
             preferred,
         })
     }
@@ -111,10 +122,36 @@ impl Reservation {
                 self.revision,
                 self.request,
                 self.session,
-                &selected.account_id,
-                selected.generation,
+                (&selected.account_id, selected.generation),
                 self.now,
             )
             .await
     }
+}
+
+pub(super) fn session_plan(
+    input: &GroupRoutingInput,
+    preferred: &str,
+) -> crate::plugin::routing::GroupRoutingExecutionPlan {
+    use crate::plugin::routing::{GroupRoutingExecutionDirective, GroupRoutingExecutionPlan};
+    let mut candidates: Vec<_> = input
+        .candidates
+        .iter()
+        .map(|candidate| GroupRoutingExecutionDirective {
+            directive: GroupRoutingDirective {
+                tenant_id: candidate.tenant_id.clone(),
+                route_id: candidate.route_id.clone(),
+                account_id: candidate.account_id.clone(),
+                generation: candidate.generation,
+                allow_transient_probe: false,
+                cooldown_ms: 0,
+                recovery_wait_ms: 0,
+                recheck_ms: 0,
+                stickiness: false,
+            },
+            transient_policy: None,
+        })
+        .collect();
+    candidates.sort_by_key(|candidate| candidate.directive.account_id != preferred);
+    GroupRoutingExecutionPlan { candidates }
 }

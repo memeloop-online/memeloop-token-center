@@ -402,6 +402,39 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
             + low.received_requests().await.unwrap().len(),
         7
     );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        responses_transport::wait_for_financial_events(&fixture.state, fixture.key_id, 7),
+    )
+    .await
+    .unwrap();
+    fixture
+        .state
+        .db
+        .refresh_allocation_usage(group.tenant_id, fixture.accounts[0], unix_millis())
+        .await
+        .unwrap();
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM group_allocation_reservations WHERE tenant_id=$1")
+            .bind(group.tenant_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        pending, 0,
+        "completed projections replace their exact reservations"
+    );
+    let requests: i64 = sqlx::query_scalar(
+        "SELECT CAST(SUM(requests) AS BIGINT) FROM group_allocation_usage WHERE tenant_id=$1",
+    )
+    .bind(group.tenant_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        requests, 7,
+        "completed history counts each request once after reconciliation"
+    );
     sqlx::query("DROP TABLE group_allocation_usage")
         .execute(&pool)
         .await

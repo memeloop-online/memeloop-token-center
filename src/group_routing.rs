@@ -635,6 +635,7 @@ async fn prepare_inner(
         let result = async {
             for attempt in 0..2 {
                 let reservation = if uses_allocation {
+                    let read_phase = SnapshotPhase::new(request_id, "group_allocation_read");
                     let reservation = allocation::Reservation::read(
                         state,
                         tenant_id,
@@ -643,27 +644,38 @@ async fn prepare_inner(
                         &input,
                     )
                     .await?;
-                    input.allocation_context = Some(reservation.context.clone());
+                    read_phase.finish("returned");
+                    input.allocation_context = reservation.context.clone();
                     Some(reservation)
                 } else {
                     None
                 };
-                let runtime = state.plugins.clone();
-                let execute_id = plugin_id.clone();
-                let execute_input = input.clone();
-                let execute_signals = transient_signals.clone();
-                let mut plan = crate::api::plugin_execution::run_group(
-                    state.metrics.clone(),
-                    crate::metrics::plugin_execution::Phase::GroupRoutingPlan,
-                    move || {
-                        runtime.execute_group_routing_plan_with_health(
-                            &execute_id,
-                            &execute_input,
-                            execute_signals.as_deref(),
-                        )
-                    },
-                )
-                .await?;
+                let mut plan = if let Some(preferred) = reservation
+                    .as_ref()
+                    .and_then(|reservation| reservation.preferred.as_deref())
+                {
+                    state
+                        .plugins
+                        .validate_group_routing_configuration(&plugin_id, &input.config)?;
+                    allocation::session_plan(&input, preferred)
+                } else {
+                    let runtime = state.plugins.clone();
+                    let execute_id = plugin_id.clone();
+                    let execute_input = input.clone();
+                    let execute_signals = transient_signals.clone();
+                    crate::api::plugin_execution::run_group(
+                        state.metrics.clone(),
+                        crate::metrics::plugin_execution::Phase::GroupRoutingPlan,
+                        move || {
+                            runtime.execute_group_routing_plan_with_health(
+                                &execute_id,
+                                &execute_input,
+                                execute_signals.as_deref(),
+                            )
+                        },
+                    )
+                    .await?
+                };
                 sort_execution_candidates(selection_seed, &mut plan.candidates);
                 if let Some(reservation) = reservation {
                     if let Some(preferred) = &reservation.preferred {
@@ -676,7 +688,10 @@ async fn prepare_inner(
                         .filter_map(|item| planned_candidate(&input, &item.directive))
                         .find(|candidate| candidate.health == GroupRoutingHealth::Healthy)
                         .ok_or_else(|| AppError::internal("allocation_healthy_candidate"))?;
-                    if !reservation.commit(state, selected).await? {
+                    let commit_phase = SnapshotPhase::new(request_id, "group_allocation_commit");
+                    let committed = reservation.commit(state, selected).await?;
+                    commit_phase.finish(if committed { "committed" } else { "conflict" });
+                    if !committed {
                         if attempt == 0 {
                             continue;
                         }

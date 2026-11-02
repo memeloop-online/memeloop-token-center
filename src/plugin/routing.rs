@@ -10,6 +10,33 @@ mod bindings {
     });
 }
 
+pub(super) type PreparedGroupRouting = bindings::GroupRoutingPluginPre<HostState>;
+
+pub(super) fn prepare_component(
+    engine: &Engine,
+    manifest: &PluginManifest,
+    component: Option<&Component>,
+) -> Result<Option<PreparedGroupRouting>, AppError> {
+    if !manifest
+        .contributions
+        .group_routing
+        .as_ref()
+        .is_some_and(|routing| routing.allocation_context.is_some())
+    {
+        return Ok(None);
+    }
+    let component = component.ok_or_else(invalid)?;
+    let mut linker = Linker::new(engine);
+    Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+        .map_err(|_| plugin_runtime_failure("routing_linker_configuration"))?;
+    let pre = linker
+        .instantiate_pre(component)
+        .map_err(|_| plugin_runtime_failure("routing_component_preparation"))?;
+    PreparedGroupRouting::new(pre)
+        .map(Some)
+        .map_err(|_| plugin_runtime_failure("routing_component_preparation"))
+}
+
 pub const GROUP_ROUTING_VERSION: &str = "group-routing-v1";
 pub const GROUP_ROUTING_V2_VERSION: &str = "group-routing-v2";
 const MAX_CANDIDATES: usize = 1024;
@@ -1008,11 +1035,17 @@ impl PluginRuntime {
         store
             .set_fuel(self.fuel)
             .map_err(|_| plugin_runtime_failure("fuel_configuration"))?;
-        let mut linker = Linker::new(engine);
-        Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
-            .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
-        let bindings = bindings::GroupRoutingPlugin::instantiate(&mut store, component, &linker)
-            .map_err(|error| plugin_failure(plugin_id, error))?;
+        let bindings = if let Some(prepared) = &plugin.routing_component {
+            prepared
+                .instantiate(&mut store)
+                .map_err(|error| plugin_failure(plugin_id, error))?
+        } else {
+            let mut linker = Linker::new(engine);
+            Plugin::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
+                .map_err(|_| plugin_runtime_failure("linker_configuration"))?;
+            bindings::GroupRoutingPlugin::instantiate(&mut store, component, &linker)
+                .map_err(|error| plugin_failure(plugin_id, error))?
+        };
         let guest = bindings.memeloop_token_center_group_routing_v1();
         let output = if observe {
             guest.call_observe(&mut store, &encoded)
