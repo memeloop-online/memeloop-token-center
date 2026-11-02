@@ -21,6 +21,18 @@ pub(crate) struct AllocationUsage {
     pub tokens: u64,
 }
 
+fn allocation_refresh_error(stage: &'static str, error: sqlx::Error) -> AppError {
+    let code = error.as_database_error().and_then(|error| error.code());
+    tracing::warn!(
+        stage,
+        sqlstate = code.as_deref(),
+        "allocation history refresh deferred"
+    );
+    #[cfg(test)]
+    eprintln!("allocation history refresh deferred: stage={stage} sqlstate={code:?}");
+    error.into()
+}
+
 impl Database {
     pub(crate) async fn allocation_revision(&self, tenant: Uuid) -> Result<i64, AppError> {
         Ok(
@@ -139,6 +151,8 @@ impl Database {
             sqlx::query("SET LOCAL statement_timeout='80ms'")
                 .execute(&mut *tx)
                 .await?;
+            // Compact reconciliation benefits from direct execution within its short budget.
+            sqlx::query("SET LOCAL jit=off").execute(&mut *tx).await?;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut *tx)
                 .await?;
@@ -156,19 +170,21 @@ impl Database {
         sqlx::query("DELETE FROM group_allocation_usage WHERE tenant_id=$1")
             .bind(tenant.to_string())
             .execute(&mut *tx)
-            .await?;
+            .await
+            .map_err(|error| allocation_refresh_error("usage_clear", error))?;
         sqlx::query("INSERT INTO group_allocation_usage(tenant_id,account_id,hour_bucket,requests,tokens) SELECT tenant_id,upstream_account_id,hour_bucket,CAST(SUM(requests) AS BIGINT),CAST(SUM(input_tokens+output_tokens) AS BIGINT) FROM usage_analysis_hourly WHERE tenant_id=$1 AND hour_bucket>=$2 GROUP BY tenant_id,upstream_account_id,hour_bucket")
-            .bind(tenant.to_string()).bind(now/HOUR_MS-23).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM group_allocation_reservations WHERE tenant_id=$1 AND (created_at<$2 OR request_id IN (SELECT f.request_id FROM request_stats_facts f JOIN request_records r ON r.id=f.request_id WHERE f.request_id=group_allocation_reservations.request_id AND f.tenant_id=$1 AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id=f.request_id AND t.projected_at IS NULL) AND NOT EXISTS (SELECT 1 FROM metered_usage_projection_outbox m WHERE m.reservation_id=r.reservation_id AND m.projected_at IS NULL)))")
-            .bind(tenant.to_string()).bind(now-DAY_MS).execute(&mut *tx).await?;
+            .bind(tenant.to_string()).bind(now/HOUR_MS-23).execute(&mut *tx).await.map_err(|error| allocation_refresh_error("usage_snapshot", error))?;
+        sqlx::query("DELETE FROM group_allocation_reservations WHERE tenant_id=$1 AND (created_at<$2 OR EXISTS (SELECT 1 FROM request_stats_facts f JOIN request_records r ON r.id=f.request_id WHERE f.request_id=group_allocation_reservations.request_id AND f.tenant_id=$1 AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id=f.request_id AND t.projected_at IS NULL) AND NOT EXISTS (SELECT 1 FROM metered_usage_projection_outbox m WHERE m.reservation_id=r.reservation_id AND m.projected_at IS NULL)))")
+            .bind(tenant.to_string()).bind(now-DAY_MS).execute(&mut *tx).await.map_err(|error| allocation_refresh_error("reservation_reconcile", error))?;
         sqlx::query("DELETE FROM group_allocation_pending WHERE tenant_id=$1")
             .bind(tenant.to_string())
             .execute(&mut *tx)
-            .await?;
+            .await
+            .map_err(|error| allocation_refresh_error("pending_clear", error))?;
         sqlx::query("INSERT INTO group_allocation_pending(tenant_id,account_id,hour_bucket,requests) SELECT tenant_id,account_id,created_at/3600000,COUNT(*) FROM group_allocation_reservations WHERE tenant_id=$1 AND created_at>=$2 GROUP BY tenant_id,account_id,created_at/3600000")
-            .bind(tenant.to_string()).bind((now/HOUR_MS-23)*HOUR_MS).execute(&mut *tx).await?;
+            .bind(tenant.to_string()).bind((now/HOUR_MS-23)*HOUR_MS).execute(&mut *tx).await.map_err(|error| allocation_refresh_error("pending_snapshot", error))?;
         sqlx::query("DELETE FROM group_allocation_sessions WHERE tenant_id=$1 AND session_key IN (SELECT session_key FROM group_allocation_sessions WHERE tenant_id=$1 AND expires_at<=$2 ORDER BY expires_at LIMIT 512)")
-            .bind(tenant.to_string()).bind(now).execute(&mut *tx).await?;
+            .bind(tenant.to_string()).bind(now).execute(&mut *tx).await.map_err(|error| allocation_refresh_error("session_expiry", error))?;
         tx.commit().await?;
         Ok(())
     }
