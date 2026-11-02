@@ -158,7 +158,7 @@ pub(super) fn members(
     input: Vec<MemberInput>,
     previous: &[Member],
 ) -> Result<Vec<Member>, AppError> {
-    if !(1..=4).contains(&input.len()) {
+    if input.is_empty() {
         return Err(invalid());
     }
     let mut output: Vec<Member> = Vec::new();

@@ -782,6 +782,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "first class network proxies",
         sql: include_str!("../../../migrations/common/0148_network_proxies.sql"),
     },
+    Migration {
+        version: 149,
+        name: "transport proxy member indices without four member limit",
+        sql: include_str!("../../../migrations/common/0149_transport_proxy_member_indices.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1542,6 +1547,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 148,
         name: "first class network proxies",
         sql: include_str!("../../../migrations/common/0148_network_proxies.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "transport proxy member indices without four member limit",
+        sql: include_str!("../../../migrations/common/0149_transport_proxy_member_indices.sql"),
     },
 ];
 

@@ -10,7 +10,7 @@ configuration retain their single-proxy behavior.
 `MTC_TRANSPORT_PROXY_GROUPS` defaults to `[]`. Supply it through the existing
 Secret mechanism, identically to gateway, control and OAuth worker processes.
 Each entry has `account_id` (MTC account UUID), positive integer `version`, and
-`proxies` (one to four distinct private IP-literal `socks5h://` URLs). Limits are
+`proxies` (one or more distinct private IP-literal `socks5h://` URLs). Limits are
 256 accounts and 256 KiB of JSON. Credentials may be part of the URLs; config
 serialization omits this field and errors do not echo its contents.
 
@@ -40,8 +40,9 @@ Refresh preserves the operator's original credential proxy binding. A newer
 credential snapshot invalidates old local CAS tickets and the client-cache epoch
 while retaining the selected exit when the binding is unchanged. A configured
 account with no proxy or a proxy outside its group fails closed, never DIRECT.
-The 64-bit state encodes a positive 32-bit credential generation, 28-bit epoch,
-and two two-bit indices. Exhaustion fails closed instead of wrapping old tickets.
+The 128-bit atomic state preserves the positive 32-bit credential generation and
+28-bit epoch, with two 32-bit member indices. Existing configuration byte budgets
+remain unchanged. Exhaustion fails closed instead of wrapping old tickets.
 
 ## Optional persistence and consistency limits
 
@@ -80,8 +81,9 @@ group version. Removing a group restores the existing single-proxy path.
 ## Schema and validation
 
 Selector persistence uses **0116_transport_proxy_groups.sql**,
-registered for both SQLite and PostgreSQL; management adds migration 117 and Helm
-declares schema 117. Versions
+registered for both SQLite and PostgreSQL; management adds migration 117,
+entities add migration 148, and migration 149 preserves existing selections while
+removing the four-member index constraint. Helm declares schema 149. Versions
 0114 (#422) and 0115 (#455) remain owned by their PRs. The migration runner checks
 the applied-version set, so gaps need no placeholder or dependency cherry-pick.
 Historical migrations and deployed checksums are unchanged.

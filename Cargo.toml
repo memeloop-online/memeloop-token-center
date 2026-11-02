@@ -33,6 +33,7 @@ plugin-distribution = ["dep:oci-client"]
 
 [dependencies]
 percent-encoding = "2"
+portable-atomic = "=1.15.0"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 # Only the delay iterator is used; the quota deadline owns Tokio sleeping.

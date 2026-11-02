@@ -312,6 +312,71 @@ async fn upgrade_contract(database: &Database) {
         .fetch_optional(&database.pool)
         .await
         .unwrap();
+    let account = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'index-upgrade', 'http-json', 'none', '{}', 'active', 1, 0, 0)")
+        .bind(&account).bind(&tenant).execute(&database.pool).await.unwrap();
+    sqlx::query("DROP TABLE upstream_transport_proxy_selections")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/common/0116_transport_proxy_groups.sql"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO upstream_transport_proxy_selections (account_id, group_version, group_fingerprint, credential_generation, base_index, selected_index, selection_generation) VALUES ($1, 9, 'preserved-fingerprint', 1, 2, 3, 7)")
+        .bind(&account).execute(&database.pool).await.unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 149")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let saved =
+        sqlx::query("SELECT * FROM upstream_transport_proxy_selections WHERE account_id = $1")
+            .bind(&account)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        saved.try_get::<String, _>("group_fingerprint").unwrap(),
+        "preserved-fingerprint"
+    );
+    for (column, expected) in [
+        ("group_version", 9_i64),
+        ("credential_generation", 1),
+        ("base_index", 2),
+        ("selected_index", 3),
+        ("selection_generation", 7),
+    ] {
+        assert_eq!(saved.try_get::<i64, _>(column).unwrap(), expected);
+    }
+    sqlx::query("UPDATE upstream_transport_proxy_selections SET base_index = 6, selected_index = 7 WHERE account_id = $1")
+        .bind(&account).execute(&database.pool).await.unwrap();
+    database.migrate().await.unwrap();
+    let selected: i64 = sqlx::query_scalar(
+        "SELECT selected_index FROM upstream_transport_proxy_selections WHERE account_id = $1",
+    )
+    .bind(&account)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(selected, 7);
+    assert!(sqlx::query("UPDATE upstream_transport_proxy_selections SET selected_index = -1 WHERE account_id = $1")
+        .bind(&account).execute(&database.pool).await.is_err());
+    sqlx::query("DELETE FROM upstream_accounts WHERE id = $1")
+        .bind(&account)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_transport_proxy_selections WHERE account_id = $1",
+    )
+    .bind(&account)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[test]
@@ -326,7 +391,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148, 149
             ]
         );
     }

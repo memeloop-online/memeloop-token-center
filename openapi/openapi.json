@@ -18210,7 +18210,6 @@
           "members": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4,
             "items": {
               "$ref": "#/components/schemas/TransportProxyMemberInput"
             }
@@ -18457,7 +18456,6 @@
           "members": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4,
             "items": {
               "$ref": "#/components/schemas/TransportProxyMemberInput"
             }

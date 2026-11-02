@@ -10,7 +10,7 @@
   `providers:write` 权限，并校验目标租户与账号/组归属。
 - GET 的租户参数为 `tenant_external_id` query；写请求将该参数放在 JSON body。
 - 所有响应使用 `Cache-Control: private, no-store`。时间为 Unix 毫秒，ID 为 UUID。
-- 组名称和成员标签为 1–64 字符；每组 1–4 个不同的私网 `socks5h://`
+- 组名称和成员标签为 1–64 字符；每组至少一个不同的私网 `socks5h://`
   地址。支持私网 IP 及 Kubernetes Service DNS：`service.namespace.svc`、
   `service.namespace.svc.cluster.local`，例如 `mihomo.egress.svc:1080`。
   新增/替换地址复用现有私网出口解析校验，拒绝公网、loopback、link-local、
@@ -210,7 +210,7 @@ DELETE 解绑请求必须显式选择保留的单代理成员，不提供 DIRECT
 
 - 正式配置写入必须持久化成功；运行时选择仍为已有最佳努力持久化，不提升为
   跨 Pod 共识。配置版本与选择代次分开，健康出口不轮询、不自动 failback。
-- 后台加载并发布有界快照；最多 256 个配置组、256 个绑定账号，每组最多四成员，
+- 后台加载并发布有界快照；最多 256 个配置组、256 个绑定账号，不另设每组成员数量上限，
   活跃绑定配置维持 256 KiB 序列化预算。超限拒绝管理写入，不静默截断。
 - 现有账号/路由快照携带绑定标识及版本；选组只验证内存中的对应版本，缺失或
   过期时 fail closed，不临时查 DB，也不降级 DIRECT。
