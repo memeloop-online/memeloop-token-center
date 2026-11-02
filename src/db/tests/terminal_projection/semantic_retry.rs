@@ -127,6 +127,18 @@ async fn complete(
     assert_eq!(row.get::<i64, _>("events"), 1);
 }
 
+async fn released_terminal_lease(database: &Database, request_id: Uuid) {
+    let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at, projected_at, (SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1) AS payloads, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1) AS observations FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+    assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+    assert_eq!(row.get::<Option<String>, _>("terminal_lease_owner"), None);
+    assert_eq!(row.get::<Option<i64>, _>("terminal_lease_expires_at"), None);
+    assert_eq!(row.get::<Option<i64>, _>("projected_at"), None);
+    assert_eq!(row.get::<i64, _>("payloads"), 0);
+    assert_eq!(row.get::<i64, _>("observations"), 0);
+}
+
 async fn retry_contract(database_url: &str) {
     let database = Database::connect_with_max(database_url, 1).await.unwrap();
     database.migrate().await.unwrap();
@@ -212,7 +224,6 @@ async fn retry_contract(database_url: &str) {
     complete(&database, request_id, &reservation, next_owner).await;
 
     let (_key, reservation, request_id, owner) = pending(&database, false).await;
-    let original_expiry = expiry(&database, request_id).await;
     let terminal_projected_at: i64 = sqlx::query_scalar(
         "SELECT projected_at FROM terminal_projection_outbox WHERE request_id = $1",
     )
@@ -233,7 +244,7 @@ async fn retry_contract(database_url: &str) {
             .await
             .unwrap()
     );
-    retained(&database, request_id, original_expiry, 0).await;
+    released_terminal_lease(&database, request_id).await;
     sqlx::raw_sql("DROP TRIGGER reject_retry ON conversation_projection_outbox; DROP FUNCTION reject_retry();")
         .execute(&blockers).await.unwrap();
     assert!(
@@ -242,14 +253,23 @@ async fn retry_contract(database_url: &str) {
             .await
             .unwrap()
     );
-    retained(&database, request_id, original_expiry, 0).await;
+    released_terminal_lease(&database, request_id).await;
     sqlx::query("UPDATE terminal_projection_outbox SET projected_at = $1 WHERE request_id = $2")
         .bind(terminal_projected_at)
         .bind(request_id.to_string())
         .execute(&database.pool)
         .await
         .unwrap();
-    complete(&database, request_id, &reservation, owner).await;
+    let next_owner = Uuid::now_v7();
+    assert!(
+        database
+            .claim_conversation_projection_tasks(next_owner, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id)
+    );
+    complete(&database, request_id, &reservation, next_owner).await;
 
     for (name, trigger) in [
         (
