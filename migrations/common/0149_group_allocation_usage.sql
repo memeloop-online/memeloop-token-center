@@ -1,6 +1,7 @@
 CREATE TABLE group_allocation_revisions (
     tenant_id TEXT PRIMARY KEY,
-    revision BIGINT NOT NULL
+    revision BIGINT NOT NULL,
+    refreshed_at BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE group_allocation_usage (
     tenant_id TEXT NOT NULL,
@@ -13,6 +14,7 @@ CREATE TABLE group_allocation_usage (
 CREATE TABLE group_allocation_sessions (
     tenant_id TEXT NOT NULL,
     session_key TEXT NOT NULL,
+    request_id TEXT NOT NULL,
     account_id TEXT NOT NULL,
     generation BIGINT NOT NULL,
     observed_at BIGINT NOT NULL,

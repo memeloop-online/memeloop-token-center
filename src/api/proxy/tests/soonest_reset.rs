@@ -384,7 +384,20 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
     assert_eq!(
         high.received_requests().await.unwrap().len()
             + low.received_requests().await.unwrap().len(),
-        5
+        7
+    );
+    sqlx::query("DROP TABLE group_allocation_usage")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = send_resilient_chat(&fixture, Some("one-shared-session"), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        high.received_requests().await.unwrap().len()
+            + low.received_requests().await.unwrap().len(),
+        8,
+        "allocation storage failure preserves normal routing"
     );
     pool.close().await;
 }

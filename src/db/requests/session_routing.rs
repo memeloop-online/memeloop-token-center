@@ -162,7 +162,6 @@ pub(super) async fn upsert_session_routing_terminal_from_request_in_transaction(
     .bind(created_at)
     .execute(&mut **transaction)
     .await?;
-    crate::db::allocation::correct_terminal(transaction, request_id).await?;
     Ok(())
 }
 
@@ -196,7 +195,6 @@ async fn upsert_session_routing_terminal_in_transaction(
     .bind(expires_at)
     .execute(&mut **transaction)
     .await?;
-    crate::db::allocation::correct_terminal(transaction, &input.request_id.to_string()).await?;
     Ok(())
 }
 

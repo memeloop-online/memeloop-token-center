@@ -1,6 +1,6 @@
 //! Shared request reservations, session affinity and compact hourly history.
-use super::{AppError, Database, unix_millis};
-use sqlx::{Any, Row, Transaction};
+use super::{AppError, Database, DatabaseBackend};
+use sqlx::{Any, Row};
 use uuid::Uuid;
 
 pub(crate) const HOUR_MS: i64 = 3_600_000;
@@ -32,7 +32,7 @@ impl Database {
         session: Uuid,
         now: i64,
     ) -> Result<Option<(String, u64)>, AppError> {
-        let row = sqlx::query("SELECT account_id,generation FROM group_allocation_sessions WHERE tenant_id=$1 AND session_key=$2 AND expires_at>$3")
+        let row = sqlx::query("SELECT CASE WHEN t.status_code>=200 AND t.status_code<400 AND COALESCE(t.error_code,'')='' THEN COALESCE(t.upstream_account_id,s.account_id) ELSE s.account_id END AS account_id,CASE WHEN t.status_code>=200 AND t.status_code<400 AND COALESCE(t.error_code,'')='' AND t.upstream_account_id IS NOT NULL THEN -1 ELSE s.generation END AS generation FROM group_allocation_sessions s LEFT JOIN session_routing_terminals t ON t.request_id=s.request_id AND t.tenant_id=s.tenant_id WHERE s.tenant_id=$1 AND s.session_key=$2 AND s.expires_at>$3")
             .bind(tenant.to_string()).bind(session.to_string()).bind(now).fetch_optional(&self.pool).await?;
         Ok(row.map(|row| {
             (
@@ -68,8 +68,8 @@ impl Database {
         sqlx::query("INSERT INTO group_allocation_reservations(tenant_id,request_id,account_id,session_key,generation,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id,request_id) DO NOTHING")
             .bind(tenant.to_string()).bind(request.to_string()).bind(account).bind(session.map(|id|id.to_string()).unwrap_or_default()).bind(generation as i64).bind(now).execute(&mut *tx).await?;
         if let Some(session) = session {
-            sqlx::query("INSERT INTO group_allocation_sessions(tenant_id,session_key,account_id,generation,observed_at,expires_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id,session_key) DO UPDATE SET account_id=excluded.account_id,generation=excluded.generation,observed_at=excluded.observed_at,expires_at=excluded.expires_at WHERE group_allocation_sessions.observed_at<=excluded.observed_at")
-                .bind(tenant.to_string()).bind(session.to_string()).bind(account).bind(generation as i64).bind(now).bind(now+DAY_MS).execute(&mut *tx).await?;
+            sqlx::query("INSERT INTO group_allocation_sessions(tenant_id,session_key,account_id,generation,observed_at,expires_at,request_id) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,session_key) DO UPDATE SET account_id=excluded.account_id,generation=excluded.generation,observed_at=excluded.observed_at,expires_at=excluded.expires_at,request_id=excluded.request_id WHERE group_allocation_sessions.observed_at<=excluded.observed_at")
+                .bind(tenant.to_string()).bind(session.to_string()).bind(account).bind(generation as i64).bind(now).bind(now+DAY_MS).bind(request.to_string()).execute(&mut *tx).await?;
         }
         tx.commit().await?;
         Ok(true)
@@ -82,22 +82,33 @@ impl Database {
         account: Uuid,
         now: i64,
     ) -> Result<(), AppError> {
+        let _ = account;
         let mut tx = self.begin_write_transaction().await?;
-        bump_revision(&mut tx, &tenant.to_string()).await?;
-        sqlx::query("DELETE FROM group_allocation_usage WHERE tenant_id=$1 AND account_id=$2")
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *tx)
+                .await?;
+        }
+        let inserted=sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision,refreshed_at) VALUES($1,1,$2) ON CONFLICT(tenant_id) DO NOTHING")
+            .bind(tenant.to_string()).bind(now).execute(&mut *tx).await?.rows_affected();
+        if inserted == 0 {
+            let refreshed=sqlx::query("UPDATE group_allocation_revisions SET revision=revision+1,refreshed_at=$2 WHERE tenant_id=$1 AND refreshed_at<=$3")
+                .bind(tenant.to_string()).bind(now).bind(now-5000).execute(&mut *tx).await?.rows_affected();
+            if refreshed == 0 {
+                tx.rollback().await?;
+                return Ok(());
+            }
+        }
+        sqlx::query("DELETE FROM group_allocation_usage WHERE tenant_id=$1")
             .bind(tenant.to_string())
-            .bind(account.to_string())
             .execute(&mut *tx)
             .await?;
-        sqlx::query("INSERT INTO group_allocation_usage(tenant_id,account_id,hour_bucket,requests,tokens) SELECT tenant_id,upstream_account_id,hour_bucket,CAST(SUM(requests) AS BIGINT),CAST(SUM(input_tokens+output_tokens) AS BIGINT) FROM usage_analysis_hourly WHERE tenant_id=$1 AND upstream_account_id=$2 AND hour_bucket>=$3 GROUP BY tenant_id,upstream_account_id,hour_bucket")
-            .bind(tenant.to_string()).bind(account.to_string()).bind(now/HOUR_MS-23).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM group_allocation_reservations WHERE tenant_id=$1 AND account_id=$2 AND created_at<$3")
-            .bind(tenant.to_string()).bind(account.to_string()).bind(now-DAY_MS).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO group_allocation_usage(tenant_id,account_id,hour_bucket,requests,tokens) SELECT tenant_id,upstream_account_id,hour_bucket,CAST(SUM(requests) AS BIGINT),CAST(SUM(input_tokens+output_tokens) AS BIGINT) FROM usage_analysis_hourly WHERE tenant_id=$1 AND hour_bucket>=$2 GROUP BY tenant_id,upstream_account_id,hour_bucket")
+            .bind(tenant.to_string()).bind(now/HOUR_MS-23).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM group_allocation_reservations WHERE tenant_id=$1 AND (created_at<$2 OR request_id IN (SELECT f.request_id FROM request_stats_facts f JOIN request_records r ON r.id=f.request_id WHERE f.request_id=group_allocation_reservations.request_id AND f.tenant_id=$1 AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id=f.request_id AND t.projected_at IS NULL) AND NOT EXISTS (SELECT 1 FROM metered_usage_projection_outbox m WHERE m.reservation_id=r.reservation_id AND m.projected_at IS NULL)))")
+            .bind(tenant.to_string()).bind(now-DAY_MS).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM group_allocation_sessions WHERE tenant_id=$1 AND session_key IN (SELECT session_key FROM group_allocation_sessions WHERE tenant_id=$1 AND expires_at<=$2 ORDER BY expires_at LIMIT 512)")
-            .bind(tenant.to_string())
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+            .bind(tenant.to_string()).bind(now).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -114,12 +125,27 @@ impl Database {
         let mut query = sqlx::QueryBuilder::<Any>::new(
             "SELECT account_id,hour_bucket,CAST(SUM(requests) AS BIGINT) AS requests,CAST(SUM(tokens) AS BIGINT) AS tokens FROM (SELECT account_id,hour_bucket,requests,tokens FROM group_allocation_usage WHERE tenant_id=",
         );
-        query.push_bind(tenant.to_string()).push(" UNION ALL SELECT account_id,created_at / 3600000 AS hour_bucket,COUNT(*) AS requests,CAST(0 AS BIGINT) AS tokens FROM group_allocation_reservations WHERE tenant_id=").push_bind(tenant.to_string()).push(" AND created_at>=").push_bind(now-DAY_MS).push(" GROUP BY account_id,created_at / 3600000) AS history WHERE hour_bucket>=").push_bind(now/HOUR_MS-23).push(" AND account_id IN (");
-        let mut list = query.separated(",");
-        for account in accounts {
-            list.push_bind(account);
+        query
+            .push_bind(tenant.to_string())
+            .push(" AND hour_bucket>=")
+            .push_bind(now / HOUR_MS - 23)
+            .push(" AND account_id IN (");
+        {
+            let mut list = query.separated(",");
+            for account in accounts {
+                list.push_bind(account);
+            }
+            list.push_unseparated(")");
         }
-        list.push_unseparated(") GROUP BY account_id,hour_bucket");
+        query.push(" UNION ALL SELECT account_id,created_at / 3600000 AS hour_bucket,COUNT(*) AS requests,CAST(0 AS BIGINT) AS tokens FROM group_allocation_reservations WHERE tenant_id=")
+            .push_bind(tenant.to_string()).push(" AND created_at>=").push_bind((now/HOUR_MS-23)*HOUR_MS).push(" AND account_id IN (");
+        {
+            let mut list = query.separated(",");
+            for account in accounts {
+                list.push_bind(account);
+            }
+            list.push_unseparated(") GROUP BY account_id,created_at / 3600000) AS history GROUP BY account_id,hour_bucket");
+        }
         Ok(query
             .build()
             .fetch_all(&self.pool)
@@ -135,102 +161,10 @@ impl Database {
     }
 }
 
-async fn bump_revision(tx: &mut Transaction<'_, Any>, tenant: &str) -> Result<(), AppError> {
-    sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision) VALUES($1,1) ON CONFLICT(tenant_id) DO UPDATE SET revision=group_allocation_revisions.revision+1")
-        .bind(tenant).execute(&mut **tx).await?;
-    Ok(())
-}
-
-/// Completion replaces its exact reservation with the actual account's usage in one transaction.
-pub(crate) async fn project_request(
-    tx: &mut Transaction<'_, Any>,
-    request: &str,
-    direction: i64,
-) -> Result<(), AppError> {
-    let fact = sqlx::query("SELECT tenant_id,upstream_account_id,created_at,input_tokens,output_tokens,status_class FROM request_stats_facts WHERE request_id=$1")
-        .bind(request).fetch_optional(&mut **tx).await?;
-    let Some(fact) = fact else {
-        return Ok(());
-    };
-    let tenant: String = fact.get("tenant_id");
-    // Accounts enter the compact projection through the quota worker.
-    let active: Option<i64> =
-        sqlx::query_scalar("SELECT revision FROM group_allocation_revisions WHERE tenant_id=$1")
-            .bind(&tenant)
-            .fetch_optional(&mut **tx)
-            .await?;
-    if active.is_none() {
-        return Ok(());
-    }
-    bump_revision(tx, &tenant).await?;
-    sqlx::query("INSERT INTO group_allocation_usage(tenant_id,account_id,hour_bucket,requests,tokens) VALUES($1,$2,$3,$4,$5) ON CONFLICT(tenant_id,account_id,hour_bucket) DO UPDATE SET requests=group_allocation_usage.requests+excluded.requests,tokens=group_allocation_usage.tokens+excluded.tokens")
-        .bind(&tenant).bind(fact.get::<String,_>("upstream_account_id")).bind(fact.get::<i64,_>("created_at")/HOUR_MS).bind(direction).bind(direction*fact.get::<i64,_>("input_tokens").saturating_add(fact.get::<i64,_>("output_tokens"))).execute(&mut **tx).await?;
-    if direction > 0 {
-        if fact.get::<String, _>("status_class") == "success" {
-            record_terminal(
-                tx,
-                request,
-                &fact.get::<String, _>("upstream_account_id"),
-                unix_millis(),
-            )
-            .await?;
-        }
-        sqlx::query(
-            "DELETE FROM group_allocation_reservations WHERE tenant_id=$1 AND request_id=$2",
-        )
-        .bind(&tenant)
-        .bind(request)
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(())
-}
-
-/// Successful fallback supplies the next turn's preferred account.
-pub(crate) async fn record_terminal(
-    tx: &mut Transaction<'_, Any>,
-    request: &str,
-    account: &str,
-    observed: i64,
-) -> Result<(), AppError> {
-    let reservation = sqlx::query("SELECT tenant_id,session_key,generation,account_id FROM group_allocation_reservations WHERE request_id=$1")
-        .bind(request).fetch_optional(&mut **tx).await?;
-    let Some(reservation) = reservation else {
-        return Ok(());
-    };
-    let tenant: String = reservation.get("tenant_id");
-    let session: String = reservation.get("session_key");
-    if session.is_empty() {
-        return Ok(());
-    }
-    bump_revision(tx, &tenant).await?;
-    // The authorized candidate snapshot validates the current credential generation on read.
-    sqlx::query("UPDATE group_allocation_sessions SET account_id=$1,generation=CASE WHEN account_id=$1 THEN generation ELSE -1 END,observed_at=$2,expires_at=$3 WHERE tenant_id=$4 AND session_key=$5 AND observed_at<=$2")
-        .bind(account).bind(observed).bind(observed+DAY_MS).bind(tenant).bind(session).execute(&mut **tx).await?;
-    Ok(())
-}
-
-pub(crate) async fn correct_terminal(
-    tx: &mut Transaction<'_, Any>,
-    request: &str,
-) -> Result<(), AppError> {
-    let row = sqlx::query("SELECT upstream_account_id,observed_at FROM session_routing_terminals WHERE request_id=$1 AND status_code>=200 AND status_code<400 AND COALESCE(error_code,'')='' AND upstream_account_id IS NOT NULL")
-        .bind(request).fetch_optional(&mut **tx).await?;
-    if let Some(row) = row {
-        record_terminal(
-            tx,
-            request,
-            &row.get::<String, _>("upstream_account_id"),
-            row.get("observed_at"),
-        )
-        .await?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::unix_millis;
 
     async fn exercise_shared_allocations(url: &str) {
         let first = Database::connect(url).await.unwrap();
@@ -333,11 +267,8 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let mut tx = first.begin_write_transaction().await.unwrap();
-        record_terminal(&mut tx, &request.to_string(), "b", now + 101)
-            .await
-            .unwrap();
-        tx.commit().await.unwrap();
+        sqlx::query("INSERT INTO session_routing_terminals(tenant_id,principal_id,key_id,explicit_session_id,model,protocol,request_id,observed_at,status_code,upstream_account_id,expires_at) VALUES($1,$2,$3,'session','model','openai',$4,$5,200,'b',$6)")
+            .bind(tenant.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(request.to_string()).bind(now+101).bind(now+DAY_MS).execute(&first.pool).await.unwrap();
         drop(first);
         let restarted = Database::connect(url).await.unwrap();
         assert_eq!(
