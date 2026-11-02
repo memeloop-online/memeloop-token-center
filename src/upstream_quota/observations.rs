@@ -255,6 +255,7 @@ async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
             {
                 return Ok(());
             }
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), state.db.refresh_allocation_usage(target.tenant_id, target.account_id, crate::db::unix_millis())).await;
             let lease = Uuid::now_v7();
             let now = crate::db::unix_millis();
             let timeout_ms = observation_timeout_millis(

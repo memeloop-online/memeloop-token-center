@@ -53,6 +53,7 @@ mod archive_staging;
 mod gateway_persistence;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
+pub(crate) mod allocation;
 mod billing;
 mod constants;
 mod credentials;

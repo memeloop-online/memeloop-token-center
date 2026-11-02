@@ -745,6 +745,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "account-scoped plugin background action authority",
         sql: include_str!("../../../migrations/common/0148_plugin_background_actions.sql"),
     },
+    Migration {
+        version: 152,
+        name: "group allocation usage projection",
+        sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1472,6 +1477,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 148,
         name: "account-scoped plugin background action authority",
         sql: include_str!("../../../migrations/common/0148_plugin_background_actions.sql"),
+    },
+    Migration {
+        version: 152,
+        name: "group allocation usage projection",
+        sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
     },
 ];
 

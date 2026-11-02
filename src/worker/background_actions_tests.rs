@@ -20,7 +20,21 @@ use wiremock::{
     matchers::{method, path},
 };
 
-const PLUGIN: &str = "mtc-codex-expiring-reset";
+fn package_source() -> PathBuf {
+    PathBuf::from(
+        std::env::var("MTC_CODEX_EXPIRING_RESET_PACKAGE").expect("real CI guest package required"),
+    )
+}
+
+fn plugin_id() -> &'static str {
+    static ID: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let manifest: Value =
+            serde_json::from_slice(&std::fs::read(package_source().join("plugin.json")).unwrap())
+                .unwrap();
+        manifest["id"].as_str().unwrap().to_owned()
+    });
+    &ID
+}
 
 fn credits(now: i64, ahead: i64, count: i64) -> Value {
     let timestamp = |time| {
@@ -75,8 +89,9 @@ async fn request(
     token: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    let plugin = plugin_id();
     let path = format!(
-        "/internal/v1/plugins/{PLUGIN}/background-actions/{account}?tenant_external_id={tenant}"
+        "/internal/v1/plugins/{plugin}/background-actions/{account}?tenant_external_id={tenant}"
     );
     let builder = if body.is_some() {
         Request::put(path)
@@ -116,13 +131,17 @@ async fn post_count(supplier: &MockServer) -> usize {
 }
 
 async fn contract(database_url: String, directory: &tempfile::TempDir) {
-    let source = PathBuf::from(
-        std::env::var("MTC_CODEX_EXPIRING_RESET_PACKAGE").expect("real CI guest package required"),
-    );
+    let source = package_source();
     let root = directory.path().join("plugins");
-    let package = root.join(PLUGIN);
-    std::fs::create_dir_all(package.join("ui")).unwrap();
-    for name in ["plugin.json", "plugin.wasm", "ui/codex-expiring-reset.mjs"] {
+    let package = root.join(plugin_id());
+    let manifest: Value =
+        serde_json::from_slice(&std::fs::read(source.join("plugin.json")).unwrap()).unwrap();
+    let mut files = vec!["plugin.json", "plugin.wasm"];
+    for contribution in manifest["contributions"]["operator_ui"].as_array().unwrap() {
+        files.push(contribution["module_entry"].as_str().unwrap());
+    }
+    for name in files {
+        std::fs::create_dir_all(package.join(name).parent().unwrap()).unwrap();
         std::fs::copy(source.join(name), package.join(name)).unwrap();
     }
     let mut config = Config::for_test(database_url.clone());
@@ -243,7 +262,7 @@ async fn contract(database_url: String, directory: &tempfile::TempDir) {
     );
     let grant = state
         .db
-        .background_action_grant(PLUGIN, &tenant, &account.id.to_string())
+        .background_action_grant(plugin_id(), &tenant, &account.id.to_string())
         .await
         .unwrap()
         .unwrap();
@@ -355,7 +374,7 @@ async fn contract(database_url: String, directory: &tempfile::TempDir) {
             &recovering,
             &credential,
             &tenant,
-            &format!("plugin:{PLUGIN}"),
+            &format!("plugin:{}", plugin_id()),
             &key,
         )
         .await
