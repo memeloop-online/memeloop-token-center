@@ -213,6 +213,14 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: "1"
+        ports: ["8123:8123"]
+        options: >-
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s --health-timeout 3s --health-retries 20
       postgres:
         image: postgres:16-alpine
         env:
@@ -259,6 +267,17 @@ jobs:
       - name: Verify durable archive RSS harness contract
         run: node --test tests/load/test-durable-archive-memory.ts
       - run: cargo fmt --all -- --check
+      - name: Verify request history capture, replay, migration and isolated ClickHouse reads
+        env:
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+          MTC_TEST_CLICKHOUSE_URL: http://127.0.0.1:8123
+          MTC_REQUEST_HISTORY_URL: http://127.0.0.1:8123
+        run: |
+          cargo test --locked --all-features --lib request_history -- --nocapture
+          cargo test --locked --all-features --lib request_history_real_services_acceptance -- --ignored --nocapture
+          curl --fail --silent --show-error "$MTC_TEST_CLICKHOUSE_URL" --data-binary 'CREATE DATABASE IF NOT EXISTS session_tasks'
+          MTC_REQUEST_HISTORY_DATABASE=session_tasks cargo test --locked --all-features --lib session_tasks_history_real_services_acceptance -- --ignored --nocapture
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Verify pinned Claude privacy component through the host ABI
         id: claude_component
         env:
@@ -299,10 +318,6 @@ jobs:
           cargo test --locked --all-features --lib privacy_wire_shim_release_component -- --ignored
           cargo test --locked --all-features --test plugin_product \
             installable_example_contributes_provider_oauth_policy_and_rewrite
-      - name: Verify empty inventory registration and SQLite/PostgreSQL recovery CAS
-        run: cargo test --locked --all-features --lib empty_inventory -- --nocapture
-        env:
-          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
       - name: Reuse the signed Claude component through native and bridge gateway finalization
         if: ${{ !cancelled() && steps.claude_component.outcome == 'success' }}
         run: |
@@ -333,6 +348,33 @@ jobs:
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/preferred-package/plugin.wasm"
       - name: Verify default plugin loader compatibility without revision feature
         run: cargo test --locked --no-default-features --test plugin_product loader_feature_boundary
+      - name: Check out reviewed independent Codex reset-credit planner
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: memeloop-online/memeloop-token-center-example-plugins
+          ref: 38e8ff32d209c2b57a7c93cf1a1c3e336386f6e7
+          path: .codex-reset-examples
+          persist-credentials: false
+      - name: Build the real independent reset-credit component
+        run: |
+          cargo fmt --manifest-path .codex-reset-examples/plugin-sources/codex-expiring-reset/Cargo.toml -- --check
+          cargo test --locked --manifest-path .codex-reset-examples/plugin-sources/codex-expiring-reset/Cargo.toml
+          cargo build --locked --release --target wasm32-unknown-unknown --manifest-path .codex-reset-examples/plugin-sources/codex-expiring-reset/Cargo.toml
+          mkdir -p "$RUNNER_TEMP/codex-reset-package/ui"
+          cp .codex-reset-examples/plugin-sources/codex-expiring-reset/plugin.json "$RUNNER_TEMP/codex-reset-package/"
+          cp .codex-reset-examples/plugin-sources/codex-expiring-reset/ui/codex-expiring-reset.mjs "$RUNNER_TEMP/codex-reset-package/ui/"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" component new .codex-reset-examples/plugin-sources/codex-expiring-reset/target/wasm32-unknown-unknown/release/mtc_codex_expiring_reset.wasm -o "$RUNNER_TEMP/codex-reset-package/plugin.wasm"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/codex-reset-package/plugin.wasm"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" component wit "$RUNNER_TEMP/codex-reset-package/plugin.wasm" > "$RUNNER_TEMP/codex-reset.wit"
+          if grep -Eq '^[[:space:]]*import ' "$RUNNER_TEMP/codex-reset.wit"; then exit 1; fi
+          grep -F 'memeloop:background-actions/planner@0.1.0' "$RUNNER_TEMP/codex-reset.wit"
+      - name: Verify reset-credit worker, authorization and durable recovery on both databases
+        env:
+          MTC_CODEX_EXPIRING_RESET_PACKAGE: ${{ runner.temp }}/codex-reset-package
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+        run: |
+          cargo test --locked --all-features --lib background_action_recovery_and_authority_fences -- --nocapture
+          cargo test --locked --all-features --lib codex_background_action_real_component_worker_contract -- --ignored --nocapture
       - name: Build the fixed soonest-reset guest for real host acceptance
         # Reuse the pinned tool verified above; no dispatch-selected executables.
         run: |
@@ -344,7 +386,6 @@ jobs:
           "$RUNNER_TEMP/preferred-tools/wasm-tools" component new .plugin-examples/plugin-sources/soonest-reset/target/wasm32-unknown-unknown/release/mtc_soonest_reset.wasm \
             -o "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/soonest-reset-package/plugin.wasm"
-      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Verify the H2 binding build without the default features
         run: cargo test --locked --no-default-features --lib api::proxy::routing::codex::send_diagnostics::tests::typed_h2_before_headers_and_body_share_immutable_attempt_without_replay_or_secrets -- --exact --nocapture
       - name: Run documentation tests

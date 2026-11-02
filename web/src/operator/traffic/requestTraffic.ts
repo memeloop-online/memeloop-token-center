@@ -218,7 +218,7 @@ function mergeArchiveState(previous: RequestView['archive_state'], event: Reques
   return incoming;
 }
 
-function mergeSessionContext(previous: RequestView['session_context'], event: RequestEvent) {
+export function mergeSessionContext(previous: RequestView['session_context'], event: Pick<RequestEvent, 'session_context'>) {
   const incoming = event.session_context;
   // Confirmation is a one-way ownership projection. An older started or
   // unlinked event retained in the live map must not undo a newer REST
@@ -251,7 +251,10 @@ export function requestViewFromEvent(event: RequestEvent, previous?: RequestView
     };
   }
   // Replayed starts must not regress an authoritative terminal history row.
-  if (event.event_kind === 'started' && previous?.status_code != null) return previous;
+  if (event.event_kind === 'started' && previous?.status_code != null) return {
+    ...previous,
+    ...(event.session_context != null ? { session_context: mergeSessionContext(previous.session_context, event) } : {}),
+  };
   const request: RequestView = {
     ...previous,
     request_id: event.request_id,

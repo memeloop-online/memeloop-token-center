@@ -45,6 +45,12 @@
       "items": {
         "oneOf": [
           {
+            "type": "object", "additionalProperties": false,
+            "required": ["kind"],
+            "properties": { "kind": { "const": "quota_reset_credit" } },
+            "description": "Pure background reset-credit intents; requires explicit tenant/account authorization."
+          },
+          {
             "type": "object",
             "additionalProperties": false,
             "required": ["kind"],
@@ -85,6 +91,14 @@
       "additionalProperties": false,
       "properties": {
         "traffic_policy": { "type": "boolean", "default": false },
+        "background_actions": {
+          "type": "object", "additionalProperties": false,
+          "required": ["interval_seconds"],
+          "properties": {
+            "interval_seconds": { "type": "integer", "minimum": 5, "maximum": 3600 }
+          },
+          "description": "Independent memeloop:background-actions@0.1.0 pure planner ABI; no host imports."
+        },
         "group_routing": {
           "type": ["object", "null"],
           "additionalProperties": false,

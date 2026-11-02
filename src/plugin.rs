@@ -25,6 +25,7 @@ use crate::{
 
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod application;
+pub(crate) mod background_actions;
 mod configuration;
 /// Experimental lifecycle primitives; application integration is separately
 /// host-opted-in through `application` and never enabled by the production binary.
@@ -164,6 +165,8 @@ pub struct PluginContributions {
     /// only call the core proxy route for one of these manifest entries.
     #[serde(default)]
     pub service_data: Vec<PluginServiceDataEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_actions: Option<background_actions::BackgroundActionContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_shim: Option<WireShimContribution>,
 }
@@ -387,6 +390,8 @@ pub enum PluginCapability {
     },
     /// Read-only candidate quota context for native-health group ordering.
     GroupRoutingQuota,
+    /// Account-scoped reset-credit intents, authorized separately by an operator.
+    QuotaResetCredit,
 }
 
 #[derive(Clone)]
@@ -394,6 +399,8 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     service_data_component: Option<service_data_component::ServiceDataPluginPre<HostState>>,
+    background_action_component:
+        Option<background_actions::bindings::BackgroundActionsPluginPre<HostState>>,
     wire_shim_component: Option<wire_shim_component::WireShimPluginPre<HostState>>,
     ui_modules: BTreeMap<String, Arc<[u8]>>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
@@ -572,16 +579,25 @@ struct PreparedProviderEnvelope {
 struct UpstreamResponseEnvelope<'a> {
     status: u16,
     headers: &'a BTreeMap<String, String>,
-    body_base64: String,
+    #[serde(serialize_with = "serialize_provider_body")]
+    body_base64: &'a [u8],
+}
+
+fn serialize_provider_body<S>(body: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.collect_str(&base64::display::Base64Display::new(body, &STANDARD))
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NormalizedProviderEnvelope {
+struct NormalizedProviderEnvelope<'a> {
     status: u16,
     #[serde(default)]
     headers: BTreeMap<String, String>,
-    body_base64: String,
+    #[serde(borrow)]
+    body_base64: Cow<'a, str>,
     usage: ComponentProviderUsage,
 }
 
@@ -921,6 +937,8 @@ impl PluginRuntime {
             } else {
                 None
             };
+            let background_action_component =
+                background_actions::prepare_component(&engine, &manifest, component.as_ref())?;
             let wire_shim_component = if manifest.contributions.wire_shim.is_some() {
                 let component = component
                     .as_ref()
@@ -979,6 +997,7 @@ impl PluginRuntime {
                 manifest,
                 component,
                 service_data_component,
+                background_action_component,
                 wire_shim_component,
                 ui_modules,
                 configuration_validator,
@@ -1166,15 +1185,6 @@ impl PluginRuntime {
         self.apply_traffic_with_config(context, request_json, &BTreeMap::new())
     }
 
-    pub fn apply_traffic_with_config(
-        &self,
-        context: types::RequestContext,
-        request_json: &Value,
-        configurations: &BTreeMap<String, Value>,
-    ) -> Result<TrafficDecision, AppError> {
-        self.apply_traffic_with_config_and_memory(context, request_json, configurations, None)
-    }
-
     pub(crate) fn has_traffic_hooks(&self) -> bool {
         self.engine.is_some()
             && self.plugins.iter().any(|plugin| {
@@ -1183,12 +1193,11 @@ impl PluginRuntime {
             })
     }
 
-    pub(crate) fn apply_traffic_with_config_and_memory(
+    pub fn apply_traffic_with_config(
         &self,
         context: types::RequestContext,
         request_json: &Value,
         configurations: &BTreeMap<String, Value>,
-        memory: Option<&crate::gateway_body::memory::ProxyMemoryReservation>,
     ) -> Result<TrafficDecision, AppError> {
         let Some(engine) = &self.engine else {
             return Ok(TrafficDecision {
@@ -1280,11 +1289,6 @@ impl PluginRuntime {
                         validate_plugin_text(account_id, MAX_TRAFFIC_ACCOUNT_ID_BYTES, false)
                             .is_ok()
                     });
-            if let (Some(memory), Some(rewrite)) = (memory, result.request_json.as_deref())
-                && !memory.try_reserve_rewrite(rewrite.as_bytes())
-            {
-                return Err(AppError::capacity_error("proxy_memory_plugin"));
-            }
             let validated_request = result
                 .request_json
                 .as_deref()
@@ -1465,6 +1469,9 @@ impl PluginRuntime {
             .call_prepare(&mut store, &context, &config_json, &request_json)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
             .map_err(|error| plugin_reported_error(&plugin.manifest.id, "prepare", &error))?;
+        drop(config_json);
+        drop(request_json);
+        drop(store);
         if result.len() > encoded_body_limit(MAX_COMPONENT_PROVIDER_BODY) {
             return Err(AppError::upstream_with(
                 "plugin_prepared_request_exceeds_the_4_mib_abi_limit",
@@ -1535,7 +1542,7 @@ impl PluginRuntime {
         let response_json = serde_json::to_string(&UpstreamResponseEnvelope {
             status: upstream_status,
             headers: upstream_headers,
-            body_base64: STANDARD.encode(upstream_body),
+            body_base64: upstream_body,
         })
         .map_err(|_| AppError::internal("plugin_normalize_provider_response_1"))?;
         if response_json.len() > encoded_body_limit(adapter.max_response_bytes) {
@@ -1560,6 +1567,8 @@ impl PluginRuntime {
             .call_normalize(&mut store, &context, &response_json)
             .map_err(|error| plugin_failure(&plugin.manifest.id, error))?
             .map_err(|error| plugin_reported_error(&plugin.manifest.id, "normalize", &error))?;
+        drop(response_json);
+        drop(store);
         if result.len() > encoded_body_limit(adapter.max_response_bytes) {
             return Err(AppError::upstream_with(
                 "plugin_normalized_response_exceeds_its_declared_limit",
@@ -1578,7 +1587,7 @@ impl PluginRuntime {
         }
         validate_provider_headers(&envelope.headers, false)?;
         let body = STANDARD
-            .decode(envelope.body_base64)
+            .decode(envelope.body_base64.as_ref())
             .map_err(|_| AppError::upstream("plugin_returned_invalid_normalized_body_encoding"))?;
         if body.len() > adapter.max_response_bytes || body.len() > MAX_COMPONENT_PROVIDER_BODY {
             return Err(AppError::upstream_with(
@@ -2215,6 +2224,7 @@ pub fn validate_plugin_package(directory: &Path) -> Result<PluginManifest, AppEr
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
     routing::validate_contribution(manifest)?;
+    background_actions::validate_contribution(manifest)?;
     if manifest.id.is_empty()
         || manifest.id.len() > MAX_PLUGIN_ID_BYTES
         || !manifest
@@ -3171,6 +3181,48 @@ fn plugin_failure(_plugin_id: &str, error: wasmtime::Error) -> AppError {
 mod tests {
     use super::*;
 
+    #[test]
+    fn provider_envelope_streams_base64_without_changing_protocol_bytes() {
+        let headers = BTreeMap::from([("x-vendor".into(), "中文\"\\\n".into())]);
+        for body in [
+            Vec::new(),
+            vec![0, 255, 1],
+            (0..=255).cycle().take(1024 * 1024).collect(),
+        ] {
+            let serialized = serde_json::to_string(&UpstreamResponseEnvelope {
+                status: 207,
+                headers: &headers,
+                body_base64: &body,
+            })
+            .unwrap();
+            let envelope: Value = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(
+                envelope,
+                serde_json::json!({
+                    "status":207, "headers":headers, "body_base64":STANDARD.encode(&body)
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn normalized_provider_body_borrows_unescaped_base64_and_accepts_json_escapes() {
+        for encoded in ["eA==", r"\u0065A=="] {
+            let response = format!(
+                r#"{{"status":200,"body_base64":"{encoded}","usage":{{"input_tokens":7,"output_tokens":3,"estimated":false}}}}"#
+            );
+            let envelope: NormalizedProviderEnvelope = serde_json::from_str(&response).unwrap();
+            assert_eq!(
+                STANDARD.decode(envelope.body_base64.as_ref()).unwrap(),
+                b"x"
+            );
+            assert_eq!(
+                matches!(envelope.body_base64, Cow::Borrowed(_)),
+                encoded == "eA=="
+            );
+        }
+    }
+
     #[cfg(all(
         feature = "experimental-plugin-revisions",
         feature = "plugin-distribution"
@@ -3270,6 +3322,7 @@ mod tests {
                 manifest,
                 component: None,
                 service_data_component: None,
+                background_action_component: None,
                 wire_shim_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: None,

@@ -53,6 +53,10 @@ enum Command {
         role: RuntimeRole,
     },
     Migrate,
+    RequestHistory {
+        #[command(subcommand)]
+        command: memeloop_token_center::request_history::migration::HistoryCommand,
+    },
     #[command(
         about = "Preview an exact USD contract-ceiling failure manifest; --apply only changes statistical projections"
     )]
@@ -172,6 +176,13 @@ async fn run() -> Result<(), &'static str> {
     let config = Config::from_env().map_err(|_| "configuration_invalid")?;
 
     match cli.command {
+        Command::RequestHistory { command } => {
+            let result =
+                memeloop_token_center::request_history::migration::command(&config, command)
+                    .await
+                    .map_err(|_| "request_history_operation_failed")?;
+            println!("{result}");
+        }
         #[cfg(feature = "experimental-plugin-revisions")]
         Command::PreparePluginInventory { .. } => {
             unreachable!("handled before configuration loading")

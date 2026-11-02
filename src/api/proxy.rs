@@ -2837,6 +2837,7 @@ async fn execute_component_provider(
         upstream_status.as_u16(),
         upstream_headers,
         upstream_body,
+        request.memory.clone(),
     )
     .await
     {

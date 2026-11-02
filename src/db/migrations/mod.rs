@@ -759,9 +759,28 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/sqlite/0144_retire_failover_deadline.sql"),
     },
     Migration {
+        version: 145,
+        name: "request history export queue",
+        sql: concat!(
+            include_str!("../../../migrations/common/0145_request_history_export.sql"),
+            "\n",
+            include_str!("../../../migrations/sqlite/0145_request_history_export.sql"),
+        ),
+    },
+    Migration {
         version: 146,
         name: "live request owner lease observation index",
         sql: include_str!("../../../migrations/common/0146_request_live_owner_index.sql"),
+    },
+    Migration {
+        version: 147,
+        name: "session task relationships and explicit names",
+        sql: include_str!("../../../migrations/common/0147_session_task_relationships.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "account-scoped plugin background action authority",
+        sql: include_str!("../../../migrations/common/0148_plugin_background_actions.sql"),
     },
 ];
 
@@ -1501,9 +1520,28 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../../migrations/postgres/0144_retire_failover_deadline.sql"),
     },
     Migration {
+        version: 145,
+        name: "request history export queue",
+        sql: concat!(
+            include_str!("../../../migrations/common/0145_request_history_export.sql"),
+            "\n",
+            include_str!("../../../migrations/postgres/0145_request_history_export.sql"),
+        ),
+    },
+    Migration {
         version: 146,
         name: "live request owner lease observation index",
         sql: include_str!("../../../migrations/common/0146_request_live_owner_index.sql"),
+    },
+    Migration {
+        version: 147,
+        name: "session task relationships and explicit names",
+        sql: include_str!("../../../migrations/common/0147_session_task_relationships.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "account-scoped plugin background action authority",
+        sql: include_str!("../../../migrations/common/0148_plugin_background_actions.sql"),
     },
 ];
 

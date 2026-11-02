@@ -407,6 +407,8 @@ impl QuotaCapabilities {
 
 #[derive(Clone, Serialize)]
 struct ResetCredit {
+    /// Stable supplier evidence; never a credential or a consume target.
+    fingerprint: String,
     status: Option<String>,
     granted_at: Option<i64>,
     expires_at: Option<i64>,

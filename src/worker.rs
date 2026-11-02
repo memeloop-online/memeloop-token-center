@@ -13,6 +13,9 @@ use crate::{
     error::AppError, generation, metrics::BackgroundProjectionKind,
 };
 
+#[cfg(test)]
+mod background_actions_tests;
+
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
@@ -188,9 +191,16 @@ pub async fn run_until_shutdown_with_oauth_stop(
     let (oauth_stop, oauth_role_shutdown) = watch::channel(false);
     let mut roles = JoinSet::new();
     let mut oauth_refresh_roles = JoinSet::new();
+    let history_state = state.clone();
+    let history_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        crate::request_history::migration::run_worker(history_state, history_shutdown).await;
+        "request_history"
+    });
     let blocking_tasks = BlockingTasks::new();
     let oauth_blocking = blocking_tasks.clone();
     let service_data_blocking = blocking_tasks.clone();
+    let background_action_blocking = blocking_tasks.clone();
     let worker_id = format!("worker-{}", Uuid::now_v7());
     let projection_owner = Uuid::now_v7();
     let reaper_owner = ArchiveStagingLeaseOwner::new(format!("archive-reaper-{}", Uuid::now_v7()))
@@ -498,6 +508,13 @@ pub async fn run_until_shutdown_with_oauth_stop(
         }
     );
     periodic!(
+        "plugin_background_actions",
+        PLUGIN_SERVICE_DATA_INTERVAL,
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            run_plugin_background_actions(state, shutdown, &background_action_blocking).await;
+        }
+    );
+    periodic!(
         "plugin_service_data",
         PLUGIN_SERVICE_DATA_INTERVAL,
         async |state: &AppState, shutdown: &watch::Receiver<bool>| {
@@ -518,6 +535,106 @@ pub async fn run_until_shutdown_with_oauth_stop(
         blocking_tasks,
     )
     .await;
+}
+
+async fn run_plugin_background_actions(
+    state: &AppState,
+    shutdown: &watch::Receiver<bool>,
+    blocking: &BlockingTasks,
+) {
+    let pinned = match state.clone().pin_application_plugins().await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error,"worker background action runtime pin failed");
+            return;
+        }
+    };
+    for (plugin, interval) in pinned.plugins.background_action_targets() {
+        let now = crate::db::unix_millis();
+        let grants = match pinned.db.due_background_action_grants(&plugin, now).await {
+            Ok(grants) => grants,
+            Err(error) => {
+                tracing::warn!(%error,"worker background action grant enumeration failed");
+                continue;
+            }
+        };
+        for grant in grants {
+            if *shutdown.borrow() {
+                return;
+            }
+            let owner = format!("plugin-action-{}", Uuid::now_v7());
+            match pinned
+                .db
+                .claim_background_action_tick(
+                    &grant,
+                    &owner,
+                    crate::db::unix_millis(),
+                    (interval as i64) * 1000,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(%error,"worker background action tick claim failed");
+                    continue;
+                }
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(90),
+                crate::plugin::background_actions::execute_tick(
+                    pinned.clone(),
+                    grant.clone(),
+                    owner.clone(),
+                    blocking,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::error::AppError::capacity_error(
+                    "background_action_timeout",
+                ))
+            });
+            let code = result
+                .as_ref()
+                .err()
+                .map(|error| error.diagnostic_category());
+            let operation = result
+                .as_ref()
+                .ok()
+                .and_then(|operation| operation.as_ref());
+            let outcome = Some(if let Some(operation) = operation {
+                operation.state.as_str()
+            } else if result.is_ok() {
+                "no_action"
+            } else if matches!(
+                result,
+                Err(crate::error::AppError::Capacity { .. }
+                    | crate::error::AppError::Overloaded
+                    | crate::error::AppError::DatabaseUnavailable(_))
+            ) {
+                "retryable_error"
+            } else {
+                "blocked"
+            });
+            if let Err(error) = pinned
+                .db
+                .finish_background_action_tick(
+                    &grant,
+                    &owner,
+                    code,
+                    outcome,
+                    operation.map(|op| op.id.as_str()),
+                )
+                .await
+            {
+                tracing::warn!(%error,"worker background action tick completion failed");
+            }
+            if let Err(error) = result {
+                tracing::warn!(plugin_id=%plugin,upstream_account_id=%grant.upstream_account_id,error_category=error.diagnostic_category(),"plugin background action tick failed");
+            }
+        }
+    }
 }
 
 async fn refresh_plugin_service_data(

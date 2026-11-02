@@ -60,6 +60,7 @@ mod model_routes;
 mod monitoring_snapshot;
 mod new_api_transport;
 mod operator_inference;
+mod plugin_background_actions;
 pub(crate) mod plugin_execution;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installer_network;
@@ -77,6 +78,7 @@ mod routes;
 mod routing;
 mod self_service;
 mod session_reading;
+mod session_tasks;
 mod session_titles;
 pub(crate) use session_titles::process_one as process_session_title;
 mod sessions;
