@@ -33,3 +33,10 @@ CREATE TABLE group_allocation_reservations (
 );
 CREATE INDEX group_allocation_reservations_account ON group_allocation_reservations(tenant_id, account_id, created_at);
 CREATE INDEX group_allocation_reservations_request ON group_allocation_reservations(request_id);
+CREATE TABLE group_allocation_pending (
+    tenant_id TEXT NOT NULL,
+    account_id TEXT NOT NULL,
+    hour_bucket BIGINT NOT NULL,
+    requests BIGINT NOT NULL,
+    PRIMARY KEY (tenant_id, account_id, hour_bucket)
+);

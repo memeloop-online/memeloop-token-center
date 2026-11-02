@@ -54,6 +54,14 @@ impl Database {
         now: i64,
     ) -> Result<bool, AppError> {
         let mut tx = self.begin_write_transaction().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SET LOCAL lock_timeout='5ms'")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("SET LOCAL statement_timeout='20ms'")
+                .execute(&mut *tx)
+                .await?;
+        }
         let changed = if revision == 0 {
             sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision) VALUES($1,1) ON CONFLICT(tenant_id) DO NOTHING")
                 .bind(tenant.to_string()).execute(&mut *tx).await?.rows_affected()
@@ -65,8 +73,14 @@ impl Database {
             tx.rollback().await?;
             return Ok(false);
         }
-        sqlx::query("INSERT INTO group_allocation_reservations(tenant_id,request_id,account_id,session_key,generation,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id,request_id) DO NOTHING")
-            .bind(tenant.to_string()).bind(request.to_string()).bind(account).bind(session.map(|id|id.to_string()).unwrap_or_default()).bind(generation as i64).bind(now).execute(&mut *tx).await?;
+        let inserted=sqlx::query("INSERT INTO group_allocation_reservations(tenant_id,request_id,account_id,session_key,generation,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id,request_id) DO NOTHING")
+            .bind(tenant.to_string()).bind(request.to_string()).bind(account).bind(session.map(|id|id.to_string()).unwrap_or_default()).bind(generation as i64).bind(now).execute(&mut *tx).await?.rows_affected();
+        if inserted != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO group_allocation_pending(tenant_id,account_id,hour_bucket,requests) VALUES($1,$2,$3,1) ON CONFLICT(tenant_id,account_id,hour_bucket) DO UPDATE SET requests=group_allocation_pending.requests+1")
+            .bind(tenant.to_string()).bind(account).bind(now/HOUR_MS).execute(&mut *tx).await?;
         if let Some(session) = session {
             sqlx::query("INSERT INTO group_allocation_sessions(tenant_id,session_key,account_id,generation,observed_at,expires_at,request_id) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,session_key) DO UPDATE SET account_id=excluded.account_id,generation=excluded.generation,observed_at=excluded.observed_at,expires_at=excluded.expires_at,request_id=excluded.request_id WHERE group_allocation_sessions.observed_at<=excluded.observed_at")
                 .bind(tenant.to_string()).bind(session.to_string()).bind(account).bind(generation as i64).bind(now).bind(now+DAY_MS).bind(request.to_string()).execute(&mut *tx).await?;
@@ -85,6 +99,12 @@ impl Database {
         let _ = account;
         let mut tx = self.begin_write_transaction().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SET LOCAL lock_timeout='5ms'")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("SET LOCAL statement_timeout='80ms'")
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut *tx)
                 .await?;
@@ -107,6 +127,12 @@ impl Database {
             .bind(tenant.to_string()).bind(now/HOUR_MS-23).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM group_allocation_reservations WHERE tenant_id=$1 AND (created_at<$2 OR request_id IN (SELECT f.request_id FROM request_stats_facts f JOIN request_records r ON r.id=f.request_id WHERE f.request_id=group_allocation_reservations.request_id AND f.tenant_id=$1 AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id=f.request_id AND t.projected_at IS NULL) AND NOT EXISTS (SELECT 1 FROM metered_usage_projection_outbox m WHERE m.reservation_id=r.reservation_id AND m.projected_at IS NULL)))")
             .bind(tenant.to_string()).bind(now-DAY_MS).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM group_allocation_pending WHERE tenant_id=$1")
+            .bind(tenant.to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO group_allocation_pending(tenant_id,account_id,hour_bucket,requests) SELECT tenant_id,account_id,created_at/3600000,COUNT(*) FROM group_allocation_reservations WHERE tenant_id=$1 AND created_at>=$2 GROUP BY tenant_id,account_id,created_at/3600000")
+            .bind(tenant.to_string()).bind((now/HOUR_MS-23)*HOUR_MS).execute(&mut *tx).await?;
         sqlx::query("DELETE FROM group_allocation_sessions WHERE tenant_id=$1 AND session_key IN (SELECT session_key FROM group_allocation_sessions WHERE tenant_id=$1 AND expires_at<=$2 ORDER BY expires_at LIMIT 512)")
             .bind(tenant.to_string()).bind(now).execute(&mut *tx).await?;
         tx.commit().await?;
@@ -137,14 +163,14 @@ impl Database {
             }
             list.push_unseparated(")");
         }
-        query.push(" UNION ALL SELECT account_id,created_at / 3600000 AS hour_bucket,COUNT(*) AS requests,CAST(0 AS BIGINT) AS tokens FROM group_allocation_reservations WHERE tenant_id=")
-            .push_bind(tenant.to_string()).push(" AND created_at>=").push_bind((now/HOUR_MS-23)*HOUR_MS).push(" AND account_id IN (");
+        query.push(" UNION ALL SELECT account_id,hour_bucket,requests,CAST(0 AS BIGINT) AS tokens FROM group_allocation_pending WHERE tenant_id=")
+            .push_bind(tenant.to_string()).push(" AND hour_bucket>=").push_bind(now/HOUR_MS-23).push(" AND account_id IN (");
         {
             let mut list = query.separated(",");
             for account in accounts {
                 list.push_bind(account);
             }
-            list.push_unseparated(") GROUP BY account_id,created_at / 3600000) AS history GROUP BY account_id,hour_bucket");
+            list.push_unseparated(") ) AS history GROUP BY account_id,hour_bucket");
         }
         Ok(query
             .build()
