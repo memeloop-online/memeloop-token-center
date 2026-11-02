@@ -59,6 +59,7 @@ mod model_routes;
 mod monitoring_snapshot;
 mod new_api_transport;
 mod operator_inference;
+mod plugin_background_actions;
 pub(crate) mod plugin_execution;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installer_network;
