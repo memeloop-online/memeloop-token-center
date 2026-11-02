@@ -173,7 +173,8 @@ impl Database {
         let sql = format!(
             "SELECT account_id,hour_bucket,CAST(SUM(requests) AS BIGINT) AS requests,CAST(SUM(tokens) AS BIGINT) AS tokens FROM (SELECT account_id,hour_bucket,requests,tokens FROM group_allocation_usage WHERE tenant_id=$1 AND hour_bucket>=$2 AND account_id IN ({placeholders}) UNION ALL SELECT account_id,hour_bucket,requests,CAST(0 AS BIGINT) AS tokens FROM group_allocation_pending WHERE tenant_id=$1 AND hour_bucket>=$2 AND account_id IN ({placeholders})) AS history GROUP BY account_id,hour_bucket"
         );
-        let mut query = sqlx::query(&sql)
+        // SQL interpolation contains only generated parameter indices; account values are bound.
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql))
             .bind(tenant.to_string())
             .bind(now / HOUR_MS - 23);
         for account in accounts {
