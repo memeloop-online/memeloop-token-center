@@ -330,6 +330,7 @@ pub(crate) async fn prepare(
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
 ) -> Result<(), AppError> {
+    state.group_routing = None;
     let stage_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_millis(250));
     match tokio::time::timeout_at(
         stage_deadline,
