@@ -35,6 +35,12 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         .await
         .unwrap();
     let request_id = Uuid::now_v7();
+    // This fixture enters the buffered finalizer directly, bypassing gateway
+    // request-source capture. Seed the exact input document its conversation
+    // worker must read, rather than advertising an unavailable gap locator.
+    let request_body =
+        json!({"model":fixture.model,"messages":[{"role":"user","content":"test cached input"}]});
+    let request_object = format!("inline-json:{request_body}");
     let reservation = fixture
         .state
         .db
@@ -46,7 +52,7 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
             output_token_ceiling: 8,
             protocol: "openai",
             model: &fixture.model,
-            request_object: &format!("gap://{request_id}/request"),
+            request_object: &request_object,
             upstream_account_id: Some(fixture.upstream_account_id),
             model_route_id: Some(fixture.route_id),
         })
@@ -65,16 +71,11 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         conversation: Some(ProxyConversation {
             key: key.clone(),
             request_body: ConversationBody::InMemory(Bytes::from(
-                serde_json::to_vec(
-                    &json!({"model":fixture.model,"messages":[{"role":"user","content":"test cached input"}]}),
-                )
-                .unwrap(),
+                serde_json::to_vec(&request_body).unwrap(),
             )),
             hints: crate::conversation::ConversationHints::default(),
             client_name: None,
-            projection_admission: std::sync::Mutex::new(
-                ConversationProjectionAdmission::Deferred,
-            ),
+            projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
         }),
         protocol: Protocol::OpenAiChat,
         tenant_id: key.tenant_id,

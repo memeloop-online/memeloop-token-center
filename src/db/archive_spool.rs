@@ -23,7 +23,9 @@ use crate::archive_staging::{ArchiveStagingOwner, ArchiveStagingWriteLease};
 #[cfg_attr(not(test), allow(dead_code))]
 const PLAIN_LIMIT: i64 = 64 * 1024 * 1024;
 const CIPHER_CHUNK_LIMIT: usize = 512 * 1024;
-const CIPHER_LIMIT: i64 = 2 * 1024 * 1024 * 1024;
+// Match the deployed budget CHECK so exhaustion is rejected before SQL writes.
+// Keep equal request/response partitions within that shared durable capacity.
+const CIPHER_LIMIT: i64 = 256 * 1024 * 1024;
 pub(super) const REQUEST_CIPHER_LIMIT: i64 = CIPHER_LIMIT / 2;
 pub(super) const RESPONSE_CIPHER_LIMIT: i64 = CIPHER_LIMIT - REQUEST_CIPHER_LIMIT;
 pub(super) const ARCHIVE_SLOT_LIMIT: i64 = 4096;

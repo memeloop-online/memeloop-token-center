@@ -2949,6 +2949,7 @@ async fn assert_exactly_once_side_effects_for(
     expected_account_id: Uuid,
     expected_route_id: Uuid,
 ) {
+    drain_completed_response_archive(fixture).await;
     let projection_owner = Uuid::now_v7();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     // Settlement can commit the request before the conversation journal enqueues
@@ -3053,6 +3054,51 @@ async fn assert_exactly_once_side_effects_for(
         row.get::<i64, _>("response_observation_count"),
         i64::from(expected_response_id.is_some())
     );
+    pool.close().await;
+}
+
+async fn assert_settlement_once_with_inline_request(fixture: &CodexRouteFixture, request_id: Uuid) {
+    let owner = Uuid::now_v7();
+    for pending_id in fixture
+        .state
+        .db
+        .claim_terminal_projection_tasks(owner, 32)
+        .await
+        .unwrap()
+    {
+        assert!(
+            fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(owner, pending_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(owner, pending_id)
+                .await
+                .unwrap()
+        );
+    }
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let row = sqlx::query(
+        "SELECT r.reservation_id, reservation.status AS reservation_status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.reservation_id AND l.kind = 'usage') AS charges, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = r.id) AS facts, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = r.id AND e.event_kind = 'finished') AS finished_events, o.request_json FROM request_records r JOIN usage_reservations reservation ON reservation.id = r.reservation_id LEFT JOIN conversation_projection_outbox o ON o.request_id = r.id WHERE r.id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("reservation_status"), "settled");
+    for field in ["charges", "facts", "finished_events"] {
+        assert_eq!(row.get::<i64, _>(field), 1, "{field}");
+    }
+    if let Some(request_json) = row.get::<Option<String>, _>("request_json") {
+        let request_json: Value = serde_json::from_str(&request_json).unwrap();
+        assert!(request_json.get("input").is_some());
+    }
     pool.close().await;
 }
 
@@ -4476,7 +4522,6 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     let refs = fixture
         .state
         .db
@@ -4484,8 +4529,8 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .await
         .unwrap();
     assert_eq!(
-        refs.request_object,
-        format!("gap://{}/request", rows[0].request_id)
+        crate::gateway_body::request_spool::source_request_id(&refs.request_object),
+        Some(rows[0].request_id)
     );
     assert_eq!(
         refs.response_object.as_deref(),
@@ -4493,7 +4538,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Pending
+        crate::model::RequestArchiveState::Capturing
     );
     assert_eq!(
         refs.response_archive_state,
@@ -4963,7 +5008,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
     assert_eq!(rows[0].status_code, Some(200));
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     assert_eq!(rows[0].cost, "0.000005");
-    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    assert_settlement_once_with_inline_request(&fixture, rows[0].request_id).await;
     let refs = fixture
         .state
         .db

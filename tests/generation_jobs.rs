@@ -264,9 +264,18 @@ async fn provider_asset_success_keeps_delivery_and_metering_without_archiving_me
             .fetch_one(&inspection)
             .await
             .unwrap();
-    assert!(!stored_result.contains(&asset.url));
-    assert!(!stored_result.contains("token="));
-    assert!(stored_result.contains("provider-reference-json:"));
+    // Private delivery metadata retains the readable provider URL, while the
+    // public result and archive views above/below must continue to redact it.
+    let stored: serde_json::Value = serde_json::from_str(&stored_result).unwrap();
+    let reference = stored["provider_reference"].as_str().unwrap();
+    let reference: serde_json::Value =
+        serde_json::from_str(reference.strip_prefix("provider-reference-json:").unwrap()).unwrap();
+    assert_eq!(reference["assets"][0]["url"], asset.url);
+    assert_eq!(
+        reference["assets"][0]["asset_id"],
+        asset.asset_id.to_string()
+    );
+    assert_eq!(stored["media_archived"], false);
     let archive_refs = database
         .request_archive_refs(key.key_id, job.job_id)
         .await

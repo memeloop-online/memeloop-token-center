@@ -172,7 +172,7 @@ When('下游用户筛选失败请求并打开详情', async function (this: Dogf
   await assertValue(filters.getByLabel('错误码'), 'http_429');
   await assertCount(page.locator('.self-history tbody tr'), 1);
   await assertContains(page.locator('.self-history tbody'), '429');
-  await assertContains(page.locator('.self-history tbody'), '已记录原因: 上游服务返回了错误状态');
+  await assertContains(page.locator('.self-history tbody'), '已记录原因: 上游服务在响应开始时返回了错误状态');
   assert.doesNotMatch(await page.locator('.self-history tbody').innerText(), /http_429/);
   await page.locator('.self-history').getByRole('button', { name: /请求详情$/ }).click();
 });
@@ -712,11 +712,41 @@ Then('上游短期签名只保存在受保护引用中且不出现在公开响�
   assert.ok(!JSON.stringify(detail).includes(canary), 'provider canary leaked through self-service generation detail');
 
   const mockPort = Number(process.env.MTC_E2E_MOCK_PORT ?? 41740);
-  const persistenceResponse = await fetch(`http://127.0.0.1:${mockPort}/__e2e/never-persist-state`, {
+  const persistenceResponse = await fetch(`http://127.0.0.1:${mockPort}/__e2e/never-persist-state?job_id=${encodeURIComponent(video.job_id)}`, {
     signal: AbortSignal.timeout(1_000),
   });
   assert.equal(persistenceResponse.status, 200);
-  assert.deepEqual(await persistenceResponse.json(), { database: false, archive: false });
+  const persistence = await persistenceResponse.json() as { database: boolean; result_json: string; archive: boolean; logs: boolean };
+  assert.equal(persistence.database, true, 'private provider references use the deployed plain JSON storage policy');
+  assert.equal(persistence.archive, false, 'provider signatures must not enter media archives');
+  assert.equal(persistence.logs, false, 'provider signatures must not enter application logs');
+  const result = JSON.parse(persistence.result_json) as { provider_reference: string; assets: Array<{ asset_id: string }> };
+  const prefix = 'provider-reference-json:';
+  assert.ok(result.provider_reference.startsWith(prefix));
+  const reference = JSON.parse(result.provider_reference.slice(prefix.length));
+  assert.deepEqual(reference, { assets: [{
+    asset_id: result.assets[0].asset_id,
+    index: 0,
+    url: `http://127.0.0.1:${mockPort}/assets/browser-video.mp4?provider_secret=never-persist`,
+    expires_at: null,
+    mime_type: 'video/mp4',
+    filename: 'video.mp4',
+  }] });
+  assert.equal(result.provider_reference, prefix + JSON.stringify(reference), 'the private reference stores exact plain JSON');
+  const foreign = await requestJson<{ key: string }>('/internal/v1/keys', {
+    method: 'POST', credential: runtime.requireSeed().globalServiceCredential,
+    body: {
+      tenant_external_id: 'browser-multimodal-isolation',
+      principal_external_id: 'foreign-media-reader',
+      alias: 'Foreign media isolation credential',
+      currency: 'USD', initial_balance: '1', policy: {}, route_ids: [], route_group_ids: [],
+    },
+  });
+  const denied = await fetch(new URL(`/self/v1/generations/${video.job_id}`, baseURL), {
+    headers: { Authorization: `Bearer ${foreign.key}` },
+  });
+  assert.equal(denied.status, 404, 'another tenant must not access the provider reference');
+  assert.ok(!(await denied.text()).includes(canary), 'provider canary leaked across the tenant boundary');
 });
 
 Then('用户通过真实下载控件取得代理图片和视频', async function (this: DogfoodWorld) {

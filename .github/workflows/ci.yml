@@ -500,7 +500,7 @@ jobs:
             # cucumber's harness rejects nextest's --list probe.
             cargo test --locked --all-features --test cucumber
           else
-            cargo nextest run --locked --all-targets --all-features --test-threads=4 ${{ matrix.args }}
+            cargo nextest run --locked --all-targets --all-features --no-fail-fast --test-threads=4 ${{ matrix.args }}
           fi
 
   migration-smoke:

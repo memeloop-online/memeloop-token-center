@@ -1979,6 +1979,7 @@ async fn buffered_settlement_enqueues_while_conversation_content_is_locked() {
     let (response_presealed, release_response_preseal) =
         crate::response_archive_spool::pause_next_request_preseal_for_test(request_id);
     let finish_database = database.clone();
+    let expected_request_json = request_json.clone();
     let mut finish = tokio::spawn(async move {
         use crate::response_archive_spool::{BufferedArchive, BufferedArchivePurpose};
         let body = bytes::Bytes::from_static(b"buffered response");
@@ -2077,7 +2078,18 @@ async fn buffered_settlement_enqueues_while_conversation_content_is_locked() {
     .fetch_one(&database.pool)
     .await
     .unwrap();
-    assert_eq!(queued, (1, 1, 0));
+    assert_eq!(queued, (1, 0, 0));
+    let queued_request: String = sqlx::query_scalar(
+        "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&queued_request).unwrap(),
+        expected_request_json
+    );
 }
 
 #[tokio::test]
@@ -2313,7 +2325,7 @@ async fn concurrent_proxy_starts_serialize_in_sqlite() {
 
 async fn archive_queued_lifecycle_body(database: &Database, request_id: Uuid) {
     let row = sqlx::query(
-        "SELECT o.observed_at, r.completed_at, p.request_json, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = o.request_id) AS observations FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id JOIN conversation_semantic_payloads p ON p.request_id = o.request_id WHERE o.request_id = $1 AND o.projected_at IS NULL",
+        "SELECT o.observed_at, r.completed_at, o.request_json, (SELECT COUNT(*) FROM conversation_observations WHERE request_id = o.request_id) AS observations FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id WHERE o.request_id = $1 AND o.projected_at IS NULL",
     )
     .bind(request_id.to_string())
     .fetch_one(&database.pool)

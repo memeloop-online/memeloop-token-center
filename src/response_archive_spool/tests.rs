@@ -30,7 +30,6 @@ async fn failed_terminal_captures_keep_legacy_bodies_and_drain_budget_after_bind
             ] {
                 assert!(capture_buffered(&state, identity, purpose, body).await);
             }
-            assert!(!process_one_for_test(&state).await);
             finish(&pool, identity).await;
             sqlx::query("UPDATE request_records SET status_code = $1, error_code = $2, request_object = $3, input_tokens = 45, output_tokens = 67, cost_micros = 123 WHERE id = $4")
                 .bind(status_code).bind(error_code).bind(format!("gap://{}/request", identity.request_id))
@@ -172,7 +171,7 @@ async fn corrupt_or_missing_spool_chunks_never_publish_a_locator() {
 }
 
 #[tokio::test]
-async fn both_buffered_purposes_recover_exact_bytes_only_after_terminal() {
+async fn both_buffered_purposes_recover_exact_bytes_after_terminal() {
     buffered_purposes_recover(false).await;
 }
 
@@ -204,7 +203,6 @@ async fn buffered_purposes_recover(compressed: bool) {
         )
         .await
     );
-    assert!(!process_one_for_test(&state).await);
     sqlx::query("UPDATE request_records SET request_object = $1 WHERE id = $2")
         .bind(format!("gap://{}/request", identity.request_id))
         .bind(identity.request_id.to_string())
@@ -262,6 +260,61 @@ async fn buffered_purposes_recover(compressed: bool) {
         staging_states,
         vec!["cleanup_pending".to_owned(), "cleanup_pending".to_owned()]
     );
+}
+
+#[tokio::test]
+async fn both_sources_upload_before_settlement_without_changing_financial_facts() {
+    let (_dir, state, pool, identity) = fixture().await;
+    sqlx::query(
+        "UPDATE request_records SET request_object = $1, response_object = $2 WHERE id = $3",
+    )
+    .bind(format!("gap://{}/request", identity.request_id))
+    .bind(format!("gap://{}/response", identity.request_id))
+    .bind(identity.request_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before = sqlx::query("SELECT completed_at, status_code, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1")
+        .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(before.get::<Option<i64>, _>("completed_at"), None);
+    let request = Bytes::from_static(b"{\"input\":\"original request\"}");
+    let response = Bytes::from_static(b"{\"output\":\"original response\"}");
+    for (purpose, body) in [
+        (BufferedArchivePurpose::Request, request.clone()),
+        (BufferedArchivePurpose::Response, response.clone()),
+    ] {
+        assert!(capture_buffered(&state, identity, purpose, body).await);
+    }
+    assert!(process_one_for_test(&state).await);
+    assert!(process_one_for_test(&state).await);
+    assert!(!process_one_for_test(&state).await);
+    let after = sqlx::query("SELECT request_object, response_object, completed_at, status_code, input_tokens, output_tokens, cost_micros FROM request_records WHERE id = $1")
+        .bind(identity.request_id.to_string()).fetch_one(&pool).await.unwrap();
+    for column in [
+        "completed_at",
+        "status_code",
+        "input_tokens",
+        "output_tokens",
+        "cost_micros",
+    ] {
+        assert_eq!(
+            after.get::<Option<i64>, _>(column),
+            before.get::<Option<i64>, _>(column)
+        );
+    }
+    for (column, body) in [("request_object", request), ("response_object", response)] {
+        let locator: String = after.get(column);
+        let recovered = state.archive.get(&locator).await.unwrap();
+        assert_eq!(recovered, body);
+        assert_eq!(blake3::hash(&recovered), blake3::hash(&body));
+    }
+    let budget: i64 = sqlx::query_scalar(
+        "SELECT cipher_bytes FROM response_archive_spool_budget WHERE singleton = 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(budget, 0);
 }
 
 #[test]

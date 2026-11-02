@@ -368,6 +368,16 @@ async fn an_exact_or_descendant_reference_protects_but_neighbor_uuid_does_not() 
         &format!("{}0/body", cleanup.canonical_prefix()),
     )
     .await;
+    // The sibling locator must survive, while this proxy body's conversation
+    // archive has committed; otherwise the body retention fence masks the
+    // exact-segment matching assertion below.
+    sqlx::query(
+        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, observed_at, projected_at) SELECT id, tenant_id, key_id, 'neighbor-principal', '{}', '{}', 1, 1 FROM request_records WHERE id = $1",
+    )
+    .bind(neighbor_lease.key.owner.id().to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
     let proof = database
         .prove_archive_staging_unreferenced(cleanup)
         .await
@@ -429,12 +439,16 @@ async fn cleanup_failure_uses_fixed_code_bounded_backoff_and_resets_empty_proof(
 #[tokio::test]
 async fn cleaned_requires_two_separate_empty_observations_across_stability_window() {
     let (_directory, _url, database, pool) = sqlite_fixture().await;
-    let lease = created(
-        database
-            .begin_archive_staging_attempt(proxy_input(Uuid::now_v7(), Uuid::now_v7(), '3'))
-            .await
-            .unwrap(),
-    );
+    // This test exercises cleanup stability independently of proxy bodies,
+    // which remain referenced until their conversation archive commits.
+    let mut input = proxy_input(Uuid::now_v7(), Uuid::now_v7(), '3');
+    input.key = ArchiveStagingKey::new(
+        ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+        ArchiveStagingPurpose::Request,
+        input.key.attempt_id,
+    )
+    .unwrap();
+    let lease = created(database.begin_archive_staging_attempt(input).await.unwrap());
     database
         .abandon_archive_staging_attempt(&lease)
         .await

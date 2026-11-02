@@ -359,17 +359,58 @@ Then('连续事件期间会话计数有界前进且活跃筛选移除已完成�
   assert.ok(summaryRefreshes <= 4,
     `continuous events must not issue an unbounded summary read per lifecycle event: ${summaryRefreshes}`);
   assert.match(await page.locator('.session-result-count').textContent() ?? '', /0/);
+  const failedIds = responses.filter((response) => response.status === 429).map((response) => response.headers.get('x-mtc-request-id'));
+  assert.ok(failedIds.every(Boolean), 'upstream failures must retain request identities');
+  await eventually(async () => {
+    const requests = await requestJson<Array<{
+      request_id: string; completed_at: number | null; cost: string | null;
+      operational_terminal?: { financial_state: string };
+    }>>('/self/v1/requests?limit=100', { credential: runtime.requireSeed().sessionClientCredential });
+    const failed = requests.filter((request) => failedIds.includes(request.request_id));
+    assert.equal(failed.length, 2);
+    for (const request of failed) {
+      assert.equal(request.completed_at, null);
+      assert.equal(request.cost, null);
+      assert.equal(request.operational_terminal?.financial_state, 'unknown');
+    }
+  }, 10_000, 'upstream 429s must remain visible as financially unknown operational terminals');
 });
 
 Then('服务端错误筛选返回含错误的聚合结果', async function () {
   const seed = runtime.requireSeed();
-  const response = await requestJson<{ sessions: Array<{ requests: number; errors: number }>; next_cursor: unknown }>(
-    `/internal/v1/sessions?tenant_external_id=${encodeURIComponent(tenant)}&state=has_errors&limit=1`,
-    { credential: seed.serviceCredential },
-  );
-  assert.equal(response.sessions.length, 1);
-  assert.ok(response.sessions[0].requests >= response.sessions[0].errors);
-  assert.ok(response.sessions[0].errors >= 1);
+  // The upstream 429s have no authoritative usage and remain financially unknown.
+  // A local pre-admission parse failure supplies a completed, zero-usage error
+  // without inventing usage or waiting for those upstream failures to settle.
+  const invalid = await fetch(new URL('/v1/chat/completions', baseURL), {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${seed.sessionClientCredential}`,
+      'Content-Type': 'application/json',
+    },
+    body: '{',
+    signal: AbortSignal.timeout(5_000),
+  });
+  assert.equal(invalid.status, 400);
+  assert.ok(invalid.headers.get('x-mtc-request-id'), 'authenticated parse failures must have a journal request identity');
+  await invalid.text();
+  const params = new URLSearchParams({
+    tenant_external_id: tenant,
+    key_id: seed.sessionClientKeyId,
+    state: 'has_errors',
+    limit: '100',
+  });
+  await eventually(async () => {
+    const response = await requestJson<{ sessions: Array<{ session_id: string; key_id: string; requests: number; errors: number }>; next_cursor: unknown }>(
+      `/internal/v1/sessions?${params}`,
+      { credential: seed.serviceCredential },
+    );
+    assert.equal(response.sessions.length, 1);
+    assert.equal(response.sessions[0].session_id, `unlinked:${seed.sessionClientKeyId}`);
+    assert.equal(response.sessions[0].key_id, seed.sessionClientKeyId);
+    assert.equal(response.sessions[0].requests, 1);
+    assert.equal(response.sessions[0].errors, 1);
+    assert.equal(response.next_cursor, null);
+  }, 10_000, 'the completed local parse failure did not reach the scoped session error aggregate');
 });
 
 Then('其他凭据事件和无事件重连不会污染已打开的会话', async function (this: DogfoodWorld) {
