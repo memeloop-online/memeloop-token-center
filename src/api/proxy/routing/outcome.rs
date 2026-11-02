@@ -173,13 +173,14 @@ mod tests {
 
     #[test]
     fn only_classified403_quota_rejection_grants_quota_failover() {
-        let quota = Some(UpstreamFailureKind::RateLimitedUntil {
+        let kind = UpstreamFailureKind::RateLimitedUntil {
             exhausted: true,
             until: 0,
-        });
+        };
+        let quota = Some(kind);
         assert_eq!(
             classify_response_failure(StatusCode::FORBIDDEN, quota),
-            Some((quota.unwrap(), UpstreamHealthReason::RateLimited))
+            Some((kind, UpstreamHealthReason::RateLimited))
         );
         assert_eq!(
             failover_disposition(Some(StatusCode::FORBIDDEN), None, quota),

@@ -310,55 +310,66 @@ async fn ordinary403_permission_rejection_is_not_quota_or_replay_permission() {
 }
 
 #[tokio::test]
-async fn emitted_stream_quota_error_never_replays_or_loses_real_usage() {
-    let running = MockServer::start().await;
-    let standby = MockServer::start().await;
-    let sse = concat!(
-        "data: {\"id\":\"chat-403-stream\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"already emitted\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"chat-403-stream\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
-        "data: {\"id\":\"chat-403-stream\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
-        "data: {\"error\":{\"code\":\"insufficient_user_quota\",\"message\":\"用户额度不足\"}}\n\n",
-        "data: [DONE]\n\n"
-    );
-    Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
-        .expect(1)
-        .mount(&running)
+async fn emitted_stream_keeps_attribution_and_never_replays_known_or_unknown_usage() {
+    use futures_util::StreamExt;
+    for failed in [false, true] {
+        let running = MockServer::start().await;
+        let standby = MockServer::start().await;
+        let prefix = "data: {\"id\":\"chat-403-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"upstream-0\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"already emitted\"},\"finish_reason\":null}]}\n\n";
+        let suffix = if failed {
+            "data: {\"error\":{\"code\":\"insufficient_user_quota\",\"message\":\"用户额度不足\"}}\n\n"
+        } else {
+            concat!(
+                "data: {\"id\":\"chat-403-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"upstream-0\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: {\"id\":\"chat-403-stream\",\"object\":\"chat.completion.chunk\",\"model\":\"upstream-0\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\n",
+                "data: [DONE]\n\n"
+            )
+        };
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(format!("{prefix}{suffix}"), "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&running)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(successful_chat_response())
+            .expect(0)
+            .mount(&standby)
+            .await;
+        let fixture = resilient_route_fixture(
+            "stream403-no-replay",
+            &[(running.uri(), 0), (standby.uri(), 10)],
+        )
         .await;
-    Mock::given(method("POST"))
-        .respond_with(successful_chat_response())
-        .expect(0)
-        .mount(&standby)
-        .await;
-    let fixture = resilient_route_fixture(
-        "stream403-no-replay",
-        &[(running.uri(), 0), (standby.uri(), 10)],
-    )
-    .await;
-    let response = send_resilient_chat(&fixture, None, true).await;
-    let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        let response = send_resilient_chat(&fixture, None, true).await;
+        let mut stream = response.into_body().into_data_stream();
+        let mut bytes = Vec::new();
+        while let Some(Ok(chunk)) = stream.next().await {
+            bytes.extend_from_slice(&chunk);
+        }
+        assert!(String::from_utf8_lossy(&bytes).contains("already emitted"));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let requests = fixture
+                    .state
+                    .db
+                    .list_requests(fixture.key_id, 10)
+                    .await
+                    .unwrap();
+                if requests.len() == 1 && (failed || requests[0].completed_at.is_some()) {
+                    assert_eq!(requests[0].upstream_account_id, Some(fixture.accounts[0]));
+                    assert_eq!(requests[0].usage.tokens.is_some(), !failed);
+                    assert_eq!(requests[0].billing.cost.is_some(), !failed);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&bytes).contains("already emitted"));
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let requests = fixture
-                .state
-                .db
-                .list_requests(fixture.key_id, 10)
-                .await
-                .unwrap();
-            if requests.len() == 1 && requests[0].completed_at.is_some() {
-                assert_eq!(requests[0].upstream_account_id, Some(fixture.accounts[0]));
-                assert!(requests[0].usage.tokens.is_some());
-                assert!(requests[0].billing.cost.is_some());
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    running.verify().await;
-    standby.verify().await;
+        running.verify().await;
+        standby.verify().await;
+    }
 }
