@@ -689,6 +689,24 @@ async fn prepare_inner(
                         .find(|candidate| candidate.health == GroupRoutingHealth::Healthy)
                         .ok_or_else(|| AppError::internal("allocation_healthy_candidate"))?;
                     let commit_phase = SnapshotPhase::new(request_id, "group_allocation_commit");
+                    if reservation.preferred.is_some() {
+                        let count_deadline = execution_deadline
+                            .min(tokio::time::Instant::now() + Duration::from_millis(5));
+                        let counted = matches!(
+                            tokio::time::timeout_at(
+                                count_deadline,
+                                reservation.commit(state, selected)
+                            )
+                            .await,
+                            Ok(Ok(true))
+                        );
+                        commit_phase.finish(if counted {
+                            "counted"
+                        } else {
+                            "background_reconciliation"
+                        });
+                        return Ok(plan);
+                    }
                     let committed = reservation.commit(state, selected).await?;
                     commit_phase.finish(if committed { "committed" } else { "conflict" });
                     if !committed {

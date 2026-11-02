@@ -119,7 +119,7 @@ impl Reservation {
             .db
             .allocation_reserve(
                 self.tenant,
-                self.revision,
+                self.preferred.is_none().then_some(self.revision),
                 self.request,
                 self.session,
                 (&selected.account_id, selected.generation),

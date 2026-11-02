@@ -46,7 +46,7 @@ impl Database {
     pub(crate) async fn allocation_reserve(
         &self,
         tenant: Uuid,
-        revision: i64,
+        revision: Option<i64>,
         request: Uuid,
         session: Option<Uuid>,
         selected: (&str, u64),
@@ -62,7 +62,10 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
-        let changed = if revision == 0 {
+        let changed = if revision.is_none() {
+            sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision) VALUES($1,1) ON CONFLICT(tenant_id) DO UPDATE SET revision=group_allocation_revisions.revision+1")
+                .bind(tenant.to_string()).execute(&mut *tx).await?.rows_affected()
+        } else if revision == Some(0) {
             sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision) VALUES($1,1) ON CONFLICT(tenant_id) DO NOTHING")
                 .bind(tenant.to_string()).execute(&mut *tx).await?.rows_affected()
         } else {
@@ -207,7 +210,7 @@ mod tests {
             let (left, right) = tokio::join!(
                 first.allocation_reserve(
                     tenant,
-                    revision,
+                    Some(revision),
                     left_request,
                     Some(session),
                     ("a", 1),
@@ -215,7 +218,7 @@ mod tests {
                 ),
                 second.allocation_reserve(
                     tenant,
-                    revision,
+                    Some(revision),
                     right_request,
                     None,
                     ("a", 1),
@@ -249,7 +252,14 @@ mod tests {
             let revision = loser.allocation_revision(tenant).await.unwrap();
             assert!(
                 loser
-                    .allocation_reserve(tenant, revision, request, None, ("b", 1), now + index)
+                    .allocation_reserve(
+                        tenant,
+                        Some(revision),
+                        request,
+                        None,
+                        ("b", 1),
+                        now + index
+                    )
                     .await
                     .unwrap()
             );
@@ -288,7 +298,7 @@ mod tests {
             first
                 .allocation_reserve(
                     tenant,
-                    revision,
+                    Some(revision),
                     request,
                     Some(session),
                     ("a", 1),
