@@ -32,6 +32,7 @@ impl Fixture {
         for source in [
             "CREATE TABLE schema_migrations (version BIGINT PRIMARY KEY, name TEXT NOT NULL, applied_at BIGINT NOT NULL); INSERT INTO schema_migrations VALUES (142, 'existing142', 123456)",
             "CREATE TABLE request_records (id TEXT PRIMARY KEY)",
+            "CREATE TABLE request_events (id TEXT PRIMARY KEY)",
             include_str!("../../../migrations/common/0071_response_archive_spool.sql"),
             include_str!("../../../migrations/common/0080_request_archive_spool.sql"),
             include_str!("../../../migrations/common/0106_archive_budget_reservations.sql"),
@@ -60,37 +61,41 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn postgres143_prepares_the_later146_index_lock_before_spool_ddl() {
+async fn postgres143_prepares_later_index_and_partition_locks_before_spool_ddl() {
     let Some(fixture) = Fixture::new().await else {
         return;
     };
-    let mut business = fixture.database.pool.begin().await.unwrap();
-    sqlx::query("LOCK TABLE request_records IN ROW EXCLUSIVE MODE")
-        .execute(&mut *business)
-        .await
-        .unwrap();
-    let mut migration = fixture.database.pool.begin().await.unwrap();
-    let error = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        apply_migration_range(&mut migration, POSTGRES_MIGRATIONS, 143, 146),
-    )
-    .await
-    .expect("the later146 index lock must not wait behind a business writer")
-    .unwrap_err();
-    assert_eq!(
-        error.as_database_error().unwrap().code().as_deref(),
-        Some("55P03")
-    );
-    migration.rollback().await.unwrap();
-    for table in LOCK_TABLES {
+    for parent in ["request_records", "request_events"] {
+        let mut business = fixture.database.pool.begin().await.unwrap();
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "LOCK TABLE {table} IN ROW EXCLUSIVE MODE NOWAIT"
+            "LOCK TABLE {parent} IN ACCESS SHARE MODE"
         )))
         .execute(&mut *business)
         .await
-        .expect("maintenance must not retain any spool lock behind the business writer");
+        .unwrap();
+        let mut migration = fixture.database.pool.begin().await.unwrap();
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            apply_migration_range(&mut migration, POSTGRES_MIGRATIONS, 143, 146),
+        )
+        .await
+        .expect("later partition locks must not wait behind a business reader")
+        .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("55P03")
+        );
+        migration.rollback().await.unwrap();
+        for table in LOCK_TABLES {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "LOCK TABLE {table} IN ROW EXCLUSIVE MODE NOWAIT"
+            )))
+            .execute(&mut *business)
+            .await
+            .expect("maintenance must not retain spool locks behind the business reader");
+        }
+        business.rollback().await.unwrap();
     }
-    business.rollback().await.unwrap();
     fixture.cleanup().await;
 }
 
