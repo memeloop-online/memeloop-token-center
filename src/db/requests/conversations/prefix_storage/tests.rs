@@ -438,7 +438,6 @@ async fn contract(url: &str) {
         client_name: Some("Codex"),
         upstream_response_id: None,
         observed_at: now + 205,
-        content_materialized: false,
     };
     enqueue_conversation_projection_in_transaction(&mut transaction, input)
         .await

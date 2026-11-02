@@ -1,7 +1,7 @@
 import type { Locale } from '../i18n';
 
 const zh = {
-  oldCredential: '这里不会在提供商处撤销旧密钥或令牌；如已泄露，请在提供商处撤销。',
+  oldCredential: '旧密钥或令牌仍在提供商处有效。如已泄露，请到提供商处撤销。',
   denied: '当前没有此账号的管理权限。请切换到账号所属租户，并使用具有提供商管理权限的服务凭据。',
   fields: '新凭据',
   submit: '保存',
@@ -20,7 +20,7 @@ const zh = {
 };
 
 const en: typeof zh = {
-  oldCredential: 'This does not revoke the old key or token at the provider. If exposed, revoke it there.',
+  oldCredential: 'The old key or token stays valid at the provider. If it was exposed, revoke it there.',
   denied: 'You cannot manage this account in the current scope. Select its tenant and use a service credential with provider management permission.',
   fields: 'New credential',
   submit: 'Save',
@@ -44,12 +44,12 @@ export const rotationFieldCopy: Record<string, [string, string, string, string]>
   type: ['凭据类型', 'Credential type', '应与提供商要求的认证方式一致。', 'Match the authentication method required by the provider.'],
   value: ['新 API 密钥', 'New API key', '粘贴提供商签发的新密钥，不要填写账号密码。', 'Paste a new key issued by the provider, not your account password.'],
   access_token: ['访问令牌', 'Access token', '粘贴授权流程取得的有效访问令牌。', 'Paste a valid access token from the authorization flow.'],
-  refresh_token: ['刷新令牌', 'Refresh token', '用于访问令牌到期后续期。请填写与新访问令牌配套的刷新令牌；留空不会保留旧刷新令牌。', 'Used to renew an expired access token. Supply the matching refresh token; leaving this blank does not retain the old refresh token.'],
+  refresh_token: ['刷新令牌', 'Refresh token', '用于访问令牌到期后续期。请填写与新访问令牌配套的刷新令牌。留空会清除旧刷新令牌。', 'Used to renew an expired access token. Supply the matching refresh token. Leaving this blank clears the old refresh token.'],
   expires_at: ['到期时间（Unix 毫秒）', 'Expiry (Unix milliseconds)', '填写提供商给出的到期时间戳，单位为毫秒，不是秒；可选时留空表示未知。', 'Use the provider’s expiry timestamp in milliseconds, not seconds. If optional, leave blank when unknown.'],
   header: ['认证请求头', 'Authentication header', '通常使用 authorization；仅在提供商要求时修改。', 'Usually authorization; change only if the provider requires it.'],
   prefix: ['认证前缀', 'Authentication prefix', '通常为 Bearer 加一个空格。尾部空格会原样保留。', 'Usually Bearer followed by a space. Trailing spaces are preserved.'],
   proxy_url: ['账号代理地址', 'Account proxy URL', '仅在提供商支持时填写。留空沿用当前代理；Codex 的代理需在账号连接设置中修改。', 'Use only when supported by the provider. Omission retains the current proxy; change Codex proxies in account connection settings.'],
   proxy_network_scope: ['代理网络范围', 'Proxy network scope', '私有网络代理需要相应的代理管理权限；不能使用此选项绕过网络访问限制。', 'Private proxies require the applicable proxy management permission; this option cannot bypass network restrictions.'],
   adapter_state: ['授权附加数据', 'Authorization metadata', '这是提供商授权流程生成的敏感数据。若没有完整数据，请返回并使用账号重新授权。', 'Sensitive data produced by the provider authorization flow. If unavailable, go back and reauthorize the account.'],
-  scopes: ['提供商权限范围', 'Provider scopes', '使用提供商实际授予的权限；填写权限名称不会获得额外授权。', 'Use scopes actually granted by the provider; entering a scope does not grant it.'],
+  scopes: ['提供商权限范围', 'Provider scopes', '填写提供商已经授予的权限名称。额外权限要在提供商处开通。', 'Enter the scope names the provider already granted. Extra access is opened at the provider.'],
 };

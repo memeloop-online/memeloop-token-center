@@ -11,7 +11,8 @@ use crate::{
             CodexDevicePollScope, ReadyCodexDeviceLogin, recover_codex_device_session_token,
         },
     },
-    provider::{UpstreamCredential, seal_private_json},
+    plain_json::encode_handle,
+    provider::UpstreamCredential,
 };
 use serde_json::json;
 use tower::ServiceExt;
@@ -87,11 +88,11 @@ async fn staged_login_recovery(stale_account: bool) {
             now - 1000
         },
     };
-    let encrypted = seal_private_json(&json!({
+    let encrypted = encode_handle(&json!({
         "session_id":session_id,"tenant_external_id":reference.tenant_external_id,"account_name":"Synthetic account",
         "provider_config":config,"operator_service_id":null,"device_auth_id":"synthetic-device","user_code":"FIXTURE",
         "poll_interval_seconds":1,"not_before":now-5000,"expires_at":reference.expires_at,"reauthorize":null,
-    }), key, b"memeloop-token-center/openai-codex-device-state/v1").unwrap();
+    })).unwrap();
     state
         .db
         .begin_oauth_login_session(BeginOAuthLoginSession {
@@ -152,12 +153,7 @@ async fn staged_login_recovery(stale_account: bool) {
         .stage_oauth_login_ready(
             session_id,
             lease_owner,
-            seal_private_json(
-                &ready,
-                key,
-                b"memeloop-token-center/openai-codex-device-ready/v1",
-            )
-            .unwrap(),
+            encode_handle(&ready).unwrap(),
             now - 3000,
         )
         .await

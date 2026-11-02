@@ -72,8 +72,8 @@ pub(super) async fn cpu_profile(
     });
     let bytes = tokio::time::timeout(duration + PROFILE_FINISH_GRACE, task)
         .await
-        .map_err(|_| AppError::Internal)?
-        .map_err(|_| AppError::Internal)??;
+        .map_err(|_| AppError::internal("diagnostics_cpu_profile_1"))?
+        .map_err(|_| AppError::internal("diagnostics_cpu_profile_2"))??;
     Ok((
         [
             (header::CONTENT_TYPE, "application/vnd.google.protobuf"),
@@ -94,16 +94,21 @@ fn capture_cpu_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
         .frequency(99)
         .blocklist(&["libc", "libgcc", "pthread", "vdso"])
         .build()
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_1"))?;
     std::thread::sleep(duration);
-    let report = profiler.report().build().map_err(|_| AppError::Internal)?;
-    let profile = report.pprof().map_err(|_| AppError::Internal)?;
+    let report = profiler
+        .report()
+        .build()
+        .map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_2"))?;
+    let profile = report
+        .pprof()
+        .map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_3"))?;
     let mut output = Vec::with_capacity(profile.encoded_len().min(MAX_CPU_PROFILE_BYTES));
     profile
         .encode(&mut output)
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("diagnostics_capture_cpu_profile_4"))?;
     if output.is_empty() || output.len() > MAX_CPU_PROFILE_BYTES {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("diagnostics_capture_cpu_profile_1"));
     }
     Ok(output)
 }
@@ -126,8 +131,8 @@ pub(super) async fn heap_profile(
     });
     let bytes = tokio::time::timeout(duration + PROFILE_FINISH_GRACE, task)
         .await
-        .map_err(|_| AppError::Internal)?
-        .map_err(|_| AppError::Internal)??;
+        .map_err(|_| AppError::internal("diagnostics_heap_profile_1"))?
+        .map_err(|_| AppError::internal("diagnostics_heap_profile_2"))??;
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream"),
@@ -146,23 +151,26 @@ pub(super) async fn heap_profile(
 fn capture_heap_profile(duration: Duration) -> Result<Vec<u8>, AppError> {
     use std::{ffi::CString, os::unix::ffi::OsStrExt, path::PathBuf};
     if crate::jemalloc_control::read_bool(b"opt.prof\0") != Some(true) {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("diagnostics_capture_heap_profile_1"));
     }
     let active = JemallocProfileActivation::begin()?;
     std::thread::sleep(duration);
     let path = PathBuf::from("/tmp").join(format!("memeloop-token-center-{}.heap", Uuid::now_v7()));
     let temporary = TemporaryProfile(path);
-    let path = CString::new(temporary.0.as_os_str().as_bytes()).map_err(|_| AppError::Internal)?;
+    let path = CString::new(temporary.0.as_os_str().as_bytes())
+        .map_err(|_| AppError::internal("diagnostics_capture_heap_profile_1"))?;
     // SAFETY: `prof.dump` expects a pointer to a NUL-terminated path and
     // jemalloc consumes it synchronously before CString is dropped.
     crate::jemalloc_control::write_pointer(b"prof.dump\0", path.as_ptr())
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::internal("diagnostics_capture_heap_profile_2"))?;
     drop(active);
-    let metadata = std::fs::metadata(&temporary.0).map_err(|_| AppError::Internal)?;
+    let metadata = std::fs::metadata(&temporary.0)
+        .map_err(|_| AppError::internal("diagnostics_capture_heap_profile_3"))?;
     if metadata.len() > MAX_HEAP_PROFILE_BYTES as u64 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("diagnostics_capture_heap_profile_2"));
     }
-    std::fs::read(&temporary.0).map_err(|_| AppError::Internal)
+    std::fs::read(&temporary.0)
+        .map_err(|_| AppError::internal("diagnostics_capture_heap_profile_4"))
 }
 
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
@@ -175,7 +183,7 @@ impl JemallocProfileActivation {
     fn begin() -> Result<Self, AppError> {
         // SAFETY: `prof.active` has the documented jemalloc `bool` type.
         let previous = crate::jemalloc_control::update_bool(b"prof.active\0", true)
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("diagnostics_begin_1"))?;
         Ok(Self { previous })
     }
 }

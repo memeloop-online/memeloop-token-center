@@ -8,19 +8,40 @@ pub struct SelectedEgress {
     pub group_name: Option<String>,
     pub member_id: Option<Uuid>,
     pub member_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_version: Option<i64>,
     scheme: Option<String>,
     host: Option<String>,
     port: Option<u16>,
 }
 
 impl SelectedEgress {
+    /// One address shared by several group members is one actual proxy.
+    /// Hash only the sanitized endpoint, never proxy authentication material.
+    pub(crate) fn concurrency_identity(&self) -> Option<String> {
+        if self.kind != "proxy" {
+            return None;
+        }
+        let endpoint = serde_json::to_vec(&(
+            self.scheme.as_ref()?,
+            self.host.as_ref()?.to_ascii_lowercase(),
+            self.port?,
+        ))
+        .ok()?;
+        Some(blake3::hash(&endpoint).to_hex().to_string())
+    }
+
     pub fn capture(selected_proxy_url: Option<&str>) -> Result<Self, AppError> {
         let address = selected_proxy_url
             .map(|value| {
-                let parsed = url::Url::parse(value).map_err(|_| AppError::Internal)?;
-                let host = parsed.host_str().ok_or(AppError::Internal)?.to_owned();
+                let parsed =
+                    url::Url::parse(value).map_err(|_| AppError::internal("egress_capture_1"))?;
+                let host = parsed
+                    .host_str()
+                    .ok_or(AppError::internal("egress_capture_1"))?
+                    .to_owned();
                 if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("egress_capture_2"));
                 }
                 let port = parsed
                     .port_or_known_default()
@@ -40,6 +61,7 @@ impl SelectedEgress {
             group_name: None,
             member_id: None,
             member_name: None,
+            proxy_version: None,
             scheme: address.as_ref().map(|value| value.0.clone()),
             host: address.as_ref().map(|value| value.1.clone()),
             port: address.and_then(|value| value.2),
@@ -47,7 +69,7 @@ impl SelectedEgress {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestEgressAttempt {
     pub request_id: Uuid,
     pub attempt_id: Uuid,
@@ -66,6 +88,7 @@ pub struct RequestEgressAttempt {
     pub completed: bool,
     pub final_response: bool,
     pub response_body_complete: bool,
+    #[serde(skip_deserializing, default = "payload_measurement_basis")]
     pub measurement_basis: &'static str,
 }
 
@@ -89,20 +112,21 @@ impl Database {
         &self,
         attempt: &RequestEgressAttempt,
     ) -> Result<(), AppError> {
-        let snapshot = serde_json::to_string(&attempt.selected).map_err(|_| AppError::Internal)?;
-        let transport =
-            serde_json::to_string(&attempt.transport).map_err(|_| AppError::Internal)?;
+        let snapshot = serde_json::to_string(&attempt.selected)
+            .map_err(|_| AppError::internal("egress_record_request_egress_attempt_1"))?;
+        let transport = serde_json::to_string(&attempt.transport)
+            .map_err(|_| AppError::internal("egress_record_request_egress_attempt_2"))?;
         let binding = attempt
             .connection_binding
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("egress_record_request_egress_attempt_3"))?;
         if snapshot.len() > 8192
             || transport.len() > 8192
             || binding.as_ref().is_some_and(|value| value.len() > 2048)
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("egress_record_request_egress_attempt_1"));
         }
         let result = sqlx::query(
             "INSERT INTO request_egress_attempts (
@@ -157,12 +181,33 @@ impl Database {
         .execute(&self.pool)
         .await?;
         if result.rows_affected() != 1 {
-            return Err(AppError::Storage("egress attempt snapshot conflict".into()));
+            return Err(AppError::storage("egress_attempt_snapshot_conflict"));
         }
+        crate::db::network_proxies::signals::stage_attempt(&self.pool, attempt).await?;
         Ok(())
     }
 
     pub async fn request_egress_attempts(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Vec<RequestEgressAttempt>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let Some(snapshot) = client
+                .request_snapshot(
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    request_id,
+                )
+                .await?
+            else {
+                return Ok(Vec::new());
+            };
+            return serde_json::from_value(snapshot.read_model["egress_attempts"].clone())
+                .map_err(|_| AppError::internal("history_egress_projection_missing"));
+        }
+        self.source_request_egress_attempts(request_id).await
+    }
+
+    pub(crate) async fn source_request_egress_attempts(
         &self,
         request_id: Uuid,
     ) -> Result<Vec<RequestEgressAttempt>, AppError> {
@@ -188,15 +233,13 @@ impl Database {
                     selected: decode_selected(&row.try_get::<String, _>("snapshot_json")?)?,
                     transport: serde_json::from_str(&row.try_get::<String, _>("transport_json")?)
                         .map_err(|_| {
-                        AppError::Storage("egress transport snapshot is malformed".into())
+                        AppError::storage("egress_transport_snapshot_is_malformed")
                     })?,
                     connection_binding: row
                         .try_get::<Option<String>, _>("connection_binding_json")?
                         .map(|value| serde_json::from_str(&value))
                         .transpose()
-                        .map_err(|_| {
-                            AppError::Storage("egress connection binding is malformed".into())
-                        })?,
+                        .map_err(|_| AppError::storage("egress_connection_binding_is_malformed"))?,
                     request_payload_bytes: row.try_get("request_payload_bytes")?,
                     response_payload_bytes: row.try_get("response_payload_bytes")?,
                     completed: row.try_get::<i64, _>("completed")? != 0,
@@ -228,27 +271,48 @@ impl Database {
                 "invalid egress observation window".into(),
             ));
         }
-        let rows = sqlx::query(
-            "SELECT snapshot_json, COUNT(*) AS recorded_attempts,
+        if let Some(client) = self.history_reader().await? {
+            return Ok(client
+                .egress_summary(self.history_scope(tenant_external_id).await?, start, end)
+                .await?);
+        }
+        let rows = if let Some(external_id) = tenant_external_id {
+            sqlx::query(
+                "SELECT snapshot_json, COUNT(*) AS recorded_attempts,
                     CAST(SUM(completed) AS BIGINT) AS completed_attempts,
                     CAST(SUM(final_response) AS BIGINT) AS final_response_attempts,
                     COUNT(request_payload_bytes) AS request_known_attempts,
                     COUNT(response_payload_bytes) AS response_known_attempts,
                     CAST(SUM(request_payload_bytes) AS BIGINT) AS request_payload_bytes,
                     CAST(SUM(response_payload_bytes) AS BIGINT) AS response_payload_bytes
-             FROM request_egress_attempts e WHERE observed_at >= $1 AND observed_at < $2
-                AND (CAST($3 AS TEXT) IS NULL OR EXISTS (
-                    SELECT 1 FROM request_record_locators locator
-                    JOIN tenants tenant ON tenant.id = locator.tenant_id
-                    WHERE locator.id = e.request_id AND tenant.external_id = $3
-                ))
-             GROUP BY snapshot_json ORDER BY snapshot_json",
-        )
-        .bind(start)
-        .bind(end)
-        .bind(tenant_external_id)
-        .fetch_all(&self.pool)
-        .await?;
+                 FROM request_egress_attempts e
+                 JOIN request_record_locators locator ON locator.id = e.request_id
+                 JOIN tenants tenant ON tenant.id = locator.tenant_id
+                 WHERE e.observed_at >= $1 AND e.observed_at < $2 AND tenant.external_id = $3
+                 GROUP BY snapshot_json ORDER BY snapshot_json",
+            )
+            .bind(start)
+            .bind(end)
+            .bind(external_id)
+            .fetch_all(&self.pool)
+            .await?
+        } else {
+            sqlx::query(
+                "SELECT snapshot_json, COUNT(*) AS recorded_attempts,
+                    CAST(SUM(completed) AS BIGINT) AS completed_attempts,
+                    CAST(SUM(final_response) AS BIGINT) AS final_response_attempts,
+                    COUNT(request_payload_bytes) AS request_known_attempts,
+                    COUNT(response_payload_bytes) AS response_known_attempts,
+                    CAST(SUM(request_payload_bytes) AS BIGINT) AS request_payload_bytes,
+                    CAST(SUM(response_payload_bytes) AS BIGINT) AS response_payload_bytes
+                 FROM request_egress_attempts e WHERE e.observed_at >= $1 AND e.observed_at < $2
+                 GROUP BY snapshot_json ORDER BY snapshot_json",
+            )
+            .bind(start)
+            .bind(end)
+            .fetch_all(&self.pool)
+            .await?
+        };
         rows.into_iter()
             .map(|row| {
                 Ok(RequestEgressSummary {
@@ -270,10 +334,13 @@ impl Database {
 }
 
 fn decode_selected(snapshot: &str) -> Result<SelectedEgress, AppError> {
-    serde_json::from_str(snapshot)
-        .map_err(|_| AppError::Storage("egress snapshot is malformed".into()))
+    serde_json::from_str(snapshot).map_err(|_| AppError::storage("egress_snapshot_is_malformed"))
 }
 
 #[cfg(test)]
 #[path = "egress_tests.rs"]
 mod tests;
+
+fn payload_measurement_basis() -> &'static str {
+    "application_payload_estimate"
+}

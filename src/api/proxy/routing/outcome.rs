@@ -8,6 +8,7 @@ pub(in crate::api::proxy) enum FailoverDisposition {
     CandidateNotDispatched,
     ConnectionNotDelivered,
     RateLimitRejected,
+    QuotaRejected,
     Stop,
 }
 
@@ -16,7 +17,9 @@ impl FailoverDisposition {
         match self {
             Self::CandidateNotDispatched => Some(UpstreamHealthReason::Unavailable),
             Self::ConnectionNotDelivered => Some(UpstreamHealthReason::Connection),
-            Self::RateLimitRejected => Some(UpstreamHealthReason::RateLimited),
+            Self::RateLimitRejected | Self::QuotaRejected => {
+                Some(UpstreamHealthReason::RateLimited)
+            }
             Self::Stop => None,
         }
     }
@@ -26,6 +29,7 @@ impl FailoverDisposition {
             Self::CandidateNotDispatched => "candidate_not_dispatched",
             Self::ConnectionNotDelivered => "connection_not_delivered",
             Self::RateLimitRejected => "rate_limit_rejected",
+            Self::QuotaRejected => "quota_rejected",
             Self::Stop => "no_replay_evidence",
         }
     }
@@ -34,6 +38,7 @@ impl FailoverDisposition {
 pub(in crate::api::proxy) fn failover_disposition(
     status: Option<StatusCode>,
     error: Option<&ProxySendError>,
+    quota_failure: Option<UpstreamFailureKind>,
 ) -> FailoverDisposition {
     match (status, error) {
         (
@@ -44,6 +49,17 @@ pub(in crate::api::proxy) fn failover_disposition(
             FailoverDisposition::ConnectionNotDelivered
         }
         (Some(StatusCode::TOO_MANY_REQUESTS), None) => FailoverDisposition::RateLimitRejected,
+        (Some(StatusCode::FORBIDDEN), None)
+            if matches!(
+                quota_failure,
+                Some(UpstreamFailureKind::RateLimitedUntil {
+                    exhausted: true,
+                    ..
+                })
+            ) =>
+        {
+            FailoverDisposition::QuotaRejected
+        }
         _ => FailoverDisposition::Stop,
     }
 }
@@ -105,6 +121,17 @@ fn classify_response_failure(
     rate_limit: Option<UpstreamFailureKind>,
 ) -> Option<(UpstreamFailureKind, UpstreamHealthReason)> {
     match status {
+        StatusCode::FORBIDDEN
+            if matches!(
+                rate_limit,
+                Some(UpstreamFailureKind::RateLimitedUntil {
+                    exhausted: true,
+                    ..
+                })
+            ) =>
+        {
+            Some((rate_limit.unwrap(), UpstreamHealthReason::RateLimited))
+        }
         StatusCode::TOO_MANY_REQUESTS => Some((
             rate_limit.unwrap_or(UpstreamFailureKind::RateLimited),
             UpstreamHealthReason::RateLimited,
@@ -133,7 +160,7 @@ mod tests {
                 Some((UpstreamFailureKind::Authentication, _))
             ));
             assert_eq!(
-                failover_disposition(Some(status), None),
+                failover_disposition(Some(status), None, None),
                 FailoverDisposition::Stop
             );
         }
@@ -145,21 +172,60 @@ mod tests {
     }
 
     #[test]
+    fn only_classified403_quota_rejection_grants_quota_failover() {
+        let kind = UpstreamFailureKind::RateLimitedUntil {
+            exhausted: true,
+            until: 0,
+        };
+        let quota = Some(kind);
+        assert_eq!(
+            classify_response_failure(StatusCode::FORBIDDEN, quota),
+            Some((kind, UpstreamHealthReason::RateLimited))
+        );
+        assert_eq!(
+            failover_disposition(Some(StatusCode::FORBIDDEN), None, quota),
+            FailoverDisposition::QuotaRejected
+        );
+        for status in [
+            StatusCode::OK,
+            StatusCode::UNAUTHORIZED,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert_eq!(
+                failover_disposition(Some(status), None, quota),
+                FailoverDisposition::Stop
+            );
+        }
+        assert_eq!(
+            failover_disposition(
+                Some(StatusCode::FORBIDDEN),
+                None,
+                Some(UpstreamFailureKind::RateLimitedUntil {
+                    exhausted: false,
+                    until: i64::MAX
+                }),
+            ),
+            FailoverDisposition::Stop
+        );
+    }
+
+    #[test]
     fn only_explicit_non_delivery_or_rate_limit_rejection_permits_failover() {
         assert_eq!(
-            failover_disposition(Some(StatusCode::TOO_MANY_REQUESTS), None),
+            failover_disposition(Some(StatusCode::TOO_MANY_REQUESTS), None, None),
             FailoverDisposition::RateLimitRejected
         );
         assert_eq!(
             failover_disposition(
                 None,
-                Some(&ProxySendError::RetryableConnection("proxy_connect"))
+                Some(&ProxySendError::RetryableConnection("proxy_connect")),
+                None
             ),
             FailoverDisposition::ConnectionNotDelivered
         );
         for status in [200, 400, 401, 403, 500, 502, 503, 504] {
             assert_eq!(
-                failover_disposition(Some(StatusCode::from_u16(status).unwrap()), None),
+                failover_disposition(Some(StatusCode::from_u16(status).unwrap()), None, None),
                 FailoverDisposition::Stop
             );
         }
@@ -171,14 +237,15 @@ mod tests {
             ProxySendError::Credential,
         ] {
             assert_eq!(
-                failover_disposition(None, Some(&error)),
+                failover_disposition(None, Some(&error), None),
                 FailoverDisposition::Stop
             );
         }
         assert_eq!(
             failover_disposition(
                 Some(StatusCode::SERVICE_UNAVAILABLE),
-                Some(&ProxySendError::RetryableConnection("connect"))
+                Some(&ProxySendError::RetryableConnection("connect")),
+                None
             ),
             FailoverDisposition::Stop
         );
@@ -206,7 +273,7 @@ mod tests {
                 ))
             );
             assert_eq!(
-                failover_disposition(None, result.as_ref().err()),
+                failover_disposition(None, result.as_ref().err(), None),
                 FailoverDisposition::Stop
             );
             assert_eq!(attempt_failure_stage(&result), stage);

@@ -7,6 +7,63 @@ use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 
 impl Database {
+    /// Reads configuration window names from persisted account observations.
+    pub(crate) async fn quota_window_metadata(
+        &self,
+        account_ids: &[Uuid],
+        tenant: &str,
+    ) -> Result<Vec<crate::upstream_quota::observations::QuotaWindowMetadata>, AppError> {
+        use crate::upstream_quota::observations::{QuotaWindowDescriptor, QuotaWindowMetadata};
+        let ids = match self.backend {
+            DatabaseBackend::PostgreSql => "SELECT jsonb_array_elements_text(CAST($1 AS jsonb))",
+            DatabaseBackend::Sqlite => "SELECT value FROM json_each($1)",
+        };
+        let statement = format!("SELECT a.id,a.driver,q.observation_json FROM upstream_accounts a
+            JOIN tenants t ON t.id=a.tenant_id
+            LEFT JOIN upstream_quota_observations q ON q.upstream_account_id=a.id AND q.tenant_id=a.tenant_id
+                AND q.credential_generation=a.credential_generation AND q.config_revision=a.updated_at
+            WHERE a.id IN ({ids}) AND t.external_id=$2 AND a.status='active' ORDER BY a.id");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(
+                serde_json::to_string(account_ids)
+                    .map_err(|_| AppError::internal("quota_window_metadata_ids"))?,
+            )
+            .bind(tenant)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let account_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
+                    .map_err(|_| AppError::internal("quota_window_metadata_account"))?;
+                let provider: String = row.try_get("driver")?;
+                let observation = row
+                    .try_get::<Option<String>, _>("observation_json")?
+                    .and_then(|raw| serde_json::from_str::<RoutingQuotaObservation>(&raw).ok());
+                let windows = observation
+                    .filter(|value| value.account_id == account_id && value.provider == provider)
+                    .map(|value| {
+                        value
+                            .windows
+                            .into_iter()
+                            .take(64)
+                            .filter(|window| !window.id.is_empty() && window.id.len() <= 512)
+                            .map(|window| QuotaWindowDescriptor {
+                                label: window.id.clone(),
+                                id: window.id,
+                                period_seconds: window.period_seconds,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(QuotaWindowMetadata {
+                    upstream_account_id: account_id,
+                    provider,
+                    windows,
+                })
+            })
+            .collect()
+    }
+
     /// Read-only fence before quota attempts; never opens or refreshes a credential.
     pub(crate) async fn quota_read_generation_current(
         &self,
@@ -82,7 +139,9 @@ impl Database {
                     OR (p.recovery_priority=0 AND p.recovery_mark>COALESCE(q.last_attempt_at,0)))
             ORDER BY p.recovery_priority,COALESCE(q.last_attempt_at,0),a.id LIMIT $3");
         sqlx::query(sqlx::AssertSqlSafe(statement))
-            .bind(serde_json::to_string(plugins).map_err(|_| AppError::Internal)?)
+            .bind(serde_json::to_string(plugins).map_err(|_| {
+                AppError::internal("quota_observations_quota_observation_targets_1")
+            })?)
             .bind(now)
             .bind(limit.clamp(1, 16))
             .fetch_all(&self.pool)
@@ -90,10 +149,12 @@ impl Database {
             .into_iter()
             .map(|row| {
                 Ok(QuotaObservationTarget {
-                    account_id: Uuid::parse_str(&row.try_get::<String, _>("id")?)
-                        .map_err(|_| AppError::Internal)?,
-                    tenant_id: Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?)
-                        .map_err(|_| AppError::Internal)?,
+                    account_id: Uuid::parse_str(&row.try_get::<String, _>("id")?).map_err(
+                        |_| AppError::internal("quota_observations_quota_observation_targets_2"),
+                    )?,
+                    tenant_id: Uuid::parse_str(&row.try_get::<String, _>("tenant_id")?).map_err(
+                        |_| AppError::internal("quota_observations_quota_observation_targets_3"),
+                    )?,
                     tenant_external_id: row.try_get("external_id")?,
                     generation: row.try_get("credential_generation")?,
                     config_revision: row.try_get("updated_at")?,
@@ -146,7 +207,7 @@ impl Database {
         let json = observation
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("quota_observations_finish_quota_observation_1"))?;
         sqlx::query("UPDATE upstream_quota_observations SET observation_json=$1,valid_until=$2,next_refresh_at=$3,lease_id=NULL,lease_until=0
             WHERE upstream_account_id=$4 AND tenant_id=$5 AND credential_generation=$6 AND config_revision=$7 AND lease_id=$8
                 AND EXISTS (SELECT 1 FROM upstream_accounts a WHERE a.id=$4 AND a.tenant_id=$5 AND a.credential_generation=$6 AND a.updated_at=$7 AND a.status='active')")
@@ -215,8 +276,9 @@ impl Database {
                     "quota_observation_payload_limit".into(),
                 ));
             }
-            let value: RoutingQuotaObservation =
-                serde_json::from_str(&json).map_err(|_| AppError::Internal)?;
+            let value: RoutingQuotaObservation = serde_json::from_str(&json).map_err(|_| {
+                AppError::internal("quota_observations_routing_quota_observations_1")
+            })?;
             if value.observed_at >= 0
                 && value.observed_at <= now
                 && value.valid_until > now

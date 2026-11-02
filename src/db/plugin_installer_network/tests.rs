@@ -53,15 +53,19 @@ async fn contract(database: &Database) {
         .unwrap();
     assert_eq!(view["has_password"], true);
     assert!(view.get("password").is_none());
-    let ciphertext: String = sqlx::query_scalar(
+    let stored_preference: String = sqlx::query_scalar(
         "SELECT preference_ciphertext FROM plugin_installer_network_preferences WHERE actor=$1",
     )
     .bind(&actor)
     .fetch_one(&database.pool)
     .await
     .unwrap();
-    assert!(!ciphertext.contains("fixture-secret"));
-    assert!(!ciphertext.contains("fixture-user"));
+    // The legacy column name holds plaintext JSON; the public view stays redacted.
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored_preference).unwrap(),
+        serde_json::to_value(&input).unwrap()
+    );
+    assert!(!view.to_string().contains("fixture-secret"));
     assert!(matches!(
         database
             .installer_network_preference(&other_actor, KEY)
@@ -115,12 +119,20 @@ async fn contract(database: &Database) {
     assert_eq!(copied.proxy_url, snapshot.proxy_url);
     assert_eq!(copied.password, snapshot.password);
     assert_eq!(copied.proxy_addresses, snapshot.proxy_addresses);
-    assert!(
+    // Plaintext reads remain actor-bound and do not depend on the storage key.
+    let reloaded = database
+        .load_installer_network(&operation, &actor, b"wrong-key")
+        .await
+        .unwrap();
+    assert_eq!(reloaded.password, snapshot.password);
+    assert_eq!(reloaded.proxy_addresses, snapshot.proxy_addresses);
+    // Explicit selection replay still verifies the keyed selection digest.
+    assert!(matches!(
         database
-            .load_installer_network(&operation, &actor, b"wrong-key")
-            .await
-            .is_err()
-    );
+            .freeze_installer_network(&operation, &actor, Some(input.clone()), b"wrong-key")
+            .await,
+        Err(AppError::Conflict(_))
+    ));
     // Password omission keeps a credential only for the same URL and identity.
     database
         .put_installer_network_preference(&actor, input.clone(), KEY)
@@ -335,7 +347,7 @@ async fn group_contract(database: &Database) {
 }
 
 #[tokio::test]
-async fn sqlite_installer_network_encrypted_remember_and_frozen_retry() {
+async fn sqlite_installer_network_plaintext_remember_and_frozen_retry() {
     let directory = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -357,7 +369,7 @@ async fn sqlite_installer_network_encrypted_remember_and_frozen_retry() {
 }
 
 #[tokio::test]
-async fn postgres_installer_network_encrypted_remember_and_frozen_retry() {
+async fn postgres_installer_network_plaintext_remember_and_frozen_retry() {
     let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         return;
     };

@@ -396,7 +396,7 @@ impl Database {
     ) -> Result<(), AppError> {
         let mut tx = self.begin_write_transaction().await?;
         let tenant_id = sqlx::query(
-            "SELECT r.tenant_id FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2 AND r.archived_at IS NULL",
+            "SELECT r.tenant_id FROM model_routes r JOIN tenants t ON t.id = r.tenant_id WHERE r.id = $1 AND t.external_id = $2",
         )
         .bind(route_id.to_string())
         .bind(tenant_external_id)
@@ -426,17 +426,6 @@ impl Database {
         if updated_at != expected_updated_at {
             return Err(AppError::Conflict(
                 "reload the model route before deleting it".into(),
-            ));
-        }
-        let referenced =
-            sqlx::query("SELECT id FROM request_records WHERE model_route_id = $1 LIMIT 1")
-                .bind(route_id.to_string())
-                .fetch_optional(&mut *tx)
-                .await?
-                .is_some();
-        if referenced {
-            return Err(AppError::Conflict(
-                "the route has request history and must be retained in a disabled state".into(),
             ));
         }
         let active_create_claim = sqlx::query(
@@ -535,8 +524,8 @@ impl Database {
             return Ok(None);
         };
         let config_json: String = row.try_get("config_json")?;
-        let persisted_config: serde_json::Value =
-            serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?;
+        let persisted_config: serde_json::Value = serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("routes_resolve_upstream_with_hint_1"))?;
         let ciphertext: String = row.try_get("credential_ciphertext")?;
         let credential = open_credential(&ciphertext, key_material)?;
         let config = credential.hydrate_provider_adapter_config(persisted_config)?;

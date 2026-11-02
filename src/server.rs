@@ -115,6 +115,9 @@ fn connection_builder(limits: ServerLimits) -> auto::Builder<TokioExecutor> {
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http1()
+        // A completed upload may send FIN while authentication/admission is
+        // still producing the response. Preserve the response side of TCP.
+        .half_close(true)
         .timer(TokioTimer::new())
         .header_read_timeout(limits.header_read_timeout)
         .max_headers(limits.max_http1_headers)

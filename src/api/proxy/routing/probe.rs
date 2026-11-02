@@ -143,7 +143,7 @@ pub(super) fn record_preparation_failure(state: &AppState, failure: PreparationF
             }),
         )
         .await
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("probe_record_preparation_failure_1"))?
     });
 }
 
@@ -879,7 +879,7 @@ impl UpstreamAttemptGuard {
             queue.submit(4096, async move {
                 tokio::time::timeout(std::time::Duration::from_secs(2), completion)
                     .await
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("probe_complete_1"))?;
                 Ok(())
             });
         }
@@ -990,7 +990,7 @@ impl Drop for UpstreamAttemptGuard {
             queue.submit(4096, async move {
                 tokio::time::timeout(std::time::Duration::from_secs(2), completion)
                     .await
-                    .map_err(|_| AppError::Internal)?;
+                    .map_err(|_| AppError::internal("probe_drop_1"))?;
                 Ok(())
             });
         }
@@ -1032,9 +1032,6 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             .cloned()
     });
     let _ = transient_health_scope;
-    // A successful send refreshes service availability. It does not rewrite
-    // the circuit-breaker cohort: cooldown and probe leases stay with their
-    // own compare-and-swap. A failure here is not an availability sample.
     let signal: Option<crate::plugin::routing::GroupRoutingTransientSignal> = None;
     let directive: Option<crate::plugin::routing::GroupRoutingExecutionDirective> = None;
     let mandatory_failure = matches!(
@@ -1042,12 +1039,8 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
         GroupRoutingOutcome::HardQuota | GroupRoutingOutcome::Authentication
     );
     let health = terminal_health_config(state.config.upstream_health, directive.as_ref(), terminal);
-    if matches!(terminal, UpstreamAttemptTerminal::Succeeded) {
-        state.db.note_service_available(upstream_account_id).await;
-    }
     if observe_only {
         // The customer already has its result. Keep the transport diagnostic.
-        // Service availability was refreshed above when this attempt succeeded.
         if let UpstreamAttemptTerminal::Failed {
             kind,
             failure_stage,
@@ -1095,7 +1088,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
             tracing::info!(
                 %request_id,
                 %upstream_account_id,
-                "upstream success refreshed service availability"
+                "upstream request succeeded"
             );
         }
         UpstreamAttemptTerminal::Inconclusive => {
@@ -1155,7 +1148,7 @@ async fn record_terminal(record: UpstreamAttemptRecord, terminal: UpstreamAttemp
                 state.routing_persistence.submit(4096, async move {
                     tokio::time::timeout(std::time::Duration::from_millis(250), diagnostic)
                         .await
-                        .map_err(|_| AppError::Internal)?
+                        .map_err(|_| AppError::internal("probe_site_1"))?
                 });
             } else if let Err(error) = diagnostic.await {
                 state.routing_persistence.record_failure_gap();

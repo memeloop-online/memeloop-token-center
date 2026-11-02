@@ -60,10 +60,9 @@ pub(in crate::api) async fn create_generation_for_modality(
             .get(&route.driver)
             .is_some_and(|provider| provider.modalities.iter().any(|value| value == modality));
         if !adapter.supports_modality(modality) || !provider_supports_modality {
-            return Err(AppError::Upstream(format!(
-                "generation route for {} does not support {} generation",
-                body.model, modality
-            )));
+            return Err(AppError::upstream(
+                "generation_route_for_does_not_support_generation",
+            ));
         }
     }
     adapter.normalize_input(&mut body.input)?;
@@ -113,7 +112,7 @@ pub(in crate::api) async fn create_generation_for_modality(
         "model": body.model,
         "input": body.input
     }))
-    .map_err(|_| AppError::Internal)?;
+    .map_err(|_| AppError::internal("jobs_create_generation_for_modality_1"))?;
     let key_id = key.key_id;
     let started = state
         .db

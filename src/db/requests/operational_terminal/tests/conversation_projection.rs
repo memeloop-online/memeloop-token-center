@@ -113,9 +113,6 @@ async fn contract(fixture: Fixture) {
         .unwrap();
     assert_eq!(active.len(), 1, "a running request must remain active");
     assert_eq!(active[0].active_requests, 1);
-    let body = serde_json::json!({
-        "messages": [{"role": "user", "content": "retain history despite unknown usage"}]
-    });
     let hints = ConversationHints::default();
     let mut transaction = fixture.database.begin_write_transaction().await.unwrap();
     enqueue_conversation_projection_in_transaction(
@@ -123,12 +120,11 @@ async fn contract(fixture: Fixture) {
         ConversationProjectionEnqueueInput {
             request_id,
             key: &fixture.key,
-            request_json: &body,
+            request_json: &serde_json::json!({}),
             hints: &hints,
             client_name: Some("Codex"),
             upstream_response_id: None,
             observed_at: unix_millis(),
-            content_materialized: false,
         },
     )
     .await
@@ -142,13 +138,13 @@ async fn contract(fixture: Fixture) {
         .unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].request_id, request_id);
-    // Merely having a request is not evidence of runtime completion.
+    // An empty deferred snapshot is a harmless no-op, even before runtime completion.
     assert!(
-        fixture
+        !fixture
             .database
             .project_claimed_conversation_projection_task(owner, request_id)
             .await
-            .is_err()
+            .unwrap()
     );
     let terminal = fixture.operational(429);
     fixture.record(Uuid::now_v7(), &terminal).await.unwrap();
@@ -157,6 +153,23 @@ async fn contract(fixture: Fixture) {
         .mark_pending_proxy_settlement_unknown(&fixture.claim)
         .await
         .unwrap();
+    super::unknown_bridge::drain_terminal(&fixture).await;
+    let tasks = fixture
+        .database
+        .claim_conversation_projection_tasks(owner, 1)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    let body = serde_json::json!({"messages": [{"role": "user", "content": "unknown usage"}]});
+    let session = crate::conversation::session_body_from_documents(&body, &serde_json::json!({}));
+    let (atoms, nodes) = session.into_prefix();
+    assert!(
+        fixture
+            .database
+            .prepare_session_body_archive(owner, request_id, atoms, &nodes, &[])
+            .await
+            .unwrap()
+    );
     assert!(
         fixture
             .database

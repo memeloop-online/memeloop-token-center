@@ -261,7 +261,7 @@ async fn tenant_for_lifecycle(
         .ok_or(AppError::NotFound)?;
     let id = row.try_get::<String, _>("id")?;
     Ok((
-        Uuid::parse_str(&id).map_err(|_| AppError::Internal)?,
+        Uuid::parse_str(&id).map_err(|_| AppError::internal("tenants_tenant_for_lifecycle_1"))?,
         row.try_get("status")?,
         row.try_get("created_at")?,
     ))

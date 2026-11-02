@@ -118,7 +118,7 @@ test('quota observation state does not confuse a failed refresh or expired snaps
   assert.equal(quotaSummaryPresentation(exhausted, 1500).key, 'providerDirectory.used');
   assert.equal(quotaWindowPresentation(exhausted.provider, exhausted.windows[0]).periodKey, 'quota.periodWeekly');
   assert.equal(quotaCreditPresentation(exhausted, 'en', 1500)?.state, 'reported', 'an exhausted plan window does not erase independent supplier credits');
-  assert.match(quotaCreditPresentation(exhausted, 'en', 1500)?.explanation ?? '', /units are unspecified and requests are not guaranteed/);
+  assert.match(quotaCreditPresentation(exhausted, 'en', 1500)?.explanation ?? '', /The unit is not stated yet/);
   for (const historical of [{ ...exhausted, stale: true }, { ...exhausted, status: 'error' as const }, { ...exhausted, error_code: 'quota_timeout' }]) {
     assert.match(quotaCreditPresentation(historical, 'en', 1500)?.message ?? '', /^Last observed:/);
   }

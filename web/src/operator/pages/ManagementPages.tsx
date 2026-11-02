@@ -1458,7 +1458,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
     if (route.enabled || !await confirm(t('routes.confirmDelete', { model: route.public_model }))) return;
     setBusy(route.id); setMessage(''); setError('');
     try {
-      await api(`/internal/v1/model-routes/${route.id}/archive`, token, { method: 'POST', body: JSON.stringify({ tenant_external_id: writeTenant, expected_updated_at: route.updated_at }) });
+      const query = new URLSearchParams({ tenant_external_id: writeTenant, expected_updated_at: String(route.updated_at) });
+      await api(`/internal/v1/model-routes/${route.id}?${query}`, token, { method: 'DELETE' });
       setEditing(undefined); setMessage(t('routes.deleted')); await load();
     } catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
@@ -1473,8 +1474,8 @@ function RouteWorkspace({ token, tenant, writeTenant = tenant, upstreams, provid
       <div className="journey-actions"><p>{t('routes.description')}</p><Button appearance="primary" type="button" disabled={Boolean(busy) || !canSubmit(editing ? editForm : form, editing ? editCatalog.valid : formCatalog.valid)} onClick={() => void (editing ? saveEdit() : createRoute())}>{t(editing ? 'common.save' : 'routes.create')}</Button></div>
     </CreateJourney>
   </section><section className="routing-group-managers">
-    <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: value.driver }))} onChanged={providerGroups.load} />
-    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} resources={credentialRouteOptions(routes.filter(canManage), scopedUpstreams, providers, locale)} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
+    <GroupManager kind="provider" token={token} tenant={writeTenant} groups={providerGroups.groups} resources={scopedUpstreams.map((value) => ({ value: value.id, label: value.name, description: providerDisplayName(value.driver, providers, locale) }))} onChanged={providerGroups.load} />
+    <GroupManager kind="route" token={token} tenant={writeTenant} groups={routeGroups.groups} accounts={scopedUpstreams.map(value => ({ value: value.id, label: value.name, description: providerDisplayName(value.driver, providers, locale) }))} routes={routes.filter(canManage)} providerGroups={providerGroups.groups} resources={credentialRouteOptions(routes.filter(canManage), scopedUpstreams, providers, locale)} onChanged={async () => { await Promise.all([routeGroups.load(), load()]); }} />
   </section></>;
 }
 
@@ -1926,7 +1927,7 @@ const serviceCredentialStatisticsGroupId = 'statistics-and-requests';
 const serviceCredentialScopeGroups = [
   { id: serviceCredentialStatisticsGroupId, title: '统计与请求', titleEn: 'Statistics and requests', scopes: [
     { value: 'metrics:read', label: '读取诊断指标', labelEn: 'Read diagnostic metrics', hint: '读取诊断与健康状态；不包含请求记录或用量分析。', hintEn: 'Read diagnostics and health status, not request records or usage analysis.' },
-    { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '读取请求记录、监控快照和用量分析；不允许写入。', hintEn: 'Read request records, monitoring snapshots, and usage analysis without write access.' },
+    { value: 'requests:read', label: '读取请求与用量', labelEn: 'Read requests and usage', hint: '只读：请求记录、监控快照和用量分析。', hintEn: 'Read request records, monitoring snapshots, and usage analysis.' },
   ] },
   { id: 'credentials-and-credits', title: '凭据与额度', titleEn: 'Credentials and credits', scopes: [
     { value: 'keys:read', label: '读取客户端凭据', labelEn: 'Read client credentials', hint: '查看客户端凭据及其配置。', hintEn: 'View client credentials and their configuration.' },

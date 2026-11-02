@@ -179,6 +179,23 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
         },
     )
     .await;
+    // All twenty wire/finalize cases share this key across inventory changes.
+    // Response delivery can precede settlement of its reservation; the shared
+    // fixture's four-reservation cap must not turn a later case into a 429.
+    fixture
+        .state
+        .db
+        .update_key_policy(
+            fixture.key_id,
+            KeyPolicy {
+                requests_per_minute: None,
+                tokens_per_minute: None,
+                max_concurrency: None,
+                ..KeyPolicy::default()
+            },
+        )
+        .await
+        .unwrap();
     let tenant = format!("compatibility-route-{label}");
     let native_route = fixture
         .state
@@ -337,6 +354,16 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
         }
         gateway_state.refresh_application_plugins().await.unwrap();
         for (index, (name, path, request)) in cases.iter().enumerate() {
+            let limits = gateway_state
+                .db
+                .key_limit_snapshot(fixture.key_id)
+                .await
+                .unwrap();
+            let admission = json!({
+                "rpm": limits.rpm,
+                "tpm": limits.tpm,
+                "concurrency": limits.concurrency,
+            });
             let response = client
                 .post(format!("{gateway}{path}"))
                 .bearer_auth(&fixture.key)
@@ -344,8 +371,33 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{phase}/{name}");
+            let status = response.status();
             let response: Value = response.json().await.unwrap();
+            if status != StatusCode::OK {
+                let failure = json!({
+                    "phase": phase,
+                    "case": name,
+                    "status": status.as_u16(),
+                    "error_code": response.pointer("/error/code"),
+                    "error_type": response.pointer("/error/type"),
+                    "upstream_captures": captures.lock().await.len(),
+                    "admission_before": admission,
+                    "finalize_observations": finalize_observations(&gateway_state),
+                });
+                if let Ok(output) = std::env::var("MTC_CLAUDE_WIRE_EVIDENCE") {
+                    std::fs::write(
+                        output,
+                        serde_json::to_vec_pretty(&json!({
+                            "synthetic_only": true,
+                            "cases": evidence,
+                            "failure": failure,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }
+                assert_eq!(status, StatusCode::OK, "{failure}");
+            }
             if *path == "/v1/responses" {
                 assert_eq!(response["status"], "completed");
             } else {
@@ -418,7 +470,7 @@ async fn signed_claude_gateway_empty_recovery_finalize_matrix() {
                 _ => 0,
             };
             assert_finalize_count(&gateway_state, count);
-            evidence.push(json!({"phase":phase,"case":name,"capture":capture,"finalize_observations":finalize_observations(&gateway_state)}));
+            evidence.push(json!({"phase":phase,"case":name,"capture":capture,"admission_before":admission,"finalize_observations":finalize_observations(&gateway_state)}));
         }
     }
     assert_eq!(

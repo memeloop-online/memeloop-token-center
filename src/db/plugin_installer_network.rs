@@ -1,7 +1,8 @@
-//! Installer preferences and immutable operation snapshots. Secrets are only
-//! serialized into authenticated encrypted envelopes, never HTTP responses.
+//! Installer preferences and immutable operation snapshots. Stored selections
+//! never reach an HTTP response: only the resolved view is returned.
 use super::transport_proxy_management::{OAuthGroupReference, OAuthGroupSnapshot};
 use super::*;
+use crate::plain_json::{decode_json, encode_json};
 use std::net::SocketAddr;
 
 #[derive(Clone, Default, Serialize, PartialEq, Eq)]
@@ -102,10 +103,6 @@ pub(crate) struct FrozenInstallerNetwork {
     pub group: Option<OAuthGroupSnapshot>,
 }
 
-fn aad(kind: &str, actor: &str, operation: &str) -> Vec<u8> {
-    format!("mtc/plugin-installer-network/v1/{kind}/{actor}/{operation}").into_bytes()
-}
-
 fn changed_selection() -> AppError {
     AppError::Conflict("installation operation already has a different network selection".into())
 }
@@ -122,7 +119,7 @@ impl Database {
     pub(crate) async fn installer_network_preference(
         &self,
         actor: &str,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<InstallerNetworkInput, AppError> {
         let row = sqlx::query(
             "SELECT preference_ciphertext FROM plugin_installer_network_preferences WHERE actor=$1",
@@ -130,15 +127,9 @@ impl Database {
         .bind(actor)
         .fetch_optional(&self.pool)
         .await?;
-        row.map(|row| {
-            open_private_json(
-                &row.try_get::<String, _>("preference_ciphertext")?,
-                key,
-                &aad("preference", actor, ""),
-            )
-        })
-        .transpose()
-        .map(|value| value.unwrap_or_default())
+        row.map(|row| decode_json(&row.try_get::<String, _>("preference_ciphertext")?))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
     }
 
     async fn complete_installer_network_input(
@@ -212,9 +203,9 @@ impl Database {
         &self,
         actor: &str,
         input: &InstallerNetworkInput,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<(), AppError> {
-        let ciphertext = seal_private_json(input, key, &aad("preference", actor, ""))?;
+        let ciphertext = encode_json(input)?;
         sqlx::query("INSERT INTO plugin_installer_network_preferences(actor,preference_ciphertext,updated_at) VALUES ($1,$2,$3) ON CONFLICT(actor) DO UPDATE SET preference_ciphertext=excluded.preference_ciphertext,updated_at=excluded.updated_at")
             .bind(actor).bind(ciphertext).bind(unix_millis()).execute(&self.pool).await?;
         Ok(())
@@ -269,26 +260,37 @@ impl Database {
                         key,
                     )
                     .await?;
-                let mut parsed =
-                    url::Url::parse(&group.selected_proxy_url).map_err(|_| AppError::Internal)?;
-                let decode = |value: &str| {
+                let mut parsed = url::Url::parse(&group.selected_proxy_url).map_err(|_| {
+                    AppError::internal("plugin_installer_network_resolve_installer_network_1")
+                })?;
+                let percent_decode = |value: &str| {
                     percent_encoding::percent_decode_str(value)
                         .decode_utf8()
                         .map(|value| value.into_owned())
-                        .map_err(|_| AppError::Internal)
+                        .map_err(|_| {
+                            AppError::internal(
+                                "plugin_installer_network_resolve_installer_network_2",
+                            )
+                        })
                 };
                 snapshot.username = (!parsed.username().is_empty())
-                    .then(|| decode(parsed.username()))
+                    .then(|| percent_decode(parsed.username()))
                     .transpose()?;
-                snapshot.password = parsed.password().map(decode).transpose()?;
-                parsed.set_username("").map_err(|_| AppError::Internal)?;
-                parsed.set_password(None).map_err(|_| AppError::Internal)?;
+                snapshot.password = parsed.password().map(percent_decode).transpose()?;
+                parsed.set_username("").map_err(|_| {
+                    AppError::internal("plugin_installer_network_resolve_installer_network_3")
+                })?;
+                parsed.set_password(None).map_err(|_| {
+                    AppError::internal("plugin_installer_network_resolve_installer_network_4")
+                })?;
                 snapshot.proxy_url = Some(parsed.to_string());
                 snapshot.group = Some(group);
             }
         }
         let (host, addresses) = crate::network::validate_installer_proxy_endpoint(
-            snapshot.proxy_url.as_deref().ok_or(AppError::Internal)?,
+            snapshot.proxy_url.as_deref().ok_or(AppError::internal(
+                "plugin_installer_network_resolve_installer_network_1",
+            ))?,
             snapshot.group.is_some(),
         )
         .await?;
@@ -350,11 +352,7 @@ impl Database {
                     return Err(changed_selection());
                 }
             }
-            return open_private_json(
-                &row.try_get::<String, _>("snapshot_ciphertext")?,
-                key,
-                &aad("snapshot", actor, operation_key),
-            );
+            return decode_json(&row.try_get::<String, _>("snapshot_ciphertext")?);
         }
         let explicit = input.is_some();
         let input = match input {
@@ -365,7 +363,7 @@ impl Database {
             None => self.installer_network_preference(actor, key).await?,
         };
         // Keep the remembered selection as Default; deployment credentials are
-        // only stored in the encrypted operation snapshot, never preferences.
+        // only stored in the operation snapshot, never preferences.
         let effective = if matches!(input, InstallerNetworkInput::Default) {
             deployment_default
                 .as_ref()
@@ -396,9 +394,9 @@ impl Database {
         actor: &str,
         digest: &str,
         snapshot: &FrozenInstallerNetwork,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<FrozenInstallerNetwork, AppError> {
-        let ciphertext = seal_private_json(snapshot, key, &aad("snapshot", actor, operation_key))?;
+        let ciphertext = encode_json(snapshot)?;
         sqlx::query("INSERT INTO plugin_installer_network_snapshots(operation_key,actor,selection_digest,snapshot_ciphertext,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT(operation_key) DO NOTHING")
             .bind(operation_key).bind(actor).bind(digest).bind(ciphertext).bind(unix_millis()).execute(&self.pool).await?;
         let row = sqlx::query("SELECT actor,selection_digest,snapshot_ciphertext FROM plugin_installer_network_snapshots WHERE operation_key=$1")
@@ -409,26 +407,18 @@ impl Database {
         if row.try_get::<String, _>("selection_digest")? != digest {
             return Err(changed_selection());
         }
-        open_private_json(
-            &row.try_get::<String, _>("snapshot_ciphertext")?,
-            key,
-            &aad("snapshot", actor, operation_key),
-        )
+        decode_json(&row.try_get::<String, _>("snapshot_ciphertext")?)
     }
 
     pub(crate) async fn load_installer_network(
         &self,
         operation_key: &str,
         actor: &str,
-        key: &[u8],
+        _key: &[u8],
     ) -> Result<FrozenInstallerNetwork, AppError> {
         let row = sqlx::query("SELECT snapshot_ciphertext FROM plugin_installer_network_snapshots WHERE operation_key=$1 AND actor=$2")
             .bind(operation_key).bind(actor).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;
-        open_private_json(
-            &row.try_get::<String, _>("snapshot_ciphertext")?,
-            key,
-            &aad("snapshot", actor, operation_key),
-        )
+        decode_json(&row.try_get::<String, _>("snapshot_ciphertext")?)
     }
 
     pub(crate) async fn freeze_installer_network_from(
@@ -440,11 +430,7 @@ impl Database {
     ) -> Result<FrozenInstallerNetwork, AppError> {
         let row = sqlx::query("SELECT selection_digest,snapshot_ciphertext FROM plugin_installer_network_snapshots WHERE operation_key=$1 AND actor=$2")
             .bind(source_operation_key).bind(actor).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;
-        let snapshot = open_private_json(
-            &row.try_get::<String, _>("snapshot_ciphertext")?,
-            key,
-            &aad("snapshot", actor, source_operation_key),
-        )?;
+        let snapshot = decode_json(&row.try_get::<String, _>("snapshot_ciphertext")?)?;
         self.insert_installer_network_snapshot(
             operation_key,
             actor,
@@ -459,9 +445,13 @@ impl Database {
 fn selection_digest(input: &InstallerNetworkInput, key: &[u8]) -> Result<String, AppError> {
     use hmac::{Hmac, Mac};
     // The digest stays server-side. Never add it or the input to audit/review.
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| AppError::Internal)?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(key)
+        .map_err(|_| AppError::internal("plugin_installer_network_selection_digest_1"))?;
     mac.update(b"mtc/plugin-installer-network/selection/v1");
-    mac.update(&serde_json::to_vec(input).map_err(|_| AppError::Internal)?);
+    mac.update(
+        &serde_json::to_vec(input)
+            .map_err(|_| AppError::internal("plugin_installer_network_selection_digest_2"))?,
+    );
     Ok(mac
         .finalize()
         .into_bytes()

@@ -22,6 +22,29 @@ pub(super) fn snapshot_matches(
     if existing == expected {
         return true;
     }
+    // New enqueues carry an empty placeholder; the deferred worker owns the
+    // derived snapshot. Request identity/body/hints are checked by the caller,
+    // so a replay must accept content the worker has already materialized.
+    if expected
+        .and_then(|encoded| serde_json::from_str::<ConversationSemanticSnapshot>(encoded).ok())
+        .as_ref()
+        .is_some_and(empty_semantic_snapshot)
+    {
+        return existing.is_some_and(|encoded| {
+            serde_json::from_str::<ConversationSemanticSnapshot>(encoded).is_ok()
+                || (completed
+                    && serde_json::from_str::<serde_json::Value>(encoded)
+                        .ok()
+                        .is_some_and(|value| {
+                            value["completed_snapshot_digest_v1"]
+                                .as_str()
+                                .is_some_and(|digest| {
+                                    digest.len() == 64
+                                        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                                })
+                        }))
+        });
+    }
     if !completed {
         return false;
     }
@@ -34,6 +57,17 @@ pub(super) fn snapshot_matches(
 const MAX_SEMANTIC_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 
 impl Database {
+    #[cfg(test)]
+    pub(crate) async fn persist_legacy_conversation_payload_for_test(
+        transaction: &mut Transaction<'_, Any>,
+        request_id: Uuid,
+        key: &AuthenticatedKey,
+        request: &serde_json::Value,
+    ) -> Result<(), AppError> {
+        let (body, digest) = encode(request_id, key, request)?;
+        persist(transaction, request_id, key, &body, &digest).await
+    }
+
     /// Keyset-walk every outbox row, not an unindexed filter for completed
     /// snapshots. At most 32 rows and 128 KiB per snapshot leave the database.
     /// Pending jobs, malformed snapshots and missing retained paths are kept.
@@ -112,6 +146,106 @@ impl Database {
     }
 }
 
+#[cfg(test)]
+pub(super) fn encode(
+    request_id: Uuid,
+    key: &AuthenticatedKey,
+    request: &serde_json::Value,
+) -> Result<(String, String), AppError> {
+    let length = crate::gateway_body::memory::json_encoded_length(request)?;
+    if length > MAX_SEMANTIC_PAYLOAD_BYTES {
+        return Err(AppError::Conflict(
+            "conversation semantic payload exceeds its bound".into(),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(length);
+    serde_json::to_writer(&mut bytes, request)
+        .map_err(|_| AppError::internal("semantic_payload_encode_1"))?;
+    let body =
+        String::from_utf8(bytes).map_err(|_| AppError::internal("semantic_payload_encode_2"))?;
+    let digest = digest(
+        &request_id.to_string(),
+        &key.tenant_id.to_string(),
+        &key.key_id.to_string(),
+        &key.principal_id.to_string(),
+        &body,
+    );
+    Ok((body, digest))
+}
+
+#[cfg(test)]
+pub(super) async fn persist(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: Uuid,
+    key: &AuthenticatedKey,
+    body: &str,
+    digest: &str,
+) -> Result<(), AppError> {
+    let inserted = sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7) ON CONFLICT(request_id) DO NOTHING")
+        .bind(request_id.to_string())
+        .bind(key.tenant_id.to_string())
+        .bind(key.key_id.to_string())
+        .bind(key.principal_id.to_string())
+        .bind(body.len() as i64)
+        .bind(digest)
+        .bind(body)
+        .execute(&mut **transaction)
+        .await?;
+    if inserted.rows_affected() != 1 {
+        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&mut **transaction)
+            .await?;
+        let decoded = validated_body(
+            &existing,
+            request_id,
+            &key.tenant_id.to_string(),
+            &key.key_id.to_string(),
+            &key.principal_id.to_string(),
+            digest,
+        )?;
+        if decoded != body {
+            return Err(AppError::Conflict(
+                "conversation semantic payload changed".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 快照还是空哨兵时，用这行缩减后的对话重试。不把它当成会话正文。
+pub(super) async fn load_reduced(
+    database: &Database,
+    request_id: Uuid,
+    tenant_id: &str,
+    key_id: &str,
+    principal_id: &str,
+) -> Result<Option<String>, AppError> {
+    let length = match database.backend {
+        DatabaseBackend::PostgreSql => "octet_length(request_json)",
+        DatabaseBackend::Sqlite => "length(CAST(request_json AS BLOB))",
+    };
+    let statement = format!(
+        "SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1 AND encoded_bytes BETWEEN 2 AND 134217728 AND {length} = encoded_bytes"
+    );
+    let Some(row) = sqlx::query(sqlx::AssertSqlSafe(statement))
+        .bind(request_id.to_string())
+        .fetch_optional(&database.pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let expected: String = row.try_get("digest")?;
+    Ok(Some(validated_body(
+        &row,
+        request_id,
+        tenant_id,
+        key_id,
+        principal_id,
+        &expected,
+    )?))
+}
+
 fn digest(
     request_id: &str,
     tenant_id: &str,
@@ -127,67 +261,14 @@ fn digest(
     digest.finalize().to_hex().to_string()
 }
 
-pub(super) fn encode(
-    request_id: Uuid,
-    key: &AuthenticatedKey,
-    request: &serde_json::Value,
-) -> Result<(String, String), AppError> {
-    let length = crate::gateway_body::memory::json_encoded_length(request)?;
-    if length > MAX_SEMANTIC_PAYLOAD_BYTES {
-        return Err(AppError::Conflict(
-            "conversation semantic payload exceeds its bound".into(),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(length);
-    serde_json::to_writer(&mut bytes, request).map_err(|_| AppError::Internal)?;
-    let body = String::from_utf8(bytes).map_err(|_| AppError::Internal)?;
-    let digest = digest(
-        &request_id.to_string(),
-        &key.tenant_id.to_string(),
-        &key.key_id.to_string(),
-        &key.principal_id.to_string(),
-        &body,
-    );
-    Ok((body, digest))
-}
-
-pub(super) async fn persist(
-    transaction: &mut Transaction<'_, Any>,
-    request_id: Uuid,
-    key: &AuthenticatedKey,
-    body: &str,
-    digest: &str,
-) -> Result<(), AppError> {
-    let inserted = sqlx::query("INSERT INTO conversation_semantic_payloads (request_id, tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json) VALUES ($1, $2, $3, $4, 1, $5, $6, $7) ON CONFLICT(request_id) DO NOTHING")
-        .bind(request_id.to_string()).bind(key.tenant_id.to_string()).bind(key.key_id.to_string()).bind(key.principal_id.to_string()).bind(body.len() as i64).bind(digest).bind(body).execute(&mut **transaction).await?;
-    if inserted.rows_affected() != 1 {
-        let existing = sqlx::query("SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1")
-            .bind(request_id.to_string()).fetch_one(&mut **transaction).await?;
-        let decoded = validate(
-            &existing,
-            request_id,
-            &key.tenant_id.to_string(),
-            &key.key_id.to_string(),
-            &key.principal_id.to_string(),
-            digest,
-        )?;
-        if serde_json::to_string(&decoded).map_err(|_| AppError::Internal)? != body {
-            return Err(AppError::Conflict(
-                "conversation semantic payload changed".into(),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate(
+fn validated_body(
     row: &sqlx::any::AnyRow,
     request_id: Uuid,
     tenant_id: &str,
     key_id: &str,
     principal_id: &str,
     expected: &str,
-) -> Result<serde_json::Value, AppError> {
+) -> Result<String, AppError> {
     let body: String = row.try_get("request_json")?;
     if row.try_get::<String, _>("tenant_id")? != tenant_id
         || row.try_get::<String, _>("key_id")? != key_id
@@ -208,8 +289,17 @@ fn validate(
             "conversation semantic payload integrity mismatch".into(),
         ));
     }
-    serde_json::from_str(&body)
-        .map_err(|_| AppError::Conflict("invalid conversation semantic payload".into()))
+    if !json_document(&body) {
+        return Err(AppError::Conflict(
+            "invalid conversation semantic payload".into(),
+        ));
+    }
+    Ok(body)
+}
+
+fn json_document(body: &str) -> bool {
+    let mut deserializer = serde_json::Deserializer::from_str(body);
+    serde::de::IgnoredAny::deserialize(&mut deserializer).is_ok() && deserializer.end().is_ok()
 }
 
 pub(super) async fn load(
@@ -219,7 +309,7 @@ pub(super) async fn load(
     key_id: &str,
     principal_id: &str,
     expected: &str,
-) -> Result<serde_json::Value, AppError> {
+) -> Result<String, AppError> {
     let length = match database.backend {
         DatabaseBackend::PostgreSql => "octet_length(request_json)",
         DatabaseBackend::Sqlite => "length(CAST(request_json AS BLOB))",
@@ -232,7 +322,7 @@ pub(super) async fn load(
         .fetch_optional(&database.pool)
         .await?
         .ok_or_else(|| AppError::Conflict("conversation semantic payload is missing".into()))?;
-    validate(&row, request_id, tenant_id, key_id, principal_id, expected)
+    validated_body(&row, request_id, tenant_id, key_id, principal_id, expected)
 }
 
 pub(super) async fn verify_in_transaction(
@@ -254,7 +344,7 @@ pub(super) async fn verify_in_transaction(
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or_else(|| AppError::Conflict("conversation semantic payload is missing".into()))?;
-    validate(
+    validated_body(
         &row,
         request_id,
         &key.tenant_id.to_string(),
@@ -283,6 +373,15 @@ mod receipt_tests {
             "legacy completed rows remain replayable"
         );
         let empty = r#"{"leaf":null,"atom_hashes":[]}"#;
+        assert!(snapshot_matches(Some(&snapshot), Some(empty), false));
+        assert!(snapshot_matches(Some(&receipt), Some(empty), true));
+        assert!(!snapshot_matches(Some(&receipt), Some(empty), false));
+        assert!(!snapshot_matches(Some("{}"), Some(empty), true));
+        assert!(!snapshot_matches(
+            Some(r#"{"completed_snapshot_digest_v1":"invalid"}"#),
+            Some(empty),
+            true
+        ));
         assert_eq!(
             completed_receipt(empty),
             empty,
@@ -342,8 +441,15 @@ mod receipt_tests {
                     client_name: Some("Codex"),
                     upstream_response_id: None,
                     observed_at: index as i64,
-                    content_materialized: false,
                 },
+            )
+            .await
+            .unwrap();
+            Database::persist_legacy_conversation_payload_for_test(
+                &mut tx,
+                Uuid::from_u128(index),
+                &key,
+                &body,
             )
             .await
             .unwrap();
@@ -361,8 +467,23 @@ mod receipt_tests {
             true,
         )
         .await;
+        let atoms = crate::conversation::extract_atoms(&body);
+        let nodes = crate::conversation::build_prefix(&atoms);
+        let planted = serde_json::to_string(&ConversationSemanticSnapshot {
+            leaf: nodes.last().map(|node| node.node_hash.clone()),
+            atom_hashes: atoms.iter().map(|atom| atom.content_hash.clone()).collect(),
+            payload_digest: None,
+        })
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversation_projection_outbox SET semantic_snapshot_json = $1, semantic_payload_snapshot_json = NULL",
+        )
+        .bind(&planted)
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let encoded: String = sqlx::query_scalar(
-            "SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+            "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
         )
         .bind(Uuid::from_u128(1).to_string())
         .fetch_one(&db.pool)
@@ -386,7 +507,7 @@ mod receipt_tests {
         assert_eq!(next, Some(Uuid::from_u128(32).to_string()));
         assert_eq!(compacted, 1);
         let receipt: String = sqlx::query_scalar(
-            "SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+            "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
         )
         .bind(Uuid::from_u128(1).to_string())
         .fetch_one(&db.pool)
@@ -394,14 +515,28 @@ mod receipt_tests {
         .unwrap();
         assert!(snapshot_matches(Some(&receipt), Some(&encoded), true));
         assert!(receipt.len() < encoded.len());
+        let compacted_payload: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+        )
+        .bind(Uuid::from_u128(1).to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            compacted_payload, 0,
+            "completed receipt drops its reduced dialogue"
+        );
         let payloads: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM conversation_semantic_payloads")
                 .fetch_one(&db.pool)
                 .await
                 .unwrap();
-        assert_eq!(payloads, 34);
+        assert_eq!(
+            payloads, 34,
+            "pending rows keep the reduced dialogue for retry"
+        );
         let unchanged: String = sqlx::query_scalar(
-            "SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
+            "SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1",
         )
         .bind(Uuid::from_u128(3).to_string())
         .fetch_one(&db.pool)
@@ -444,26 +579,25 @@ mod receipt_tests {
         db.migrate().await.unwrap();
         let key = key(&db, "receipt").await;
         let request = Uuid::now_v7();
-        let body = serde_json::json!({"input":[{"role":"user","content":"retained question"}]});
         let hints = ConversationHints::default();
-        let enqueue = |request_json| ConversationProjectionEnqueueInput {
+        let empty = serde_json::json!({});
+        let enqueue = |client_name| ConversationProjectionEnqueueInput {
             request_id: request,
             key: &key,
-            request_json,
+            request_json: &empty,
             hints: &hints,
-            client_name: Some("Codex"),
+            client_name,
             upstream_response_id: None,
             observed_at: 1,
-            content_materialized: false,
         };
         let mut tx = db.begin_write_transaction().await.unwrap();
-        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&body))
+        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(Some("Codex")))
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        let snapshot: String = sqlx::query_scalar("SELECT semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+        let snapshot: String = sqlx::query_scalar("SELECT COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) FROM conversation_projection_outbox WHERE request_id = $1")
             .bind(request.to_string()).fetch_one(&db.pool).await.unwrap();
-        sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 2, semantic_payload_snapshot_json = $1 WHERE request_id = $2")
+        sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 2, semantic_snapshot_json = $1, semantic_payload_snapshot_json = NULL WHERE request_id = $2")
             .bind(completed_receipt(&snapshot)).bind(request.to_string()).execute(&db.pool).await.unwrap();
         sqlx::query("DELETE FROM conversation_semantic_payloads WHERE request_id = $1")
             .bind(request.to_string())
@@ -471,7 +605,7 @@ mod receipt_tests {
             .await
             .unwrap();
         let mut tx = db.begin_write_transaction().await.unwrap();
-        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&body))
+        enqueue_conversation_projection_in_transaction(&mut tx, enqueue(Some("Codex")))
             .await
             .unwrap();
         tx.commit().await.unwrap();
@@ -480,10 +614,9 @@ mod receipt_tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
-        let changed = serde_json::json!({"input":"different evidence"});
         let mut tx = db.begin_write_transaction().await.unwrap();
         assert!(
-            enqueue_conversation_projection_in_transaction(&mut tx, enqueue(&changed))
+            enqueue_conversation_projection_in_transaction(&mut tx, enqueue(Some("other")))
                 .await
                 .is_err()
         );

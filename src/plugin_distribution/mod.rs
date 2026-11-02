@@ -1,8 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::{
     collections::BTreeSet,
     ffi::OsString,
     io::{self, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
@@ -308,11 +309,11 @@ impl CosignWorkspace {
     ) -> io::Result<Self> {
         let directory = TempDirBuilder::new()
             .prefix(".mtc-cosign-")
-            .tempdir_in("/tmp")?;
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+            .tempdir_in(cosign_temp_parent()?)?;
+        restrict_private_directory(directory.path())?;
         let docker_config = directory.path().join("docker");
         std::fs::create_dir(&docker_config)?;
-        std::fs::set_permissions(&docker_config, std::fs::Permissions::from_mode(0o700))?;
+        restrict_private_directory(&docker_config)?;
         let auth = match credentials {
             RegistryCredentials::Anonymous => serde_json::json!({}),
             RegistryCredentials::Basic { username, password } => serde_json::json!({
@@ -339,14 +340,47 @@ impl CosignWorkspace {
     }
 }
 
+fn cosign_temp_parent() -> io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        Ok(PathBuf::from("/tmp"))
+    }
+    #[cfg(windows)]
+    {
+        Ok(std::env::temp_dir())
+    }
+}
+
+fn restrict_private_directory(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(windows)]
+    {
+        crate::windows_dir::restrict_to_current_user(path)
+    }
+}
+
 fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
+    let mut file = create_private_file(path)?;
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+fn create_private_file(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        crate::windows_dir::create_private_file(path)
+    }
 }
 
 struct CosignCommandSpec {
@@ -839,6 +873,7 @@ async fn install_plugin_oci_with_verifier(
     })
 }
 
+#[cfg(unix)]
 fn package_fingerprint(
     root: &Path,
 ) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>, PluginDistributionError> {
@@ -847,6 +882,16 @@ fn package_fingerprint(
     package_fingerprint_at(&directory)
 }
 
+#[cfg(windows)]
+fn package_fingerprint(
+    root: &Path,
+) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>, PluginDistributionError> {
+    let directory =
+        crate::windows_dir::open_directory(root).map_err(|_| PluginDistributionError::Storage)?;
+    package_fingerprint_windows(&directory, PathBuf::new())
+}
+
+#[cfg(unix)]
 fn package_fingerprint_at(
     root: &rustix::fd::OwnedFd,
 ) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>, PluginDistributionError> {
@@ -930,10 +975,90 @@ fn package_fingerprint_at(
     Ok(result)
 }
 
+#[cfg(windows)]
+fn package_fingerprint_windows(
+    root: &crate::windows_dir::Directory,
+    start: PathBuf,
+) -> Result<std::collections::BTreeMap<PathBuf, Vec<u8>>, PluginDistributionError> {
+    use sha2::{Digest, Sha256};
+    use std::{collections::BTreeMap, io::Read};
+    let mut pending = vec![(
+        start,
+        root.try_clone()
+            .map_err(|_| PluginDistributionError::Storage)?,
+    )];
+    let mut result = BTreeMap::new();
+    let mut total = 0u64;
+    let mut entries = 0usize;
+    while let Some((relative, directory)) = pending.pop() {
+        if relative.as_os_str().as_encoded_bytes().len() > MAX_PATH_BYTES {
+            return Err(PluginDistributionError::TargetExists);
+        }
+        for name in crate::windows_dir::read_names(&directory)
+            .map_err(|_| PluginDistributionError::Storage)?
+        {
+            if crate::windows_dir::ensure_component(name.as_os_str()).is_err() {
+                return Err(PluginDistributionError::TargetExists);
+            }
+            entries += 1;
+            if entries > MAX_FILES * MAX_PATH_BYTES {
+                return Err(PluginDistributionError::TargetExists);
+            }
+            let child_path = relative.join(&name);
+            if !relative.as_os_str().is_empty() && child_path.parent() != Some(relative.as_path()) {
+                return Err(PluginDistributionError::TargetExists);
+            }
+            match crate::windows_dir::open_subdir(&directory, name.as_os_str()) {
+                Ok(child) => {
+                    if pending.len() >= MAX_FILES * 2 {
+                        return Err(PluginDistributionError::TargetExists);
+                    }
+                    pending.push((child_path, child));
+                }
+                Err(error) if crate::windows_dir::is_reparse_refusal(&error) => {
+                    return Err(PluginDistributionError::TargetExists);
+                }
+                Err(_) => {
+                    let file = crate::windows_dir::open_file(&directory, name.as_os_str())
+                        .map_err(|error| {
+                            if crate::windows_dir::is_reparse_refusal(&error) {
+                                PluginDistributionError::TargetExists
+                            } else {
+                                PluginDistributionError::Storage
+                            }
+                        })?;
+                    if result.len() > MAX_FILES {
+                        return Err(PluginDistributionError::TargetExists);
+                    }
+                    let mut reader = file.take(MAX_WASM_BYTES + 1);
+                    let mut hash = Sha256::new();
+                    let mut buffer = [0u8; 65536];
+                    loop {
+                        let count = reader
+                            .read(&mut buffer)
+                            .map_err(|_| PluginDistributionError::Storage)?;
+                        if count == 0 {
+                            break;
+                        }
+                        total += count as u64;
+                        if total > MAX_TOTAL_BYTES + 16 * 1024 {
+                            return Err(PluginDistributionError::TargetExists);
+                        }
+                        hash.update(&buffer[..count]);
+                    }
+                    result.insert(child_path, hash.finalize().to_vec());
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
 fn identical_packages(left: &Path, right: &Path) -> Result<bool, PluginDistributionError> {
     Ok(package_fingerprint(left)? == package_fingerprint(right)?)
 }
 
+#[cfg(unix)]
 fn portable_publish(
     root: &Path,
     staging: &Path,
@@ -1050,7 +1175,96 @@ fn finish_package_rename(
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn portable_publish(
+    root: &Path,
+    staging: &Path,
+    plugin_id: &str,
+) -> Result<bool, PluginDistributionError> {
+    use crate::plugin_publication::{claim_directory, link_file_at, report_io, sync_directory};
+    use sha2::{Digest, Sha256};
+    let target = root.join(plugin_id);
+    let expected = package_fingerprint(staging)?;
+    let mut digest = Sha256::new();
+    for (path, hash) in &expected {
+        digest.update(path.as_os_str().as_encoded_bytes());
+        digest.update([0]);
+        digest.update(hash);
+    }
+    let owner = digest.finalize();
+    let publish = || -> std::io::Result<()> {
+        let directory = claim_directory(&target, &owner)?;
+        for relative in expected
+            .keys()
+            .filter(|path| path.as_path() != Path::new("plugin.json"))
+        {
+            link_file_at(&staging.join(relative), &directory, relative)?;
+        }
+        let mut actual = package_fingerprint_windows(&directory, PathBuf::new())
+            .map_err(|_| std::io::ErrorKind::AlreadyExists)?;
+        let mut required = expected.clone();
+        actual.remove(Path::new("plugin.json"));
+        required.remove(Path::new("plugin.json"));
+        if actual != required {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        link_file_at(
+            &staging.join("plugin.json"),
+            &directory,
+            Path::new("plugin.json"),
+        )?;
+        directory.sync()?;
+        claim_directory(&target, &owner)?;
+        sync_directory(root)
+    };
+    publish().map_err(|error| {
+        report_io("package_publish", &error);
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            PluginDistributionError::TargetExists
+        } else {
+            PluginDistributionError::Storage
+        }
+    })?;
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn atomic_noreplace_rename(
+    root: &Path,
+    staging: &Path,
+    plugin_id: &str,
+    allow_portable_publication: bool,
+) -> Result<bool, PluginDistributionError> {
+    use std::ffi::OsStr;
+    let staging_name = staging
+        .file_name()
+        .ok_or(PluginDistributionError::Storage)?;
+    let plugin_name = OsStr::new(plugin_id);
+    if crate::windows_dir::ensure_component(staging_name).is_err()
+        || crate::windows_dir::ensure_component(plugin_name).is_err()
+    {
+        return Err(PluginDistributionError::Storage);
+    }
+    let parent = crate::windows_dir::open_writable_directory(root)
+        .map_err(|_| PluginDistributionError::Storage)?;
+    match crate::windows_dir::rename_noreplace(&parent, staging_name, &parent, plugin_name) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(PluginDistributionError::TargetExists)
+        }
+        Err(error)
+            if allow_portable_publication && crate::windows_dir::rename_unsupported(&error) =>
+        {
+            portable_publish(root, staging, plugin_id)
+        }
+        Err(error) => {
+            crate::plugin_publication::report_io("package_rename", &error);
+            Err(PluginDistributionError::Storage)
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn atomic_noreplace_rename(
     _root: &Path,
     _staging: &Path,

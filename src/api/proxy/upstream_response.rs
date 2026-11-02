@@ -67,6 +67,37 @@ impl CodexHttp2Failure {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct CodexHttp2Evidence {
+    reset: bool,
+    go_away: bool,
+    remote: bool,
+    library: bool,
+    reason: Option<u32>,
+}
+
+impl CodexHttp2Evidence {
+    pub(super) const fn is_reset(self) -> bool {
+        self.reset
+    }
+
+    pub(super) const fn is_go_away(self) -> bool {
+        self.go_away
+    }
+
+    pub(super) const fn is_remote(self) -> bool {
+        self.remote
+    }
+
+    pub(super) const fn is_library(self) -> bool {
+        self.library
+    }
+
+    pub(super) const fn reason(self) -> Option<u32> {
+        self.reason
+    }
+}
+
 pub(super) fn codex_http2_failure(
     error: &(dyn std::error::Error + 'static),
 ) -> Option<CodexHttp2Failure> {
@@ -80,15 +111,13 @@ pub(super) fn codex_http2_failure(
     }
 }
 
-pub(super) fn codex_http2_error<'a>(
-    error: &'a (dyn std::error::Error + 'static),
-) -> Option<&'a http2::Error> {
+pub(super) fn codex_http2_error(
+    error: &(dyn std::error::Error + 'static),
+) -> Option<CodexHttp2Evidence> {
     let mut source = Some(error);
     while let Some(current) = source {
-        if let Some(http2) = current.downcast_ref::<http2::Error>()
-            && (http2.is_reset() || http2.is_go_away())
-        {
-            return Some(http2);
+        if let Some(evidence) = http2_frame_evidence(current) {
+            return Some(evidence);
         }
         if let Some(inner) = current
             .downcast_ref::<std::io::Error>()
@@ -102,6 +131,48 @@ pub(super) fn codex_http2_error<'a>(
     None
 }
 
+fn http2_frame_evidence(error: &(dyn std::error::Error + 'static)) -> Option<CodexHttp2Evidence> {
+    if let Some(frame) = error.downcast_ref::<http2::Error>() {
+        return frame_evidence(
+            frame.is_reset(),
+            frame.is_go_away(),
+            frame.is_remote(),
+            frame.is_library(),
+            frame.reason().map(u32::from),
+        );
+    }
+    if let Some(frame) = error.downcast_ref::<h2::Error>() {
+        return frame_evidence(
+            frame.is_reset(),
+            frame.is_go_away(),
+            frame.is_remote(),
+            frame.is_library(),
+            frame.reason().map(u32::from),
+        );
+    }
+    None
+}
+
+fn frame_evidence(
+    reset: bool,
+    go_away: bool,
+    remote: bool,
+    library: bool,
+    reason: Option<u32>,
+) -> Option<CodexHttp2Evidence> {
+    if reset || go_away {
+        Some(CodexHttp2Evidence {
+            reset,
+            go_away,
+            remote,
+            library,
+            reason,
+        })
+    } else {
+        None
+    }
+}
+
 pub(super) struct UpstreamResponseParts {
     pub(super) status: StatusCode,
     pub(super) headers: HeaderMap,
@@ -110,11 +181,10 @@ pub(super) struct UpstreamResponseParts {
     pub(super) stream: UpstreamByteStream,
 }
 
-/// A small client-neutral response surface. Native Codex uses wreq for its
-/// TLS/HTTP2 fingerprint; all other upstreams remain on reqwest.
+/// A small response surface. Native Codex and every other upstream use reqwest.
 pub(super) enum UpstreamResponse {
     Reqwest(reqwest::Response),
-    Codex(wreq::Response),
+    Codex(reqwest::Response),
     Prefetched {
         status: StatusCode,
         headers: HeaderMap,
@@ -278,11 +348,12 @@ impl UpstreamResponse {
 
     pub(super) fn bytes_stream(self) -> UpstreamByteStream {
         match self {
-            Self::Reqwest(response) => Box::pin(
-                response
-                    .bytes_stream()
-                    .map(|chunk| chunk.map_err(|_| UPSTREAM_STREAM_ERROR)),
-            ),
+            Self::Reqwest(response) => Box::pin(response.bytes_stream().map(|chunk| {
+                chunk.map_err(|error| {
+                    codex_http2_failure(&error)
+                        .map_or(UPSTREAM_STREAM_ERROR, CodexHttp2Failure::error_code)
+                })
+            })),
             Self::Codex(response) => Box::pin(response.bytes_stream().map(|chunk| {
                 chunk.map_err(|error| {
                     codex_http2_failure(&error)
@@ -384,7 +455,7 @@ mod tests {
         assert!(!error.is_library());
         assert_eq!(
             codex_http2_error(&error).unwrap().reason(),
-            Some(http2::Reason::CANCEL)
+            Some(u32::from(http2::Reason::CANCEL))
         );
         assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::Reset));
         let wrapped = std::io::Error::other(error);
@@ -425,7 +496,7 @@ mod tests {
         assert!(error.is_remote());
         assert_eq!(
             codex_http2_error(&error).unwrap().reason(),
-            Some(http2::Reason::INTERNAL_ERROR)
+            Some(u32::from(http2::Reason::INTERNAL_ERROR))
         );
         assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::GoAway));
         driver.abort();
@@ -541,7 +612,7 @@ mod tests {
         assert!(evidence.is_reset());
         assert!(!evidence.is_remote());
         assert!(!evidence.is_library());
-        assert_eq!(evidence.reason(), Some(http2::Reason::CANCEL));
+        assert_eq!(evidence.reason(), Some(u32::from(http2::Reason::CANCEL)));
         assert_eq!(codex_http2_failure(&error), Some(CodexHttp2Failure::Reset));
         driver.abort();
         server.abort();

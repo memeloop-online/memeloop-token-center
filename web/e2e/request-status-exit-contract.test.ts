@@ -21,23 +21,23 @@ const proxyObservation: RequestEgressObservation = {
   observed_at: 1760000000000,
 };
 
-test('recorded proxy exit shows the human name and safe address, and hover carries group without internal IDs', () => {
+test('recorded proxy exit shows only its human name while hover retains the safe address and group without internal IDs', () => {
   const line = requestEgressLine({ ...request, egress: proxyObservation }, 'zh-CN');
   assert.ok(line);
   assert.equal(line.kind, 'proxy');
-  assert.equal(line.text, 'edge-01 · socks5h://192.0.2.10:1080');
+  assert.equal(line.text, 'edge-01');
   assert.match(line.hover, /示例出口组/);
   assert.match(line.hover, /组版本 3/);
   assert.match(line.hover, /edge-01/);
   assert.match(line.hover, /socks5h:\/\/192\.0\.2\.10:1080/);
-  assert.match(line.hover, /连通性: 未记录/);
+  assert.match(line.hover, /连通性/);
   assert.match(line.hover, /记录时间: \d/);
   assert.doesNotMatch(line.text + line.hover, /fixture-group-internal-id|fixture-member-internal-id/, 'internal IDs stay out of the visible copy');
   const english = requestEgressLine({ ...request, egress: proxyObservation }, 'en');
   assert.ok(english);
-  assert.equal(english.text, 'edge-01 · socks5h://192.0.2.10:1080');
-  assert.match(english.hover, /Connectivity: not recorded \(past use does not confirm current reachability\)/);
-  assert.match(english.hover, /separate from the upstream account/, 'hover distinguishes the network proxy from the upstream account');
+  assert.equal(english.text, 'edge-01');
+  assert.match(english.hover, /Connectivity/);
+  assert.match(english.hover, /This request used a proxy exit/);
   assert.doesNotMatch(english.hover, /fixture-group-internal-id|fixture-member-internal-id/);
 });
 
@@ -81,7 +81,7 @@ test('IPv6 exit addresses render bracketed without inventing data', () => {
     egress: { selected: { ...proxyObservation.selected, host: '2001:db8::10', group_name: null, group_id: null, group_version: null }, observed_at: undefined },
   }, 'zh-CN');
   assert.ok(line);
-  assert.match(line.text, /\[2001:db8::10\]:1080/);
+  assert.match(line.hover, /\[2001:db8::10\]:1080/);
   assert.match(line.hover, /记录时间: 未记录/);
   assert.match(line.hover, /未归属代理组的出口/);
 });
@@ -95,8 +95,8 @@ test('direct exits say so plainly and never imply a proxy', () => {
   assert.ok(line);
   assert.equal(line.kind, 'direct');
   assert.equal(line.text, '直连');
-  assert.match(line.hover, /未使用代理出口/);
-  assert.match(line.hover, /与上游账号不同/);
+  assert.match(line.hover, /这次请求走直连/);
+  assert.doesNotMatch(line.hover, /不是|不会|不代表|与上游账号不同/);
   const english = requestEgressLine({ ...request, egress: direct }, 'en');
   assert.ok(english);
   assert.equal(english.text, 'Direct');
@@ -108,8 +108,8 @@ test('pre-admission terminal records render no exit line, keeping the evidence i
   assert.equal(requestEgressLine(preAdmission, 'en'), null);
   // A snapshot would be contradictory for a pre-admission record; the terminal cause wins.
   assert.equal(requestEgressLine({ ...preAdmission, egress: proxyObservation }, 'zh-CN'), null);
-  assert.match(requestStatusCopy(preAdmission, 'zh-CN').cause, /网关准入前失败/);
-  assert.match(requestStatusCopy(preAdmission, 'en').cause, /before gateway admission/);
+  assert.match(requestStatusCopy(preAdmission, 'zh-CN').cause, /请求没有发到上游/);
+  assert.match(requestStatusCopy(preAdmission, 'en').cause, /was not sent upstream/);
 });
 
 test('missing snapshots render no exit line for old, in-flight, explicit-null and unknown-kind records', () => {

@@ -97,6 +97,23 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
+            if mode == "failure" {
+                // The source remains readable while its metadata is retried.
+                // Restore the database before draining those retained jobs.
+                gateway_persistence::assert_readable_source_without_spool(
+                    &fixture,
+                    &pool,
+                    rows[0].request_id,
+                    &json!({"model": fixture.model, "input": "isolation", "stream": stream}),
+                )
+                .await;
+                for table in ["request_archive_spools", "response_archive_spools"] {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TRIGGER reject_{table}")))
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                }
+            }
             assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex"))
                 .await;
             upstream.verify().await;

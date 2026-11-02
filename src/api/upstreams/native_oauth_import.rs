@@ -151,8 +151,9 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
     for account in body.accounts {
         validate_source(&account)?;
         let canonical_document = canonical_json(&account.document);
-        let document_bytes =
-            serde_json::to_vec(&canonical_document).map_err(|_| AppError::Internal)?;
+        let document_bytes = serde_json::to_vec(&canonical_document).map_err(|_| {
+            AppError::internal("native_oauth_import_import_native_kimi_oauth_cohort_1")
+        })?;
         if document_bytes.len() > MAX_NATIVE_OAUTH_DOCUMENT {
             return Err(AppError::BadRequest(
                 "native Kimi OAuth source document exceeds the supported limit".into(),
@@ -167,7 +168,9 @@ pub(in crate::api) async fn import_native_kimi_oauth_cohort(
             crate::oauth::managed::kimi::credential_from_native_import(&account.document)?;
         let ordinal = ordinal_by_identity
             .binary_search(&account.source_identity_hash)
-            .map_err(|_| AppError::Internal)? as i64
+            .map_err(|_| {
+                AppError::internal("native_oauth_import_import_native_kimi_oauth_cohort_2")
+            })? as i64
             + 1;
         let payload_digest = payload_digest(
             state.config.key_pepper.as_bytes(),
@@ -315,8 +318,10 @@ pub(super) fn canonical_json(value: &Value) -> Value {
 }
 
 fn cohort_digest<T: Serialize>(entries: &[T]) -> Result<String, AppError> {
-    let value = serde_json::to_value(entries).map_err(|_| AppError::Internal)?;
-    let bytes = serde_json::to_vec(&canonical_json(&value)).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_value(entries)
+        .map_err(|_| AppError::internal("native_oauth_import_cohort_digest_1"))?;
+    let bytes = serde_json::to_vec(&canonical_json(&value))
+        .map_err(|_| AppError::internal("native_oauth_import_cohort_digest_2"))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -334,8 +339,10 @@ fn payload_digest(
         "source_identity_hash": source_identity_hash,
         "tenant_external_id": tenant_external_id,
     });
-    let bytes = serde_json::to_vec(&canonical_json(&value)).map_err(|_| AppError::Internal)?;
-    let mut mac = Hmac::<Sha256>::new_from_slice(pepper).map_err(|_| AppError::Internal)?;
+    let bytes = serde_json::to_vec(&canonical_json(&value))
+        .map_err(|_| AppError::internal("native_oauth_import_payload_digest_1"))?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(pepper)
+        .map_err(|_| AppError::internal("native_oauth_import_payload_digest_2"))?;
     mac.update(PAYLOAD_DIGEST_DOMAIN);
     mac.update(&bytes);
     Ok(format!("{:x}", mac.finalize().into_bytes()))
@@ -349,6 +356,8 @@ fn cohort_disposition(
         (1, 0) => Ok((StatusCode::OK, "converged")),
         (0, 0) => Ok((StatusCode::OK, "replayed")),
         (0, 2) => Ok((StatusCode::OK, "rotated")),
-        _ => Err(AppError::Internal),
+        _ => Err(AppError::internal(
+            "native_oauth_import_cohort_disposition_1",
+        )),
     }
 }

@@ -153,7 +153,9 @@ impl InventoryStamp {
         }
         Ok(Self {
             length: metadata.len(),
-            modified: metadata.modified().map_err(|_| AppError::Internal)?,
+            modified: metadata
+                .modified()
+                .map_err(|_| AppError::internal("application_from_metadata_1"))?,
             #[cfg(unix)]
             inode: {
                 use std::os::unix::fs::MetadataExt;
@@ -190,24 +192,44 @@ type LoadResult = Result<Arc<ApplicationPluginSnapshot>, LoadFailure>;
 #[derive(Clone, Copy)]
 enum LoadFailure {
     Forbidden,
-    Overloaded,
-    Internal,
+    Capacity {
+        code: &'static str,
+        facts: crate::error::ErrorFacts,
+    },
+    Upstream {
+        code: &'static str,
+        facts: crate::error::ErrorFacts,
+    },
+    Internal {
+        code: &'static str,
+        facts: crate::error::ErrorFacts,
+    },
 }
 
 impl LoadFailure {
     fn from_error(error: AppError) -> Self {
         match error {
             AppError::Forbidden => Self::Forbidden,
-            AppError::Overloaded => Self::Overloaded,
-            _ => Self::Internal,
+            AppError::Capacity { code, facts } => Self::Capacity { code, facts },
+            AppError::Overloaded => Self::Capacity {
+                code: "service_overloaded",
+                facts: crate::error::ErrorFacts::new().stage("plugin_snapshot"),
+            },
+            AppError::Internal { code, facts } => Self::Internal { code, facts },
+            AppError::Upstream { code, facts } => Self::Upstream { code, facts },
+            other => Self::Internal {
+                code: "plugin_snapshot_load_failed",
+                facts: crate::error::ErrorFacts::new().stage(other.diagnostic_category()),
+            },
         }
     }
 
     fn into_error(self) -> AppError {
         match self {
             Self::Forbidden => AppError::Forbidden,
-            Self::Overloaded => AppError::Overloaded,
-            Self::Internal => AppError::Internal,
+            Self::Capacity { code, facts } => AppError::capacity(code, facts),
+            Self::Upstream { code, facts } => AppError::upstream_with(code, facts),
+            Self::Internal { code, facts } => AppError::Internal { code, facts },
         }
     }
 }
@@ -307,9 +329,13 @@ impl ApplicationPlugins {
         let mut cached_stamp = self.inventory_stamp.lock().await;
         let file = tokio::fs::File::open(path)
             .await
-            .map_err(|_| AppError::Internal)?;
-        let stamp =
-            InventoryStamp::from_metadata(&file.metadata().await.map_err(|_| AppError::Internal)?)?;
+            .map_err(|_| AppError::internal("application_refresh_inventory_1"))?;
+        let stamp = InventoryStamp::from_metadata(
+            &file
+                .metadata()
+                .await
+                .map_err(|_| AppError::internal("application_refresh_inventory_2"))?,
+        )?;
         if cached_stamp.as_ref() == Some(&stamp) {
             return Ok(());
         }
@@ -323,7 +349,7 @@ impl ApplicationPlugins {
         file.take(MAX_INVENTORY_BYTES + 1)
             .read_to_end(&mut bytes)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("application_refresh_inventory_3"))?;
         if bytes.len() as u64 > MAX_INVENTORY_BYTES {
             return Err(AppError::Forbidden);
         }
@@ -340,8 +366,10 @@ impl ApplicationPlugins {
         // are immutable, including grants; changing a contract needs a new ID.
         for (id, old) in inventory.iter() {
             let new = incoming.get(id).ok_or(AppError::Forbidden)?;
-            if serde_json::to_value(old).map_err(|_| AppError::Internal)?
-                != serde_json::to_value(new).map_err(|_| AppError::Internal)?
+            if serde_json::to_value(old)
+                .map_err(|_| AppError::internal("application_refresh_inventory_4"))?
+                != serde_json::to_value(new)
+                    .map_err(|_| AppError::internal("application_refresh_inventory_5"))?
             {
                 return Err(AppError::Forbidden);
             }
@@ -380,8 +408,8 @@ impl ApplicationPlugins {
         let permit =
             tokio::time::timeout(ADMISSION_WAIT, COMPILATION_PERMITS.clone().acquire_owned())
                 .await
-                .map_err(|_| AppError::Overloaded)?
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| AppError::capacity_error("plugin_compilation_capacity"))?
+                .map_err(|_| AppError::internal("application_load_entry_1"))?;
         #[cfg(test)]
         self.compilations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -394,22 +422,25 @@ impl ApplicationPlugins {
             #[cfg(test)]
             if let Some((entered, release)) = gate {
                 let _ = entered.send(());
-                release.recv().map_err(|_| AppError::Internal)?;
+                release
+                    .recv()
+                    .map_err(|_| AppError::internal("application_load_entry_2"))?;
             }
-            let metadata =
-                std::fs::symlink_metadata(&entry.root).map_err(|_| AppError::Internal)?;
+            let metadata = std::fs::symlink_metadata(&entry.root)
+                .map_err(|_| AppError::internal("application_load_entry_3"))?;
             if !metadata.is_dir() || metadata.file_type().is_symlink() {
                 return Err(AppError::Forbidden);
             }
             let root = entry.root.to_str().ok_or(AppError::Forbidden)?;
-            let runtime = PluginRuntime::load(Some(root), db).map_err(|_| AppError::Internal)?;
+            let runtime = PluginRuntime::load(Some(root), db)
+                .map_err(|_| AppError::internal("application_load_entry_4"))?;
             lifecycle::validate_grants(&runtime, &entry.grants)?;
             Ok::<_, AppError>(runtime)
         });
         let runtime = tokio::time::timeout(COMPILATION_DEADLINE, task)
             .await
-            .map_err(|_| AppError::Overloaded)?
-            .map_err(|_| AppError::Internal)??;
+            .map_err(|_| AppError::capacity_error("plugin_compilation_capacity"))?
+            .map_err(|_| AppError::internal("application_load_entry_5"))??;
         let contract_digest = contract_digest(&runtime)?;
         runtime.validate_stored_configurations().await?;
         let identity_digest = super::plugin_configuration_schema_digest(&json!({
@@ -421,7 +452,7 @@ impl ApplicationPlugins {
             "initial" => RevisionReason::Initial,
             "reload" => RevisionReason::Reload,
             "rollback" => RevisionReason::Rollback,
-            _ => return Err(AppError::Internal),
+            _ => return Err(AppError::internal("application_load_entry_1")),
         };
         Ok(ApplicationPluginSnapshot {
             receipt: ApplicationRevision {
@@ -433,7 +464,9 @@ impl ApplicationPlugins {
             },
             runtime: lifecycle::snapshot(
                 runtime,
-                revision.try_into().map_err(|_| AppError::Internal)?,
+                revision
+                    .try_into()
+                    .map_err(|_| AppError::internal("application_load_entry_6"))?,
                 revision_reason,
             ),
             providers,
@@ -584,9 +617,12 @@ impl ApplicationPlugins {
     }
 
     pub fn current_snapshot(&self) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
-        let current = self.current.read().map_err(|_| AppError::Internal)?;
+        let current = self
+            .current
+            .read()
+            .map_err(|_| AppError::internal("application_current_snapshot_1"))?;
         if !current.initialized {
-            return Err(AppError::Overloaded);
+            return Err(AppError::capacity_error("plugin_snapshot_unavailable"));
         }
         Ok(current.snapshot.clone())
     }
@@ -611,7 +647,10 @@ impl ApplicationPlugins {
         let result = tokio::time::timeout(PIN_DEADLINE, async {
             let head = self.db.optional_application_plugin_head().await?;
             {
-                let current = self.current.read().map_err(|_| AppError::Internal)?;
+                let current = self
+                    .current
+                    .read()
+                    .map_err(|_| AppError::internal("application_refresh_current_1"))?;
                 if head.is_none() && current.snapshot.is_some() {
                     return Err(AppError::Forbidden);
                 }
@@ -628,7 +667,10 @@ impl ApplicationPlugins {
                     "plugin head changed during refresh".into(),
                 ));
             }
-            let mut current = self.current.write().map_err(|_| AppError::Internal)?;
+            let mut current = self
+                .current
+                .write()
+                .map_err(|_| AppError::internal("application_refresh_current_2"))?;
             let previous = std::mem::replace(&mut current.snapshot, snapshot);
             current.initialized = true;
             current.error = None;
@@ -637,10 +679,14 @@ impl ApplicationPlugins {
             Ok(())
         })
         .await
-        .unwrap_or(Err(AppError::Overloaded));
+        .unwrap_or(Err(AppError::capacity_error(
+            "plugin_snapshot_refresh_timeout",
+        )));
         if let Err(error) = &result {
-            self.current.write().map_err(|_| AppError::Internal)?.error =
-                Some("snapshot_refresh_failed");
+            self.current
+                .write()
+                .map_err(|_| AppError::internal("application_refresh_current_3"))?
+                .error = Some("snapshot_refresh_failed");
             tracing::error!(%error, "application plugin snapshot refresh failed");
         }
         attempt.completed = true;
@@ -677,13 +723,13 @@ impl ApplicationPlugins {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let metadata = tokio::fs::symlink_metadata(&entry.root)
             .await
-            .map_err(|_| AppError::Internal)?;
+            .map_err(|_| AppError::internal("application_pin_revision_1"))?;
         if !metadata.is_dir() || metadata.file_type().is_symlink() {
             return Err(AppError::Forbidden);
         }
         tokio::time::timeout(PIN_DEADLINE, self.pin_head(head))
             .await
-            .map_err(|_| AppError::Overloaded)?
+            .map_err(|_| AppError::capacity_error("plugin_pin_timeout"))?
     }
 
     async fn pin_head(
@@ -725,7 +771,7 @@ impl ApplicationPlugins {
                             Ok::<_, AppError>(Arc::new(snapshot))
                         })
                         .await
-                        .unwrap_or(Err(AppError::Overloaded))
+                        .unwrap_or(Err(AppError::capacity_error("plugin_pin_timeout")))
                         .map_err(LoadFailure::from_error);
                         let mut cache = authority.snapshots.lock().await;
                         if let Ok(snapshot) = &loaded {
@@ -754,7 +800,7 @@ impl ApplicationPlugins {
                     {
                         cache.in_flight = None;
                     }
-                    return Err(AppError::Internal);
+                    return Err(AppError::internal("application_pin_head_1"));
                 }
             };
             if flight.revision == head.revision {

@@ -56,7 +56,7 @@ function navigation(surface: AppSurface, locale: Locale, pluginNavigation: Plugi
     route,
     icon,
     primary,
-    label: route === 'tenants' ? identityCopy(locale).title : route === 'proxy-groups' ? transportProxyGroupCopy(locale).title : label(locale, route as keyof typeof labels.en),
+    label: route === 'tenants' ? identityCopy(locale).title : route === 'proxy-groups' ? transportProxyGroupCopy(locale).pageTitle : label(locale, route as keyof typeof labels.en),
   });
   if (surface === 'portal') return [
     { id: 'workspace', label: label(locale, 'workspace'), items: [item('overview'), item('requests'), item('sessions'), item('usage')] },

@@ -109,7 +109,9 @@ fn validate_provider_credential_schema_from_canonical(
     driver: &str,
     credential: &UpstreamCredential,
 ) -> Result<(), AppError> {
-    let value = serde_json::to_value(credential).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_value(credential).map_err(|_| {
+        AppError::internal("accounts_validate_provider_credential_schema_from_canonical_1")
+    })?;
     if validate_provider_credential_schema(state, driver, &value).is_ok() {
         return Ok(());
     }
@@ -332,7 +334,8 @@ fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError
         && config.get("video_api").and_then(Value::as_str) == Some("wasu-wan-v1")
     {
         let base_url = validate_config(config)?;
-        let parsed = url::Url::parse(&base_url).map_err(|_| AppError::Internal)?;
+        let parsed = url::Url::parse(&base_url)
+            .map_err(|_| AppError::internal("accounts_validate_provider_config_1"))?;
         if parsed.path() != "/v1"
             || config.get("video_models") != Some(&json!(["wan3.0-video"]))
             || config
@@ -350,7 +353,8 @@ fn validate_provider_config(driver: &str, config: &Value) -> Result<(), AppError
         && config.get("video_api").and_then(Value::as_str) == Some("siliconflow-v1")
     {
         let base_url = validate_config(config)?;
-        let parsed = url::Url::parse(&base_url).map_err(|_| AppError::Internal)?;
+        let parsed = url::Url::parse(&base_url)
+            .map_err(|_| AppError::internal("accounts_validate_provider_config_2"))?;
         if parsed.path() != "/v1"
             || config
                 .get("result_origins")
@@ -699,7 +703,6 @@ pub(in crate::api) async fn update_upstream(
             expected_revision = body.expected_updated_at, accepted_revision = account.updated_at,
             policy_version = policy.version, candidate_attempts = policy.candidate_attempts,
             http_protocol = policy.http_protocol.as_str(),
-            failover_deadline_millis = policy.failover_deadline_millis,
             connect_attempts = policy.connect_attempts,
             connect_retry_delay_millis = policy.connect_retry_delay_millis,
             shared_probe_attempts = ?policy.shared_probe_attempts,

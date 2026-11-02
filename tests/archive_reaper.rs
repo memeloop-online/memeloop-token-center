@@ -84,13 +84,18 @@ impl Fixture {
         owner_id: Uuid,
         attempt_id: Uuid,
     ) -> memeloop_token_center::archive_staging::ArchiveStagingWriteLease {
+        self.make_attempt_with_owner(ArchiveStagingOwner::ProxyRequest(owner_id), attempt_id)
+            .await
+    }
+
+    async fn make_attempt_with_owner(
+        &self,
+        owner: ArchiveStagingOwner,
+        attempt_id: Uuid,
+    ) -> memeloop_token_center::archive_staging::ArchiveStagingWriteLease {
         let input = BeginArchiveStagingInput {
-            key: ArchiveStagingKey::new(
-                ArchiveStagingOwner::ProxyRequest(owner_id),
-                ArchiveStagingPurpose::Request,
-                attempt_id,
-            )
-            .expect("typed key"),
+            key: ArchiveStagingKey::new(owner, ArchiveStagingPurpose::Request, attempt_id)
+                .expect("typed key"),
             intent_digest: ArchiveStagingIntentDigest::new("a".repeat(64)).expect("digest"),
             lease_token: Uuid::now_v7(),
             lease_owner: ArchiveStagingLeaseOwner::new("archive-writer-test")
@@ -199,9 +204,7 @@ impl ArchiveStagingObjectStore for FlakyStore {
             })
             .is_ok()
         {
-            return Err(AppError::Storage(
-                "injected endpoint and credential detail".into(),
-            ));
+            return Err(AppError::storage("local_storage_failed"));
         }
         Ok(())
     }
@@ -217,9 +220,7 @@ impl ArchiveStagingObjectStore for FlakyStore {
             })
             .is_ok()
         {
-            return Err(AppError::Storage(
-                "injected object path and owner detail".into(),
-            ));
+            return Err(AppError::storage("local_storage_failed"));
         }
         Ok(true)
     }
@@ -295,7 +296,14 @@ async fn typed_delete_and_empty_verification_preserve_uuid_neighbours() {
 async fn crashed_unbound_attempt_is_deleted_and_needs_two_independent_claims() {
     for backend in [ArchiveBackend::Memory, ArchiveBackend::Filesystem] {
         let fixture = Fixture::new(backend).await;
-        let lease = fixture.make_attempt(Uuid::now_v7(), Uuid::now_v7()).await;
+        // Proxy request bodies remain protected until conversation archival commits.
+        // An unbound generation attempt exercises reclaimable crash debris.
+        let lease = fixture
+            .make_attempt_with_owner(
+                ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+                Uuid::now_v7(),
+            )
+            .await;
         let target = format!("{}/body", lease.key.canonical_prefix());
         let neighbour = format!("{}0/body", lease.key.canonical_prefix());
         fixture
@@ -428,7 +436,14 @@ async fn bound_and_exactly_referenced_attempts_are_never_deleted() {
 #[tokio::test]
 async fn object_failures_release_the_lease_and_persist_fixed_retry_codes() {
     let fixture = Fixture::new(ArchiveBackend::Memory).await;
-    let lease = fixture.make_attempt(Uuid::now_v7(), Uuid::now_v7()).await;
+    // Exercise object I/O with reclaimable debris; proxy sources are retained
+    // until conversation archival commits.
+    let lease = fixture
+        .make_attempt_with_owner(
+            ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+            Uuid::now_v7(),
+        )
+        .await;
     fixture
         .database
         .abandon_archive_staging_attempt(&lease)
@@ -475,7 +490,14 @@ async fn object_failures_release_the_lease_and_persist_fixed_retry_codes() {
 #[tokio::test]
 async fn a_long_generation_task_does_not_block_the_independent_reaper() {
     let fixture = Fixture::new(ArchiveBackend::Memory).await;
-    let lease = fixture.make_attempt(Uuid::now_v7(), Uuid::now_v7()).await;
+    // Exercise object I/O with reclaimable debris; proxy sources are retained
+    // until conversation archival commits.
+    let lease = fixture
+        .make_attempt_with_owner(
+            ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+            Uuid::now_v7(),
+        )
+        .await;
     fixture
         .database
         .abandon_archive_staging_attempt(&lease)
@@ -515,7 +537,14 @@ async fn reaper_loop_stops_cleanly_on_shutdown() {
 #[tokio::test]
 async fn shutdown_cancels_a_blocked_store_pass_without_finalizing_its_lease() {
     let fixture = Fixture::new(ArchiveBackend::Memory).await;
-    let lease = fixture.make_attempt(Uuid::now_v7(), Uuid::now_v7()).await;
+    // Exercise object I/O with reclaimable debris; proxy sources are retained
+    // until conversation archival commits.
+    let lease = fixture
+        .make_attempt_with_owner(
+            ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+            Uuid::now_v7(),
+        )
+        .await;
     fixture
         .database
         .abandon_archive_staging_attempt(&lease)
@@ -568,7 +597,10 @@ async fn one_pass_claims_only_the_configured_small_batch() {
     let fixture = Fixture::new(ArchiveBackend::Memory).await;
     for index in 1..=6_u128 {
         let lease = fixture
-            .make_attempt(Uuid::from_u128(index), Uuid::from_u128(100 + index))
+            .make_attempt_with_owner(
+                ArchiveStagingOwner::GenerationJob(Uuid::from_u128(index)),
+                Uuid::from_u128(100 + index),
+            )
             .await;
         fixture
             .database

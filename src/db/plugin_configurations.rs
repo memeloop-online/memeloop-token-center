@@ -88,7 +88,8 @@ impl Database {
                 "invalid plugin configuration concurrency metadata".into(),
             ));
         }
-        let value_json = serde_json::to_string(&input.value).map_err(|_| AppError::Internal)?;
+        let value_json = serde_json::to_string(&input.value)
+            .map_err(|_| AppError::internal("plugin_configurations_put_plugin_configuration_1"))?;
         if value_json.len() > 1024 * 1024 {
             return Err(AppError::BadRequest(
                 "plugin configuration exceeds the 1 MiB limit".into(),
@@ -150,7 +151,9 @@ impl Database {
             return Ok(StoredPluginConfiguration {
                 plugin_id: input.plugin_id,
                 tenant_id: input.tenant_id,
-                value: serde_json::from_str(&value_json).map_err(|_| AppError::Internal)?,
+                value: serde_json::from_str(&value_json).map_err(|_| {
+                    AppError::internal("plugin_configurations_put_plugin_configuration_2")
+                })?,
                 schema_digest,
                 version,
                 updated_at,
@@ -205,7 +208,7 @@ impl Database {
         .execute(&mut *transaction)
         .await?;
         if recorded.rows_affected() != 1 {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("plugin_configurations_site_1"));
         }
         transaction.commit().await?;
         Ok(StoredPluginConfiguration {
@@ -229,7 +232,7 @@ fn stored_configuration(row: AnyRow) -> Result<StoredPluginConfiguration, AppErr
         plugin_id: row.try_get("plugin_id")?,
         tenant_id: tenant_id.map(parse_uuid).transpose()?,
         value: serde_json::from_str(&row.try_get::<String, _>("value_json")?)
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("plugin_configurations_stored_configuration_1"))?,
         schema_digest: row.try_get("schema_digest")?,
         version: row.try_get("version")?,
         updated_at: row.try_get("updated_at")?,

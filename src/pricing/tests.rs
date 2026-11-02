@@ -17,6 +17,52 @@ fn price(source: &'static str, id: &str) -> RemotePrice {
     }
 }
 
+#[tokio::test]
+async fn source_http_body_is_unlimited_and_deadline_comes_from_settings() {
+    let server = MockServer::start().await;
+    let document = serde_json::json!({
+        "data": [{"id":"fixture", "pricing":{"prompt":"0.000001","completion":"0.000002"}}],
+        "padding": "x".repeat(8 * 1024 * 1024 + 1)
+    });
+    Mock::given(path("/large"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&document))
+        .mount(&server)
+        .await;
+    let unlimited = crate::http_settings::HttpClient::default();
+    let (prices, _) = sources::fetch_source(
+        &unlimited,
+        "openrouter",
+        &format!("{}/large", server.uri()),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(prices.len(), 1);
+    Mock::given(path("/slow"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "data":[{"id":"fixture","pricing":{"prompt":"0.000001","completion":"0.000002"}}]
+                }))
+                .set_delay(std::time::Duration::from_millis(200)),
+        )
+        .mount(&server)
+        .await;
+    let limited = crate::http_settings::tests::configured_timeout(25);
+    let error = sources::fetch_source(
+        &limited,
+        "openrouter",
+        &format!("{}/slow", server.uri()),
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::Upstream { facts, .. } if facts.stage == Some("timeout")
+    ));
+}
+
 async fn test_database() -> (TempDir, Database) {
     let directory = tempfile::tempdir().expect("pricing test directory");
     let database_url = format!(
@@ -568,7 +614,7 @@ async fn all_source_failures_do_not_modify_existing_prices() {
     )
     .await
     .expect_err("all unavailable sources must fail closed");
-    assert!(matches!(error, AppError::Upstream(_)));
+    assert!(matches!(error, AppError::Upstream { .. }));
     let price = database
         .model_price_view("openai/gpt-manual", "USD")
         .await

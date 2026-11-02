@@ -93,15 +93,16 @@ impl Content {
         match self {
             Self::Text(text) => Some(text),
             Self::Blocks(blocks) => {
-                let mut text = String::new();
-                let mut found = false;
+                let mut text: Option<String> = None;
                 for block in blocks {
                     if matches!(block.kind.as_str(), "text" | "output_text") {
-                        text.push_str(&block.text);
-                        found = true;
+                        match text.as_mut() {
+                            Some(text) if !text.is_empty() => text.push_str(&block.text),
+                            _ => text = Some(block.text),
+                        }
                     }
                 }
-                found.then_some(text)
+                text
             }
             Self::Empty => None,
         }
@@ -161,22 +162,27 @@ impl Answer {
 
     fn finish(self) -> Option<String> {
         self.explicit
-            .or_else(|| self.unmarked.map(|text| last_paragraph(&text).to_owned()))
+            .or_else(|| self.unmarked.map(last_paragraph))
             .filter(|text| !text.trim().is_empty())
     }
 }
 
-fn last_paragraph(text: &str) -> &str {
-    let text = text.trim_end();
+fn last_paragraph(mut text: String) -> String {
+    let trimmed = text.trim_end();
+    let end = trimmed.len();
     let mut start = 0;
     let mut position = 0;
-    for line in text.split_inclusive('\n') {
+    for line in trimmed.split_inclusive('\n') {
         position += line.len();
         if line.trim().is_empty() {
             start = position;
         }
     }
-    &text[start..]
+    // Keep the selected paragraph in the original allocation, including when
+    // the entire unmarked answer is one very large paragraph.
+    text.truncate(end);
+    drop(text.drain(..start));
+    text
 }
 
 /// Caller limits total archive bytes and uses a blocking worker, never the
@@ -323,6 +329,119 @@ mod tests {
 
     fn parse(value: serde_json::Value) -> Result<Option<String>, &'static str> {
         extract(Cursor::new(serde_json::to_vec(&value).unwrap()))
+    }
+
+    #[test]
+    fn unmarked_answer_keeps_the_exact_entire_last_paragraph() {
+        for (input, expected) in [
+            ("", None),
+            (" \t\r\n\u{2003}", None),
+            ("one paragraph", Some("one paragraph")),
+            (
+                "  indented\nsecond line \t\n",
+                Some("  indented\nsecond line"),
+            ),
+            ("first\n\nlast\nline\n", Some("last\nline")),
+            (
+                "first\r\n \r\n末段😀\r\n下一行\t ",
+                Some("末段😀\r\n下一行"),
+            ),
+            ("first\n\u{2003}\n\n  final\n\n \t\n", Some("  final")),
+            ("first\n \t\nsecond\n\nlast", Some("last")),
+        ] {
+            assert_eq!(
+                Answer {
+                    unmarked: Some(input.into()),
+                    ..Answer::default()
+                }
+                .finish()
+                .as_deref(),
+                expected,
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_text_blocks_and_last_paragraph_transfer_the_allocation() {
+        let paragraph = format!("  {}😀\nlast line", "x".repeat(1024 * 1024));
+        for prefix in ["", "earlier paragraph\r\n \r\n"] {
+            let source = format!("{prefix}{paragraph}\r\n\t ");
+            let pointer = source.as_ptr();
+            let capacity = source.capacity();
+            let text = Content::Blocks(vec![
+                TextBlock {
+                    kind: "tool_use".into(),
+                    text: "ignored".into(),
+                },
+                TextBlock {
+                    kind: "text".into(),
+                    ..TextBlock::default()
+                },
+                TextBlock {
+                    kind: "output_text".into(),
+                    text: source,
+                },
+            ])
+            .text()
+            .unwrap();
+            assert_eq!(
+                text.as_ptr(),
+                pointer,
+                "reuse the first nonempty text block"
+            );
+            let selected = Answer {
+                unmarked: Some(text),
+                ..Answer::default()
+            }
+            .finish()
+            .unwrap();
+            assert_eq!(selected, paragraph);
+            assert_eq!(selected.as_ptr(), pointer, "compact the paragraph in place");
+            assert_eq!(selected.capacity(), capacity);
+        }
+        assert_eq!(
+            Content::Blocks(vec![
+                TextBlock {
+                    kind: "text".into(),
+                    text: "first\n".into()
+                },
+                TextBlock {
+                    kind: "tool_use".into(),
+                    text: "ignored".into()
+                },
+                TextBlock {
+                    kind: "output_text".into(),
+                    text: "second".into()
+                },
+            ])
+            .text()
+            .as_deref(),
+            Some("first\nsecond")
+        );
+        assert_eq!(Content::Blocks(vec![]).text(), None);
+    }
+
+    #[test]
+    fn explicit_answer_keeps_all_paragraphs_and_whitespace_without_fallback() {
+        let explicit = "  first\n\nlast😀\n\t ".to_owned();
+        let pointer = explicit.as_ptr();
+        let selected = Answer {
+            explicit: Some(explicit),
+            unmarked: Some("fallback".into()),
+        }
+        .finish()
+        .unwrap();
+        assert_eq!(selected, "  first\n\nlast😀\n\t ");
+        assert_eq!(selected.as_ptr(), pointer);
+        assert_eq!(
+            Answer {
+                explicit: Some(" \n\t".into()),
+                unmarked: Some("fallback".into()),
+            }
+            .finish(),
+            None
+        );
     }
 
     #[test]

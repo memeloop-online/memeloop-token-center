@@ -168,7 +168,7 @@ async fn authenticated_body_admission_failure_has_no_supplier_or_reservation() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert!(rows[0].model.is_empty());
-    assert_eq!(rows[0].error_code.as_deref(), Some("service_overloaded"));
+    assert_eq!(rows[0].error_code.as_deref(), Some("proxy_memory_ingress"));
     assert!(!rows[0].billing.billable);
     assert!(rows[0].upstream_account_id.is_none());
 }

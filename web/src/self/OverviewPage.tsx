@@ -62,8 +62,9 @@ export function OverviewPage({ credential, credentialView, onError, onOpenReques
   const summary = stats?.summary;
   const balance = formatCompactCurrency(currentKey.available_balance, currentKey.currency, locale);
   const cost = formatCompactCurrency(summary?.total_cost, currentKey.currency, locale);
-  const successRate = summary && summary.total_requests > 0
-    ? summary.successful_requests / summary.total_requests
+  const settledRequests = summary ? summary.successful_requests + summary.failed_requests : 0;
+  const successRate = summary && settledRequests > 0
+    ? summary.successful_requests / settledRequests
     : null;
   const countMetric = (label: string, value: number | undefined, tone = '') => {
     const display = formatMetricDisplay(value, locale);

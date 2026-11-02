@@ -47,14 +47,14 @@ impl<'a> BufferedArchive<'a> {
         pepper: &'a [u8],
         compression_enabled: bool,
     ) -> Result<Self, AppError> {
-        if body.len() > 64 * 1024 * 1024 {
-            return Err(AppError::Overloaded);
-        }
+        // Raw request JSON and raw response JSON are split into CHUNK_BYTES
+        // pieces and archived in full. The former 64MiB plain ceiling is not
+        // a capture cutoff.
         let chunk_count = body.len().div_ceil(super::CHUNK_BYTES);
         let mut nonces = Vec::with_capacity(chunk_count);
         for _ in 0..chunk_count {
             let mut nonce = [0_u8; 12];
-            fill(&mut nonce).map_err(|_| AppError::Internal)?;
+            fill(&mut nonce).map_err(|_| AppError::internal("producer_new_1"))?;
             nonces.push(nonce);
         }
         Ok(Self {
@@ -84,15 +84,22 @@ impl<'a> BufferedArchive<'a> {
     }
 
     pub(crate) fn seal(&self, seq: usize) -> Result<String, AppError> {
-        let nonce = self.nonces.get(seq).copied().ok_or(AppError::Internal)?;
+        let nonce = self
+            .nonces
+            .get(seq)
+            .copied()
+            .ok_or(AppError::internal("producer_seal_1"))?;
         let start = seq
             .checked_mul(super::CHUNK_BYTES)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("producer_seal_2"))?;
         let end = (start + super::CHUNK_BYTES).min(self.body.len());
-        let bytes = self.body.get(start..end).ok_or(AppError::Internal)?;
+        let bytes = self
+            .body
+            .get(start..end)
+            .ok_or(AppError::internal("producer_seal_3"))?;
         let sealed = super::cipher::seal_for_purpose_with_nonce_and_compression(
             self.identity,
-            i64::try_from(seq).map_err(|_| AppError::Internal)?,
+            i64::try_from(seq).map_err(|_| AppError::internal("producer_seal_1"))?,
             bytes,
             self.pepper,
             self.purpose,
@@ -115,12 +122,14 @@ impl<'a> BufferedArchive<'a> {
             .map(|seq| {
                 let start = seq
                     .checked_mul(super::CHUNK_BYTES)
-                    .ok_or(AppError::Internal)?;
+                    .ok_or(AppError::internal("producer_prepare_first_batch_1"))?;
                 let end = (start + super::CHUNK_BYTES).min(self.body.len());
                 Ok(crate::db::ArchiveSpoolChunk {
-                    seq: i64::try_from(seq).map_err(|_| AppError::Internal)?,
+                    seq: i64::try_from(seq)
+                        .map_err(|_| AppError::internal("producer_prepare_first_batch_1"))?,
                     ciphertext: self.seal(seq)?,
-                    byte_count: i64::try_from(end - start).map_err(|_| AppError::Internal)?,
+                    byte_count: i64::try_from(end - start)
+                        .map_err(|_| AppError::internal("producer_prepare_first_batch_2"))?,
                 })
             })
             .collect::<Result<Vec<_>, AppError>>()?;
@@ -236,9 +245,8 @@ pub(crate) fn encrypt_buffered(
     body: &Bytes,
     pepper: &[u8],
 ) -> Result<Vec<crate::db::ArchiveSpoolChunk>, AppError> {
-    if body.len() > 64 * 1024 * 1024 {
-        return Err(AppError::Overloaded);
-    }
+    // Same full-body chunking as BufferedArchive::new. The former 64MiB plain
+    // ceiling is not a capture cutoff.
     body.chunks(super::CHUNK_BYTES)
         .enumerate()
         .map(|(seq, bytes)| {
@@ -440,7 +448,9 @@ impl ResponseArchiveSettlement {
         Self {
             _writer: super::OwnedTask::spawn(
                 async move {
-                    released.await.map_err(|_| AppError::Internal)?;
+                    released
+                        .await
+                        .map_err(|_| AppError::internal("producer_pending_for_test_1"))?;
                     Ok(())
                 },
                 "response_spool_writer_test",
@@ -546,6 +556,7 @@ impl ResponseArchiveProducer {
         let failure_active = active.clone();
         let mut writer_state = state.clone();
         writer_state.db = state.persistence_db.clone();
+        writer_state.db.refresh_closed_persistence_pool();
         let writer_memory = queue_memory.clone();
         let writer = super::OwnedTask::spawn(
             async move {
@@ -709,7 +720,7 @@ impl ResponseArchiveWriter {
         )
         .await?
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_begin_inner_1"));
         }
         Ok(Self {
             state,
@@ -725,13 +736,16 @@ impl ResponseArchiveWriter {
 
     async fn append_chunks(&mut self, chunks: Vec<QueuedArchiveChunk>) -> Result<(), AppError> {
         if chunks.is_empty() || chunks.len() > super::CAPTURE_DATABASE_BATCH_CHUNKS {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_append_chunks_1"));
         }
         let chunk_count = chunks.len();
         let batch_bytes = chunks.iter().try_fold(0_i64, |total, chunk| {
             total
-                .checked_add(i64::try_from(chunk.bytes.len()).map_err(|_| AppError::Internal)?)
-                .ok_or(AppError::Internal)
+                .checked_add(
+                    i64::try_from(chunk.bytes.len())
+                        .map_err(|_| AppError::internal("producer_append_chunks_1"))?,
+                )
+                .ok_or(AppError::internal("producer_append_chunks_2"))
         })?;
         let mut chunks = chunks.into_iter();
         let identity = self.identity;
@@ -758,9 +772,9 @@ impl ResponseArchiveWriter {
                             bytes,
                             _memory: memory,
                         } =
-                            chunks.next().ok_or(AppError::Internal)?;
+                            chunks.next().ok_or(AppError::internal("producer_append_chunks_3"))?;
                         let byte_count =
-                            i64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
+                            i64::try_from(bytes.len()).map_err(|_| AppError::internal("producer_append_chunks_2"))?;
                         let ciphertext = super::cipher::seal_for_purpose_with_compression(
                             identity,
                             seq,
@@ -790,16 +804,19 @@ impl ResponseArchiveWriter {
         };
         self.append_attempts += 1;
         if !appended? {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_append_chunks_4"));
         }
         self.seq = self
             .seq
-            .checked_add(i64::try_from(chunk_count).map_err(|_| AppError::Internal)?)
-            .ok_or(AppError::Internal)?;
+            .checked_add(
+                i64::try_from(chunk_count)
+                    .map_err(|_| AppError::internal("producer_append_chunks_3"))?,
+            )
+            .ok_or(AppError::internal("producer_append_chunks_5"))?;
         self.bytes = self
             .bytes
             .checked_add(batch_bytes)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal("producer_append_chunks_6"))?;
         Ok(())
     }
 
@@ -861,7 +878,7 @@ impl ResponseArchiveWriter {
         )
         .await?
         {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("producer_seal_inner_1"));
         }
         Ok(())
     }
@@ -879,7 +896,7 @@ enum WriterOutcome {
 }
 
 async fn run_response_archive_writer(
-    state: AppState,
+    mut state: AppState,
     identity: ArchiveSpoolIdentity,
     mut receiver: tokio::sync::mpsc::Receiver<QueuedArchiveChunk>,
     terminal: tokio::sync::oneshot::Receiver<Bytes>,
@@ -887,7 +904,26 @@ async fn run_response_archive_writer(
 ) -> Result<WriterOutcome, AppError> {
     #[cfg(test)]
     pause_begin_for_test(&state).await;
-    let mut writer = ResponseArchiveWriter::begin_inner(state.clone(), identity).await?;
+    let mut writer = loop {
+        state.db.refresh_closed_persistence_pool();
+        match ResponseArchiveWriter::begin_inner(state.clone(), identity).await {
+            Ok(writer) => break writer,
+            Err(error)
+                if active.load(Ordering::Acquire)
+                    && (error.diagnostic_category() == "database_operation_failed"
+                        || error.diagnostic_category() == "database_pool_exhausted"
+                        || matches!(&error, AppError::DatabaseUnavailable(_))) =>
+            {
+                tracing::warn!(
+                    request_id = %identity.request_id,
+                    error_category = error.diagnostic_category(),
+                    "response archive retains queued bytes while begin recovers"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
     while let Some(first) = receiver.recv().await {
@@ -958,7 +994,7 @@ async fn observe_writer_database(
     }
     // The existing SQLx conversion emits only a safe fixed error_kind (for
     // example pool_timeout/query_cancelled). Keep that event correlated before
-    // conversion erases its type into AppError::Internal.
+    // conversion erases its type into AppError::internal("producer_observe_writer_database_1").
     let result = operation.instrument(tracing::info_span!("response_archive_database", request_id = %identity.request_id, phase)).await;
     let outcome = match &result {
         Ok(true) => "acknowledged",
@@ -1117,13 +1153,19 @@ mod tests {
             })
             .now_or_never()
             .unwrap();
-            assert!(matches!(result, Err(AppError::Overloaded)));
+            assert!(matches!(
+                result,
+                Err(AppError::Capacity {
+                    code: "database_pool_exhausted",
+                    ..
+                })
+            ));
             let result = observe_writer_database(identity(), "response_spool_seal", 8, async {
-                Err(AppError::Storage("SECRET_CANARY".to_owned()))
+                Err(AppError::storage("object_storage_failed"))
             })
             .now_or_never()
             .unwrap();
-            assert!(matches!(result, Err(AppError::Storage(_))));
+            assert!(matches!(result, Err(AppError::Storage { .. })));
         });
         let bytes = writer.0.lock().unwrap();
         let logs = std::str::from_utf8(&bytes).unwrap();
@@ -1194,6 +1236,91 @@ mod tests {
         assert!(replay.starts_with("zstd1."));
         assert_eq!(replay, first.seal(0).unwrap());
         assert_ne!(first.seal(0).unwrap(), second.seal(0).unwrap());
+    }
+
+    #[test]
+    fn raw_json_above_former_plain_ceiling_is_chunked_in_full() {
+        const FORMER_PLAIN_CEILING: usize = 64 * 1024 * 1024;
+        let chunk_bytes = super::super::CHUNK_BYTES;
+        assert_eq!(FORMER_PLAIN_CEILING % chunk_bytes, 0);
+        let mut raw = vec![b'x'; FORMER_PLAIN_CEILING + 1];
+        raw[0] = b'a';
+        raw[FORMER_PLAIN_CEILING] = b'z';
+        let body = Bytes::from(raw);
+        let pepper = b"archive-spool-test-pepper";
+        let chunk_count = body.len().div_ceil(chunk_bytes);
+        let tail_seq = chunk_count - 1;
+        let tail_len = body.len() - tail_seq * chunk_bytes;
+        assert_eq!(chunk_count, FORMER_PLAIN_CEILING / chunk_bytes + 1);
+        assert_eq!(tail_len, 1);
+
+        let request = super::super::BufferedArchivePurpose::Request;
+        let archive = match BufferedArchive::new(identity(), request, &body, pepper, false) {
+            Ok(archive) => archive,
+            Err(error) => panic!("raw request JSON capture failed: {error}"),
+        };
+        let opened_tail = super::super::cipher::open_for_purpose(
+            identity(),
+            tail_seq as i64,
+            &archive.seal(tail_seq).unwrap(),
+            tail_len as i64,
+            pepper,
+            request,
+        )
+        .unwrap();
+        assert_eq!(opened_tail.as_ref(), &body[FORMER_PLAIN_CEILING..]);
+        assert!(archive.seal(chunk_count).is_err());
+        let opened_first = super::super::cipher::open_for_purpose(
+            identity(),
+            0,
+            &archive.seal(0).unwrap(),
+            chunk_bytes as i64,
+            pepper,
+            request,
+        )
+        .unwrap();
+        assert_eq!(opened_first.len(), chunk_bytes);
+        assert_eq!(opened_first[0], body[0]);
+        assert_eq!(&opened_first[1..], &body[1..chunk_bytes]);
+
+        let response = super::super::BufferedArchivePurpose::Response;
+        let chunks = match encrypt_buffered(identity(), response, &body, pepper) {
+            Ok(chunks) => chunks,
+            Err(error) => panic!("raw response JSON capture failed: {error}"),
+        };
+        assert_eq!(chunks.len(), chunk_count);
+        assert!(chunks.iter().enumerate().all(|(seq, chunk)| {
+            let start = seq * chunk_bytes;
+            chunk.seq == seq as i64
+                && chunk.byte_count as usize == body.len().saturating_sub(start).min(chunk_bytes)
+        }));
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.byte_count as usize)
+                .sum::<usize>(),
+            body.len()
+        );
+        let opened_response_tail = super::super::cipher::open_for_purpose(
+            identity(),
+            tail_seq as i64,
+            &chunks[tail_seq].ciphertext,
+            tail_len as i64,
+            pepper,
+            response,
+        )
+        .unwrap();
+        assert_eq!(opened_response_tail.as_ref(), &body[FORMER_PLAIN_CEILING..]);
+        let opened_response_first = super::super::cipher::open_for_purpose(
+            identity(),
+            0,
+            &chunks[0].ciphertext,
+            chunk_bytes as i64,
+            pepper,
+            response,
+        )
+        .unwrap();
+        assert_eq!(opened_response_first.as_ref(), &body[..chunk_bytes]);
     }
 
     #[tokio::test(start_paused = true)]

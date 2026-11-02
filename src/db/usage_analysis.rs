@@ -83,11 +83,33 @@ struct UsageAnalysisSnapshot {
     completed_business_statements: Vec<&'static str>,
 }
 
+/// Planner cost assumptions for the usage-analysis snapshot only.
+///
+/// These statements are throughput-shaped (a small number of wide aggregations over a
+/// time range), and on the deployed instance almost nothing they touch is cached, so a
+/// random page is far more expensive than the `seq_page_cost = 1` baseline that the
+/// upstream default `random_page_cost = 4` assumes.  Measured on the production cluster
+/// (CNPG on single-replica local Longhorn, 1 vCPU, 128 MB `shared_buffers` for a 62 GB
+/// database) a seven-day `output_rate` statement spent 25 s of 38 s in an ordered index
+/// scan that fetched ~164k rows by random heap access, while the equivalent sequential
+/// scan of the same table finished in 3.9 s.
+///
+/// 15 is the value that flips that plan to a sequential scan plus hash join; the cluster
+/// also carries it in `postgresql.parameters`.  Pinning it here as well keeps the fix
+/// effective for this rule even before cluster parameters roll out, and states the
+/// assumption next to the statements that depend on it.  The setting is transaction-local
+/// and these transactions are read-only, so it cannot re-plan the OLTP paths that share
+/// the pool.
+const USAGE_ANALYSIS_RANDOM_PAGE_COST: &str = "SET LOCAL random_page_cost = 15";
+
 impl UsageAnalysisSnapshot {
     async fn begin(database: &Database) -> Result<Self, AppError> {
         let mut transaction = database.pool.begin().await?;
         if matches!(database.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                .execute(&mut *transaction)
+                .await?;
+            sqlx::query(USAGE_ANALYSIS_RANDOM_PAGE_COST)
                 .execute(&mut *transaction)
                 .await?;
         }
@@ -251,6 +273,36 @@ impl Database {
         tenant_id: Option<Uuid>,
         filter: &UsageAnalysisFilter,
     ) -> Result<UsageAnalysisTrendsResponse, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let range = validate_usage_analysis_filter_with_limits(filter, false)?;
+            let scope = match tenant_id {
+                Some(tenant) if tenant.is_nil() => {
+                    crate::request_history::HistoryScope::EmptyTenant
+                }
+                Some(tenant) => crate::request_history::HistoryScope::Tenant(tenant),
+                None => crate::request_history::HistoryScope::GlobalOperator,
+            };
+            let response = client
+                .usage_projection(
+                    scope,
+                    filter,
+                    (UsageAnalysisProjection::Trends, true),
+                    range.from_created_at,
+                    range.to_created_at,
+                    range.granularity.as_str(),
+                )
+                .await?;
+            return Ok(UsageAnalysisTrendsResponse {
+                from_created_at: response.from_created_at,
+                to_created_at: response.to_created_at,
+                granularity: response.granularity,
+                time_zone: response.time_zone,
+                p95_is_approximate: response.p95_is_approximate,
+                p95_method: response.p95_method,
+                summary: response.summary,
+                time_series: response.time_series,
+            });
+        }
         let range = validate_usage_analysis_filter(filter)?;
         let mut snapshot = UsageAnalysisSnapshot::begin(self).await?;
         let mut projections = self
@@ -265,7 +317,9 @@ impl Database {
             .await?;
         let (summary, time_series) = take_summary_time_series(&mut projections)?;
         if !projections.is_empty() {
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "usage_analysis_aggregate_usage_analysis_trends_for_tenant_id_1",
+            ));
         }
         snapshot.record_completion("trends");
         snapshot.commit().await?;
@@ -296,6 +350,24 @@ impl Database {
         filter: &UsageAnalysisFilter,
         projection: UsageAnalysisProjection,
     ) -> Result<UsageAnalysisResponse, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let range = validate_usage_analysis_filter_with_limits(filter, false)?;
+            let scope = match tenant_id {
+                Some(id) if id.is_nil() => crate::request_history::HistoryScope::EmptyTenant,
+                Some(id) => crate::request_history::HistoryScope::Tenant(id),
+                None => crate::request_history::HistoryScope::GlobalOperator,
+            };
+            return Ok(client
+                .usage(
+                    scope,
+                    filter,
+                    projection,
+                    range.from_created_at,
+                    range.to_created_at,
+                    range.granularity.as_str(),
+                )
+                .await?);
+        }
         let range = validate_usage_analysis_filter(filter)?;
         let tenant_scoped = tenant_id.is_some();
         let mut snapshot = UsageAnalysisSnapshot::begin(self).await?;
@@ -438,7 +510,11 @@ impl Database {
                         units,
                     },
                 ),
-                _ => return Err(AppError::Internal),
+                _ => {
+                    return Err(AppError::internal(
+                        "usage_analysis_aggregate_usage_analysis_for_tenant_id_1",
+                    ));
+                }
             }
         }
         generation_units_by_modality.sort_by(|left, right| {
@@ -496,7 +572,7 @@ impl Database {
             let label = accumulator.label.clone();
             let metrics = accumulator.finish();
             match kind.as_str() {
-                "time" | "summary" => return Err(AppError::Internal),
+                "time" | "summary" => return Err(AppError::internal("usage_analysis_site_1")),
                 "model" => by_model.push(UsageAnalysisBucket { id, label, metrics }),
                 "key" => by_key.push(UsageAnalysisBucket { id, label, metrics }),
                 "upstream" => by_upstream.push(UsageAnalysisBucket { id, label, metrics }),
@@ -510,7 +586,7 @@ impl Database {
                     by_status.push(UsageAnalysisBucket { id, label, metrics });
                 }
                 "error" => errors.push(UsageAnalysisBucket { id, label, metrics }),
-                _ => return Err(AppError::Internal),
+                _ => return Err(AppError::internal("usage_analysis_site_2")),
             }
         }
         for buckets in [
@@ -542,7 +618,9 @@ impl Database {
             .into_iter()
             .map(|((_kind, id), accumulator)| {
                 Ok(UsageAnalysisHeatmapBucket {
-                    hour_of_week: id.parse().map_err(|_| AppError::Internal)?,
+                    hour_of_week: id
+                        .parse()
+                        .map_err(|_| AppError::internal("usage_analysis_site_1"))?,
                     metrics: accumulator.finish(),
                 })
             })
@@ -746,6 +824,13 @@ fn inclusive_fact_bounds(from_created_at: i128, to_exclusive: i128) -> (i64, i64
 fn validate_usage_analysis_filter(
     filter: &UsageAnalysisFilter,
 ) -> Result<ValidatedUsageAnalysisRange, AppError> {
+    validate_usage_analysis_filter_with_limits(filter, true)
+}
+
+fn validate_usage_analysis_filter_with_limits(
+    filter: &UsageAnalysisFilter,
+    bounded: bool,
+) -> Result<ValidatedUsageAnalysisRange, AppError> {
     const HOUR_RANGE_LIMIT: i64 = 31 * 86_400_000;
     let requested = filter.granularity.as_deref().unwrap_or("auto");
     if !matches!(requested, "auto" | "hour" | "day") {
@@ -769,13 +854,13 @@ fn validate_usage_analysis_filter(
         ));
     }
     let range = to.saturating_sub(from);
-    if range > MAX_STATS_RANGE_MILLIS {
+    if bounded && range > MAX_STATS_RANGE_MILLIS {
         return Err(AppError::BadRequest(
             "usage analysis range must not exceed 93 days".into(),
         ));
     }
     let granularity = match requested {
-        "hour" if range > HOUR_RANGE_LIMIT => {
+        "hour" if bounded && range > HOUR_RANGE_LIMIT => {
             return Err(AppError::BadRequest(
                 "hour granularity range must not exceed 31 days".into(),
             ));
@@ -1325,8 +1410,16 @@ fn take_summary_time_series(
         .collect::<Vec<_>>();
     let mut time_series = Vec::with_capacity(time_keys.len());
     for key in time_keys {
-        let bucket_start = key.1.parse().map_err(|_| AppError::Internal)?;
-        let metrics = projections.remove(&key).ok_or(AppError::Internal)?.finish();
+        let bucket_start = key
+            .1
+            .parse()
+            .map_err(|_| AppError::internal("usage_analysis_take_summary_time_series_1"))?;
+        let metrics = projections
+            .remove(&key)
+            .ok_or(AppError::internal(
+                "usage_analysis_take_summary_time_series_1",
+            ))?
+            .finish();
         time_series.push(UsageAnalysisTimeBucket {
             bucket_start,
             metrics,
@@ -1384,7 +1477,7 @@ fn accumulate_usage_row(
     let currency: String = row.try_get("currency")?;
     let cost_micros: i64 = row.try_get("cost_micros")?;
     if currency.is_empty() {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("usage_analysis_accumulate_usage_row_1"));
     }
     let cost = accumulator.costs.entry(currency).or_default();
     *cost = cost.saturating_add(cost_micros);

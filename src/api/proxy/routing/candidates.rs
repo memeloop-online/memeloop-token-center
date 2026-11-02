@@ -60,7 +60,9 @@ pub(in crate::api::proxy) fn candidate_reservation_bounds(
         .map(|limit| {
             limit
                 .checked_mul(output_choice_count)
-                .ok_or(AppError::Internal)
+                .ok_or(AppError::internal(
+                    "candidates_candidate_reservation_bounds_1",
+                ))
         })
         .transpose()?;
     Ok((
@@ -97,8 +99,9 @@ fn input_reservation_bound(
         )?)
         .filter(|ceiling| *ceiling <= MAX_REPORTED_TOKENS)
         .ok_or_else(|| {
-            AppError::Upstream(
-                "upstream input token reservation is outside the supported range".into(),
+            AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("candidates_input_reservation_bound"),
             )
         })
 }
@@ -162,8 +165,10 @@ pub(in crate::api::proxy) async fn next_planned_proxy_candidate(
                     stage = "candidate_materialize",
                     "selected authorized proxy candidate is invalid"
                 );
-                return Err(AppError::Upstream(
-                    "selected upstream candidate is invalid".into(),
+                return Err(AppError::upstream_with(
+                    "upstream_unavailable",
+                    crate::error::ErrorFacts::new()
+                        .stage("candidates_next_planned_proxy_candidate"),
                 ));
             }
         };
@@ -318,11 +323,14 @@ pub(in crate::api::proxy) fn exhausted_candidate_error(
         return Ok(AppError::CompactionProducerUnavailable);
     }
     if summary.reservation_metadata_unavailable > 0 {
-        return Ok(AppError::Upstream(
-            "Codex model reservation metadata is not configured; synchronize the account model catalog or configure a verified bound for this exact model".into(),
+        return Ok(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("candidates_exhausted_candidate_error"),
         ));
     }
-    Ok(AppError::Overloaded)
+    Ok(AppError::capacity_error(
+        "upstream_candidate_preparation_exhausted",
+    ))
 }
 
 #[cfg(test)]

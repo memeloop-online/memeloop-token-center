@@ -78,8 +78,8 @@ impl Database {
         let now = unix_millis();
         let account_id = Uuid::now_v7();
         let tenant_candidate = Uuid::now_v7();
-        let mut config_json =
-            serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
+        let mut config_json = serde_json::to_string(&input.config)
+            .map_err(|_| AppError::internal("accounts_create_upstream_account_with_transport_1"))?;
         let credential_ciphertext = seal_credential(&input.credential, key_material)?;
         let auth_kind = input.credential.auth_kind();
         let credential_expires_at = input.credential.expires_at();
@@ -186,10 +186,11 @@ impl Database {
             input
                 .config
                 .as_object_mut()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal("accounts_site_1"))?
                 .insert(
                     crate::db::transport_proxy_management::CONFIG_KEY.into(),
-                    serde_json::to_value(stamp).map_err(|_| AppError::Internal)?,
+                    serde_json::to_value(stamp)
+                        .map_err(|_| AppError::internal("accounts_site_1"))?,
                 );
             config_json = input.config.to_string();
             sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
@@ -268,7 +269,9 @@ impl Database {
         }
         let account_ids =
             serde_json::to_string(&account_ids.iter().map(Uuid::to_string).collect::<Vec<_>>())
-                .map_err(|_| AppError::Internal)?;
+                .map_err(|_| {
+                    AppError::internal("accounts_upstream_accounts_with_credentials_batch_1")
+                })?;
         let selected_accounts = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT selected.item FROM jsonb_array_elements_text(CAST($2 AS jsonb)) AS selected(item)"
@@ -379,7 +382,8 @@ impl Database {
             .await?
             .ok_or(AppError::NotFound)?;
         let tenant_id: String = current.try_get("tenant_id")?;
-        let receipt_tenant_id = Uuid::parse_str(&tenant_id).map_err(|_| AppError::Internal)?;
+        let receipt_tenant_id = Uuid::parse_str(&tenant_id)
+            .map_err(|_| AppError::internal("accounts_rename_upstream_account_1"))?;
         let current_updated_at: i64 = current.try_get("updated_at")?;
         if current_updated_at != expected_updated_at {
             return Err(AppError::Conflict(
@@ -545,14 +549,15 @@ impl Database {
             input
                 .config
                 .as_object_mut()
-                .ok_or(AppError::Internal)?
+                .ok_or(AppError::internal("accounts_update_upstream_account_1"))?
                 .insert(stamp_key.into(), stamp.clone());
         } else if input.config.get(stamp_key).is_some() {
             return Err(AppError::BadRequest(
                 "transport proxy binding is managed separately".into(),
             ));
         }
-        let config_json = serde_json::to_string(&input.config).map_err(|_| AppError::Internal)?;
+        let config_json = serde_json::to_string(&input.config)
+            .map_err(|_| AppError::internal("accounts_update_upstream_account_1"))?;
         #[cfg(test)]
         self.pause_oauth_refresh_write_phase(
             account_id,
@@ -1154,7 +1159,8 @@ pub(super) fn upstream_account_view(
         auth_kind,
         credential_generation: row.try_get("credential_generation")?,
         status: row.try_get("status")?,
-        config: serde_json::from_str(&config_json).map_err(|_| AppError::Internal)?,
+        config: serde_json::from_str(&config_json)
+            .map_err(|_| AppError::internal("accounts_upstream_account_view_1"))?,
         credential_expires_at: row.try_get("expires_at")?,
         has_proxy: false,
         proxy_scheme: None,
@@ -1431,7 +1437,7 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(AppError::Internal)),
+            matches!(result, Err(AppError::Internal { .. })),
             "the real no-op mutation must encounter the competing writer at BEGIN IMMEDIATE"
         );
 

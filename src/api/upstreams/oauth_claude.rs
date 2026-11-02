@@ -380,11 +380,9 @@ mod tests {
             .await
             .expect("start response body");
         let start: Value = serde_json::from_slice(&bytes).expect("start response JSON");
-        let pepper = state.config.key_pepper.as_bytes();
-        let token: Value = crate::provider::open_private_json(
+        let _pepper = state.config.key_pepper.as_bytes();
+        let token: Value = crate::plain_json::decode_handle(
             start["session_token"].as_str().expect("session token"),
-            pepper,
-            claude::SESSION_AAD,
         )
         .expect("session token opens");
         let reference = OAuthLoginSessionReference {
@@ -412,8 +410,7 @@ mod tests {
             panic!("pending login session must be claimable");
         };
         let session: Value =
-            crate::provider::open_private_json(&state_ciphertext, pepper, claude::STATE_AAD)
-                .expect("login state opens");
+            crate::plain_json::decode_handle(&state_ciphertext).expect("login state opens");
         session
             .get("proxy_url")
             .and_then(Value::as_str)

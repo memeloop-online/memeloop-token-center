@@ -21,6 +21,10 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
         )
         .route("/self/v1/stats", get(self_stats))
         .route("/self/v1/usage-analysis", get(self_usage_analysis))
+        .route(
+            "/self/v1/sessions/analyze",
+            post(session_tasks::self_analyze),
+        )
         .route("/self/v1/generations", get(self_generations))
         .route(
             "/self/v1/generations/{job_id}",
@@ -40,6 +44,10 @@ pub(in crate::api) fn gateway_router(state: AppState) -> Router<AppState> {
         .route(
             "/self/v1/sessions/{session_id}/requests/{request_id}/context",
             get(self_session_context),
+        )
+        .route(
+            "/self/v1/sessions/{session_id}/requests/{request_id}/dialogue",
+            get(self_session_dialogue),
         )
         .route(
             "/self/v1/sessions/{session_id}/requests/{request_id}/context/content",

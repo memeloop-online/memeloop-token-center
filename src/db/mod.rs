@@ -44,7 +44,7 @@ use crate::{
     },
     provider::{
         ModelRouteView, ResolvedUpstream, UpstreamAccountView, UpstreamCredential, open_credential,
-        open_private_json, seal_credential, seal_private_json, validate_config,
+        seal_credential, validate_config,
     },
 };
 
@@ -62,9 +62,11 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
+pub(crate) mod plugin_background_actions;
 mod plugin_configurations;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installations;
@@ -78,6 +80,7 @@ mod plugin_revisions;
 mod plugin_service_data;
 mod projection_lock;
 mod providers;
+mod request_history;
 mod requests;
 pub(crate) use requests::EarlyRequestTerminal;
 #[allow(unused_imports)] // Consumed by the separately owned API receipt integration.
@@ -98,18 +101,22 @@ mod session_responses;
 pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
 pub(crate) use session_responses::SessionResponseTask;
 mod session_projection;
+pub(crate) mod session_tasks;
 mod session_titles;
 pub(crate) use session_titles::{
     SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
 };
+pub(crate) mod network_proxies;
 mod tenants;
-mod transport_proxy_groups;
+pub(crate) mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
+pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
-mod upstream_service_probes;
+pub(crate) mod upstream_service_probes;
+pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
 mod usage_analysis;
 mod validation;
 
@@ -210,19 +217,22 @@ pub use requests::{
     ProxyConversationInput, RequestListFilter, StartMeteredSynchronousRequest, StartProxyRequest,
     StatsFilter, normalize_proxy_usage,
 };
+#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use requests::{
-    ConversationObservationInput, MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution,
-    SessionRoutingTerminalInput, SwitchProxyCandidateInput, allocate_request_event_cursor,
-    attach_conversation_upstream_response_in_transaction, is_session_avoid_terminal,
-    normalize_proxy_usage_with_output_limit, price_token_usage,
-    record_request_finished_in_transaction, record_request_started_in_transaction,
-    reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
-    validate_numeric_range,
+    ConversationObservationInput, attach_conversation_upstream_response_in_transaction,
 };
 #[cfg(test)]
 pub(crate) use requests::{
     FILTERED_ACTIVITY_SOURCE_FACTS, FILTERED_ACTIVITY_SOURCE_PENDING,
     FILTERED_ACTIVITY_SOURCE_ROLLUPS,
+};
+pub(crate) use requests::{
+    MAX_STATS_RANGE_MILLIS, ProxyRequestUpstreamAttribution, SessionRoutingTerminalInput,
+    SwitchProxyCandidateInput, allocate_request_event_cursor, is_session_avoid_terminal,
+    normalize_proxy_usage_with_output_limit, price_token_usage,
+    record_request_finished_in_transaction, record_request_started_in_transaction,
+    reserve_usage_in_transaction, search_prefix, settle_token_usage_in_transaction,
+    validate_numeric_range,
 };
 #[cfg(test)]
 pub(crate) use requests::{
@@ -248,6 +258,7 @@ pub use usage_analysis::{
 
 #[derive(Clone)]
 pub struct Database {
+    pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
     pool_role: &'static str,
     backend: DatabaseBackend,
@@ -437,7 +448,9 @@ impl Database {
             .await
             .map_err(|error| match error {
                 DatabaseReadinessError::Dependency(error) => error,
-                DatabaseReadinessError::SchemaOutdated(_) => AppError::Internal,
+                DatabaseReadinessError::SchemaOutdated(_) => {
+                    AppError::internal("db_mod_readiness_check_1")
+                }
             })
     }
 
@@ -569,7 +582,9 @@ impl Database {
     }
 
     pub(crate) async fn close(&self) {
-        self.gateway_persistence.pool.close().await;
+        if self.pool_role != "independent_persistence" {
+            self.gateway_persistence.pool.close().await;
+        }
         self.pool.close().await;
     }
 
@@ -652,6 +667,7 @@ impl Database {
                 .await?;
         }
         Ok(Self {
+            http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
                 database_url.as_ref(),
                 backend,
@@ -725,6 +741,7 @@ impl Database {
 
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
+            http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
             pool: self
@@ -738,6 +755,12 @@ impl Database {
             terminal_projection_enabled: self.terminal_projection_enabled,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn refresh_closed_persistence_pool(&mut self) {
+        if self.pool_role == "independent_persistence" && self.pool.is_closed() {
+            *self = self.independent_persistence_pool();
         }
     }
 

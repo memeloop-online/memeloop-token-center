@@ -23,7 +23,7 @@ const ASSET_DOWNLOAD_CHUNK_BYTES = 256 * 1024;
 // The gateway's generic reqwest pool retires idle connections after 30 seconds.
 // Keep the in-process benchmark upstream alive well beyond that boundary so
 // the memory gate measures the service rather than Node's shorter defaults.
-const MOCK_KEEP_ALIVE_TIMEOUT_MS = 120_000;
+const MOCK_KEEP_ALIVE_TIMEOUT_MS = 0;
 const MOCK_KEEP_ALIVE_TIMEOUT_BUFFER_MS = 5_000;
 const MOCK_HEADERS_TIMEOUT_MS = 130_000;
 const MOCK_REQUEST_TIMEOUT_MS = 300_000;

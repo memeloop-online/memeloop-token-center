@@ -1501,7 +1501,7 @@ async fn explicit_compaction_with_retained_content_links_but_weak_similarity_doe
 }
 
 #[tokio::test]
-async fn out_of_order_explicit_session_merges_without_reversing_ancestry() {
+async fn out_of_order_explicit_session_merges_without_reversing_admission_ancestry() {
     let fixture = Fixture::new("future-compaction").await;
     let session_hints = ConversationHints {
         session_id: Some("archive-thread".into()),
@@ -1525,10 +1525,9 @@ async fn out_of_order_explicit_session_merges_without_reversing_ancestry() {
         .await
         .expect("record future full-context observation");
 
-    // Archive rows are applied in completed-at order but observations use the
-    // source started-at timestamp. Model that inversion explicitly: the row
-    // already present in the database occurred after the observation that will
-    // be recorded next.
+    // Native ancestry follows admission time even when asynchronous observation
+    // timestamps arrive out of order. The first request was admitted first;
+    // moving its observation into the future must not reverse that ancestry.
     let future_observed_at = chrono::Utc::now().timestamp_millis() + 60_000;
     sqlx::query("UPDATE conversation_observations SET created_at = $1 WHERE request_id = $2")
         .bind(future_observed_at)
@@ -1576,12 +1575,29 @@ async fn out_of_order_explicit_session_merges_without_reversing_ancestry() {
     .expect("count inverse-order explicit session members");
     assert_eq!(session_members, 2);
     let reversed_edges: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations source ON source.id = e.from_observation_id JOIN conversation_observations target ON target.id = e.to_observation_id WHERE source.created_at > target.created_at",
+        "SELECT COUNT(*) FROM conversation_edges e JOIN conversation_observations source ON source.id = e.from_observation_id JOIN conversation_observations target ON target.id = e.to_observation_id JOIN request_record_locators source_request ON source_request.id = source.request_id JOIN request_record_locators target_request ON target_request.id = target.request_id WHERE e.cluster_id = $1 AND source_request.created_at > target_request.created_at",
     )
+    .bind(future_cluster.to_string())
     .fetch_one(&fixture.pool)
     .await
     .expect("count temporally reversed conversation edges");
     assert_eq!(reversed_edges, 0);
+    let edges: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT source.request_id, target.request_id, e.relation_kind FROM conversation_edges e JOIN conversation_observations source ON source.id = e.from_observation_id JOIN conversation_observations target ON target.id = e.to_observation_id WHERE e.cluster_id = $1",
+    )
+    .bind(future_cluster.to_string())
+    .fetch_all(&fixture.pool)
+    .await
+    .expect("load admission-ordered compaction edge");
+    assert_eq!(
+        edges,
+        vec![(
+            future_request.to_string(),
+            compacted_request.to_string(),
+            "compacts".to_owned(),
+        )],
+        "the explicit compaction must keep its admitted parent"
+    );
 }
 
 #[tokio::test]

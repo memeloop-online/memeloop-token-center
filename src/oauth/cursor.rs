@@ -12,7 +12,8 @@ use crate::{
     db::{BeginOAuthLoginSession, Database, OAuthLoginClaim, OAuthLoginSessionReference},
     error::AppError,
     network::{self, OutboundScope},
-    provider::{ProviderCatalog, UpstreamCredential, open_private_json, seal_private_json},
+    plain_json::{decode_handle, encode_handle},
+    provider::{ProviderCatalog, UpstreamCredential},
 };
 
 use super::{
@@ -23,9 +24,6 @@ use super::{
     validate_oauth_login_config,
 };
 
-const CURSOR_SESSION_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-session/v2";
-const CURSOR_STATE_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-state/v2";
-const CURSOR_READY_AAD: &[u8] = b"memeloop-token-center/cursor-oauth-ready/v2";
 const CURSOR_ADAPTER_SCHEMA: &str = "cursor-oauth-v1";
 const MAX_CURSOR_IDENTITY_BYTES: usize = 512;
 const MAX_CURSOR_TOKEN_BYTES: usize = 128 * 1024;
@@ -191,7 +189,7 @@ pub async fn start_cursor_login(
     db: &Database,
     input: StartCursorLogin,
     operator_service_id: Option<Uuid>,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
 ) -> Result<OAuthLoginStart, AppError> {
     if input.account_name.trim().is_empty()
@@ -242,7 +240,7 @@ pub async fn start_cursor_login(
         )
     };
     let mut verifier_bytes = [0_u8; 32];
-    fill(&mut verifier_bytes).map_err(|_| AppError::Internal)?;
+    fill(&mut verifier_bytes).map_err(|_| AppError::internal("cursor_start_cursor_login_1"))?;
     let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
     let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let uuid = Uuid::now_v7().to_string();
@@ -293,12 +291,12 @@ pub async fn start_cursor_login(
         .to_owned(),
         tenant_external_id: state.tenant_external_id.clone(),
         operator_service_id,
-        state_ciphertext: super::seal_oauth_login_state(&state, key_material, CURSOR_STATE_AAD)?,
+        state_ciphertext: super::seal_oauth_login_state(&state)?,
         next_poll_at: now,
         expires_at,
     })
     .await?;
-    let session_token = seal_private_json(&session, key_material, CURSOR_SESSION_AAD)?;
+    let session_token = encode_handle(&session)?;
     Ok(OAuthLoginStart {
         driver: oauth_driver,
         login_url: login_url.to_string(),
@@ -320,13 +318,12 @@ pub struct CursorPollAuthority<'a> {
 
 pub(crate) fn cursor_login_application_revision(
     session_token: &str,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     authority: CursorPollAuthority<'_>,
 ) -> Result<Option<i64>, AppError> {
-    let session: CursorLoginSessionToken =
-        open_private_json(session_token, key_material, CURSOR_SESSION_AAD)
-            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    let session: CursorLoginSessionToken = decode_handle(session_token)
+        .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if authority
         .required_tenant
         .is_some_and(|tenant| tenant != session.tenant_external_id)
@@ -349,15 +346,14 @@ pub(crate) fn cursor_login_application_revision(
 pub async fn poll_cursor_login(
     db: &Database,
     providers: &ProviderCatalog,
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     session_token: &str,
-    key_material: &[u8],
+    _key_material: &[u8],
     now: i64,
     authority: CursorPollAuthority<'_>,
 ) -> Result<CursorPollResult, AppError> {
-    let session: CursorLoginSessionToken =
-        open_private_json(session_token, key_material, CURSOR_SESSION_AAD)
-            .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
+    let session: CursorLoginSessionToken = decode_handle(session_token)
+        .map_err(|_| AppError::BadRequest("invalid OAuth session token".into()))?;
     if authority
         .required_tenant
         .is_some_and(|tenant| tenant != session.tenant_external_id)
@@ -393,8 +389,7 @@ pub async fn poll_cursor_login(
             lease_owner,
             ready_ciphertext,
         } => {
-            let login: ReadyCursorLogin =
-                open_private_json(&ready_ciphertext, key_material, CURSOR_READY_AAD)?;
+            let login: ReadyCursorLogin = decode_handle(&ready_ciphertext)?;
             if login.application_plugin_revision != session.application_plugin_revision {
                 return Err(AppError::Forbidden);
             }
@@ -416,11 +411,7 @@ pub async fn poll_cursor_login(
             state_ciphertext,
         } => (
             lease_owner,
-            open_private_json::<CursorLoginState>(
-                &state_ciphertext,
-                key_material,
-                CURSOR_STATE_AAD,
-            )?,
+            decode_handle::<CursorLoginState>(&state_ciphertext)?,
         ),
     };
     if state.application_plugin_revision != session.application_plugin_revision {
@@ -461,7 +452,7 @@ pub async fn poll_cursor_login(
         .await?
     } else {
         network::client_for_url(
-            http,
+            &crate::http_settings::scoped(http, crate::http_settings::HttpPurpose::Oauth),
             poll_url.as_str(),
             scope,
             authority.allow_test_loopback,
@@ -496,10 +487,10 @@ pub async fn poll_cursor_login(
         let _ = db
             .release_oauth_login_poll(state.session_id, lease_owner, now)
             .await;
-        return Err(AppError::Upstream(format!(
-            "Cursor OAuth poll returned {}",
-            status
-        )));
+        return Err(AppError::upstream_status(
+            "cursor_oauth_poll_returned",
+            status.as_u16(),
+        ));
     }
     let body = match bounded_body(response).await {
         Ok(body) => body,
@@ -511,10 +502,11 @@ pub async fn poll_cursor_login(
         }
     };
     let tokens: CursorTokens = serde_json::from_slice(&body)
-        .map_err(|_| AppError::Upstream("Cursor OAuth returned invalid JSON".into()))?;
+        .map_err(|_| AppError::upstream("cursor_oauth_returned_invalid_json"))?;
     if tokens.access_token.is_empty() {
-        return Err(AppError::Upstream(
-            "Cursor OAuth returned an empty access token".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("cursor_poll_cursor_login"),
         ));
     }
     let expires_at = token_expiry_millis(&tokens.access_token)
@@ -534,7 +526,7 @@ pub async fn poll_cursor_login(
                 schema: CURSOR_ADAPTER_SCHEMA.to_owned(),
                 account_id,
             })
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("cursor_site_1"))?,
         )
     } else {
         None
@@ -560,24 +552,15 @@ pub async fn poll_cursor_login(
         },
         reauthorize: state.reauthorize,
     };
-    db.stage_oauth_login_ready(
-        ready.session_id,
-        lease_owner,
-        seal_private_json(&ready, key_material, CURSOR_READY_AAD)?,
-        now,
-    )
-    .await?;
+    db.stage_oauth_login_ready(ready.session_id, lease_owner, encode_handle(&ready)?, now)
+        .await?;
     match db.claim_oauth_login_poll(&reference, now, 1).await? {
         OAuthLoginClaim::Ready {
             lease_owner,
             ready_ciphertext,
         } => Ok(CursorPollResult::Ready {
             lease_owner,
-            login: Box::new(open_private_json(
-                &ready_ciphertext,
-                key_material,
-                CURSOR_READY_AAD,
-            )?),
+            login: Box::new(decode_handle(&ready_ciphertext)?),
         }),
         OAuthLoginClaim::Consumed { account_id } => Ok(CursorPollResult::Consumed {
             account_id,
@@ -588,12 +571,12 @@ pub async fn poll_cursor_login(
         } => Ok(CursorPollResult::Pending {
             retry_after_seconds,
         }),
-        OAuthLoginClaim::Claimed { .. } => Err(AppError::Internal),
+        OAuthLoginClaim::Claimed { .. } => Err(AppError::internal("cursor_site_1")),
     }
 }
 
 pub async fn refresh_cursor_credential(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     refresh_url: &str,
     credential: &UpstreamCredential,
     now: i64,
@@ -611,30 +594,36 @@ pub async fn refresh_cursor_credential(
     };
     let refresh_url =
         validate_oauth_endpoint_with_scope(refresh_url, "refresh_url", configured_scope)?;
+    let http = http.http_client(crate::http_settings::ClientOptions {
+        purpose: Some(crate::http_settings::HttpPurpose::Oauth),
+        no_retry: true,
+        ..Default::default()
+    })?;
     let request = http
         .post(refresh_url.as_str())
         .bearer_auth(refresh_token)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body("{}")
         .build()
-        .map_err(|_| AppError::Upstream("Cursor OAuth refresh failed".into()))?;
+        .map_err(|_| AppError::upstream("cursor_oauth_refresh_failed"))?;
     request_guard.mark_request_started().await?;
     let response = http
         .execute(request)
         .await
-        .map_err(|_| AppError::Upstream("Cursor OAuth refresh failed".into()))?;
+        .map_err(|_| AppError::upstream("cursor_oauth_refresh_failed"))?;
     if !response.status().is_success() {
-        return Err(AppError::Upstream(format!(
-            "Cursor OAuth refresh returned {}",
-            response.status()
-        )));
+        return Err(AppError::upstream_status(
+            "cursor_oauth_refresh_returned",
+            response.status().as_u16(),
+        ));
     }
     let body = bounded_body(response).await?;
     let tokens: CursorTokens = serde_json::from_slice(&body)
-        .map_err(|_| AppError::Upstream("Cursor OAuth refresh returned invalid JSON".into()))?;
+        .map_err(|_| AppError::upstream("cursor_oauth_refresh_returned_invalid_json"))?;
     if tokens.access_token.is_empty() {
-        return Err(AppError::Upstream(
-            "Cursor OAuth refresh returned an empty access token".into(),
+        return Err(AppError::upstream_with(
+            "upstream_unavailable",
+            crate::error::ErrorFacts::new().stage("cursor_refresh_cursor_credential"),
         ));
     }
     let expires_at = token_expiry_millis(&tokens.access_token)
@@ -669,7 +658,7 @@ pub async fn refresh_cursor_credential(
                 schema: CURSOR_ADAPTER_SCHEMA.to_owned(),
                 account_id,
             })
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("cursor_refresh_cursor_credential_1"))?,
         ),
         None => credential.adapter_state().cloned(),
     };
@@ -833,7 +822,7 @@ fn cursor_identity_error() -> AppError {
 }
 
 fn cursor_identity_upstream_error() -> AppError {
-    AppError::Upstream("Cursor OAuth did not return a stable account identity".into())
+    AppError::upstream("cursor_oauth_did_not_return_a_stable_account_identity")
 }
 
 #[cfg(test)]
@@ -968,7 +957,7 @@ mod tests {
         let rendered = error.to_string();
         assert_eq!(
             rendered,
-            "configured upstream is unavailable: Cursor OAuth did not return a stable account identity"
+            "configured upstream is unavailable: cursor_oauth_did_not_return_a_stable_account_identity"
         );
         for secret in [
             opaque_secret,

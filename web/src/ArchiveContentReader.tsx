@@ -133,11 +133,11 @@ export function ArchiveContentReader({ request, sessionId, side, loadRange, rend
   }
 
   if (!opened) return <section className="archive-content-reader collapsed" aria-label={t('sessionReplay.content')}>
-    <Button appearance="primary" onClick={() => void readPage(0)}>{t('sessionReplay.readFullSide', { side: t(side === 'request' ? 'request.request' : 'request.response') })}</Button>
+    <Button appearance="primary" onClick={() => void readPage(0)}>{t('sessionReplay.readFullSide', { side: t(side === 'request' ? 'request.rawRequestJson' : 'request.rawReturnJson') })}</Button>
   </section>;
   return <section className="archive-content-reader" aria-label={t('sessionReplay.content')} aria-busy={loading}>
     <header className="archive-content-reader-header">
-      <b>{t(side === 'request' ? 'request.request' : 'request.response')}</b>
+      <b>{t(side === 'request' ? 'request.rawRequestJson' : 'request.rawReturnJson')}</b>
       <span className="mtc-loading-counter">{loading ? t('sessionReplay.readBytes', { loaded: progress.loaded.toLocaleString(), total: progress.total > 0 ? progress.total.toLocaleString() : '…' }) : ''}</span>
       <Button appearance="subtle" onClick={() => { controller.current?.abort(); cursor.current = undefined; setLoading(false); setOpened(false); setError(''); setPage({ key, loader: loadRange, offset: 0, items: [], done: false }); setProgress({ loaded: 0, total: 0 }); }}>{t('common.close')}</Button>
     </header>

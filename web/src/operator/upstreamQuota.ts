@@ -185,7 +185,7 @@ export function quotaCreditPresentation(snapshot: UpstreamQuotaSnapshot, locale:
   return {
     state,
     message: prefix + message,
-    explanation: zh ? '额外点数与套餐窗口分别统计；单位未说明，不代表请求一定可用。' : 'Extra credits are separate from plan windows; units are unspecified and requests are not guaranteed.',
+    explanation: zh ? '额外点数和套餐窗口分开统计。单位尚未说明。能否发起请求，以路由和账号状态为准。' : 'Extra credits are counted apart from plan windows. The unit is not stated yet. Whether a request can be sent depends on the route and account.',
   };
 }
 
@@ -317,7 +317,7 @@ function quotaPeriodKey(periodSeconds: number | null, role: string | undefined) 
  * Codex names durations from the supplier's window length (matching the official
  * Codex status surface); primary/secondary are only fallbacks when no duration exists.
  */
-export function quotaWindowPresentation(provider: string, window: UpstreamQuotaSnapshot['windows'][number]): QuotaWindowPresentation {
+export function quotaWindowPresentation(provider: string, window: Pick<UpstreamQuotaSnapshot['windows'][number], 'id' | 'label' | 'period_seconds'>): QuotaWindowPresentation {
   const match = /^([^:]+):(primary_window|secondary_window)$/.exec(window.id);
   const role = match?.[2];
   // Kimi's usages API defines `usage` (normalized id `summary`) as the

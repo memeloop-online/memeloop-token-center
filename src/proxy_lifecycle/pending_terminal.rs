@@ -19,6 +19,16 @@ use crate::{
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
+fn confirmed_not_executed(input: &FinishProxyRequest<'_>) -> bool {
+    use crate::model::{RequestTerminalCause, RequestUsageBasis};
+    matches!(
+        input.terminal_cause,
+        Some(RequestTerminalCause::GatewayPreAdmission)
+    ) && input.usage == TokenUsage::default()
+        && input.usage_basis == Some(RequestUsageBasis::NotObserved)
+        && (400..=599).contains(&input.status_code)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(remote = "UsageReservation")]
 struct ReservationWire {
@@ -246,7 +256,7 @@ impl Snapshot {
             "version": 1, "claim": self.claim, "receipt_id": self.receipt_id,
             "terminal": self.operational_terminal, "attribution": attribution,
         }))
-        .map_err(|_| crate::error::AppError::Internal)?;
+        .map_err(|_| crate::error::AppError::internal("pending_terminal_operational_digest_1"))?;
         Ok(blake3::hash(&bytes).to_hex().to_string())
     }
 
@@ -277,7 +287,9 @@ impl Snapshot {
                 ]
                 .into_iter()
                 .find(|cause| cause.as_str() == value.as_str())
-                .ok_or(crate::error::AppError::Internal)
+                .ok_or(crate::error::AppError::internal(
+                    "pending_terminal_terminal_1",
+                ))
             })
             .transpose()?;
         if self.version != 1
@@ -286,7 +298,9 @@ impl Snapshot {
                 .checked_add(self.output_token_ceiling)
                 != Some(self.reservation.reserved_tokens)
         {
-            return Err(crate::error::AppError::Internal);
+            return Err(crate::error::AppError::internal(
+                "pending_terminal_terminal_2",
+            ));
         }
         Ok(FinishProxyRequest {
             terminal_cause,
@@ -335,6 +349,8 @@ struct Pending {
     operational_reconcile: bool,
     preparation: Option<Preparation>,
     projection_retained: Option<Box<dyn Send>>,
+    /// 对话还在异步整理时，收据还不能对外比较。整理完才会带上 request_json。
+    conversation_pending: bool,
 }
 
 type Preparation =
@@ -345,6 +361,7 @@ pub(crate) struct Journal {
     pending: Mutex<HashMap<Uuid, Pending>>,
     claims: Mutex<HashMap<Uuid, ClaimState>>,
     wake: Notify,
+    progress: Notify,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tasks: Mutex<Vec<(Work, tokio::task::JoinHandle<()>)>>,
     #[cfg(test)]
@@ -374,6 +391,7 @@ impl Journal {
             pending: Mutex::new(HashMap::new()),
             claims: Mutex::new(HashMap::new()),
             wake: Notify::new(),
+            progress: Notify::new(),
             worker: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -391,6 +409,7 @@ impl Journal {
                 journal.start_operational(&database);
                 journal.start_pending(&database);
                 journal.start_unknown(&database);
+                journal.progress.notify_waiters();
                 tokio::select! {
                     _ = journal.wake.notified() => {},
                     _ = tokio::time::sleep(RETRY_INTERVAL) => {},
@@ -403,6 +422,44 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(worker);
         journal
+    }
+
+    pub(crate) async fn drain(&self) {
+        self.wake.notify_one();
+        loop {
+            let progress = self.progress.notified();
+            tokio::pin!(progress);
+            progress.as_mut().enable();
+            let drained = self
+                .pending
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .values()
+                .all(|entry| {
+                    entry.reconcile
+                        && !entry.running
+                        && !entry.operational_running
+                        && !entry.conversation_pending
+                        && (entry.snapshot.claim.is_none()
+                            || entry.operational_acknowledged
+                            || entry.operational_reconcile)
+                        && (!entry.unknown_annotated || entry.conversation_enqueued)
+                })
+                && self
+                    .claims
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty()
+                && self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .is_empty();
+            if drained {
+                return;
+            }
+            progress.await;
+        }
     }
 
     async fn reap(&self) {
@@ -469,18 +526,26 @@ impl Journal {
             .values_mut()
             .filter(|entry| entry.durable && entry.reconcile && !entry.running)
         {
-            let keep_unknown_evidence = entry.unknown_annotated
+            // An unknown receipt keeps its parsed conversation only while
+            // that is the sole copy: once the projection outbox row holds
+            // the payload, the evidence is durable and the compact disk
+            // receipt identifies the financial hold. Retaining the
+            // conversation after that is what made gateway memory grow
+            // without bound under quota-rejection traffic, and a restart
+            // already recovers from the conversation-less disk receipt, so
+            // nothing after enqueue may depend on the in-memory value.
+            let keep_unknown_conversation = entry.unknown_annotated
                 && entry.snapshot.claim.is_some()
                 && entry.snapshot.usage_basis
-                    != Some(crate::model::RequestUsageBasis::ProviderReported);
-            if !keep_unknown_evidence && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot) {
+                    != Some(crate::model::RequestUsageBasis::ProviderReported)
+                && !entry.conversation_enqueued;
+            if !keep_unknown_conversation && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot)
+            {
                 snapshot.conversation = None;
             }
             // The budgeted body can leave once its projection is durable.
             // Until then the permit stays with the unenqueued evidence.
-            // The conversation value itself stays: it is the receipt, not the
-            // budgeted buffer.
-            if !keep_unknown_evidence || entry.conversation_enqueued {
+            if !keep_unknown_conversation || entry.conversation_enqueued {
                 entry.projection_retained = None;
             }
         }
@@ -531,6 +596,7 @@ impl Journal {
                 operational_reconcile: false,
                 preparation: Some(Box::pin(preparation)),
                 projection_retained: None,
+                conversation_pending: true,
             },
         );
         tracing::info!(%request_id, %receipt_id, financial_state = "pending_unacknowledged", "terminal responsibility accepted in memory; journal durability not acknowledged");
@@ -571,11 +637,16 @@ impl Journal {
         let claim = snapshot
             .claim
             .as_ref()
-            .ok_or(crate::error::AppError::Internal)?;
-        let terminal = snapshot
-            .operational_terminal
-            .as_ref()
-            .ok_or(crate::error::AppError::Internal)?;
+            .ok_or(crate::error::AppError::internal(
+                "pending_terminal_record_operational_observation_1",
+            ))?;
+        let terminal =
+            snapshot
+                .operational_terminal
+                .as_ref()
+                .ok_or(crate::error::AppError::internal(
+                    "pending_terminal_record_operational_observation_2",
+                ))?;
         let expected_digest = snapshot.operational_digest()?;
         let ack = database
             .record_pending_proxy_operational_terminal(
@@ -781,6 +852,7 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .values()
+            .filter(|entry| !entry.conversation_pending)
             .filter_map(|entry| serde_json::to_value(entry.snapshot.as_ref()).ok())
             .collect()
     }
@@ -938,6 +1010,7 @@ impl Journal {
                     operational_reconcile: false,
                     preparation: None,
                     projection_retained: None,
+                    conversation_pending: false,
                 });
             }
         }
@@ -969,7 +1042,7 @@ impl Journal {
                     let claim = snapshot
                         .claim
                         .as_ref()
-                        .ok_or(crate::error::AppError::Internal)?;
+                        .ok_or(crate::error::AppError::internal("pending_terminal_start_operational_1"))?;
                     if !operational_acknowledged {
                         let terminal = snapshot.operational_terminal.as_ref().ok_or_else(|| {
                             crate::error::AppError::Conflict(
@@ -1088,6 +1161,7 @@ impl Journal {
                     {
                         entry.snapshot = prepared.clone();
                         entry.projection_retained = projection_retained;
+                        entry.conversation_pending = false;
                     }
                     prepared
                 } else {
@@ -1127,14 +1201,21 @@ impl Journal {
             let result = match snapshot.terminal() {
                 Ok(input) => {
                     if let Some(claim) = snapshot.claim.as_ref() {
-                        if input.usage_basis
-                            == Some(crate::model::RequestUsageBasis::ProviderReported)
-                        {
+                        let evidence = match input.usage_basis {
+                            Some(crate::model::RequestUsageBasis::ProviderReported) => {
+                                Some(crate::db::PendingProxySettlementEvidence::ProviderReported)
+                            }
+                            _ if confirmed_not_executed(&input) => Some(
+                                crate::db::PendingProxySettlementEvidence::ConfirmedNotExecuted,
+                            ),
+                            _ => None,
+                        };
+                        if let Some(evidence) = evidence {
                             database
                                 .finish_pending_proxy_settlement(
                                     claim,
                                     receipt_id,
-                                    crate::db::PendingProxySettlementEvidence::ProviderReported,
+                                    evidence,
                                     input,
                                     attribution,
                                 )
@@ -1152,7 +1233,9 @@ impl Journal {
                                             usage_invalid: false,
                                         }))
                                     } else {
-                                        Err(crate::error::AppError::Internal)
+                                        Err(crate::error::AppError::internal(
+                                            "pending_terminal_attempt_1",
+                                        ))
                                     }
                                 })
                         } else {

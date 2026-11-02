@@ -7,10 +7,14 @@ use std::{
 };
 
 use super::*;
+use portable_atomic::AtomicU128;
 
+mod entity_probe;
 mod managed;
 mod persistence;
 mod probe;
+pub(crate) mod strategy;
+mod strategy_runtime;
 #[cfg(test)]
 mod tests;
 
@@ -27,9 +31,9 @@ struct Group {
 struct Entry {
     group: Group,
     fingerprint: String,
-    state: AtomicU64,
-    persisted: AtomicU64,
-    durable: AtomicU64,
+    state: AtomicU128,
+    persisted: AtomicU128,
+    durable: AtomicU128,
     observed_generation: AtomicU64,
     blocked: AtomicBool,
     probe_url: std::sync::Mutex<Option<String>>,
@@ -48,41 +52,45 @@ struct Snapshot {
 }
 
 impl Snapshot {
-    fn decode(value: u64) -> Self {
+    fn decode(value: u128) -> Self {
         Self {
-            credential_generation: (value >> 32) as u32,
-            epoch: (value >> 4) & MAX_EPOCH,
-            base: ((value >> 2) & 3) as usize,
-            selected: (value & 3) as usize,
+            credential_generation: (value >> 96) as u32,
+            epoch: ((value >> 64) & u128::from(MAX_EPOCH)) as u64,
+            base: ((value >> 32) & u128::from(u32::MAX)) as usize,
+            selected: (value & u128::from(u32::MAX)) as usize,
         }
     }
 
-    fn encode(self) -> Result<u64, AppError> {
+    fn encode(self) -> Result<u128, AppError> {
         if self.credential_generation == 0
             || self.epoch == 0
             || self.epoch > MAX_EPOCH
-            || self.base > 3
-            || self.selected > 3
+            || self.base > u32::MAX as usize
+            || self.selected > u32::MAX as usize
         {
             return Err(unavailable());
         }
-        Ok((u64::from(self.credential_generation) << 32)
-            | (self.epoch << 4)
-            | ((self.base as u64) << 2)
-            | self.selected as u64)
+        Ok((u128::from(self.credential_generation) << 96)
+            | (u128::from(self.epoch) << 64)
+            | ((self.base as u128) << 32)
+            | self.selected as u128)
     }
 }
 
 pub(crate) struct TransportProxyGroups {
+    http_clients: Arc<crate::http_settings::HttpClientFactory>,
     groups: BTreeMap<Uuid, Arc<Entry>>,
     managed: std::sync::RwLock<BTreeMap<Uuid, managed::ManagedEntry>>,
+    probe_permits: Arc<tokio::sync::Semaphore>,
+    entity_probe_inflight: std::sync::Mutex<std::collections::BTreeSet<(Uuid, i64)>>,
+    strategy_status: std::sync::RwLock<BTreeMap<Uuid, Value>>,
     key: Vec<u8>,
 }
 
 pub(crate) struct ProxySelection {
     pub(crate) credential: UpstreamCredential,
     pub(crate) generation: i64,
-    ticket: Option<(Arc<Entry>, u64)>,
+    ticket: Option<(Arc<Entry>, u128)>,
     member_override: Option<usize>,
     egress_members: Vec<egress::SelectedEgress>,
 }
@@ -92,6 +100,14 @@ fn unavailable() -> AppError {
 }
 
 impl TransportProxyGroups {
+    pub(crate) fn with_http_clients(
+        mut self,
+        factory: Arc<crate::http_settings::HttpClientFactory>,
+    ) -> Self {
+        self.http_clients = factory;
+        self
+    }
+
     pub(crate) fn parse(input: &str, key: &[u8]) -> Result<Self, AppError> {
         if input.len() > 256 * 1024 {
             return Err(unavailable());
@@ -102,7 +118,7 @@ impl TransportProxyGroups {
         }
         let mut groups = BTreeMap::new();
         for group in values {
-            if group.version <= 0 || !(1..=4).contains(&group.proxies.len()) {
+            if group.version <= 0 || group.proxies.is_empty() {
                 return Err(unavailable());
             }
             for (index, proxy) in group.proxies.iter().enumerate() {
@@ -117,9 +133,9 @@ impl TransportProxyGroups {
             let entry = Arc::new(Entry {
                 group,
                 fingerprint,
-                state: AtomicU64::new(0),
-                persisted: AtomicU64::new(0),
-                durable: AtomicU64::new(0),
+                state: AtomicU128::new(0),
+                persisted: AtomicU128::new(0),
+                durable: AtomicU128::new(0),
                 observed_generation: AtomicU64::new(0),
                 blocked: AtomicBool::new(false),
                 probe_url: std::sync::Mutex::new(None),
@@ -133,8 +149,12 @@ impl TransportProxyGroups {
             }
         }
         Ok(Self {
+            http_clients: Arc::default(),
             groups,
             managed: std::sync::RwLock::new(BTreeMap::new()),
+            probe_permits: Arc::new(tokio::sync::Semaphore::new(4)),
+            entity_probe_inflight: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            strategy_status: std::sync::RwLock::new(BTreeMap::new()),
             key: key.to_vec(),
         })
     }
@@ -419,7 +439,7 @@ impl Entry {
 
     /// Move the sticky exit after an independent probe failed. A customer
     /// request never calls this.
-    pub(super) fn advance_after_probe(&self, state: u64) -> bool {
+    pub(super) fn advance_after_probe(&self, state: u128) -> bool {
         if state == 0 || self.blocked.load(Ordering::Acquire) {
             return false;
         }

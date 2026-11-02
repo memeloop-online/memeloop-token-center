@@ -4,6 +4,8 @@ mod config_secret_graph;
 mod config_secret_paths;
 mod config_secrets;
 mod health;
+#[cfg(test)]
+pub(in crate::api) use health::run_upstream_service_probe;
 mod models;
 mod native_cursor_import;
 mod native_oauth_import;
@@ -50,7 +52,7 @@ pub(in crate::api) use quota::{
     confirm_quota_reset, current_quota_reset, get_quota_reset, prepare_quota_reset,
     reconcile_quota_reset,
 };
-pub(in crate::api) use quota::{upstream_quota, upstream_quota_batch};
+pub(in crate::api) use quota::{upstream_quota, upstream_quota_batch, upstream_quota_windows};
 
 pub(in crate::api) use oauth::{
     disconnect_upstream_oauth, poll_codex_oauth, poll_cursor_oauth, refresh_upstream_oauth,

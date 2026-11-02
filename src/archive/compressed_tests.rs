@@ -184,7 +184,7 @@ async fn compressed_writer_rejects_double_suffix_and_shared_cas_finish() {
     writer.write(Bytes::from_static(b"content")).await.unwrap();
     assert!(matches!(
         writer.finish().await,
-        Err(crate::error::AppError::Storage(_))
+        Err(crate::error::AppError::Storage { .. })
     ));
     // No staged object was committed and no CAS copy was published. This
     // asserts completed-object state, not timing of the detached abort task.

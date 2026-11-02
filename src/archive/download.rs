@@ -62,9 +62,7 @@ pub(super) fn validate_download_range(
         || expected.end > object_size
         || *returned != expected
     {
-        return Err(AppError::Storage(
-            "archive download range mismatch".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     Ok(expected.end - expected.start)
 }

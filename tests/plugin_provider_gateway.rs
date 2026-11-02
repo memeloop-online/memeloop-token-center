@@ -21,6 +21,7 @@ use memeloop_token_center::{
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::{
     net::TcpListener,
     sync::{oneshot, watch},
@@ -163,7 +164,7 @@ async fn oauth_only_provider_rejects_raw_oauth_on_the_direct_creation_api() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"]["code"], "invalid_request");
     assert!(
-        error["error"]["message"]
+        error["error"]["message_en"]
             .as_str()
             .is_some_and(|message| message.contains("authorization flow"))
     );
@@ -339,6 +340,12 @@ async fn component_provider_fixture(
 #[tokio::test]
 async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_secrets_billing_and_archive()
  {
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_env_filter("memeloop_token_center::response_archive_spool=warn")
+            .with_test_writer()
+            .finish(),
+    );
     let mock = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/vendor/infer"))
@@ -459,6 +466,9 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         .unwrap();
     assert_eq!(exact_account.summary.total_requests, 2);
 
+    let inspection = sqlx::AnyPool::connect(&state.config.database_url)
+        .await
+        .unwrap();
     for request in requests {
         let refs = state
             .db
@@ -466,9 +476,30 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .await
             .unwrap();
         let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-        assert!(refs.request_object.starts_with(&cas_prefix));
+        assert_eq!(
+            refs.request_object,
+            format!(
+                "staging/proxy/{0}/request/{0}/body.json",
+                request.request_id
+            )
+        );
         let response_object = refs.response_object.as_deref().unwrap();
-        assert!(response_object.starts_with(&cas_prefix));
+        assert!(
+            response_object.starts_with(&cas_prefix)
+                || response_object
+                    .starts_with(&format!("staging/proxy/{}/response/", request.request_id))
+        );
+        let bound: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM response_archive_spools s JOIN request_records r ON r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id WHERE r.id = $1 AND r.key_id = $2 AND r.tenant_id = $3 AND s.state = 'bound' AND s.bound_locator = $4 AND r.response_object = $4",
+        )
+        .bind(request.request_id.to_string())
+        .bind(key.key_id.to_string())
+        .bind(key.tenant_id.to_string())
+        .bind(response_object)
+        .fetch_one(&inspection)
+        .await
+        .unwrap();
+        assert_eq!(bound, 1);
         let archived_request = state
             .archive
             .get_bounded(&refs.request_object, 1024 * 1024)
@@ -479,7 +510,15 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .get_bounded(response_object, 1024 * 1024)
             .await
             .unwrap();
-        assert!(String::from_utf8_lossy(&archived_request).contains("requested-model"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&archived_request).unwrap(),
+            json!({
+                "model": "requested-model",
+                "messages": [{"role": "user", "content": "canonical"}],
+                "stream": false,
+                "max_tokens": 32
+            })
+        );
         assert_eq!(
             serde_json::from_slice::<Value>(&archived_response).unwrap()["choices"][0]["message"]["content"],
             "normalized by component"
@@ -492,6 +531,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         assert!(!combined.contains("component-api-secret"));
         assert!(!combined.contains("component-api-secret-rotated"));
     }
+    inspection.close().await;
 }
 
 #[tokio::test]
@@ -587,9 +627,11 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
     assert_eq!(response.status(), StatusCode::OK);
 
     let mut pending = request_ids.to_vec();
+    let mut archive_events_pending = request_ids.to_vec();
     let mut financial_pending = request_ids.to_vec();
+    let mut observed = Vec::new();
     let mut stream = response.into_body().into_data_stream();
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut buffered = String::new();
         while let Some(chunk) = stream.next().await {
             buffered.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
@@ -611,21 +653,77 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
                 else {
                     continue;
                 };
-                if event["event_kind"] == "archive_bound" && event["archive_state"] == "bound" {
+                if request_ids.contains(&request_id) {
+                    observed.push(json!({
+                        "request_id": request_id,
+                        "event_id": event["event_id"],
+                        "event_at": event["event_at"],
+                        "event_kind": event["event_kind"],
+                        "archive_state": event["archive_state"],
+                    }));
+                }
+                if event["event_kind"] == "archive_bound" {
+                    archive_events_pending.retain(|candidate| *candidate != request_id);
+                }
+                if event["archive_state"] == "bound" {
                     pending.retain(|candidate| *candidate != request_id);
                 }
                 if event["event_kind"] == "finished" {
                     financial_pending.retain(|candidate| *candidate != request_id);
                 }
-                if pending.is_empty() && financial_pending.is_empty() {
+                if pending.is_empty()
+                    && archive_events_pending.is_empty()
+                    && financial_pending.is_empty()
+                {
                     return;
                 }
             }
         }
     })
-    .await
-    .expect("plugin requests reached financial completion and bound archives");
+    .await;
+    if result.is_err() {
+        eprintln!("plugin completion observed events: {observed:?}");
+        let diagnostic = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let pool = sqlx::AnyPool::connect(&state.config.database_url)
+                .await
+                .unwrap();
+            let mut spools = Vec::new();
+            for request_id in request_ids {
+                let rows = sqlx::query(
+                    "SELECT 'request' AS purpose, state, attempts, next_attempt_at, last_error_code, byte_count FROM request_archive_spools WHERE request_id = $1 UNION ALL SELECT 'response' AS purpose, state, attempts, next_attempt_at, last_error_code, byte_count FROM response_archive_spools WHERE request_id = $1",
+                )
+                .bind(request_id.to_string())
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+                for row in rows {
+                    spools.push(json!({
+                        "request_id": request_id,
+                        "observed_at": unix_millis(),
+                        "purpose": row.get::<String, _>("purpose"),
+                        "state": row.get::<String, _>("state"),
+                        "attempts": row.get::<i64, _>("attempts"),
+                        "next_attempt_at": row.get::<i64, _>("next_attempt_at"),
+                        "last_error_code": row.get::<Option<String>, _>("last_error_code"),
+                        "byte_count": row.get::<i64, _>("byte_count"),
+                    }));
+                }
+            }
+            pool.close().await;
+            spools
+        })
+        .await;
+        eprintln!("plugin completion spools after timeout: {diagnostic:?}");
+    }
+    assert!(
+        result.is_ok(),
+        "plugin completion barrier: unbound={pending:?}, missing_archive_events={archive_events_pending:?}, missing_financial_events={financial_pending:?}"
+    );
     assert!(pending.is_empty(), "missing archive bindings: {pending:?}");
+    assert!(
+        archive_events_pending.is_empty(),
+        "missing archive events: {archive_events_pending:?}"
+    );
     assert!(
         financial_pending.is_empty(),
         "missing financial completions: {financial_pending:?}"

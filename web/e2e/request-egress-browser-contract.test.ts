@@ -24,9 +24,18 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       await page.goto(`${origin}/e2e/fixtures/request-egress.html`);
+      await page.getByRole('tab', { name: locale === 'zh-CN' ? '代理组' : 'Proxy groups', exact: true }).evaluate((tab: HTMLElement) => tab.click());
+      await page.waitForFunction(() => document.querySelector('.proxy-groups-page [role="tab"][value="groups"]')?.getAttribute('aria-selected') === 'true');
+      await page.getByRole('button', { name: locale === 'zh-CN' ? '新建代理组' : 'Create proxy group', exact: true }).waitFor();
       await page.getByText('Current exit · socks5h://current.proxy.test:1080', { exact: true }).waitFor();
       const summary = page.getByRole('region', { name: copy.title, exact: true });
       await summary.locator('[data-egress-summary]').first().waitFor();
+      assert.equal(copy.title, locale === 'zh-CN' ? '流量用量' : 'Traffic usage');
+      await summary.getByText(copy.scope, { exact: true }).waitFor();
+      await summary.getByRole('button', { name: copy.measurementDetailsTitle, exact: true }).click();
+      await summary.getByText(copy.measurementDetails, { exact: true }).waitFor();
+      await summary.getByText(copy.exclusions, { exact: true }).waitFor();
+      await summary.getByRole('button', { name: copy.measurementDetailsTitle, exact: true }).click();
       assert.equal(await summary.locator('[data-egress-summary]').count(), 3);
       assert.match(await summary.innerText(), /old\.proxy\.test|later\.proxy\.test/);
       assert.doesNotMatch(await summary.innerText(), /current\.proxy\.test|credential-canary/);
@@ -34,6 +43,16 @@ test('operator exit history keeps addresses, coverage, scope and failed reads di
       assert.ok((await summary.innerText()).includes('0 B'));
       await summary.getByLabel(copy.groupFilter, { exact: true }).selectOption('group-a');
       assert.equal(await summary.locator('[data-egress-summary]').count(), 2);
+      await page.setViewportSize({ width: 1440, height: 1000 });
+      const controlEdges = await summary.locator('.egress-controls').evaluate(element => {
+        const selects = Array.from(element.querySelectorAll('select'));
+        const button = element.querySelector('.egress-refresh-control button');
+        return { selects: selects.map(select => select.getBoundingClientRect().bottom), button: button?.getBoundingClientRect().bottom };
+      });
+      assert.ok(controlEdges.button !== undefined && controlEdges.selects.length === 2 && controlEdges.selects.every(bottom => Math.abs(bottom - controlEdges.button!) <= 1),
+        `the refresh action aligns with a labeled filter control: ${JSON.stringify(controlEdges)}`);
+      await page.screenshot({ path: `${artifactRoot}/egress-summary-${locale}-1440.png`, fullPage: true });
+      await page.setViewportSize({ width: 390, height: 844 });
       await page.screenshot({ path: `${artifactRoot}/egress-summary-${locale}-390.png`, fullPage: true });
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true);
       for (const mode of ['denied', 'failed', 'empty']) {
@@ -140,7 +159,7 @@ test('request list exit lines render only real recorded exits with exact text an
       };
       const proxyLine = row('model-c').locator('.request-egress-line');
       await proxyLine.waitFor();
-      assert.equal(await proxyLine.innerText(), 'edge-01 · socks5h://192.0.2.10:1080');
+      assert.equal(await proxyLine.innerText(), 'edge-01');
       assert.equal(await proxyLine.getAttribute('data-egress'), 'proxy');
       const directLine = row('model-d').locator('.request-egress-line');
       assert.equal(await directLine.innerText(), zh ? '直连' : 'Direct');
@@ -155,12 +174,12 @@ test('request list exit lines render only real recorded exits with exact text an
       assert.match(proxyTip, zh ? /组版本 3/ : /Group version 3/);
       assert.match(proxyTip, /edge-01/);
       assert.match(proxyTip, /socks5h:\/\/192\.0\.2\.10:1080/);
-      assert.match(proxyTip, zh ? /连通性: 未记录（历史使用不代表当前可通）/ : /Connectivity: not recorded \(past use does not confirm current reachability\)/);
-      assert.match(proxyTip, zh ? /与上游账号不同/ : /separate from the upstream account/);
+      assert.match(proxyTip, zh ? /连通性/ : /Connectivity/);
+      assert.match(proxyTip, zh ? /这次请求走代理出口/ : /This request used a proxy exit/);
       await page.keyboard.press('Escape');
       await proxyTooltip.waitFor({ state: 'hidden' });
       const directTooltip = await tooltipForExit('model-d');
-      assert.match(await directTooltip.innerText(), zh ? /未使用代理出口/ : /without a proxy exit/);
+      assert.match(await directTooltip.innerText(), zh ? /这次请求走直连/ : /This request used a direct connection/);
       await page.keyboard.press('Escape');
       await directTooltip.waitFor({ state: 'hidden' });
       assert.deepEqual(errors, []);

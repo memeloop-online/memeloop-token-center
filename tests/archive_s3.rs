@@ -90,7 +90,13 @@ async fn minio_put_get_list_missing_and_read_limit() {
         .get_bounded(&oversized_location, 1024)
         .await
         .expect_err("bounded read must reject an oversized object");
-    assert!(error.to_string().contains("read limit"));
+    assert!(matches!(
+        error,
+        AppError::Storage {
+            code: "archive_object_exceeds_byte_read_limit",
+            ..
+        }
+    ));
 
     // Unsafe tenant/object input must be rejected locally, before it can become an S3 key.
     let unsafe_location = format!("tenants/{unique}/../another-tenant/object.bin");
@@ -130,7 +136,7 @@ async fn minio_list_only_credentials_fail_the_read_write_readiness_canary() {
         .expect_err("ListBucket without PutObject/GetObject/DeleteObject must not be ready");
     assert_eq!(
         error.to_string(),
-        "storage error: archive readiness canary failed"
+        "storage error: archive_readiness_canary_failed"
     );
     let cached = store
         .readiness_check()
@@ -376,8 +382,16 @@ async fn minio_outage_is_bounded_and_http_error_does_not_leak_storage_details() 
         .await
         .expect("read sanitized error body");
     let payload: Value = serde_json::from_slice(&body).expect("JSON error response");
-    assert_eq!(payload["error"]["code"], "internal_error");
-    assert_eq!(payload["error"]["message"], "internal error");
+    assert_eq!(payload["error"]["code"], "archive_readiness_canary_failed");
+    assert!(
+        payload["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("失败"))
+            || payload["error"]["message_en"]
+                .as_str()
+                .is_some_and(|message| message.contains("failed")),
+        "{payload}"
+    );
     let body = String::from_utf8_lossy(&body);
     assert!(!body.contains("127.0.0.1"));
     assert!(!body.contains("must-not-leak"));

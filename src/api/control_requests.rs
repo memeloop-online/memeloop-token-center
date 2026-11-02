@@ -54,7 +54,7 @@ pub(super) async fn configuration_schemas(
 ) -> Result<impl IntoResponse, AppError> {
     require_service(&headers, &state, "schemas:read").await?;
     fn schema(source: &str) -> Result<Value, AppError> {
-        serde_json::from_str(source).map_err(|_| AppError::Internal)
+        serde_json::from_str(source).map_err(|_| AppError::internal("control_requests_schema_1"))
     }
     Ok(Json(json!({
         "core_config": schema(include_str!("../../schemas/core-config.schema.json"))?,
@@ -123,6 +123,12 @@ pub(super) async fn internal_requests(
     // length and wire format.
     let mut query_filter = filter;
     query_filter.lookahead = paged;
+    let scope = state.db.history_scope(tenant.as_deref()).await?;
+    if let Some(value) =
+        crate::request_history_api::list_if_enabled(&state, scope, &query_filter, paged).await?
+    {
+        return Ok(Json(value));
+    }
     let values = match tenant {
         Some(tenant) => {
             state
@@ -188,6 +194,12 @@ pub(super) async fn typed_internal_requests(
         typed_ast: Some(body.ast),
         ..crate::db::RequestListFilter::default()
     };
+    let scope = state.db.history_scope(tenant.as_deref()).await?;
+    if let Some(value) =
+        crate::request_history_api::list_if_enabled(&state, scope, &filter, body.paged).await?
+    {
+        return Ok(Json(value));
+    }
     let mut values = match tenant {
         Some(tenant) => state.db.list_all_requests_filtered(&tenant, filter).await?,
         None => state.db.list_global_requests_filtered(filter).await?,
@@ -405,7 +417,7 @@ pub(super) async fn put_filter_assistant_settings(
         .as_deref()
         .map(serde_json::from_slice::<FilterAssistantSettings>)
         .transpose()
-        .map_err(|_| AppError::Internal)?
+        .map_err(|_| AppError::internal("control_requests_put_filter_assistant_settings_1"))?
         .map(|value| value.updated_at)
         != body.expected_updated_at
     {
@@ -413,7 +425,8 @@ pub(super) async fn put_filter_assistant_settings(
             "filter assistant settings changed; reload before saving".into(),
         ));
     }
-    let value = serde_json::to_vec(&settings).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_vec(&settings)
+        .map_err(|_| AppError::internal("control_requests_put_filter_assistant_settings_2"))?;
     state
         .db
         .replace_filter_assistant_settings(
@@ -494,7 +507,8 @@ async fn load_filter_preset_state(
     else {
         return Ok(FilterPresetState::default());
     };
-    serde_json::from_slice(&value).map_err(|_| AppError::Internal)
+    serde_json::from_slice(&value)
+        .map_err(|_| AppError::internal("control_requests_load_filter_preset_state_1"))
 }
 
 async fn store_filter_preset_state(
@@ -503,7 +517,8 @@ async fn store_filter_preset_state(
     tenant: Option<&str>,
     stored: &FilterPresetState,
 ) -> Result<(), AppError> {
-    let value = serde_json::to_vec(stored).map_err(|_| AppError::Internal)?;
+    let value = serde_json::to_vec(stored)
+        .map_err(|_| AppError::internal("control_requests_store_filter_preset_state_1"))?;
     state
         .db
         .plugin_kv_put(
@@ -530,7 +545,7 @@ pub(in crate::api) async fn load_filter_assistant_settings(
     };
     serde_json::from_slice(&value)
         .map(Some)
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("control_requests_load_filter_assistant_settings_1"))
 }
 
 pub(super) async fn assistant_execution_context(
@@ -821,6 +836,12 @@ pub(super) async fn internal_stats(
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id.clone())?;
     let filter = query.to_filter(true, None)?;
+    let scope = state.db.history_scope(tenant.as_deref()).await?;
+    if let Some(stats) =
+        crate::request_history_api::statistics_if_enabled(&state, scope, &filter).await?
+    {
+        return Ok(Json(stats));
+    }
     let stats = match tenant {
         Some(tenant) => state.db.operator_stats_filtered(&tenant, filter).await?,
         None => state.db.global_operator_stats_filtered(filter).await?,

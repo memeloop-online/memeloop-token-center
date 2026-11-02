@@ -124,7 +124,9 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
                 }
                 let finished: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_events WHERE key_id = $1 AND event_kind = 'finished'")
                     .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
-                if finished == 64 {
+                // Operational completion also projects the cancelled request,
+                // while its reservation remains financially unknown.
+                if finished == 65 {
                     break;
                 }
             }
@@ -134,6 +136,7 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
     })
     .await
     .unwrap();
+    drain_archive_capture(&fixture).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let rows = sqlx::query(
         "SELECT COALESCE(q.status_code, o.status_code) AS status_code, q.completed_at, q.status_code AS financial_status, r.status, r.actual_micros, p.state AS pending_state, p.unknown_reason, o.error_code AS operational_error, o.completed_at AS operational_completed, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS event_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id LEFT JOIN pending_proxy_settlements p ON p.request_id = q.id LEFT JOIN proxy_operational_terminals o ON o.request_id = q.id",
@@ -163,7 +166,7 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
             );
             assert!(row.get::<Option<i64>, _>("operational_completed").is_some());
             assert_eq!(row.get::<i64, _>("ledger_count"), 0);
-            assert_eq!(row.get::<i64, _>("event_count"), 0);
+            assert_eq!(row.get::<i64, _>("event_count"), 1);
         } else {
             assert!(row.get::<Option<i64>, _>("completed_at").is_some());
             assert_eq!(row.get::<String, _>("status"), "settled");
@@ -173,7 +176,6 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
     }
     assert_eq!(cancelled, 1);
     assert_eq!(fixture.state.proxy_lifecycles.active(), 0);
-    drain_archive_capture(&fixture).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();

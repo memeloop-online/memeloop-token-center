@@ -44,7 +44,13 @@ test('real Codex config shapes localize transport controls and preserve advanced
       await retry.focus(); await page.keyboard.press('Enter');
       await workspace.getByLabel('连接尝试次数').waitFor();
       assert.doesNotMatch(await workspace.innerText(), /Pre-delivery|Maximum inactivity|One absolute budget/);
-      await workspace.getByText('此数值仍须小于请求总超时。Codex 转发不会用它切断连接；代理是否可达由代理组上的独立探测判断。', { exact: true }).waitFor();
+      for (const help of [
+        '可选的连接建立超时。默认不设置，不施加应用层连接时限。显式取值只覆盖建立连接（含 TLS 和配置的代理），不限制响应时长。',
+        '可选。默认不设置时，上游再安静也不会被中断。设置后，该值是每收到一个字节就重新计时的读取静默窗口；Codex 转发不把它当作绝对时限。',
+        'HTTP/2 保活 PING 应答超时，也是模型目录和额度读取的总预算。不对推理或压缩施加绝对时限；连接保持健康时，安静的上游响应会继续。',
+      ]) {
+        await workspace.getByText(help, { exact: true }).waitFor();
+      }
       await workspace.getByText('运行时传输策略', { exact: true }).waitFor();
       await workspace.getByText('单位见各字段；这些设置影响该账号的所有请求。', { exact: true }).waitFor();
       for (const title of ['最大 SSE 事件（字节）', '单个网络分片最大帧数据量（字节）', '终止事件最大暂存量（字节）',

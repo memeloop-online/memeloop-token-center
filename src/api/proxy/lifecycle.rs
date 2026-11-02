@@ -24,7 +24,10 @@ pub(super) async fn finish_dispatch_failure(
     let mut response = finish_local_buffered_error_with_upstream_attribution(
         request,
         status,
-        Bytes::from(serde_json::to_vec(&body).map_err(|_| AppError::Internal)?),
+        Bytes::from(
+            serde_json::to_vec(&body)
+                .map_err(|_| AppError::internal("lifecycle_finish_dispatch_failure_1"))?,
+        ),
         "application/json",
         (
             TokenUsage::default(),
@@ -49,11 +52,17 @@ pub(super) async fn finish_unavailable(
     let mut response = finish_local_buffered_error_with_upstream_attribution(
         request,
         StatusCode::SERVICE_UNAVAILABLE,
-        Bytes::from_static(
-            b"{\"error\":{\"message\":\"no healthy upstream is currently available\",\"type\":\"upstream_error\"}}",
-        ),
+        Bytes::from(crate::error::explained_failure_body(
+            "当前没有健康的上游",
+            "no healthy upstream is currently available",
+            error_code,
+            crate::error::ErrorFacts::new(),
+        )),
         "application/json",
-        (TokenUsage::default(), crate::model::RequestUsageBasis::NotObserved),
+        (
+            TokenUsage::default(),
+            crate::model::RequestUsageBasis::NotObserved,
+        ),
         Some(error_code.to_owned()),
         ProxyRequestUpstreamAttribution::LastDispatched(last_dispatched_upstream),
     )

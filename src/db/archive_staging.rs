@@ -24,6 +24,134 @@ use super::{
 };
 
 impl Database {
+    pub(crate) async fn prepare_staged_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        mut body: crate::conversation::SessionBody,
+        staging: &[ArchiveStagingWriteLease],
+    ) -> Result<bool, AppError> {
+        if staging.is_empty() {
+            let (atoms, nodes, media) = body.into_archive_parts();
+            return self
+                .prepare_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
+                .await;
+        }
+        let mut transaction = self.begin_write_transaction().await?;
+        let now = archive_database_now(&mut transaction, self.backend).await?;
+        let lock = match self.backend {
+            DatabaseBackend::PostgreSql => " FOR UPDATE",
+            DatabaseBackend::Sqlite => "",
+        };
+        let tenant_id: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3{lock}"
+        )))
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .bind(now)
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(tenant_id) = tenant_id else {
+            return Ok(false);
+        };
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 734627102948340))")
+                .bind(format!("conversation-media:{tenant_id}"))
+                .execute(&mut *transaction)
+                .await?;
+        }
+        for lease in staging {
+            if lease.key.owner != ArchiveStagingOwner::ProxyRequest(request_id)
+                || lease.key.purpose != crate::archive_staging::ArchiveStagingPurpose::Media
+                || !bind_archive_staging_attempt_in_transaction(
+                    &mut transaction,
+                    self.backend,
+                    lease,
+                    &lease.key.canonical_prefix(),
+                )
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        let mut canonical: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for turn in &mut body.turns {
+            for part in &mut turn.parts {
+                let (Some(hash), Some(locator)) = (&part.content_blake3, &part.object_locator)
+                else {
+                    continue;
+                };
+                if part
+                    .media_type
+                    .as_deref()
+                    .is_some_and(|media_type| media_type.is_empty() || media_type.len() > 128)
+                    || part
+                        .byte_length
+                        .is_none_or(|length| i64::try_from(length).is_err())
+                {
+                    return Err(AppError::BadRequest(
+                        "invalid session media reference".into(),
+                    ));
+                }
+                if !staging.iter().any(|lease| {
+                    crate::archive_staging::conversation_media_locator(lease.key, hash)
+                        .is_ok_and(|expected| expected == *locator)
+                }) {
+                    return Err(AppError::Conflict(
+                        "session media staging locator mismatch".into(),
+                    ));
+                }
+                let canonical_locator = match canonical.entry(hash.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let existing: Option<String> = sqlx::query_scalar(
+                            "SELECT object_locator FROM conversation_media_parts WHERE tenant_id = $1 AND content_blake3 = $2 ORDER BY object_locator LIMIT 1",
+                        )
+                        .bind(&tenant_id)
+                        .bind(hash)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                        entry
+                            .insert(existing.unwrap_or_else(|| locator.clone()))
+                            .clone()
+                    }
+                };
+                part.object_locator = Some(canonical_locator);
+            }
+        }
+        let (atoms, nodes, media) = body.into_archive_parts();
+        if !self
+            .prepare_session_body_archive_in_transaction(
+                &mut transaction,
+                lease_owner,
+                request_id,
+                atoms,
+                &nodes,
+                &media,
+            )
+            .await?
+        {
+            return Ok(false);
+        }
+        for lease in staging {
+            if !release_bound_archive_staging_attempt_in_transaction(
+                &mut transaction,
+                self.backend,
+                lease.key,
+                &lease.key.canonical_prefix(),
+            )
+            .await?
+            {
+                return Err(AppError::Conflict(
+                    "session media staging release was fenced".into(),
+                ));
+            }
+        }
+        transaction.commit().await?;
+        Ok(true)
+    }
+
     /// Creates a writing attempt or returns the exact idempotent replay.
     ///
     /// `lease_token` must be persisted by the caller before retrying. Reusing an
@@ -34,9 +162,11 @@ impl Database {
     ) -> Result<BeginArchiveStagingResult, AppError> {
         let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
-        let expires_at = now
-            .checked_add(ARCHIVE_STAGING_WRITE_LEASE_MILLIS)
-            .ok_or(AppError::Internal)?;
+        let expires_at =
+            now.checked_add(ARCHIVE_STAGING_WRITE_LEASE_MILLIS)
+                .ok_or(AppError::internal(
+                    "archive_staging_begin_archive_staging_attempt_1",
+                ))?;
         let inserted = sqlx::query(
             "INSERT INTO archive_staging_attempts (attempt_id, owner_kind, owner_id, purpose, intent_digest, state, writer_owner, writer_token, lease_owner, lease_token, lease_expires_at, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, 'writing', $6, $7, $8, $9, $10, $11, $12) ON CONFLICT(attempt_id) DO NOTHING",
         )
@@ -67,7 +197,9 @@ impl Database {
 
         let row = lock_attempt(&mut transaction, self.backend, input.key.attempt_id)
             .await?
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal(
+                "archive_staging_begin_archive_staging_attempt_2",
+            ))?;
         let stored = archive_attempt_from_row(&row)?;
         let stored_writer_owner: String = row.try_get("writer_owner")?;
         let stored_writer_token: String = row.try_get("writer_token")?;
@@ -87,7 +219,9 @@ impl Database {
             && stored_lease_expires_at.is_some_and(|expiry| expiry > now)
         {
             let replay = ArchiveStagingWriteLease {
-                expires_at: stored_lease_expires_at.ok_or(AppError::Internal)?,
+                expires_at: stored_lease_expires_at.ok_or(AppError::internal(
+                    "archive_staging_begin_archive_staging_attempt_3",
+                ))?,
                 ..lease
             };
             transaction.commit().await?;
@@ -104,9 +238,11 @@ impl Database {
     ) -> Result<bool, AppError> {
         let mut transaction = self.begin_write_transaction().await?;
         let now = archive_database_now(&mut transaction, self.backend).await?;
-        let expires_at = now
-            .checked_add(ARCHIVE_STAGING_WRITE_LEASE_MILLIS)
-            .ok_or(AppError::Internal)?;
+        let expires_at =
+            now.checked_add(ARCHIVE_STAGING_WRITE_LEASE_MILLIS)
+                .ok_or(AppError::internal(
+                    "archive_staging_heartbeat_archive_staging_write_1",
+                ))?;
         let updated = sqlx::query(
             "UPDATE archive_staging_attempts SET lease_expires_at = $1, updated_at = $2 WHERE attempt_id = $3 AND state = 'writing' AND lease_owner = $4 AND lease_token = $5 AND lease_expires_at > $6",
         )
@@ -198,7 +334,9 @@ impl Database {
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let next_cleanup_at = now
             .checked_add(ARCHIVE_STAGING_STALE_DELETE_GRACE_MILLIS)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal(
+                "archive_staging_promote_stale_archive_staging_attempts_1",
+            ))?;
         let query = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT attempt_id FROM archive_staging_attempts WHERE state = 'writing' AND lease_expires_at <= $1 ORDER BY lease_expires_at, attempt_id FOR UPDATE SKIP LOCKED LIMIT $2"
@@ -259,7 +397,9 @@ impl Database {
         let token = Uuid::now_v7();
         let expires_at = now
             .checked_add(ARCHIVE_STAGING_CLEANUP_LEASE_MILLIS)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal(
+                "archive_staging_claim_archive_staging_cleanup_1",
+            ))?;
         let attempt_id: String = row.try_get("attempt_id")?;
         let updated = sqlx::query(
             "UPDATE archive_staging_attempts SET lease_owner = $1, lease_token = $2, lease_expires_at = $3, updated_at = $4 WHERE attempt_id = $5 AND state = 'cleanup_pending' AND (lease_expires_at IS NULL OR lease_expires_at <= $6)",
@@ -274,7 +414,9 @@ impl Database {
         .await?;
         if updated.rows_affected() != 1 {
             transaction.rollback().await?;
-            return Err(AppError::Internal);
+            return Err(AppError::internal(
+                "archive_staging_claim_archive_staging_cleanup_2",
+            ));
         }
         let mut attempt = archive_attempt_from_row(&row)?;
         attempt.updated_at = now;
@@ -295,7 +437,9 @@ impl Database {
         let now = archive_database_now(&mut transaction, self.backend).await?;
         let expires_at = now
             .checked_add(ARCHIVE_STAGING_CLEANUP_LEASE_MILLIS)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal(
+                "archive_staging_heartbeat_archive_staging_cleanup_1",
+            ))?;
         let updated = sqlx::query(
             "UPDATE archive_staging_attempts SET lease_expires_at = $1, updated_at = $2 WHERE attempt_id = $3 AND state = 'cleanup_pending' AND lease_owner = $4 AND lease_token = $5 AND lease_expires_at > $6",
         )
@@ -335,13 +479,17 @@ impl Database {
         if let Some(locator) = referenced {
             let old_failures: i64 = locked.try_get("cleanup_failures")?;
             let failures = old_failures.saturating_add(1).min(63);
-            let failure_count = u32::try_from(failures).map_err(|_| AppError::Internal)?;
+            let failure_count = u32::try_from(failures).map_err(|_| {
+                AppError::internal("archive_staging_prove_archive_staging_unreferenced_1")
+            })?;
             let next_cleanup_at = now
                 .checked_add(cleanup_backoff_with_jitter(
                     lease.attempt.key.attempt_id,
                     failure_count,
                 ))
-                .ok_or(AppError::Internal)?;
+                .ok_or(AppError::internal(
+                    "archive_staging_prove_archive_staging_unreferenced_1",
+                ))?;
             let protected = sqlx::query(
                 "UPDATE archive_staging_attempts SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, empty_observed_at = NULL, cleanup_failures = $1, next_cleanup_at = $2, last_error_code = 'reference_present', updated_at = $3 WHERE attempt_id = $4 AND state = 'cleanup_pending' AND lease_owner = $5 AND lease_token = $6 AND lease_expires_at > $7",
             )
@@ -393,7 +541,9 @@ impl Database {
         if let Some(first_observed_at) = first_observed_at {
             let confirm_after = first_observed_at
                 .checked_add(ARCHIVE_STAGING_EMPTY_STABILITY_MILLIS)
-                .ok_or(AppError::Internal)?;
+                .ok_or(AppError::internal(
+                    "archive_staging_record_archive_staging_empty_1",
+                ))?;
             if now < confirm_after {
                 transaction.rollback().await?;
                 return Err(AppError::Conflict(
@@ -424,7 +574,9 @@ impl Database {
 
         let confirm_after = now
             .checked_add(ARCHIVE_STAGING_EMPTY_STABILITY_MILLIS)
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal(
+                "archive_staging_record_archive_staging_empty_2",
+            ))?;
         let observed = sqlx::query(
             "UPDATE archive_staging_attempts SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, empty_observed_at = $1, next_cleanup_at = $2, last_error_code = NULL, updated_at = $3 WHERE attempt_id = $4 AND state = 'cleanup_pending' AND lease_owner = $5 AND lease_token = $6 AND lease_expires_at > $7 AND empty_observed_at IS NULL",
         )
@@ -459,13 +611,17 @@ impl Database {
         let row = lock_and_verify_cleanup_lease(&mut transaction, self.backend, lease, now).await?;
         let old_failures: i64 = row.try_get("cleanup_failures")?;
         let failures = old_failures.saturating_add(1).min(63);
-        let failure_count = u32::try_from(failures).map_err(|_| AppError::Internal)?;
+        let failure_count = u32::try_from(failures).map_err(|_| {
+            AppError::internal("archive_staging_record_archive_staging_cleanup_failure_1")
+        })?;
         let next_cleanup_at = now
             .checked_add(cleanup_backoff_with_jitter(
                 lease.attempt.key.attempt_id,
                 failure_count,
             ))
-            .ok_or(AppError::Internal)?;
+            .ok_or(AppError::internal(
+                "archive_staging_record_archive_staging_cleanup_failure_1",
+            ))?;
         let updated = sqlx::query(
             "UPDATE archive_staging_attempts SET lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, empty_observed_at = NULL, cleanup_failures = $1, next_cleanup_at = $2, last_error_code = $3, updated_at = $4 WHERE attempt_id = $5 AND state = 'cleanup_pending' AND lease_owner = $6 AND lease_token = $7 AND lease_expires_at > $8",
         )
@@ -669,6 +825,13 @@ async fn archive_staging_reference(
                 {
                     return Ok(Some(response));
                 }
+                if request_response_archive_pending(key)
+                    && !conversation_archive_committed(transaction, &owner_id).await?
+                {
+                    return Ok(Some(prefix.to_owned()));
+                }
+            } else if request_response_archive_pending(key) {
+                return Ok(Some(prefix.to_owned()));
             }
         }
         ArchiveStagingOwner::GenerationJob(_) => {
@@ -684,8 +847,10 @@ async fn archive_staging_reference(
                     return Ok(Some(request));
                 }
                 if let Some(manifest) = row.try_get::<Option<String>, _>("staged_assets_json")? {
-                    let manifest: GenerationStagedAssets =
-                        serde_json::from_str(&manifest).map_err(|_| AppError::Internal)?;
+                    let manifest: GenerationStagedAssets = serde_json::from_str(&manifest)
+                        .map_err(|_| {
+                            AppError::internal("archive_staging_archive_staging_reference_1")
+                        })?;
                     if manifest.attempt_nonce == key.attempt_id {
                         return Ok(Some(prefix.to_owned()));
                     }
@@ -723,9 +888,9 @@ async fn archive_staging_reference(
         let response: Option<String> = sqlx::query_scalar(
             "SELECT response_object FROM synchronous_image_idempotency WHERE request_id = $1 AND response_object IS NOT NULL AND (response_object = $2 OR SUBSTR(response_object, 1, LENGTH($2) + 1) = $3) LIMIT 1",
         )
-        .bind(owner_id)
+        .bind(&owner_id)
         .bind(prefix)
-        .bind(segment_prefix)
+        .bind(&segment_prefix)
         .fetch_optional(&mut **transaction)
         .await?;
         if let Some(response) = response {
@@ -733,7 +898,62 @@ async fn archive_staging_reference(
         }
     }
 
+    if let Some(locator) =
+        conversation_media_reference(transaction, prefix, &segment_prefix).await?
+    {
+        return Ok(Some(locator));
+    }
+
     Ok(None)
+}
+
+/// 原始请求 JSON 与响应对象在该请求的会话正文归档提交，且对应的
+/// `request_object` / `response_object` 已清空之前，仍然被引用。
+/// 会话正文归档提交不会放开媒体对象，也不会放开 `generation_assets`。
+fn request_response_archive_pending(key: ArchiveStagingKey) -> bool {
+    matches!(key.owner, ArchiveStagingOwner::ProxyRequest(_))
+        && matches!(
+            key.purpose,
+            crate::archive_staging::ArchiveStagingPurpose::Request
+                | crate::archive_staging::ArchiveStagingPurpose::Response
+        )
+}
+
+/// 既有 `conversation_projection_outbox.projected_at` 只作为会话正文归档的提交标记。
+/// 计量用量 projection 和终态 projection 的表与名称保持不动。
+async fn conversation_archive_committed(
+    transaction: &mut Transaction<'_, Any>,
+    request_id: &str,
+) -> Result<bool, AppError> {
+    let committed_at: Option<Option<i64>> = sqlx::query_scalar(
+        "SELECT projected_at FROM conversation_projection_outbox WHERE request_id = $1 LIMIT 1",
+    )
+    .bind(request_id)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(committed_at.flatten().is_some())
+}
+
+/// 媒体对象在任一 CNPG part 仍保存其 locator 或 blake3 时继续保留。
+/// 会话正文归档是否提交不参与这次判断。相同哈希只有一个对象，最后一条引用留下。
+/// `generation_assets` 仍走原来的引用检查，不并入媒体对象。
+async fn conversation_media_reference(
+    transaction: &mut Transaction<'_, Any>,
+    prefix: &str,
+    segment_prefix: &str,
+) -> Result<Option<String>, AppError> {
+    let locator: Option<String> = sqlx::query_scalar(
+        "SELECT object_locator FROM conversation_media_parts \
+         WHERE object_locator = $1 \
+            OR SUBSTR(object_locator, 1, LENGTH($1) + 1) = $2 \
+            OR $1 LIKE ('%/' || content_blake3) \
+         LIMIT 1",
+    )
+    .bind(prefix)
+    .bind(segment_prefix)
+    .fetch_optional(&mut **transaction)
+    .await?;
+    Ok(locator)
 }
 
 async fn lock_attempt(
@@ -777,7 +997,9 @@ async fn lock_and_verify_cleanup_lease(
     }
     let stored_key = archive_staging_key_from_row(&row)?;
     if stored_key != lease.attempt.key {
-        return Err(AppError::Internal);
+        return Err(AppError::internal(
+            "archive_staging_lock_and_verify_cleanup_lease_1",
+        ));
     }
     Ok(row)
 }
@@ -787,12 +1009,13 @@ fn archive_attempt_from_row(row: &AnyRow) -> Result<ArchiveStagingAttempt, AppEr
     Ok(ArchiveStagingAttempt {
         key: archive_staging_key_from_row(row)?,
         intent_digest: ArchiveStagingIntentDigest::new(row.try_get::<String, _>("intent_digest")?)
-            .map_err(|_| AppError::Internal)?,
+            .map_err(|_| AppError::internal("archive_staging_archive_attempt_from_row_1"))?,
         state: ArchiveStagingState::parse(&row.try_get::<String, _>("state")?)?,
         bound_locator: row.try_get("bound_locator")?,
         bound_at: row.try_get("bound_at")?,
         empty_observed_at: row.try_get("empty_observed_at")?,
-        cleanup_failures: u32::try_from(cleanup_failures).map_err(|_| AppError::Internal)?,
+        cleanup_failures: u32::try_from(cleanup_failures)
+            .map_err(|_| AppError::internal("archive_staging_archive_attempt_from_row_2"))?,
         next_cleanup_at: row.try_get("next_cleanup_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
@@ -825,7 +1048,10 @@ async fn archive_database_now(
         .fetch_one(&mut **transaction)
         .await?;
     if now < 0 {
-        return Err(AppError::Internal);
+        return Err(AppError::internal("archive_staging_archive_database_now_1"));
     }
     Ok(now)
 }
+
+#[cfg(test)]
+mod media_tests;

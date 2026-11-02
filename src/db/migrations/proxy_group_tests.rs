@@ -84,6 +84,10 @@ async fn upgrade_contract(database: &Database) {
     assert!(versions.contains(&125));
     assert!(versions.contains(&126));
     for statement in [
+        "DROP TABLE session_relationships",
+        "DROP TABLE session_thread_parents",
+        "DROP INDEX conversation_observations_explicit_session_idx",
+        "DROP INDEX request_stats_facts_session_idx",
         "DROP TABLE session_generated_titles",
         "DROP TABLE session_response_summaries",
         "DROP VIEW model_route_eligible_upstream_accounts",
@@ -104,6 +108,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     for statement in [
+        "DROP TABLE plugin_background_action_grants",
         "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
         "DROP TABLE proxy_operational_terminals",
         "DROP TABLE application_plugin_release_resolutions",
@@ -111,6 +116,7 @@ async fn upgrade_contract(database: &Database) {
         "DROP TABLE plugin_installer_network_preferences",
         "DROP TABLE pending_proxy_settlements",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_token",
+        "DROP INDEX request_records_live_owner_expiry_idx",
         "ALTER TABLE request_records DROP COLUMN proxy_owner_expires_at",
         "ALTER TABLE request_records DROP COLUMN cache_known_input_tokens",
         "ALTER TABLE request_records DROP COLUMN cache_known_read_tokens",
@@ -131,11 +137,17 @@ async fn upgrade_contract(database: &Database) {
         "ALTER TABLE conversation_projection_outbox DROP COLUMN semantic_snapshot_json",
         "ALTER TABLE conversation_projection_outbox DROP COLUMN terminal_lease_owner",
         "ALTER TABLE conversation_projection_outbox DROP COLUMN terminal_lease_expires_at",
+        "DROP TABLE network_proxy_attempt_signals",
+        "DROP TABLE network_proxy_selection_policies",
+        "DROP TABLE network_proxy_group_members",
+        "DROP TABLE network_proxies",
+        "ALTER TABLE transport_proxy_groups DROP COLUMN members_normalized",
         "DROP TABLE transport_proxy_bindings",
         "DROP TABLE transport_proxy_groups",
         "DROP TABLE transport_proxy_management_audit",
         "DROP TABLE transport_proxy_management_lock",
         "DROP TABLE upstream_service_probes",
+        "DROP TABLE upstream_supplier_availability",
     ] {
         sqlx::query(statement)
             .execute(&database.pool)
@@ -166,12 +178,39 @@ async fn upgrade_contract(database: &Database) {
         .execute(&database.pool)
         .await
         .unwrap();
-    sqlx::query(
-        "DELETE FROM schema_migrations WHERE version IN (115, 116, 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136)",
-    )
-    .execute(&database.pool)
-    .await
-    .unwrap();
+    sqlx::query("ALTER TABLE request_records DROP COLUMN in_flight_stage")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE conversation_media_parts")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    for statement in [
+        "DROP INDEX IF EXISTS session_archive_unlinked_recent_idx",
+        "DROP INDEX IF EXISTS request_egress_attempts_request_idx",
+        "DROP INDEX IF EXISTS conversation_observations_compacted_probe_idx",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    for statement in [
+        "DROP VIEW request_history_source_ids",
+        "DROP TABLE request_history_backfill",
+        "DROP TABLE request_history_export",
+        "DROP TABLE request_history_state",
+    ] {
+        sqlx::query(statement)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("DELETE FROM schema_migrations WHERE version >= 115")
+        .execute(&database.pool)
+        .await
+        .unwrap();
     let maximum: i64 = sqlx::query_scalar("SELECT MAX(version) FROM schema_migrations")
         .fetch_one(&database.pool)
         .await
@@ -212,6 +251,7 @@ async fn upgrade_contract(database: &Database) {
         .unwrap();
     transaction.commit().await.unwrap();
     database.migrate().await.unwrap();
+    database.migrate().await.unwrap();
     let replayed_at: i64 =
         sqlx::query_scalar("SELECT applied_at FROM schema_migrations WHERE version = 116")
             .fetch_one(&database.pool)
@@ -226,10 +266,11 @@ async fn upgrade_contract(database: &Database) {
     .unwrap();
     assert_eq!(
         tail,
-        vec![
-            117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132, 133,
-            134, 135, 136
-        ]
+        migrations
+            .iter()
+            .filter(|migration| migration.version >= 117)
+            .map(|migration| migration.version)
+            .collect::<Vec<_>>()
     );
     let policy: String = sqlx::query_scalar(
         "SELECT catalog_policy FROM model_route_included_provider_groups WHERE model_route_id = $1",
@@ -248,6 +289,29 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     assert_eq!(count, 0);
+    for table in [
+        "network_proxies",
+        "network_proxy_group_members",
+        "network_proxy_selection_policies",
+        "network_proxy_attempt_signals",
+        "plugin_background_action_grants",
+        "upstream_supplier_availability",
+    ] {
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0, "{table} rebuilt by migrations 148 through 150");
+    }
+    sqlx::query("SELECT result_json, last_attempt_json, last_attempt_at, actual_model, credential_generation, transport_revision FROM upstream_service_probes LIMIT 1")
+        .fetch_optional(&database.pool)
+        .await
+        .unwrap();
+    sqlx::query("SELECT members_normalized FROM transport_proxy_groups LIMIT 1")
+        .fetch_optional(&database.pool)
+        .await
+        .unwrap();
     sqlx::query("SELECT terminal_cause_code, proxy_owner_token, proxy_owner_expires_at FROM request_records LIMIT 1")
         .fetch_optional(&database.pool)
         .await
@@ -256,6 +320,71 @@ async fn upgrade_contract(database: &Database) {
         .fetch_optional(&database.pool)
         .await
         .unwrap();
+    let account = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO upstream_accounts (id, tenant_id, name, driver, auth_kind, config_json, status, credential_generation, created_at, updated_at) VALUES ($1, $2, 'index-upgrade', 'http-json', 'none', '{}', 'active', 1, 0, 0)")
+        .bind(&account).bind(&tenant).execute(&database.pool).await.unwrap();
+    sqlx::query("DROP TABLE upstream_transport_proxy_selections")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!(
+        "../../../migrations/common/0116_transport_proxy_groups.sql"
+    ))
+    .execute(&database.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO upstream_transport_proxy_selections (account_id, group_version, group_fingerprint, credential_generation, base_index, selected_index, selection_generation) VALUES ($1, 9, 'preserved-fingerprint', 1, 2, 3, 7)")
+        .bind(&account).execute(&database.pool).await.unwrap();
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 151")
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    database.migrate().await.unwrap();
+    let saved =
+        sqlx::query("SELECT * FROM upstream_transport_proxy_selections WHERE account_id = $1")
+            .bind(&account)
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        saved.try_get::<String, _>("group_fingerprint").unwrap(),
+        "preserved-fingerprint"
+    );
+    for (column, expected) in [
+        ("group_version", 9_i64),
+        ("credential_generation", 1),
+        ("base_index", 2),
+        ("selected_index", 3),
+        ("selection_generation", 7),
+    ] {
+        assert_eq!(saved.try_get::<i64, _>(column).unwrap(), expected);
+    }
+    sqlx::query("UPDATE upstream_transport_proxy_selections SET base_index = 6, selected_index = 7 WHERE account_id = $1")
+        .bind(&account).execute(&database.pool).await.unwrap();
+    database.migrate().await.unwrap();
+    let selected: i64 = sqlx::query_scalar(
+        "SELECT selected_index FROM upstream_transport_proxy_selections WHERE account_id = $1",
+    )
+    .bind(&account)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(selected, 7);
+    assert!(sqlx::query("UPDATE upstream_transport_proxy_selections SET selected_index = -1 WHERE account_id = $1")
+        .bind(&account).execute(&database.pool).await.is_err());
+    sqlx::query("DELETE FROM upstream_accounts WHERE id = $1")
+        .bind(&account)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM upstream_transport_proxy_selections WHERE account_id = $1",
+    )
+    .bind(&account)
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0);
 }
 
 #[test]
@@ -270,7 +399,8 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148, 149,
+                150, 151
             ]
         );
     }

@@ -20,7 +20,7 @@ impl RequestOwnerLease {
         .await;
         if !matches!(acquired, Ok(Ok(true))) {
             lost.send_replace(true);
-            return Err(AppError::Internal);
+            return Err(AppError::internal("owner_acquire_1"));
         }
         let task = tokio::spawn(async move {
             renew_owner_until_lost(started, lost, || async {
@@ -146,7 +146,9 @@ mod tests {
         let (lost, mut receiver) = watch::channel(false);
         let started = tokio::time::Instant::now();
         renew_owner_until_lost(started, lost, || {
-            std::future::ready(Err(AppError::Internal))
+            std::future::ready(Err(AppError::internal(
+                "owner_unrenewable_owner_loses_authority_at_the_last_confirmed_le",
+            )))
         })
         .await;
         assert!(*receiver.borrow_and_update());

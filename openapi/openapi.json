@@ -69,6 +69,835 @@
     }
   ],
   "paths": {
+    "/internal/v1/transport-proxies/{proxy_id}/observations": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getNetworkProxyObservations",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "requests:read",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxies/{proxy_id}/probe": {
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "probeNetworkProxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "expected_version"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "expected_version": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxy-strategies": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "listNetworkProxyStrategies",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      }
+    },
+    "/internal/v1/upstreams/{account_id}/transport-proxy-selection": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getNetworkProxySelection",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "updateNetworkProxySelection",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "expected_selection_version",
+                  "expected_binding_version",
+                  "expected_credential_generation",
+                  "expected_updated_at",
+                  "mode"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "manual",
+                      "auto",
+                      "plugin"
+                    ]
+                  },
+                  "plugin_id": {
+                    "type": "string"
+                  },
+                  "plugin_version": {
+                    "type": "string"
+                  },
+                  "expected_selection_version": {
+                    "type": "integer"
+                  },
+                  "expected_binding_version": {
+                    "type": "integer"
+                  },
+                  "expected_credential_generation": {
+                    "type": "integer"
+                  },
+                  "expected_updated_at": {
+                    "type": "integer"
+                  },
+                  "expected_group_version": {
+                    "type": "integer"
+                  },
+                  "proxy_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "group_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "config": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxies": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "listNetworkProxies",
+        "summary": "list Network Proxies",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "createNetworkProxy",
+        "summary": "create Network Proxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "name",
+                  "proxy_url"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "proxy_url": {
+                    "type": "string",
+                    "writeOnly": true
+                  },
+                  "probe": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "enabled",
+                      "target_url",
+                      "interval_ms",
+                      "attempts"
+                    ],
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "target_url": {
+                        "type": "string",
+                        "format": "uri",
+                        "maxLength": 2048
+                      },
+                      "interval_ms": {
+                        "type": "integer",
+                        "minimum": 10000,
+                        "maximum": 3600000
+                      },
+                      "attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxies/{proxy_id}": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getNetworkProxy",
+        "summary": "get Network Proxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "updateNetworkProxy",
+        "summary": "update Network Proxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "expected_version",
+                  "name"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "expected_version": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "proxy_url": {
+                    "type": "string",
+                    "writeOnly": true
+                  },
+                  "probe": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "enabled",
+                      "target_url",
+                      "interval_ms",
+                      "attempts"
+                    ],
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "target_url": {
+                        "type": "string",
+                        "format": "uri",
+                        "maxLength": 2048
+                      },
+                      "interval_ms": {
+                        "type": "integer",
+                        "minimum": 10000,
+                        "maximum": 3600000
+                      },
+                      "attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "deleteNetworkProxy",
+        "summary": "delete Network Proxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "expected_version"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "expected_version": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      }
+    },
     "/healthz": {
       "get": {
         "tags": [
@@ -314,7 +1143,7 @@
         ],
         "operationId": "operatorChatCompletion",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\ncompletions are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\ncompletions are supported; stream=true is rejected.\n",
         "security": [
           {
             "serviceBearer": []
@@ -341,6 +1170,9 @@
                   "key_id": {
                     "type": "string",
                     "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
                   },
                   "request": {
                     "type": "object",
@@ -395,7 +1227,7 @@
         ],
         "operationId": "operatorMessages",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nmessages are supported; stream=true is rejected.\n",
         "security": [
           {
             "serviceBearer": []
@@ -422,6 +1254,9 @@
                   "key_id": {
                     "type": "string",
                     "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
                   },
                   "request": {
                     "type": "object",
@@ -452,6 +1287,90 @@
           },
           "400": {
             "description": "Invalid JSON Messages request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/internal/v1/inference/responses": {
+      "post": {
+        "tags": [
+          "Client credentials"
+        ],
+        "operationId": "operatorResponse",
+        "summary": "Run inference using an explicitly authorized billing credential",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nResponses are supported; stream=true is rejected.\n",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "keys:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "key_id",
+                  "request"
+                ],
+                "properties": {
+                  "key_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "conversation": {
+                    "$ref": "#/components/schemas/OperatorInferenceConversation"
+                  },
+                  "request": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                      "stream": {
+                        "type": "boolean",
+                        "const": false
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OpenAI Responses result including image generation output, billed to the selected key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid JSON Responses request",
             "content": {
               "application/json": {
                 "schema": {
@@ -3168,6 +4087,149 @@
         }
       }
     },
+    "/internal/v1/plugins/{plugin_id}/background-actions/{account_id}": {
+      "parameters": [
+        {
+          "name": "plugin_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{1,64}$"
+          }
+        },
+        {
+          "name": "account_id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "format": "uuid"
+          }
+        },
+        {
+          "name": "tenant_external_id",
+          "in": "query",
+          "required": true,
+          "schema": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getPluginBackgroundActionGrant",
+        "summary": "Read account-scoped background-action authorization and durable result",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scopes": [
+          "plugins:read",
+          "providers:read"
+        ],
+        "description": "Tenant and account ownership are checked. This read never dispatches a reset.",
+        "responses": {
+          "200": {
+            "description": "Current persisted authority and the associated reset operation, if any.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginBackgroundActionStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "putPluginBackgroundActionGrant",
+        "summary": "Enable or disable background reset-credit authority for one account",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scopes": [
+          "plugins:write",
+          "providers:write"
+        ],
+        "description": "Explicit opt-in binds the current actor and credential generation. Revision zero creates the grant. Revocation fences future dispatch claims; requests already claimed may complete. Unknown or submitted operations remain non-dispatchable after re-enabling. This endpoint only saves authority and never directly consumes a credit.",
+        "responses": {
+          "200": {
+            "description": "Current persisted authority and the associated reset operation, if any.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PluginBackgroundActionStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutPluginBackgroundActionGrant"
+              }
+            }
+          }
+        }
+      }
+    },
     "/internal/v1/plugins/{plugin_id}/configuration": {
       "parameters": [
         {
@@ -4918,7 +5980,7 @@
         ],
         "operationId": "readUpstreamProviderHealth",
         "summary": "Read the latest independent upstream service probe",
-        "description": "Returns the stored result of the periodic or manually requested service\nprobe. Customer requests do not update this result. `null` means no probe\nhas completed yet.\n",
+        "description": "Returns independently observed billed inference evidence. Customer requests\ndo not update it. A skipped latest attempt is visible with the preserved\nlast_result; otherwise last_attempt accompanies the stored result.\nLegacy rows retain historical_result with unknown status and unverified\nprovenance. null means no result or attempt has been stored.\n",
         "security": [
           {
             "serviceBearer": []
@@ -4968,7 +6030,7 @@
         ],
         "operationId": "probeUpstreamProviderHealth",
         "summary": "Probe one upstream without returning its response body",
-        "description": "Performs a bounded provider-specific read using the current credential. The\nupstream response body is never read, logged, or returned. Transport and\nauthentication failures are represented by `status: unhealthy` in a 200\nmanagement response; they are not proxy responses.\n",
+        "description": "Performs a bounded billed inference using the configured billing credential\nand an exact account/model/generation/revision pin. The default selects a\nlocally routable model priced in that credential's currency. Explicit\nunavailable selections do not fall back. Local pre-dispatch failures are\nskipped and preserve the last real result. Provider bodies may be read for\nbounded protocol/quota classification but are never returned here.\nManual recovery may bypass known quota deadlines; periodic probes wait\nunless fresh accepted-reset readback permits exact-model verification.\nDisabled accounts remain unsendable. HTTP 200 is the management response,\nnot evidence of provider success; upstream_status records original receipt.\n",
         "security": [
           {
             "serviceBearer": []
@@ -8263,8 +9325,8 @@
           "Routes and pricing"
         ],
         "operationId": "deleteModelRoute",
-        "summary": "Delete a disabled, unreferenced model route",
-        "description": "The route must first be disabled and must not be referenced by request history.\nA stale `expected_updated_at`, enabled route, or historical reference returns\n409. A missing route, including a repeated successful delete, returns 204.\n",
+        "summary": "Delete disabled or archived route configuration while preserving history",
+        "description": "The route must first be disabled. Deletion removes active or archived configuration,\ngrants and memberships. Request and financial snapshots retain their original\nroute UUID, model, account, usage and cost and do not require a configuration\nforeign key. A stale `expected_updated_at` or enabled route returns 409. A\nmissing route, including a repeated successful delete, returns 204.\n",
         "security": [
           {
             "serviceBearer": []
@@ -11744,6 +12806,60 @@
         }
       }
     },
+    "/internal/v1/sessions/{session_id}/requests/{request_id}/dialogue": {
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getOperatorSessionDialogue",
+        "summary": "Read the cleaned session dialogue stored for this request",
+        "description": "Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "requests:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          },
+          {
+            "$ref": "#/components/parameters/ContextKeyId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cleaned dialogue turns for viewing and training export.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDialogue"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/internal/v1/sessions/{session_id}/requests/{request_id}/context/content": {
       "get": {
         "tags": [
@@ -12372,7 +13488,15 @@
             "description": "Select only the analysis needed by the current view; full preserves the complete legacy response.",
             "schema": {
               "type": "string",
-              "enum": ["full", "overview", "trends", "dimensions", "sessions", "heatmap", "output_rate"],
+              "enum": [
+                "full",
+                "overview",
+                "trends",
+                "dimensions",
+                "sessions",
+                "heatmap",
+                "output_rate"
+              ],
               "default": "full"
             }
           },
@@ -12510,7 +13634,10 @@
             "description": "full includes exact output rates; trends returns only rollup summary and time-series metrics.",
             "schema": {
               "type": "string",
-              "enum": ["full", "trends"],
+              "enum": [
+                "full",
+                "trends"
+              ],
               "default": "full"
             }
           },
@@ -13759,6 +14886,50 @@
         }
       }
     },
+    "/self/v1/sessions/{session_id}/requests/{request_id}/dialogue": {
+      "get": {
+        "tags": [
+          "Self service"
+        ],
+        "operationId": "getOwnSessionDialogue",
+        "summary": "Read the cleaned session dialogue stored for this owned request",
+        "description": "Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.",
+        "security": [
+          {
+            "clientBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/ContextSessionId"
+          },
+          {
+            "$ref": "#/components/parameters/RequestIdPath"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cleaned dialogue turns for this credential's request.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionDialogue"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          }
+        }
+      }
+    },
     "/self/v1/sessions/{session_id}/requests/{request_id}/context/content": {
       "get": {
         "tags": [
@@ -14573,6 +15744,827 @@
           },
           "502": {
             "$ref": "#/components/responses/UpstreamError"
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/resolve": {
+      "post": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "resolveOperatorSessionThreads",
+        "summary": "Resolve exact Codex thread metadata without reading bodies",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionThreadResolution"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "requests:read",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionThreadResolveRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/analyze": {
+      "post": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "analyzeOperatorSessionTasks",
+        "summary": "Analyze one session, automatic subtree or selected related union",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTaskAnalysis"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "requests:read",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskAnalysisRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/self/v1/sessions/analyze": {
+      "post": {
+        "tags": [
+          "Self service"
+        ],
+        "operationId": "analyzeSelfSessionTasks",
+        "summary": "Analyze sessions within the authenticated credential",
+        "security": [
+          {
+            "clientBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTaskAnalysis"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskAnalysisRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/parents": {
+      "post": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "importOperatorSessionParents",
+        "summary": "Persist exact thread-spawn evidence and resolve all known tenant identities",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "accepted",
+                    "linked"
+                  ],
+                  "properties": {
+                    "accepted": {
+                      "type": "integer",
+                      "format": "int64",
+                      "minimum": 0
+                    },
+                    "linked": {
+                      "type": "integer",
+                      "format": "int64",
+                      "minimum": 0
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionThreadParentsRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/titles": {
+      "post": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "generateUnnamedOperatorSessionTitles",
+        "summary": "Queue existing background title jobs for selected unnamed sessions",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "queued",
+                    "results"
+                  ],
+                  "properties": {
+                    "queued": {
+                      "type": "integer",
+                      "format": "int64",
+                      "minimum": 0
+                    },
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "key_id",
+                          "session_id",
+                          "status"
+                        ],
+                        "properties": {
+                          "key_id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "session_id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "status": {
+                            "type": "string",
+                            "enum": [
+                              "queued",
+                              "already_queued",
+                              "named"
+                            ]
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskTitleBatchRequest"
+              }
+            }
+          }
+        },
+        "x-additional-required-scopes": [
+          "filter_assistant:execute"
+        ]
+      }
+    },
+    "/internal/v1/sessions/{session_id}/name": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ContextSessionId"
+        },
+        {
+          "$ref": "#/components/parameters/TenantFilter"
+        },
+        {
+          "$ref": "#/components/parameters/ContextKeyId"
+        }
+      ],
+      "put": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "updateOperatorSessionName",
+        "summary": "Compare and set an explicit name, preserving manual priority",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionGeneratedTitle"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskNameUpdate"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/sessions/{session_id}/relationships": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/ContextSessionId"
+        },
+        {
+          "$ref": "#/components/parameters/TenantFilter"
+        },
+        {
+          "$ref": "#/components/parameters/ContextKeyId"
+        }
+      ],
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getOperatorSessionRelationships",
+        "summary": "Read automatic parents and manual related sessions",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionTaskRelationships"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "requests:read"
+      },
+      "put": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "putOperatorSessionRelationship",
+        "summary": "Persist a session association without copying accounting",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "ok"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskRelationshipChange"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "deleteOperatorSessionRelationship",
+        "summary": "Remove a manual related association",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful operation.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "ok"
+                  ],
+                  "properties": {
+                    "ok": {
+                      "const": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Identity, revision or parent evidence conflicts."
+          }
+        },
+        "x-required-scope": "keys:write",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionTaskRelationshipChange"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/internal/v1/system-settings/http": {
+      "get": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "getHttpSettings",
+        "summary": "Read global HTTP settings and locally installed effective values",
+        "description": "Global operators only. Refreshes the local snapshot from persistent system settings. Each purpose reports effective values, units and sources. No credentials or proxy URLs are returned.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "x-global-operator-only": true,
+        "responses": {
+          "200": {
+            "description": "Current installed revision. An unconfigured system has revision zero.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpSettingsView"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "System"
+        ],
+        "operationId": "putHttpSettings",
+        "summary": "Atomically replace global HTTP settings",
+        "description": "Full-document replacement with revision comparison and a transactional audit receipt. Omitted fields inherit; explicit null disables a duration even when the parent supplies a finite value. Purpose overrides take precedence over global defaults and explicit source defaults. Removing a field clears its override. All duration defaults are unlimited. New outbound requests use the new local revision; in-flight clients retain their previous pools. Other processes refresh off the request path every five seconds and retain their last valid snapshot if storage is unavailable. TLS verification, proxy authorization, DNS pinning, redirect and non-idempotent retry rules cannot be changed here.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "x-global-operator-only": true,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PutHttpSettings"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Locally installed settings and effective values after durable commit.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HttpSettingsView"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          }
+        }
+      }
+    },
+    "/internal/v1/upstream-concurrency": {
+      "get": {
+        "tags": [
+          "Operator traffic"
+        ],
+        "operationId": "getUpstreamConcurrency",
+        "summary": "Read sampled active leases and observed proxy concurrency",
+        "description": "Requires both providers:read and requests:read. Read-only asynchronous samples across gateways sharing the database. Live request-owner leases, generation job states, and unfinished egress attempts have separate measurement bases. Five-second sampled peaks are lower bounds; history is process-local for 15 minutes. Expired/missing request leases are excluded. Metadata gaps, truncation and stale collection are explicit. Unknown proxy attribution is never inferred from configured proxies or health. Recommendations are null; application is manual only.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "parameters": [
+          {
+            "name": "tenant_external_id",
+            "in": "query",
+            "required": false,
+            "description": "Tenant-scoped credentials remain restricted to their tenant. Global credentials may select a tenant or omit for global observations.",
+            "schema": {
+              "type": "string",
+              "maxLength": 200
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Cached operational concurrency samples.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamConcurrencySnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        },
+        "x-required-scopes": [
+          "providers:read",
+          "requests:read"
+        ]
+      }
+    },
+    "/internal/v1/upstreams/quota/windows": {
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getUpstreamQuotaWindows",
+        "summary": "Read persisted quota window names for configuration",
+        "description": "Reads account window metadata from the authorized tenant in one database query. Historical window names remain available for configuration. Routing freshness is evaluated separately by the routing projection.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "account_ids",
+                  "tenant_external_id"
+                ],
+                "properties": {
+                  "account_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 100,
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    }
+                  },
+                  "tenant_external_id": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Known account window names. Accounts awaiting observation have an empty windows array.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "results"
+                  ],
+                  "properties": {
+                    "results": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "upstream_account_id",
+                          "provider",
+                          "windows"
+                        ],
+                        "properties": {
+                          "upstream_account_id": {
+                            "type": "string",
+                            "format": "uuid"
+                          },
+                          "provider": {
+                            "type": "string"
+                          },
+                          "windows": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "required": [
+                                "id",
+                                "label",
+                                "period_seconds"
+                              ],
+                              "properties": {
+                                "id": {
+                                  "type": "string"
+                                },
+                                "label": {
+                                  "type": "string"
+                                },
+                                "period_seconds": {
+                                  "type": [
+                                    "integer",
+                                    "null"
+                                  ]
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
           }
         }
       }
@@ -15893,6 +17885,172 @@
       }
     },
     "schemas": {
+      "PluginBackgroundActionGrant": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "plugin_id",
+          "tenant_id",
+          "tenant_external_id",
+          "upstream_account_id",
+          "enabled",
+          "revision",
+          "last_attempt_at",
+          "last_error_code",
+          "last_result",
+          "last_operation_id"
+        ],
+        "properties": {
+          "plugin_id": {
+            "type": "string"
+          },
+          "tenant_id": {
+            "type": "string"
+          },
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "upstream_account_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "last_attempt_at": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_result": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "no_action",
+              "retryable_error",
+              "blocked",
+              "prepared",
+              "submitted",
+              "accepted",
+              "unknown",
+              "expired",
+              null
+            ]
+          },
+          "last_operation_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "PluginBackgroundActionStatus": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "grant",
+          "can_write",
+          "operation"
+        ],
+        "properties": {
+          "grant": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PluginBackgroundActionGrant"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "can_write": {
+            "type": "boolean"
+          },
+          "operation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamQuotaResetOperation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "PutPluginBackgroundActionGrant": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "expected_revision"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "OperatorInferenceConversation": {
+        "type": [
+          "object",
+          "null"
+        ],
+        "additionalProperties": false,
+        "required": [
+          "id"
+        ],
+        "description": "Gateway-owned session and turn identifiers; consumed before forwarding the inference request.",
+        "properties": {
+          "id": {
+            "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+          },
+          "turn_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "parent_turn_id": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/OperatorInferenceConversationIdentifier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "OperatorInferenceConversationIdentifier": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "pattern": "^[A-Za-z0-9._:-]+$"
+      },
       "SessionContextItem": {
         "type": "object",
         "required": [
@@ -16118,13 +18276,141 @@
           }
         }
       },
+      "SessionDialogue": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "contract_version",
+          "representation",
+          "request_id",
+          "session_id",
+          "turns"
+        ],
+        "properties": {
+          "contract_version": {
+            "type": "string",
+            "enum": [
+              "session_dialogue_v1"
+            ]
+          },
+          "representation": {
+            "type": "string",
+            "enum": [
+              "session_body"
+            ]
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "turns": {
+            "type": "array",
+            "maxItems": 4096,
+            "items": {
+              "$ref": "#/components/schemas/SessionDialogueTurn"
+            }
+          }
+        }
+      },
+      "SessionDialogueTurn": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "role",
+          "origin",
+          "parts"
+        ],
+        "properties": {
+          "role": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "origin": {
+            "type": "string",
+            "enum": [
+              "request",
+              "return"
+            ]
+          },
+          "parts": {
+            "type": "array",
+            "maxItems": 256,
+            "items": {
+              "$ref": "#/components/schemas/SessionDialoguePart"
+            }
+          }
+        }
+      },
+      "SessionDialoguePart": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "part_index",
+          "kind",
+          "text",
+          "media_type",
+          "byte_length",
+          "call_id",
+          "tool_call_id"
+        ],
+        "properties": {
+          "part_index": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "kind": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "media_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "byte_length": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          },
+          "call_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tool_call_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "SessionGeneratedTitle": {
         "type": "object",
         "required": [
           "title",
           "state",
           "error_code",
-          "updated_at"
+          "updated_at",
+          "source",
+          "revision"
         ],
         "properties": {
           "title": {
@@ -16158,6 +18444,20 @@
               "null"
             ],
             "format": "int64"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "generated",
+              "manual",
+              "codex"
+            ]
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },
@@ -16301,7 +18601,6 @@
           "members": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4,
             "items": {
               "$ref": "#/components/schemas/TransportProxyMemberInput"
             }
@@ -16548,7 +18847,6 @@
           "members": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4,
             "items": {
               "$ref": "#/components/schemas/TransportProxyMemberInput"
             }
@@ -20011,6 +22309,7 @@
         "required": [
           "account_id",
           "status",
+          "source",
           "checked_at"
         ],
         "properties": {
@@ -20022,7 +22321,16 @@
             "type": "string",
             "enum": [
               "healthy",
-              "unhealthy"
+              "unhealthy",
+              "skipped",
+              "unknown"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "model_probe",
+              "legacy_unverified"
             ]
           },
           "error_code": {
@@ -20031,31 +22339,222 @@
               "null"
             ],
             "enum": [
-              "credential_invalid",
-              "destination_invalid",
               "authentication_failed",
               "upstream_unavailable",
-              "connection_failed",
+              "rate_limited",
+              "quota_exhausted",
+              "service_overloaded",
+              "probe_admission_skipped",
+              "probe_state_unavailable",
+              "probe_account_unavailable",
+              "provider_retired",
+              "probe_model_unavailable",
+              "probe_billing_unavailable",
+              "probe_route_unavailable",
+              "probe_model_unpriced",
+              "supplier_quota_reset_pending",
               null
             ]
           },
           "upstream_status": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 100,
             "maximum": 599,
-            "description": "Present when an HTTP response was received; its body is discarded."
+            "description": "Original provider HTTP status at receipt; null before receipt."
           },
           "latency_ms": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
-            "minimum": 0,
-            "description": "Present when a network probe was attempted."
+            "minimum": 0
           },
           "checked_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "trigger": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "periodic",
+              "periodic_recovery"
+            ]
+          },
+          "credential_generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "transport_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "selected_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "actual_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exact target when transport dispatch began; null for local preparation failures. Does not prove supplier execution."
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status_origin": {
+            "type": "string",
+            "enum": [
+              "provider",
+              "mtc"
+            ]
+          },
+          "reset_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Provider deadline in Unix milliseconds; null means unknown."
+          },
+          "reset_source": {
+            "type": "string",
+            "enum": [
+              "retry_after",
+              "provider_reset",
+              "unknown"
+            ]
+          },
+          "historical_result": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "error_code",
+              "latency_ms",
+              "checked_at"
+            ],
+            "properties": {
+              "status": {
+                "type": "string"
+              },
+              "error_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "latency_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "checked_at": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "description": "Preserved legacy data whose independent-probe provenance cannot be established."
+          },
+          "last_attempt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamProbeAttempt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamProbeResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
+      },
+      "UpstreamProbeAttempt": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/UpstreamHealthResult"
+          },
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "healthy",
+                  "unhealthy",
+                  "skipped"
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "last_attempt"
+                  ]
+                },
+                {
+                  "required": [
+                    "last_result"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "UpstreamProbeResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/UpstreamHealthResult"
+          },
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "healthy",
+                  "unhealthy",
+                  "unknown"
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "last_attempt"
+                  ]
+                },
+                {
+                  "required": [
+                    "last_result"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
       },
       "StartCursorOAuthRequest": {
         "type": "object",
@@ -25524,7 +28023,8 @@
               "duration_ms",
               "cost_micros",
               "key_alias",
-              "principal"
+              "principal",
+              "session_association"
             ]
           },
           "operator": {
@@ -29105,6 +31605,945 @@
             "type": "string",
             "minLength": 1,
             "maxLength": 32000
+          }
+        }
+      },
+      "SessionTaskIdentity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "key_id",
+          "session_id"
+        ],
+        "properties": {
+          "key_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      },
+      "SessionTaskAnalysisRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "identities",
+          "scope"
+        ],
+        "properties": {
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "identities": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/SessionTaskIdentity"
+            }
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "session",
+              "subtree",
+              "related"
+            ],
+            "description": "session and subtree require one root; related accepts a nonempty selected union without a task-count limit."
+          },
+          "timezone": {
+            "type": "string",
+            "default": "UTC",
+            "description": "IANA timezone; historical local calendar days honor daylight saving transitions."
+          },
+          "timezone_offset_minutes": {
+            "type": "integer",
+            "minimum": -840,
+            "maximum": 840,
+            "description": "Fixed minutes east of UTC, used only with UTC timezone. Prefer an IANA timezone for historical analysis."
+          },
+          "include_subtrees": {
+            "type": "boolean",
+            "default": false,
+            "description": "Expand automatic descendants of each selected related root. The subtree scope always expands descendants."
+          }
+        }
+      },
+      "SessionTaskUsage": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "requests",
+          "input_tokens",
+          "output_tokens",
+          "cached_input_tokens",
+          "cache_write_tokens",
+          "request_duration_sum_ms",
+          "unknown_cost_requests",
+          "costs"
+        ],
+        "properties": {
+          "requests": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cached_input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cache_write_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "request_duration_sum_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0,
+            "description": "Sum of request durations; overlapping requests are not wallclock work time."
+          },
+          "unknown_cost_requests": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "costs": {
+            "type": "object",
+            "description": "Known integer micros keyed by currency. Unknown costs are counted separately and must not be displayed as zero.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        }
+      },
+      "SessionTaskAnalysis": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "scope",
+          "identities",
+          "timezone",
+          "first_request_at",
+          "last_request_at",
+          "calendar_span_days",
+          "active_days",
+          "totals",
+          "daily",
+          "coverage",
+          "timezone_offset_minutes",
+          "include_subtrees"
+        ],
+        "properties": {
+          "scope": {
+            "type": "string",
+            "enum": [
+              "session",
+              "subtree",
+              "related"
+            ]
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionTaskIdentity"
+            }
+          },
+          "timezone": {
+            "type": "string"
+          },
+          "first_request_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_request_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "calendar_span_days": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "active_days": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "totals": {
+            "$ref": "#/components/schemas/SessionTaskUsage"
+          },
+          "daily": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "day_bucket",
+                "day_start_at",
+                "usage"
+              ],
+              "properties": {
+                "day_bucket": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "day_start_at": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "usage": {
+                  "$ref": "#/components/schemas/SessionTaskUsage"
+                }
+              }
+            }
+          },
+          "coverage": {
+            "const": "completed_request_facts_and_archive_only"
+          },
+          "timezone_offset_minutes": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "include_subtrees": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SessionThreadResolveRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "explicit_session_ids"
+        ],
+        "properties": {
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "explicit_session_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        }
+      },
+      "SessionThreadResolution": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sessions"
+        ],
+        "properties": {
+          "sessions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "tenant_id",
+                "key_id",
+                "session_id",
+                "explicit_session_id",
+                "title",
+                "title_source",
+                "title_revision"
+              ],
+              "properties": {
+                "tenant_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "key_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "session_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "explicit_session_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "title_source": {
+                  "type": "string"
+                },
+                "title_revision": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      },
+      "SessionTaskNameUpdate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "title",
+          "source",
+          "expected_revision"
+        ],
+        "properties": {
+          "title": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 80
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "codex"
+            ]
+          },
+          "explicit_session_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "expected_unnamed": {
+            "type": "boolean",
+            "default": false
+          },
+          "idempotency_key": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          }
+        }
+      },
+      "SessionTaskRelationshipChange": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "target",
+          "kind"
+        ],
+        "properties": {
+          "target": {
+            "$ref": "#/components/schemas/SessionTaskIdentity"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "parent",
+              "related"
+            ]
+          },
+          "evidence": {
+            "type": "string",
+            "maxLength": 512
+          }
+        }
+      },
+      "SessionTaskRelationships": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "relationships"
+        ],
+        "properties": {
+          "relationships": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "key_id",
+                "session_id",
+                "target",
+                "kind",
+                "evidence"
+              ],
+              "properties": {
+                "key_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "session_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "target": {
+                  "$ref": "#/components/schemas/SessionTaskIdentity"
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "parent",
+                    "related"
+                  ]
+                },
+                "evidence": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "SessionThreadParentsRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "parents"
+        ],
+        "properties": {
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "parents": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "child_thread_id",
+                "parent_thread_id",
+                "evidence"
+              ],
+              "properties": {
+                "child_thread_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "parent_thread_id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "evidence": {
+                  "type": "string",
+                  "enum": [
+                    "thread_spawn_edges",
+                    "source.subagent.thread_spawn"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      },
+      "SessionTaskTitleBatchRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "identities"
+        ],
+        "properties": {
+          "tenant_external_id": {
+            "type": "string"
+          },
+          "identities": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "$ref": "#/components/schemas/SessionTaskIdentity"
+            }
+          }
+        }
+      },
+      "HttpDurationOverride": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 1,
+        "maximum": 9007199254740991,
+        "description": "Milliseconds. Null disables the duration. Omit the containing field to inherit."
+      },
+      "HttpOverrides": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "connect_timeout_ms": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "read_timeout_ms": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "request_timeout_ms": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "pool_idle_timeout_ms": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "pool_max_idle_per_host": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991,
+            "description": "Idle connections per host. Zero disables idle retention; it does not limit active requests."
+          }
+        }
+      },
+      "HttpSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "defaults": {
+            "$ref": "#/components/schemas/HttpOverrides"
+          },
+          "purposes": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "general": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "codex": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "oauth": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "plugin": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "plugin_release": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              },
+              "probe": {
+                "$ref": "#/components/schemas/HttpOverrides"
+              }
+            }
+          }
+        }
+      },
+      "PutHttpSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "expected_revision",
+          "settings"
+        ],
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "settings": {
+            "$ref": "#/components/schemas/HttpSettings"
+          }
+        }
+      },
+      "HttpSettingSource": {
+        "type": "string",
+        "enum": [
+          "purpose_override",
+          "global_default",
+          "source_default"
+        ]
+      },
+      "EffectiveHttpDuration": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "value",
+          "source",
+          "unit"
+        ],
+        "properties": {
+          "value": {
+            "$ref": "#/components/schemas/HttpDurationOverride"
+          },
+          "source": {
+            "$ref": "#/components/schemas/HttpSettingSource"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "milliseconds"
+            ]
+          }
+        }
+      },
+      "EffectiveHttpPoolSize": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "value",
+          "source",
+          "unit"
+        ],
+        "properties": {
+          "value": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "source": {
+            "$ref": "#/components/schemas/HttpSettingSource"
+          },
+          "unit": {
+            "type": "string",
+            "enum": [
+              "connections"
+            ]
+          }
+        }
+      },
+      "EffectiveHttpSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "connect_timeout_ms",
+          "read_timeout_ms",
+          "request_timeout_ms",
+          "pool_idle_timeout_ms",
+          "pool_max_idle_per_host"
+        ],
+        "properties": {
+          "connect_timeout_ms": {
+            "$ref": "#/components/schemas/EffectiveHttpDuration"
+          },
+          "read_timeout_ms": {
+            "$ref": "#/components/schemas/EffectiveHttpDuration"
+          },
+          "request_timeout_ms": {
+            "$ref": "#/components/schemas/EffectiveHttpDuration"
+          },
+          "pool_idle_timeout_ms": {
+            "$ref": "#/components/schemas/EffectiveHttpDuration"
+          },
+          "pool_max_idle_per_host": {
+            "$ref": "#/components/schemas/EffectiveHttpPoolSize"
+          }
+        }
+      },
+      "HttpSettingsView": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "revision",
+          "settings",
+          "effective"
+        ],
+        "properties": {
+          "revision": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "settings": {
+            "$ref": "#/components/schemas/HttpSettings"
+          },
+          "effective": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "general",
+              "codex",
+              "oauth",
+              "plugin",
+              "plugin_release",
+              "probe"
+            ],
+            "properties": {
+              "general": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "codex": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "oauth": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "plugin": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "plugin_release": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              },
+              "probe": {
+                "$ref": "#/components/schemas/EffectiveHttpSettings"
+              }
+            }
+          }
+        }
+      },
+      "UpstreamConcurrencySnapshot": {
+        "type": "object",
+        "required": [
+          "contract_version",
+          "scope",
+          "generated_at",
+          "observed_at",
+          "last_attempt_at",
+          "last_error_at",
+          "stale",
+          "expired_and_missing_request_leases_excluded",
+          "sample_interval_ms",
+          "retention_ms",
+          "peak_is_sampled_lower_bound",
+          "samples_truncated",
+          "recommendation",
+          "application_mode",
+          "series",
+          "samples",
+          "metadata_gaps"
+        ],
+        "properties": {
+          "contract_version": {
+            "const": "upstream_concurrency_v1"
+          },
+          "scope": {
+            "const": "shared_database_operational_leases_and_generation_states"
+          },
+          "generated_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "observed_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_attempt_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "last_error_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "stale": {
+            "type": "boolean"
+          },
+          "expired_and_missing_request_leases_excluded": {
+            "const": true
+          },
+          "sample_interval_ms": {
+            "const": 5000
+          },
+          "retention_ms": {
+            "const": 900000
+          },
+          "peak_is_sampled_lower_bound": {
+            "const": true
+          },
+          "samples_truncated": {
+            "type": "boolean"
+          },
+          "recommendation": {
+            "type": "null"
+          },
+          "application_mode": {
+            "const": "manual_only"
+          },
+          "series": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "tenant_external_id",
+                "dimension",
+                "identity",
+                "measurement_basis",
+                "current",
+                "sampled_peak",
+                "points",
+                "sample_ids"
+              ],
+              "properties": {
+                "tenant_external_id": {
+                  "type": "string"
+                },
+                "dimension": {
+                  "enum": [
+                    "upstream_account",
+                    "network_proxy"
+                  ]
+                },
+                "identity": {
+                  "type": "string"
+                },
+                "measurement_basis": {
+                  "type": "string"
+                },
+                "current": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "sampled_peak": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "points": {
+                  "type": "array",
+                  "maxItems": 180,
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "observed_at": {
+                        "type": "integer",
+                        "format": "int64"
+                      },
+                      "value": {
+                        "type": "integer",
+                        "minimum": 0
+                      },
+                      "truncated": {
+                        "type": "boolean"
+                      }
+                    }
+                  }
+                },
+                "sample_ids": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
+          "samples": {
+            "type": "array",
+            "maxItems": 4096,
+            "items": {
+              "type": "object",
+              "required": [
+                "tenant_external_id",
+                "sample_id",
+                "source",
+                "upstream_account_id",
+                "state",
+                "lease_expires_at",
+                "lease_state",
+                "selected_egress",
+                "egress_attempt_id",
+                "egress_upstream_account_id",
+                "egress_state"
+              ],
+              "properties": {
+                "tenant_external_id": {
+                  "type": "string"
+                },
+                "sample_id": {
+                  "type": "string"
+                },
+                "source": {
+                  "enum": [
+                    "request_owner",
+                    "generation_job"
+                  ]
+                },
+                "upstream_account_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "type": "string"
+                },
+                "lease_expires_at": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "format": "int64"
+                },
+                "lease_state": {
+                  "enum": [
+                    "live",
+                    "expired",
+                    "missing"
+                  ]
+                },
+                "selected_egress": {
+                  "type": [
+                    "object",
+                    "null"
+                  ],
+                  "description": "Sanitized selected egress metadata, without authentication material."
+                },
+                "egress_attempt_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "egress_upstream_account_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "egress_state": {
+                  "enum": [
+                    "unfinished_attempt",
+                    "completed_attempt",
+                    "invalid_metadata",
+                    "missing_metadata"
+                  ]
+                }
+              }
+            }
+          },
+          "metadata_gaps": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
         }
       }

@@ -4,7 +4,7 @@ use memeloop_token_center::{
         ArchiveStagingOwner, ArchiveStagingPurpose, ArchiveStagingState, BeginArchiveStagingInput,
         BeginArchiveStagingResult,
     },
-    conversation::{ConversationHints, extract_atoms},
+    conversation::{ConversationHints, extract_atoms, session_body_from_documents},
     db::{
         ConversationDetailFilter, ConversationListFilter, CreateKeyInput, CreateModelRouteInput,
         CreateUpstreamAccountInput, Database, FinishProxyRequest, FinishProxyRequestResult,
@@ -1285,9 +1285,10 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
         return;
     };
     let _postgres_test_guard = POSTGRES_TEST_SERIAL.lock().await;
-    let database = Database::connect_with_max(&database_url, 8).await.unwrap();
+    let isolated = postgres_isolation::IsolatedPostgres::create(&database_url).await;
+    let database = Database::connect_with_max(isolated.url(), 8).await.unwrap();
     database.migrate().await.unwrap();
-    let inspection = PgPool::connect(&database_url).await.unwrap();
+    let inspection = PgPool::connect(isolated.url()).await.unwrap();
     let unique = Uuid::now_v7();
     let model = format!("proxy-admission-lock-{unique}");
     let pepper = b"postgres proxy admission lock pepper";
@@ -1347,9 +1348,10 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
         })
         .collect::<Vec<_>>();
     let request_json = serde_json::json!({"model": model, "messages": messages});
-    let target_atom = extract_atoms(&request_json)
-        .into_iter()
-        .next()
+    let (atoms_a, nodes_a) =
+        session_body_from_documents(&request_json, &serde_json::json!({})).into_prefix();
+    let target_atom = atoms_a
+        .first()
         .expect("the request must materialize one semantic atom");
     sqlx::query(
         "INSERT INTO semantic_atoms (tenant_id, content_hash, instance_hash, role, kind, content_json, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -1424,6 +1426,53 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
             .await
     });
 
+    // Foreground settlement must finish while the content row remains locked.
+    // Only the deferred archive worker is allowed to wait on semantic INSERTs.
+    let finish_a_result =
+        match tokio::time::timeout(std::time::Duration::from_secs(2), &mut finish_a).await {
+            Ok(result) => result.unwrap().unwrap(),
+            Err(_) => {
+                blocker.rollback().await.unwrap();
+                finish_a.abort();
+                let _ = finish_a.await;
+                panic!("foreground finish A waited for immutable content");
+            }
+        };
+    assert_eq!(
+        finish_a_result,
+        FinishProxyRequestResult::Finished {
+            cost_micros: 18,
+            usage_invalid: false,
+        }
+    );
+    let queued: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL), (SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1), (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1)",
+    )
+    .bind(request_a.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(queued, (1, 0, 0));
+
+    let projector_a = Uuid::now_v7();
+    let tasks_a = database
+        .claim_conversation_projection_tasks(projector_a, 1)
+        .await
+        .unwrap();
+    assert_eq!(tasks_a.len(), 1);
+    assert_eq!(tasks_a[0].request_id, request_a);
+    let projection_database = database.clone();
+    let mut projection_a = tokio::spawn(async move {
+        assert!(
+            projection_database
+                .prepare_session_body_archive(projector_a, request_a, atoms_a, &nodes_a, &[])
+                .await?
+        );
+        projection_database
+            .project_claimed_conversation_projection_task(projector_a, request_a)
+            .await
+    });
+
     let blocked_pid = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             if let Some(pid) = sqlx::query_scalar::<_, i32>(
@@ -1444,24 +1493,23 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
         Ok(pid) => pid,
         Err(_) => {
             blocker.rollback().await.unwrap();
-            let finish_result =
-                tokio::time::timeout(std::time::Duration::from_secs(30), &mut finish_a).await;
-            if finish_result.is_err() {
-                finish_a.abort();
-                let _ = finish_a.await;
+            let projection_result =
+                tokio::time::timeout(std::time::Duration::from_secs(30), &mut projection_a).await;
+            if projection_result.is_err() {
+                projection_a.abort();
+                let _ = projection_a.await;
             }
-            panic!("finish A never reached the semantic INSERT lock wait: {finish_result:?}");
+            panic!("archive A never reached the semantic INSERT lock wait: {projection_result:?}");
         }
     };
     assert!(blocked_pid > 0);
 
     let request_b = Uuid::now_v7();
-    // Keep the semantic-row blocker open for this entire admission gate. The two-second
-    // wait-detection budget plus this five-second admission gate remains below the
-    // production 10-second PostgreSQL lock_timeout: the old lock order cannot pass by
-    // merely timing out its lock.
+    // Keep A's content wait open through B's admission, settlement and projection.
+    // Each gate has two seconds, below the production ten-second lock timeout
+    // in total. Recheck the actual lock wait before releasing the blocker.
     let started_b = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        std::time::Duration::from_secs(2),
         database.start_proxy_request(StartProxyRequest {
             request_id: request_b,
             key: &key,
@@ -1484,9 +1532,8 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
         session_id: Some(format!("admission-lock-{unique}")),
         ..ConversationHints::default()
     };
-    // The observed unique-row wait above is our database barrier: A is still
-    // preparing its content. B must finish on the SAME explicit session while
-    // that wait remains blocked, not merely pass same-key admission.
+    // The observed unique-row wait is our database barrier. B must settle and
+    // project on the SAME explicit session while A's archive remains blocked.
     let finished_b = if let Ok(Ok(reservation_b)) = &started_b {
         Some(
             tokio::time::timeout(
@@ -1528,24 +1575,70 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
         None
     };
 
-    // Always release the blocker before interpreting B's result so a regression fails
-    // promptly instead of leaving the spawned finish waiting on test teardown.
+    let projected_b = if matches!(
+        &finished_b,
+        Some(Ok(Ok(FinishProxyRequestResult::Finished { .. })))
+    ) {
+        Some(
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let projector_b = Uuid::now_v7();
+                let tasks = database
+                    .claim_conversation_projection_tasks(projector_b, 1)
+                    .await?;
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].request_id, request_b);
+                let (atoms, nodes) =
+                    session_body_from_documents(&request_b_json, &serde_json::json!({}))
+                        .into_prefix();
+                assert!(
+                    database
+                        .prepare_session_body_archive(projector_b, request_b, atoms, &nodes, &[])
+                        .await?
+                );
+                database
+                    .project_claimed_conversation_projection_task(projector_b, request_b)
+                    .await
+            })
+            .await,
+        )
+    } else {
+        None
+    };
+    let a_still_blocked: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active' AND wait_event_type = 'Lock' AND $2 = ANY(pg_blocking_pids(pid)))",
+    )
+    .bind(blocked_pid)
+    .bind(blocker_pid)
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    // Release the blocker before interpreting B's results, including timeouts.
     blocker.rollback().await.unwrap();
-    let finish_a_result =
-        match tokio::time::timeout(std::time::Duration::from_secs(30), &mut finish_a).await {
+    let projection_a_result =
+        match tokio::time::timeout(std::time::Duration::from_secs(30), &mut projection_a).await {
             Ok(result) => result.unwrap().unwrap(),
             Err(_) => {
-                finish_a.abort();
-                let _ = finish_a.await;
-                panic!("finish A must resume after the semantic row blocker is released");
+                projection_a.abort();
+                let _ = projection_a.await;
+                panic!("archive A must resume after the semantic row blocker is released");
             }
         };
-    assert_eq!(
-        finish_a_result,
-        FinishProxyRequestResult::Finished {
-            cost_micros: 18,
-            usage_invalid: false,
-        }
+    assert!(projection_a_result);
+    assert!(
+        a_still_blocked,
+        "B must complete while A still waits for content"
+    );
+    assert!(
+        projected_b
+            .expect("B must have settled")
+            .expect("same-session B must project while A waits for immutable content")
+            .unwrap()
+    );
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(projector_a, request_a)
+            .await
+            .unwrap()
     );
     let materialized: (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM semantic_atoms WHERE tenant_id = $1), (SELECT COUNT(*) FROM context_nodes WHERE tenant_id = $2)",
@@ -1556,8 +1649,34 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
     .await
     .unwrap();
     assert_eq!(materialized, (152, 152));
+    for (request_id, document) in [(request_a, &request_json), (request_b, &request_b_json)] {
+        let (atoms, nodes) =
+            session_body_from_documents(document, &serde_json::json!({})).into_prefix();
+        let leaf: String = sqlx::query_scalar(
+            "SELECT leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&inspection)
+        .await
+        .unwrap();
+        assert_eq!(leaf, nodes.last().unwrap().node_hash);
+        for atom in atoms {
+            let content: String = sqlx::query_scalar(
+                "SELECT content_json FROM semantic_atoms WHERE tenant_id = $1 AND content_hash = $2",
+            )
+            .bind(key.tenant_id.to_string())
+            .bind(&atom.content_hash)
+            .fetch_one(&inspection)
+            .await
+            .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&content).unwrap(),
+                atom.content
+            );
+        }
+    }
     let reservation_b = started_b
-        .expect("same-key request B admission must complete within five seconds")
+        .expect("same-key request B admission must complete within two seconds")
         .unwrap();
     assert_eq!(
         finished_b
@@ -1674,6 +1793,17 @@ async fn postgres_proxy_conversation_content_wait_does_not_hold_session_lock() {
     .await
     .unwrap();
     assert_eq!(active_reservations, 0);
+    let raw_payloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE tenant_id = $1",
+    )
+    .bind(key.tenant_id.to_string())
+    .fetch_one(&inspection)
+    .await
+    .unwrap();
+    assert_eq!(raw_payloads, 0);
+    inspection.close().await;
+    drop(database);
+    isolated.cleanup().await;
 }
 
 #[tokio::test]

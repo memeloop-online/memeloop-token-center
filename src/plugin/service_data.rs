@@ -5,10 +5,9 @@ use serde_json::Value;
 use wasmtime::{Store, StoreLimitsBuilder};
 
 use super::{
-    HostState, PLUGIN_MEMORY_BYTES, PLUGIN_TABLE_ELEMENTS, PluginRuntime,
-    PluginServiceDataEndpoint, PluginServiceDataProvenance, PluginServiceDataView,
-    epoch_deadline_ticks, plugin_configuration_schema_digest, plugin_failure,
-    plugin_reported_error,
+    HostState, PLUGIN_TABLE_ELEMENTS, PluginRuntime, PluginServiceDataEndpoint,
+    PluginServiceDataProvenance, PluginServiceDataView, epoch_deadline_ticks,
+    plugin_configuration_schema_digest, plugin_failure, plugin_reported_error,
 };
 use crate::{
     db::PluginServiceDataRefreshErrorCode,
@@ -36,12 +35,15 @@ pub(crate) struct PluginServiceDataCollected {
 #[derive(Debug)]
 pub(crate) struct PluginServiceDataCollectionFailure {
     pub(crate) code: PluginServiceDataRefreshErrorCode,
-    pub(crate) error: AppError,
+    pub(crate) error: Box<AppError>,
 }
 
 impl PluginServiceDataCollectionFailure {
     fn new(code: PluginServiceDataRefreshErrorCode, error: AppError) -> Self {
-        Self { code, error }
+        Self {
+            code,
+            error: Box::new(error),
+        }
     }
 }
 
@@ -112,7 +114,11 @@ impl PluginRuntime {
         endpoint_id: &str,
     ) -> Result<PluginServiceDataView, AppError> {
         let target = self.service_data_target(plugin_id, endpoint_id)?;
-        let database = &self.kv.as_ref().ok_or(AppError::Internal)?.database;
+        let database = &self
+            .kv
+            .as_ref()
+            .ok_or(AppError::internal("service_data_service_data_1"))?
+            .database;
         let snapshot = database
             .plugin_service_data_snapshot(
                 runtime_revision,
@@ -174,7 +180,9 @@ impl PluginRuntime {
                 ));
             }
         };
-        let fetched_at = snapshot.fetched_at.ok_or(AppError::Internal)?;
+        let fetched_at = snapshot
+            .fetched_at
+            .ok_or(AppError::internal("service_data_service_data_2"))?;
         let fresh_until = fetched_at.saturating_add(
             i64::try_from(target.endpoint.cache_ttl_seconds)
                 .unwrap_or(i64::MAX)
@@ -211,13 +219,13 @@ impl PluginRuntime {
         let url = endpoint.url.as_deref().ok_or_else(|| {
             PluginServiceDataCollectionFailure::new(
                 PluginServiceDataRefreshErrorCode::Network,
-                AppError::Internal,
+                AppError::internal("service_data_collect_http_service_data_1"),
             )
         })?;
         let http = self.http.as_ref().ok_or_else(|| {
             PluginServiceDataCollectionFailure::new(
                 PluginServiceDataRefreshErrorCode::Network,
-                AppError::Internal,
+                AppError::internal("service_data_collect_http_service_data_2"),
             )
         })?;
         let timeout = Duration::from_millis(endpoint.timeout_millis);
@@ -325,7 +333,6 @@ impl PluginRuntime {
             .min(Duration::from_millis(endpoint.timeout_millis));
         let deadline = Instant::now() + timeout;
         let limits = StoreLimitsBuilder::new()
-            .memory_size(PLUGIN_MEMORY_BYTES)
             .table_elements(PLUGIN_TABLE_ELEMENTS)
             .instances(8)
             .tables(2)
@@ -341,7 +348,7 @@ impl PluginRuntime {
                 kv: self.kv.clone(),
                 limits,
                 deadline,
-                http_body_limit: endpoint.max_body_bytes,
+                http_body_limit: Some(endpoint.max_body_bytes),
                 http_diagnostic: super::PluginHttpDiagnostic {
                     stage: "not_called",
                     ..super::PluginHttpDiagnostic::default()
@@ -448,11 +455,11 @@ fn service_data_origin(
 ) -> Result<String, AppError> {
     match (&endpoint.url, &endpoint.component_adapter) {
         (Some(url), None) => Ok(url::Url::parse(url)
-            .map_err(|_| AppError::Internal)?
+            .map_err(|_| AppError::internal("service_data_service_data_origin_1"))?
             .origin()
             .ascii_serialization()),
         (None, Some(adapter)) => Ok(format!("plugin:{plugin_id}#{}", adapter.collector)),
-        _ => Err(AppError::Internal),
+        _ => Err(AppError::internal("service_data_service_data_origin_1")),
     }
 }
 
@@ -494,7 +501,7 @@ fn collection_failure(
 ) -> PluginServiceDataCollectionFailure {
     PluginServiceDataCollectionFailure::new(
         code,
-        AppError::Upstream("plugin service data collection failed".into()),
+        AppError::upstream("plugin_service_data_collection_failed"),
     )
 }
 
@@ -742,8 +749,8 @@ mod tests {
             (12_000_000, 12_000_000, false),
         ] {
             let (_directory, runtime) = service_data_runtime(collect_work, normalize_work).await;
-            assert_eq!(runtime.fuel, 5_000_000);
-            assert_eq!(super::super::PLUGIN_FUEL, 5_000_000);
+            assert_eq!(runtime.fuel, u64::MAX);
+            assert_eq!(super::super::PLUGIN_FUEL, u64::MAX);
             let target = runtime.service_data_targets().unwrap().remove(0);
             let result = runtime.collect_component_service_data(&target);
             if succeeds {

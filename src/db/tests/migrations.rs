@@ -846,6 +846,104 @@ async fn sqlite_control_list_projection_indexes_are_covering() {
 }
 
 #[tokio::test]
+async fn sqlite_request_list_newest_page_scan_indexes_exist() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("request-list-scan.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+
+    for index in [
+        "session_archive_unlinked_recent_idx",
+        "request_egress_attempts_request_idx",
+    ] {
+        let installed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $1",
+        )
+        .bind(index)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(installed, 1, "missing v140 request-list scan index {index}");
+    }
+
+    // The unlinked-archive source must reach the newest-first ordering directly
+    // instead of scanning and sorting the whole table on every global page.
+    let archive_plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT * FROM session_archive_unlinked_requests WHERE source_started_at >= 0 ORDER BY source_started_at DESC, archive_request_id DESC LIMIT 101",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("detail").unwrap())
+    .collect();
+    assert!(
+        archive_plan
+            .iter()
+            .any(|detail| detail.contains("session_archive_unlinked_recent_idx")),
+        "newest archive page must use session_archive_unlinked_recent_idx: {archive_plan:?}"
+    );
+
+    // The per-page egress lookup must use the request_id key, not a table scan.
+    let egress_plan: Vec<String> = sqlx::query(
+        "EXPLAIN QUERY PLAN SELECT request_id FROM request_egress_attempts WHERE request_id = 'request-a'",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.try_get("detail").unwrap())
+    .collect();
+    assert!(
+        egress_plan
+            .iter()
+            .any(|detail| detail.contains("request_egress_attempts_request_idx")),
+        "egress page lookup must use request_egress_attempts_request_idx: {egress_plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn sqlite_usage_analysis_compaction_probe_index_exists() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("compaction-probe.db").display()
+    );
+    let database = Database::connect(&database_url).await.unwrap();
+    database.migrate().await.unwrap();
+
+    let installed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $1")
+            .bind("conversation_observations_compacted_probe_idx")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        installed, 1,
+        "missing v141 usage-analysis compaction probe index"
+    );
+
+    // The probe must stay a *partial* index over compacted rows only: covering every
+    // observation would just duplicate conversation_observations_request_id_key.  The
+    // plan itself is not asserted because SQLite legitimately prefers that existing
+    // unique key for a request_id equality lookup.
+    let definition: String =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = $1")
+            .bind("conversation_observations_compacted_probe_idx")
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    let normalized = definition.to_lowercase().replace(['\n', '\r'], " ");
+    assert!(
+        normalized.contains("where") && normalized.contains("compaction = 1"),
+        "compaction probe index must be restricted to compacted rows: {definition}"
+    );
+}
+
+#[tokio::test]
 async fn durable_oauth_migration_retires_bridge_routes_without_deleting_history() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -1697,7 +1795,7 @@ async fn sqlite_request_lifecycle_uses_locators_for_finish_detail_and_events() {
         .unwrap();
     assert!(matches!(
         database.request_archive_refs(key_id, request_id).await,
-        Err(AppError::Internal)
+        Err(AppError::Internal { .. })
     ));
 }
 

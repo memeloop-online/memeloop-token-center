@@ -65,7 +65,7 @@ pub(super) fn validate_service_tier(service_tier: &str) -> Result<(), AppError> 
 }
 
 pub(super) fn parse_uuid(value: String) -> Result<Uuid, AppError> {
-    Uuid::parse_str(&value).map_err(|_| AppError::Internal)
+    Uuid::parse_str(&value).map_err(|_| AppError::internal("validation_parse_uuid_1"))
 }
 
 pub(super) fn is_sha256_hex(value: &str) -> bool {

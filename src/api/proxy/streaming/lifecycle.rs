@@ -282,7 +282,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         requested_service_tier.as_deref(),
     ) {
         Ok(normalized) => usage = normalized,
-        Err(AppError::Upstream(_)) => {
+        Err(AppError::Upstream { .. }) => {
             usage_basis = crate::model::RequestUsageBasis::NotObserved;
             terminal_status = 502;
             error_code = Some("upstream_invalid_usage");

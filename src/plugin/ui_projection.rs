@@ -46,7 +46,7 @@ fn validate_projection(
     if slots.is_empty() {
         return Ok(());
     }
-    let invalid = || AppError::Upstream("plugin UI projection is invalid".into());
+    let invalid = || AppError::upstream("plugin_ui_projection_is_invalid");
     crate::schema::validate_instance(&PROJECTION_SCHEMA, data).map_err(|_| invalid())?;
     if data["plugin_id"].as_str() != Some(manifest.id.as_str())
         || !slots

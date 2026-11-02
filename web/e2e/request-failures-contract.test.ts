@@ -24,3 +24,14 @@ test('monitoring scope cleanup permits only an aborted snapshot GET', () => {
   assert.equal(isExpectedResourceAbort('GET', url, 'net::ERR_CONNECTION_RESET'), false);
   assert.equal(isExpectedResourceAbort('GET', `${url.split('?')[0]}/other`, 'net::ERR_ABORTED'), false);
 });
+
+test('request-page cleanup permits only its aborted read-only query POST', () => {
+  const url = 'http://127.0.0.1/internal/v1/requests/query';
+  assert.equal(isExpectedResourceAbort('POST', url, 'net::ERR_ABORTED'), true);
+  assert.equal(isExpectedResourceAbort('GET', url, 'net::ERR_ABORTED'), false);
+  assert.equal(isExpectedResourceAbort('DELETE', url, 'net::ERR_ABORTED'), false);
+  assert.equal(isExpectedResourceAbort('POST', url, 'net::ERR_CONNECTION_RESET'), false);
+  assert.equal(isExpectedResourceAbort('POST', `${url}/other`, 'net::ERR_ABORTED'), false);
+  assert.equal(isExpectedResourceAbort('POST', 'http://127.0.0.1/internal/v1/generations', 'net::ERR_ABORTED'), false);
+  assert.equal(isExpectedResourceAbort('POST', 'not a URL', 'net::ERR_ABORTED'), false);
+});

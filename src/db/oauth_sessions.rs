@@ -218,7 +218,9 @@ impl Database {
                         lease_owner,
                         ready_ciphertext: row
                             .try_get::<Option<String>, _>("ready_ciphertext")?
-                            .ok_or(AppError::Internal)?,
+                            .ok_or(AppError::internal(
+                                "oauth_sessions_claim_oauth_login_poll_impl_1",
+                            ))?,
                     })
                 } else {
                     Ok(OAuthLoginClaim::Pending {
@@ -233,7 +235,7 @@ impl Database {
             "failed" => Err(AppError::BadRequest(
                 "OAuth login session is no longer active".into(),
             )),
-            "consumed" => Err(AppError::Internal),
+            "consumed" => Err(AppError::internal("oauth_sessions_site_1")),
             "pending" | "polling" => {
                 let next = row.try_get::<i64, _>("next_poll_at")?.max(
                     row.try_get::<Option<i64>, _>("lease_expires_at")?
@@ -243,7 +245,7 @@ impl Database {
                     retry_after_seconds: millis_until(now, next),
                 })
             }
-            _ => Err(AppError::Internal),
+            _ => Err(AppError::internal("oauth_sessions_site_2")),
         }
     }
 

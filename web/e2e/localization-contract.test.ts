@@ -139,8 +139,8 @@ test('operator guidance gives user actions instead of development reports and ke
     assert.ok(catalog['settings.noEnabledRouteHint'].includes(catalog['providers.title']));
     assert.ok(catalog['settings.noEnabledRouteHint'].includes(catalog['nav.routes']));
   }
-  assert.match(chinese['quota.resetDiscoveryPending'], /查看额度.*不会消耗重置次数/);
-  assert.match(english['quota.resetDiscoveryPending'], /View quota.*does not use a reset credit/);
+  assert.match(chinese['quota.resetDiscoveryPending'], /查看额度只读取当前窗口/);
+  assert.match(english['quota.resetDiscoveryPending'], /Viewing quota only reads the current window/);
   assert.match(chinese['quota.resetDiscoveryFailed'], /检查账号连接.*未执行重置.*未消耗重置次数/);
   assert.match(english['quota.resetDiscoveryFailed'], /Check the account connection.*No reset was performed.*no reset credit was used/);
   assert.match(chinese['quota.resetNotIntegrated'], /通过模型服务提供方重置额度/);
@@ -156,9 +156,9 @@ test('operator guidance gives user actions instead of development reports and ke
 
 test('leaving authorization explains uncertain outcomes without promising cancellation or recovery', () => {
   assert.equal(translationCatalogs['zh-CN']['providers.confirmLeaveAuthorization'],
-    '离开授权页？授权可能尚未完成。离开不会撤销已提交的请求，其结果可能仍未确认。返回后请先检查账号状态；结果未确认时，不要重复提交。');
+    '离开授权页？授权可能尚未完成。已提交的请求会继续处理，结果可能仍未确认。返回后先检查账号状态。结果未确认时，先不要再提交一次。');
   assert.equal(translationCatalogs.en['providers.confirmLeaveAuthorization'],
-    'Leave the authorization page? Authorization may not be complete. Leaving does not undo submitted requests, and their results may still be unknown. Check the account status when you return; do not resubmit requests with unconfirmed results.');
+    'Leave the authorization page? Authorization may still be in progress. Submitted requests keep running, and their results may still be unknown. Check the account status when you return. Wait for an unconfirmed result before submitting again.');
 });
 
 test('provider settings explain user choices through shared bilingual guidance', async () => {

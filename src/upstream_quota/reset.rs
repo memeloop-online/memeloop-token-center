@@ -8,6 +8,206 @@ use crate::{
 
 const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
+// Test binaries may redirect the fixed supplier to a loopback fixture.
+// Production builds retain the fixed supplier endpoints.
+#[cfg(test)]
+pub(super) fn test_supplier_url(account: &UpstreamAccountView, original: &str) -> String {
+    let Some(base) = account
+        .config
+        .get("reset_test_supplier_url")
+        .and_then(Value::as_str)
+    else {
+        return original.to_owned();
+    };
+    let base = url::Url::parse(base).unwrap();
+    assert!(base.scheme() == "http" && base.host_str() == Some("127.0.0.1"));
+    base.join(match original {
+        CONSUME_URL => "consume",
+        USAGE_URL => "usage",
+        _ => "credits",
+    })
+    .unwrap()
+    .to_string()
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CreditEvidence {
+    pub fingerprint: String,
+    pub granted_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+pub(crate) struct CreditInventory {
+    pub credits: Vec<CreditEvidence>,
+    pub fingerprint: String,
+}
+
+pub(crate) struct BackgroundResetGuard {
+    pub grant: crate::db::plugin_background_actions::BackgroundActionGrant,
+    /// Exact host-validated plugin snapshot, separate from business identity.
+    pub runtime_revision: Option<i64>,
+    pub lease_owner: String,
+    pub credit_fingerprint: String,
+    pub inventory_fingerprint: String,
+    pub not_before_ms: i64,
+    pub deadline_ms: i64,
+}
+
+pub(super) fn credit_fingerprint(credit: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    // Supplier credit identity, where present, distinguishes equal-count
+    // replacements with otherwise identical lifetime fields. The host uses
+    // this identity as a fresh precondition; the supplier body carries a redeem ID.
+    let field = |snake: &str, camel: &str| {
+        credit
+            .get(snake)
+            .or_else(|| credit.get(camel))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let evidence = json!({
+        "id": credit.get("id").cloned().unwrap_or_else(||field("credit_id","creditId")),
+        "type": field("reset_type","resetType"),
+        "status": credit.get("status"),
+        "granted": field("granted_at","grantedAt"),
+        "expires": field("expires_at","expiresAt"),
+    });
+    format!("{:x}", Sha256::digest(evidence.to_string().as_bytes()))
+}
+
+fn inventory(snapshot: &QuotaSnapshot, now: i64) -> CreditInventory {
+    use sha2::{Digest, Sha256};
+    let mut credits = snapshot
+        .reset_credits
+        .iter()
+        .filter_map(|credit| {
+            let granted = credit.granted_at?;
+            let expires = credit.expires_at?;
+            (credit.status.as_deref() == Some("available") && granted <= now && now < expires).then(
+                || CreditEvidence {
+                    fingerprint: credit.fingerprint.clone(),
+                    granted_at_ms: granted,
+                    expires_at_ms: expires,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    credits.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+    // Include multiplicity and supplier counts. A same-count replacement is
+    // insufficient evidence even when the selected credit is still present.
+    let evidence = json!({"credits":credits.iter().map(|c|&c.fingerprint).collect::<Vec<_>>(),
+        "available":snapshot.reset_capability.available_credits,
+        "applicable":snapshot.reset_capability.applicable_credits});
+    CreditInventory {
+        credits,
+        fingerprint: format!("{:x}", Sha256::digest(evidence.to_string().as_bytes())),
+    }
+}
+
+pub(crate) async fn background_credit_inventory(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+) -> Result<CreditInventory, AppError> {
+    let snapshot = fresh(state, account, credential, tenant).await?;
+    Ok(inventory(&snapshot, unix_millis()))
+}
+
+fn validate_background_evidence(
+    snapshot: &QuotaSnapshot,
+    guard: &BackgroundResetGuard,
+    now: i64,
+) -> Result<(), AppError> {
+    if snapshot
+        .reset_capability
+        .available_credits
+        .is_none_or(|count| count < 1)
+        || snapshot
+            .reset_capability
+            .applicable_credits
+            .is_none_or(|count| count < 1)
+    {
+        return Err(blocked());
+    }
+    let current = inventory(snapshot, now);
+    let target = current
+        .credits
+        .iter()
+        .find(|credit| credit.fingerprint == guard.credit_fingerprint)
+        .ok_or_else(blocked)?;
+    if current.fingerprint != guard.inventory_fingerprint
+        || guard.not_before_ms > now
+        || guard.deadline_ms <= now
+        || guard.deadline_ms > target.expires_at_ms
+        || guard.not_before_ms < target.granted_at_ms
+        || guard.not_before_ms >= guard.deadline_ms
+    {
+        return Err(blocked());
+    }
+    Ok(())
+}
+
+/// An authorized worker enters this path. Stable business identity spans
+/// runtime, package, configuration and authorization revisions, preserving
+/// one dispatch identity through upgrades and re-enablement.
+pub(crate) async fn background_reset(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    guard: &BackgroundResetGuard,
+) -> Result<QuotaResetOperation, AppError> {
+    let actor = format!("plugin:{}", guard.grant.plugin_id);
+    let key = format!(
+        "background-reset-credit-v1:{}:{}",
+        account.id, guard.credit_fingerprint
+    );
+    // Validate before creating durable work. Scheduler ticks outside the window
+    // or with replaced credits leave the durable operation set unchanged.
+    let snapshot = fresh(state, account, credential, &guard.grant.tenant_external_id).await?;
+    validate_background_evidence(&snapshot, guard, unix_millis())?;
+    let prepared = prepare(
+        state,
+        account,
+        credential,
+        &guard.grant.tenant_external_id,
+        &actor,
+        &key,
+    )
+    .await?;
+    if matches!(prepared.operation.state.as_str(), "prepared" | "expired") {
+        state
+            .db
+            .refresh_background_quota_reset_prepare(
+                account,
+                &prepared.operation.id,
+                snapshot
+                    .reset_capability
+                    .available_credits
+                    .ok_or_else(blocked)?,
+                snapshot
+                    .reset_capability
+                    .applicable_credits
+                    .ok_or_else(blocked)?,
+                snapshot.observed_at.ok_or_else(blocked)?,
+                guard,
+            )
+            .await?;
+    }
+    confirm_guarded(
+        state,
+        account,
+        credential,
+        &guard.grant.tenant_external_id,
+        &actor,
+        &prepared.operation.id,
+        &prepared.confirmation_token,
+        &key,
+        Some(guard),
+    )
+    .await
+}
+
 #[derive(Serialize)]
 pub(crate) struct PreparedReset {
     operation: QuotaResetOperation,
@@ -21,8 +221,8 @@ fn blocked() -> AppError {
     )
 }
 
-fn temporarily_unavailable() -> AppError {
-    AppError::Overloaded
+fn temporarily_unavailable(code: &'static str) -> AppError {
+    AppError::capacity_error(code)
 }
 
 async fn fresh_snapshot(
@@ -45,10 +245,11 @@ async fn fresh_snapshot(
         .upstream_quota
         .permits
         .try_acquire()
-        .map_err(|_| temporarily_unavailable())?;
-    let mut budget = codex_quota_budget(&account.config).map_err(|_| temporarily_unavailable())?;
-    // Even the reset workflow's credit precheck remains a single attempt.
-    // Consumption below is a separate no-retry transport and never enters the reader.
+        .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
+    let mut budget = codex_quota_budget(&account.config)
+        .map_err(|_| temporarily_unavailable("quota_reset_budget"))?;
+    // The reset workflow's credit precheck uses one attempt. Consumption below
+    // uses its own fixed transport after the fresh read completes.
     budget.attempt_limit = 1;
     let session = retry::ReadSession::new(
         Some(state),
@@ -58,10 +259,9 @@ async fn fresh_snapshot(
     let observed_started_at = unix_millis();
     let account_header =
         crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
-    let http = state
-        .codex_clients
-        .account_transport_snapshot(account, credential, selection.generation)
-        .map_err(|_| temporarily_unavailable())?;
+    let policy =
+        crate::provider::CodexTransportPolicy::parse(account.config.get("transport_policy"))
+            .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
     let (credential_header, credential_value) = credential
         .request_header(observed_started_at)
         .map_err(|_| blocked())?
@@ -73,12 +273,18 @@ async fn fresh_snapshot(
         proxy_url: credential.proxy().map(|(url, _)| url),
     };
     let refresh_started = tokio::time::Instant::now();
+    let credits_url = CREDITS_URL;
+    #[cfg(test)]
+    let fixture_url = test_supplier_url(account, credits_url);
+    #[cfg(test)]
+    let credits_url = fixture_url.as_str();
     let reset = match tokio::time::timeout(
         budget.total,
         get_codex_json(
-            &http,
+            &state.codex_clients,
+            policy,
             auth,
-            CREDITS_URL,
+            credits_url,
             QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
             budget,
             &session,
@@ -95,7 +301,7 @@ async fn fresh_snapshot(
                 error,
                 refresh_started,
             );
-            return Err(temporarily_unavailable());
+            return Err(temporarily_unavailable("quota_reset_read_failed"));
         }
         Err(_) => {
             log_quota_read_completed(
@@ -105,7 +311,7 @@ async fn fresh_snapshot(
                 "quota_timeout",
                 refresh_started,
             );
-            return Err(temporarily_unavailable());
+            return Err(temporarily_unavailable("quota_reset_timeout"));
         }
     };
     let observed_at = unix_millis();
@@ -118,7 +324,7 @@ async fn fresh_snapshot(
             error,
             refresh_started,
         );
-        return Err(temporarily_unavailable());
+        return Err(temporarily_unavailable("quota_reset_normalize"));
     }
     snapshot.status = "ready";
     snapshot.freshness = "fresh";
@@ -148,7 +354,7 @@ async fn fresh(
         || available.is_none_or(|value| value < 0)
         || applicable.is_none_or(|value| value < 0)
     {
-        return Err(temporarily_unavailable());
+        return Err(temporarily_unavailable("quota_reset_credits_unavailable"));
     }
     Ok(snapshot)
 }
@@ -167,7 +373,8 @@ pub(crate) async fn prepare(
         .quota_reset_prepare_replay(account, actor, &prepare_idempotency_hash)
         .await?
     {
-        let operation_id = Uuid::parse_str(&operation.id).map_err(|_| AppError::Internal)?;
+        let operation_id =
+            Uuid::parse_str(&operation.id).map_err(|_| AppError::internal("reset_prepare_1"))?;
         return Ok(PreparedReset {
             operation,
             confirmation_token: confirmation_token(
@@ -220,7 +427,7 @@ pub(crate) async fn prepare(
         state,
         account,
         actor,
-        Uuid::parse_str(&result.operation.id).map_err(|_| AppError::Internal)?,
+        Uuid::parse_str(&result.operation.id).map_err(|_| AppError::internal("reset_prepare_2"))?,
         idempotency_key,
     );
     Ok(PreparedReset {
@@ -289,6 +496,32 @@ pub(crate) async fn confirm(
     token: &str,
     idempotency_key: &str,
 ) -> Result<QuotaResetOperation, AppError> {
+    confirm_guarded(
+        state,
+        account,
+        credential,
+        tenant,
+        actor,
+        operation,
+        token,
+        idempotency_key,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn confirm_guarded(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+    actor: &str,
+    operation: &str,
+    token: &str,
+    idempotency_key: &str,
+    guard: Option<&BackgroundResetGuard>,
+) -> Result<QuotaResetOperation, AppError> {
     if !(32..=256).contains(&token.len()) {
         return Err(blocked());
     }
@@ -315,10 +548,13 @@ pub(crate) async fn confirm(
             .await?
         {
             QuotaResetClaim::Replayed(operation) => Ok(*operation),
-            QuotaResetClaim::Claimed { .. } => Err(AppError::Internal),
+            QuotaResetClaim::Claimed { .. } => Err(AppError::internal("reset_confirm_1")),
         };
     }
     let snapshot = fresh(state, account, credential, tenant).await?;
+    if let Some(guard) = guard {
+        validate_background_evidence(&snapshot, guard, unix_millis())?;
+    }
     if snapshot.reset_capability.available_credits != Some(original.available_credits)
         || snapshot.reset_capability.applicable_credits != Some(original.applicable_credits)
         || original.applicable_credits < 1
@@ -332,43 +568,56 @@ pub(crate) async fn confirm(
         credential,
         &account.config,
     )?;
-    let credential = &selection.credential;
-    let account_header =
-        crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
+    let dispatch_credential = &selection.credential;
+    let account_header = crate::oauth::managed::codex::account_header_value(dispatch_credential)
+        .map_err(|_| blocked())?;
     let _permit = state
         .upstream_quota
         .permits
         .try_acquire()
-        .map_err(|_| temporarily_unavailable())?;
-    let http = tokio::time::timeout(
-        Duration::from_secs(5),
-        crate::network::client_for_codex_url_without_retries(
-            &state.http,
-            CONSUME_URL,
-            &json!({"network_scope":"public"}),
-            credential.proxy(),
-            false,
-        ),
-    )
-    .await
-    .map_err(|_| temporarily_unavailable())?
-    .map_err(|_| temporarily_unavailable())?;
+        .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
+    let http = consume_client(state, dispatch_credential).await?;
+    #[cfg(test)]
+    let http = if account.config.get("reset_test_supplier_url").is_some() {
+        crate::build_no_retry_http_client(None, &[]).unwrap()
+    } else {
+        http
+    };
     let claim = state
         .db
-        .claim_quota_reset(
+        .claim_quota_reset_guarded(
             account,
             operation,
             actor,
             &confirmation_hash,
             &confirm_idempotency_hash,
+            guard,
         )
         .await?;
     let redeem = match claim {
         QuotaResetClaim::Claimed { redeem_request_id } => redeem_request_id,
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
-    // No automatic retry and no new redeem ID on any ambiguous outcome.
-    let result = dispatch_once(&http, credential, account_header, CONSUME_URL, &redeem).await;
+    // Each durable operation keeps one redeem ID and one supplier dispatch.
+    let result = if guard.is_some_and(|guard| unix_millis() >= guard.deadline_ms) {
+        Err("quota_reset_deadline_elapsed")
+    } else {
+        let consume_url = CONSUME_URL;
+        #[cfg(test)]
+        let r2_fixture_url = r2_tests::fixture_url(consume_url);
+        #[cfg(test)]
+        let fixture_url = r2_fixture_url.unwrap_or_else(|| test_supplier_url(account, consume_url));
+        #[cfg(test)]
+        let consume_url = fixture_url.as_str();
+        dispatch_once(
+            &http,
+            dispatch_credential,
+            account_header,
+            consume_url,
+            &redeem,
+        )
+        .await
+    };
     drop(_permit);
     let accepted = result.is_ok();
     state
@@ -381,30 +630,44 @@ pub(crate) async fn confirm(
         .lock()
         .await
         .retain(|key, _| key.account != account.id);
+    #[cfg(test)]
+    r2_tests::after_reset_eviction().await;
     if accepted {
         // The consume response proves only that the reset was accepted. A
         // separate fresh supplier read is the evidence that may clear the
         // exact quota-exhausted health row through the existing fenced CAS.
         // Recovery failure must never replay the paid reset or change its
         // accepted durable result.
-        match fresh_snapshot(state, account, credential, tenant).await {
-            Ok(_) => tracing::info!(
+        // read_fresh selects its own transport from the stored credential,
+        // never from the consume request's selected proxy credential.
+        let readback = state
+            .upstream_quota
+            .read_fresh(
+                state,
+                account,
+                credential,
+                tenant,
+                QuotaReadTrigger::ResetWorkflow,
+            )
+            .await;
+        match readback.error_code {
+            None => tracing::info!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
                 trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
                 "refreshed quota evidence after an accepted reset"
             ),
-            Err(error) => tracing::warn!(
+            Some(error) => tracing::warn!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
                 trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
                 error = %error,
                 error_code = "quota_reset_recovery_pending",
-                "accepted quota reset could not refresh supplier evidence"
+                "accepted quota reset supplier evidence refresh is pending"
             ),
         }
     }
-    // Accepted means only supplier HTTP 2xx. It does not assert window state.
+    // Accepted records the supplier HTTP 2xx response; quota windows remain independently observed.
     state
         .db
         .quota_reset_operation(
@@ -413,6 +676,29 @@ pub(crate) async fn confirm(
             operation,
         )
         .await
+}
+
+async fn consume_client(
+    state: &AppState,
+    dispatch_credential: &UpstreamCredential,
+) -> Result<reqwest::Client, AppError> {
+    #[cfg(test)]
+    if r2_tests::fixture_url(CONSUME_URL).is_some() {
+        return Ok(crate::build_no_retry_http_client(None, &[]).unwrap());
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::network::client_for_codex_url_without_retries(
+            &state.http,
+            CONSUME_URL,
+            &json!({"network_scope":"public"}),
+            dispatch_credential.proxy(),
+            false,
+        ),
+    )
+    .await
+    .map_err(|_| temporarily_unavailable("quota_reset_transport_timeout"))?
+    .map_err(|_| temporarily_unavailable("quota_reset_transport"))
 }
 
 pub(crate) async fn reconcile(

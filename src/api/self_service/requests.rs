@@ -139,12 +139,20 @@ pub(in crate::api) async fn self_requests(
     Query(query): Query<RequestsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    Ok(Json(
-        state
-            .db
-            .list_requests_filtered(key.key_id, query.to_filter(false)?)
-            .await?,
-    ))
+    let filter = query.to_filter(false)?;
+    if let Some(value) = crate::request_history_api::list_if_enabled(
+        &state,
+        crate::request_history_api::authenticated_key_scope(&key),
+        &filter,
+        false,
+    )
+    .await?
+    {
+        return Ok(Json(value));
+    }
+    Ok(Json(serde_json::json!(
+        state.db.list_requests_filtered(key.key_id, filter).await?
+    )))
 }
 
 pub(in crate::api) async fn self_request_detail(
@@ -189,7 +197,9 @@ pub(in crate::api) async fn request_detail_response_with_transport_diagnostics(
     let mut detail = request_detail(state, refs).await;
     detail.transport_diagnostics = transport_diagnostics;
     detail.egress_attempts = egress_attempts;
-    let mut body = serde_json::to_vec(&detail).map_err(|_| AppError::Internal)?;
+    let mut body = serde_json::to_vec(&detail).map_err(|_| {
+        AppError::internal("requests_request_detail_response_with_transport_diagnostics_1")
+    })?;
     if body.len() > MAX_ARCHIVE_DETAIL_RESPONSE {
         detail.request_body = Value::Null;
         detail.response_body = Value::Null;
@@ -198,7 +208,9 @@ pub(in crate::api) async fn request_detail_response_with_transport_diagnostics(
             side.complete = false;
             side.reason = Some("archive_detail_response_too_large".to_owned());
         }
-        body = serde_json::to_vec(&detail).map_err(|_| AppError::Internal)?;
+        body = serde_json::to_vec(&detail).map_err(|_| {
+            AppError::internal("requests_request_detail_response_with_transport_diagnostics_2")
+        })?;
     }
     let body_len = body.len();
     Response::builder()
@@ -207,7 +219,9 @@ pub(in crate::api) async fn request_detail_response_with_transport_diagnostics(
         .header(header::CONTENT_LENGTH, body_len)
         .header(header::CACHE_CONTROL, "private, no-store")
         .body(Body::from(body))
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| {
+            AppError::internal("requests_request_detail_response_with_transport_diagnostics_3")
+        })
 }
 
 pub(in crate::api) async fn self_stats(
@@ -216,10 +230,21 @@ pub(in crate::api) async fn self_stats(
     Query(query): Query<StatsQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let key = authenticate_downstream(&headers, &state).await?;
-    Ok(Json(
-        state
-            .db
-            .stats_filtered(key.key_id, query.to_filter(false, Some(key.key_id))?)
-            .await?,
-    ))
+    let filter = query.to_filter(false, Some(key.key_id))?;
+    if let Some(stats) = crate::request_history_api::statistics_if_enabled(
+        &state,
+        crate::request_history_api::authenticated_key_scope(&key),
+        &filter,
+    )
+    .await?
+    {
+        return Ok(Json(crate::model::SelfStats {
+            key_id: key.key_id,
+            summary: stats.summary,
+            by_model: stats.by_model,
+            by_day: stats.by_day,
+            errors: stats.errors,
+        }));
+    }
+    Ok(Json(state.db.stats_filtered(key.key_id, filter).await?))
 }

@@ -1,5 +1,69 @@
 use super::*;
 
+async fn owned_enqueued_source(
+    fixture: &CodexRouteFixture,
+    pool: &sqlx::AnyPool,
+    request_id: Uuid,
+    expected: &Value,
+) -> Value {
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let locator: String = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(locator) = sqlx::query_scalar::<_, String>(
+                "SELECT r.request_object FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3 AND o.principal_id = $4 AND o.projected_at IS NULL",
+            )
+            .bind(request_id.to_string())
+            .bind(key.tenant_id.to_string())
+            .bind(key.key_id.to_string())
+            .bind(key.principal_id.to_string())
+            .fetch_optional(pool).await.unwrap() {
+                break locator;
+            }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("original identity must retain an enqueued source object");
+    assert_eq!(
+        locator,
+        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
+            .unwrap()
+    );
+    assert_eq!(
+        crate::gateway_body::request_spool::source_request_id(&locator),
+        Some(request_id)
+    );
+    let raw = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(raw) = fixture.state.archive.get(&locator).await {
+                break raw;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original source bytes must remain readable after enqueue");
+    assert_eq!(
+        raw.as_ref(),
+        serde_json::to_vec(expected).unwrap().as_slice()
+    );
+    let payloads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        payloads, 0,
+        "new enqueue must not duplicate raw bytes in the database"
+    );
+    serde_json::from_slice(&raw).unwrap()
+}
+
 #[tokio::test]
 async fn durable_unknown_receipt_releases_projection_memory_without_discarding_evidence() {
     let upstream = MockServer::start().await;
@@ -35,10 +99,6 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         Some("upstream_invalid_response"),
     )
     .await;
-    assert_eq!(
-        receipt["conversation"]["request_json"]["input"],
-        "PRIVATE_OWNED_UNKNOWN_INPUT"
-    );
     let receipt_id = Uuid::parse_str(receipt["receipt_id"].as_str().unwrap()).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -58,7 +118,33 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         .into_iter()
         .find(|item| item["receipt_id"] == receipt["receipt_id"])
         .expect("unknown finance keeps the in-memory receipt");
-    assert_eq!(retained_receipt, receipt);
+    // Once the outbox retains the source identity the receipt drops the parsed
+    // conversation from memory, so only the identity survives in-process.
+    assert_eq!(retained_receipt["receipt_id"], receipt["receipt_id"]);
+    assert_eq!(retained_receipt["request_id"], receipt["request_id"]);
+    assert_eq!(retained_receipt["status_code"], receipt["status_code"]);
+    assert_eq!(retained_receipt["error_code"], receipt["error_code"]);
+    assert_eq!(retained_receipt["claim"], receipt["claim"]);
+    assert_eq!(
+        fixture
+            .state
+            .pending_terminals
+            .idle_conversation_retained_for_test(receipt_id)
+            .await,
+        Some(false),
+        "durable enqueue must drop the parsed conversation from memory"
+    );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let retained_body = owned_enqueued_source(
+        &fixture,
+        &pool,
+        Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap(),
+        &json!({"model": fixture.model, "input": "PRIVATE_OWNED_UNKNOWN_INPUT",
+            "stream": false, "max_output_tokens": 16}),
+    )
+    .await;
+    assert_eq!(retained_body["input"], "PRIVATE_OWNED_UNKNOWN_INPUT");
+    pool.close().await;
     assert!(
         fixture
             .state
@@ -137,8 +223,17 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
         .await
         .unwrap();
     let body: Value = serde_json::from_slice(&delivered).unwrap();
-    assert_eq!(body["error"]["code"], "internal_error");
-    assert_eq!(body["error"]["message"], "internal error");
+    assert_eq!(body["error"]["code"], "database_operation_failed");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("数据库")
+            || body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("内部错误")
+    );
     assert!(!String::from_utf8_lossy(&delivered).contains("PRIVATE_CANARY"));
     let authority = sqlx::query(
         "SELECT p.fence, p.contract_digest, p.contract_json, q.upstream_account_id, q.completed_at, \
@@ -169,7 +264,10 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
     cancellation::assert_unknown_request(&fixture, request_id, 0).await;
     let record = wait_for_operational(&fixture).await;
     assert_eq!(record.status_code, Some(500));
-    assert_eq!(record.error_code.as_deref(), Some("internal_error"));
+    assert_eq!(
+        record.error_code.as_deref(),
+        Some("database_operation_failed")
+    );
     assert_eq!(record.terminal_cause_code, None);
     assert_eq!(
         record.upstream_account_id,
@@ -200,8 +298,14 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
             .contains_receipt_for_test(operational_receipt_id)
     );
     drop(held);
-    let receipt =
-        cancellation::assert_unknown_receipt(&fixture, request_id, 500, "internal_error", 0).await;
+    let receipt = cancellation::assert_unknown_receipt(
+        &fixture,
+        request_id,
+        500,
+        "database_operation_failed",
+        0,
+    )
+    .await;
     assert_eq!(receipt["receipt_id"], operational_receipt);
     assert_eq!(
         receipt["claim"]["fence"],
@@ -222,6 +326,15 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
         receipt["operational_terminal"]["stage"],
         "upstream_response_headers"
     );
+    // The helper above observes the in-memory snapshot, not completion of the
+    // journal attempt released by `held`. Close the fixture's terminal work
+    // before asserting that runtime ACK preserved the unknown responsibility.
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        fixture.state.pending_terminals.drain(),
+    )
+    .await
+    .expect("unknown terminal shutdown must retain its responsibility");
     assert!(
         fixture
             .state
@@ -229,6 +342,23 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
             .contains_receipt_for_test(operational_receipt_id),
         "runtime ACK must not retire unknown finance"
     );
+    cancellation::assert_unknown_request(&fixture, request_id, 0).await;
+    let retained: Value = serde_json::from_slice(
+        &tokio::fs::read(
+            fixture
+                .state
+                .pending_terminals
+                .directory_for_test()
+                .join(format!("{operational_receipt_id}.json")),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retained["receipt_id"], receipt["receipt_id"]);
+    assert_eq!(retained["claim"], receipt["claim"]);
+    assert_eq!(retained["usage_basis"], "not_observed");
+    assert!(retained["financial_ack"].is_null());
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     upstream.verify().await;
     pool.close().await;
@@ -1283,7 +1413,14 @@ async fn unknown_failure_retries_operational_projection() {
         Some("upstream_failed_response"),
     )
     .await;
-    assert_eq!(receipt, original);
+    // The retried pass may have enqueued the conversation and reaped the
+    // parsed copy already; the receipt's identity must be unchanged either
+    // way.
+    assert_eq!(receipt["receipt_id"], original["receipt_id"]);
+    assert_eq!(receipt["request_id"], original["request_id"]);
+    assert_eq!(receipt["status_code"], original["status_code"]);
+    assert_eq!(receipt["error_code"], original["error_code"]);
+    assert_eq!(receipt["claim"], original["claim"]);
     assert!(
         fixture
             .state
@@ -1316,26 +1453,18 @@ async fn unknown_failure_retries_operational_projection() {
         .execute(&pool)
         .await
         .unwrap();
-    let payload: String = tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            if let Some(payload) = sqlx::query_scalar::<_, String>(
-                "SELECT request_json FROM conversation_semantic_payloads WHERE request_id = $1",
-            )
-            .bind(request_id.to_string())
-            .fetch_optional(&pool)
-            .await
-            .unwrap()
-            {
-                break payload;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("financial arbitration must keep retrying the original semantic projection");
+    let payload = owned_enqueued_source(
+        &fixture,
+        &pool,
+        request_id,
+        &json!({"model": fixture.model, "input": "operational failure retry", "stream": true}),
+    )
+    .await;
+    // The durable source retains the entire ingress envelope; the receipt
+    // deliberately keeps only the conversation fields.
     assert_eq!(
-        serde_json::from_str::<Value>(&payload).unwrap(),
-        original["conversation"]["request_json"]
+        payload["input"],
+        original["conversation"]["request_json"]["input"]
     );
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
@@ -1344,7 +1473,7 @@ async fn unknown_failure_retries_operational_projection() {
                 .pending_terminals
                 .idle_conversation_retained_for_test(receipt_id)
                 .await
-                == Some(true)
+                == Some(false)
             {
                 let (used, _, retained, _) = fixture.state.proxy_memory_budget.snapshot();
                 if used == 0 && retained == 0 {
@@ -1355,7 +1484,26 @@ async fn unknown_failure_retries_operational_projection() {
         }
     })
     .await
-    .expect("unknown with durable semantic enqueue must release memory and keep the receipt conversation");
+    .expect(
+        "unknown with durable semantic enqueue must release memory and the parsed conversation",
+    );
+    let terminal_owner = Uuid::now_v7();
+    for pending_id in fixture
+        .state
+        .db
+        .claim_terminal_projection_tasks(terminal_owner, 32)
+        .await
+        .unwrap()
+    {
+        assert!(
+            fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(terminal_owner, pending_id)
+                .await
+                .unwrap()
+        );
+    }
     let owner = Uuid::now_v7();
     let tasks = fixture
         .state
@@ -1391,7 +1539,7 @@ async fn unknown_failure_retries_operational_projection() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(effects, (1, 0, 0));
+    assert_eq!(effects, (1, 0, 1));
     pool.close().await;
     upstream.verify().await;
 }
@@ -1464,7 +1612,17 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
         cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled")).await;
     assert_eq!(receipt["receipt_id"], original.0);
     assert_eq!(receipt["operational_terminal"]["completed_at"], original.2);
-    assert!(receipt["conversation"].is_object());
+    // The recovered annotation enqueues the conversation as durable
+    // evidence; the parsed copy leaves memory once that lands.
+    let enqueued = owned_enqueued_source(
+        &fixture, &pool, record.request_id,
+        &json!({"model": fixture.model, "input": "cancel before provider terminal", "stream": true}),
+    ).await;
+    assert_eq!(enqueued["input"], "cancel before provider terminal");
+    // Enqueue precedes the compact journal write and the receipt attempt's
+    // durable flag. Acknowledge that owner, not just the outbox, before
+    // checking preservation; the upstream terminal is still withheld.
+    fixture.state.pending_terminals.drain().await;
     assert!(
         fixture
             .state
@@ -1472,6 +1630,21 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
             .contains_receipt_for_test(receipt_id),
         "runtime ACK is not a financial receipt ACK"
     );
+    let compact: Value = serde_json::from_slice(
+        &tokio::fs::read(
+            fixture
+                .state
+                .pending_terminals
+                .directory_for_test()
+                .join(format!("{receipt_id}.json")),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(compact["receipt_id"], receipt["receipt_id"]);
+    assert_eq!(compact["claim"], receipt["claim"]);
+    assert!(compact["financial_ack"].is_null());
     release.send(()).unwrap();
     server.await.unwrap();
     drain_archive_capture(&fixture).await;
@@ -1486,7 +1659,7 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
                     .pending_terminals
                     .idle_conversation_retained_for_test(receipt_id)
                     .await
-                    == Some(true)
+                    == Some(false)
             {
                 break;
             }
@@ -1495,7 +1668,7 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
     })
     .await
     .expect(
-        "durable semantic enqueue must release every memory permit and keep the receipt conversation",
+        "durable semantic enqueue must release every memory permit and drop the parsed conversation",
     );
     assert!(
         fixture

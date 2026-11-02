@@ -368,6 +368,30 @@ async fn an_exact_or_descendant_reference_protects_but_neighbor_uuid_does_not() 
         &format!("{}0/body", cleanup.canonical_prefix()),
     )
     .await;
+    // A neighboring locator does not reference this segment, but raw proxy
+    // sources still require a committed conversation archive before deletion.
+    let prefix = cleanup.canonical_prefix();
+    assert!(matches!(
+        database
+            .prove_archive_staging_unreferenced(cleanup)
+            .await
+            .unwrap(),
+        ArchiveStagingReferenceProof::Protected { locator } if locator == prefix
+    ));
+    mark_conversation_archive_committed(&pool, neighbor_lease.key.owner.id()).await;
+    sqlx::query(
+        "UPDATE archive_staging_attempts SET next_cleanup_at = created_at WHERE attempt_id = $1",
+    )
+    .bind(neighbor_lease.key.attempt_id.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let cleanup = database
+        .claim_archive_staging_cleanup(owner("neighbor-after-archive"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleanup.attempt.key, neighbor_lease.key);
     let proof = database
         .prove_archive_staging_unreferenced(cleanup)
         .await
@@ -435,6 +459,10 @@ async fn cleaned_requires_two_separate_empty_observations_across_stability_windo
             .await
             .unwrap(),
     );
+    // Empty-object confirmation starts only after the durable source consumer
+    // has committed; keep proxy retention as a separate precondition.
+    insert_archive_reference(&pool, "empty", lease.key.owner.id(), "inline-json:{}").await;
+    mark_conversation_archive_committed(&pool, lease.key.owner.id()).await;
     database
         .abandon_archive_staging_attempt(&lease)
         .await
@@ -587,6 +615,16 @@ async fn insert_archive_reference(pool: &AnyPool, suffix: &str, request_id: Uuid
     .bind(Uuid::now_v7().to_string())
     .bind(locator)
     .bind(Uuid::now_v7().to_string())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn mark_conversation_archive_committed(pool: &AnyPool, request_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO conversation_projection_outbox (request_id, tenant_id, key_id, principal_id, request_json, hints_json, observed_at, projected_at) SELECT id, tenant_id, key_id, key_id, '{}', '{}', 1, 1 FROM request_records WHERE id = $1",
+    )
+    .bind(request_id.to_string())
     .execute(pool)
     .await
     .unwrap();

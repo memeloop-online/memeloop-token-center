@@ -198,16 +198,27 @@ fn assert_encoded_upload(wire: &Wire, length: usize) -> serde_json::Value {
 
 pub(crate) async fn verify<F>(expected: Bytes, build_request: F) -> serde_json::Value
 where
-    F: FnOnce(&wreq::Client, &str, wreq::Proxy) -> wreq::Request,
+    F: FnOnce(&reqwest::Client, &str) -> reqwest::Request,
 {
     timeout(Duration::from_secs(10), async {
         let fixture = tls_fixture::TlsFixture::new().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
-        let client = crate::codex_http_client_builder(CodexTransportPolicy::default(), crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL)
-            .tls_cert_store(fixture.roots).build().unwrap();
-        let request = build_request(&client, &format!("https://{HOST}/v1/responses"), proxy);
-        assert_eq!(request.version(), None, "preserve default negotiation");
+        let proxy_url = format!("socks5h://{}", listener.local_addr().unwrap());
+        let client = crate::codex_http_client_builder_with_proxy(
+            CodexTransportPolicy::default(),
+            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+            Some(&proxy_url),
+        )
+        .unwrap()
+        .add_root_certificate(fixture.root_certificate())
+        .build()
+        .unwrap();
+        let request = build_request(&client, &format!("https://{HOST}/v1/responses"));
+        assert_eq!(
+            request.version(),
+            http::Version::HTTP_11,
+            "preserve default negotiation"
+        );
         let expected_headers = request.headers().clone();
         let length = expected.len();
         let wire = Arc::new(Mutex::new(Wire { started: Instant::now(), frames: Vec::new() }));

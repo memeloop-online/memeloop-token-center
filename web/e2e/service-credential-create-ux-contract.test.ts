@@ -120,7 +120,7 @@ test('service credential creation validates the draft and issues only a read-onl
   assert.ok(hintCount > 20, 'each supported permission has a supplemental explanation');
   const hints = await scopeHints.evaluateAll(elements => elements.map(element => element.getAttribute('aria-label')?.replace(/^\S+: /, '')));
   for (const hint of hints) assert.ok(hint);
-  const requestsHint = '读取请求记录、监控快照和用量分析；不允许写入。';
+  const requestsHint = '只读：请求记录、监控快照和用量分析。';
   assert.equal(await form.locator('[aria-label^="requests:read:"]').getAttribute('aria-label'),
     `requests:read: ${requestsHint}`);
   const trace = await page.evaluateHandle<{ read: (index: number) => unknown; stop: () => void }>(`(() => {

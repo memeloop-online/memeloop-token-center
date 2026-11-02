@@ -3,11 +3,13 @@ import { Disclosure } from './design-system';
 import { ArchiveContentReader } from './ArchiveContentReader.js';
 import type { ArchiveRangeLoader } from './archiveRange.js';
 import {
+  projectSessionDialogue,
   projectSessionReplay,
   finalReplayResponse,
   SESSION_REPLAY_MAX_REQUESTS,
   SESSION_REPLAY_MAX_ITEMS,
   type ReplayUnknownReason,
+  type SessionDialogueTurn,
   type SessionReplayItem,
 } from './sessionReplayProjection.js';
 import { useI18n } from './i18n.js';
@@ -114,7 +116,7 @@ function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t
   </article>;
 
   if (item.kind === 'tool_call') return <article className="session-replay-entry tool-call" data-replay-kind={item.kind}>
-    <header><b>{t('sessionReplay.toolCall')}</b><span>{item.body === 'request' ? t('request.request') : t('request.response')}</span></header>
+    <header><b>{t('sessionReplay.toolCall')}</b><span>{item.body === 'request' ? t('request.rawRequestJson') : t('request.rawReturnJson')}</span></header>
     <p className="session-replay-tool-name">{item.name ?? t('sessionReplay.unknown')}</p>
     {item.pairing !== 'paired' && <small className="session-replay-flag">{t(`sessionReplay.pairing.${item.pairing}`)}</small>}
     <LazyDisclosure title={t('sessionReplay.arguments')}>
@@ -130,7 +132,7 @@ function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t
   </article>;
 
   return <article className="session-replay-entry tool-result" data-replay-kind={item.kind}>
-    <header><b>{t('sessionReplay.toolResult')}</b><span>{item.body === 'request' ? t('request.request') : t('request.response')}</span></header>
+    <header><b>{t('sessionReplay.toolResult')}</b><span>{item.body === 'request' ? t('request.rawRequestJson') : t('request.rawReturnJson')}</span></header>
     {item.name && <p className="session-replay-tool-name">{item.name}</p>}
     <LazyDisclosure title={t('sessionReplay.output')}>
       <ArchiveText kind="tool" t={t} value={item.output ?? unknownLabel(t, item.unknownFields.includes('output') ? 'missing_text' : null)} />
@@ -146,10 +148,22 @@ function EntryContent({ entry, t, summaryOnly = false }: { entry: ReplayEntry; t
   </article>;
 }
 
+/** Cleaned dialogue from CNPG. Raw documents stay on the archive reader. */
+export function SessionDialogueEntries({ requestId, turns }: { requestId: string; turns: readonly SessionDialogueTurn[] }) {
+  const { t } = useI18n();
+  const items = projectSessionDialogue(requestId, turns, (type) => t('sessionReplay.retainedMedia', { type }));
+  if (!items.length) return null;
+  return <ol className="session-replay-feed" aria-label={t('sessionReplay.sessionBody')}>
+    {items.map((item, index) => <li key={`${requestId}:${index}:${item.kind}`}>
+      <EntryContent entry={{ item, index, identity: `${requestId}:dialogue:${index}` }} t={t} />
+    </li>)}
+  </ol>;
+}
+
 /**
- * Displays the bounded, typed P1 archive projection. Archive reads are supplied
+ * Displays the bounded, typed archive read. Archive reads are supplied
  * by the owning surface so this component never handles authentication material or broadens
- * archive authorization.
+ * archive authorization. The dialogue an operator reads is the cleaned session text.
  */
 export function SessionReplayPanel({ detail, scopeKey = detail.session_id, loadArchiveDetail, loadArchiveRange, onLoadEarlierRequests, loadingEarlier = false }: {
   detail: LogicalSessionDetail;

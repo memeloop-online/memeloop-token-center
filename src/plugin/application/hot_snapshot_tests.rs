@@ -282,7 +282,13 @@ async fn background_refresh_timeout_keeps_serving_verified_snapshot() {
     tokio::pin!(refresh);
     assert!(futures_util::poll!(refresh.as_mut()).is_pending());
     tokio::time::advance(Duration::from_secs(46)).await;
-    assert!(matches!(refresh.await, Err(AppError::Overloaded)));
+    assert!(matches!(
+        refresh.await,
+        Err(AppError::Capacity {
+            code: "plugin_snapshot_refresh_timeout",
+            ..
+        })
+    ));
     assert!(Arc::ptr_eq(
         &original,
         &authority.current_snapshot().unwrap().unwrap()

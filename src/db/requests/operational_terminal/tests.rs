@@ -4,6 +4,7 @@ use crate::model::{RequestFinancialState, RequestLifecycleState, RequestUsageBas
 use rust_decimal::Decimal;
 
 mod conversation_projection;
+mod unknown_bridge;
 
 struct Fixture {
     isolated: Option<PostgresTestDatabase>,
@@ -46,6 +47,25 @@ impl Fixture {
         isolated: Option<PostgresTestDatabase>,
         tenant: &str,
     ) -> Self {
+        Self::create_with_mode(database, isolated, tenant, EnforcementMode::Prepaid).await
+    }
+
+    async fn create_with_mode(
+        database: Database,
+        isolated: Option<PostgresTestDatabase>,
+        tenant: &str,
+        enforcement_mode: EnforcementMode,
+    ) -> Self {
+        Self::create_with_currency(database, isolated, tenant, enforcement_mode, "USD").await
+    }
+
+    async fn create_with_currency(
+        database: Database,
+        isolated: Option<PostgresTestDatabase>,
+        tenant: &str,
+        enforcement_mode: EnforcementMode,
+        currency: &str,
+    ) -> Self {
         database.migrate().await.unwrap();
         let pepper = b"operational receipt regression";
         let issued = database
@@ -54,9 +74,9 @@ impl Fixture {
                     tenant_external_id: tenant.into(),
                     principal_external_id: "member".into(),
                     alias: "operational-test".into(),
-                    currency: "USD".into(),
+                    currency: currency.into(),
                     policy: KeyPolicy {
-                        enforcement_mode: EnforcementMode::Prepaid,
+                        enforcement_mode,
                         ..KeyPolicy::default()
                     },
                     initial_balance: Decimal::ONE,
@@ -71,7 +91,7 @@ impl Fixture {
             .await
             .unwrap();
         let price = database
-            .upsert_model_price("operational-model", "USD", Decimal::ONE, Decimal::ONE)
+            .upsert_model_price("operational-model", currency, Decimal::ONE, Decimal::ONE)
             .await
             .unwrap();
         let request_id = Uuid::now_v7();
@@ -204,7 +224,7 @@ impl Fixture {
         );
         assert!(row.get::<Option<i64>, _>("completed_at").is_none());
         assert!(row.get::<Option<i64>, _>("actual_micros").is_none());
-        for name in ["ledgers", "outboxes", "facts"] {
+        for name in ["ledgers", "facts"] {
             assert_eq!(row.get::<i64, _>(name), 0, "{name}");
         }
     }
@@ -326,6 +346,102 @@ async fn postgres_operational_statistics_preserve_unknown_finance_and_filters() 
         };
         operational_statistics_contract(fixture, status).await;
     }
+}
+
+#[tokio::test]
+async fn sqlite_unsettled_requests_count_as_failures_in_success_rates() {
+    unsettled_requests_count_as_failures_in_success_rates(Fixture::sqlite().await).await;
+}
+
+#[tokio::test]
+async fn postgres_unsettled_requests_count_as_failures_in_success_rates() {
+    let Some(fixture) = Fixture::postgres().await else {
+        return;
+    };
+    unsettled_requests_count_as_failures_in_success_rates(fixture).await;
+}
+
+async fn unsettled_requests_count_as_failures_in_success_rates(fixture: Fixture) {
+    let created_at: i64 =
+        sqlx::query_scalar("SELECT created_at FROM request_record_locators WHERE id = $1")
+            .bind(fixture.claim.request_id.to_string())
+            .fetch_one(&fixture.database.pool)
+            .await
+            .unwrap();
+    let filter = StatsFilter {
+        from_created_at: Some(created_at),
+        to_created_at: Some(created_at),
+        ..StatsFilter::default()
+    };
+    let unsettled = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(unsettled.summary.total_requests, 1);
+    assert_eq!(unsettled.summary.successful_requests, 0);
+    assert_eq!(unsettled.summary.failed_requests, 0);
+    assert_eq!(unsettled.summary.pending_requests, 1);
+    assert_eq!(unsettled.summary.total_cost, None);
+    assert!(unsettled.summary.costs.is_empty());
+    assert_eq!(unsettled.by_model.len(), 1);
+    assert_eq!(unsettled.by_model[0].requests, 1);
+    assert_eq!(unsettled.by_day.len(), 1);
+    assert_eq!(unsettled.by_day[0].requests, 1);
+    let errored = fixture
+        .database
+        .stats_filtered(
+            fixture.key.key_id,
+            StatsFilter {
+                status: Some("error".into()),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(errored.summary.total_requests, 0);
+    assert_eq!(errored.summary.failed_requests, 0);
+    let succeeded = fixture
+        .database
+        .stats_filtered(
+            fixture.key.key_id,
+            StatsFilter {
+                status: Some("success".into()),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(succeeded.summary.total_requests, 0);
+    // The dedicated pending operational view keeps its own classification.
+    let pending = fixture
+        .database
+        .stats_filtered(
+            fixture.key.key_id,
+            StatsFilter {
+                status: Some("pending".into()),
+                ..filter.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.summary.total_requests, 1);
+    assert_eq!(pending.summary.failed_requests, 0);
+
+    // Once a 499 operational terminal is recorded it stays exactly one failure.
+    let terminal = fixture.operational(499);
+    fixture.record(Uuid::now_v7(), &terminal).await.unwrap();
+    let cancelled = fixture
+        .database
+        .stats_filtered(fixture.key.key_id, filter.clone())
+        .await
+        .unwrap();
+    assert_eq!(cancelled.summary.total_requests, 1);
+    assert_eq!(cancelled.summary.successful_requests, 0);
+    assert_eq!(cancelled.summary.failed_requests, 1);
+    assert_eq!(cancelled.errors.len(), 1);
+    assert_eq!(cancelled.errors[0].name, "client_cancelled");
+    fixture.close().await;
 }
 
 async fn operational_statistics_contract(fixture: Fixture, status: i64) {

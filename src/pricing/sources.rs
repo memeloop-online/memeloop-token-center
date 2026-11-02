@@ -1,7 +1,5 @@
-use std::{str::FromStr, time::Duration};
+use std::str::FromStr;
 
-use bytes::BytesMut;
-use futures_util::StreamExt;
 use rust_decimal::Decimal;
 use serde_json::Value;
 
@@ -10,57 +8,50 @@ use crate::{
     network::{self, OutboundScope},
 };
 
-use super::{MAX_SOURCE_BYTES, MAX_SOURCE_PRICES, RemotePrice};
+use super::{MAX_SOURCE_PRICES, RemotePrice};
 
-const SOURCE_TIMEOUT: Duration = Duration::from_secs(12);
+fn price_source_stage(source: &str) -> &'static str {
+    match source {
+        "models.dev" => "models_dev",
+        "litellm" => "litellm",
+        "openrouter" => "openrouter",
+        _ => "price_source",
+    }
+}
+
+fn price_upstream(code: &'static str, source: &str) -> AppError {
+    AppError::upstream_with(
+        code,
+        crate::error::ErrorFacts::new().stage(price_source_stage(source)),
+    )
+}
 
 pub(super) async fn fetch_source(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     source: &'static str,
     url: &str,
     allow_test_loopback: bool,
 ) -> Result<(Vec<RemotePrice>, usize), AppError> {
-    let task = async {
-        let outbound =
-            network::client_for_url(http, url, OutboundScope::Public, allow_test_loopback).await?;
-        let response = outbound.get(url).send().await?;
-        if !response.status().is_success() {
-            return Err(AppError::Upstream(format!(
-                "{source} returned HTTP {}",
-                response.status()
-            )));
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_SOURCE_BYTES as u64)
-        {
-            return Err(AppError::Upstream(format!(
-                "{source} response exceeded the size limit"
-            )));
-        }
-        let mut bytes = BytesMut::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            if bytes.len().saturating_add(chunk.len()) > MAX_SOURCE_BYTES {
-                return Err(AppError::Upstream(format!(
-                    "{source} response exceeded the size limit"
-                )));
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let document: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| AppError::Upstream(format!("{source} returned invalid JSON")))?;
-        match source {
-            "models.dev" => parse_models_dev(&document),
-            "litellm" => parse_litellm(&document),
-            "openrouter" => parse_openrouter(&document),
-            _ => Err(AppError::Internal),
-        }
-    };
-    tokio::time::timeout(SOURCE_TIMEOUT, task)
-        .await
-        .map_err(|_| AppError::Upstream(format!("{source} synchronization timed out")))?
+    let outbound =
+        network::client_for_url(http, url, OutboundScope::Public, allow_test_loopback).await?;
+    let response = outbound.get(url).send().await?;
+    if !response.status().is_success() {
+        return Err(AppError::upstream_with(
+            "price_source_http_status",
+            crate::error::ErrorFacts::new()
+                .stage(price_source_stage(source))
+                .status(response.status().as_u16()),
+        ));
+    }
+    let bytes = response.bytes().await?;
+    let document: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| price_upstream("price_source_invalid_json", source))?;
+    match source {
+        "models.dev" => parse_models_dev(&document),
+        "litellm" => parse_litellm(&document),
+        "openrouter" => parse_openrouter(&document),
+        _ => Err(AppError::internal("sources_fetch_source_1")),
+    }
 }
 
 fn parse_models_dev(document: &Value) -> Result<(Vec<RemotePrice>, usize), AppError> {
@@ -68,7 +59,7 @@ fn parse_models_dev(document: &Value) -> Result<(Vec<RemotePrice>, usize), AppEr
         Some(providers) => providers.as_object(),
         None => document.as_object(),
     }
-    .ok_or_else(|| AppError::Upstream("models.dev returned an invalid catalog".into()))?;
+    .ok_or_else(|| price_upstream("price_source_catalog_invalid", "models.dev"))?;
     let mut prices = Vec::new();
     let mut skipped = 0;
     for (provider_id, provider) in providers {
@@ -112,7 +103,7 @@ fn parse_models_dev(document: &Value) -> Result<(Vec<RemotePrice>, usize), AppEr
 fn parse_litellm(document: &Value) -> Result<(Vec<RemotePrice>, usize), AppError> {
     let entries = document
         .as_object()
-        .ok_or_else(|| AppError::Upstream("litellm returned an invalid catalog".into()))?;
+        .ok_or_else(|| price_upstream("price_source_catalog_invalid", "litellm"))?;
     let million = Decimal::from(1_000_000_u64);
     let mut prices = Vec::new();
     let mut skipped = 0;
@@ -149,7 +140,7 @@ pub(super) fn parse_openrouter(document: &Value) -> Result<(Vec<RemotePrice>, us
     let entries = document
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| AppError::Upstream("openrouter returned an invalid catalog".into()))?;
+        .ok_or_else(|| price_upstream("price_source_catalog_invalid", "openrouter"))?;
     let million = Decimal::from(1_000_000_u64);
     let mut prices = Vec::new();
     let mut skipped = 0;
@@ -196,9 +187,7 @@ pub(super) fn parse_openrouter(document: &Value) -> Result<(Vec<RemotePrice>, us
 
 fn ensure_price_count(source: &str, count: usize) -> Result<(), AppError> {
     if count > MAX_SOURCE_PRICES {
-        Err(AppError::Upstream(format!(
-            "{source} catalog exceeded the model limit"
-        )))
+        Err(price_upstream("price_source_model_limit", source))
     } else {
         Ok(())
     }
@@ -210,9 +199,7 @@ fn ensure_prices(
     skipped: usize,
 ) -> Result<(Vec<RemotePrice>, usize), AppError> {
     if prices.is_empty() {
-        Err(AppError::Upstream(format!(
-            "{source} catalog contained no usable token prices"
-        )))
+        Err(price_upstream("price_source_no_prices", source))
     } else {
         Ok((prices, skipped))
     }

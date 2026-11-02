@@ -1,18 +1,7 @@
 use std::{
     fmt::Write,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Instant,
+    sync::atomic::{AtomicU64, Ordering},
 };
-
-#[derive(Clone, Copy)]
-pub(crate) enum Stage {
-    Retained,
-    Response,
-    Projection,
-}
 
 #[derive(Default)]
 struct StageCounters {
@@ -24,19 +13,9 @@ struct StageCounters {
 }
 
 #[derive(Default)]
-pub(super) struct Counters([Arc<StageCounters>; 3]);
+pub(super) struct Counters([StageCounters; 3]);
 
 impl Counters {
-    pub(super) fn wait(&self, stage: Stage) -> WaitGuard {
-        let counters = self.0[stage as usize].clone();
-        counters.waiting.fetch_add(1, Ordering::Relaxed);
-        WaitGuard {
-            counters,
-            started: Instant::now(),
-            result: None,
-        }
-    }
-
     pub(super) fn render(&self, output: &mut String) {
         output.push_str("# HELP memeloop_token_center_proxy_memory_waiting Requests currently queued for memory capacity.\n# TYPE memeloop_token_center_proxy_memory_waiting gauge\n");
         output.push_str("# HELP memeloop_token_center_proxy_memory_waits_total Completed memory queue waits by stage and outcome.\n# TYPE memeloop_token_center_proxy_memory_waits_total counter\n");
@@ -67,33 +46,5 @@ impl Counters {
                 counters.wait_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
             );
         }
-    }
-}
-
-pub(crate) struct WaitGuard {
-    counters: Arc<StageCounters>,
-    started: Instant,
-    result: Option<bool>,
-}
-
-impl WaitGuard {
-    pub(crate) fn finish(mut self, admitted: bool) {
-        self.result = Some(admitted);
-    }
-}
-
-impl Drop for WaitGuard {
-    fn drop(&mut self) {
-        self.counters.waiting.fetch_sub(1, Ordering::Relaxed);
-        let outcome = match self.result {
-            Some(true) => &self.counters.admitted,
-            Some(false) => &self.counters.timed_out,
-            None => &self.counters.cancelled,
-        };
-        outcome.fetch_add(1, Ordering::Relaxed);
-        self.counters.wait_micros.fetch_add(
-            self.started.elapsed().as_micros().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
     }
 }

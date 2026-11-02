@@ -2,9 +2,411 @@ use super::super::*;
 use crate::conversation::ConversationHints;
 use std::time::Duration;
 
+mod archive_binding;
 mod cache_coverage;
 mod semantic_isolation;
 mod semantic_retry;
+
+#[tokio::test]
+async fn sqlite_deferred_session_body_retries_after_terminal_completion() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = crate::AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("deferred-session-body.db").display()
+    )))
+    .await
+    .unwrap();
+    let database = &state.db;
+    let (key, reservation, request_id) = admitted(database, false).await;
+    let request = serde_json::json!({"messages": [{"role": "user", "content": "retry this turn"}]});
+    let hints = ConversationHints::default();
+    let mut input = finish(&key, &reservation, request_id);
+    input.conversation = Some(ProxyConversationInput {
+        key: &key,
+        request_json: &request,
+        hints: &hints,
+        client_name: None,
+        upstream_response_id: None,
+    });
+    database.finish_proxy_request_deferred(input).await.unwrap();
+
+    let empty_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(empty_owner, 1)
+            .await
+            .unwrap()[0]
+            .request_id,
+        request_id
+    );
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(empty_owner, request_id)
+            .await
+            .unwrap()
+    );
+
+    // The empty snapshot must release its lease without waiting five minutes.
+    let body_owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(body_owner, 1)
+            .await
+            .unwrap()[0]
+            .request_id,
+        request_id
+    );
+    // The worker materializes content before discovering the terminal writer
+    // is still pending. Its rolled-back observation must release ownership too.
+    assert!(
+        !crate::worker::archive_session_body(&state, body_owner, request_id)
+            .await
+            .unwrap()
+    );
+    let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at, projected_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
+    assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
+    assert_eq!(row.get::<Option<String>, _>("terminal_lease_owner"), None);
+    assert_eq!(row.get::<Option<i64>, _>("terminal_lease_expires_at"), None);
+    assert_eq!(row.get::<Option<i64>, _>("projected_at"), None);
+
+    let owner = Uuid::now_v7();
+    assert_eq!(
+        database
+            .claim_conversation_projection_tasks(owner, 1)
+            .await
+            .unwrap()[0]
+            .request_id,
+        request_id
+    );
+    // A stale owner cannot release the replacement worker's lease.
+    assert!(
+        !database
+            .project_claimed_conversation_projection_task(body_owner, request_id)
+            .await
+            .unwrap()
+    );
+    // Statement retries must also recognize an already materialized snapshot,
+    // whose payload marker has been cleared by the session-body worker.
+    assert!(
+        database
+            .schedule_rolled_back_conversation_retry(request_id, owner)
+            .await
+            .unwrap()
+    );
+    let retry_at: i64 = sqlx::query_scalar(
+        "SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert!(retry_at <= unix_millis() + 4000);
+    let terminal_owner = Uuid::now_v7();
+    assert!(
+        database
+            .claim_terminal_projection_tasks(terminal_owner, 1)
+            .await
+            .unwrap()
+            .contains(&request_id)
+    );
+    assert!(
+        database
+            .project_claimed_terminal_projection_task(terminal_owner, request_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        crate::worker::archive_session_body(&state, owner, request_id)
+            .await
+            .unwrap()
+    );
+    assert!(
+        !crate::worker::archive_session_body(&state, owner, request_id)
+            .await
+            .unwrap()
+    );
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(request_id.to_string())
+            .fetch_one(&database.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    assert!(
+        database
+            .claim_conversation_projection_tasks(Uuid::now_v7(), 1)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn sqlite_deferred_session_edges_follow_admission_when_settlement_is_reversed() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = crate::AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("deferred-session-order.db").display()
+    )))
+    .await
+    .unwrap();
+    let database = &state.db;
+    let (key, parent_reservation, parent) = admitted(database, false).await;
+    let price = database
+        .upsert_model_price("deferred-order", "USD", Decimal::ONE, Decimal::ONE)
+        .await
+        .unwrap();
+    let child = Uuid::now_v7();
+    let child_reservation = database
+        .start_proxy_request(StartProxyRequest {
+            request_id: child,
+            key: &key,
+            price: &price,
+            input_token_ceiling: 10,
+            output_token_ceiling: 10,
+            protocol: "openai",
+            model: "deferred-order",
+            request_object: "gap://deferred-order/request",
+            upstream_account_id: None,
+            model_route_id: None,
+        })
+        .await
+        .unwrap();
+    let hints = ConversationHints {
+        session_id: Some("deferred-order".into()),
+        ..Default::default()
+    };
+    let parent_body = serde_json::json!({"messages": [{"role": "user", "content": "one"}]});
+    let child_body = serde_json::json!({"messages": [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "user", "content": "three"}
+    ]});
+    for (request_id, reservation, body) in [
+        (child, &child_reservation, &child_body),
+        (parent, &parent_reservation, &parent_body),
+    ] {
+        let mut input = finish(&key, reservation, request_id);
+        input.response_object =
+            r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"hello"}}]}"#;
+        input.conversation = Some(ProxyConversationInput {
+            key: &key,
+            request_json: body,
+            hints: &hints,
+            client_name: None,
+            upstream_response_id: None,
+        });
+        database.finish_proxy_request_deferred(input).await.unwrap();
+        let terminal_owner = Uuid::now_v7();
+        database
+            .claim_terminal_projection_tasks(terminal_owner, 2)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .project_claimed_terminal_projection_task(terminal_owner, request_id)
+                .await
+                .unwrap()
+        );
+        let owner = Uuid::now_v7();
+        assert_eq!(
+            database
+                .claim_conversation_projection_tasks(owner, 1)
+                .await
+                .unwrap()[0]
+                .request_id,
+            request_id
+        );
+        assert!(
+            crate::worker::archive_session_body(&state, owner, request_id)
+                .await
+                .unwrap()
+        );
+    }
+    let edges: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT source.request_id, target.request_id, edge.relation_kind FROM conversation_edges edge JOIN conversation_observations source ON source.id = edge.from_observation_id JOIN conversation_observations target ON target.id = edge.to_observation_id",
+    )
+    .fetch_all(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        edges,
+        vec![(parent.to_string(), child.to_string(), "continues".into())]
+    );
+}
+
+#[tokio::test]
+async fn sqlite_session_body_rebuild_rewrites_only_two_locator_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = crate::AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("session-body-rebuild.db").display()
+    )))
+    .await
+    .unwrap();
+    let database = &state.db;
+    let request = serde_json::json!({
+        "model": "raw-provider-model",
+        "private_request_field": "exclude from training",
+        "messages": [
+            {"role": "system", "content": "rules"},
+            {"role": "user", "content": "question"}
+        ]
+    });
+    let response = serde_json::json!({
+        "id": "raw-provider-response-id",
+        "private_response_field": "exclude from training",
+        "choices": [{"message": {"role": "assistant", "content": "answer"}}]
+    });
+    let request_locator = format!("inline-json:{request}");
+    let response_locator = format!("inline-json:{response}");
+    let mut selected = None;
+    let mut excluded = Vec::new();
+    for (request_object, response_object) in [
+        ("", None),
+        (request_locator.as_str(), None),
+        (request_locator.as_str(), Some("")),
+        ("", Some(response_locator.as_str())),
+        (request_locator.as_str(), Some(response_locator.as_str())),
+    ] {
+        let (key, reservation, request_id) = admitted(database, false).await;
+        let hints = ConversationHints {
+            session_id: Some(request_id.to_string()),
+            ..ConversationHints::default()
+        };
+        let mut input = finish(&key, &reservation, request_id);
+        input.conversation = Some(ProxyConversationInput {
+            key: &key,
+            request_json: &request,
+            hints: &hints,
+            client_name: None,
+            upstream_response_id: None,
+        });
+        database.finish_proxy_request_deferred(input).await.unwrap();
+        let terminal_owner = Uuid::now_v7();
+        database
+            .claim_terminal_projection_tasks(terminal_owner, 32)
+            .await
+            .unwrap();
+        assert!(
+            database
+                .project_claimed_terminal_projection_task(terminal_owner, request_id)
+                .await
+                .unwrap()
+        );
+        let cluster = database
+            .record_conversation_observation(&key, request_id, &request, &hints, None)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE request_records SET request_object = $1, response_object = $2 WHERE id = $3",
+        )
+        .bind(request_object)
+        .bind(response_object)
+        .bind(request_id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        // Both old snapshot columns must be cleared before exposing a rebuild.
+        sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 1, statistics_outcome = 'applied', semantic_snapshot_json = '{}', semantic_payload_snapshot_json = '{}', lease_owner = NULL, lease_expires_at = NULL WHERE request_id = $1")
+            .bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        if !request_object.is_empty() && response_object.is_some_and(|value| !value.is_empty()) {
+            selected = Some((request_id, key.tenant_id, cluster));
+        } else {
+            excluded.push(request_id);
+        }
+    }
+    let (request_id, tenant_id, cluster) = selected.unwrap();
+    assert_eq!(database.reopen_session_body_rebuilds(32).await.unwrap(), 1);
+    let marker = sqlx::query("SELECT projected_at, semantic_snapshot_json, semantic_payload_snapshot_json, lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(marker.get::<Option<i64>, _>("projected_at"), None);
+    for field in [
+        "semantic_snapshot_json",
+        "semantic_payload_snapshot_json",
+        "terminal_lease_owner",
+    ] {
+        assert_eq!(marker.get::<Option<String>, _>(field), None);
+    }
+    assert_eq!(
+        marker.get::<Option<i64>, _>("terminal_lease_expires_at"),
+        None
+    );
+    assert_eq!(
+        marker.get::<String, _>("lease_owner"),
+        "session-body-rebuild"
+    );
+    assert_eq!(marker.get::<i64, _>("lease_expires_at"), i64::MAX);
+    let old_claimable: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_projection_outbox WHERE projected_at IS NULL AND ((lease_expires_at IS NULL OR lease_expires_at <= $1) OR ((semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL) AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $1)))")
+        .bind(unix_millis()).fetch_one(&database.pool).await.unwrap();
+    assert_eq!(old_claimable, 0);
+    let owner = Uuid::now_v7();
+    let tasks = database
+        .claim_conversation_projection_tasks(owner, 32)
+        .await
+        .unwrap();
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].request_id, request_id);
+    assert!(
+        crate::worker::archive_session_body(&state, owner, request_id)
+            .await
+            .unwrap()
+    );
+    let expected = crate::conversation::session_body_from_documents(&request, &response);
+    let (atoms, nodes) = expected.into_prefix();
+    assert_eq!(atoms.len(), 3);
+    let observation = sqlx::query(
+        "SELECT leaf_node_hash, cluster_id FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&database.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        observation.get::<String, _>("leaf_node_hash"),
+        nodes.last().unwrap().node_hash
+    );
+    assert_eq!(
+        observation.get::<String, _>("cluster_id"),
+        cluster.to_string()
+    );
+    let mut turns = Vec::new();
+    for atom in atoms {
+        let content: String = sqlx::query_scalar(
+            "SELECT content_json FROM semantic_atoms WHERE tenant_id = $1 AND content_hash = $2",
+        )
+        .bind(tenant_id.to_string())
+        .bind(&atom.content_hash)
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(!content.contains("private_request_field"));
+        assert!(!content.contains("private_response_field"));
+        assert!(!content.contains("raw-provider"));
+        turns.push(serde_json::from_str(&content).unwrap());
+    }
+    let dialogue = crate::conversation::training_dialogue(&turns);
+    assert_eq!(
+        dialogue
+            .iter()
+            .map(|turn| turn.role.as_str())
+            .collect::<Vec<_>>(),
+        ["system", "user", "assistant"]
+    );
+    assert_eq!(dialogue[2].origin, "return");
+    assert_eq!(dialogue[2].parts[0]["text"], "answer");
+    assert_eq!(database.reopen_session_body_rebuilds(32).await.unwrap(), 0);
+    for excluded_id in excluded {
+        let row = sqlx::query("SELECT projected_at, statistics_outcome, semantic_snapshot_json, semantic_payload_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(excluded_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(row.get::<i64, _>("projected_at"), 1);
+        assert_eq!(row.get::<String, _>("statistics_outcome"), "applied");
+        assert_eq!(row.get::<String, _>("semantic_snapshot_json"), "{}");
+        assert_eq!(row.get::<String, _>("semantic_payload_snapshot_json"), "{}");
+    }
+}
 
 async fn admitted(
     database: &Database,
@@ -139,7 +541,12 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
     );
     let envelope = sqlx::query("SELECT request_json, COALESCE(semantic_payload_snapshot_json, semantic_snapshot_json) AS semantic_snapshot_json, lease_owner FROM conversation_projection_outbox WHERE request_id = $1")
         .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
-    assert_eq!(envelope.get::<String, _>("request_json"), "{}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&envelope.get::<String, _>("request_json"))
+            .unwrap(),
+        body,
+        "outbox keeps the reduced dialogue for a gap locator"
+    );
     assert!(envelope.get::<String, _>("semantic_snapshot_json").len() < 71_000);
     assert_eq!(envelope.get::<String, _>("lease_owner"), "terminal-v118");
     if account_first {
@@ -170,6 +577,14 @@ async fn replay_after_source_deletion(database: &Database, metered: bool, accoun
             .project_claimed_conversation_projection_task(conversation_owner, request_id)
             .await
             .unwrap()
+    );
+    assert!(
+        database
+            .claim_conversation_projection_tasks(conversation_owner, 32)
+            .await
+            .unwrap()
+            .iter()
+            .any(|task| task.request_id == request_id)
     );
     sqlx::query("DELETE FROM request_records WHERE id = $1")
         .bind(request_id.to_string())

@@ -273,7 +273,7 @@ fn assert_paced_wire(wire: &Wire) -> serde_json::Value {
 async fn socks_cleartext_h2_reused_paced_window_595435_with_concurrent_sibling() {
     timeout(Duration::from_secs(60), async {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy = wreq::Proxy::all(format!("socks5h://{}", listener.local_addr().unwrap())).unwrap();
+        let proxy_url = format!("socks5h://{}", listener.local_addr().unwrap());
         let synthetic = |length: usize| {
             let body = Bytes::from(format!("{{\"input\":\"{}\"}}", "x".repeat(length - 12)));
             assert_eq!(body.len(), length);
@@ -334,12 +334,19 @@ async fn socks_cleartext_h2_reused_paced_window_595435_with_concurrent_sibling()
                 receipts
             }
         });
-        let client = build_codex_http_client_with_policy(CodexTransportPolicy::default()).unwrap();
+        let client = crate::codex_http_client_builder_with_proxy(
+            CodexTransportPolicy::default(),
+            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+            Some(&proxy_url),
+        )
+        .unwrap()
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
         let send = |payload: Bytes| {
             client
                 .post(format!("http://{HOST}/v1/responses"))
                 .version(http::Version::HTTP_2)
-                .proxy(proxy.clone())
                 .header(http::header::CONTENT_TYPE, "application/json")
                 .body(payload)
                 .send()

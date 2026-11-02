@@ -642,7 +642,16 @@ pub struct EntitlementReconcileResult {
     pub replaced_entitlement_id: Option<Uuid>,
 }
 
-#[derive(Clone, Debug)]
+/// Stages a live proxy request can have recorded. Anything else, including a
+/// delivery-contract marker, is not an in-flight stage.
+pub(crate) fn recorded_in_flight_stage(value: Option<String>) -> Option<String> {
+    match value.as_deref() {
+        Some("upstream_response_headers" | "upstream_response_body" | "response_delivery") => value,
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct RequestView {
     /// Independently acknowledged execution outcome; accounting may remain unknown.
     pub operational_terminal: Option<RequestOperationalTerminalView>,
@@ -680,10 +689,15 @@ pub struct RequestView {
     /// in-process callers. Serialization reads their nullable wire values from
     /// `usage` and `billing`, so an unknown observation is never exposed as
     /// zero to API clients.
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub input_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cached_input_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cache_write_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub output_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cost: String,
     /// Historical request currency when it was durably captured. It remains
     /// absent for generation history whose currency cannot be recovered
@@ -697,6 +711,10 @@ pub struct RequestView {
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub terminal_cause_code: Option<String>,
+    /// Stage recorded while the request was still open. Absence means no stage
+    /// was stored. A finished row may still carry the last stage; the operator
+    /// label uses it only while `status_code` is absent.
+    pub in_flight_stage: Option<String>,
     /// Fixed supplier reason reconstructed from a bounded native inline envelope.
     pub supplier_error: Option<crate::supplier_error::SupplierError>,
     /// Current durable archive workflow state. Terminal spool transitions are
@@ -712,14 +730,14 @@ pub struct RequestView {
     pub session_context: Option<RequestSessionContext>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestOperationalTerminalView {
     pub completed_at: i64,
     pub stage: Option<String>,
     pub financial_state: RequestFinancialState,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFinancialState {
     Pending,
@@ -735,7 +753,7 @@ impl Serialize for RequestView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestView", 33)?;
+        let mut state = serializer.serialize_struct("RequestView", 34)?;
         state.serialize_field("operational_terminal", &self.operational_terminal)?;
         state.serialize_field("egress", &self.egress)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
@@ -773,11 +791,20 @@ impl Serialize for RequestView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field("in_flight_stage", &self.in_flight_stage)?;
         let diagnostic = failure_diagnostic(self.terminal_cause_code.as_deref());
         let diagnostic = diagnostic.map(|value| {
+            // An operational terminal records a phase the request reached, and
+            // that phase is finer evidence than the typed cause. A buffered
+            // request ends with "buffered_response_ready", which marks the
+            // start of finalization rather than a phase reached, so it must
+            // not overwrite the typed stage. An absent stage stays absent.
             let stage = match self.operational_terminal.as_ref() {
-                Some(terminal) => terminal.stage.as_deref(),
                 None => value.stage,
+                Some(terminal) => match terminal.stage.as_deref() {
+                    Some("buffered_response_ready") => value.stage,
+                    other => other,
+                },
             };
             serde_json::json!({
                 "stage": stage,
@@ -794,13 +821,13 @@ impl Serialize for RequestView {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestEgressObservation {
     pub selected: crate::db::egress::SelectedEgress,
     pub observed_at: i64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestLifecycleState {
     Preparing,
@@ -814,7 +841,7 @@ pub enum RequestLifecycleState {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestArchiveState {
     Capturing,
@@ -839,7 +866,7 @@ impl RequestArchiveState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestTokenUsageView {
     pub input_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
@@ -847,13 +874,13 @@ pub struct RequestTokenUsageView {
     pub output_tokens: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestGenerationUsageView {
     pub billed_units: Option<i64>,
     pub billing_unit: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestUsageView {
     pub tokens: Option<RequestTokenUsageView>,
     pub generation: Option<RequestGenerationUsageView>,
@@ -890,14 +917,14 @@ impl RequestUsageBasis {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestBillingView {
     pub billable: bool,
     pub cost: Option<String>,
     pub currency: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestCredentialIdentityView {
     pub tenant_external_id: String,
     pub key_id: Uuid,
@@ -923,14 +950,14 @@ pub struct RequestListResponse {
     pub next_cursor: Option<RequestListCursor>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestSessionAssociation {
     Confirmed,
     Unlinked,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestSessionContext {
     /// Internal logical-session identifier used by the session detail API.
     /// Unlinked request records deliberately keep this null.
@@ -957,7 +984,7 @@ impl RequestSessionContext {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RequestEventView {
     pub usage_basis: Option<RequestUsageBasis>,
     pub compaction: Option<bool>,
@@ -976,7 +1003,9 @@ pub struct RequestEventView {
     pub upstream_account_id: Option<Uuid>,
     pub route_id: Option<Uuid>,
     pub currency: Option<String>,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cached_input_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cache_write_tokens: i64,
     pub session_context: Option<RequestSessionContext>,
     pub key_id: Uuid,
@@ -984,13 +1013,18 @@ pub struct RequestEventView {
     pub model: String,
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub input_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub output_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cost: String,
     pub usage: RequestUsageView,
     pub billing: RequestBillingView,
     pub error_code: Option<String>,
     pub terminal_cause_code: Option<String>,
+    /// Current open-request stage joined from the request row when the event is read.
+    pub in_flight_stage: Option<String>,
     /// Fixed supplier reason reconstructed from a bounded native inline envelope.
     pub supplier_error: Option<crate::supplier_error::SupplierError>,
     pub archive_state: RequestArchiveState,
@@ -1005,7 +1039,7 @@ impl Serialize for RequestEventView {
         use serde::ser::SerializeStruct;
 
         let tokens = self.usage.tokens.as_ref();
-        let mut state = serializer.serialize_struct("RequestEventView", 35)?;
+        let mut state = serializer.serialize_struct("RequestEventView", 36)?;
         state.serialize_field("usage_basis", &self.usage_basis)?;
         state.serialize_field("compaction", &self.compaction.filter(|value| *value))?;
         state.serialize_field("event_id", &self.event_id)?;
@@ -1046,6 +1080,7 @@ impl Serialize for RequestEventView {
         state.serialize_field("billing", &self.billing)?;
         state.serialize_field("error_code", &self.error_code)?;
         state.serialize_field("terminal_cause_code", &self.terminal_cause_code)?;
+        state.serialize_field("in_flight_stage", &self.in_flight_stage)?;
         state.serialize_field(
             "failure_diagnostic",
             &failure_diagnostic(self.terminal_cause_code.as_deref()),
@@ -1057,7 +1092,7 @@ impl Serialize for RequestEventView {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RequestArchiveRefs {
     pub view: RequestView,
     pub request_object: String,
@@ -1070,7 +1105,7 @@ pub struct RequestArchiveRefs {
     pub response_archive_reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestProvenanceView {
     pub source: String,
     pub disposition: String,
@@ -1095,7 +1130,7 @@ pub struct RequestDetail {
     pub egress_attempts: Option<Vec<crate::db::egress::RequestEgressAttempt>>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestTransportDiagnosticView {
     pub upstream_account_id: Uuid,
     pub route_id: Uuid,
@@ -1241,6 +1276,7 @@ pub struct StatsSummary {
     pub total_requests: i64,
     pub successful_requests: i64,
     pub failed_requests: i64,
+    pub pending_requests: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cache_usage: CacheStats,
@@ -1911,6 +1947,7 @@ mod tests {
                 .into(),
             ),
             terminal_cause_code: Some(cause.into()),
+            in_flight_stage: None,
             supplier_error: None,
             archive_state: RequestArchiveState::Gap,
             credential_identity: None,
@@ -2003,4 +2040,12 @@ mod tests {
             );
         }
     }
+}
+
+fn deserialize_nullable_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }

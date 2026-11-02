@@ -36,8 +36,8 @@ pub(super) async fn retain_approved_installations(
     let destination = destination.to_owned();
     let permit = tokio::time::timeout(ADMISSION_WAIT, COPY_PERMITS.clone().acquire_owned())
         .await
-        .map_err(|_| AppError::Overloaded)?
-        .map_err(|_| AppError::Internal)?;
+        .map_err(|_| AppError::capacity_error("plugin_retained_copy_capacity"))?
+        .map_err(|_| AppError::internal("retained_installation_retain_approved_installations_1"))?;
     tokio::time::timeout(
         Duration::from_secs(60),
         tokio::task::spawn_blocking(move || {
@@ -46,8 +46,8 @@ pub(super) async fn retain_approved_installations(
         }),
     )
     .await
-    .map_err(|_| AppError::Overloaded)?
-    .map_err(|_| AppError::Internal)?
+    .map_err(|_| AppError::capacity_error("plugin_retained_copy_capacity"))?
+    .map_err(|_| AppError::internal("retained_installation_retain_approved_installations_2"))?
 }
 
 /// Approval of a newly installed package cannot approve changes to an old one.
@@ -152,7 +152,8 @@ fn copy_retained(entry: &PreinstalledInventory, destination: &Path) -> Result<()
     if found.len() != entry.grants.len() {
         return Err(AppError::Forbidden);
     }
-    rustix::fs::fsync(&destination).map_err(|_| AppError::Internal)
+    rustix::fs::fsync(&destination)
+        .map_err(|_| AppError::internal("retained_installation_copy_retained_1"))
 }
 
 #[cfg(target_os = "linux")]
@@ -234,12 +235,15 @@ fn copy_package(
                 {
                     return Err(AppError::Forbidden);
                 }
-                output.sync_all().map_err(|_| AppError::Internal)?;
+                output
+                    .sync_all()
+                    .map_err(|_| AppError::internal("retained_installation_copy_package_1"))?;
             } else {
                 return Err(AppError::Forbidden);
             }
         }
-        rustix::fs::fsync(&target).map_err(|_| AppError::Internal)?;
+        rustix::fs::fsync(&target)
+            .map_err(|_| AppError::internal("retained_installation_copy_package_2"))?;
     }
     Ok(())
 }

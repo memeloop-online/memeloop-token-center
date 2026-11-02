@@ -482,7 +482,8 @@ async fn kimi_translation_clears_length_and_uses_complete_unknown_length_memory_
         serde_json::from_slice::<Value>(&body).unwrap()["output"][0]["content"][0]["text"],
         "translated"
     );
-    assert_eq!(budget.snapshot().0, 192 * 1024 * 1024);
+    assert_eq!(budget.snapshot().0, 64 * 1024);
+    assert!(memory.response_json_fits(&body));
     drop(memory);
     assert_eq!(budget.snapshot().0, 0);
     upstream.verify().await;
@@ -1376,9 +1377,9 @@ async fn compaction_candidates_all_disabled_return_precise_400_without_dispatch(
             .unwrap(),
     )
     .unwrap();
-    assert_eq!(body["error"]["code"], "invalid_request");
+    assert_eq!(body["error"]["code"], "compaction_producer_unavailable");
     assert_eq!(
-        body["error"]["message"],
+        body["error"]["message_en"],
         "invalid request: no available authorized upstream supports Responses compaction production"
     );
     assert!(preferred.received_requests().await.unwrap().is_empty());
@@ -1512,7 +1513,7 @@ async fn malformed_compaction_requests_are_not_swallowed_by_candidate_skipping()
             )
             .unwrap();
             assert_eq!(body["error"]["code"], "invalid_request");
-            assert_eq!(body["error"]["message"], expected);
+            assert_eq!(body["error"]["message_en"], expected);
             assert!(preferred.received_requests().await.unwrap().is_empty());
             assert!(standby.received_requests().await.unwrap().is_empty());
             assert_no_compaction_candidate_health_failure(&fixture).await;

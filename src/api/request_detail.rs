@@ -187,7 +187,8 @@ fn inline_archive_content_response(
     headers: &HeaderMap,
     bytes: Bytes,
 ) -> Result<Response, AppError> {
-    let size = u64::try_from(bytes.len()).map_err(|_| AppError::Internal)?;
+    let size = u64::try_from(bytes.len())
+        .map_err(|_| AppError::internal("request_detail_inline_archive_content_response_1"))?;
     let etag = format!("\"{}\"", blake3::hash(&bytes).to_hex());
     if !if_match_satisfied(headers, &etag) {
         return precondition_failed(&etag);
@@ -197,8 +198,10 @@ fn inline_archive_content_response(
         Err(()) => return range_not_satisfiable(size, Some(&etag)),
     };
     let range = requested_range.clone().unwrap_or(0..size);
-    let start = usize::try_from(range.start).map_err(|_| AppError::Internal)?;
-    let end = usize::try_from(range.end).map_err(|_| AppError::Internal)?;
+    let start = usize::try_from(range.start)
+        .map_err(|_| AppError::internal("request_detail_inline_archive_content_response_2"))?;
+    let end = usize::try_from(range.end)
+        .map_err(|_| AppError::internal("request_detail_inline_archive_content_response_3"))?;
     archive_content_success(
         requested_range.is_some(),
         size,
@@ -246,15 +249,11 @@ async fn object_archive_content_response(
         }
     };
     if download.object_size != size {
-        return Err(AppError::Storage(
-            "request archive changed during download".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     let expected_range = requested_range.clone().unwrap_or(0..size);
     if download.range != expected_range {
-        return Err(AppError::Storage(
-            "request archive returned an unexpected range".to_owned(),
-        ));
+        return Err(AppError::storage("local_storage_failed"));
     }
     archive_content_success(
         requested_range.is_some(),
@@ -338,7 +337,9 @@ fn archive_content_success(
             ),
         );
     }
-    response.body(body).map_err(|_| AppError::Internal)
+    response
+        .body(body)
+        .map_err(|_| AppError::internal("request_detail_archive_content_success_1"))
 }
 
 fn archive_content_unavailable(reason: &str) -> Result<Response, AppError> {
@@ -349,14 +350,14 @@ fn archive_content_unavailable(reason: &str) -> Result<Response, AppError> {
             "reason": reason,
         }
     }))
-    .map_err(|_| AppError::Internal)?;
+    .map_err(|_| AppError::internal("request_detail_archive_content_unavailable_1"))?;
     Response::builder()
         .status(StatusCode::CONFLICT)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CONTENT_LENGTH, body.len())
         .header(header::CACHE_CONTROL, "private, no-store")
         .body(Body::from(body))
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("request_detail_archive_content_unavailable_2"))
 }
 
 fn precondition_failed(etag: &str) -> Result<Response, AppError> {
@@ -367,7 +368,7 @@ fn precondition_failed(etag: &str) -> Result<Response, AppError> {
         .header(header::CACHE_CONTROL, "private, no-store")
         .header(header::ETAG, etag)
         .body(Body::empty())
-        .map_err(|_| AppError::Internal)
+        .map_err(|_| AppError::internal("request_detail_precondition_failed_1"))
 }
 
 fn range_not_satisfiable(size: u64, etag: Option<&str>) -> Result<Response, AppError> {
@@ -380,7 +381,9 @@ fn range_not_satisfiable(size: u64, etag: Option<&str>) -> Result<Response, AppE
     if let Some(etag) = etag {
         response = response.header(header::ETAG, etag);
     }
-    response.body(Body::empty()).map_err(|_| AppError::Internal)
+    response
+        .body(Body::empty())
+        .map_err(|_| AppError::internal("request_detail_range_not_satisfiable_1"))
 }
 
 struct ArchiveValue {

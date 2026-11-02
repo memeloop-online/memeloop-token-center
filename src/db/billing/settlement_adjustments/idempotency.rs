@@ -55,7 +55,7 @@ pub(super) async fn insert_idempotency(
     .bind(&input.idempotency_key)
     .fetch_optional(&mut **tx)
     .await?
-    .ok_or(AppError::Internal)?;
+    .ok_or(AppError::internal("idempotency_insert_idempotency_1"))?;
     let existing_hash: String = row.try_get("request_hash")?;
     let existing_event: String = row.try_get("event_id")?;
     if existing_hash == request_hash && existing_event == event_id {
@@ -78,13 +78,13 @@ pub(super) async fn event_result(
     .bind(event_id)
     .fetch_optional(&mut **tx)
     .await?
-    .ok_or(AppError::Internal)?;
+    .ok_or(AppError::internal("idempotency_event_result_1"))?;
     let account_id = parse_uuid(event.try_get("account_id")?)?;
     let settlement_id = parse_uuid(event.try_get("settlement_id")?)?;
     let request_kind = match event.try_get::<String, _>("request_kind")?.as_str() {
         "text" => AccountSettlementKind::Text,
         "generation" => AccountSettlementKind::Generation,
-        _ => return Err(AppError::Internal),
+        _ => return Err(AppError::internal("idempotency_event_result_2")),
     };
     let cumulative_rebate_micros: i64 = event.try_get("cumulative_rebate_micros")?;
     let gross_micros: i64 = sqlx::query_scalar(
@@ -94,7 +94,7 @@ pub(super) async fn event_result(
     .bind(settlement_id.to_string())
     .fetch_optional(&mut **tx)
     .await?
-    .ok_or(AppError::Internal)?;
+    .ok_or(AppError::internal("idempotency_event_result_3"))?;
     Ok(SettlementAdjustmentReconcileResult {
         account_id,
         settlement_id,
@@ -107,7 +107,7 @@ pub(super) async fn event_result(
         cumulative_rebate_micros,
         remaining_rebate_micros: gross_micros
             .checked_sub(cumulative_rebate_micros)
-            .ok_or(AppError::Internal)?,
+            .ok_or(AppError::internal("idempotency_event_result_4"))?,
         version: event.try_get("version")?,
         adjustment_entry_id: event
             .try_get::<Option<String>, _>("ledger_entry_id")?

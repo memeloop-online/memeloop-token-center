@@ -89,7 +89,7 @@ impl Database {
             return Err(AppError::NotFound);
         };
         if !crypto::verify_credential(&key, pepper, &expected) {
-            return Err(AppError::Internal);
+            return Err(AppError::internal("copy_copy_key_credential_1"));
         }
         let credential_generation = current.try_get("credential_generation")?;
         tx.commit().await?;

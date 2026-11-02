@@ -78,7 +78,13 @@ async fn acquisition_timeout_is_distinct_from_query_failure_and_keeps_overload()
     }
     .with_subscriber(capture.subscriber())
     .await;
-    assert!(matches!(result, Err(AppError::Overloaded)));
+    assert!(matches!(
+        result,
+        Err(AppError::Capacity {
+            code: "database_pool_exhausted",
+            ..
+        })
+    ));
     let events = capture.phases(&[
         canary,
         &url,
@@ -117,7 +123,7 @@ async fn query_failure_follows_successful_acquisition_without_driver_text() {
         )
         .with_subscriber(capture.subscriber())
         .await;
-    assert!(matches!(result, Err(AppError::Internal)));
+    assert!(matches!(result, Err(AppError::Internal { .. })));
     let events = capture.phases(&[
         "private-auth-query-credential",
         "private-auth-query-pepper",

@@ -1,9 +1,8 @@
 //! Native Antigravity wire protocol. No account import, broker or generated credentials.
 //! All network operations share the account's explicit outbound proxy policy.
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -15,7 +14,6 @@ pub const BASE_URL: &str = "https://daily-cloudcode-pa.googleapis.com";
 pub const CONTROL_URL: &str = "https://cloudcode-pa.googleapis.com";
 
 const IMAGE_LIMIT: usize = 32 * 1024 * 1024;
-const CONTROL_LIMIT: usize = 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -161,20 +159,14 @@ pub fn authorize_config_update(
 }
 
 pub struct NativeClient<'a> {
-    pub http: &'a reqwest::Client,
+    pub http: &'a dyn crate::http_settings::HttpClientSource,
     pub credential: &'a UpstreamCredential,
     pub config: &'a Config,
     pub allow_test_loopback: bool,
 }
 
 impl NativeClient<'_> {
-    async fn post(
-        &self,
-        base: &str,
-        path: &str,
-        body: &Value,
-        limit: usize,
-    ) -> Result<Value, AppError> {
+    async fn post(&self, base: &str, path: &str, body: &Value) -> Result<Value, AppError> {
         let endpoint = format!("{}{path}", base.trim_end_matches('/'));
         let http = network::client_for_config_url_no_retry(
             self.http,
@@ -184,27 +176,27 @@ impl NativeClient<'_> {
             self.allow_test_loopback,
         )
         .await?;
-        let request = http
-            .post(endpoint)
-            .timeout(Duration::from_secs(180))
-            .json(body);
+        let request = http.post(endpoint).json(body);
         let request = self.credential.apply(request, crate::db::unix_millis())?;
         let response = self
             .config
             .apply_headers(request)?
             .send()
             .await
-            .map_err(|_| AppError::Upstream("Antigravity request failed".into()))?;
+            .map_err(|_| AppError::upstream("antigravity_request_failed"))?;
         let status = response.status();
-        let body = bounded_body(response, limit).await?;
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| AppError::upstream("antigravity_response_interrupted"))?;
         if !status.is_success() {
-            return Err(AppError::Upstream(format!(
-                "Antigravity returned HTTP {}",
-                status.as_u16()
-            )));
+            return Err(AppError::upstream_status(
+                "antigravity_returned_http",
+                status.as_u16(),
+            ));
         }
         serde_json::from_slice(&body)
-            .map_err(|_| AppError::Upstream("invalid Antigravity response".into()))
+            .map_err(|_| AppError::upstream("invalid_antigravity_response"))
     }
 
     /// Read the existing project only. Never enroll, accept terms, reset quota,
@@ -215,7 +207,6 @@ impl NativeClient<'_> {
                 &self.config.control_url,
                 "/v1internal:loadCodeAssist",
                 &json!({"metadata": {"ideType": "ANTIGRAVITY"}}),
-                CONTROL_LIMIT,
             )
             .await?;
         response
@@ -242,16 +233,16 @@ impl NativeClient<'_> {
                 &self.config.base_url,
                 "/v1internal:fetchAvailableModels",
                 &json!({"project": self.config.project_id}),
-                CONTROL_LIMIT,
             )
             .await?;
         let models = response
             .get("models")
             .and_then(Value::as_object)
-            .ok_or_else(|| AppError::Upstream("Antigravity model catalog is invalid".into()))?;
+            .ok_or_else(|| AppError::upstream("antigravity_model_catalog_is_invalid"))?;
         if models.len() > 4096 {
-            return Err(AppError::Upstream(
-                "Antigravity model catalog is too large".into(),
+            return Err(AppError::upstream_with(
+                "upstream_unavailable",
+                crate::error::ErrorFacts::new().stage("antigravity_list_models"),
             ));
         }
         Ok(models
@@ -275,7 +266,6 @@ impl NativeClient<'_> {
                 &self.config.base_url,
                 "/v1internal:generateContent",
                 &payload,
-                IMAGE_LIMIT,
             )
             .await?;
         decode_images(&response)
@@ -421,7 +411,7 @@ pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
     let candidates = response
         .get("candidates")
         .and_then(Value::as_array)
-        .ok_or_else(|| AppError::Upstream("Antigravity image response has no candidates".into()))?;
+        .ok_or_else(|| AppError::upstream("antigravity_image_response_has_no_candidates"))?;
     let mut result = ImageResponse {
         images: vec![],
         text: vec![],
@@ -450,22 +440,21 @@ pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
                     .and_then(Value::as_str)
                     .filter(|mime| matches!(*mime, "image/png" | "image/jpeg" | "image/webp"))
                     .ok_or_else(|| {
-                        AppError::Upstream("Antigravity image MIME type is unsupported".into())
+                        AppError::upstream("antigravity_image_mime_type_is_unsupported")
                     })?;
                 let data = inline
                     .get("data")
                     .and_then(Value::as_str)
                     .filter(|data| data.len() <= IMAGE_LIMIT)
-                    .ok_or_else(|| {
-                        AppError::Upstream("Antigravity image data is invalid".into())
-                    })?;
-                let bytes = STANDARD.decode(data).map_err(|_| {
-                    AppError::Upstream("Antigravity image encoding is invalid".into())
-                })?;
+                    .ok_or_else(|| AppError::upstream("antigravity_image_data_is_invalid"))?;
+                let bytes = STANDARD
+                    .decode(data)
+                    .map_err(|_| AppError::upstream("antigravity_image_encoding_is_invalid"))?;
                 total = total.saturating_add(bytes.len());
                 if bytes.is_empty() || total > IMAGE_LIMIT || result.images.len() >= 16 {
-                    return Err(AppError::Upstream(
-                        "Antigravity image output exceeds limits".into(),
+                    return Err(AppError::upstream_with(
+                        "upstream_unavailable",
+                        crate::error::ErrorFacts::new().stage("antigravity_decode_images"),
                     ));
                 }
                 result.images.push(GeneratedImage {
@@ -476,33 +465,9 @@ pub fn decode_images(envelope: &Value) -> Result<ImageResponse, AppError> {
         }
     }
     if result.images.is_empty() {
-        return Err(AppError::Upstream("Antigravity returned no image".into()));
+        return Err(AppError::upstream("antigravity_returned_no_image"));
     }
     Ok(result)
-}
-
-async fn bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, AppError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > limit as u64)
-    {
-        return Err(AppError::Upstream(
-            "Antigravity response exceeds limit".into(),
-        ));
-    }
-    let mut output = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk =
-            chunk.map_err(|_| AppError::Upstream("Antigravity response interrupted".into()))?;
-        if output.len().saturating_add(chunk.len()) > limit {
-            return Err(AppError::Upstream(
-                "Antigravity response exceeds limit".into(),
-            ));
-        }
-        output.extend_from_slice(&chunk);
-    }
-    Ok(output)
 }
 
 #[cfg(test)]
@@ -639,10 +604,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1internal:fetchAvailableModels"))
             .and(header("authorization", "Bearer fixture-access"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"models": {"gemini-3-pro-image": {}}})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": {"gemini-3-pro-image": {}},
+                "padding": "x".repeat(1024 * 1024 + 1)
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -684,5 +649,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.images[0].bytes, b"image");
+    }
+
+    #[tokio::test]
+    async fn native_post_observes_updated_http_deadline_and_explicit_null() {
+        use crate::http_settings::{HttpClientFactory, HttpPurpose};
+        let server = MockServer::start().await;
+        Mock::given(path("/slow"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"ok": true}))
+                    .set_delay(std::time::Duration::from_millis(200)),
+            )
+            .mount(&server)
+            .await;
+        let factory = std::sync::Arc::new(HttpClientFactory::default());
+        let http = factory.handle(HttpPurpose::General);
+        let client = NativeClient {
+            http: &http,
+            credential: &UpstreamCredential::None,
+            config: &Config::default(),
+            allow_test_loopback: true,
+        };
+        factory.publish(
+            serde_json::from_value(json!({
+                "revision":1, "settings":{"defaults":{"request_timeout_ms":25}}
+            }))
+            .unwrap(),
+        );
+        let error = client
+            .post(&server.uri(), "/slow", &json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error.diagnostic_category(), "antigravity_request_failed");
+        factory.publish(
+            serde_json::from_value(json!({
+                "revision":2, "settings":{"defaults":{"request_timeout_ms":null}}
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            client
+                .post(&server.uri(), "/slow", &json!({}))
+                .await
+                .unwrap(),
+            json!({"ok": true})
+        );
     }
 }

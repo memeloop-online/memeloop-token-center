@@ -15,6 +15,7 @@ declare global {
     sessionDetailReads: number;
     sessionListReads: number;
     sessionListAborts: number;
+    unlinkedNavigations: Array<{ sessionId: string; keyId?: string }>;
     resolveSessionList: (status: boolean | number) => void;
     resolveSessionDetail: (status: boolean | number) => void;
   }
@@ -22,6 +23,7 @@ declare global {
 window.sessionListReads = 0;
 window.sessionListAborts = 0;
 window.sessionDetailReads = 0;
+window.unlinkedNavigations = [];
 const controlledDetail = new URLSearchParams(location.search).has('controlled-detail');
 const session: LogicalSessionSummary = {
   session_id: 'fixture-session', session_name: 'Retained session', task_kind: null,
@@ -76,6 +78,14 @@ window.fetch = async (input, init) => {
   const requestUrl = new URL(url, location.origin);
   if (requestUrl.pathname.endsWith('/title')) {
     return new Response(JSON.stringify({ title: null, state: 'unavailable', error_code: null, updated_at: null }));
+  }
+  const dialogueMatch = /\/sessions\/([^/]+)\/requests\/([^/]+)\/dialogue$/.exec(requestUrl.pathname);
+  if (dialogueMatch) {
+    return new Response(JSON.stringify({
+      contract_version: 'session_dialogue_v1', representation: 'session_body',
+      session_id: decodeURIComponent(dialogueMatch[1]!), request_id: decodeURIComponent(dialogueMatch[2]!),
+      turns: [],
+    }));
   }
   const contextMatch = /\/sessions\/([^/]+)\/requests\/([^/]+)\/context$/.exec(requestUrl.pathname);
   if (contextMatch) {
@@ -172,6 +182,7 @@ function Fixture() {
     <button onClick={() => setBackgroundPaused(true)}>Pause shared refresh</button>
     <button onClick={() => setBackgroundPaused(false)}>Resume shared refresh</button>
     <SessionMonitor token="fixture-only" tenant="default" revision={revision} eventKeyIds={keys} eventOverflowed={overflowed} streamState="live"
+      onOpenUnlinkedRequests={(sessionId, keyId) => window.unlinkedNavigations.push({ sessionId, keyId })}
       refreshCadence={{ intervalMs: refreshInterval, paused: backgroundPaused, onIntervalChange: setRefreshInterval }} onSelectRequest={async () => {}} />
   </main></MtcFluentProvider></I18nProvider>;
 }
