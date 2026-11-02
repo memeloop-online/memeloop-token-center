@@ -1,10 +1,14 @@
 use super::*;
+use sqlx::Connection;
 
 #[cfg(test)]
 mod archive_numbering_tests;
 #[cfg(test)]
 mod execution_lock_tests;
 mod observation_prefix;
+mod online147;
+#[cfg(test)]
+mod online147_tests;
 mod plaintext_sweep;
 #[cfg(test)]
 mod transport_policy_tests;
@@ -1613,7 +1617,15 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
-        let mut transaction = self.pool.begin().await?;
+        let mut connection = self.pool.acquire().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            connection.close_on_drop();
+            sqlx::query("SELECT pg_advisory_lock(734627102948311)")
+                .execute(&mut *connection)
+                .await?;
+            online147::prepare(&mut connection).await?;
+        }
+        let mut transaction = connection.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SELECT pg_advisory_xact_lock(734627102948311)")
                 .execute(&mut *transaction)
@@ -1824,10 +1836,16 @@ pub(super) async fn apply_migration_range(
             .execute(&mut **transaction)
             .await?;
         }
-        if let Err(error) = sqlx::raw_sql(migration.sql)
-            .execute(&mut **transaction)
-            .await
-        {
+        let execution =
+            if migration.version == 147 && transaction.as_mut().backend_name() == "PostgreSQL" {
+                online147::apply(&mut *transaction, migration.sql).await
+            } else {
+                sqlx::raw_sql(migration.sql)
+                    .execute(&mut **transaction)
+                    .await
+                    .map(|_| ())
+            };
+        if let Err(error) = execution {
             tracing::error!(
                 migration_version = migration.version,
                 migration_name = migration.name,
