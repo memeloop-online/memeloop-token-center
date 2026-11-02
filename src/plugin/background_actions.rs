@@ -131,7 +131,7 @@ impl PluginRuntime {
                     .memories(2)
                     .build(),
                 deadline: Instant::now() + timeout,
-                http_body_limit: None,
+                http_body_limit: super::PLUGIN_HTTP_BODY_BYTES,
                 http_diagnostic: PluginHttpDiagnostic::default(),
             },
         );
