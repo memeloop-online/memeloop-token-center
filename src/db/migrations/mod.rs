@@ -799,6 +799,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "transport proxy member indices without four member limit",
         sql: include_str!("../../../migrations/common/0151_transport_proxy_member_indices.sql"),
     },
+    Migration {
+        version: 152,
+        name: "group allocation usage projection",
+        sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1574,6 +1579,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         version: 151,
         name: "transport proxy member indices without four member limit",
         sql: include_str!("../../../migrations/common/0151_transport_proxy_member_indices.sql"),
+    },
+    Migration {
+        version: 152,
+        name: "group allocation usage projection",
+        sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
     },
 ];
 

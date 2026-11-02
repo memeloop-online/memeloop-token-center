@@ -402,6 +402,7 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     service_data_component: Option<service_data_component::ServiceDataPluginPre<HostState>>,
+    routing_component: Option<routing::PreparedGroupRouting>,
     background_action_component:
         Option<background_actions::bindings::BackgroundActionsPluginPre<HostState>>,
     wire_shim_component: Option<wire_shim_component::WireShimPluginPre<HostState>>,
@@ -940,6 +941,8 @@ impl PluginRuntime {
             } else {
                 None
             };
+            let routing_component =
+                routing::prepare_component(&engine, &manifest, component.as_ref())?;
             let background_action_component =
                 background_actions::prepare_component(&engine, &manifest, component.as_ref())?;
             let wire_shim_component = if manifest.contributions.wire_shim.is_some() {
@@ -1001,6 +1004,7 @@ impl PluginRuntime {
                 component,
                 service_data_component,
                 background_action_component,
+                routing_component,
                 wire_shim_component,
                 ui_modules,
                 configuration_validator,
@@ -3327,6 +3331,7 @@ mod tests {
                 component: None,
                 service_data_component: None,
                 background_action_component: None,
+                routing_component: None,
                 wire_shim_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: None,

@@ -108,6 +108,11 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     for statement in [
+        "DROP TABLE group_allocation_pending",
+        "DROP TABLE group_allocation_reservations",
+        "DROP TABLE group_allocation_sessions",
+        "DROP TABLE group_allocation_usage",
+        "DROP TABLE group_allocation_revisions",
         "DROP TABLE plugin_background_action_grants",
         "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
         "DROP TABLE proxy_operational_terminals",
@@ -400,7 +405,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
                 133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148, 149,
-                150, 151
+                150, 151, 152
             ]
         );
     }

@@ -162,6 +162,7 @@ pub(crate) async fn restore_selected(
             config: policy.config.clone(),
             candidates: vec![policy.candidate.clone()],
             quota_context: None,
+            allocation_context: None,
         };
         crate::plugin::routing::validate_group_routing_plan(
             &input,

@@ -105,6 +105,7 @@
           "required": ["version", "schema", "default"],
           "properties": {
             "version": { "enum": ["group-routing-v1", "group-routing-v2"] },
+            "allocation_context": {"const": "account-history-v1"},
             "health_policy": {
               "enum": ["plugin", "native"],
               "default": "plugin",

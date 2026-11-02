@@ -57,6 +57,11 @@ async fn conversion_contract(url: &str) {
         .await
         .unwrap();
     for statement in [
+        "DROP TABLE group_allocation_pending",
+        "DROP TABLE group_allocation_reservations",
+        "DROP TABLE group_allocation_sessions",
+        "DROP TABLE group_allocation_usage",
+        "DROP TABLE group_allocation_revisions",
         "DROP TABLE network_proxy_attempt_signals",
         "DROP TABLE network_proxy_selection_policies",
         "DROP TABLE network_proxy_group_members",
