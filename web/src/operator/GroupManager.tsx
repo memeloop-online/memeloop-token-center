@@ -3,8 +3,9 @@ import { useEffect, useRef, useState } from 'react';
 import { api } from '../api';
 import { formatNumber } from '../format';
 import { useI18n } from '../i18n';
-import type { GroupKind, GroupView } from '../types';
+import type { GroupKind, GroupView, ModelRouteView } from '../types';
 import { MultiCombobox, type ComboboxOption } from './MultiCombobox';
+import { strategyAccounts } from './groupStrategyResources';
 import { GroupStrategyEditor } from './GroupStrategyEditor';
 
 const paths: Record<GroupKind, string> = {
@@ -49,10 +50,13 @@ interface GroupManagerProps {
   tenant: string;
   groups: GroupView[];
   resources: ComboboxOption[];
+  accounts?: ComboboxOption[];
+  routes?: ModelRouteView[];
+  providerGroups?: GroupView[];
   onChanged: () => Promise<void>;
 }
 
-export function GroupManager({ kind, token, tenant, groups, resources, onChanged }: GroupManagerProps) {
+export function GroupManager({ kind, token, tenant, groups, resources, accounts = resources, routes = [], providerGroups = [], onChanged }: GroupManagerProps) {
   const { locale, t } = useI18n();
   const { confirm, confirmationDialog } = useConfirmDialog([token, tenant, kind]);
   const [selectedId, setSelectedId] = useState('');
@@ -164,7 +168,7 @@ export function GroupManager({ kind, token, tenant, groups, resources, onChanged
             return () => { setSavedGroups(current => { const next = { ...current }; delete next[selected.id]; return next; }); setSelectedId(''); };
           }, t('groups.deleted', { name: selected.name }));
         }}>{t('common.remove')}</button></div>
-        {kind !== 'credential' && <GroupStrategyEditor key={`${token}\0${tenant}\0${kind}\0${selected.id}`} kind={kind} token={token} tenant={tenant} group={selected} onChanged={onChanged} onSaved={rememberSaved} />}
+        {kind !== 'credential' && <GroupStrategyEditor key={`${token}\0${tenant}\0${kind}\0${selected.id}`} kind={kind} token={token} tenant={tenant} group={selected} accounts={strategyAccounts(selected, kind, accounts, routes, providerGroups)} onChanged={onChanged} onSaved={rememberSaved} />}
       </div>}
     </div>}
   </article>;
