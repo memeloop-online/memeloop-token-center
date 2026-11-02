@@ -1,4 +1,4 @@
-//! Read-only classification of definite HTTP 429 rejection, never a supplier
+//! Read-only classification of definite quota rejection, never a supplier
 //! retry or quota reset. SSE failures do not establish that execution was free.
 use super::super::super::*;
 use crate::db::{SupplierQuotaEvidence, UpstreamFailureKind};
@@ -41,6 +41,30 @@ fn classify(headers: &HeaderMap, body: Option<&[u8]>, now: i64) -> UpstreamFailu
     }
 }
 
+fn exhausted_error(error: &Value) -> bool {
+    use crate::supplier_error::SafeReason;
+    let message = match (error.get("message"), error.get("msg")) {
+        (Some(_), Some(_)) => return false,
+        (Some(message), None) | (None, Some(message)) => message.as_str(),
+        _ => None,
+    };
+    let code = error.get("code").and_then(Value::as_str);
+    let kind = error.get("type").and_then(Value::as_str);
+    let reason = SafeReason::from_supplier(code.or(kind), message);
+    if kind == Some("usage_limit_reached") {
+        return [
+            SafeReason::from_supplier(code, None),
+            SafeReason::from_supplier(None, message),
+        ]
+        .into_iter()
+        .all(|reason| reason.is_none_or(|reason| reason == SafeReason::InsufficientQuota));
+    }
+    matches!(
+        code.or(kind),
+        Some("insufficient_quota" | "insufficient_user_quota")
+    ) && reason == Some(SafeReason::InsufficientQuota)
+}
+
 pub(in crate::api::proxy) fn quota_evidence(
     headers: &HeaderMap,
     body: Option<&[u8]>,
@@ -48,14 +72,14 @@ pub(in crate::api::proxy) fn quota_evidence(
 ) -> SupplierQuotaEvidence {
     let header_deadline = retry_after(headers, now);
     let value = body.and_then(|body| crate::api::sse::parse_unique_json(body).ok());
-    let error = value.as_ref().and_then(|value| {
-        // Only the exact structured supplier signal qualifies as exhaustion.
-        // Text matching and guessed HTTP200/5xx semantics are deliberately absent.
-        [value.get("error"), Some(value)]
-            .into_iter()
-            .flatten()
-            .find(|error| error.get("type").and_then(Value::as_str) == Some("usage_limit_reached"))
-    });
+    let error = value
+        .as_ref()
+        .and_then(|value| match value.get("error") {
+            Some(error) if error.is_object() => Some(error),
+            None if value.is_object() => Some(value),
+            _ => None,
+        })
+        .filter(|error| exhausted_error(error));
     let reset = error.and_then(|error| {
         error
             .get("resets_at")
@@ -95,14 +119,48 @@ pub(in crate::api::proxy) async fn classify_rate_limit(
 pub(in crate::api::proxy) async fn classify_supplier_quota(
     response: UpstreamResponse,
 ) -> (UpstreamResponse, UpstreamFailureKind, SupplierQuotaEvidence) {
-    if response.status() != StatusCode::TOO_MANY_REQUESTS {
+    if !matches!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
+    ) {
         let evidence = quota_evidence(response.headers(), None, unix_millis());
         return (response, UpstreamFailureKind::RateLimited, evidence);
     }
     let mut parts = response.into_parts();
+    let forbidden = parts.status == StatusCode::FORBIDDEN;
+    if forbidden
+        && (upstream_error::rejection_content_class(&parts.headers) != "json"
+            || parts
+                .headers
+                .get_all(header::CONTENT_ENCODING)
+                .iter()
+                .any(|encoding| !encoding.as_bytes().eq_ignore_ascii_case(b"identity")))
+    {
+        return (
+            UpstreamResponse::Prefetched {
+                status: parts.status,
+                headers: parts.headers,
+                version: parts.version,
+                content_length: parts.content_length,
+                stream: parts.stream,
+            },
+            UpstreamFailureKind::Authentication,
+            SupplierQuotaEvidence {
+                exhausted: false,
+                reset_at: None,
+                reset_source: "unknown",
+            },
+        );
+    }
     let mut prefix = Vec::new();
     let mut body = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    let max_body = if forbidden {
+        upstream_error::MAX_ERROR_BYTES
+    } else {
+        MAX_BODY
+    };
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_millis(if forbidden { 100 } else { 500 });
     let read = async {
         loop {
             // Empty and permanently-ready chunks consume work and metadata
@@ -119,7 +177,7 @@ pub(in crate::api::proxy) async fn classify_supplier_quota(
             }
             match parts.stream.next().await {
                 Some(Ok(chunk)) => {
-                    let fits = body.len().saturating_add(chunk.len()) <= MAX_BODY;
+                    let fits = body.len().saturating_add(chunk.len()) <= max_body;
                     if fits {
                         body.extend_from_slice(&chunk);
                     }
@@ -140,8 +198,12 @@ pub(in crate::api::proxy) async fn classify_supplier_quota(
         .await
         .unwrap_or(false);
     let now = unix_millis();
-    let kind = classify(&parts.headers, complete.then_some(body.as_slice()), now);
     let evidence = quota_evidence(&parts.headers, complete.then_some(body.as_slice()), now);
+    let kind = if forbidden && !evidence.exhausted {
+        UpstreamFailureKind::Authentication
+    } else {
+        classify(&parts.headers, complete.then_some(body.as_slice()), now)
+    };
     // Preserve the entire original stream including errors and unread suffix.
     // No secret error JSON enters logs, metrics, health rows or new archives.
     let response = UpstreamResponse::Prefetched {
@@ -159,6 +221,106 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn structured_quota_codes_reuse_safe_supplier_classification_not_message_substrings() {
+        for body in [
+            r#"{"error":{"code":"insufficient_user_quota","type":"new_api_error","message":"用户额度不足, private-canary"}}"#,
+            r#"{"error":{"code":"insufficient_quota"}}"#,
+            r#"{"error":{"type":"insufficient_quota"}}"#,
+        ] {
+            assert!(quota_evidence(&HeaderMap::new(), Some(body.as_bytes()), NOW).exhausted);
+        }
+        for body in [
+            r#"{"error":{"code":"invalid_api_key","message":"Invalid API key"}}"#,
+            r#"{"error":{"code":"insufficient_user_quota","message":"Invalid API key"}}"#,
+            r#"{"error":{"type":"usage_limit_reached","code":"invalid_api_key","message":"Insufficient quota"}}"#,
+            r#"{"error":{"message":"The upstream account has insufficient quota"}}"#,
+            r#"{"error":{"code":"insufficient_quota","code":"invalid_api_key"}}"#,
+            r#"{"error":"permission denied","code":"insufficient_quota"}"#,
+            r#"{"error":{"code":"insufficient_quota","message":"Insufficient quota","msg":"Invalid API key"}}"#,
+        ] {
+            assert!(
+                !quota_evidence(&HeaderMap::new(), Some(body.as_bytes()), NOW).exhausted,
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_capture_requires_complete_json_and_preserves_every_original_chunk() {
+        for (body, content_type, exhausted) in [
+            (
+                r#"{"error":{"code":"insufficient_user_quota"}}"#,
+                "application/json",
+                true,
+            ),
+            (
+                r#"{"error":{"code":"invalid_api_key"}}"#,
+                "application/json",
+                false,
+            ),
+            (
+                r#"{"error":{"code":"insufficient_user_quota"}}"#,
+                "text/html",
+                false,
+            ),
+            (
+                r#"{"error":{"code":"insufficient_user_quota"}}"#,
+                "text/event-stream",
+                false,
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            let chunks = vec![Ok(Bytes::from(body.to_owned()))];
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::FORBIDDEN,
+                headers,
+                version: http::Version::HTTP_2,
+                content_length: None,
+                stream: Box::pin(stream::iter(chunks.clone())),
+            };
+            let (response, kind, evidence) = classify_supplier_quota(response).await;
+            assert_eq!(evidence.exhausted, exhausted);
+            assert_eq!(
+                kind.as_str(),
+                if exhausted {
+                    "quota_exhausted"
+                } else {
+                    "authentication"
+                }
+            );
+            assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, chunks);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn incomplete403_cannot_grant_failover_and_keeps_unread_suffix() {
+        let chunks = vec![Ok(Bytes::from_static(
+            br#"{"error":{"code":"insufficient_quota"}}"#,
+        ))];
+        let suffix = chunks.clone();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::FORBIDDEN,
+            headers,
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::iter(chunks.clone()).chain(stream::once(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                suffix[0].clone()
+            }))),
+        };
+        let (response, kind, evidence) = classify_supplier_quota(response).await;
+        assert_eq!(kind, UpstreamFailureKind::Authentication);
+        assert!(!evidence.exhausted);
+        assert_eq!(response.bytes_stream().collect::<Vec<_>>().await.len(), 2);
+    }
 
     #[test]
     fn unknown_malformed_and_duplicate_resets_remain_unknown() {

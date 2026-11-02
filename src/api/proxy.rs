@@ -1505,19 +1505,22 @@ async fn proxy_with_cancellation_guard(
         }
         let (result, rate_limit) = match result {
             Ok(mut result)
-                if active_route.is_codex()
-                    && result.response.status() == StatusCode::TOO_MANY_REQUESTS =>
+                if result.response.status() == StatusCode::FORBIDDEN
+                    || (active_route.is_codex()
+                        && result.response.status() == StatusCode::TOO_MANY_REQUESTS) =>
             {
                 let observed_at = unix_millis();
                 let (response, kind, evidence) =
                     routing::classify_supplier_quota(result.response).await;
-                publish_supplier_quota(
-                    &state,
-                    &active_route.route,
-                    request_id,
-                    observed_at,
-                    evidence,
-                );
+                if response.status() == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
+                    publish_supplier_quota(
+                        &state,
+                        &active_route.route,
+                        request_id,
+                        observed_at,
+                        evidence,
+                    );
+                }
                 result.response = response;
                 (Ok(result), Some(kind))
             }
@@ -1581,6 +1584,7 @@ async fn proxy_with_cancellation_guard(
             selected_candidate_rank,
             outbound_attempt,
             &result,
+            rate_limit,
         );
         let candidate_unavailable = matches!(
             &result,
@@ -1631,6 +1635,7 @@ async fn proxy_with_cancellation_guard(
         let disposition = routing::failover_disposition(
             result.as_ref().ok().map(|result| result.response.status()),
             result.as_ref().err(),
+            rate_limit,
         );
         let has_standby =
             !route_candidates.as_slice().is_empty() || !deferred_shared_probes.is_empty();
@@ -2761,21 +2766,30 @@ async fn execute_component_provider(
     IndependentProbeTarget::response(upstream_status);
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
         if let Some(attempt) = upstream_attempt.as_mut() {
-            let terminal = if upstream_status == StatusCode::TOO_MANY_REQUESTS {
+            let terminal = if matches!(
+                upstream_status,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
+            ) {
                 let observed_at = unix_millis();
                 let (response, kind, evidence) =
                     routing::classify_supplier_quota(upstream.into()).await;
-                publish_supplier_quota(
-                    request.state,
-                    route,
-                    request.request_id,
-                    observed_at,
-                    evidence,
-                );
+                if upstream_status == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
+                    publish_supplier_quota(
+                        request.state,
+                        route,
+                        request.request_id,
+                        observed_at,
+                        evidence,
+                    );
+                }
                 drop(response);
                 UpstreamAttemptTerminal::Failed {
                     kind,
-                    reason: UpstreamHealthReason::RateLimited,
+                    reason: if kind == crate::db::UpstreamFailureKind::Authentication {
+                        UpstreamHealthReason::Unavailable
+                    } else {
+                        UpstreamHealthReason::RateLimited
+                    },
                     failure_stage: "upstream_response",
                 }
             } else {

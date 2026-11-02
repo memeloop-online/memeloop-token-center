@@ -847,7 +847,7 @@ mod tests {
             Err(ProxySendError::RetryableConnection("preparation_timeout"))
         ));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
+            failover_disposition(None, result.as_ref().err(), None),
             super::super::outcome::FailoverDisposition::ConnectionNotDelivered
         );
         if drain_before_terminal {

@@ -895,7 +895,7 @@ mod timeout_tests {
             ))
         ));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
+            failover_disposition(None, result.as_ref().err(), None),
             FailoverDisposition::Stop
         );
         let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
@@ -954,7 +954,7 @@ mod timeout_tests {
             ))
         ));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
+            failover_disposition(None, result.as_ref().err(), None),
             FailoverDisposition::Stop
         );
     }
@@ -990,7 +990,7 @@ mod timeout_tests {
             ))
         ));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
+            failover_disposition(None, result.as_ref().err(), None),
             FailoverDisposition::Stop
         );
     }

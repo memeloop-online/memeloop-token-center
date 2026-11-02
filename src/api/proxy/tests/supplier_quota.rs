@@ -1,5 +1,7 @@
 use super::*;
 
+mod forbidden;
+
 #[tokio::test]
 async fn provider429_publishes_exact_model_and_next_request_uses_alternate_without_probe_post() {
     let exhausted = MockServer::start().await;
