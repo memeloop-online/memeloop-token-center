@@ -344,7 +344,11 @@ pub(crate) async fn prepare(
     )
     .await
     {
-        Ok(result) => result,
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            tracing::warn!(%request_id, stage="group_routing_native_fallback", error_category=error.diagnostic_category(), "group strategy preparation failed; core routing continues");
+            Ok(())
+        }
         Err(_) => {
             tracing::warn!(%request_id, stage="group_routing_native_fallback", "group snapshot or execution exceeded request scheduling budget");
             Ok(())
@@ -685,8 +689,7 @@ async fn prepare_inner(
                 tracing::info!(%request_id, %group_id, %plugin_id, strategy_version=members[0].3, stage="group_routing_plan", "group strategy snapshot applied");
             }
             Err(error) => {
-                // Fail closed with respect to authority, fail open only to the
-                // native order/admission of these exact authorized candidates.
+                // Continue with the core ordering of this group's candidates.
                 tracing::warn!(%request_id, %group_id, %plugin_id, error_category=error.diagnostic_category(), stage="group_routing_native_fallback", "group strategy failed; native policy retained for its candidates");
             }
         }
