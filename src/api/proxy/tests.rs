@@ -3058,6 +3058,31 @@ async fn assert_exactly_once_side_effects_for(
 }
 
 async fn assert_settlement_once_with_inline_request(fixture: &CodexRouteFixture, request_id: Uuid) {
+    let owner = Uuid::now_v7();
+    for pending_id in fixture
+        .state
+        .db
+        .claim_terminal_projection_tasks(owner, 32)
+        .await
+        .unwrap()
+    {
+        assert!(
+            fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(owner, pending_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(owner, pending_id)
+                .await
+                .unwrap()
+        );
+    }
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let row = sqlx::query(
         "SELECT r.reservation_id, reservation.status AS reservation_status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.reservation_id AND l.kind = 'usage') AS charges, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = r.id) AS facts, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = r.id AND e.event_kind = 'finished') AS finished_events, o.request_json FROM request_records r JOIN usage_reservations reservation ON reservation.id = r.reservation_id LEFT JOIN conversation_projection_outbox o ON o.request_id = r.id WHERE r.id = $1",
