@@ -69,6 +69,835 @@
     }
   ],
   "paths": {
+    "/internal/v1/transport-proxies/{proxy_id}/observations": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getNetworkProxyObservations",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "requests:read",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxies/{proxy_id}/probe": {
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "probeNetworkProxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "expected_version"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "expected_version": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxy-strategies": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "listNetworkProxyStrategies",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      }
+    },
+    "/internal/v1/upstreams/{account_id}/transport-proxy-selection": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getNetworkProxySelection",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "updateNetworkProxySelection",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "expected_selection_version",
+                  "expected_binding_version",
+                  "expected_credential_generation",
+                  "expected_updated_at",
+                  "mode"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "manual",
+                      "auto",
+                      "plugin"
+                    ]
+                  },
+                  "plugin_id": {
+                    "type": "string"
+                  },
+                  "plugin_version": {
+                    "type": "string"
+                  },
+                  "expected_selection_version": {
+                    "type": "integer"
+                  },
+                  "expected_binding_version": {
+                    "type": "integer"
+                  },
+                  "expected_credential_generation": {
+                    "type": "integer"
+                  },
+                  "expected_updated_at": {
+                    "type": "integer"
+                  },
+                  "expected_group_version": {
+                    "type": "integer"
+                  },
+                  "proxy_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "group_id": {
+                    "type": "string",
+                    "format": "uuid"
+                  },
+                  "config": {
+                    "type": "object"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Private, no-store. Background application and observations are asynchronous.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Configuration or selection version conflict."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxies": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "listNetworkProxies",
+        "summary": "list Network Proxies",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "createNetworkProxy",
+        "summary": "create Network Proxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "name",
+                  "proxy_url"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 64
+                  },
+                  "proxy_url": {
+                    "type": "string",
+                    "writeOnly": true
+                  },
+                  "probe": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "enabled",
+                      "target_url",
+                      "interval_ms",
+                      "attempts"
+                    ],
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "target_url": {
+                        "type": "string",
+                        "format": "uri",
+                        "maxLength": 2048
+                      },
+                      "interval_ms": {
+                        "type": "integer",
+                        "minimum": 10000,
+                        "maximum": 3600000
+                      },
+                      "attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      }
+    },
+    "/internal/v1/transport-proxies/{proxy_id}": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getNetworkProxy",
+        "summary": "get Network Proxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/RequiredTenant"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "updateNetworkProxy",
+        "summary": "update Network Proxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "expected_version",
+                  "name"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "expected_version": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "proxy_url": {
+                    "type": "string",
+                    "writeOnly": true
+                  },
+                  "probe": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "enabled",
+                      "target_url",
+                      "interval_ms",
+                      "attempts"
+                    ],
+                    "properties": {
+                      "enabled": {
+                        "type": "boolean"
+                      },
+                      "target_url": {
+                        "type": "string",
+                        "format": "uri",
+                        "maxLength": 2048
+                      },
+                      "interval_ms": {
+                        "type": "integer",
+                        "minimum": 10000,
+                        "maximum": 3600000
+                      },
+                      "attempts": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 8
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "deleteNetworkProxy",
+        "summary": "delete Network Proxy",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "name": "proxy_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tenant_external_id",
+                  "expected_version"
+                ],
+                "properties": {
+                  "tenant_external_id": {
+                    "type": "string"
+                  },
+                  "expected_version": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Private, no-store. Proxy credentials are never returned.",
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "type": "string",
+                  "const": "private, no-store"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "Version conflict, duplicate name, or referenced proxy."
+          }
+        }
+      }
+    },
     "/healthz": {
       "get": {
         "tags": [
@@ -5151,7 +5980,7 @@
         ],
         "operationId": "readUpstreamProviderHealth",
         "summary": "Read the latest independent upstream service probe",
-        "description": "Returns the stored result of the periodic or manually requested service\nprobe. Customer requests do not update this result. `null` means no probe\nhas completed yet.\n",
+        "description": "Returns independently observed billed inference evidence. Customer requests\ndo not update it. A skipped latest attempt is visible with the preserved\nlast_result; otherwise last_attempt accompanies the stored result.\nLegacy rows retain historical_result with unknown status and unverified\nprovenance. null means no result or attempt has been stored.\n",
         "security": [
           {
             "serviceBearer": []
@@ -5201,7 +6030,7 @@
         ],
         "operationId": "probeUpstreamProviderHealth",
         "summary": "Probe one upstream without returning its response body",
-        "description": "Performs a bounded provider-specific read using the current credential. The\nupstream response body is never read, logged, or returned. Transport and\nauthentication failures are represented by `status: unhealthy` in a 200\nmanagement response; they are not proxy responses.\n",
+        "description": "Performs a bounded billed inference using the configured billing credential\nand an exact account/model/generation/revision pin. The default selects a\nlocally routable model priced in that credential's currency. Explicit\nunavailable selections do not fall back. Local pre-dispatch failures are\nskipped and preserve the last real result. Provider bodies may be read for\nbounded protocol/quota classification but are never returned here.\nManual recovery may bypass known quota deadlines; periodic probes wait\nunless fresh accepted-reset readback permits exact-model verification.\nDisabled accounts remain unsendable. HTTP 200 is the management response,\nnot evidence of provider success; upstream_status records original receipt.\n",
         "security": [
           {
             "serviceBearer": []
@@ -17772,7 +18601,6 @@
           "members": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4,
             "items": {
               "$ref": "#/components/schemas/TransportProxyMemberInput"
             }
@@ -18019,7 +18847,6 @@
           "members": {
             "type": "array",
             "minItems": 1,
-            "maxItems": 4,
             "items": {
               "$ref": "#/components/schemas/TransportProxyMemberInput"
             }
@@ -21482,6 +22309,7 @@
         "required": [
           "account_id",
           "status",
+          "source",
           "checked_at"
         ],
         "properties": {
@@ -21493,7 +22321,16 @@
             "type": "string",
             "enum": [
               "healthy",
-              "unhealthy"
+              "unhealthy",
+              "skipped",
+              "unknown"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "model_probe",
+              "legacy_unverified"
             ]
           },
           "error_code": {
@@ -21502,31 +22339,222 @@
               "null"
             ],
             "enum": [
-              "credential_invalid",
-              "destination_invalid",
               "authentication_failed",
               "upstream_unavailable",
-              "connection_failed",
+              "rate_limited",
+              "quota_exhausted",
+              "service_overloaded",
+              "probe_admission_skipped",
+              "probe_state_unavailable",
+              "probe_account_unavailable",
+              "provider_retired",
+              "probe_model_unavailable",
+              "probe_billing_unavailable",
+              "probe_route_unavailable",
+              "probe_model_unpriced",
+              "supplier_quota_reset_pending",
               null
             ]
           },
           "upstream_status": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 100,
             "maximum": 599,
-            "description": "Present when an HTTP response was received; its body is discarded."
+            "description": "Original provider HTTP status at receipt; null before receipt."
           },
           "latency_ms": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
-            "minimum": 0,
-            "description": "Present when a network probe was attempted."
+            "minimum": 0
           },
           "checked_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "started_at": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "trigger": {
+            "type": "string",
+            "enum": [
+              "manual",
+              "periodic",
+              "periodic_recovery"
+            ]
+          },
+          "credential_generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "transport_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "selected_model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "actual_model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Exact target when transport dispatch began; null for local preparation failures. Does not prove supplier execution."
+          },
+          "request_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "status_origin": {
+            "type": "string",
+            "enum": [
+              "provider",
+              "mtc"
+            ]
+          },
+          "reset_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Provider deadline in Unix milliseconds; null means unknown."
+          },
+          "reset_source": {
+            "type": "string",
+            "enum": [
+              "retry_after",
+              "provider_reset",
+              "unknown"
+            ]
+          },
+          "historical_result": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "status",
+              "error_code",
+              "latency_ms",
+              "checked_at"
+            ],
+            "properties": {
+              "status": {
+                "type": "string"
+              },
+              "error_code": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "latency_ms": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "checked_at": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "description": "Preserved legacy data whose independent-probe provenance cannot be established."
+          },
+          "last_attempt": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamProbeAttempt"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_result": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/UpstreamProbeResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
+      },
+      "UpstreamProbeAttempt": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/UpstreamHealthResult"
+          },
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "healthy",
+                  "unhealthy",
+                  "skipped"
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "last_attempt"
+                  ]
+                },
+                {
+                  "required": [
+                    "last_result"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "UpstreamProbeResult": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/UpstreamHealthResult"
+          },
+          {
+            "properties": {
+              "status": {
+                "enum": [
+                  "healthy",
+                  "unhealthy",
+                  "unknown"
+                ]
+              }
+            },
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "last_attempt"
+                  ]
+                },
+                {
+                  "required": [
+                    "last_result"
+                  ]
+                }
+              ]
+            }
+          }
+        ]
       },
       "StartCursorOAuthRequest": {
         "type": "object",

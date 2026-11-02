@@ -146,6 +146,14 @@ async fn contract(database_url: String, directory: &tempfile::TempDir) {
         .mount(&supplier)
         .await;
     let response_status = status.clone();
+    Mock::given(method("GET"))
+        .and(path("/usage"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "rate_limit": {"allowed": true, "limit_reached": false,
+                "primary_window": {"used_percent": 0}}
+        })))
+        .mount(&supplier)
+        .await;
     Mock::given(method("POST"))
         .and(path("/consume"))
         .respond_with(move |_: &wiremock::Request| {

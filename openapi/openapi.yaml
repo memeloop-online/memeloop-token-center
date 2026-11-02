@@ -70,6 +70,12 @@ tags:
   - name: Multimodal generation
     description: Synchronous image and asynchronous image/video generation routes.
 paths:
+  /internal/v1/transport-proxies/{proxy_id}/observations: {"get":{"tags":["Upstream providers"],"operationId":"getNetworkProxyObservations","security":[{"serviceBearer":[]}],"x-required-scope":"requests:read","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"$ref":"#/components/parameters/RequiredTenant"},{"name":"start","in":"query","required":true,"schema":{"type":"integer","format":"int64"}},{"name":"end","in":"query","required":true,"schema":{"type":"integer","format":"int64"}}],"responses":{"200":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
+  /internal/v1/transport-proxies/{proxy_id}/probe: {"post":{"tags":["Upstream providers"],"operationId":"probeNetworkProxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1}}}}}},"responses":{"202":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
+  /internal/v1/transport-proxy-strategies: {"get":{"tags":["Upstream providers"],"operationId":"listNetworkProxyStrategies","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
+  /internal/v1/upstreams/{account_id}/transport-proxy-selection: {"get":{"tags":["Upstream providers"],"operationId":"getNetworkProxySelection","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"account_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}},"put":{"tags":["Upstream providers"],"operationId":"updateNetworkProxySelection","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"account_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_selection_version","expected_binding_version","expected_credential_generation","expected_updated_at","mode"],"properties":{"tenant_external_id":{"type":"string"},"mode":{"type":"string","enum":["manual","auto","plugin"]},"plugin_id":{"type":"string"},"plugin_version":{"type":"string"},"expected_selection_version":{"type":"integer"},"expected_binding_version":{"type":"integer"},"expected_credential_generation":{"type":"integer"},"expected_updated_at":{"type":"integer"},"expected_group_version":{"type":"integer"},"proxy_id":{"type":"string","format":"uuid"},"group_id":{"type":"string","format":"uuid"},"config":{"type":"object"}}}}}},"responses":{"202":{"description":"Private, no-store. Background application and observations are asynchronous.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Configuration or selection version conflict."}}}}
+  /internal/v1/transport-proxies: {"get":{"tags":["Upstream providers"],"operationId":"listNetworkProxies","summary":"list Network Proxies","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}},"post":{"tags":["Upstream providers"],"operationId":"createNetworkProxy","summary":"create Network Proxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","name","proxy_url"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"proxy_url":{"type":"string","writeOnly":true},"probe":{"type":"object","additionalProperties":false,"required":["enabled","target_url","interval_ms","attempts"],"properties":{"enabled":{"type":"boolean"},"target_url":{"type":"string","format":"uri","maxLength":2048},"interval_ms":{"type":"integer","minimum":10000,"maximum":3600000},"attempts":{"type":"integer","minimum":1,"maximum":8}}}}}}}},"responses":{"201":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}}}
+  /internal/v1/transport-proxies/{proxy_id}: {"get":{"tags":["Upstream providers"],"operationId":"getNetworkProxy","summary":"get Network Proxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}},{"$ref":"#/components/parameters/RequiredTenant"}],"responses":{"200":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}},"put":{"tags":["Upstream providers"],"operationId":"updateNetworkProxy","summary":"update Network Proxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version","name"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1},"name":{"type":"string"},"proxy_url":{"type":"string","writeOnly":true},"probe":{"type":"object","additionalProperties":false,"required":["enabled","target_url","interval_ms","attempts"],"properties":{"enabled":{"type":"boolean"},"target_url":{"type":"string","format":"uri","maxLength":2048},"interval_ms":{"type":"integer","minimum":10000,"maximum":3600000},"attempts":{"type":"integer","minimum":1,"maximum":8}}}}}}}},"responses":{"200":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}},"content":{"application/json":{"schema":{"type":"object"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}},"delete":{"tags":["Upstream providers"],"operationId":"deleteNetworkProxy","summary":"delete Network Proxy","security":[{"serviceBearer":[]}],"x-required-scope":"providers:write","parameters":[{"name":"proxy_id","in":"path","required":true,"schema":{"type":"string","format":"uuid"}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1}}}}}},"responses":{"204":{"description":"Private, no-store. Proxy credentials are never returned.","headers":{"Cache-Control":{"schema":{"type":"string","const":"private, no-store"}}}},"400":{"$ref":"#/components/responses/InvalidRequest"},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"Version conflict, duplicate name, or referenced proxy."}}}}
   /healthz:
     get:
       tags: [System]
@@ -2329,9 +2335,11 @@ paths:
       operationId: readUpstreamProviderHealth
       summary: Read the latest independent upstream service probe
       description: |
-        Returns the stored result of the periodic or manually requested service
-        probe. Customer requests do not update this result. `null` means no probe
-        has completed yet.
+        Returns independently observed billed inference evidence. Customer requests
+        do not update it. A skipped latest attempt is visible with the preserved
+        last_result; otherwise last_attempt accompanies the stored result.
+        Legacy rows retain historical_result with unknown status and unverified
+        provenance. null means no result or attempt has been stored.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:read
       parameters:
@@ -2354,10 +2362,16 @@ paths:
       operationId: probeUpstreamProviderHealth
       summary: Probe one upstream without returning its response body
       description: |
-        Performs a bounded provider-specific read using the current credential. The
-        upstream response body is never read, logged, or returned. Transport and
-        authentication failures are represented by `status: unhealthy` in a 200
-        management response; they are not proxy responses.
+        Performs a bounded billed inference using the configured billing credential
+        and an exact account/model/generation/revision pin. The default selects a
+        locally routable model priced in that credential's currency. Explicit
+        unavailable selections do not fall back. Local pre-dispatch failures are
+        skipped and preserve the last real result. Provider bodies may be read for
+        bounded protocol/quota classification but are never returned here.
+        Manual recovery may bypass known quota deadlines; periodic probes wait
+        unless fresh accepted-reset readback permits exact-model verification.
+        Disabled accounts remain unsendable. HTTP 200 is the management response,
+        not evidence of provider success; upstream_status records original receipt.
       security: [{ serviceBearer: [] }]
       x-required-scope: providers:write
       parameters:
@@ -9078,11 +9092,11 @@ components:
     PluginInstallerNetworkInput: {"oneOf":[{"type":"object","additionalProperties":false,"required":["mode"],"properties":{"mode":{"type":"string","enum":["default","direct"]}}},{"type":"object","additionalProperties":false,"required":["mode","url"],"properties":{"mode":{"type":"string","enum":["custom"]},"url":{"type":"string","maxLength":2048},"username":{"type":"string","maxLength":255},"password":{"type":"string","maxLength":255,"writeOnly":true}}},{"type":"object","additionalProperties":false,"required":["mode","tenant_external_id","group_id","group_version","member_id"],"properties":{"mode":{"type":"string","enum":["group"]},"tenant_external_id":{"type":"string"},"group_id":{"type":"string","format":"uuid"},"group_version":{"type":"integer"},"member_id":{"type":"string","format":"uuid"}}}]}
     TransportProxyGroupList: {"type":"object","required":["items"],"properties":{"items":{"type":"array","items":{"$ref":"#/components/schemas/TransportProxyGroup"}}}}
     TransportProxyMemberInput: {"type":"object","additionalProperties":false,"required":["label"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string","minLength":1,"maxLength":64},"proxy_url":{"type":"string","maxLength":2048,"writeOnly":true,"description":"Required for new members. socks5h private IP or authorized Kubernetes Service DNS; never echoed."}}}
-    CreateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}}}}
+    CreateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}}}}
     DeleteTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"expected_version":{"type":"integer","minimum":1}}}
     TransportProxyGroup: {"type":"object","required":["id","tenant_external_id","name","version","members","bound_account_count","created_at","updated_at"],"properties":{"id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"name":{"type":"string"},"version":{"type":"integer"},"members":{"type":"array","items":{"type":"object","required":["id","label","scheme","host","port","remote_dns","has_auth"],"properties":{"id":{"type":"string","format":"uuid"},"label":{"type":"string"},"scheme":{"const":"socks5h"},"host":{"type":"string"},"port":{"type":"integer","minimum":1,"maximum":65535},"remote_dns":{"const":true},"has_auth":{"type":"boolean"}}}},"bound_account_count":{"type":"integer"},"probe_url":{"type":["string","null"]},"probe_attempts":{"type":"integer"},"last_probe_status":{"type":["string","null"],"enum":["healthy","unhealthy",null]},"last_probe_checked_at":{"type":["integer","null"]},"created_at":{"type":"integer"},"updated_at":{"type":"integer"}}}
     TransportProxyGroupBinding: {"type":"object","required":["account_id","tenant_external_id","binding_version","group_id","group_version","initial_member_id","credential_generation","updated_at","runtime"],"properties":{"account_id":{"type":"string","format":"uuid"},"tenant_external_id":{"type":"string"},"binding_version":{"type":"integer"},"group_id":{"type":["string","null"],"format":"uuid"},"group_version":{"type":["integer","null"]},"initial_member_id":{"type":["string","null"],"format":"uuid"},"credential_generation":{"type":"integer"},"updated_at":{"type":"integer"},"runtime":{"type":"object","required":["scope","configuration_state","applied_binding_version","applied_group_version","selected_member_id","observed_at"],"properties":{"scope":{"const":"this_process"},"configuration_state":{"enum":["unbound","pending","applied","unavailable"]},"applied_binding_version":{"type":["integer","null"]},"applied_group_version":{"type":["integer","null"]},"selected_member_id":{"type":["string","null"],"format":"uuid"},"observed_at":{"type":"integer"}}}}}
-    UpdateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"maxItems":4,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}},"expected_version":{"type":"integer","minimum":1},"replacement_member_id":{"type":"string","format":"uuid","description":"Required when removing/replacing an existing member of a bound group. Used only when a selected member no longer exists unchanged. Must identify a retained member in the submitted list."}}}
+    UpdateTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","name","members","expected_version"],"properties":{"tenant_external_id":{"type":"string"},"name":{"type":"string","minLength":1,"maxLength":64},"members":{"type":"array","minItems":1,"items":{"$ref":"#/components/schemas/TransportProxyMemberInput"}},"expected_version":{"type":"integer","minimum":1},"replacement_member_id":{"type":"string","format":"uuid","description":"Required when removing/replacing an existing member of a bound group. Used only when a selected member no longer exists unchanged. Must identify a retained member in the submitted list."}}}
     BindTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_group_version","expected_binding_version","expected_credential_generation","expected_updated_at","group_id","initial_member_id"],"properties":{"tenant_external_id":{"type":"string"},"expected_group_version":{"type":"integer","minimum":1},"expected_binding_version":{"type":"integer","minimum":0},"expected_credential_generation":{"type":"integer","minimum":1},"expected_updated_at":{"type":"integer"},"group_id":{"type":"string","format":"uuid"},"initial_member_id":{"type":"string","format":"uuid"}}}
     UnbindTransportProxyGroup: {"type":"object","additionalProperties":false,"required":["tenant_external_id","expected_group_version","expected_binding_version","expected_credential_generation","expected_updated_at","single_proxy_member_id"],"properties":{"tenant_external_id":{"type":"string"},"expected_group_version":{"type":"integer","minimum":1},"expected_binding_version":{"type":"integer","minimum":0},"expected_credential_generation":{"type":"integer","minimum":1},"expected_updated_at":{"type":"integer"},"single_proxy_member_id":{"type":"string","format":"uuid"}}}
     UpstreamQuotaBatchRequest:
@@ -10209,16 +10223,63 @@ components:
     UpstreamHealthResult:
       type: object
       additionalProperties: false
-      required: [account_id, status, checked_at]
+      required: [account_id, status, source, checked_at]
       properties:
         account_id: { type: string, format: uuid }
-        status: { type: string, enum: [healthy, unhealthy] }
+        status: { type: string, enum: [healthy, unhealthy, skipped, unknown] }
+        source: { type: string, enum: [model_probe, legacy_unverified] }
         error_code:
           type: [string, 'null']
-          enum: [credential_invalid, destination_invalid, authentication_failed, upstream_unavailable, connection_failed, null]
-        upstream_status: { type: integer, minimum: 100, maximum: 599, description: Present when an HTTP response was received; its body is discarded. }
-        latency_ms: { type: integer, format: int64, minimum: 0, description: Present when a network probe was attempted. }
+          enum: [authentication_failed, upstream_unavailable, rate_limited, quota_exhausted, service_overloaded, probe_admission_skipped, probe_state_unavailable, probe_account_unavailable, provider_retired, probe_model_unavailable, probe_billing_unavailable, probe_route_unavailable, probe_model_unpriced, supplier_quota_reset_pending, null]
+        upstream_status: { type: [integer, 'null'], minimum: 100, maximum: 599, description: Original provider HTTP status at receipt; null before receipt. }
+        latency_ms: { type: [integer, 'null'], format: int64, minimum: 0 }
         checked_at: { type: integer, format: int64 }
+        started_at: { type: integer, format: int64 }
+        trigger: { type: string, enum: [manual, periodic, periodic_recovery] }
+        credential_generation: { type: integer, format: int64 }
+        transport_revision: { type: integer, format: int64 }
+        selected_model: { type: [string, 'null'] }
+        actual_model: { type: [string, 'null'], description: Exact target when transport dispatch began; null for local preparation failures. Does not prove supplier execution. }
+        request_id: { type: string, format: uuid }
+        status_origin: { type: string, enum: [provider, mtc] }
+        reset_at: { type: [integer, 'null'], format: int64, description: Provider deadline in Unix milliseconds; null means unknown. }
+        reset_source: { type: string, enum: [retry_after, provider_reset, unknown] }
+        historical_result:
+          type: object
+          additionalProperties: false
+          required: [status, error_code, latency_ms, checked_at]
+          properties:
+            status: { type: string }
+            error_code: { type: [string, 'null'] }
+            latency_ms: { type: [integer, 'null'], format: int64 }
+            checked_at: { type: integer, format: int64 }
+          description: Preserved legacy data whose independent-probe provenance cannot be established.
+        last_attempt:
+          anyOf:
+            - $ref: '#/components/schemas/UpstreamProbeAttempt'
+            - type: 'null'
+        last_result:
+          anyOf:
+            - $ref: '#/components/schemas/UpstreamProbeResult'
+            - type: 'null'
+    UpstreamProbeAttempt:
+      allOf:
+        - $ref: '#/components/schemas/UpstreamHealthResult'
+        - properties:
+            status: { enum: [healthy, unhealthy, skipped] }
+          not:
+            anyOf:
+              - required: [last_attempt]
+              - required: [last_result]
+    UpstreamProbeResult:
+      allOf:
+        - $ref: '#/components/schemas/UpstreamHealthResult'
+        - properties:
+            status: { enum: [healthy, unhealthy, unknown] }
+          not:
+            anyOf:
+              - required: [last_attempt]
+              - required: [last_result]
     StartCursorOAuthRequest:
       type: object
       additionalProperties: false

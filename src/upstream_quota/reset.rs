@@ -11,7 +11,7 @@ const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 // Test binaries may redirect the fixed supplier to a loopback fixture.
 // Production builds retain the fixed supplier endpoints.
 #[cfg(test)]
-fn test_supplier_url(account: &UpstreamAccountView, original: &str) -> String {
+pub(super) fn test_supplier_url(account: &UpstreamAccountView, original: &str) -> String {
     let Some(base) = account
         .config
         .get("reset_test_supplier_url")
@@ -21,10 +21,10 @@ fn test_supplier_url(account: &UpstreamAccountView, original: &str) -> String {
     };
     let base = url::Url::parse(base).unwrap();
     assert!(base.scheme() == "http" && base.host_str() == Some("127.0.0.1"));
-    base.join(if original == CONSUME_URL {
-        "consume"
-    } else {
-        "credits"
+    base.join(match original {
+        CONSUME_URL => "consume",
+        USAGE_URL => "usage",
+        _ => "credits",
     })
     .unwrap()
     .to_string()
@@ -568,27 +568,15 @@ async fn confirm_guarded(
         credential,
         &account.config,
     )?;
-    let credential = &selection.credential;
-    let account_header =
-        crate::oauth::managed::codex::account_header_value(credential).map_err(|_| blocked())?;
+    let dispatch_credential = &selection.credential;
+    let account_header = crate::oauth::managed::codex::account_header_value(dispatch_credential)
+        .map_err(|_| blocked())?;
     let _permit = state
         .upstream_quota
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
-    let http = tokio::time::timeout(
-        Duration::from_secs(5),
-        crate::network::client_for_codex_url_without_retries(
-            &state.http,
-            CONSUME_URL,
-            &json!({"network_scope":"public"}),
-            credential.proxy(),
-            false,
-        ),
-    )
-    .await
-    .map_err(|_| temporarily_unavailable("quota_reset_transport_timeout"))?
-    .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
+    let http = consume_client(state, dispatch_credential).await?;
     #[cfg(test)]
     let http = if account.config.get("reset_test_supplier_url").is_some() {
         crate::build_no_retry_http_client(None, &[]).unwrap()
@@ -616,10 +604,19 @@ async fn confirm_guarded(
     } else {
         let consume_url = CONSUME_URL;
         #[cfg(test)]
-        let fixture_url = test_supplier_url(account, consume_url);
+        let r2_fixture_url = r2_tests::fixture_url(consume_url);
+        #[cfg(test)]
+        let fixture_url = r2_fixture_url.unwrap_or_else(|| test_supplier_url(account, consume_url));
         #[cfg(test)]
         let consume_url = fixture_url.as_str();
-        dispatch_once(&http, credential, account_header, consume_url, &redeem).await
+        dispatch_once(
+            &http,
+            dispatch_credential,
+            account_header,
+            consume_url,
+            &redeem,
+        )
+        .await
     };
     drop(_permit);
     let accepted = result.is_ok();
@@ -633,20 +630,34 @@ async fn confirm_guarded(
         .lock()
         .await
         .retain(|key, _| key.account != account.id);
+    #[cfg(test)]
+    r2_tests::after_reset_eviction().await;
     if accepted {
         // The consume response proves only that the reset was accepted. A
         // separate fresh supplier read is the evidence that may clear the
         // exact quota-exhausted health row through the existing fenced CAS.
-        // Recovery updates supplier evidence while preserving the accepted
-        // durable result and operation identity.
-        match fresh_snapshot(state, account, credential, tenant).await {
-            Ok(_) => tracing::info!(
+        // Recovery failure must never replay the paid reset or change its
+        // accepted durable result.
+        // read_fresh selects its own transport from the stored credential,
+        // never from the consume request's selected proxy credential.
+        let readback = state
+            .upstream_quota
+            .read_fresh(
+                state,
+                account,
+                credential,
+                tenant,
+                QuotaReadTrigger::ResetWorkflow,
+            )
+            .await;
+        match readback.error_code {
+            None => tracing::info!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
                 trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
                 "refreshed quota evidence after an accepted reset"
             ),
-            Err(error) => tracing::warn!(
+            Some(error) => tracing::warn!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
                 trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
@@ -665,6 +676,29 @@ async fn confirm_guarded(
             operation,
         )
         .await
+}
+
+async fn consume_client(
+    state: &AppState,
+    dispatch_credential: &UpstreamCredential,
+) -> Result<reqwest::Client, AppError> {
+    #[cfg(test)]
+    if r2_tests::fixture_url(CONSUME_URL).is_some() {
+        return Ok(crate::build_no_retry_http_client(None, &[]).unwrap());
+    }
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::network::client_for_codex_url_without_retries(
+            &state.http,
+            CONSUME_URL,
+            &json!({"network_scope":"public"}),
+            dispatch_credential.proxy(),
+            false,
+        ),
+    )
+    .await
+    .map_err(|_| temporarily_unavailable("quota_reset_transport_timeout"))?
+    .map_err(|_| temporarily_unavailable("quota_reset_transport"))
 }
 
 pub(crate) async fn reconcile(

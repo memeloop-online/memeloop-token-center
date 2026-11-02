@@ -1,10 +1,14 @@
 use super::*;
-use crate::plain_json::decode_json;
+use crate::db::network_proxies::{
+    load_group_members, normalize_legacy_members, store_group_members,
+};
 
 mod bindings;
 mod groups;
 mod oauth;
+mod policies;
 mod selection;
+pub(crate) use policies::UpdateProxySelection;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -69,16 +73,6 @@ fn validate_name(value: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Proxy members are stored as plain JSON so operators can read and repair
-/// them directly from the database.
-pub(super) fn decode_members(stored: &str) -> Result<Vec<Member>, AppError> {
-    decode_json(stored)
-}
-
-fn open_members(row: &AnyRow, _key: &[u8]) -> Result<Vec<Member>, AppError> {
-    decode_members(&row.try_get::<String, _>("members_ciphertext")?)
-}
-
 async fn available_name(
     tx: &mut Transaction<'_, Any>,
     tenant_id: &str,
@@ -97,14 +91,26 @@ async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppErro
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transport_proxy_groups")
         .fetch_one(&mut **tx)
         .await?;
-    let rows = sqlx::query("SELECT b.account_id, g.members_ciphertext FROM transport_proxy_bindings b JOIN transport_proxy_groups g ON g.id = b.group_id")
+    let rows = sqlx::query("SELECT b.account_id, b.group_id, p.proxy_id FROM transport_proxy_bindings b LEFT JOIN network_proxy_selection_policies p ON p.account_id = b.account_id WHERE b.group_id IS NOT NULL OR p.mode = 'manual' ")
         .fetch_all(&mut **tx).await?;
     let mut bytes = 0usize;
     for row in &rows {
-        let proxies = open_members(row, key)?
-            .into_iter()
-            .map(|member| member.proxy_url)
-            .collect::<Vec<_>>();
+        let proxies = if let Some(group) = row.try_get::<Option<String>, _>("group_id")? {
+            load_group_members(&mut **tx, &group, key)
+                .await?
+                .into_iter()
+                .map(|member| member.proxy_url)
+                .collect::<Vec<_>>()
+        } else {
+            vec![
+                sqlx::query_scalar::<_, String>(
+                    "SELECT proxy_url FROM network_proxies WHERE id = $1",
+                )
+                .bind(row.try_get::<String, _>("proxy_id")?)
+                .fetch_one(&mut **tx)
+                .await?,
+            ]
+        };
         bytes += serde_json::to_vec(&serde_json::json!([{
             "account_id":row.try_get::<String, _>("account_id")?,
             "version":i64::MAX,
@@ -118,4 +124,157 @@ async fn budget(tx: &mut Transaction<'_, Any>, key: &[u8]) -> Result<(), AppErro
         return Err(conflict("proxy_group_capacity_exceeded"));
     }
     Ok(())
+}
+
+impl Database {
+    async fn resolve_proxy_members(
+        &self,
+        tx: &mut Transaction<'_, Any>,
+        tenant_id: &str,
+        mut inputs: Vec<MemberInput>,
+        previous: &[Member],
+        _key: &[u8],
+    ) -> Result<Vec<Member>, AppError> {
+        let mut known = previous.to_vec();
+        for input in &mut inputs {
+            if let Some(id) = input.id {
+                if !known.iter().any(|member| member.id == id) {
+                    let row = sqlx::query("SELECT id, name, version, proxy_url FROM network_proxies WHERE id = $1 AND tenant_id = $2")
+                        .bind(id.to_string()).bind(tenant_id).fetch_optional(&mut **tx).await?.ok_or(AppError::NotFound)?;
+                    known.push(Member {
+                        id,
+                        label: row.try_get("name")?,
+                        version: row.try_get("version")?,
+                        proxy_url: row.try_get::<String, _>("proxy_url")?,
+                    });
+                }
+                if input.label.is_empty() && input.proxy_url.is_none() {
+                    input.label = known
+                        .iter()
+                        .find(|member| member.id == id)
+                        .ok_or_else(invalid)?
+                        .label
+                        .clone();
+                }
+            }
+        }
+        members(inputs, &known)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn refresh_network_proxy_references(
+        &self,
+        tx: &mut Transaction<'_, Any>,
+        proxy_id: Uuid,
+        old_proxy: &str,
+        old_name: &str,
+        exclude_group: Option<&str>,
+        key: &[u8],
+    ) -> Result<(), AppError> {
+        let groups = sqlx::query("SELECT g.id, g.tenant_id, g.version FROM transport_proxy_groups g JOIN network_proxy_group_members m ON m.group_id = g.id WHERE m.proxy_id = $1 ORDER BY g.id")
+            .bind(proxy_id.to_string()).fetch_all(&mut **tx).await?;
+        for group in groups {
+            let id: String = group.try_get("id")?;
+            if exclude_group == Some(id.as_str()) {
+                continue;
+            }
+            let tenant_id: String = group.try_get("tenant_id")?;
+            let version = group
+                .try_get::<i64, _>("version")?
+                .checked_add(1)
+                .ok_or_else(|| AppError::internal("network_proxy_group_version"))?;
+            let next = load_group_members(&mut **tx, &id, key).await?;
+            let mut previous = next.clone();
+            if let Some(member) = previous.iter_mut().find(|member| member.id == proxy_id) {
+                member.proxy_url = old_proxy.to_owned();
+                member.label = old_name.to_owned();
+            }
+            sqlx::query(
+                "UPDATE transport_proxy_groups SET version = $1, updated_at = $2 WHERE id = $3",
+            )
+            .bind(version)
+            .bind(unix_millis())
+            .bind(&id)
+            .execute(&mut **tx)
+            .await?;
+            let accounts = sqlx::query("SELECT account_id, version, initial_member_id FROM transport_proxy_bindings WHERE group_id = $1 ORDER BY account_id")
+                .bind(&id).fetch_all(&mut **tx).await?;
+            for account in accounts {
+                let account_id = parse_uuid(account.try_get("account_id")?)?;
+                let initial = parse_uuid(account.try_get("initial_member_id")?)?;
+                let base = next
+                    .iter()
+                    .find(|member| member.id == initial)
+                    .ok_or_else(invalid)?;
+                let stamp = BindingStamp {
+                    selection_version: revision(tx).await?,
+                    binding_version: account.try_get("version")?,
+                    group_id: Some(parse_uuid(id.clone())?),
+                    group_version: Some(version),
+                };
+                self.write_transport_account(
+                    tx,
+                    account_id,
+                    &tenant_id,
+                    &stamp,
+                    &base.proxy_url,
+                    None,
+                    key,
+                )
+                .await?;
+                selection::rebase_selection(
+                    tx,
+                    account_id,
+                    &previous,
+                    &next,
+                    initial,
+                    Some(initial),
+                    key,
+                )
+                .await?;
+            }
+        }
+        let manual = sqlx::query("SELECT p.account_id, p.tenant_id, b.version FROM network_proxy_selection_policies p JOIN transport_proxy_bindings b ON b.account_id = p.account_id WHERE p.proxy_id = $1 AND p.mode = 'manual' ORDER BY p.account_id")
+            .bind(proxy_id.to_string()).fetch_all(&mut **tx).await?;
+        if !manual.is_empty() {
+            let proxy =
+                sqlx::query("SELECT name, version, proxy_url FROM network_proxies WHERE id = $1")
+                    .bind(proxy_id.to_string())
+                    .fetch_one(&mut **tx)
+                    .await?;
+            let url: String = proxy.try_get("proxy_url")?;
+            let next = vec![Member {
+                id: proxy_id,
+                label: proxy.try_get("name")?,
+                version: proxy.try_get("version")?,
+                proxy_url: url.clone(),
+            }];
+            let previous = vec![Member {
+                proxy_url: old_proxy.to_owned(),
+                ..next[0].clone()
+            }];
+            for account in manual {
+                let stamp = BindingStamp {
+                    selection_version: revision(tx).await?,
+                    binding_version: account.try_get("version")?,
+                    group_id: None,
+                    group_version: None,
+                };
+                let account_id = parse_uuid(account.try_get("account_id")?)?;
+                self.write_transport_account(
+                    tx,
+                    account_id,
+                    &account.try_get::<String, _>("tenant_id")?,
+                    &stamp,
+                    &url,
+                    None,
+                    key,
+                )
+                .await?;
+                selection::rebase_selection(tx, account_id, &previous, &next, proxy_id, None, key)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
 }

@@ -24,10 +24,11 @@ fn classify_probe_error(error: &AppError) -> ProbeDisposition {
     match error {
         AppError::Upstream { .. } => ProbeDisposition::Store("upstream_unavailable"),
         AppError::OAuthRefresh(_) => ProbeDisposition::Store("authentication_failed"),
-        AppError::Capacity { code, .. } => ProbeDisposition::Skip(code),
+        AppError::Capacity { .. } => ProbeDisposition::Skip("probe_admission_skipped"),
         AppError::Overloaded => ProbeDisposition::Skip("service_overloaded"),
-        AppError::Internal { code, .. } => ProbeDisposition::Skip(code),
-        AppError::Storage { code, .. } => ProbeDisposition::Skip(code),
+        AppError::Internal { .. } | AppError::Storage { .. } => {
+            ProbeDisposition::Skip("probe_state_unavailable")
+        }
         AppError::Forbidden
         | AppError::NoAuthorizedUpstreamCandidate
         | AppError::Unauthorized
@@ -63,7 +64,9 @@ pub(in crate::api) async fn probe_upstream_health(
         require_service_tenant(&service, tenant)?;
         state.db.require_upstream_tenant(account_id, tenant).await?;
     }
-    Ok(Json(run_upstream_service_probe(&state, account_id).await))
+    Ok(Json(
+        run_upstream_service_probe(&state, account_id, "manual", None).await,
+    ))
 }
 
 pub(in crate::api) async fn read_upstream_service_probe(
@@ -86,8 +89,31 @@ pub(in crate::api) async fn read_upstream_service_probe(
             .db
             .upstream_service_probe(account_id)
             .await?
+            .map(visible_probe_attempt)
             .unwrap_or(Value::Null),
     ))
+}
+
+/// Existing clients render the top-level status. A skipped latest attempt
+/// must remain visible after reload, without erasing the last real result.
+fn visible_probe_attempt(mut result: Value) -> Value {
+    let Some(attempt) = result
+        .get("last_attempt")
+        .filter(|attempt| attempt["status"] == "skipped")
+    else {
+        return result;
+    };
+    let mut visible = attempt.clone();
+    result
+        .as_object_mut()
+        .expect("probe results are objects")
+        .remove("last_attempt");
+    visible["last_result"] = if result["status"] == "skipped" {
+        Value::Null
+    } else {
+        result
+    };
+    visible
 }
 
 pub(crate) async fn run_upstream_service_probes(
@@ -124,7 +150,28 @@ pub(crate) async fn run_upstream_service_probes(
         for account_id in due {
             let state = state.clone();
             inflight.spawn(async move {
-                run_upstream_service_probe(&state, account_id).await;
+                let result = run_upstream_service_probe(&state, account_id, "periodic", None).await;
+                // Recovery remains background and pinned; a cheap default
+                // success cannot establish availability for another model.
+                match state.db.supplier_quota_recovery_models(account_id).await {
+                    Ok(models) => {
+                        for model in models {
+                            if result["selected_model"].as_str() != Some(&model) {
+                                run_upstream_service_probe(
+                                    &state,
+                                    account_id,
+                                    "periodic_recovery",
+                                    Some(&model),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Err(error) => tracing::warn!(
+                        error_category = error.diagnostic_category(),
+                        "supplier quota recovery schedule failed"
+                    ),
+                }
             });
         }
         while !inflight.is_empty() {
@@ -143,13 +190,33 @@ pub(crate) async fn run_upstream_service_probes(
     }
 }
 
-async fn run_upstream_service_probe(state: &AppState, account_id: Uuid) -> Value {
-    let (body, store) = upstream_service_probe_body(state, account_id).await;
-    if store
-        && let Err(error) = state
-            .db
-            .store_upstream_service_probe(account_id, &body)
-            .await
+pub(in crate::api) async fn run_upstream_service_probe(
+    state: &AppState,
+    account_id: Uuid,
+    trigger: &str,
+    recovery_model: Option<&str>,
+) -> Value {
+    let account = match state.db.probe_account_context(account_id).await {
+        Ok(account) => account,
+        Err(_) => return skipped(account_id, "probe_account_unavailable").0,
+    };
+    let started_at = unix_millis();
+    let (mut body, _) = upstream_service_probe_body(
+        state,
+        account_id,
+        &account,
+        recovery_model,
+        trigger != "manual",
+    )
+    .await;
+    body["trigger"] = json!(trigger);
+    body["started_at"] = json!(started_at);
+    body["credential_generation"] = json!(account.credential_generation);
+    body["transport_revision"] = json!(account.transport_revision);
+    if let Err(error) = state
+        .db
+        .store_upstream_service_probe(account_id, &body)
+        .await
     {
         tracing::warn!(%account_id, error_category = error.diagnostic_category(), "upstream service probe result was not stored");
     }
@@ -165,7 +232,7 @@ fn skipped(account_id: Uuid, error_code: &'static str) -> (Value, bool) {
             "source": "model_probe",
             "checked_at": unix_millis()
         }),
-        false,
+        true,
     )
 }
 
@@ -195,6 +262,9 @@ struct PreparedProbe {
     route_id: Uuid,
     protocol: Protocol,
     body: Vec<u8>,
+    model: String,
+    credential_generation: i64,
+    transport_revision: i64,
 }
 
 fn probe_envelope(protocol: &str, public_model: &str) -> Option<(Protocol, Value)> {
@@ -236,28 +306,11 @@ fn prepare_failed(account_id: Uuid, error: &AppError, code: &'static str) -> (Va
 async fn prepare_model_probe(
     state: &AppState,
     account_id: Uuid,
+    account: &crate::db::upstream_service_probes::ProbeAccountContext,
+    recovery_model: Option<&str>,
 ) -> Result<PreparedProbe, (Value, bool)> {
-    let account = match state.db.probe_account_context(account_id).await {
-        Ok(account) => account,
-        Err(AppError::NotFound) => {
-            return Err(skipped(account_id, "probe_account_unavailable"));
-        }
-        Err(error) => {
-            return Err(prepare_failed(
-                account_id,
-                &error,
-                "probe_state_unavailable",
-            ));
-        }
-    };
     if !state.providers.is_public(&account.driver) {
-        return Err(recorded(
-            account_id,
-            false,
-            Some("provider_retired"),
-            None,
-            None,
-        ));
+        return Err(skipped(account_id, "provider_retired"));
     }
     let text_provider = state
         .providers
@@ -288,21 +341,22 @@ async fn prepare_model_probe(
             ));
         }
     };
-    let Some(model) = select_probe_model(
-        account.config.get("probe_model").and_then(Value::as_str),
-        &catalog,
-    ) else {
+    let configured =
+        recovery_model.or_else(|| account.config.get("probe_model").and_then(Value::as_str));
+    if select_probe_model(configured, &catalog).is_none() {
         return Err(skipped(account_id, "probe_model_unavailable"));
-    };
-    bill_model_probe(state, account_id, &account.tenant_external_id, &model).await
+    }
+    bill_model_probe(state, account_id, account, configured, catalog).await
 }
 
 async fn bill_model_probe(
     state: &AppState,
     account_id: Uuid,
-    tenant: &str,
-    model: &str,
+    account: &crate::db::upstream_service_probes::ProbeAccountContext,
+    configured: Option<&str>,
+    mut catalog: Vec<CatalogModel>,
 ) -> Result<PreparedProbe, (Value, bool)> {
+    let tenant = &account.tenant_external_id;
     let settings =
         match super::super::control_requests::load_filter_assistant_settings(state, tenant).await {
             Ok(settings) => settings,
@@ -331,19 +385,65 @@ async fn bill_model_probe(
             ));
         }
     };
-    let route = match state
-        .db
-        .probe_billing_route(account_id, key.key_id, model)
-        .await
-    {
-        Ok(Some(route)) => route,
-        Ok(None) => return Err(skipped(account_id, "probe_route_unavailable")),
-        Err(error) => {
-            return Err(prepare_failed(
-                account_id,
-                &error,
-                "probe_state_unavailable",
-            ));
+    // Feasibility and ordering use the same currency and exact model as
+    // forwarding. Missing prices are local skips, never discovery POSTs.
+    let mut billable = Vec::new();
+    for mut candidate in catalog {
+        match state
+            .db
+            .model_price(&candidate.model_id, &key.currency)
+            .await
+        {
+            Ok(price) => {
+                candidate.input_price = Some(price.input_micros_per_million);
+                billable.push(candidate);
+            }
+            Err(AppError::UnpricedModel) => {
+                if configured.map(str::trim) == Some(candidate.model_id.as_str()) {
+                    let (mut body, store) = skipped(account_id, "probe_model_unpriced");
+                    body["selected_model"] = json!(candidate.model_id);
+                    return Err((body, store));
+                }
+            }
+            Err(error) => {
+                return Err(prepare_failed(
+                    account_id,
+                    &error,
+                    "probe_state_unavailable",
+                ));
+            }
+        }
+    }
+    catalog = billable;
+    // Remove unroutable models before applying the established price/version/
+    // list ordering. Explicit selections never silently fall back.
+    let (model, route) = loop {
+        let Some(model) = select_probe_model(configured, &catalog) else {
+            return Err(skipped(account_id, "probe_route_unavailable"));
+        };
+        match state
+            .db
+            .probe_billing_route(account_id, key.key_id, &model)
+            .await
+        {
+            Ok(Some(route)) => break (model, route),
+            Ok(None)
+                if configured
+                    .map(str::trim)
+                    .is_some_and(|value| !value.is_empty()) =>
+            {
+                let (mut body, store) = skipped(account_id, "probe_route_unavailable");
+                body["selected_model"] = json!(model);
+                return Err((body, store));
+            }
+            Ok(None) => catalog.retain(|candidate| candidate.model_id != model),
+            Err(error) => {
+                return Err(prepare_failed(
+                    account_id,
+                    &error,
+                    "probe_state_unavailable",
+                ));
+            }
         }
     };
     let Some((protocol, request)) = probe_envelope(&route.protocol, &route.public_model) else {
@@ -356,6 +456,9 @@ async fn bill_model_probe(
         route_id: route.route_id,
         protocol,
         body,
+        model,
+        credential_generation: account.credential_generation,
+        transport_revision: account.transport_revision,
     })
 }
 
@@ -370,23 +473,34 @@ async fn send_model_probe(
         HeaderValue::from_static("upstream-health-probe"),
     );
     let started = Instant::now();
+    let context = super::super::proxy_diagnostics::Context::new();
+    let target = super::super::proxy::IndependentProbeTarget::new(
+        account_id,
+        prepared.model.clone(),
+        prepared.credential_generation,
+        prepared.transport_revision,
+    );
     let memory = state.proxy_memory_budget.reservation();
     let dispatched = tokio::time::timeout(
         PROBE_TIMEOUT,
-        super::super::proxy::proxy_with_pinned_account(
-            state.clone(),
-            headers,
-            Bytes::from(prepared.body),
-            prepared.protocol,
-            prepared.key,
-            prepared.route_id,
-            account_id,
-            memory,
+        super::super::proxy_diagnostics::CONTEXT.scope(
+            context,
+            super::super::proxy::proxy_with_pinned_account(
+                state.clone(),
+                headers,
+                Bytes::from(prepared.body),
+                prepared.protocol,
+                prepared.key,
+                prepared.route_id,
+                account_id,
+                memory,
+                target.clone(),
+            ),
         ),
     )
     .await;
     let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
-    match dispatched {
+    let (mut body, store) = match dispatched {
         Err(_) => recorded(
             account_id,
             false,
@@ -419,12 +533,62 @@ async fn send_model_probe(
                 Some(status.as_u16()),
             )
         }
+    };
+    body["request_id"] = json!(context.request_id);
+    body["selected_model"] = json!(prepared.model);
+    let observation = target.observation();
+    body["actual_model"] = json!(observation.model);
+    body["upstream_status"] = json!(observation.status);
+    if body["status"] != "skipped" && observation.status.is_none() && observation.model.is_none() {
+        body["status"] = json!("skipped");
+        body["error_code"] = json!("probe_admission_skipped");
     }
+    if let Some(quota) = observation.quota {
+        body["error_code"] = json!(if quota.exhausted {
+            "quota_exhausted"
+        } else {
+            "rate_limited"
+        });
+        body["reset_at"] = json!(quota.reset_at);
+        body["reset_source"] = json!(quota.reset_source);
+    }
+    body["status_origin"] = json!(if observation.status.is_some() {
+        "provider"
+    } else {
+        "mtc"
+    });
+    (body, store)
 }
 
-async fn upstream_service_probe_body(state: &AppState, account_id: Uuid) -> (Value, bool) {
-    match prepare_model_probe(state, account_id).await {
-        Ok(prepared) => send_model_probe(state, account_id, prepared).await,
+async fn upstream_service_probe_body(
+    state: &AppState,
+    account_id: Uuid,
+    account: &crate::db::upstream_service_probes::ProbeAccountContext,
+    recovery_model: Option<&str>,
+    periodic: bool,
+) -> (Value, bool) {
+    match prepare_model_probe(state, account_id, account, recovery_model).await {
+        Ok(prepared) => {
+            if periodic {
+                match state
+                    .db
+                    .supplier_quota_probe_deadline(account_id, &prepared.model)
+                    .await
+                {
+                    Ok(Some(deadline)) => {
+                        let (mut body, store) = skipped(account_id, "supplier_quota_reset_pending");
+                        body["selected_model"] = json!(prepared.model);
+                        body["reset_at"] = json!(deadline);
+                        return (body, store);
+                    }
+                    Err(error) => {
+                        return prepare_failed(account_id, &error, "probe_state_unavailable");
+                    }
+                    Ok(None) => {}
+                }
+            }
+            send_model_probe(state, account_id, prepared).await
+        }
         Err(finished) => finished,
     }
 }
