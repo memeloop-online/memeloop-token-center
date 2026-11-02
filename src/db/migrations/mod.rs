@@ -1785,8 +1785,8 @@ pub(super) async fn apply_migration_range(
                 sqlx::query(
                     "LOCK TABLE request_records, request_events IN ACCESS EXCLUSIVE MODE NOWAIT",
                 )
-                    .execute(&mut **transaction)
-                    .await?;
+                .execute(&mut **transaction)
+                .await?;
             }
             sqlx::query(
                 "LOCK TABLE request_archive_spools, response_archive_spools, response_archive_spool_budget, archive_budget_reservations IN ACCESS EXCLUSIVE MODE NOWAIT",
