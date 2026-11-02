@@ -429,3 +429,136 @@ async fn buffered_capture_capacity_gap_preserves_delivery_source_and_settlement_
     assert_eq!(blake3::hash(&captured), blake3::hash(&original));
     upstream.verify().await;
 }
+
+#[tokio::test]
+async fn response_archive_binding_and_terminal_receipt_preserve_both_completion_orders() {
+    archive_terminal_completion_orders(None).await;
+}
+
+#[tokio::test]
+async fn postgres_response_archive_binding_and_terminal_receipt_preserve_both_completion_orders() {
+    let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "PostgreSQL required in CI"
+        );
+        return;
+    };
+    let isolated = crate::db::test_support::PostgresTestDatabase::create(&url).await;
+    archive_terminal_completion_orders(Some(isolated.url())).await;
+    isolated.cleanup().await;
+}
+
+async fn archive_terminal_completion_orders(database_url: Option<&str>) {
+    for bind_first in [true, false] {
+        for stream in [false, true] {
+            let fixture = codex_route_fixture_with_database(
+                &format!("archive-terminal-order-{bind_first}-{stream}"),
+                "archive",
+                database_url,
+            )
+            .await;
+            let held = if bind_first {
+                Some(fixture.state.pending_terminals.hold_writer_for_test().await)
+            } else {
+                None
+            };
+            let upstream = MockServer::start().await;
+            let sse = completed_codex_sse("preserve the bound response");
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_raw(sse.clone(), "text/event-stream"),
+                )
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            let request = json!({"model": fixture.model, "input": "keep source and response ownership", "stream": stream});
+            let response =
+                send_codex_route(&fixture, &upstream, "/v1/responses", request.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+                .await
+                .unwrap();
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            let request_id = rows[0].request_id;
+            let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+            if bind_first {
+                let completed: Option<i64> =
+                    sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id = $1")
+                        .bind(request_id.to_string())
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(completed, None);
+            } else {
+                wait_for_request_settlement(&fixture, 1).await;
+            }
+            drain_archive_capture(&fixture).await;
+            assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
+            let before = fixture
+                .state
+                .db
+                .request_archive_refs(fixture.key_id, request_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                before.response_archive_state,
+                crate::model::RequestArchiveState::Bound
+            );
+            let bound = before.response_object.unwrap();
+            if bind_first {
+                let completed: Option<i64> =
+                    sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id = $1")
+                        .bind(request_id.to_string())
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                assert_eq!(
+                    completed, None,
+                    "archive binding precedes financial terminal"
+                );
+            }
+            drop(held);
+            wait_for_request_settlement(&fixture, 1).await;
+            assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+            let refs = fixture
+                .state
+                .db
+                .request_archive_refs(fixture.key_id, request_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                refs.request_archive_state,
+                crate::model::RequestArchiveState::Bound
+            );
+            assert_eq!(
+                refs.response_archive_state,
+                crate::model::RequestArchiveState::Bound
+            );
+            assert_eq!(refs.response_object.as_deref(), Some(bound.as_str()));
+            let captured = fixture.state.archive.get(&bound).await.unwrap();
+            let expected = if stream { Bytes::from(sse) } else { delivered };
+            assert_eq!(captured, expected);
+            assert_eq!(blake3::hash(&captured), blake3::hash(&expected));
+            let original = serde_json::to_vec(&request).unwrap();
+            let captured = fixture
+                .state
+                .archive
+                .get(&refs.request_object)
+                .await
+                .unwrap();
+            assert_eq!(captured.as_ref(), original.as_slice());
+            assert_eq!(blake3::hash(&captured), blake3::hash(&original));
+            upstream.verify().await;
+            pool.close().await;
+            fixture.state.db.close().await;
+            fixture.state.persistence_db.close().await;
+        }
+    }
+}

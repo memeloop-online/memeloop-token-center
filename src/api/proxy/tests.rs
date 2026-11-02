@@ -615,12 +615,22 @@ async fn codex_route_fixture_with_archive_directory(
     label: &str,
     archive_directory: &str,
 ) -> CodexRouteFixture {
+    codex_route_fixture_with_database(label, archive_directory, None).await
+}
+
+async fn codex_route_fixture_with_database(
+    label: &str,
+    archive_directory: &str,
+    database_url: Option<&str>,
+) -> CodexRouteFixture {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join(archive_directory);
-    let database_url = crate::db::Database::sqlite_database_url(&format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join(format!("codex-{label}.db")).display()
-    ));
+    let database_url = database_url.map(str::to_owned).unwrap_or_else(|| {
+        crate::db::Database::sqlite_database_url(&format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join(format!("codex-{label}.db")).display()
+        ))
+    });
     let mut config = Config::for_test(database_url.clone());
     config.archive_backend = ArchiveBackend::Filesystem;
     config.archive_path = Some(archive_path.display().to_string());
@@ -2142,6 +2152,43 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
         requests[1].headers.get("session-id")
     );
     upstream.verify().await;
+}
+
+#[tokio::test]
+async fn native_codex_refused_connection_settles_zero_once() {
+    let fixture = codex_route_fixture("native-connect-not-delivered").await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let response = send_codex_route_to_endpoint(
+        &fixture,
+        endpoint,
+        "/v1/responses",
+        json!({"model": fixture.model, "input": "connection was not established", "stream": false}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("upstream_connect_failed")
+    );
+    wait_for_request_settlement(&fixture, 1).await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let zero = sqlx::query("SELECT r.cost_micros, u.status, u.actual_micros, p.state, p.unknown_reason, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.reservation_id AND l.kind = 'usage' AND l.amount_micros = 0) AS settlements FROM request_records r JOIN usage_reservations u ON u.id = r.reservation_id JOIN pending_proxy_settlements p ON p.request_id = r.id WHERE r.id = $1")
+        .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(zero.get::<i64, _>("cost_micros"), 0);
+    assert_eq!(zero.get::<String, _>("status"), "settled");
+    assert_eq!(zero.get::<Option<i64>, _>("actual_micros"), Some(0));
+    assert_eq!(zero.get::<String, _>("state"), "applied");
+    assert_eq!(zero.get::<Option<String>, _>("unknown_reason"), None);
+    assert_eq!(zero.get::<i64, _>("settlements"), 1);
+    pool.close().await;
 }
 
 #[tokio::test]

@@ -1558,6 +1558,15 @@ async fn proxy_with_cancellation_guard(
             &result,
             Err(ProxySendError::CandidateUnavailable | ProxySendError::CredentialUnavailable)
         );
+        // Only the transport's pre-delivery classification proves that an
+        // attempted send did not execute. Preserve uncertainty from any prior
+        // candidate even if the final connection fails before delivery.
+        cancellation.record_transport_non_delivery(matches!(
+            &result,
+            Err(ProxySendError::RetryableConnection(_)
+                | ProxySendError::CandidateUnavailable
+                | ProxySendError::CredentialUnavailable)
+        ));
         if consumed_outbound_attempt {
             outbound_attempts += 1;
             last_dispatch = Some((active_route.route.account_id, active_route.route.route_id));

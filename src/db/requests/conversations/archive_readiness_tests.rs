@@ -23,7 +23,7 @@ impl Fixture {
         inline_request: bool,
         protocol: Option<&str>,
     ) -> Self {
-        Self::new_with_capture(database_url, inline_request, protocol, false).await
+        Self::new_with_capture(database_url, inline_request, protocol, false, false).await
     }
 
     async fn new_with_capture(
@@ -31,6 +31,7 @@ impl Fixture {
         inline_request: bool,
         protocol: Option<&str>,
         capture_before_finish: bool,
+        bind_before_capacity_gap: bool,
     ) -> Self {
         let state = AppState::initialize(Config::for_test(database_url))
             .await
@@ -91,7 +92,9 @@ impl Fixture {
             .and_then(|source| source.object_locator())
             .map(str::to_owned)
             .unwrap_or_else(|| format!("gap://{request_id}/request"));
-        let response_locator = if source.is_some() {
+        let response_locator = if bind_before_capacity_gap {
+            format!("gap://{request_id}/response/capacity")
+        } else if source.is_some() {
             r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#.to_owned()
         } else {
             format!("gap://{request_id}/response")
@@ -124,7 +127,7 @@ impl Fixture {
         } else {
             state.db.start_proxy_request(input).await.unwrap()
         };
-        if capture_before_finish {
+        if capture_before_finish || bind_before_capacity_gap {
             let identity = ArchiveSpoolIdentity {
                 request_id,
                 tenant_id: key.tenant_id,
@@ -137,6 +140,16 @@ impl Fixture {
                 assert!(response_archive_spool::capture_buffered(&state, identity, purpose, body).await);
             }
         }
+        let bound_response = if bind_before_capacity_gap {
+            assert!(response_archive_spool::process_one_for_test(&state).await);
+            assert!(response_archive_spool::process_one_for_test(&state).await);
+            let bound: String = sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1 AND completed_at IS NULL")
+                .bind(request_id.to_string()).fetch_one(&state.db.pool).await.unwrap();
+            assert!(!bound.starts_with("gap://"));
+            Some(bound)
+        } else {
+            None
+        };
         let request = if inline_request {
             serde_json::json!({"messages": [{"role": "user", "content": "archive question"}]})
         } else {
@@ -177,8 +190,35 @@ impl Fixture {
             })
             .await
             .unwrap();
+        if let Some(bound) = bound_response {
+            let row = sqlx::query("SELECT r.response_object, (SELECT COUNT(*) FROM ledger_entries ledger WHERE ledger.source = r.reservation_id AND ledger.kind = 'usage') AS charges FROM request_records r WHERE r.id = $1")
+                .bind(request_id.to_string()).fetch_one(&state.db.pool).await.unwrap();
+            assert_eq!(row.get::<String, _>("response_object"), bound);
+            assert_eq!(row.get::<i64, _>("charges"), 1);
+            let body = state.archive.get(&bound).await.unwrap();
+            let expected = br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#;
+            assert_eq!(body.as_ref(), expected.as_slice());
+            assert_eq!(blake3::hash(&body), blake3::hash(expected));
+        }
         state.responses_request_spool.drain_uploads_for_test().await;
         state.db.drain_gateway_persistence_for_test().await;
+        if source.is_some() {
+            state
+                .db
+                .publish_proxy_started_event(ArchiveSpoolIdentity {
+                    request_id,
+                    tenant_id: key.tenant_id,
+                    reservation_id: reservation.id,
+                })
+                .await
+                .unwrap();
+            let orphaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_event_locators locator LEFT JOIN request_events event ON event.event_id = locator.id AND event.event_at = locator.created_at WHERE locator.request_id = $1 AND event.event_id IS NULL")
+                .bind(request_id.to_string()).fetch_one(&state.db.pool).await.unwrap();
+            assert_eq!(
+                orphaned, 0,
+                "late source completion must not allocate an event locator without its event"
+            );
+        }
         let terminal_owner = Uuid::now_v7();
         assert!(
             state
@@ -384,6 +424,7 @@ async fn sqlite_final_archive_gap_keeps_request_turn() {
         true,
         None,
         true,
+        false,
     )
     .await;
     sqlx::query("UPDATE request_archive_spools SET state = 'gap' WHERE request_id = $1")
@@ -526,6 +567,18 @@ async fn source_contract(database_url: String) {
                 .all(|part| !part.to_string().contains("provider_secret_field"))
         );
     }
+    let fixture = Fixture::new_with_capture(database_url, true, None, false, true).await;
+    fixture.assert_completed(true).await;
+    let request_object: String =
+        sqlx::query_scalar("SELECT request_object FROM request_records WHERE id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    let captured = fixture.state.archive.get(&request_object).await.unwrap();
+    let original = br#"{"messages":[{"role":"user","content":"archive question"}]}"#;
+    assert_eq!(captured.as_ref(), original.as_slice());
+    assert_eq!(blake3::hash(&captured), blake3::hash(original));
 }
 
 #[tokio::test]

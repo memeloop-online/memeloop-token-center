@@ -24,6 +24,7 @@ struct CancelledRequest {
     permit: crate::proxy_lifecycle::ProxyLifecycleActivity,
     identity: crate::db::ProxyRequestOwner,
     stage: &'static str,
+    all_attempts_not_delivered: bool,
 }
 
 impl CancellationGuard {
@@ -67,6 +68,7 @@ impl CancellationGuard {
             permit,
             identity,
             stage: "upstream_response_headers",
+            all_attempts_not_delivered: true,
         });
     }
 
@@ -115,6 +117,16 @@ impl CancellationGuard {
     pub(in crate::api::proxy) fn response_headers_received(&mut self) {
         if let Some(owner) = self.owner.as_mut() {
             owner.stage = "upstream_response_body";
+        }
+    }
+
+    pub(in crate::api::proxy) fn record_transport_non_delivery(&mut self, not_delivered: bool) {
+        if let Some(owner) = self.owner.as_mut() {
+            owner.all_attempts_not_delivered &= not_delivered;
+            owner.pending.record_transport_non_delivery(
+                owner.context.request_id,
+                owner.all_attempts_not_delivered,
+            );
         }
     }
 

@@ -512,8 +512,9 @@ async fn fuel_exhaustion_and_guest_traps_fail_closed() {
         let plugins = directory.path().join("plugins");
         fs::create_dir(&plugins).unwrap();
         write_policy_package(&plugins, id, body);
-        let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
+        let mut runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
             .expect("load failure fixture");
+        runtime.set_execution_limits_for_tests(Duration::from_secs(2), 5_000_000);
         let error = runtime
             .apply_traffic(context(), &json!({"model": "test"}))
             .expect_err("plugin failure must reject the request");
@@ -837,31 +838,23 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
     );
     let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
         .expect("load oversize fixture");
+    let error = runtime
+        .normalize_provider_response(
+            "oversize-provider",
+            context(),
+            200,
+            &BTreeMap::new(),
+            b"nine-byte",
+        )
+        .expect_err("oversize upstream response must be rejected");
     assert!(
-        runtime
-            .normalize_provider_response(
-                "oversize-provider",
-                context(),
-                200,
-                &BTreeMap::new(),
-                b"nine-byte",
-            )
-            .expect_err("oversize upstream response must be rejected")
-            .to_string()
-            .contains("declared limit")
+        matches!(error, memeloop_token_center::error::AppError::Upstream { code: "plugin_upstream_response_exceeds_its_declared_limit", facts } if facts.bytes == Some(9) && facts.limit == Some(8))
     );
+    let error = runtime
+        .normalize_provider_response("oversize-provider", context(), 200, &BTreeMap::new(), b"{}")
+        .expect_err("oversize normalized body must be rejected");
     assert!(
-        runtime
-            .normalize_provider_response(
-                "oversize-provider",
-                context(),
-                200,
-                &BTreeMap::new(),
-                b"{}",
-            )
-            .expect_err("oversize normalized body must be rejected")
-            .to_string()
-            .contains("declared limit")
+        matches!(error, memeloop_token_center::error::AppError::Upstream { code: "plugin_normalized_response_body_exceeds_its_declared_limit", facts } if facts.bytes.is_some_and(|bytes| bytes > 8) && facts.limit == Some(8))
     );
 }
 
