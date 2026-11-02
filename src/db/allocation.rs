@@ -359,7 +359,7 @@ mod tests {
                     .await
                     .unwrap()
             );
-            let mut holder = first.begin_write_transaction().await.unwrap();
+            let mut holder = restarted.begin_write_transaction().await.unwrap();
             sqlx::query(
                 "UPDATE group_allocation_revisions SET revision=revision WHERE tenant_id=$1",
             )
