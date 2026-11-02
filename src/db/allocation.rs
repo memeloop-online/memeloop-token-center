@@ -79,14 +79,30 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
-        let changed = if revision.is_none() {
-            1
-        } else if revision == Some(0) {
-            sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision) VALUES($1,1) ON CONFLICT(tenant_id) DO NOTHING")
-                .bind(tenant.to_string()).execute(&mut *tx).await?.rows_affected()
+        let changed = if let Some(revision) = revision {
+            let acquired = if revision == 0 {
+                sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision) VALUES($1,1) ON CONFLICT(tenant_id) DO NOTHING")
+                    .bind(tenant.to_string()).execute(&mut *tx).await
+            } else {
+                sqlx::query("UPDATE group_allocation_revisions SET revision=revision+1 WHERE tenant_id=$1 AND revision=$2")
+                    .bind(tenant.to_string()).bind(revision).execute(&mut *tx).await
+            };
+            match acquired {
+                Ok(result) => result.rows_affected(),
+                Err(error)
+                    if error
+                        .as_database_error()
+                        .and_then(|error| error.code())
+                        .as_deref()
+                        == Some("55P03") =>
+                {
+                    tx.rollback().await?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(error.into()),
+            }
         } else {
-            sqlx::query("UPDATE group_allocation_revisions SET revision=revision+1 WHERE tenant_id=$1 AND revision=$2")
-                .bind(tenant.to_string()).bind(revision).execute(&mut *tx).await?.rows_affected()
+            1
         };
         if changed != 1 {
             tx.rollback().await?;
@@ -335,6 +351,42 @@ mod tests {
             .unwrap();
         assert!(usage.iter().all(|row| row.hour >= midnight / HOUR_MS - 23));
         assert!(usage.iter().any(|row| row.requests >= 90));
+        if matches!(restarted.backend, DatabaseBackend::PostgreSql) {
+            let locked_tenant = Uuid::now_v7();
+            assert!(
+                restarted
+                    .allocation_reserve(locked_tenant, Some(0), Uuid::now_v7(), None, ("a", 1), now)
+                    .await
+                    .unwrap()
+            );
+            let mut holder = first.begin_write_transaction().await.unwrap();
+            sqlx::query(
+                "UPDATE group_allocation_revisions SET revision=revision WHERE tenant_id=$1",
+            )
+            .bind(locked_tenant.to_string())
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+            let retry_request = Uuid::now_v7();
+            assert!(
+                !second
+                    .allocation_reserve(locked_tenant, Some(1), retry_request, None, ("b", 1), now)
+                    .await
+                    .unwrap()
+            );
+            holder.rollback().await.unwrap();
+            assert!(
+                second
+                    .allocation_reserve(locked_tenant, Some(1), retry_request, None, ("b", 1), now)
+                    .await
+                    .unwrap()
+            );
+            let usage = second
+                .allocation_usage(locked_tenant, &accounts, now)
+                .await
+                .unwrap();
+            assert_eq!(usage.iter().map(|row| row.requests).sum::<u64>(), 2);
+        }
         let concurrent_tenant = Uuid::now_v7();
         let mut committed = 0_i64;
         for index in 0..16 {
