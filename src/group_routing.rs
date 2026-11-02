@@ -330,6 +330,7 @@ pub(crate) async fn prepare(
     request_id: Uuid,
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
+    session_identity: Option<crate::db::allocation::AllocationSession<'_>>,
 ) -> Result<(), AppError> {
     state.group_routing = None;
     let stage_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_millis(250));
@@ -342,6 +343,7 @@ pub(crate) async fn prepare(
             request_id,
             deadline,
             candidates,
+            session_identity,
         ),
     )
     .await
@@ -365,6 +367,7 @@ async fn prepare_inner(
     request_id: Uuid,
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
+    session_identity: Option<crate::db::allocation::AllocationSession<'_>>,
 ) -> Result<(), AppError> {
     let started = tokio::time::Instant::now();
     // Many overlapping groups must not multiply per-component execution into
@@ -642,6 +645,7 @@ async fn prepare_inner(
                         request_id,
                         selection_seed,
                         &input,
+                        session_identity,
                     )
                     .await?;
                     read_phase.finish("returned");

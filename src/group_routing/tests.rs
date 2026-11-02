@@ -56,6 +56,7 @@ async fn empty_and_oversized_snapshots_do_not_wait_for_database_preflight() {
             Uuid::now_v7(),
             started + Duration::from_secs(1),
             &mut candidates,
+            None,
         )
         .await
         .unwrap();
@@ -147,6 +148,7 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
         request_id,
         deadline,
         &mut candidates,
+        None,
     )
     .with_subscriber(subscriber)
     .await

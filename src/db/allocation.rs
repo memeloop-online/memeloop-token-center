@@ -6,6 +6,14 @@ use uuid::Uuid;
 pub(crate) const HOUR_MS: i64 = 3_600_000;
 pub(crate) const DAY_MS: i64 = 24 * HOUR_MS;
 
+#[derive(Clone, Copy)]
+pub(crate) struct AllocationSession<'a> {
+    pub key: &'a crate::model::AuthenticatedKey,
+    pub session: &'a str,
+    pub model: &'a str,
+    pub protocol: &'a str,
+}
+
 pub(crate) struct AllocationUsage {
     pub account: String,
     pub hour: i64,
@@ -42,7 +50,16 @@ impl Database {
         }))
     }
 
-    /// The revision fences every shared allocation mutation; the guest runs before this transaction.
+    pub(crate) async fn allocation_actual_session(
+        &self,
+        identity: AllocationSession<'_>,
+        now: i64,
+    ) -> Result<Option<String>, AppError> {
+        sqlx::query_scalar("SELECT upstream_account_id FROM session_routing_terminals WHERE tenant_id=$1 AND principal_id=$2 AND key_id=$3 AND explicit_session_id=$4 AND model=$5 AND protocol=$6 AND expires_at>$7 AND status_code>=200 AND status_code<400 AND COALESCE(error_code,'')='' AND upstream_account_id IS NOT NULL ORDER BY observed_at DESC,request_id DESC LIMIT 1")
+            .bind(identity.key.tenant_id.to_string()).bind(identity.key.principal_id.to_string()).bind(identity.key.key_id.to_string()).bind(identity.session).bind(identity.model).bind(identity.protocol).bind(now).fetch_optional(&self.pool).await.map_err(Into::into)
+    }
+
+    /// New-session selections share a revision fence. Established sessions append their request count.
     pub(crate) async fn allocation_reserve(
         &self,
         tenant: Uuid,
@@ -63,8 +80,7 @@ impl Database {
                 .await?;
         }
         let changed = if revision.is_none() {
-            sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision) VALUES($1,1) ON CONFLICT(tenant_id) DO UPDATE SET revision=group_allocation_revisions.revision+1")
-                .bind(tenant.to_string()).execute(&mut *tx).await?.rows_affected()
+            1
         } else if revision == Some(0) {
             sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision) VALUES($1,1) ON CONFLICT(tenant_id) DO NOTHING")
                 .bind(tenant.to_string()).execute(&mut *tx).await?.rows_affected()

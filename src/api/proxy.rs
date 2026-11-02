@@ -1105,6 +1105,14 @@ async fn proxy_with_cancellation_guard(
             request_id,
             route_preparation_recovery_wait_deadline,
             &mut candidates,
+            conversation_hints.session_id.as_deref().map(|session| {
+                crate::db::allocation::AllocationSession {
+                    key: &key,
+                    session,
+                    model: &model,
+                    protocol: protocol.name(),
+                }
+            }),
         )
         .await?;
         strategy.finish("completed", None, None);

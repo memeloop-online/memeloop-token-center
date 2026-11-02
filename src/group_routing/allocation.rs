@@ -19,26 +19,38 @@ impl Reservation {
         request: Uuid,
         session: Uuid,
         input: &GroupRoutingInput,
+        session_identity: Option<crate::db::allocation::AllocationSession<'_>>,
     ) -> Result<Self, AppError> {
         let now = crate::db::unix_millis();
         let revision = state.db.allocation_revision(tenant).await?;
         let session = (session != request).then_some(session);
-        let preferred = if let Some(session) = session {
-            state
-                .db
-                .allocation_session(tenant, session, now)
-                .await?
-                .filter(|(id, generation)| {
-                    input.candidates.iter().any(|candidate| {
-                        candidate.account_id == *id
-                            && (*generation == u64::MAX || candidate.generation == *generation)
-                            && candidate.health == GroupRoutingHealth::Healthy
-                    })
-                })
-                .map(|(id, _)| id)
+        let binding = if let Some(session) = session {
+            state.db.allocation_session(tenant, session, now).await?
         } else {
             None
         };
+        let actual = if let Some(identity) = session_identity {
+            if identity.key.tenant_id != tenant {
+                return Err(AppError::internal("allocation_session_scope"));
+            }
+            state
+                .db
+                .allocation_actual_session(identity, now)
+                .await?
+                .map(|account| (account, u64::MAX))
+        } else {
+            None
+        };
+        let preferred = actual
+            .or(binding)
+            .filter(|(id, generation)| {
+                input.candidates.iter().any(|candidate| {
+                    candidate.account_id == *id
+                        && (*generation == u64::MAX || candidate.generation == *generation)
+                        && candidate.health == GroupRoutingHealth::Healthy
+                })
+            })
+            .map(|(id, _)| id);
         if preferred.is_some() {
             return Ok(Self {
                 tenant,

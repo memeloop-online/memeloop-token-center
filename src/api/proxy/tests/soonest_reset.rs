@@ -161,6 +161,7 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
         Uuid::now_v7(),
         tokio::time::Instant::now() + Duration::from_secs(5),
         &mut candidates,
+        None,
     )
     .await
     .unwrap();
@@ -270,10 +271,10 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
         .try_init();
     let high = MockServer::start().await;
     let low = MockServer::start().await;
-    for upstream in [&high, &low] {
+    for (name, upstream) in [("high", &high), ("low", &low)] {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(successful_chat_response())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":name,"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}})))
             .mount(upstream)
             .await;
     }
@@ -408,6 +409,53 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
     )
     .await
     .unwrap();
+    let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let (response, ()) = tokio::join!(
+        send_resilient_chat(&fixture, Some("one-shared-session"), false),
+        async {
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            writer.rollback().await.unwrap();
+        },
+    );
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["id"],
+        "high",
+        "a held SQLite writer preserves the established session's first outbound account"
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        responses_transport::wait_for_financial_events(&fixture.state, fixture.key_id, 8),
+    )
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER allocation_count_failure BEFORE INSERT ON group_allocation_reservations BEGIN SELECT RAISE(ABORT,'allocation_count_failure'); END").execute(&pool).await.unwrap();
+    let (existing, new_session) = tokio::join!(
+        send_resilient_chat(&fixture, Some("one-shared-session"), false),
+        send_resilient_chat(&fixture, Some("new-session-during-counter-failure"), false),
+    );
+    assert_eq!(existing.status(), StatusCode::OK);
+    assert_eq!(new_session.status(), StatusCode::OK);
+    let existing = to_bytes(existing.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&existing).unwrap()["id"],
+        "high",
+        "optional counting failure keeps the first outbound on the established account"
+    );
+    let _ = to_bytes(new_session.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER allocation_count_failure")
+        .execute(&pool)
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        responses_transport::wait_for_financial_events(&fixture.state, fixture.key_id, 10),
+    )
+    .await
+    .unwrap();
     fixture
         .state
         .db
@@ -432,10 +480,10 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
     .await
     .unwrap();
     assert_eq!(
-        requests, 7,
+        requests, 10,
         "completed history counts each request once after reconciliation"
     );
-    sqlx::query("DROP TABLE group_allocation_usage")
+    sqlx::query("DROP TABLE group_allocation_sessions")
         .execute(&pool)
         .await
         .unwrap();
@@ -445,18 +493,44 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
     assert_eq!(
         high.received_requests().await.unwrap().len()
             + low.received_requests().await.unwrap().len(),
-        8,
+        11,
         "allocation storage failure preserves normal routing"
     );
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        responses_transport::wait_for_financial_events(&fixture.state, fixture.key_id, 8),
-    )
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let completed: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM request_records WHERE key_id=$1 AND completed_at IS NOT NULL",
+            )
+            .bind(fixture.key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if completed == 11 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let owner = Uuid::now_v7();
+        for request in fixture
+            .state
+            .db
+            .claim_terminal_projection_tasks(owner, 32)
+            .await
+            .unwrap()
+        {
+            fixture
+                .state
+                .db
+                .project_claimed_terminal_projection_task(owner, request)
+                .await
+                .unwrap();
+        }
+    })
     .await
     .unwrap();
     let financial=sqlx::query("SELECT q.status_code,(SELECT COUNT(*) FROM ledger_entries l WHERE l.source=q.reservation_id) AS ledgers,(SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id=q.id) AS facts,(SELECT COUNT(*) FROM session_routing_terminals s WHERE s.request_id=q.id) AS terminals FROM request_records q WHERE key_id=$1")
         .bind(fixture.key_id.to_string()).fetch_all(&pool).await.unwrap();
-    assert_eq!(financial.len(), 8);
+    assert_eq!(financial.len(), 11);
     for row in financial {
         assert_eq!(row.get::<i64, _>("status_code"), 200);
         assert_eq!(row.get::<i64, _>("ledgers"), 1);

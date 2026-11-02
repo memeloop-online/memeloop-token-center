@@ -187,6 +187,7 @@ async fn installed_hook_without_group_configuration_retains_native_candidates() 
         Uuid::now_v7(),
         tokio::time::Instant::now() + Duration::from_secs(1),
         &mut candidates,
+        None,
     )
     .await
     .unwrap();
@@ -247,6 +248,7 @@ async fn broken_group_configuration_continues_to_the_upstream() {
         Uuid::now_v7(),
         tokio::time::Instant::now() + Duration::from_secs(1),
         &mut candidates,
+        None,
     )
     .await
     .unwrap();
@@ -363,6 +365,7 @@ async fn preferred_account_real_gateway_uses_order_without_overriding_native_hea
         Uuid::now_v7(),
         tokio::time::Instant::now() + Duration::from_secs(5),
         &mut candidates,
+        None,
     )
     .await
     .unwrap();
