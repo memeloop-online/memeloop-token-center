@@ -348,6 +348,33 @@ jobs:
           "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/preferred-package/plugin.wasm"
       - name: Verify default plugin loader compatibility without revision feature
         run: cargo test --locked --no-default-features --test plugin_product loader_feature_boundary
+      - name: Check out reviewed independent Codex reset-credit planner
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          repository: memeloop-online/memeloop-token-center-example-plugins
+          ref: 38e8ff32d209c2b57a7c93cf1a1c3e336386f6e7
+          path: .codex-reset-examples
+          persist-credentials: false
+      - name: Build the real independent reset-credit component
+        run: |
+          cargo fmt --manifest-path .codex-reset-examples/plugin-sources/codex-expiring-reset/Cargo.toml -- --check
+          cargo test --locked --manifest-path .codex-reset-examples/plugin-sources/codex-expiring-reset/Cargo.toml
+          cargo build --locked --release --target wasm32-unknown-unknown --manifest-path .codex-reset-examples/plugin-sources/codex-expiring-reset/Cargo.toml
+          mkdir -p "$RUNNER_TEMP/codex-reset-package/ui"
+          cp .codex-reset-examples/plugin-sources/codex-expiring-reset/plugin.json "$RUNNER_TEMP/codex-reset-package/"
+          cp .codex-reset-examples/plugin-sources/codex-expiring-reset/ui/codex-expiring-reset.mjs "$RUNNER_TEMP/codex-reset-package/ui/"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" component new .codex-reset-examples/plugin-sources/codex-expiring-reset/target/wasm32-unknown-unknown/release/mtc_codex_expiring_reset.wasm -o "$RUNNER_TEMP/codex-reset-package/plugin.wasm"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" validate --features component-model "$RUNNER_TEMP/codex-reset-package/plugin.wasm"
+          "$RUNNER_TEMP/preferred-tools/wasm-tools" component wit "$RUNNER_TEMP/codex-reset-package/plugin.wasm" > "$RUNNER_TEMP/codex-reset.wit"
+          if grep -Eq '^[[:space:]]*import ' "$RUNNER_TEMP/codex-reset.wit"; then exit 1; fi
+          grep -F 'memeloop:background-actions/planner@0.1.0' "$RUNNER_TEMP/codex-reset.wit"
+      - name: Verify reset-credit worker, authorization and durable recovery on both databases
+        env:
+          MTC_CODEX_EXPIRING_RESET_PACKAGE: ${{ runner.temp }}/codex-reset-package
+          MTC_TEST_POSTGRES_URL: postgres://token_center:token_center@127.0.0.1:5432/memeloop_token_center_test
+        run: |
+          cargo test --locked --all-features --lib background_action_recovery_and_authority_fences -- --nocapture
+          cargo test --locked --all-features --lib codex_background_action_real_component_worker_contract -- --ignored --nocapture
       - name: Build the fixed soonest-reset guest for real host acceptance
         # Reuse the pinned tool verified above; no dispatch-selected executables.
         run: |

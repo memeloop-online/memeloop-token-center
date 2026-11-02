@@ -82,8 +82,8 @@ group version. Removing a group restores the existing single-proxy path.
 
 Selector persistence uses **0116_transport_proxy_groups.sql**,
 registered for both SQLite and PostgreSQL; management adds migration 117,
-entities add migration 148, and migration 149 preserves existing selections while
-removing the four-member index constraint. Helm declares schema 149. Versions
+entities add migration 150, and migration 151 preserves existing selections while
+removing the four-member index constraint. Helm declares schema 151. Versions
 0114 (#422) and 0115 (#455) remain owned by their PRs. The migration runner checks
 the applied-version set, so gaps need no placeholder or dependency cherry-pick.
 Historical migrations and deployed checksums are unchanged.

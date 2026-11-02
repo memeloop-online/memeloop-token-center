@@ -200,12 +200,21 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(poll_cursor_oauth),
         )
         .route(
+            "/internal/v1/plugins/{plugin_id}/background-actions/{account_id}",
+            get(super::super::plugin_background_actions::get)
+                .put(super::super::plugin_background_actions::put),
+        )
+        .route(
             "/internal/v1/upstreams",
             get(list_upstreams).post(create_upstream),
         )
         .route(
             "/internal/v1/upstream-availability",
             get(upstream_account_availability),
+        )
+        .route(
+            "/internal/v1/upstreams/quota/windows",
+            post(upstream_quota_windows),
         )
         .route(
             "/internal/v1/upstreams/quota/batch",

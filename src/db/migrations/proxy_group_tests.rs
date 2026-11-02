@@ -108,6 +108,7 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     for statement in [
+        "DROP TABLE plugin_background_action_grants",
         "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
         "DROP TABLE proxy_operational_terminals",
         "DROP TABLE application_plugin_release_resolutions",
@@ -298,7 +299,7 @@ async fn upgrade_contract(database: &Database) {
                 .fetch_one(&database.pool)
                 .await
                 .unwrap();
-        assert_eq!(count, 0, "{table} rebuilt by migration 148");
+        assert_eq!(count, 0, "{table} rebuilt by migration 150");
     }
     sqlx::query("SELECT members_normalized FROM transport_proxy_groups LIMIT 1")
         .fetch_optional(&database.pool)
@@ -327,7 +328,7 @@ async fn upgrade_contract(database: &Database) {
     .unwrap();
     sqlx::query("INSERT INTO upstream_transport_proxy_selections (account_id, group_version, group_fingerprint, credential_generation, base_index, selected_index, selection_generation) VALUES ($1, 9, 'preserved-fingerprint', 1, 2, 3, 7)")
         .bind(&account).execute(&database.pool).await.unwrap();
-    sqlx::query("DELETE FROM schema_migrations WHERE version = 149")
+    sqlx::query("DELETE FROM schema_migrations WHERE version = 151")
         .execute(&database.pool)
         .await
         .unwrap();
@@ -391,7 +392,7 @@ fn terminal_projection_migration_precedes_routing_snapshot_in_both_registries() 
             tail,
             vec![
                 117, 118, 119, 120, 121, 122, 123, 124, 125, 126, 127, 128, 129, 130, 131, 132,
-                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148, 149
+                133, 134, 135, 136, 137, 138, 139, 140, 141, 143, 144, 145, 146, 147, 148, 150, 151
             ]
         );
     }

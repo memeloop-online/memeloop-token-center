@@ -62,6 +62,7 @@ async fn conversion_contract(url: &str) {
         "DROP TABLE network_proxy_group_members",
         "DROP TABLE network_proxies",
         "ALTER TABLE transport_proxy_groups DROP COLUMN members_normalized",
+        "DROP TABLE plugin_background_action_grants",
         "ALTER TABLE transport_proxy_groups DROP COLUMN probe_url",
         "ALTER TABLE transport_proxy_groups DROP COLUMN probe_attempts",
         "ALTER TABLE usage_reservations DROP COLUMN tpm_window_applied",
