@@ -54,6 +54,8 @@ pub mod pricing;
 pub mod provider;
 mod proxy_lifecycle;
 mod request_event_stream;
+pub mod request_history;
+pub mod request_history_api;
 mod response_archive_spool;
 pub mod schema;
 pub mod server;

@@ -174,6 +174,7 @@ pub(super) fn reset_credits(
         for credit in credits {
             if field(credit, "reset_type", "resetType").as_str() == Some("codex_rate_limits") {
                 snapshot.reset_credits.push(ResetCredit {
+                    fingerprint: super::reset::credit_fingerprint(credit),
                     status: text(&credit["status"]),
                     granted_at: timestamp(field(credit, "granted_at", "grantedAt")),
                     expires_at: timestamp(field(credit, "expires_at", "expiresAt")),

@@ -651,7 +651,7 @@ pub(crate) fn recorded_in_flight_stage(value: Option<String>) -> Option<String> 
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RequestView {
     /// Independently acknowledged execution outcome; accounting may remain unknown.
     pub operational_terminal: Option<RequestOperationalTerminalView>,
@@ -689,10 +689,15 @@ pub struct RequestView {
     /// in-process callers. Serialization reads their nullable wire values from
     /// `usage` and `billing`, so an unknown observation is never exposed as
     /// zero to API clients.
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub input_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cached_input_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cache_write_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub output_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cost: String,
     /// Historical request currency when it was durably captured. It remains
     /// absent for generation history whose currency cannot be recovered
@@ -725,14 +730,14 @@ pub struct RequestView {
     pub session_context: Option<RequestSessionContext>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestOperationalTerminalView {
     pub completed_at: i64,
     pub stage: Option<String>,
     pub financial_state: RequestFinancialState,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestFinancialState {
     Pending,
@@ -816,13 +821,13 @@ impl Serialize for RequestView {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestEgressObservation {
     pub selected: crate::db::egress::SelectedEgress,
     pub observed_at: i64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestLifecycleState {
     Preparing,
@@ -836,7 +841,7 @@ pub enum RequestLifecycleState {
     Cancelled,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestArchiveState {
     Capturing,
@@ -861,7 +866,7 @@ impl RequestArchiveState {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestTokenUsageView {
     pub input_tokens: Option<i64>,
     pub cached_input_tokens: Option<i64>,
@@ -869,13 +874,13 @@ pub struct RequestTokenUsageView {
     pub output_tokens: Option<i64>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestGenerationUsageView {
     pub billed_units: Option<i64>,
     pub billing_unit: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestUsageView {
     pub tokens: Option<RequestTokenUsageView>,
     pub generation: Option<RequestGenerationUsageView>,
@@ -912,14 +917,14 @@ impl RequestUsageBasis {
     }
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestBillingView {
     pub billable: bool,
     pub cost: Option<String>,
     pub currency: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestCredentialIdentityView {
     pub tenant_external_id: String,
     pub key_id: Uuid,
@@ -945,14 +950,14 @@ pub struct RequestListResponse {
     pub next_cursor: Option<RequestListCursor>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestSessionAssociation {
     Confirmed,
     Unlinked,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Deserialize)]
 pub struct RequestSessionContext {
     /// Internal logical-session identifier used by the session detail API.
     /// Unlinked request records deliberately keep this null.
@@ -979,7 +984,7 @@ impl RequestSessionContext {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct RequestEventView {
     pub usage_basis: Option<RequestUsageBasis>,
     pub compaction: Option<bool>,
@@ -998,7 +1003,9 @@ pub struct RequestEventView {
     pub upstream_account_id: Option<Uuid>,
     pub route_id: Option<Uuid>,
     pub currency: Option<String>,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cached_input_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cache_write_tokens: i64,
     pub session_context: Option<RequestSessionContext>,
     pub key_id: Uuid,
@@ -1006,8 +1013,11 @@ pub struct RequestEventView {
     pub model: String,
     pub status_code: Option<i64>,
     pub duration_ms: Option<i64>,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub input_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub output_tokens: i64,
+    #[serde(deserialize_with = "deserialize_nullable_default")]
     pub cost: String,
     pub usage: RequestUsageView,
     pub billing: RequestBillingView,
@@ -1082,7 +1092,7 @@ impl Serialize for RequestEventView {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RequestArchiveRefs {
     pub view: RequestView,
     pub request_object: String,
@@ -1095,7 +1105,7 @@ pub struct RequestArchiveRefs {
     pub response_archive_reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RequestProvenanceView {
     pub source: String,
     pub disposition: String,
@@ -1120,7 +1130,7 @@ pub struct RequestDetail {
     pub egress_attempts: Option<Vec<crate::db::egress::RequestEgressAttempt>>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RequestTransportDiagnosticView {
     pub upstream_account_id: Uuid,
     pub route_id: Uuid,
@@ -2030,4 +2040,12 @@ mod tests {
             );
         }
     }
+}
+
+fn deserialize_nullable_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }

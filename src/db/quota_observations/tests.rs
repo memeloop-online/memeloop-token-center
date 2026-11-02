@@ -282,6 +282,20 @@ async fn verify(config: Config) {
             .unwrap()
             .is_empty()
     );
+    let metadata = db
+        .quota_window_metadata(&[account.id], &tenant)
+        .await
+        .unwrap();
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].provider, "kimi-oauth");
+    assert_eq!(metadata[0].windows[0].id, "summary");
+    assert_eq!(metadata[0].windows[0].period_seconds, Some(604800));
+    assert!(
+        db.quota_window_metadata(&[account.id], "other-tenant")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let failure_lease = Uuid::now_v7();
     assert!(
         db.claim_quota_observation(&target, failure_lease, 111, 141)
@@ -313,4 +327,9 @@ async fn verify(config: Config) {
             .unwrap()
             .is_empty()
     );
+    let metadata = db
+        .quota_window_metadata(&[account.id], &tenant)
+        .await
+        .unwrap();
+    assert!(metadata[0].windows.is_empty());
 }

@@ -600,6 +600,21 @@ impl Database {
         tenant_external_id: Option<&str>,
         filter: &StatsFilter,
     ) -> Result<OperatorStats, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let query = crate::request_history_api::query_from_stats_filter(
+                self.history_scope(tenant_external_id).await?,
+                filter,
+            )?;
+            return Ok(client.statistics(&query).await?);
+        }
+        self.source_history_stats(tenant_external_id, filter).await
+    }
+
+    pub(crate) async fn source_history_stats(
+        &self,
+        tenant_external_id: Option<&str>,
+        filter: &StatsFilter,
+    ) -> Result<OperatorStats, AppError> {
         validate_stats_filter(filter)?;
         let tenant_external_id = tenant_external_id.unwrap_or_default();
         let key_id = filter.key_id.map(|id| id.to_string()).unwrap_or_default();

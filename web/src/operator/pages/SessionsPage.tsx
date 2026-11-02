@@ -8,14 +8,18 @@ import { RequestEgressDetails } from '../RequestEgressDetails';
 import { useOperatorResource } from '../hooks/useOperatorResource';
 import { LatestRequestGate, SessionMonitor, type SessionFocus } from '../SessionMonitor.js';
 import { messageOf, queryForTenant } from '../scope/operatorShared.js';
+import { credentialDisplayName } from '../../identityPresentation.js';
+import { unnamedSessionName } from '../../sessionTitles.js';
+import { useSessionParentLabel } from '../sessionTasks.js';
 import {
   beginRequestDetailSelection, emptyRequestDetailSelection, rejectRequestDetailSelection,
   requestDetailSelectionInScope, resolveRequestDetailSelection,
 } from '../requestDetailSelection.js';
 import type { SessionStreamState } from '../SessionMonitor.js';
 import type { SessionEventChannel } from '../sessionEventChannel.js';
+import type { SessionRequestOrigin } from '../sessionNavigation.js';
 
-export function SessionsPage({ token, tenant, focus, sessionEvents, streamState, streamError, onOpenRequests, requestRefresh }: {
+export function SessionsPage({ token, tenant, focus, sessionEvents, streamState, streamError, onOpenRequests, onOpenUnlinkedRequests, onReturnOrigin, requestRefresh }: {
   token: string;
   tenant: string;
   focus?: SessionFocus;
@@ -23,10 +27,12 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
   streamState: SessionStreamState;
   streamError: string;
   onOpenRequests: () => void;
+  onOpenUnlinkedRequests?: (sessionId: string, keyId?: string) => void;
+  onReturnOrigin: (origin: SessionRequestOrigin) => void;
   requestRefresh?: { intervalMs: number; paused: boolean; onIntervalChange: (value: number) => void };
 }) {
   const revision = useSyncExternalStore(sessionEvents.subscribe, sessionEvents.snapshot);
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const scopeKey = `${tenant}\0${token}`;
   const [requestSelection, setRequestSelection] = useState(emptyRequestDetailSelection);
   const detailRequests = useRef(new LatestRequestGate());
@@ -63,6 +69,9 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
   }
 
   const scopedSelection = requestDetailSelectionInScope(requestSelection, scopeKey);
+  const sessionParent = useSessionParentLabel(tenant, token, scopedSelection.detail?.credential_identity?.key_id,
+    scopedSelection.detail?.session_context?.association === 'confirmed' ? scopedSelection.detail.session_context.session_id : null,
+    (summary) => summary.session_name?.trim() || unnamedSessionName(t, locale, summary.last_activity_at, credentialDisplayName(summary.key_alias, t), true));
   const accounts = useOperatorResource(Boolean(scopedSelection.detail?.egress_attempts?.length), scopeKey,
     signal => api<UpstreamAccount[]>(`/internal/v1/upstreams${queryForTenant(tenant)}`, token, { signal }), '');
   const accountNames = accounts.state.kind === 'ready' && !accounts.state.refreshError
@@ -89,6 +98,8 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
         streamState={streamState}
         refreshCadence={requestRefresh}
         onSelectRequest={selectRequest}
+        onOpenUnlinkedRequests={onOpenUnlinkedRequests}
+        onReturnOrigin={onReturnOrigin}
       />
     </article>
     {scopedSelection.request && <DrawerFrame title={scopedSelection.detail?.model ?? scopedSelection.request.model} eyebrow={t('request.operatorDiagnosis')} onClose={closeRequestDetail}>
@@ -101,7 +112,7 @@ export function SessionsPage({ token, tenant, focus, sessionEvents, streamState,
         <div className="notice error" role="alert"><span>{scopedSelection.error}</span><Button appearance="secondary" type="button" onClick={retryRequestDetail}>{t('common.retry')}</Button></div>
       </>}
       {scopedSelection.detail && <>
-          <RequestDiagnostics request={scopedSelection.detail} />
+          <RequestDiagnostics request={scopedSelection.detail} sessionParent={sessionParent ? { label: sessionParent.label, sessionId: sessionParent.identity.session_id } : undefined} />
           <RequestEgressDetails attempts={scopedSelection.detail.egress_attempts} accountNames={accountNames} />
           <div className="request-diagnostics request-detail-surface request-archive-diagnostics">
             <span><b>{t('self.archive')}</b>{scopedSelection.detail.archive_complete ? t('request.archiveComplete') : t('request.archiveIncomplete')}</span>

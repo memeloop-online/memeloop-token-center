@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mergeLiveRequestEvents, mergeRefreshedRequestPage, requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
+import { coalesceRequestEvent } from '../src/operator/traffic/requestRefresh.js';
 import type { RequestEvent, RequestView } from '../src/types.js';
 
 const event: RequestEvent = {
@@ -23,6 +24,31 @@ const recorded: RequestView = {
     task_kind: 'task', agent_id: 'agent', semantics_source: 'declared',
   },
 };
+
+test('sparse SSE preserves REST exit and confirmed session metadata through terminal updates', () => {
+  const egress: NonNullable<RequestView['egress']> = {
+    selected: { kind: 'direct', group_id: null, group_version: null, group_name: null,
+      member_id: null, member_name: null, scheme: null, host: null, port: null },
+    observed_at: 800,
+  };
+  const enriched = { ...event, created_at: 100, session_context: recorded.session_context };
+  const cached = coalesceRequestEvent(undefined, enriched);
+  const sparse: RequestEvent = { ...event, event_id: 'later', event_at: 1000,
+    event_kind: 'archive_bound', archive_state: 'bound', session_context: { ...recorded.session_context!, association: 'unlinked', session_id: null } };
+  const retained = coalesceRequestEvent(cached, sparse);
+  const reconstructed = requestViewFromEvent(retained);
+  assert.deepEqual(reconstructed?.session_context, recorded.session_context);
+  for (const event_kind of ['started', 'projected', 'archive_bound'] as const) {
+    for (const operational_terminal of [undefined, { completed_at: 800, stage: null, financial_state: 'pending' as const }]) {
+      const previous = { ...recorded, egress, operational_terminal,
+        session_context: { ...recorded.session_context!, association: 'unlinked' as const, session_id: null } };
+      const merged = requestViewFromEvent({ ...enriched, event_kind }, previous);
+      assert.deepEqual(merged?.egress, egress);
+      assert.deepEqual(merged?.session_context, recorded.session_context);
+      assert.equal(merged?.status_code, previous.status_code);
+    }
+  }
+});
 
 test('retained financial events cannot replace operational outcomes or invent confirmed money', () => {
   for (const status_code of [200, 499, 502]) {

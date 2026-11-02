@@ -66,6 +66,7 @@ mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
+pub(crate) mod plugin_background_actions;
 mod plugin_configurations;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installations;
@@ -79,6 +80,7 @@ mod plugin_revisions;
 mod plugin_service_data;
 mod projection_lock;
 mod providers;
+mod request_history;
 mod requests;
 pub(crate) use requests::EarlyRequestTerminal;
 #[allow(unused_imports)] // Consumed by the separately owned API receipt integration.
@@ -99,6 +101,7 @@ mod session_responses;
 pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
 pub(crate) use session_responses::SessionResponseTask;
 mod session_projection;
+pub(crate) mod session_tasks;
 mod session_titles;
 pub(crate) use session_titles::{
     SessionTitleTask, SessionTitleView, enqueue_initial_session_title,

@@ -1501,6 +1501,16 @@
   min-width: 0;
 }
 
+.usage-task-picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.usage-task-picker > span { display: block; }
+.usage-task-picker .fui-Combobox { width: 100%; min-width: 0; }
+
 .usage-heading {
   align-items: flex-start;
   display: flex;

@@ -25,6 +25,7 @@ use crate::{
 
 #[cfg(feature = "experimental-plugin-revisions")]
 pub mod application;
+pub(crate) mod background_actions;
 mod configuration;
 /// Experimental lifecycle primitives; application integration is separately
 /// host-opted-in through `application` and never enabled by the production binary.
@@ -164,6 +165,8 @@ pub struct PluginContributions {
     /// only call the core proxy route for one of these manifest entries.
     #[serde(default)]
     pub service_data: Vec<PluginServiceDataEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_actions: Option<background_actions::BackgroundActionContribution>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wire_shim: Option<WireShimContribution>,
 }
@@ -387,6 +390,8 @@ pub enum PluginCapability {
     },
     /// Read-only candidate quota context for native-health group ordering.
     GroupRoutingQuota,
+    /// Account-scoped reset-credit intents, authorized separately by an operator.
+    QuotaResetCredit,
 }
 
 #[derive(Clone)]
@@ -394,6 +399,8 @@ struct LoadedPlugin {
     manifest: PluginManifest,
     component: Option<Component>,
     service_data_component: Option<service_data_component::ServiceDataPluginPre<HostState>>,
+    background_action_component:
+        Option<background_actions::bindings::BackgroundActionsPluginPre<HostState>>,
     wire_shim_component: Option<wire_shim_component::WireShimPluginPre<HostState>>,
     ui_modules: BTreeMap<String, Arc<[u8]>>,
     configuration_validator: Option<crate::schema::CompiledSchema>,
@@ -930,6 +937,8 @@ impl PluginRuntime {
             } else {
                 None
             };
+            let background_action_component =
+                background_actions::prepare_component(&engine, &manifest, component.as_ref())?;
             let wire_shim_component = if manifest.contributions.wire_shim.is_some() {
                 let component = component
                     .as_ref()
@@ -988,6 +997,7 @@ impl PluginRuntime {
                 manifest,
                 component,
                 service_data_component,
+                background_action_component,
                 wire_shim_component,
                 ui_modules,
                 configuration_validator,
@@ -2214,6 +2224,7 @@ pub fn validate_plugin_package(directory: &Path) -> Result<PluginManifest, AppEr
 
 fn validate_manifest(manifest: &PluginManifest) -> Result<(), AppError> {
     routing::validate_contribution(manifest)?;
+    background_actions::validate_contribution(manifest)?;
     if manifest.id.is_empty()
         || manifest.id.len() > MAX_PLUGIN_ID_BYTES
         || !manifest
@@ -3311,6 +3322,7 @@ mod tests {
                 manifest,
                 component: None,
                 service_data_component: None,
+                background_action_component: None,
                 wire_shim_component: None,
                 ui_modules: BTreeMap::new(),
                 configuration_validator: None,
