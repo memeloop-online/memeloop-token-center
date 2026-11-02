@@ -22,7 +22,6 @@ impl Reservation {
         session_identity: Option<crate::db::allocation::AllocationSession<'_>>,
     ) -> Result<Self, AppError> {
         let now = crate::db::unix_millis();
-        let revision = state.db.allocation_revision(tenant).await?;
         let session = (session != request).then_some(session);
         let binding = if let Some(session) = session {
             state.db.allocation_session(tenant, session, now).await?
@@ -54,7 +53,7 @@ impl Reservation {
         if preferred.is_some() {
             return Ok(Self {
                 tenant,
-                revision,
+                revision: 0,
                 request,
                 session,
                 now,
@@ -62,6 +61,7 @@ impl Reservation {
                 preferred,
             });
         }
+        let revision = state.db.allocation_revision(tenant).await?;
         let identities: BTreeMap<_, _> = input
             .candidates
             .iter()

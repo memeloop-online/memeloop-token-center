@@ -396,8 +396,13 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
         .unwrap();
     let response = send_resilient_chat(&fixture, Some("one-shared-session"), false).await;
     let status = response.status();
-    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap()["id"],
+        "high",
+        "fresh session affinity survives quota observation expiry"
+    );
     assert_eq!(
         high.received_requests().await.unwrap().len()
             + low.received_requests().await.unwrap().len(),

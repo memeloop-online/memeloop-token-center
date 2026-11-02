@@ -351,9 +351,18 @@ mod tests {
         for index in 0..16 {
             let request = Uuid::now_v7();
             let projection_time = now + index * 5001;
+            let account = format!("concurrent-account-{}", index % 2);
+            let observed = now - (index / 4) * HOUR_MS;
             let (projection, reservation) = tokio::join!(
                 second.refresh_allocation_usage(concurrent_tenant, Uuid::nil(), projection_time),
-                restarted.allocation_reserve(concurrent_tenant, None, request, None, ("a", 1), now),
+                restarted.allocation_reserve(
+                    concurrent_tenant,
+                    None,
+                    request,
+                    None,
+                    (&account, 1),
+                    observed
+                ),
             );
             if matches!(reservation, Ok(true)) {
                 committed += 1;

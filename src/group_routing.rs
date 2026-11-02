@@ -560,6 +560,12 @@ async fn prepare_inner(
         let quota_context = if state.plugins.group_routing_uses_quota_context(&plugin_id) {
             match quota::context_for_bucket(&members, &quota_observations, quota_now_ms) {
                 Some(context) => Some(context),
+                None if state
+                    .plugins
+                    .group_routing_uses_allocation_context(&plugin_id) =>
+                {
+                    None
+                }
                 None => {
                     tracing::debug!(%request_id, %group_id, stage="group_routing_quota_fallback", reason="missing_or_stale", "quota evidence incomplete; native group order retained");
                     continue;
