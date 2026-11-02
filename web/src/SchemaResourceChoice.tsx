@@ -17,7 +17,7 @@ export function SchemaResourceChoice({ options, value, description, busy, error,
       const option = options.find(item => item.value === event.target.value); if (option) onChange(option);
     }}>
       {!value && <option value="">{t(busy ? 'common.loading' : 'resourceChoice.choose')}</option>}
-      {options.map(option => <option key={option.value} value={option.value} title={option.details}>{option.label}</option>)}
+      {options.map(option => <option key={option.value} value={option.value} title={option.label}>{option.label}</option>)}
     </Select>
     {busy && <small role="status">{t('resourceChoice.loading')}</small>}
     {error && <div role="alert">{error}<Button type="button" appearance="subtle" disabled={disabled || busy} onClick={onRetry}>{t('common.retry')}</Button></div>}
