@@ -399,5 +399,20 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
         8,
         "allocation storage failure preserves normal routing"
     );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        responses_transport::wait_for_financial_events(&fixture.state, fixture.key_id, 8),
+    )
+    .await
+    .unwrap();
+    let financial=sqlx::query("SELECT q.status_code,(SELECT COUNT(*) FROM ledger_entries l WHERE l.source=q.reservation_id) AS ledgers,(SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id=q.id) AS facts,(SELECT COUNT(*) FROM session_routing_terminals s WHERE s.request_id=q.id) AS terminals FROM request_records q WHERE key_id=$1")
+        .bind(fixture.key_id.to_string()).fetch_all(&pool).await.unwrap();
+    assert_eq!(financial.len(), 8);
+    for row in financial {
+        assert_eq!(row.get::<i64, _>("status_code"), 200);
+        assert_eq!(row.get::<i64, _>("ledgers"), 1);
+        assert_eq!(row.get::<i64, _>("facts"), 1);
+        assert_eq!(row.get::<i64, _>("terminals"), 1);
+    }
     pool.close().await;
 }
