@@ -53,6 +53,7 @@ mod archive_staging;
 mod gateway_persistence;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
+pub(crate) mod allocation;
 mod billing;
 mod constants;
 mod credentials;
@@ -73,7 +74,6 @@ mod plugin_installations;
 #[cfg(feature = "experimental-plugin-revisions")]
 pub(crate) mod plugin_installer_network;
 mod plugin_kv;
-pub(crate) mod allocation;
 #[cfg(feature = "experimental-plugin-revisions")]
 pub(crate) mod plugin_release_resolutions;
 #[cfg(feature = "experimental-plugin-revisions")]

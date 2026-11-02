@@ -264,6 +264,10 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
 #[tokio::test]
 #[ignore = "requires MTC_SOONEST_RESET_PACKAGE with remaining_balance built in CI"]
 async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
+    let _ = tracing_subscriber::fmt()
+        .with_test_writer()
+        .with_max_level(tracing::Level::INFO)
+        .try_init();
     let high = MockServer::start().await;
     let low = MockServer::start().await;
     for upstream in [&high, &low] {
@@ -333,6 +337,18 @@ async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
         let status = response.status();
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let reserved: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM group_allocation_reservations WHERE tenant_id=$1",
+        )
+        .bind(group.tenant_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        eprintln!(
+            "allocation diagnostic reserved={reserved}, high={}, low={}",
+            high.received_requests().await.unwrap().len(),
+            low.received_requests().await.unwrap().len()
+        );
     }
     let high_count = high.received_requests().await.unwrap().len();
     let low_count = low.received_requests().await.unwrap().len();
