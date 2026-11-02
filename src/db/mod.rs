@@ -73,6 +73,7 @@ mod plugin_installations;
 #[cfg(feature = "experimental-plugin-revisions")]
 pub(crate) mod plugin_installer_network;
 mod plugin_kv;
+pub(crate) mod allocation;
 #[cfg(feature = "experimental-plugin-revisions")]
 pub(crate) mod plugin_release_resolutions;
 #[cfg(feature = "experimental-plugin-revisions")]

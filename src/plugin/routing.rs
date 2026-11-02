@@ -34,6 +34,8 @@ pub struct GroupRoutingContribution {
     pub version: String,
     #[serde(default, skip_serializing_if = "GroupRoutingHealthPolicy::is_plugin")]
     pub health_policy: GroupRoutingHealthPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_context: Option<String>,
     pub schema: Value,
     pub default: Value,
 }
@@ -151,6 +153,8 @@ pub struct GroupRoutingInput {
     /// Omitted for existing guests, including strict v1 JSON decoders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_context: Option<GroupRoutingQuotaContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allocation_context: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -349,6 +353,16 @@ pub(super) fn validate_contribution(manifest: &PluginManifest) -> Result<(), App
     let Some(contribution) = &manifest.contributions.group_routing else {
         return Ok(());
     };
+    if contribution
+        .allocation_context
+        .as_deref()
+        .is_some_and(|version| version != "account-history-v1")
+        || (contribution.allocation_context.is_some()
+            && (contribution.health_policy != GroupRoutingHealthPolicy::Native
+                || contribution.version != GROUP_ROUTING_VERSION))
+    {
+        return Err(invalid());
+    }
     if manifest.wasm.is_none()
         || !matches!(
             contribution.version.as_str(),
@@ -454,6 +468,69 @@ fn validate_input(input: &GroupRoutingInput) -> Result<(), AppError> {
     if let Some(context) = &input.quota_context {
         validate_quota_context(input, context)?;
     }
+    if let Some(context) = &input.allocation_context {
+        let object = context.as_object().ok_or_else(invalid)?;
+        let now = object
+            .get("now_ms")
+            .and_then(Value::as_i64)
+            .ok_or_else(invalid)?;
+        let start = object
+            .get("period_start")
+            .and_then(Value::as_i64)
+            .ok_or_else(invalid)?;
+        let accounts = object
+            .get("accounts")
+            .and_then(Value::as_array)
+            .ok_or_else(invalid)?;
+        if object.get("version").and_then(Value::as_str) != Some("account-history-v1")
+            || start > now
+            || now.saturating_sub(start) > 86_400_000
+            || accounts.len() > MAX_CANDIDATES
+        {
+            return Err(invalid());
+        }
+        let mut seen = BTreeSet::new();
+        for row in accounts {
+            let id = row
+                .get("account_id")
+                .and_then(Value::as_str)
+                .ok_or_else(invalid)?;
+            let generation = row
+                .get("generation")
+                .and_then(Value::as_u64)
+                .ok_or_else(invalid)?;
+            if !seen.insert(id)
+                || !input.candidates.iter().any(|candidate| {
+                    candidate.account_id == id && candidate.generation == generation
+                })
+                || row.get("recent_requests").and_then(Value::as_u64).is_none()
+                || row.get("recent_tokens").and_then(Value::as_u64).is_none()
+            {
+                return Err(invalid());
+            }
+            let baselines = row
+                .get("window_baselines")
+                .and_then(Value::as_object)
+                .ok_or_else(invalid)?;
+            if baselines.len() > 64
+                || baselines
+                    .values()
+                    .any(|epoch| epoch.get("baseline").and_then(Value::as_u64).is_none())
+            {
+                return Err(invalid());
+            }
+        }
+        if let Some(preferred) = object
+            .get("session_account")
+            .filter(|value| !value.is_null())
+        {
+            let preferred = preferred.as_str().ok_or_else(invalid)?;
+            if !seen.contains(preferred) {
+                return Err(invalid());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -495,6 +572,7 @@ fn validate_v2_input(input: &GroupRoutingInputV2) -> Result<GroupRoutingInput, A
         config: input.config.clone(),
         candidates: input.candidates.iter().map(v1_candidate).collect(),
         quota_context: input.quota_context.clone(),
+        allocation_context: None,
     };
     validate_input(&v1)?;
     Ok(v1)
@@ -614,6 +692,20 @@ impl PluginRuntime {
             })
             .map(|plugin| plugin.manifest.id.clone())
             .collect()
+    }
+
+    pub(crate) fn group_routing_uses_allocation_context(&self, id: &str) -> bool {
+        self.plugins.iter().any(|plugin| {
+            plugin.manifest.id == id
+                && plugin
+                    .manifest
+                    .contributions
+                    .group_routing
+                    .as_ref()
+                    .is_some_and(|routing| {
+                        routing.allocation_context.as_deref() == Some("account-history-v1")
+                    })
+        })
     }
 
     pub(crate) fn group_routing_uses_quota_context(&self, plugin_id: &str) -> bool {
@@ -764,6 +856,7 @@ impl PluginRuntime {
             remaining_deadline_ms: input.remaining_deadline_ms.max(1),
             config: input.config.clone(),
             candidates: vec![input.candidate.clone()],
+            allocation_context: None,
             quota_context: None,
         })?;
         self.validate_group_routing_configuration(plugin_id, &input.config)?;
@@ -1204,6 +1297,7 @@ mod tests {
                 remaining_deadline_ms: 1000,
                 config: serde_json::json!({}),
                 candidates: vec![candidate],
+                allocation_context: None,
                 quota_context: None,
             },
             GroupRoutingPlan {

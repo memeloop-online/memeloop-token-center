@@ -202,6 +202,7 @@ fn input() -> GroupRoutingInput {
         config: json!({}),
         candidates: Vec::new(),
         quota_context: None,
+        allocation_context: None,
     }
 }
 

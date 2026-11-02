@@ -1,4 +1,5 @@
 //! Request-owned group policy. Authorization and health leases stay in core.
+mod allocation;
 pub(crate) mod durable;
 mod quota;
 #[cfg(test)]
@@ -589,19 +590,15 @@ async fn prepare_inner(
                 health,
             });
         }
-        let input = GroupRoutingInput {
+        let mut input = GroupRoutingInput {
             tenant_id: tenant_id.to_string(),
-            seed: if native_health && quota_context.is_some() {
-                let digest = blake3::hash(request_id.as_bytes());
-                u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap())
-            } else {
-                seed
-            },
+            seed,
             remaining_deadline_ms: remaining_deadline_ms
                 .saturating_sub(started.elapsed().as_millis() as u64),
             config: config.clone(),
             candidates: inputs,
             quota_context,
+            allocation_context: None,
         };
         let signal_now_ms = crate::db::unix_millis();
         let transient_signals = plugin_is_v2.then(|| {
@@ -625,31 +622,77 @@ async fn prepare_inner(
                 })
                 .collect::<Vec<_>>()
         });
-        let runtime = state.plugins.clone();
-        let execute_id = plugin_id.clone();
-        let execute_input = input.clone();
-        let result = tokio::time::timeout_at(
-            hook_deadline,
-            crate::api::plugin_execution::run_group(
-                state.metrics.clone(),
-                crate::metrics::plugin_execution::Phase::GroupRoutingPlan,
-                move || {
-                    runtime.execute_group_routing_plan_with_health(
-                        &execute_id,
-                        &execute_input,
-                        transient_signals.as_deref(),
+        let allocation_deadline =
+            hook_deadline.min(tokio::time::Instant::now() + Duration::from_millis(25));
+        let uses_allocation = state
+            .plugins
+            .group_routing_uses_allocation_context(&plugin_id);
+        let execution_deadline = if uses_allocation {
+            allocation_deadline
+        } else {
+            hook_deadline
+        };
+        let result = async {
+            for attempt in 0..2 {
+                let reservation = if uses_allocation {
+                    let reservation = allocation::Reservation::read(
+                        state,
+                        tenant_id,
+                        request_id,
+                        selection_seed,
+                        &input,
                     )
-                },
-            ),
-        )
-        .await
-        .map_err(|_| AppError::internal("group_routing_site_1"))
-        .and_then(|result| result);
-        match result {
-            Ok(mut plan) => {
-                // Sticky candidates form a deterministic, tenant/key/session
-                // seeded rendezvous tier. Others preserve plugin plan order.
+                    .await?;
+                    input.allocation_context = Some(reservation.context.clone());
+                    Some(reservation)
+                } else {
+                    None
+                };
+                let runtime = state.plugins.clone();
+                let execute_id = plugin_id.clone();
+                let execute_input = input.clone();
+                let execute_signals = transient_signals.clone();
+                let mut plan = crate::api::plugin_execution::run_group(
+                    state.metrics.clone(),
+                    crate::metrics::plugin_execution::Phase::GroupRoutingPlan,
+                    move || {
+                        runtime.execute_group_routing_plan_with_health(
+                            &execute_id,
+                            &execute_input,
+                            execute_signals.as_deref(),
+                        )
+                    },
+                )
+                .await?;
                 sort_execution_candidates(selection_seed, &mut plan.candidates);
+                if let Some(reservation) = reservation {
+                    if let Some(preferred) = &reservation.preferred {
+                        plan.candidates
+                            .sort_by_key(|item| item.directive.account_id != *preferred);
+                    }
+                    let selected = plan
+                        .candidates
+                        .iter()
+                        .filter_map(|item| planned_candidate(&input, &item.directive))
+                        .find(|candidate| candidate.health == GroupRoutingHealth::Healthy)
+                        .ok_or_else(|| AppError::internal("allocation_healthy_candidate"))?;
+                    if !reservation.commit(state, selected).await? {
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return Err(AppError::internal("allocation_contention"));
+                    }
+                }
+                return Ok(plan);
+            }
+            Err(AppError::internal("allocation_contention"))
+        };
+        let result = tokio::time::timeout_at(execution_deadline, result)
+            .await
+            .map_err(|_| AppError::internal("group_routing_site_1"))
+            .and_then(|result| result);
+        match result {
+            Ok(plan) => {
                 for (position, execution) in plan.candidates.into_iter().enumerate() {
                     let crate::plugin::routing::GroupRoutingExecutionDirective {
                         directive,

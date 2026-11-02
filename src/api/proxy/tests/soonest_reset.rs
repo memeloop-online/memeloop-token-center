@@ -263,7 +263,7 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
 
 #[tokio::test]
 #[ignore = "requires MTC_SOONEST_RESET_PACKAGE with remaining_balance built in CI"]
-async fn remaining_quota_real_gateway_distributes_requests_within_one_session() {
+async fn remaining_quota_real_gateway_keeps_one_session_on_one_account() {
     let high = MockServer::start().await;
     let low = MockServer::start().await;
     for upstream in [&high, &low] {
@@ -328,7 +328,7 @@ async fn remaining_quota_real_gateway_distributes_requests_within_one_session() 
             .bind(account).bind(group.tenant_id.to_string()).bind(generation).bind(revision).bind(observation.to_string()).bind(now+300_000).execute(&pool).await.unwrap();
     }
     fixture.state.plugins = quota_plugin(&fixture);
-    for _ in 0..96 {
+    for _ in 0..4 {
         let response = send_resilient_chat(&fixture, Some("one-shared-session"), false).await;
         let status = response.status();
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -336,11 +336,42 @@ async fn remaining_quota_real_gateway_distributes_requests_within_one_session() 
     }
     let high_count = high.received_requests().await.unwrap().len();
     let low_count = low.received_requests().await.unwrap().len();
-    assert_eq!(high_count + low_count, 96);
-    // Wide sampling tolerance; the guest's seeded distribution contract checks the exact ratio.
+    assert_eq!(high_count + low_count, 4);
     assert!(
-        (40..=85).contains(&high_count),
+        high_count == 4 || low_count == 4,
         "high={high_count}, low={low_count}"
+    );
+    assert_eq!(
+        high_count, 4,
+        "the initially larger remaining quota receives the first session"
+    );
+    let hour = unix_millis() / 3_600_000;
+    for (account, requests) in [(fixture.accounts[0], 90_i64), (fixture.accounts[1], 10_i64)] {
+        sqlx::query("INSERT INTO group_allocation_usage(tenant_id,account_id,hour_bucket,requests,tokens) VALUES($1,$2,$3,$4,$5) ON CONFLICT(tenant_id,account_id,hour_bucket) DO UPDATE SET requests=excluded.requests,tokens=excluded.tokens")
+            .bind(group.tenant_id.to_string()).bind(account.to_string()).bind(hour).bind(requests).bind(requests*1000).execute(&pool).await.unwrap();
+    }
+    // New sessions correct historical load while the established conversation keeps its account.
+    for session in ["new-session-after-long-conversation", "one-shared-session"] {
+        let response = send_resilient_chat(&fixture, Some(session), false).await;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+    assert_eq!(high.received_requests().await.unwrap().len(), 5);
+    assert_eq!(
+        low.received_requests().await.unwrap().len(),
+        1,
+        "new session follows the underallocated account"
+    );
+    let bindings: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM group_allocation_sessions WHERE tenant_id=$1")
+            .bind(group.tenant_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        bindings, 2,
+        "both choices committed through the allocation path"
     );
     sqlx::query("UPDATE upstream_quota_observations SET valid_until=0")
         .execute(&pool)
@@ -353,7 +384,7 @@ async fn remaining_quota_real_gateway_distributes_requests_within_one_session() 
     assert_eq!(
         high.received_requests().await.unwrap().len()
             + low.received_requests().await.unwrap().len(),
-        97
+        5
     );
     pool.close().await;
 }
