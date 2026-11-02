@@ -186,6 +186,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             get(upstream_account_availability),
         )
         .route(
+            "/internal/v1/upstreams/quota/windows",
+            post(upstream_quota_windows),
+        )
+        .route(
             "/internal/v1/upstreams/quota/batch",
             post(upstream_quota_batch),
         )

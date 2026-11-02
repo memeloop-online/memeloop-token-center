@@ -7,6 +7,63 @@ use futures_util::TryStreamExt;
 use std::collections::BTreeMap;
 
 impl Database {
+    /// Reads configuration window names from persisted account observations.
+    pub(crate) async fn quota_window_metadata(
+        &self,
+        account_ids: &[Uuid],
+        tenant: &str,
+    ) -> Result<Vec<crate::upstream_quota::observations::QuotaWindowMetadata>, AppError> {
+        use crate::upstream_quota::observations::{QuotaWindowDescriptor, QuotaWindowMetadata};
+        let ids = match self.backend {
+            DatabaseBackend::PostgreSql => "SELECT jsonb_array_elements_text(CAST($1 AS jsonb))",
+            DatabaseBackend::Sqlite => "SELECT value FROM json_each($1)",
+        };
+        let statement = format!("SELECT a.id,a.driver,q.observation_json FROM upstream_accounts a
+            JOIN tenants t ON t.id=a.tenant_id
+            LEFT JOIN upstream_quota_observations q ON q.upstream_account_id=a.id AND q.tenant_id=a.tenant_id
+                AND q.credential_generation=a.credential_generation AND q.config_revision=a.updated_at
+            WHERE a.id IN ({ids}) AND t.external_id=$2 AND a.status='active' ORDER BY a.id");
+        let rows = sqlx::query(sqlx::AssertSqlSafe(statement))
+            .bind(
+                serde_json::to_string(account_ids)
+                    .map_err(|_| AppError::internal("quota_window_metadata_ids"))?,
+            )
+            .bind(tenant)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                let account_id = Uuid::parse_str(&row.try_get::<String, _>("id")?)
+                    .map_err(|_| AppError::internal("quota_window_metadata_account"))?;
+                let provider: String = row.try_get("driver")?;
+                let observation = row
+                    .try_get::<Option<String>, _>("observation_json")?
+                    .and_then(|raw| serde_json::from_str::<RoutingQuotaObservation>(&raw).ok());
+                let windows = observation
+                    .filter(|value| value.account_id == account_id && value.provider == provider)
+                    .map(|value| {
+                        value
+                            .windows
+                            .into_iter()
+                            .take(64)
+                            .filter(|window| !window.id.is_empty() && window.id.len() <= 512)
+                            .map(|window| QuotaWindowDescriptor {
+                                label: window.id.clone(),
+                                id: window.id,
+                                period_seconds: window.period_seconds,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(QuotaWindowMetadata {
+                    upstream_account_id: account_id,
+                    provider,
+                    windows,
+                })
+            })
+            .collect()
+    }
+
     /// Read-only fence before quota attempts; never opens or refreshes a credential.
     pub(crate) async fn quota_read_generation_current(
         &self,

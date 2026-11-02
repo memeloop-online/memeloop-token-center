@@ -317,7 +317,7 @@ function quotaPeriodKey(periodSeconds: number | null, role: string | undefined) 
  * Codex names durations from the supplier's window length (matching the official
  * Codex status surface); primary/secondary are only fallbacks when no duration exists.
  */
-export function quotaWindowPresentation(provider: string, window: UpstreamQuotaSnapshot['windows'][number]): QuotaWindowPresentation {
+export function quotaWindowPresentation(provider: string, window: Pick<UpstreamQuotaSnapshot['windows'][number], 'id' | 'label' | 'period_seconds'>): QuotaWindowPresentation {
   const match = /^([^:]+):(primary_window|secondary_window)$/.exec(window.id);
   const role = match?.[2];
   // Kimi's usages API defines `usage` (normalized id `summary`) as the

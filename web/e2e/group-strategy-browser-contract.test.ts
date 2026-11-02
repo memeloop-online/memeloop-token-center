@@ -150,3 +150,170 @@ test('group strategy schema validation, CAS refresh preservation, native reset a
     assert.equal(await page.locator('.selection-chip-label').count(), 0);
   } finally { await browser.close(); await server.close(); }
 });
+
+test('localized resource strategy searches real group accounts, orders by keyboard, preserves failed saves and rejects removed members', { timeout: 45_000 }, async context => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    context.skip('Chromium not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    const writes: Record<string, any>[] = [];
+    let failCatalog = true;
+    await page.route('**/internal/v1/**', async route => {
+      if (route.request().url().endsWith('/plugins/group-routing-strategies')) {
+        if (failCatalog) { failCatalog = false; await route.fulfill({ status: 503, json: { error: { message: 'unavailable' } } }); return; }
+        await route.fulfill({ json: [{ id: 'arbitrary-plugin', version: 'group-routing-v1', default: { ordered: [] }, schema: {
+          type: 'object', title: 'Account preference', 'x-i18n': { 'zh-CN': { title: '优先使用指定账号' } }, properties: {
+            ordered: { type: 'array', title: 'Preferred order', 'x-i18n': { 'zh-CN': { title: '账号使用顺序' } }, items: { type: 'string' }, uniqueItems: true,
+              'x-resource-selector': { source: 'group-accounts', ordered: true } },
+          },
+        } }, { id: 'unknown-source', version: 'group-routing-v1', default: { ordered: [] }, schema: { type: 'object', title: 'Unavailable source', properties: { ordered: { type: 'array', title: 'Unavailable accounts', items: { type: 'string' }, 'x-resource-selector': { source: 'future-resources', ordered: true } } } } }] });
+      } else if (route.request().method() === 'PUT') {
+        writes.push(route.request().postDataJSON());
+        await route.fulfill(writes.length === 1 ? { status: 503, json: { error: { message: 'unavailable' } } } : { json: {
+          id: 'group', name: 'Group', member_ids: ['alpha', 'beta', 'gamma'], member_count: 3, created_at: 1, updated_at: 2, strategy_version: 3, routing_strategy: writes.at(-1)?.routing_strategy, routing_priority: writes.at(-1)?.routing_priority,
+        } });
+      } else await route.fulfill({ json: [] });
+    });
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/group-strategy.html?resources`);
+    await page.getByText('暂时无法加载策略。请重试，已填写的内容会保留。').waitFor();
+    await page.getByRole('button', { name: '重试', exact: true }).click();
+    const strategy = page.getByRole('combobox', { name: '组路由策略', exact: true });
+    await strategy.selectOption({ label: '优先使用指定账号' });
+    assert.equal(await strategy.locator('option').filter({ hasText: 'arbitrary-plugin' }).count(), 0);
+    const picker = page.getByRole('combobox', { name: '账号使用顺序', exact: true });
+    await picker.fill('outside');
+    assert.equal(await page.getByRole('option', { name: /Outside group/ }).count(), 0);
+    await picker.fill('Anthropic');
+    await picker.press('ArrowDown'); await picker.press('Enter');
+    await picker.fill('alpha');
+    await picker.press('ArrowDown'); await picker.press('Enter');
+    const rows = page.locator('.resource-selector-order li');
+    assert.match(await rows.nth(0).innerText(), /Beta account/);
+    await page.getByRole('button', { name: '提高 Alpha account 的优先级', exact: true }).focus();
+    await page.keyboard.press('Enter');
+    assert.match(await rows.nth(0).innerText(), /Alpha account/);
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.locator('.group-strategy-editor').evaluate(element => { element.style.width = '384px'; element.style.maxWidth = '100%'; });
+    const geometry = await rows.nth(0).evaluate(element => ({
+      rowHeight: element.getBoundingClientRect().height,
+      nameWidth: element.querySelector('.resource-selector-name')!.getBoundingClientRect().width,
+    }));
+    assert.ok(geometry.nameWidth >= 200, 'account names remain readable inside a narrow desktop form column');
+    assert.ok(geometry.rowHeight < 180, 'account labels must not wrap into a vertical column of single characters');
+    await page.setViewportSize({ width: 390, height: 844 });
+    const save = page.getByRole('button', { name: '保存组策略', exact: true });
+    await save.click();
+    await page.getByText('暂时无法保存策略。请重试，已填写的内容会保留。').waitFor();
+    assert.equal(await rows.count(), 2);
+    assert.deepEqual(writes[0].routing_strategy.config, { ordered: ['alpha', 'beta'] });
+    await page.getByRole('button', { name: 'Remove Beta membership' }).click();
+    await page.getByText('请移除列表中已不可用的账号，再保存策略。').waitFor();
+    assert.equal(await save.isDisabled(), true);
+    await page.getByRole('button', { name: '移除 账号已不在可用成员中', exact: true }).click();
+    await save.click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[1].routing_strategy.config, { ordered: ['alpha'] });
+    await page.getByLabel('重叠组优先级', { exact: true }).fill('7');
+    await strategy.selectOption('');
+    await page.getByRole('button', { name: '恢复已保存的设置', exact: true }).click();
+    assert.equal(await strategy.inputValue(), 'arbitrary-plugin');
+    assert.equal(await page.getByLabel('重叠组优先级', { exact: true }).inputValue(), '0');
+    assert.match(await rows.nth(0).innerText(), /Alpha account/);
+    assert.equal(await rows.count(), 1);
+    assert.equal(await page.getByRole('button', { name: '恢复已保存的设置', exact: true }).count(), 0);
+    await strategy.selectOption('unknown-source');
+    await page.getByText('当前无法选择此类资源。请刷新页面或选择其他策略。').waitFor();
+    assert.equal(await save.isDisabled(), true, 'an unknown resource source cannot save even an empty selection');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('quota choice automatically configures a unique real window and maps one choice to both stored fields', { timeout: 45_000 }, async context => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+    context.skip('Chromium not installed'); return;
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address(); assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } });
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'zh-CN'));
+    const writes: Record<string, any>[] = [];
+    let multiple = false;
+    let failMetadata = false;
+    let emptyMetadata = false;
+    let releaseSlow!: () => void;
+    const slowAccounts = new Promise<void>(resolve => { releaseSlow = resolve; });
+    await page.route('**/internal/v1/**', async route => {
+      const url = route.request().url();
+      if (url.endsWith('/plugins/group-routing-strategies')) await route.fulfill({ json: [{ id: 'quota-order', version: 'group-routing-v1', default: { service: '', allowance: '' }, schema: {
+        type: 'object', title: '优先使用即将重置的账号', description: '优先使用额度即将重置的账号', properties: { service: { type: 'string' }, allowance: { type: 'string' } },
+        'x-resource-choice': { source: 'group-quota-windows', bindings: { service: 'provider', allowance: 'window_id' }, autoSelectSingle: true },
+      } }] });
+      else if (url.endsWith('/upstreams/quota/windows')) {
+        if (failMetadata) { await route.fulfill({ status: 503, json: { error: { message: 'unavailable' } } }); return; }
+        if (emptyMetadata) { await route.fulfill({ json: { results: [] } }); return; }
+        assert.deepEqual(route.request().postDataJSON(), { account_ids: ['alpha', 'beta', 'gamma'], tenant_external_id: 'tenant' });
+        await route.fulfill({ json: { results: ['alpha', 'beta', 'gamma'].map(upstream_account_id => ({ upstream_account_id, provider: 'openai-codex', windows: [{ id: 'code:primary_window', label: 'code:primary_window', period_seconds: 604800 }, ...(multiple ? [{ id: 'code:secondary_window', label: 'code:secondary_window', period_seconds: 18000 }] : [])] })) } });
+      } else if (url.includes('/quota?')) {
+        assert.ok(emptyMetadata, 'persisted windows configure directly');
+        const upstream_account_id = /upstreams\/([^/]+)\/quota/.exec(url)![1];
+        if (upstream_account_id !== 'alpha') await slowAccounts;
+        await route.fulfill({ json: { upstream_account_id, provider: 'openai-codex', windows: [{ id: 'code:primary_window', label: 'code:primary_window', period_seconds: 604800 }] } });
+      } else if (url.endsWith('/upstreams/quota/batch')) {
+        throw new Error('Window discovery publishes each account result independently');
+      } else if (route.request().method() === 'PUT') {
+        writes.push(route.request().postDataJSON());
+        await route.fulfill({ json: { id: 'group', name: 'Group', member_ids: ['alpha', 'beta', 'gamma'], member_count: 3, created_at: 1, updated_at: 2,
+          strategy_version: 3, routing_strategy: writes.at(-1)?.routing_strategy, routing_priority: 0 } });
+      } else await route.fulfill({ json: [] });
+    });
+    const url = `http://127.0.0.1:${address.port}/e2e/fixtures/group-strategy.html?resources`;
+    await page.goto(url);
+    await page.getByRole('combobox', { name: '组路由策略', exact: true }).selectOption('quota-order');
+    const choice = page.getByRole('combobox', { name: '优先使用的额度', exact: true });
+    await page.waitForFunction(() => document.querySelector<HTMLSelectElement>('.schema-resource-choice select')?.selectedOptions[0]?.textContent === 'Codex · 周额度');
+    assert.equal(await page.locator('.group-strategy-editor input:not([type="hidden"]):not([type="number"])').count(), 0);
+    await page.getByRole('button', { name: '查看分配方式' }).hover();
+    await page.getByRole('tooltip').filter({ hasText: '优先使用额度即将重置的账号' }).waitFor();
+    await page.getByRole('button', { name: '保存组策略', exact: true }).click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[0].routing_strategy.config, { service: 'openai-codex', allowance: 'code:primary_window' });
+    multiple = true; await page.goto(url);
+    await page.getByRole('combobox', { name: '组路由策略', exact: true }).selectOption('quota-order');
+    await choice.selectOption({ label: 'Codex · 5 小时额度' });
+    await page.getByRole('button', { name: '保存组策略', exact: true }).click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[1].routing_strategy.config, { service: 'openai-codex', allowance: 'code:secondary_window' });
+    failMetadata = true;
+    await page.getByRole('button', { name: 'Remove Beta membership' }).click();
+    await page.getByText('额度读取失败，请重试。').waitFor();
+    assert.match(await choice.locator('option:checked').innerText(), /Codex/);
+    await page.getByLabel('重叠组优先级', { exact: true }).fill('5');
+    await page.getByRole('button', { name: '保存组策略', exact: true }).click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[2].routing_strategy.config, { service: 'openai-codex', allowance: 'code:secondary_window' });
+    assert.equal(writes[2].routing_priority, 5);
+    failMetadata = false; emptyMetadata = true; multiple = false;
+    await page.goto(url);
+    await page.getByRole('combobox', { name: '组路由策略', exact: true }).selectOption('quota-order');
+    await page.waitForFunction(() => document.querySelector<HTMLSelectElement>('.schema-resource-choice select')?.selectedOptions[0]?.textContent === 'Codex · 周额度');
+    await page.getByRole('button', { name: '保存组策略', exact: true }).click();
+    await page.getByText('组策略已保存', { exact: true }).waitFor();
+    assert.deepEqual(writes[3].routing_strategy.config, { service: 'openai-codex', allowance: 'code:primary_window' });
+    releaseSlow();
+    await page.waitForFunction(() => !document.querySelector('.schema-resource-choice [role="status"]'));
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+  } finally { await browser.close(); await server.close(); }
+});

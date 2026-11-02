@@ -50,7 +50,7 @@ pub(in crate::api) use quota::{
     confirm_quota_reset, current_quota_reset, get_quota_reset, prepare_quota_reset,
     reconcile_quota_reset,
 };
-pub(in crate::api) use quota::{upstream_quota, upstream_quota_batch};
+pub(in crate::api) use quota::{upstream_quota, upstream_quota_batch, upstream_quota_windows};
 
 pub(in crate::api) use oauth::{
     disconnect_upstream_oauth, poll_codex_oauth, poll_cursor_oauth, refresh_upstream_oauth,
