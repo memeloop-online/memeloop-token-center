@@ -280,7 +280,7 @@ async function assertAccountDirectoryReturn(page: Page) {
   }), true, 'keyboard navigation can enter the returned account page');
 }
 
-test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissions and bounded exit', { timeout: 120_000 }, async context => {
+test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissions and bounded exit', { timeout: 180_000 }, async context => {
   const root = fileURLToPath(new URL('..', import.meta.url));
   const server = await createIsolatedFixtureServer({ root, configFile: false, logLevel: 'silent', plugins: [operatorFixturePlugin('/e2e/fixtures/transport-proxy-groups.html')], server: { host: '127.0.0.1', port: 0 } });
   await server.listen();
@@ -580,6 +580,34 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await page.close();
     });
 
+    await context.test('a group accepts a fifth exit with the same required fields and one atomic save', async () => {
+      for (const locale of ['zh-CN', 'en']) {
+        const copy = transportProxyGroupCopy(locale);
+        const page = await prepare(true, locale);
+        await page.getByRole('button', { name: copy.create, exact: true }).click();
+        await page.getByRole('textbox', { name: fieldLabel(copy.name) }).fill(locale === 'zh-CN' ? '研发备用组' : 'Research backups');
+        for (let index = 0; index < 5; index += 1) {
+          if (index > 0) await page.getByRole('button', { name: copy.addMember, exact: true }).click();
+          await page.getByRole('textbox', { name: fieldLabel(copy.memberName) }).last().fill(`${locale === 'zh-CN' ? '出口' : 'Exit'} ${index + 1}`);
+          await page.getByLabel(copy.requiredAddress, { exact: true }).last().fill(`socks5h://10.20.30.${40 + index}:1080`);
+        }
+        assert.equal(await page.getByRole('textbox', { name: fieldLabel(copy.memberName) }).count(), 5);
+        assert.equal(await page.getByRole('button', { name: copy.addMember, exact: true }).isEnabled(), true);
+        assert.equal(await page.getByRole('button', { name: copy.save, exact: true }).isEnabled(), true);
+        await captureNavigationIdentity(page, 'proxy-groups', 'five-member-draft', locale);
+        await page.getByRole('button', { name: copy.save, exact: true }).click();
+        await page.getByText(copy.saved, { exact: true }).waitFor();
+        const writes = await page.evaluate(() => window.proxyGroupFixture.writes);
+        assert.equal(writes.length, 1);
+        assert.equal(writes[0].method, 'POST');
+        assert.equal(writes[0].body.members.length, 5);
+        assert.deepEqual(writes[0].body.members[4], {
+          label: `${locale === 'zh-CN' ? '出口' : 'Exit'} 5`, proxy_url: 'socks5h://10.20.30.44:1080',
+        });
+        await page.close();
+      }
+    });
+
     await context.test('standalone network exits show real health, success rates, traffic and concurrency in both languages', async () => {
       for (const locale of ['zh-CN', 'en']) {
         const copy = networkProxyCopy(locale);
@@ -597,6 +625,9 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         assert.match(details, /16,384 B/);
         assert.match(details, new RegExp(`${copy.concurrency}: 1`));
         assert.match(details, new RegExp(`${copy.healthTitle}: ${copy.health.healthy}`));
+        assert.ok(details.includes(copy.trafficTitle));
+        assert.ok(details.includes(copy.trafficBasis));
+        assert.ok(details.includes(copy.trafficDetails));
         await captureNavigationIdentity(page, 'proxy-groups', 'network-exits-details', locale);
         await workspace.getByRole('button', { name: copy.edit('CSIL'), exact: true }).click();
         const address = workspace.locator('.proxy-address-input');

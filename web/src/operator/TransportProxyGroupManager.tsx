@@ -129,7 +129,7 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
   const pendingWrite = useRef<AbortController | null>(null);
   const feedback = useRef<HTMLDivElement>(null);
   const query = `?${new URLSearchParams({ tenant_external_id: tenant })}`;
-  const validMembers = members.length >= 1 && members.length <= 4 && members.every(member => member.label.trim()
+  const validMembers = members.length >= 1 && members.every(member => member.label.trim()
     && (member.id && !member.proxyUrl.trim() || member.proxyUrl.trim().startsWith('socks5h://')));
   const probeAttemptCount = Number(probeAttempts);
   const validProbe = Number.isInteger(probeAttemptCount) && probeAttemptCount >= 1 && probeAttemptCount <= 8
@@ -302,7 +302,7 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
           </FormSection>;
           })}
           <p>{copy.addressHint}</p>
-          <Button type="button" disabled={members.length >= 4} onClick={() => setMembers(current => [...current, newMember()])}>{copy.addMember}</Button>
+          <Button type="button" onClick={() => setMembers(current => [...current, newMember()])}>{copy.addMember}</Button>
           <Field label={copy.probeUrl}><Input maxLength={200} value={probeUrl} onChange={(_, data) => setProbeUrl(data.value)} placeholder="https://example.com/" /></Field>
           <Field label={copy.probeAttempts}><Input type="number" required min={1} max={8} value={probeAttempts} onChange={(_, data) => setProbeAttempts(data.value)} /></Field>
           <p>{copy.probeHint}</p>

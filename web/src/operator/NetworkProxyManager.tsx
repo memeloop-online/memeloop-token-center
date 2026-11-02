@@ -288,6 +288,7 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
                     <p>{copy.recordedAttempts}: {detail.observations.traffic.recorded_attempts ?? 0} · {copy.requestBytes}: {egressBytes(detail.observations.traffic.request_payload_bytes, locale)} · {copy.responseBytes}: {egressBytes(detail.observations.traffic.response_payload_bytes, locale)}</p>
                   </>}
                   <p className="muted">{copy.trafficBasis}</p>
+                  <p className="muted">{copy.trafficDetails}</p>
                   <Button type="button" disabled={detail.loading} onClick={() => void loadDetails(proxy)}>{copy.refreshDetails}</Button>
                 </>}
               </Disclosure>
