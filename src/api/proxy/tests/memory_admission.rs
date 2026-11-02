@@ -1,6 +1,140 @@
 use super::*;
 
 #[tokio::test]
+async fn completed_chunked_responses_release_maximum_before_financial_receipts() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let fixture = codex_route_fixture("chunked-response-envelope").await;
+    let held = fixture.state.pending_terminals.hold_writer_for_test().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let app = axum::Router::new().route(
+        codex_transport::RESPONSES_PATH,
+        axum::routing::post(move |body: Bytes| {
+            let observed = observed.clone();
+            async move {
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(request["stream"], true);
+                let number = observed.fetch_add(1, Ordering::Relaxed) + 1;
+                let sse = completed_codex_sse("small complete response")
+                    .replace("resp-codex", &format!("resp-memory-{number}"));
+                Response::builder()
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from_stream(futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(Bytes::from(sse))
+                    })))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let mut delivered = Vec::new();
+    for number in 1..=2 {
+        let request = json!({"model":fixture.model,"input":format!("retained terminal {number}"),"stream":false});
+        let response = tokio::time::timeout(
+            Duration::from_secs(3),
+            send_codex_route_to_endpoint(
+                &fixture,
+                endpoint.clone(),
+                "/v1/responses",
+                request.clone(),
+            ),
+        )
+        .await
+        .expect("the next response must precede financial receipt release");
+        assert_eq!(response.status(), StatusCode::OK);
+        let request_id =
+            Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(response["id"], format!("resp-memory-{number}"));
+        let rows = fixture
+            .state
+            .db
+            .list_requests(fixture.key_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), number);
+        assert!(rows.iter().all(|row| row.completed_at.is_none()));
+        let used = fixture.state.proxy_memory_budget.snapshot().0;
+        assert!(
+            used > 0 && used < 16 * 1024 * 1024,
+            "actual retained bytes remain charged: {used}"
+        );
+        delivered.push((request_id, request, body));
+    }
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    drop(held);
+    wait_for_request_settlement(&fixture, 2).await;
+    for (index, (request_id, request, body)) in delivered.into_iter().enumerate() {
+        assert_exactly_once_side_effects(
+            &fixture,
+            request_id,
+            Some(&format!("resp-memory-{}", index + 1)),
+        )
+        .await;
+        let refs = fixture
+            .state
+            .db
+            .request_archive_refs(fixture.key_id, request_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            refs.request_archive_state,
+            crate::model::RequestArchiveState::Bound
+        );
+        assert_eq!(
+            refs.response_archive_state,
+            crate::model::RequestArchiveState::Bound
+        );
+        let original = serde_json::to_vec(&request).unwrap();
+        let captured = fixture
+            .state
+            .archive
+            .get(&refs.request_object)
+            .await
+            .unwrap();
+        assert_eq!(captured.as_ref(), original.as_slice());
+        assert_eq!(blake3::hash(&captured), blake3::hash(&original));
+        let captured = fixture
+            .state
+            .archive
+            .get(refs.response_object.as_deref().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(captured, body);
+        assert_eq!(blake3::hash(&captured), blake3::hash(&body));
+        assert!(
+            !fixture
+                .state
+                .db
+                .session_body_locators(request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .pending
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture.state.proxy_memory_budget.snapshot().0 != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("completed request owners release their actual byte reservations");
+    assert_eq!(fixture.state.proxy_memory_budget.snapshot().2, 0);
+    upstream.abort();
+    let _ = upstream.await;
+}
+
+#[tokio::test]
 async fn source_backed_conversation_releases_all_raw_request_permits() {
     use axum::body::Body;
 

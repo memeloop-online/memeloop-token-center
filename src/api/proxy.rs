@@ -670,6 +670,9 @@ async fn finish_non_sse_proxy_response(
             crate::model::RequestUsageBasis::NotObserved,
         )
     };
+    buffered_request
+        .memory
+        .shrink_buffered_response(&response_body);
     let mut result = finish_buffered_request(
         buffered_request,
         status,
@@ -2050,6 +2053,9 @@ async fn proxy_with_cancellation_guard(
             buffered
         };
         buffer_phase.finish("completed", Some(200), Some(buffered.body.len()));
+        buffered_request
+            .memory
+            .shrink_buffered_response(&buffered.body);
         let result = finish_buffered_request(
             &buffered_request,
             StatusCode::OK,
@@ -2947,6 +2953,7 @@ async fn execute_component_provider(
         .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
         .map(|(_, value)| value.as_str())
         .unwrap_or("application/json");
+    request.memory.shrink_buffered_response(&normalized.body);
     let result = finish_buffered_request(
         &request,
         status,

@@ -119,7 +119,7 @@ pub struct AppState {
     pub(crate) pinned_application_plugins:
         Option<Arc<plugin::application::ApplicationPluginSnapshot>>,
     pub metrics: metrics::Metrics,
-    pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
+    pub(crate) request_event_streams: request_event_stream::RequestEventStreams,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
@@ -303,7 +303,7 @@ impl AppState {
             #[cfg(feature = "experimental-plugin-revisions")]
             pinned_application_plugins: None,
             metrics: metrics::Metrics::default(),
-            request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
+            request_event_streams: request_event_stream::RequestEventStreams::default(),
             upstream_quota: Arc::new(upstream_quota::QuotaCache::default()),
             gateway_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 gateway_body_read_concurrency,
