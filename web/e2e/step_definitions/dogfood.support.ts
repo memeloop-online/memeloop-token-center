@@ -191,8 +191,10 @@ export async function submitPortalGeneration(
 
 export async function waitForGenerationStatus(page: Page, generationModel: string, status: string): Promise<Locator> {
   const row = generationTableFor(page).locator('tbody tr').filter({ hasText: generationModel }).first();
-  await eventually(async () => assert.ok(((await row.textContent()) ?? '').includes(status)), 45_000,
-    `${generationModel} did not reach ${status} through portal polling`);
+  await eventually(async () => {
+    const observed = (await row.textContent()) ?? '';
+    assert.ok(observed.includes(status), `observed generation row: ${observed}`);
+  }, 45_000, `${generationModel} did not reach ${status} through portal polling`);
   return row;
 }
 

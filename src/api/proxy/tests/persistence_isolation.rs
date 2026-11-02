@@ -14,6 +14,7 @@ async fn deferred_persistence_normal_failure_and_saturation_preserve_forwarding(
         "pool_closed",
     ] {
         for stream in [false, true] {
+            eprintln!("persistence archive scenario: {mode}, stream={stream}");
             let fixture = codex_route_fixture(&format!("persistence-{mode}-{stream}")).await;
             let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
             let release = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -343,5 +344,88 @@ async fn pending_response_archive_begin_does_not_hold_first_byte_or_eof() {
     .expect("paused archive must not retain forwarding memory");
     assert!(fixture.state.persistence.stream_memory.snapshot().0 > 0);
     release.send(()).unwrap();
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn buffered_capture_capacity_gap_preserves_delivery_source_and_settlement_once() {
+    let fixture = codex_route_fixture("buffered-capture-capacity-gap").await;
+    let held = fixture
+        .state
+        .persistence
+        .hold_capture_capacity_for_test()
+        .await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            completed_codex_sse("complete at archive capacity"),
+            "text/event-stream",
+        ))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let request =
+        json!({"model": fixture.model, "input": "preserve complete request", "stream": false});
+    let response = tokio::time::timeout(
+        Duration::from_secs(2),
+        send_codex_route(&fixture, &upstream, "/v1/responses", request.clone()),
+    )
+    .await
+    .expect("capture capacity must not queue the model request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&delivered).unwrap()["output"][0]["content"][0]["text"],
+        "complete at archive capacity"
+    );
+    wait_for_request_settlement(&fixture, 1).await;
+    drop(held);
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_archive_state,
+        crate::model::RequestArchiveState::Bound
+    );
+    assert_eq!(
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert_eq!(
+        refs.response_object,
+        Some(format!("gap://{}/response/capacity", rows[0].request_id))
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .session_body_locators(rows[0].request_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .pending
+    );
+    let original = serde_json::to_vec(&request).unwrap();
+    let captured = fixture
+        .state
+        .archive
+        .get(&refs.request_object)
+        .await
+        .unwrap();
+    assert_eq!(captured.as_ref(), original.as_slice());
+    assert_eq!(blake3::hash(&captured), blake3::hash(&original));
     upstream.verify().await;
 }

@@ -208,7 +208,9 @@ async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queu
     let release = store.pause_next_write();
     let admission =
         RequestSpoolAdmission::new(directory.path().to_owned()).with_memory_store(store.clone());
-    let budget = ProxyMemoryBudget::new(192 * 1024);
+    // Ingress charges three bytes per retained byte. The first 128 KiB body
+    // fits; the second 256 KiB body must spill while the first upload waits.
+    let budget = ProxyMemoryBudget::new(576 * 1024);
     let memory = budget.reservation();
     let first = Arc::new(
         admission

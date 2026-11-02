@@ -3304,8 +3304,22 @@ async fn finish_buffered_request_before_deadline(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
-    let stored_response =
+    let mut stored_response =
         inline_response_object.unwrap_or_else(|| format!("gap://{request_id}/response"));
+    if archive_response
+        && !persistence::capture(
+            request.state,
+            crate::db::ArchiveSpoolIdentity {
+                request_id,
+                tenant_id: request.tenant_id,
+                reservation_id: request.reservation.id,
+            },
+            crate::response_archive_spool::BufferedArchivePurpose::Response,
+            body.clone(),
+        )
+    {
+        stored_response = format!("gap://{request_id}/response/capacity");
+    }
     let routing_session_id = request
         .conversation
         .as_ref()
@@ -3363,18 +3377,6 @@ async fn finish_buffered_request_before_deadline(
             %request_id,
             error_category = error.diagnostic_category(),
             "runtime terminal was not durable before the client response returned"
-        );
-    }
-    if archive_response {
-        persistence::capture(
-            request.state,
-            crate::db::ArchiveSpoolIdentity {
-                request_id,
-                tenant_id: request.tenant_id,
-                reservation_id: request.reservation.id,
-            },
-            crate::response_archive_spool::BufferedArchivePurpose::Response,
-            body.clone(),
         );
     }
     if let Some(identity) = request.session_preference {

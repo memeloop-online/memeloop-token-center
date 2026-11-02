@@ -717,11 +717,16 @@ fn builtin_codex_routes_openai_and_verified_image_generation() {
             .pointer("/properties/transport_policy/properties/responses_output_limits/default"),
         Some(&json!("provider_default"))
     );
+    assert!(
+        codex
+            .config_schema
+            .pointer("/properties/transport_policy/properties/failover_deadline_millis")
+            .is_none()
+    );
     for (field, bound, expected) in [
         ("version", "enum", json!([1])),
         ("candidate_attempts", "minimum", json!(1)),
         ("candidate_attempts", "maximum", json!(8)),
-        ("failover_deadline_millis", "maximum", json!(300000)),
         ("max_sse_event_bytes", "default", json!(8388608)),
         ("max_sse_event_bytes", "maximum", json!(16777216)),
         ("max_sse_framed_bytes", "maximum", json!(16842752)),

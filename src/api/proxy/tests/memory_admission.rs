@@ -277,7 +277,7 @@ async fn concurrent_large_streams_dispatch_while_buffered_partition_is_busy() {
 async fn executed_response_rejects_memory_without_waiting_or_replaying_upstream() {
     let fixture = std::sync::Arc::new(codex_route_fixture("response-memory-reject").await);
     let held = fixture.state.proxy_memory_budget.reservation();
-    let ingress_allowance = fixture.state.config.responses_body_max_bytes as usize * 3;
+    let ingress_allowance = 4 * 1024 * 1024;
     assert!(held.try_grow(
         fixture.state.config.proxy_memory_budget_bytes as usize - ingress_allowance,
         1,
@@ -287,6 +287,7 @@ async fn executed_response_rejects_memory_without_waiting_or_replaying_upstream(
     // or a one-unit reservation would succeed in the freed capacity.
     let output_len = ingress_allowance / 3 / 2 + 64 * 1024;
     let upstream_body = completed_codex_sse(&"x".repeat(output_len));
+    assert!(upstream_body.len() <= MAX_PROXY_RESPONSE_BODY);
     assert!(
         upstream_body
             .len()

@@ -260,9 +260,9 @@ async fn native_compaction_waits_without_a_gateway_or_account_read_deadline() {
 }
 
 #[tokio::test]
-async fn ordinary_codex_headers_outlive_selection_and_settle_once_without_standby_replay() {
+async fn ordinary_codex_headers_outlive_connect_deadline_and_settle_once_without_standby_replay() {
     let fixture = codex_route_fixture("ordinary-selection-deadline").await;
-    set_policy(&fixture, json!({"failover_deadline_millis": 1000})).await;
+    set_policy(&fixture, json!({"connect_timeout_millis": 1000})).await;
     add_codex_standby_route(
         &fixture,
         "codex-route-ordinary-selection-deadline",

@@ -6,7 +6,8 @@ pub(super) async fn assert_unknown_request(
     active_owners: usize,
 ) {
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    tokio::time::timeout(Duration::from_secs(3), async {
+    let mut last_state = String::new();
+    let completed = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let row = sqlx::query(
                 "SELECT q.completed_at, q.status_code, r.status AS reservation_status, r.actual_micros, \
@@ -27,6 +28,10 @@ pub(super) async fn assert_unknown_request(
             .fetch_one(&pool)
             .await
             .unwrap();
+            last_state = format!("state={}, unknown={:?}, reservation={}, active={}, operational={:?}, financial={:?}",
+                row.get::<String, _>("state"), row.get::<Option<String>, _>("unknown_reason"),
+                row.get::<String, _>("reservation_status"), fixture.state.proxy_lifecycles.active(),
+                row.get::<Option<i64>, _>("operational_completed"), row.get::<Option<i64>, _>("completed_at"));
             if row.get::<Option<String>, _>("unknown_reason").as_deref()
                 == Some("authoritative_usage_unavailable")
                 && fixture.state.proxy_lifecycles.active() == active_owners
@@ -71,8 +76,11 @@ pub(super) async fn assert_unknown_request(
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .expect("unknown responsibility must retain the hold without financial effects and release the owner");
+    .await;
+    assert!(
+        completed.is_ok(),
+        "unknown responsibility must retain the hold without financial effects and release the owner: {last_state}"
+    );
     pool.close().await;
 }
 

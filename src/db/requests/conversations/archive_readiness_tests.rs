@@ -177,6 +177,8 @@ impl Fixture {
             })
             .await
             .unwrap();
+        state.responses_request_spool.drain_uploads_for_test().await;
+        state.db.drain_gateway_persistence_for_test().await;
         let terminal_owner = Uuid::now_v7();
         assert!(
             state
@@ -268,7 +270,14 @@ impl Fixture {
             (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
             (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
         ] {
-            assert!(response_archive_spool::capture_buffered(&self.state, self.identity, purpose, body).await);
+            let archive = response_archive_spool::BufferedArchive::new(
+                self.identity,
+                purpose,
+                &body,
+                self.state.config.key_pepper.as_bytes(),
+                self.state.config.archive_spool_compression_enabled,
+            ).unwrap();
+            assert!(self.state.db.capture_deferred_archive(&archive).await.unwrap());
         }
     }
 

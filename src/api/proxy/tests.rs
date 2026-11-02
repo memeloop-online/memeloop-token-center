@@ -4479,10 +4479,8 @@ async fn codex_buffered_route_accepts_valid_sse_without_content_type() {
 }
 
 #[tokio::test]
-async fn buffered_text_response_survives_total_archive_failure_with_durable_pending_bodies() {
+async fn buffered_text_response_upload_retry_restores_full_archive_and_settles_once() {
     let fixture = codex_route_fixture("buffered-archive-gap").await;
-    std::fs::remove_dir_all(&fixture.archive_path).unwrap();
-    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
     let upstream = MockServer::start().await;
     let sse = completed_codex_sse("delivered despite archive failure");
     Mock::given(method("POST"))
@@ -4494,9 +4492,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
         .mount(&upstream)
         .await;
 
-    // This test requires exact durable bodies for the later upload retry.
-    // Finish optional database capture before SQLite settlement can race its
-    // bounded writer; the unavailable object backend is still exercised below.
+    // Preserve source and response capture before injecting an upload outage.
     let response = fixture
         .state
         .db
@@ -4547,7 +4543,7 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     );
     assert_eq!(
         refs.request_archive_state,
-        crate::model::RequestArchiveState::Capturing
+        crate::model::RequestArchiveState::Bound
     );
     assert_eq!(
         refs.response_archive_state,
@@ -4561,11 +4557,12 @@ async fn buffered_text_response_survives_total_archive_failure_with_durable_pend
     assert!(detail.archive.response.reason.is_none());
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
 
-    // An unavailable object backend did not gate HTTP delivery. Exercise its
-    // retryable failure, restore it, then recover both exact durable bodies.
-    crate::response_archive_spool::process_one_for_test(&fixture.state).await;
+    let saved_archive = fixture.archive_path.with_extension("source-backup");
+    std::fs::rename(&fixture.archive_path, &saved_archive).unwrap();
+    std::fs::write(&fixture.archive_path, b"archive backend unavailable").unwrap();
+    assert!(crate::response_archive_spool::process_one_for_test(&fixture.state).await);
     std::fs::remove_file(&fixture.archive_path).unwrap();
-    std::fs::create_dir_all(&fixture.archive_path).unwrap();
+    std::fs::rename(saved_archive, &fixture.archive_path).unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("UPDATE request_archive_spools SET next_attempt_at = 0 WHERE state = 'pending'")
         .execute(&pool)
@@ -5160,7 +5157,7 @@ async fn streaming_text_delivery_does_not_wait_for_an_unavailable_archive_worker
 }
 
 #[tokio::test]
-async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream() {
+async fn full_response_archive_budget_preserves_request_source_and_dispatches_once() {
     let fixture = codex_route_fixture("archive-capacity-degradation").await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query(
@@ -5218,8 +5215,8 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(gap.get::<String, _>("state"), "gap");
-    assert_eq!(gap.get::<String, _>("gap_reason"), "capacity");
+    assert_eq!(gap.get::<String, _>("state"), "bound");
+    assert!(gap.get::<Option<String>, _>("gap_reason").is_none());
     assert_eq!(
         gap.get::<i64, _>("body_byte_count"),
         request_bytes.len() as i64
@@ -5230,6 +5227,30 @@ async fn full_archive_budget_records_request_gap_and_still_dispatches_upstream()
     );
     assert_eq!(gap.get::<i64, _>("cipher_bytes"), 0);
     assert!(gap.get::<Option<i64>, _>("cleaned_at").is_some());
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        refs.request_archive_state,
+        crate::model::RequestArchiveState::Bound
+    );
+    assert_eq!(
+        refs.response_archive_state,
+        crate::model::RequestArchiveState::Gap
+    );
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get(&refs.request_object)
+            .await
+            .unwrap()
+            .as_ref(),
+        request_bytes.as_slice()
+    );
     upstream.verify().await;
     pool.close().await;
 }

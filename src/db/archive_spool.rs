@@ -1574,6 +1574,14 @@ async fn emit_response_archive_gap_without_spool_in_transaction(
     // A failed first insert leaves no spool audit row. Record the response
     // terminal fence on its request owner so session projection can distinguish
     // this outcome from a writer that is still acquiring database capacity.
+    let existing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spools WHERE request_id = $1")
+            .bind(identity.request_id.to_string())
+            .fetch_one(&mut **tx)
+            .await?;
+    if existing != 0 {
+        return Ok(());
+    }
     let owner = sqlx::query("SELECT r.tenant_id, locator.key_id FROM request_records r JOIN request_record_locators locator ON locator.id = r.id AND locator.tenant_id = r.tenant_id WHERE r.id = $1 AND r.tenant_id = $2 AND r.reservation_id = $3 AND (r.response_object IS NULL OR r.response_object = $4) AND NOT EXISTS (SELECT 1 FROM response_archive_spools s WHERE s.request_id = r.id) AND NOT EXISTS (SELECT 1 FROM request_events e WHERE e.request_id = r.id AND e.tenant_id = r.tenant_id AND e.event_kind = 'archive_gap' AND e.error_code = 'response_capture_failed')")
         .bind(identity.request_id.to_string())
         .bind(identity.tenant_id.to_string())

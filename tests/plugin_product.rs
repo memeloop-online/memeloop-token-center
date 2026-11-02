@@ -706,7 +706,7 @@ async fn epoch_timeout_interrupts_a_guest_even_with_effectively_unlimited_fuel()
 }
 
 #[tokio::test]
-async fn component_prepare_trap_fuel_and_32_mib_memory_limit_fail_closed() {
+async fn component_prepare_trap_explicit_fuel_and_memory_limit_fail_closed() {
     for (id, body) in [
         ("prepare-trap", "unreachable"),
         (
@@ -716,10 +716,10 @@ async fn component_prepare_trap_fuel_and_32_mib_memory_limit_fail_closed() {
         (
             "prepare-memory",
             r#"
-            i32.const 600
+            i32.const 9000
             memory.grow
             drop
-            i32.const 40000000
+            i32.const 600000000
             i32.load
             drop
             i32.const 768
@@ -730,8 +730,9 @@ async fn component_prepare_trap_fuel_and_32_mib_memory_limit_fail_closed() {
         let plugins = directory.path().join("plugins");
         fs::create_dir(&plugins).unwrap();
         write_component_provider_package(&plugins, id, &core_wat_with_body("PREPARE", body), 1024);
-        let runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
+        let mut runtime = PluginRuntime::load(plugins.to_str(), database(directory.path()).await)
             .expect("load component failure fixture");
+        runtime.set_execution_limits_for_tests(Duration::from_secs(2), 5_000_000);
         let error = runtime
             .prepare_provider_request(
                 &format!("{id}-provider"),
@@ -823,7 +824,7 @@ async fn component_streaming_normalize_trap_and_oversize_boundaries_fail_closed(
             )
             .expect_err("normalize trap must reject the response")
             .to_string()
-            .contains("normalize-trap")
+            .contains("plugin_execution_failed")
     );
 
     fs::remove_dir_all(&plugins).unwrap();

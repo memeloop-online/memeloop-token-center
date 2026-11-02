@@ -47,7 +47,23 @@ impl Persistence {
     }
 
     #[cfg(test)]
+    pub(crate) async fn hold_capture_capacity_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.bytes
+            .clone()
+            .acquire_many_owned(BYTES as u32)
+            .await
+            .unwrap()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn drain_for_test(&self) {
+        let _bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.bytes.acquire_many(BYTES as u32),
+        )
+        .await
+        .expect("bounded capture memory drain")
+        .unwrap();
         let _permits =
             tokio::time::timeout(Duration::from_secs(5), self.jobs.acquire_many(JOBS as u32))
                 .await
@@ -61,6 +77,38 @@ impl Persistence {
         operation: impl std::future::Future<Output = Result<(), AppError>> + Send + 'static,
     ) -> bool {
         self.submit_with_headroom(bytes, 0, operation)
+    }
+
+    // Every capture owns at least 4 MiB from BYTES while queued or running.
+    // This bounds both retained bodies and tasks to 16; JOBS bounds execution.
+    // Dropping a task releases its byte permit and captured body together.
+    fn submit_capture(
+        self: &Arc<Self>,
+        bytes: usize,
+        operation: impl std::future::Future<Output = Result<(), AppError>> + Send + 'static,
+    ) -> bool {
+        let permit = u32::try_from(bytes)
+            .ok()
+            .and_then(|bytes| self.bytes.clone().try_acquire_many_owned(bytes).ok());
+        let Some(permit) = permit else {
+            self.record_capacity_gap();
+            return false;
+        };
+        let counters = self.clone();
+        self.accepted.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            let _bytes = permit;
+            let _job = counters.jobs.acquire().await.unwrap();
+            if let Err(error) = operation.await {
+                counters.record_failure_gap();
+                tracing::warn!(
+                    stage = "deferred_persistence",
+                    error_category = error.diagnostic_category(),
+                    "response archive capture failed"
+                );
+            }
+        });
+        true
     }
 
     pub(crate) fn submit_observation(
@@ -138,7 +186,7 @@ pub(super) fn capture(
     identity: crate::db::ArchiveSpoolIdentity,
     purpose: crate::response_archive_spool::BufferedArchivePurpose,
     body: Bytes,
-) {
+) -> bool {
     let background = state.clone();
     let nodes = crate::gateway_body::memory::JsonMemoryScanner::default().observe(&body);
     let charge = body
@@ -146,48 +194,68 @@ pub(super) fn capture(
         .saturating_mul(3)
         .saturating_add(nodes.saturating_mul(256))
         .saturating_add(4 * 1024 * 1024);
-    state.persistence.submit(charge, async move {
+    let operation = async move {
         let db = &background.persistence_db;
         if purpose == crate::response_archive_spool::BufferedArchivePurpose::Request {
             if let Err(error) = db.publish_proxy_started_event(identity).await {
                 tracing::warn!(request_id = %identity.request_id, stage = "deferred_started_event", error_category = error.diagnostic_category(), "request event publication failed");
             }
             if body.len() > 16 * 1024 * 1024 {
-                background.metrics.record_request_archive_gap(crate::metrics::RequestArchiveGapReason::RetentionLimit);
-                return db.record_deferred_request_retention_gap(identity, &body).await;
+                background.metrics.record_request_archive_gap(
+                    crate::metrics::RequestArchiveGapReason::RetentionLimit,
+                );
+                return db
+                    .record_deferred_request_retention_gap(identity, &body)
+                    .await;
             }
         }
         let retained = archive_retention::prepare_json_body_if_valid(&body);
         let body = retained.as_ref().map_or_else(
-            || body.clone(), |retained| archive_retention::encode_json_body(&body, retained),
+            || body.clone(),
+            |retained| archive_retention::encode_json_body(&body, retained),
         );
         drop(retained);
         let archive = BufferedArchive::new(
-            identity, purpose, &body, background.config.key_pepper.as_bytes(),
+            identity,
+            purpose,
+            &body,
+            background.config.key_pepper.as_bytes(),
             background.config.archive_spool_compression_enabled,
         )?;
-        let captured = if purpose == crate::response_archive_spool::BufferedArchivePurpose::Response {
+        let captured = if purpose == crate::response_archive_spool::BufferedArchivePurpose::Response
+        {
             crate::response_archive_spool::retry_capture_database(&background, None, || {
                 db.capture_deferred_archive(&archive)
-            }).await
+            })
+            .await
         } else {
             db.capture_deferred_archive(&archive).await
         };
         match captured {
-            Ok(false) if purpose == crate::response_archive_spool::BufferedArchivePurpose::Request => {
-                background.metrics.record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity);
+            Ok(false)
+                if purpose == crate::response_archive_spool::BufferedArchivePurpose::Request =>
+            {
+                background
+                    .metrics
+                    .record_request_archive_gap(crate::metrics::RequestArchiveGapReason::Capacity);
             }
             Ok(false) => db.fail_response_archive_spool(identity, "capacity").await?,
             Err(error) => {
                 if purpose == crate::response_archive_spool::BufferedArchivePurpose::Response {
-                    db.fail_response_archive_spool(identity, "capture_failed").await?;
+                    db.fail_response_archive_spool(identity, "capture_failed")
+                        .await?;
                 }
                 return Err(error);
             }
             Ok(true) => {}
         }
         Ok(())
-    });
+    };
+    if purpose == crate::response_archive_spool::BufferedArchivePurpose::Response {
+        state.persistence.submit_capture(charge, operation)
+    } else {
+        state.persistence.submit(charge, operation)
+    }
 }
 
 #[cfg(test)]

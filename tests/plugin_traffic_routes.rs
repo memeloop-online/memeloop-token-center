@@ -1427,7 +1427,7 @@ async fn call(state: &AppState, key: &str, path: &str, body: Value) -> (StatusCo
 }
 
 #[tokio::test]
-async fn component_input_limit_returns_413_after_authentication_and_route_authorization() {
+async fn component_large_input_reaches_guest_after_authentication_and_route_authorization() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(500))
@@ -1454,8 +1454,8 @@ async fn component_input_limit_returns_413_after_authentication_and_route_author
     let length = 16 * 1024 * 1024 - 1;
     let overhead = serde_json::to_vec(&request).unwrap().len();
     request["prompt"] = json!("x".repeat(length - overhead));
-    // The image endpoint accepts this raw body, but its JSON plus authenticated
-    // context exceeds the component ABI limit. No guest/upstream may execute.
+    // The former 16 MiB boundary reaches the configured guest. Its trap stops
+    // upstream dispatch after authentication and route authorization.
     assert_eq!(serde_json::to_vec(&request).unwrap().len(), length);
     let (status, body) = call(
         &state,
@@ -1464,8 +1464,8 @@ async fn component_input_limit_returns_413_after_authentication_and_route_author
         request.clone(),
     )
     .await;
-    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    assert_eq!(body["error"]["code"], "plugin_input_too_large");
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(body["error"]["code"], "plugin_execution_failed");
     let (status, _) = call(
         &state,
         "invalid-test-key",
