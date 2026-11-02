@@ -9,6 +9,32 @@ use crate::{
 };
 use std::fs;
 
+fn quota_plugin(fixture: &ResilientRouteFixture) -> PluginRuntime {
+    let source = std::path::PathBuf::from(
+        std::env::var("MTC_SOONEST_RESET_PACKAGE").expect("real guest package required"),
+    );
+    let root = fixture._directory.path().join("preferred-plugins");
+    let package = root.join("mtc-soonest-reset");
+    fs::create_dir_all(&package).unwrap();
+    let manifest: Value =
+        serde_json::from_slice(&fs::read(source.join("plugin.json")).unwrap()).unwrap();
+    let mut files = vec!["plugin.json", "plugin.wasm"];
+    for ui in manifest["contributions"]["operator_ui"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(entry) = ui["module_entry"].as_str() {
+            files.push(entry);
+        }
+    }
+    for name in files {
+        fs::create_dir_all(package.join(name).parent().unwrap()).unwrap();
+        fs::copy(source.join(name), package.join(name)).unwrap();
+    }
+    PluginRuntime::load(root.to_str(), fixture.state.db.clone()).unwrap()
+}
+
 #[tokio::test]
 #[ignore = "requires MTC_SOONEST_RESET_PACKAGE built in CI"]
 async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_health() {
@@ -127,16 +153,7 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
         candidates[0].account_id, fixture.accounts[0],
         "the real native resolver must prefer the lower-priority-number route before quota ordering"
     );
-    let source = std::path::PathBuf::from(
-        std::env::var("MTC_SOONEST_RESET_PACKAGE").expect("real guest package required"),
-    );
-    let root = fixture._directory.path().join("preferred-plugins");
-    let package = root.join("mtc-soonest-reset");
-    fs::create_dir_all(&package).unwrap();
-    for name in ["plugin.json", "plugin.wasm"] {
-        fs::copy(source.join(name), package.join(name)).unwrap();
-    }
-    fixture.state.plugins = PluginRuntime::load(root.to_str(), fixture.state.db.clone()).unwrap();
+    fixture.state.plugins = quota_plugin(&fixture);
     crate::group_routing::prepare(
         &mut fixture.state,
         group.tenant_id,
@@ -242,4 +259,101 @@ async fn soonest_reset_real_gateway_uses_shared_evidence_and_preserves_native_he
         "known exhausted preferred account must not be contacted"
     );
     assert_eq!(native.received_requests().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires MTC_SOONEST_RESET_PACKAGE with remaining_balance built in CI"]
+async fn remaining_quota_real_gateway_distributes_requests_within_one_session() {
+    let high = MockServer::start().await;
+    let low = MockServer::start().await;
+    for upstream in [&high, &low] {
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(successful_chat_response())
+            .mount(upstream)
+            .await;
+    }
+    let label = "remaining-quota-same-session";
+    let mut fixture = resilient_route_fixture(label, &[(high.uri(), 0), (low.uri(), 0)]).await;
+    let tenant_external_id = format!("resilient-{label}");
+    let group = fixture
+        .state
+        .db
+        .create_group(
+            GroupKind::Provider,
+            CreateGroupInput {
+                tenant_external_id: tenant_external_id.clone(),
+                name: "Quota allocation".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let group = fixture
+        .state
+        .db
+        .replace_group_members(
+            GroupKind::Provider,
+            group.id,
+            ReplaceGroupMembersInput {
+                tenant_external_id: tenant_external_id.clone(),
+                member_ids: fixture.accounts.clone(),
+                expected_updated_at: group.updated_at,
+            },
+        )
+        .await
+        .unwrap();
+    fixture.state.db.update_group_routing_strategy(GroupKind::Provider, group.id, UpdateGroupRoutingStrategyInput {
+        tenant_external_id, expected_updated_at: group.updated_at, expected_strategy_version: group.strategy_version,
+        routing_strategy: Some(GroupRoutingStrategy { plugin_id: "mtc-soonest-reset".into(), config: json!({"target_provider":"http-json","target_window_id":"summary","mode":"remaining_balance"}) }), routing_priority: 0,
+    }).await.unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let rows = sqlx::query("SELECT route.id, route.upstream_account_id, account.credential_generation, account.updated_at FROM model_routes route JOIN upstream_accounts account ON account.id=route.upstream_account_id WHERE route.tenant_id=$1")
+        .bind(group.tenant_id.to_string()).fetch_all(&pool).await.unwrap();
+    for row in rows {
+        let route: String = row.get("id");
+        let account: String = row.get("upstream_account_id");
+        let generation: i64 = row.get("credential_generation");
+        let revision: i64 = row.get("updated_at");
+        sqlx::query("INSERT INTO model_route_included_provider_groups (tenant_id,model_route_id,provider_group_id,created_at) VALUES ($1,$2,$3,1)")
+            .bind(group.tenant_id.to_string()).bind(route).bind(group.id.to_string()).execute(&pool).await.unwrap();
+        let now = unix_millis();
+        let remaining = if account == fixture.accounts[0].to_string() {
+            0.8
+        } else {
+            0.4
+        };
+        let observation = json!({"account_id":account,"generation":generation,"config_revision":revision,"provider":"http-json","observed_at":now,"valid_until":now+300_000,
+            "windows":[{"id":"summary","period_seconds":604800,"reset_at":null,"reset_is_estimated":false,"remaining_fraction":remaining,"exhausted":false}]});
+        sqlx::query("INSERT INTO upstream_quota_observations (upstream_account_id,tenant_id,credential_generation,config_revision,observation_json,valid_until) VALUES ($1,$2,$3,$4,$5,$6)")
+            .bind(account).bind(group.tenant_id.to_string()).bind(generation).bind(revision).bind(observation.to_string()).bind(now+300_000).execute(&pool).await.unwrap();
+    }
+    fixture.state.plugins = quota_plugin(&fixture);
+    for _ in 0..96 {
+        let response = send_resilient_chat(&fixture, Some("one-shared-session"), false).await;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    }
+    let high_count = high.received_requests().await.unwrap().len();
+    let low_count = low.received_requests().await.unwrap().len();
+    assert_eq!(high_count + low_count, 96);
+    // Wide sampling tolerance; the guest's seeded distribution contract checks the exact ratio.
+    assert!(
+        (40..=85).contains(&high_count),
+        "high={high_count}, low={low_count}"
+    );
+    sqlx::query("UPDATE upstream_quota_observations SET valid_until=0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let response = send_resilient_chat(&fixture, Some("one-shared-session"), false).await;
+    let status = response.status();
+    let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        high.received_requests().await.unwrap().len()
+            + low.received_requests().await.unwrap().len(),
+        97
+    );
+    pool.close().await;
 }

@@ -590,7 +590,12 @@ async fn prepare_inner(
         }
         let input = GroupRoutingInput {
             tenant_id: tenant_id.to_string(),
-            seed,
+            seed: if native_health && quota_context.is_some() {
+                let digest = blake3::hash(request_id.as_bytes());
+                u64::from_le_bytes(digest.as_bytes()[..8].try_into().unwrap())
+            } else {
+                seed
+            },
             remaining_deadline_ms: remaining_deadline_ms
                 .saturating_sub(started.elapsed().as_millis() as u64),
             config: config.clone(),
