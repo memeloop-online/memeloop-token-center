@@ -297,7 +297,7 @@ test('quota choice automatically configures a unique real window and maps one ch
     assert.deepEqual(writes[1].routing_strategy.config, { service: 'openai-codex', allowance: 'code:secondary_window' });
     failMetadata = true;
     await page.getByRole('button', { name: 'Remove Beta membership' }).click();
-    await page.getByText('额度窗口读取失败，请重试。').waitFor();
+    await page.getByText('额度读取失败，请重试。').waitFor();
     assert.match(await choice.locator('option:checked').innerText(), /Codex/);
     await page.getByLabel('重叠组优先级', { exact: true }).fill('5');
     await page.getByRole('button', { name: '保存组策略', exact: true }).click();
