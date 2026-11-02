@@ -2480,6 +2480,107 @@ async fn refused_connection_fails_over_to_the_next_authorized_candidate() {
 }
 
 #[tokio::test]
+async fn cancellation_after_connect_failover_keeps_dispatched_candidate_finance_unknown() {
+    use tokio::io::AsyncReadExt as _;
+    let refused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let refused_uri = format!("http://{}", refused.local_addr().unwrap());
+    drop(refused);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dispatched_uri = format!("http://{}", listener.local_addr().unwrap());
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let accepted = tokio::spawn(async move {
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let count = connection.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "candidate must receive the complete request");
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = std::str::from_utf8(&bytes[..end]).unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().unwrap())
+                    })
+                    .expect("buffered request has a content length");
+                if bytes.len() >= end + 4 + length {
+                    let body = &bytes[end + 4..end + 4 + length];
+                    assert!(
+                        std::str::from_utf8(body)
+                            .unwrap()
+                            .contains("cancel after delivery")
+                    );
+                    received_tx.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    drop(connection);
+                    return;
+                }
+            }
+        }
+    });
+    let fixture = resilient_route_fixture(
+        "cancel-after-connect-failover",
+        &[(refused_uri, 0), (dispatched_uri, 10)],
+    )
+    .await;
+    let original = serde_json::to_vec(&json!({"model": fixture.model, "messages": [{"role": "user", "content": "cancel after delivery"}], "stream": false})).unwrap();
+    let request = Request::post("/v1/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+        .body(Body::from(original.clone()))
+        .unwrap();
+    let dispatched =
+        tokio::spawn(router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(request));
+    tokio::time::timeout(Duration::from_secs(3), received_rx)
+        .await
+        .expect("second candidate must receive the body")
+        .unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let request_id = rows[0].request_id;
+    dispatched.abort();
+    assert!(dispatched.await.unwrap_err().is_cancelled());
+    cancellation::assert_unknown_request_state(
+        &fixture.state,
+        &fixture.database_url,
+        fixture.key_id,
+        request_id,
+        0,
+    )
+    .await;
+    fixture
+        .state
+        .responses_request_spool
+        .drain_uploads_for_test()
+        .await;
+    fixture.state.db.drain_gateway_persistence_for_test().await;
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, request_id)
+        .await
+        .unwrap();
+    let captured = fixture
+        .state
+        .archive
+        .get(&refs.request_object)
+        .await
+        .unwrap();
+    assert_eq!(captured.as_ref(), original.as_slice());
+    assert_eq!(blake3::hash(&captured), blake3::hash(&original));
+    accepted.abort();
+    assert!(accepted.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
 async fn connection_closed_after_accept_is_not_replayed_to_a_standby() {
     use tokio::io::AsyncReadExt as _;
 

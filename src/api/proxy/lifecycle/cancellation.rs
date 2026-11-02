@@ -91,6 +91,8 @@ impl CancellationGuard {
             .await?;
         owner.reservation = request.reservation.clone();
         owner.stage = "upstream_response_headers";
+        // A fresh claim clears the previous attempt's non-delivery evidence
+        // before this candidate can send. Cancellation during send is unknown.
         owner.pending.register_claim(claim);
         let request_id = owner.context.request_id;
         if let Err(error) = owner
