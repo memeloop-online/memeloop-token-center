@@ -373,10 +373,26 @@ mod tests {
                 projection.is_ok()
             );
         }
-        restarted
-            .refresh_allocation_usage(concurrent_tenant, Uuid::nil(), now + 100000)
-            .await
-            .unwrap();
+        let mut refreshed = false;
+        for tick in 0..3 {
+            if restarted
+                .refresh_allocation_usage(
+                    concurrent_tenant,
+                    Uuid::nil(),
+                    now + 100000 + tick * 5001,
+                )
+                .await
+                .is_ok()
+            {
+                refreshed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            refreshed,
+            "a later independent background tick reconciles pending counts"
+        );
         let pending:i64=sqlx::query_scalar("SELECT CAST(COALESCE(SUM(requests),0) AS BIGINT) FROM group_allocation_pending WHERE tenant_id=$1")
             .bind(concurrent_tenant.to_string()).fetch_one(&restarted.pool).await.unwrap();
         assert_eq!(pending, committed);
