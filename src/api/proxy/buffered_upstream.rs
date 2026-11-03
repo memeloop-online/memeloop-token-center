@@ -102,7 +102,7 @@ pub(super) async fn read_bounded_upstream(
     maximum: usize,
     memory: &crate::gateway_body::memory::ProxyMemoryReservation,
     memory_admission_wait: Duration,
-    reserve_adapter_maximum: bool,
+    component_response: bool,
     conversation: Option<&ProxyConversation>,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
     if response
@@ -129,9 +129,9 @@ pub(super) async fn read_bounded_upstream(
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     let reserved = if let Some(conversation) = conversation {
-        conversation.reserve_for_buffered_response(memory, declared_maximum, deadline)
+        conversation.reserve_for_buffered_response(memory, 0, deadline)
     } else {
-        memory.reserve_buffered_response(declared_maximum, deadline)
+        memory.reserve_buffered_response(0, deadline)
     };
     if !reserved {
         tracing::warn!(request_id = %diagnostic_context.request_id,
@@ -191,15 +191,9 @@ pub(super) async fn read_bounded_upstream(
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
     memory.shrink_buffered_response(&body);
-    if reserve_adapter_maximum && !memory.grow_buffered_response(maximum) {
-        tracing::warn!(request_id = %diagnostic_context.request_id,
-            stage = "buffered_response_adapter", reserved_bytes = memory.buffered_response_reserved_bytes(),
-            actual_bytes = body.len(), has_content_length, "component working memory unavailable");
-        return Err(BoundedUpstreamError::MemoryCapacity);
-    }
     tracing::debug!(request_id = %diagnostic_context.request_id,
         stage = "buffered_response_ready", reserved_bytes = memory.buffered_response_reserved_bytes(),
-        actual_bytes = body.len(), has_content_length, "buffered response memory accounted");
+        actual_bytes = body.len(), has_content_length, component_response, "buffered response memory accounted");
     read_memory.keep = true;
     Ok(body)
 }
@@ -207,6 +201,39 @@ pub(super) async fn read_bounded_upstream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn component_small_body_uses_actual_memory_despite_large_adapter_limit() {
+        for content_length in [None, Some(2)] {
+            let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024 * 1024);
+            let occupied = budget.reservation();
+            assert!(occupied.try_grow(128 * 1024 * 1024, 1));
+            let memory = budget.reservation();
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                version: http::Version::HTTP_11,
+                content_length,
+                stream: Box::pin(futures_util::stream::iter([Ok(Bytes::from_static(b"{}"))])),
+            };
+            let body = read_bounded_upstream(
+                response,
+                MAX_PROXY_RESPONSE_BODY,
+                &memory,
+                Duration::from_secs(30),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(body, b"{}");
+            assert_eq!(memory.buffered_response_reserved_bytes(), 64 * 1024);
+            assert_eq!(budget.snapshot().0, 128 * 1024 * 1024 + 64 * 1024);
+            drop(body);
+            memory.release_buffered_response();
+            assert_eq!(budget.snapshot().0, 128 * 1024 * 1024);
+        }
+    }
 
     #[tokio::test]
     async fn dense_small_json_succeeds_with_declared_or_chunked_body_at_low_global_usage() {
@@ -288,8 +315,15 @@ mod tests {
                     futures_util::future::pending().await
                 })),
             };
-            read_bounded_upstream(response, 1024, &owned, Duration::from_secs(30), false, None)
-                .await
+            read_bounded_upstream(
+                response,
+                MAX_PROXY_RESPONSE_BODY,
+                &owned,
+                Duration::from_secs(30),
+                false,
+                None,
+            )
+            .await
         });
         waiting.await.unwrap();
         assert_eq!(budget.snapshot().0, baseline.0 + 64 * 1024);
@@ -308,7 +342,7 @@ mod tests {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             version: http::Version::HTTP_11,
-            content_length: Some(601),
+            content_length: None,
             stream: Box::pin(futures_util::stream::iter([Ok(Bytes::from(format!(
                 "[{}0]",
                 "0,".repeat(299)

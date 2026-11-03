@@ -33,6 +33,8 @@ async fn fixture_with_normalize_log(
     .unwrap();
     if normalize_log {
         manifest["capabilities"] = json!([{"kind":"log"}]);
+        manifest["contributions"]["providers"][0]["component_adapter"]["max_response_bytes"] =
+            json!(64 * 1024 * 1024);
     }
     std::fs::write(
         package.join("plugin.json"),
@@ -265,7 +267,10 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
     for cancel in [false, true] {
         let memory = state.proxy_memory_budget.reservation();
         assert!(memory.try_grow(64 * 1024, 1));
-        assert!(memory.reserve_buffered_response(64 * 1024, tokio::time::Instant::now()));
+        assert!(memory.reserve_buffered_response(0, tokio::time::Instant::now()));
+        assert!(memory.reserve_response_json(b"{}"));
+        memory.shrink_buffered_response(b"{}");
+        assert_eq!(memory.buffered_response_reserved_bytes(), 64 * 1024);
         let owner = Arc::downgrade(&memory);
         let admitted = state.proxy_memory_budget.snapshot().0;
         let context = RequestContext {
@@ -293,7 +298,7 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
                     context,
                     200,
                     BTreeMap::new(),
-                    vec![b'x'; 64 * 1024],
+                    b"{}".to_vec(),
                     memory,
                 )
                 .await
