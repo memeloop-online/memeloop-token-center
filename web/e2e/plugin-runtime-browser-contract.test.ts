@@ -147,7 +147,7 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
         await route.fulfill({ json: { id: 'resolved-release', base_revision: 1, descriptor_sha256: 'a'.repeat(64), release_url: body.url, source: 'ghcr.io/example/new', descriptor: { reference: `ghcr.io/example/new@sha256:${'b'.repeat(64)}`, signer: { issuer: 'https://token.actions.githubusercontent.com', identity: 'https://github.com/example/new/.github/workflows/release.yml@refs/tags/v1' } } } });
       } else if (path.endsWith('/installations')) {
         assert.deepEqual(body, { release_resolution_id: 'resolved-release', release_descriptor_sha256: 'a'.repeat(64), packages: [] });
-        job = { id: 'job', inventory_id: 'new-inventory', base_revision: 1, packages: [`ghcr.io/example/new@sha256:${'b'.repeat(64)}`], completed_packages: 1, actor: 'service:operator', status: 'review', review_digest: 'review-exact', review: { plugins: [{ id: 'new-plugin', version: '1.0.0', wit_version: '0.2.0', capabilities: [{ kind: 'http', allowed_origins: ['https://api.example.com'] }], contributions: {} }] }, failure_category: null, created_at: 1, updated_at: 2 };
+        job = { id: 'job', inventory_id: 'new-inventory', base_revision: 1, packages: [`ghcr.io/example/new@sha256:${'b'.repeat(64)}`], completed_packages: 1, actor: 'service:operator', status: 'review', review_digest: 'review-exact', review: { plugins: [{ id: 'new-plugin', version: '1.0.0', wit_version: '0.2.0', capabilities: [{ kind: 'http', allowed_origins: ['https://api.example.com'] }, { kind: 'group_routing_quota' }, { kind: 'quota_reset_credit' }], contributions: {} }] }, failure_category: null, created_at: 1, updated_at: 2 };
         await route.fulfill({ status: 202, json: job });
       } else if (path.endsWith('/approve')) {
         assert.equal(body.review_digest, 'review-exact');
@@ -218,6 +218,8 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     assert.equal(await approve.isDisabled(), true);
     await page.getByRole('button', { name: 'Review manifest and requested capabilities' }).click();
     await page.getByRole('listitem').filter({ hasText: 'https://api.example.com' }).waitFor();
+    assert.equal(await page.getByText('Use group routing quotas', { exact: true }).count(), 1);
+    await page.getByText('Use manual quota resets for authorized accounts', { exact: true }).waitFor();
     await page.getByRole('checkbox', { name: 'Approve permissions' }).check();
     await approve.click();
     await page.getByText('Ready to activate', { exact: true }).waitFor();

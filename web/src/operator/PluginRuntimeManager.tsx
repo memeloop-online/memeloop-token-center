@@ -348,7 +348,7 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
               {reviews[job.id]?.review && <div className="plugin-runtime-section">
                 {reviews[job.id].review?.plugins.map((plugin) => <section key={plugin.id}>
                   <h4>{plugin.id} · {plugin.version}</h4>
-                  <ul>{plugin.capabilities.map((capability, index) => <li key={index}>{capability.kind === 'http' ? `${text.httpAccess}: ${capability.allowed_origins.join(', ')}` : capability.kind === 'log' ? text.logAccess : capability.kind === 'kv' ? text.storageAccess : text.quotaAccess}</li>)}
+                  <ul>{plugin.capabilities.map((capability, index) => <li key={index}>{capability.kind === 'http' ? `${text.httpAccess}: ${capability.allowed_origins.join(', ')}` : capability.kind === 'log' ? text.logAccess : capability.kind === 'kv' ? text.storageAccess : capability.kind === 'quota_reset_credit' ? text.quotaResetAccess : text.quotaAccess}</li>)}
                     {plugin.contributions.traffic_policy && <li>{text.trafficPolicy}</li>}
                     {plugin.contributions.request_rewrite && <li>{text.requestRewrite}</li>}
                     {plugin.contributions.configuration && <li>{text.configurationAccess}</li>}
