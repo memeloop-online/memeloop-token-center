@@ -52,7 +52,10 @@ pub(super) struct GatewayPersistence {
 
 impl GatewayPersistence {
     pub(super) fn new(url: &str, backend: DatabaseBackend) -> Result<Self, sqlx::Error> {
-        let acquire_timeout = Duration::from_millis(250);
+        // This is background metadata, not a request admission deadline.
+        // Allow the same cold-connection budget as the serving pool without
+        // increasing this independent pool's connection count.
+        let acquire_timeout = Duration::from_secs(10);
         #[cfg(test)]
         let acquire_timeout = TEST_SOURCE_POOL_TIMEOUT
             .try_with(|timeout| *timeout)
@@ -71,13 +74,17 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
-                            for statement in [
-                                "SET statement_timeout = '250ms'",
-                                "SET lock_timeout = '100ms'",
-                                "SET idle_in_transaction_session_timeout = '1s'",
-                            ] {
-                                sqlx::query(statement).execute(&mut *connection).await?;
-                            }
+                            // Reuse the serving session policy in one simple
+                            // query exchange, not three prepared SET exchanges.
+                            let settings = [
+                                super::POSTGRES_SERVE_STATEMENT_TIMEOUT,
+                                super::POSTGRES_SERVE_LOCK_TIMEOUT,
+                                super::POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
+                            ]
+                            .join(";");
+                            sqlx::raw_sql(sqlx::AssertSqlSafe(settings))
+                                .execute(connection)
+                                .await?;
                         }
                     }
                     Ok(())
@@ -99,7 +106,7 @@ impl GatewayPersistence {
             #[cfg(test)]
             source_timeout: TEST_SOURCE_POOL_TIMEOUT
                 .try_with(|timeout| *timeout)
-                .unwrap_or(Duration::from_secs(2)),
+                .unwrap_or(acquire_timeout),
         })
     }
 
@@ -221,6 +228,18 @@ impl Database {
             self.publish_request_source(identity, locator, length, digest)
                 .await;
         }
+        self.complete_request_source_metadata(identity, locator, length, digest, success)
+            .await;
+    }
+
+    async fn complete_request_source_metadata(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+        success: bool,
+    ) {
         loop {
             if self
                 .persist_request_source(identity, locator, length, digest, Some(success))
@@ -334,26 +353,29 @@ impl Database {
         database.pool = self.gateway_persistence.pool.clone();
         database.pool_role = "gateway_archive";
         #[cfg(not(test))]
-        let timeout = Duration::from_secs(2);
+        let timeout = database.pool.options().get_acquire_timeout();
         #[cfg(test)]
         let timeout = self.gateway_persistence.source_timeout;
         let deadline = tokio::time::Instant::now() + timeout;
-        let result = tokio::time::timeout_at(
-            deadline,
-            ARCHIVE_DEADLINE.scope(
+        // SQLx acquisition and the session statement/lock timeouts bound DB
+        // work. Do not cancel the entire background transaction after two
+        // seconds (including time queued for this single connection): that
+        // discards useful progress and races rollback/COMMIT acknowledgements.
+        // The task-local deadline only bounds SQLite's busy-BEGIN retry.
+        let result = ARCHIVE_DEADLINE
+            .scope(
                 (self.gateway_persistence.clone(), deadline),
                 database
                     .record_request_source_state(identity, locator, length, digest, success, false),
-            ),
-        )
-        .await;
+            )
+            .await;
         match result {
-            Ok(Ok(owned)) => Some(owned),
-            _ => {
+            Ok(owned) => Some(owned),
+            Err(error) => {
                 self.gateway_persistence
                     .failed
                     .fetch_add(1, Ordering::Relaxed);
-                tracing::warn!(request_id = %identity.request_id, "request source metadata retained for retry");
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(), "request source metadata retained for retry");
                 None
             }
         }
@@ -404,16 +426,11 @@ impl Database {
                 // Raw roots are independently discoverable by the body worker.
                 return;
             };
-            let (_outcome, receiver) = tokio::sync::watch::channel(Some(success));
-            if database
-                .wait_request_source_upload(identity, &locator, length, digest, receiver)
-                .await
-                .is_none()
-            {
-                return;
-            }
+            // The outcome is already known and the immutable root was
+            // published above, even when metadata admission was unavailable.
+            // Do not fetch and verify that same object a second time.
             database
-                .complete_request_source(identity, &locator, length, digest, success)
+                .complete_request_source_metadata(identity, &locator, length, digest, success)
                 .await;
         });
     }

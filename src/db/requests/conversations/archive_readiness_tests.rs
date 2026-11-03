@@ -733,8 +733,13 @@ async fn failed_source_metadata_contract(database_url: String) {
     let release = store.pause_next_write();
     let admission =
         RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
-    let mut fixture =
-        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    // Inject the metadata outage explicitly. Production now gives a healthy
+    // cold/queued connection ten seconds rather than failing within 250ms.
+    let mut fixture = Database::with_source_pool_timeout_for_test(
+        Duration::from_millis(250),
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)),
+    )
+    .await;
     let source = fixture.source.take().unwrap();
     let locator = source.object_locator().unwrap().to_owned();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -816,8 +821,11 @@ async fn expired_live_source_writer_contract(database_url: String) {
     let release = store.pause_next_write();
     let admission =
         RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
-    let mut fixture =
-        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    let mut fixture = Database::with_source_pool_timeout_for_test(
+        Duration::from_millis(250),
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)),
+    )
+    .await;
     let source = fixture.source.take().unwrap();
     let locator = source.object_locator().unwrap().to_owned();
     let length = source.len();
