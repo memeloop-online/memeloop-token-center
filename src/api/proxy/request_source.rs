@@ -149,7 +149,12 @@ mod tests {
 
     #[tokio::test]
     async fn streamed_source_keeps_duplicate_key_and_hash_checks() {
-        for body in [br#"{"key":1,"key":2}"#.as_slice(), br#"{"key":1}{}"#] {
+        for body in [
+            br#"{"key":1,"key":2}"#.as_slice(),
+            br#"{"key":1}{}"#,
+            b"{",
+            b"",
+        ] {
             let (_, source) = captured(Bytes::copy_from_slice(body)).await;
             assert!(matches!(
                 parse(source, ProxyMemoryBudget::new(1024 * 1024).reservation()).await,

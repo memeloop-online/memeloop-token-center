@@ -713,7 +713,7 @@ impl RequestSpool {
         Ok(crate::archive::ArchiveDownload {
             object_size: length as u64,
             range: 0..length as u64,
-            stream: Box::pin(stream),
+            stream: Box::pin(stream.fuse()),
         })
     }
 
