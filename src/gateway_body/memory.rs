@@ -463,10 +463,18 @@ impl ProxyMemoryReservation {
         // input bytes and tree/map nodes separately, so tiny-token arrays and
         // objects cannot evade the memory contract through expansion.
         let nodes = JsonMemoryScanner::default().observe(body);
-        if !self.try_grow(body.len(), 3) || !self.try_grow(nodes, 256) {
+        self.try_reserve_json_shape(body.len(), nodes)
+    }
+
+    pub(crate) fn try_reserve_json_shape(&self, bytes: usize, nodes: usize) -> bool {
+        if !self.try_grow(bytes, 3) {
             return false;
         }
-        self.json_body_ceiling.store(body.len(), Ordering::Release);
+        if !self.try_grow(nodes, 256) {
+            self.release(bytes, 3);
+            return false;
+        }
+        self.json_body_ceiling.store(bytes, Ordering::Release);
         self.json_node_ceiling.store(nodes, Ordering::Release);
         true
     }

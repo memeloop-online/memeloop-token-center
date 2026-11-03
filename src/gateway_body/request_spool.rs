@@ -122,6 +122,7 @@ impl DurableRequestBodies {
         }
     }
 
+    #[cfg(test)]
     async fn get(&self, key: &str, maximum: usize) -> Result<Bytes, ()> {
         match self {
             Self::Archive(archive) => archive
@@ -166,6 +167,7 @@ enum SpillSink {
 struct CapturedBody {
     body: Option<Bytes>,
     length: usize,
+    json_nodes: usize,
     digest: [u8; 32],
     metadata: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     frames: Vec<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -309,6 +311,7 @@ impl RequestSpoolAdmission {
         let mut retained_frames = Vec::new();
         let mut length = 0_usize;
         let mut hasher = blake3::Hasher::new();
+        let mut json_scanner = super::memory::JsonMemoryScanner::default();
         let mut spilling = memory.is_some() && metadata.is_none() && durable.is_some();
         let mut sink = if spilling {
             let (store, key) = spill_target(&durable, &object_key)?;
@@ -381,6 +384,7 @@ impl RequestSpoolAdmission {
                 write_spill(sink, chunk.clone()).await?;
             }
             hasher.update(&chunk);
+            json_scanner.observe(&chunk);
             length = next;
         }
         let digest = *hasher.finalize().as_bytes();
@@ -393,6 +397,7 @@ impl RequestSpoolAdmission {
             return Ok(self.finished_spool(CapturedBody {
                 body: None,
                 length,
+                json_nodes: json_scanner.observe(&[]),
                 digest,
                 metadata: None,
                 frames: Vec::new(),
@@ -408,6 +413,7 @@ impl RequestSpoolAdmission {
             .finished_spool(CapturedBody {
                 body: Some(retained),
                 length,
+                json_nodes: json_scanner.observe(&[]),
                 digest,
                 metadata,
                 frames: retained_frames,
@@ -424,6 +430,7 @@ impl RequestSpoolAdmission {
             shared: Arc::new(SharedBody {
                 body: Mutex::new(captured.body),
                 length: captured.length,
+                json_nodes: captured.json_nodes,
                 digest: captured.digest,
                 residency: Arc::new(BodyResidency {
                     frames: Mutex::new(captured.frames),
@@ -541,6 +548,7 @@ impl Drop for RequestSpoolLease {
 struct SharedBody {
     body: Mutex<Option<Bytes>>,
     length: usize,
+    json_nodes: usize,
     digest: [u8; 32],
     residency: Arc<BodyResidency>,
     lease: Arc<Mutex<RequestSpoolLease>>,
@@ -611,6 +619,7 @@ impl RequestSpool {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_bytes(self: &Arc<Self>, bytes: Bytes) -> Bytes {
         struct BodySource {
             bytes: Bytes,
@@ -628,6 +637,82 @@ impl RequestSpool {
     }
     pub(crate) fn len(&self) -> usize {
         self.shared.length
+    }
+
+    pub(crate) fn json_nodes(&self) -> usize {
+        self.shared.json_nodes
+    }
+
+    pub(crate) async fn open_stream(
+        &self,
+    ) -> Result<crate::archive::ArchiveDownload, RequestSpoolReadError> {
+        let resident = self
+            .shared
+            .body
+            .lock()
+            .map_err(|_| RequestSpoolReadError)?
+            .clone();
+        let download = if let Some(body) = resident {
+            crate::archive::ArchiveDownload {
+                object_size: self.len() as u64,
+                range: 0..self.len() as u64,
+                stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+            }
+        } else {
+            if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
+                return Err(RequestSpoolReadError);
+            }
+            let key = self.object_locator().ok_or(RequestSpoolReadError)?;
+            match self.shared.durable.as_ref().ok_or(RequestSpoolReadError)? {
+                DurableRequestBodies::Archive(archive) => archive
+                    .open_stream(key, None)
+                    .await
+                    .map_err(|_| RequestSpoolReadError)?,
+                #[cfg(test)]
+                store @ DurableRequestBodies::Memory(_) => {
+                    let body = store
+                        .get(key, self.len())
+                        .await
+                        .map_err(|_| RequestSpoolReadError)?;
+                    crate::archive::ArchiveDownload {
+                        object_size: self.len() as u64,
+                        range: 0..self.len() as u64,
+                        stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+                    }
+                }
+            }
+        };
+        if download.object_size != self.len() as u64 {
+            return Err(RequestSpoolReadError);
+        }
+        let expected = self.shared.digest;
+        let length = self.len();
+        let stream = futures_util::stream::unfold(
+            (download.stream, blake3::Hasher::new(), 0usize, false),
+            move |(mut stream, mut hasher, mut bytes, done)| async move {
+                if done {
+                    return None;
+                }
+                let invalid = || std::io::Error::other("request source integrity failed");
+                let chunk = match stream.next().await {
+                    Some(Ok(chunk)) if chunk.len() <= length.saturating_sub(bytes) => {
+                        bytes += chunk.len();
+                        hasher.update(&chunk);
+                        Ok(chunk)
+                    }
+                    None if bytes == length && hasher.finalize().as_bytes() == &expected => {
+                        return None;
+                    }
+                    _ => return Some((Err(invalid()), (stream, hasher, bytes, true))),
+                };
+                Some((chunk, (stream, hasher, bytes, false)))
+            },
+        );
+        Ok(crate::archive::ArchiveDownload {
+            object_size: length as u64,
+            range: 0..length as u64,
+            stream: Box::pin(stream),
+        })
     }
 
     #[cfg(test)]
@@ -668,6 +753,7 @@ impl RequestSpool {
         release_resident_memory(&self.shared);
     }
 
+    #[cfg(test)]
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {
         #[cfg(test)]
         self.read_count.fetch_add(1, Ordering::AcqRel);
@@ -746,6 +832,7 @@ impl Drop for RequestSpool {
     }
 }
 
+#[cfg(test)]
 fn verified_body(shared: &SharedBody, body: Bytes) -> Result<Bytes, RequestSpoolReadError> {
     if body.len() != shared.length || *blake3::hash(&body).as_bytes() != shared.digest {
         return Err(RequestSpoolReadError);

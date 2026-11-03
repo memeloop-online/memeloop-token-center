@@ -9,6 +9,10 @@ on:
       - src/api/audio.rs
       - src/api/auth.rs
       - src/gateway_body.rs
+      - src/gateway_body/**
+      - src/api/traffic.rs
+      - src/api/proxy/request_source.rs
+      - src/api/sse/unique_json.rs
       - src/api/session_reading.rs
       - src/api/proxy/persistence.rs
       - src/api/proxy.rs
@@ -77,6 +81,9 @@ jobs:
             sleep 2
           done
           exit 1
+      - run: cargo test --locked --lib api::proxy::request_source
+      - run: cargo test --locked --lib gateway_body
+      - run: cargo test --locked --lib api::proxy::tests::early_terminal
       - run: cargo test --locked --lib archive::conversation
       - run: cargo test --locked --lib archive::session_projection -- --test-threads=1
       - run: cargo test --locked --lib conversation::return_stream_tests

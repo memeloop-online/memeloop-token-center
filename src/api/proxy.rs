@@ -45,6 +45,7 @@ mod chat_sse_usage;
 mod conversation_hints;
 mod lifecycle;
 pub(crate) mod persistence;
+mod request_source;
 mod response_metadata;
 mod routing;
 pub(crate) mod session_preferences;
@@ -956,6 +957,10 @@ async fn proxy_with_cancellation_guard(
     let request_id = diagnostic_context.request_id;
     let conversation_spool =
         conversation_spool.or_else(|| state.responses_request_spool.source(request_id));
+    let request_body_length = conversation_spool
+        .as_ref()
+        .map_or(body.len(), |source| source.len());
+    let streamed_source = conversation_spool.is_some() && body.is_empty();
     let preparation = proxy_diagnostics::Phase::new(diagnostic_context, "request_preparation");
     let _request_buffer = state
         .metrics
@@ -965,19 +970,41 @@ async fn proxy_with_cancellation_guard(
     let mut state = state.pin_application_plugins().await?;
     plugin_snapshot.finish("completed", None, None);
     let proxy_lifecycle_permit = state.proxy_lifecycles.start();
-    if !memory.try_reserve_json(&body) {
+    if !streamed_source && !memory.try_reserve_json(&body) {
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
         return Err(AppError::capacity_error("proxy_memory_json"));
     }
     let json_parse = proxy_diagnostics::Phase::new(diagnostic_context, "request_json_parse");
-    let original_request_json: Value = crate::api::sse::parse_unique_json(&body)
-        .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+    let original_request_json: Value = if streamed_source {
+        match request_source::parse(conversation_spool.as_ref().unwrap().clone(), memory.clone())
+            .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                if matches!(
+                    error,
+                    AppError::Capacity {
+                        code: "proxy_memory_json",
+                        ..
+                    }
+                ) {
+                    state.metrics.record_proxy_memory_rejection(
+                        crate::metrics::ProxyMemoryRejectionStage::Json,
+                    );
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        crate::api::sse::parse_unique_json(&body)
+            .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?
+    };
     super::early_request::observe_model(original_request_json.get("model"));
-    json_parse.finish("completed", None, Some(body.len()));
+    json_parse.finish("completed", None, Some(request_body_length));
     let conversation_hints = conversation_hints(&headers, &original_request_json);
-    tracing::info!(%request_id, phase = "request_shape", bytes = body.len(), compaction_hint = conversation_hints.compaction, "proxy request metadata");
+    tracing::info!(%request_id, phase = "request_shape", bytes = request_body_length, compaction_hint = conversation_hints.compaction, "proxy request metadata");
     let traffic_policy =
         proxy_diagnostics::Phase::new(diagnostic_context, "request_traffic_policy");
     let applied = super::traffic::apply_traffic_policy_with_memory(
@@ -1008,7 +1035,7 @@ async fn proxy_with_cancellation_guard(
     let codex_multi_agent_v2_request = matches!(protocol, Protocol::OpenAiResponses)
         && official_codex_client
         && crate::api::request_normalization::has_codex_multi_agent_v2_shape(&request_json);
-    preparation.finish("completed", None, Some(body.len()));
+    preparation.finish("completed", None, Some(request_body_length));
     let route_preparation = proxy_diagnostics::Phase::new(diagnostic_context, "route_preparation");
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
     let avoid_route_account = session_route_account_to_avoid(
@@ -1070,7 +1097,7 @@ async fn proxy_with_cancellation_guard(
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
-        original_body_length: body.len(),
+        original_body_length: request_body_length,
         candidates,
     })
     .await?;
@@ -1112,7 +1139,7 @@ async fn proxy_with_cancellation_guard(
                     request_json: &request_json,
                     codex_multi_agent_v2_request,
                 },
-                original_body_length: body.len(),
+                original_body_length: request_body_length,
                 candidates,
             })
             .await?;
@@ -1232,7 +1259,7 @@ async fn proxy_with_cancellation_guard(
     {
         Ok(started) => started,
         Err(error) => {
-            admission.finish(error.diagnostic_category(), None, Some(body.len()));
+            admission.finish(error.diagnostic_category(), None, Some(request_body_length));
             tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
@@ -1252,7 +1279,7 @@ async fn proxy_with_cancellation_guard(
         | crate::db::RequestArchiveAdmission::Queued => {}
     }
     let reservation = started_request.reservation;
-    admission.finish("completed", None, Some(body.len()));
+    admission.finish("completed", None, Some(request_body_length));
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     let client_name = client_name(&headers);
@@ -1274,7 +1301,6 @@ async fn proxy_with_cancellation_guard(
         body.len(),
         crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
     );
-    let request_body_length = body.len();
     drop(body);
     let mut buffered_request = BufferedRequest {
         session_preference: conversation.as_ref().and_then(|conversation| {
@@ -1701,16 +1727,13 @@ async fn proxy_with_cancellation_guard(
                     },
                     attempt,
                 );
-                if response.status() == StatusCode::TOO_MANY_REQUESTS
-                    && !active_route.is_codex()
-                {
-                    state.routing_persistence.submit(
-                        upstream_error::MAX_ERROR_BYTES,
-                        async move {
+                if response.status() == StatusCode::TOO_MANY_REQUESTS && !active_route.is_codex() {
+                    state
+                        .routing_persistence
+                        .submit(upstream_error::MAX_ERROR_BYTES, async move {
                             let _ = upstream_error::read_rejection(response).await;
                             Ok(())
-                        },
-                    );
+                        });
                 } else {
                     drop(response);
                 }
@@ -2824,8 +2847,7 @@ async fn execute_component_provider(
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
             ) {
                 let observed_at = unix_millis();
-                let (response, kind, evidence) =
-                    routing::classify_supplier_quota(upstream).await;
+                let (response, kind, evidence) = routing::classify_supplier_quota(upstream).await;
                 if upstream_status == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
                     publish_supplier_quota(
                         request.state,
