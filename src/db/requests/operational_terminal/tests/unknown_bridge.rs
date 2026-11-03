@@ -408,6 +408,11 @@ async fn recovery_contract(fixture: Fixture) {
         .unwrap();
     sqlx::query("UPDATE pending_proxy_settlements SET unknown_reason = 'authoritative_usage_unavailable' WHERE request_id = $1")
         .bind(fixture.claim.request_id.to_string()).execute(&fixture.database.pool).await.unwrap();
+    fixture
+        .database
+        .recover_unknown_terminal_projections(None)
+        .await
+        .unwrap();
     drain_terminal(&fixture).await;
     let stats = fixture
         .database

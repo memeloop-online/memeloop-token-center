@@ -395,6 +395,24 @@ pub async fn run_until_shutdown_with_oauth_stop(
             process_terminal_projection_batch(state, Uuid::now_v7()).await;
         }
     );
+    let terminal_recovery_cursor = Mutex::new(None::<String>);
+    periodic!(
+        "terminal_projection_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let after = terminal_recovery_cursor.lock().unwrap().clone();
+            match state
+                .db
+                .recover_unknown_terminal_projections(after.as_deref())
+                .await
+            {
+                Ok(next) => *terminal_recovery_cursor.lock().unwrap() = next,
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to recover unknown terminal projections");
+                }
+            }
+        }
+    );
     periodic!(
         "metered_projection",
         PROJECTION_INTERVAL,

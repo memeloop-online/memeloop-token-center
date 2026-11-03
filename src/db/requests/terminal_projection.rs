@@ -59,6 +59,43 @@ pub(super) async fn statistics_pruned_in_transaction(
 }
 
 impl Database {
+    pub(crate) async fn recover_unknown_terminal_projections(
+        &self,
+        after: Option<&str>,
+    ) -> Result<Option<String>, AppError> {
+        let rows = sqlx::query(
+            "SELECT p.request_id,
+                    CAST(CASE WHEN p.state = 'pending' AND p.unknown_reason IS NOT NULL
+                         AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id = p.request_id)
+                         THEN 1 ELSE 0 END AS BIGINT) AS missing
+             FROM pending_proxy_settlements p
+             WHERE p.request_id > $1 ORDER BY p.request_id LIMIT 32",
+        )
+        .bind(after.unwrap_or(""))
+        .fetch_all(&self.pool)
+        .await?;
+        let next = if rows.len() == 32 {
+            rows.last()
+                .map(|row| row.try_get::<String, _>("request_id"))
+                .transpose()?
+        } else {
+            None
+        };
+        for row in rows {
+            if row.try_get::<i64, _>("missing")? == 0 {
+                continue;
+            }
+            let request_id: String = row.try_get("request_id")?;
+            let mut transaction = self.begin_write_transaction().await?;
+            sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND completed_at IS NULL")
+                .bind(&request_id).execute(&mut *transaction).await?;
+            enqueue_unknown_terminal_projection_in_transaction(&mut transaction, &request_id)
+                .await?;
+            transaction.commit().await?;
+        }
+        Ok(next)
+    }
+
     pub async fn claim_terminal_projection_tasks(
         &self,
         lease_owner: Uuid,
@@ -66,14 +103,6 @@ impl Database {
     ) -> Result<Vec<Uuid>, AppError> {
         let now = unix_millis();
         let mut transaction = self.begin_write_transaction().await?;
-        let missing: Vec<String> = sqlx::query_scalar("SELECT p.request_id FROM pending_proxy_settlements p JOIN request_records r ON r.id = p.request_id AND r.tenant_id = p.tenant_id AND r.key_id = p.key_id AND r.reservation_id = p.reservation_id JOIN proxy_operational_terminals o ON o.request_id = p.request_id AND o.request_created_at = r.created_at AND o.tenant_id = p.tenant_id AND o.key_id = p.key_id AND o.account_id = p.account_id AND o.reservation_id = p.reservation_id AND o.owner_token = p.owner_token AND o.fence = p.fence AND o.contract_digest = p.contract_digest WHERE p.state = 'pending' AND p.unknown_reason IS NOT NULL AND r.completed_at IS NULL AND NOT EXISTS (SELECT 1 FROM terminal_projection_outbox t WHERE t.request_id = p.request_id) ORDER BY p.updated_at, p.request_id LIMIT $1")
-            .bind(limit.clamp(1, 32)).fetch_all(&mut *transaction).await?;
-        for request_id in missing {
-            sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND completed_at IS NULL")
-                .bind(&request_id).execute(&mut *transaction).await?;
-            enqueue_unknown_terminal_projection_in_transaction(&mut transaction, &request_id)
-                .await?;
-        }
         let suffix = match self.backend {
             DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
             DatabaseBackend::Sqlite => "",
