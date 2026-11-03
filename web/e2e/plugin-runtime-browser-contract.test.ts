@@ -332,7 +332,7 @@ for (const scenario of ['saved', 'edited-member', 'tenant-switch', 'missing-memb
         assert.deepEqual(writes, []);
         return;
       }
-      if (scenario === 'edited-member') await page.getByLabel('Proxy server', { exact: true }).selectOption('member-b');
+      if (scenario === 'edited-member') await page.getByLabel(/^Proxy server/).selectOption('member-b');
       assert.equal(await read.isEnabled(), true);
       const resolutionResponse = scenario === 'tenant-switch' ? undefined : page.waitForResponse(response => response.url().endsWith('/release-resolutions'));
       await read.click();
@@ -340,8 +340,11 @@ for (const scenario of ['saved', 'edited-member', 'tenant-switch', 'missing-memb
       if (scenario === 'tenant-switch') {
         await page.getByLabel('Fixture tenant').fill('other-tenant');
         releaseSave();
-        await page.waitForFunction(() => !Array.from(document.querySelectorAll('button')).some(button => button.textContent === 'Working…'));
+        await page.getByRole('button', { name: 'Install plugin', exact: true }).click();
         assert.equal(await page.getByLabel('Fixture tenant').inputValue(), 'other-tenant');
+        await page.getByRole('button', { name: 'Download network', exact: true }).click();
+        await page.getByText('No proxy groups are available in this tenant.', { exact: true }).waitFor();
+        assert.equal(await page.getByLabel(/^Proxy group/).inputValue(), '');
         assert.equal(await read.isDisabled(), true);
         assert.equal(writes.length, 1);
       } else {
