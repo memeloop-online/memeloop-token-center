@@ -579,6 +579,7 @@ async fn finish_non_sse_proxy_response(
             let (response_status, response_body, terminal_error) = if valid_output {
                 (status, response_body, "upstream_incomplete_response")
             } else {
+                drop(response_body);
                 (
                     StatusCode::BAD_GATEWAY,
                     Bytes::from(crate::error::explained_failure_body(
@@ -608,6 +609,7 @@ async fn finish_non_sse_proxy_response(
                 .await;
             return result;
         }
+        drop(response_body);
         let result = finish_proxy_failure(buffered_request, error_code).await;
         upstream_attempt
             .complete(UpstreamAttemptTerminal::invalid_response())
@@ -635,6 +637,7 @@ async fn finish_non_sse_proxy_response(
                     selected_driver,
                     protocol,
                 );
+                drop(response_body);
                 let result = finish_proxy_failure(buffered_request, "upstream_invalid_usage").await;
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::invalid_response())
@@ -2974,6 +2977,7 @@ async fn execute_component_provider(
     let status = match StatusCode::from_u16(normalized.status) {
         Ok(status) => status,
         Err(_) => {
+            drop(normalized);
             if let Some(attempt) = upstream_attempt.as_mut() {
                 attempt
                     .complete(UpstreamAttemptTerminal::invalid_response())
@@ -2984,6 +2988,7 @@ async fn execute_component_provider(
         }
     };
     if !status.is_success() {
+        drop(normalized);
         if let Some(attempt) = upstream_attempt.as_mut() {
             attempt
                 .complete(UpstreamAttemptTerminal::invalid_response())
@@ -3015,6 +3020,7 @@ async fn execute_component_provider(
                 .is_none_or(|limit| tokens <= limit)
     });
     if !usage_is_valid {
+        drop(normalized);
         if let Some(attempt) = upstream_attempt.as_mut() {
             attempt
                 .complete(UpstreamAttemptTerminal::invalid_response())

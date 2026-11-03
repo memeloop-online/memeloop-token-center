@@ -129,9 +129,9 @@ pub(super) async fn read_bounded_upstream(
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     let reserved = if let Some(conversation) = conversation {
-        conversation.reserve_for_buffered_response(memory, 0, deadline)
+        conversation.reserve_for_buffered_response(memory, declared_maximum, deadline)
     } else {
-        memory.reserve_buffered_response(0, deadline)
+        memory.reserve_buffered_response(declared_maximum, deadline)
     };
     if !reserved {
         tracing::warn!(request_id = %diagnostic_context.request_id,
@@ -288,15 +288,8 @@ mod tests {
                     futures_util::future::pending().await
                 })),
             };
-            read_bounded_upstream(
-                response,
-                MAX_PROXY_RESPONSE_BODY,
-                &owned,
-                Duration::from_secs(30),
-                false,
-                None,
-            )
-            .await
+            read_bounded_upstream(response, 1024, &owned, Duration::from_secs(30), false, None)
+                .await
         });
         waiting.await.unwrap();
         assert_eq!(budget.snapshot().0, baseline.0 + 64 * 1024);
@@ -315,7 +308,7 @@ mod tests {
             status: StatusCode::OK,
             headers: HeaderMap::new(),
             version: http::Version::HTTP_11,
-            content_length: None,
+            content_length: Some(601),
             stream: Box::pin(futures_util::stream::iter([Ok(Bytes::from(format!(
                 "[{}0]",
                 "0,".repeat(299)
