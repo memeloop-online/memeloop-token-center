@@ -63,6 +63,9 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
   const resolveKey = useRef(crypto.randomUUID());
   const mutationLock = useRef(false);
   const networkEdited = useRef(false);
+  const networkEditGeneration = useRef(0);
+  const networkScope = useRef({ tenant, generation: 0 });
+  if (networkScope.current.tenant !== tenant) networkScope.current = { tenant, generation: networkScope.current.generation + 1 };
   const { confirm, confirmationDialog } = useConfirmDialog([token, canManage, status?.current?.revision]);
   const [approvals, setApprovals] = useState<Record<string, boolean>>({});
   const [reviews, setReviews] = useState<Record<string, Installation>>({});
@@ -126,25 +129,31 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
   }, [token, tenant, canManage, network.mode, text.groupsFailed]);
 
   function editNetwork(value: NetworkView) {
-    networkEdited.current = true;
+    networkEdited.current = true; networkEditGeneration.current++;
     setNetwork(value); setNetworkDirty(true); setResolution(undefined); setTrusted(false);
     resolveKey.current = crypto.randomUUID();
   }
   const selectedGroup = network.mode === 'group' && network.tenant_external_id === tenant ? groups.find((group) => group.id === network.group_id) : undefined;
   const networkValid = network.mode === 'custom' ? Boolean(network.url.trim())
-    : network.mode !== 'group' || Boolean(selectedGroup && selectedGroup.version === network.group_version && selectedGroup.members.some((member) => member.id === network.member_id));
+    : network.mode !== 'group' || Boolean(selectedGroup && selectedGroup.members.some((member) => member.id === network.member_id));
+
+  const networkVersionChanged = network.mode === 'group' && selectedGroup && selectedGroup.version !== network.group_version;
 
   async function persistNetwork() {
+    const scope = networkScope.current.generation;
+    const edit = networkEditGeneration.current;
     const input = network.mode === 'custom'
       ? { mode: network.mode, url: network.url.trim(), username: network.username || null, ...(clearPassword ? { password: '' } : password ? { password } : {}) }
-      : network;
+      : network.mode === 'group' && selectedGroup ? { ...network, group_version: selectedGroup.version } : network;
     const saved = await api<NetworkView>('/internal/v1/plugin-runtime/installer-network', token, { method: 'PUT', body: JSON.stringify(input) });
-    if (alive.current) { setNetwork(saved); setNetworkDirty(false); setNetworkReady(true); setNetworkError(''); setPassword(''); setClearPassword(false); }
+    if (!alive.current || scope !== networkScope.current.generation || edit !== networkEditGeneration.current) return false;
+    setNetwork(saved); setNetworkDirty(false); setNetworkReady(true); setNetworkError(''); setPassword(''); setClearPassword(false);
+    return true;
   }
   async function saveNetwork() {
     if (mutationLock.current || !canManage || !networkValid) return;
     mutationLock.current = true; setBusy(true); setMessage(''); setNetworkError('');
-    try { await persistNetwork(); if (alive.current) setMessage(text.networkSaved); }
+    try { if (await persistNetwork()) setMessage(text.networkSaved); }
     catch { if (alive.current) setNetworkError(text.saveFailed); }
     finally { mutationLock.current = false; if (alive.current) setBusy(false); }
   }
@@ -152,7 +161,7 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
     if (mutationLock.current || !canManage || !networkValid || (!networkReady && !networkDirty)) return;
     mutationLock.current = true; setBusy(true); setError(''); setMessage(''); setResolution(undefined); setTrusted(false);
     try {
-      if (networkDirty) await persistNetwork();
+      if ((networkDirty || networkVersionChanged) && !await persistNetwork()) return;
       if (!alive.current) return;
       const value = await api<ReleaseResolution>('/internal/v1/plugin-runtime/release-resolutions', token, {
         method: 'POST', headers: { 'Idempotency-Key': resolveKey.current }, body: JSON.stringify({ url: releaseUrl.trim() }),
@@ -165,7 +174,10 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
     if (mutationLock.current || !canManage || !networkValid || (!networkReady && !networkDirty)) return;
     mutationLock.current = true; setBusy(true); setError('');
     try {
-      if (networkDirty) await persistNetwork();
+      if ((networkDirty || networkVersionChanged) && !await persistNetwork()) {
+        mutationLock.current = false; if (alive.current) setBusy(false);
+        return;
+      }
     } catch {
       if (alive.current) { setNetworkError(text.saveFailed); setBusy(false); }
       mutationLock.current = false;
