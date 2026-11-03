@@ -53,12 +53,13 @@ impl SnapshotPhase {
     }
 
     fn emit(&self, outcome: &'static str) {
-        tracing::info!(
-            request_id = %self.request_id,
-            stage = self.stage,
-            duration_ms = self.started.elapsed().as_millis() as u64,
-            outcome,
-        );
+        if outcome == "not_completed" {
+            tracing::info!(request_id = %self.request_id, stage = self.stage,
+                duration_ms = self.started.elapsed().as_millis() as u64, outcome);
+        } else {
+            tracing::debug!(request_id = %self.request_id, stage = self.stage,
+                duration_ms = self.started.elapsed().as_millis() as u64, outcome);
+        }
     }
 }
 
@@ -778,7 +779,7 @@ async fn prepare_inner(
                         );
                     }
                 }
-                tracing::info!(%request_id, %group_id, %plugin_id, strategy_version=members[0].3, stage="group_routing_plan", "group strategy snapshot applied");
+                tracing::debug!(%request_id, %group_id, %plugin_id, strategy_version=members[0].3, stage="group_routing_plan", "group strategy snapshot applied");
             }
             Err(error) => {
                 // Continue with the core ordering of this group's candidates.
