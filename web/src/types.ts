@@ -935,7 +935,7 @@ export interface PluginManifest {
   version: string;
   wit_version: string;
   capabilities: Array<
-    | { kind: 'log' | 'kv' | 'group_routing_quota' }
+    | { kind: 'log' | 'kv' | 'group_routing_quota' | 'quota_reset_credit' }
     | { kind: 'http'; allowed_origins: string[] }
   >;
   contributions: {
