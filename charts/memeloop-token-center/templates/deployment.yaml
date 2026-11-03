@@ -206,9 +206,15 @@ spec:
                   name: {{ $.Values.config.memeloopCloudWebhookSecret.name }}
                   key: {{ $.Values.config.memeloopCloudWebhookSecret.key }}
             {{- end }}
+            {{- else if eq $role "worker" }}
+            - name: MTC_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.config.serviceTokenSecret.name }}
+                  key: {{ $.Values.config.serviceTokenSecret.key }}
             {{- else }}
             - name: MTC_SERVICE_TOKEN
-              # Non-authenticating 32-byte sentinel that satisfies config parsing.
+              # Gateway roles use a sentinel; control and worker share grant authority.
               value: "bootstrap-disabled-for-this-role"
             {{- end }}
           startupProbe:

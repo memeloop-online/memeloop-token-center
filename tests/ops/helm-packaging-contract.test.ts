@@ -364,3 +364,21 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     }
   } finally { rmSync(workspace, { recursive: true, force: true }); }
 });
+
+
+test('worker shares bootstrap grant authority while gateway keeps its role sentinel', () => {
+  const documents = parseAllDocuments(run(helm, ['template', 'grant-authority', chart,
+    '--set', 'config.serviceTokenSecret.name=grant-authority-secret',
+    '--set', 'config.serviceTokenSecret.key=authority-token',
+  ])).map(document => document.toJSON()).filter(Boolean);
+  for (const role of ['control', 'worker', 'gateway']) {
+    const deployment = documents.find(document => document.kind === 'Deployment'
+      && document.metadata.name.endsWith(`-${role}`));
+    assert.ok(deployment, `${role} deployment is rendered`);
+    const environment = deployment.spec.template.spec.containers[0].env;
+    const token = environment.find((entry: any) => entry.name === 'MTC_SERVICE_TOKEN');
+    if (role === 'gateway') assert.equal(token.value, 'bootstrap-disabled-for-this-role');
+    else assert.deepEqual(token.valueFrom.secretKeyRef, { name: 'grant-authority-secret', key: 'authority-token' });
+    if (role === 'worker') assert.equal(environment.some((entry: any) => entry.name === 'MTC_RUNTIME_PROFILING_ENABLED'), false);
+  }
+});
