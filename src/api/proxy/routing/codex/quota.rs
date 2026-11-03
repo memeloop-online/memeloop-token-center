@@ -175,10 +175,7 @@ pub(in crate::api::proxy) async fn classify_stream_quota(
                 break 'read None;
             };
             let Some(data) = data else {
-                if name.is_some() {
-                    break 'read None;
-                }
-                continue;
+                break 'read None;
             };
             let Ok(value) = crate::api::sse::parse_unique_json(&data) else {
                 break 'read None;
@@ -199,12 +196,6 @@ pub(in crate::api::proxy) async fn classify_stream_quota(
                 break 'read None;
             }
             match event_name {
-                Some("response.created" | "response.queued" | "response.in_progress")
-                    if value.get("error").is_none()
-                        && value.pointer("/response/error").is_none_or(Value::is_null) =>
-                {
-                    continue;
-                }
                 Some("error" | "response.failed" | "response.error") | None => {
                     let error = if event_name.is_some_and(|name| name.starts_with("response.")) {
                         value.pointer("/response/error")
@@ -261,23 +252,56 @@ fn stream_quota_evidence(
     error: &Value,
 ) -> Option<(UpstreamFailureKind, SupplierQuotaEvidence)> {
     use crate::supplier_error::SafeReason;
-    let code = error.get("code").or_else(|| error.get("type"))?.as_str()?;
+    let field = |name| match error.get(name) {
+        None | Some(Value::Null) => Some(None),
+        Some(Value::String(value)) => Some(Some(value.as_str())),
+        _ => None,
+    };
+    let code = field("code")?;
+    let kind = field("type")?;
+    let reason_for = |value| match value {
+        "rate_limit_error" => Some(SafeReason::RateLimited),
+        "usage_limit_reached" => Some(SafeReason::InsufficientQuota),
+        "authentication_error" | "permission_error" => Some(SafeReason::AuthenticationInvalid),
+        _ => SafeReason::from_supplier(Some(value), None),
+    };
+    let reason = reason_for(code.or(kind)?)?;
+    if !matches!(
+        reason,
+        SafeReason::RateLimited | SafeReason::InsufficientQuota
+    ) || [code, kind]
+        .into_iter()
+        .flatten()
+        .filter_map(reason_for)
+        .any(|other| other != reason)
+        || [code, kind]
+            .into_iter()
+            .flatten()
+            .any(|value| matches!(value, "overloaded_error" | "api_error"))
+    {
+        return None;
+    }
     let message = match (error.get("message"), error.get("msg")) {
         (Some(_), Some(_)) => return None,
         (Some(message), None) | (None, Some(message)) => Some(message.as_str()?),
         _ => None,
     };
-    let rate_limited = SafeReason::from_supplier(Some(code), None) == Some(SafeReason::RateLimited)
-        && SafeReason::from_supplier(Some(code), message) == Some(SafeReason::RateLimited);
-    if !exhausted_error(error) && !rate_limited {
+    if SafeReason::from_supplier(None, message).is_some_and(|other| other != reason) {
         return None;
     }
     let body = serde_json::to_vec(error).ok()?;
     let now = unix_millis();
-    Some((
-        classify(headers, Some(&body), now),
-        quota_evidence(headers, Some(&body), now),
-    ))
+    let mut evidence = quota_evidence(headers, Some(&body), now);
+    evidence.exhausted = reason == SafeReason::InsufficientQuota;
+    let failure = if evidence.exhausted || evidence.reset_at.is_some() {
+        UpstreamFailureKind::RateLimitedUntil {
+            exhausted: evidence.exhausted,
+            until: evidence.reset_at.unwrap_or(0),
+        }
+    } else {
+        UpstreamFailureKind::RateLimited
+    };
+    Some((failure, evidence))
 }
 
 pub(in crate::api::proxy) async fn classify_supplier_quota(
@@ -388,7 +412,35 @@ mod tests {
             ),
             (
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-a\",\"output\":[],\"usage\":null}}\n\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-a\",\"error\":{\"code\":\"insufficient_quota\"}}}\n\n",
+                false,
+            ),
+            (
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"retry after plan window\"}}\n\n",
                 true,
+            ),
+            (
+                "data: {\"error\":{\"code\":null,\"type\":\"usage_limit_reached\"}}\n\n",
+                true,
+            ),
+            (
+                "data: {\"error\":{\"code\":\"insufficient_quota\",\"type\":\"rate_limit_error\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"code\":\"invalid_api_key\",\"type\":\"usage_limit_reached\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"code\":123,\"type\":\"usage_limit_reached\"}}\n\n",
+                false,
+            ),
+            (
+                "data: {\"error\":{\"type\":\"overloaded_error\"}}\n\n",
+                false,
+            ),
+            (
+                ": heartbeat\n\ndata: {\"error\":{\"type\":\"rate_limit_error\"}}\n\n",
+                false,
             ),
             (
                 "data: {\"error\":{\"code\":\"invalid_api_key\"}}\n\n",

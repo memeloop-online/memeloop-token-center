@@ -1,48 +1,260 @@
 use super::*;
 
 #[tokio::test]
+async fn two_candidates_deliver_first_event_before_release_and_keep_the_selected_stream() {
+    use futures_util::StreamExt;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for comment in [false, true] {
+        for ending in ["complete", "quota", "cancel"] {
+            let label = format!("first-event-{comment}-{ending}");
+            let fixture = codex_route_fixture(&label).await;
+            add_codex_standby_route(&fixture, &format!("codex-route-{label}"), "account-456").await;
+            let prefix = if comment {
+                ": upstream progress\n\n".to_owned()
+            } else {
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-codex\"}}\n\n"
+                    .to_owned()
+            };
+            let suffix = if ending == "quota" {
+                "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":null,\"type\":\"usage_limit_reached\"}}}\n\n".to_owned()
+            } else {
+                completed_codex_sse("selected complete")
+            };
+            let (release, gate) = tokio::sync::oneshot::channel::<()>();
+            let (dropped, observed_drop) = tokio::sync::oneshot::channel::<()>();
+            let gate = Arc::new(std::sync::Mutex::new(Some((gate, dropped))));
+            let standby_posts = Arc::new(AtomicUsize::new(0));
+            let handler_posts = standby_posts.clone();
+            let app = axum::Router::new().fallback(move |headers: HeaderMap| {
+                let gate = gate.clone();
+                let prefix = prefix.clone();
+                let suffix = suffix.clone();
+                let posts = handler_posts.clone();
+                async move {
+                    if headers
+                        .get("chatgpt-account-id")
+                        .and_then(|value| value.to_str().ok())
+                        == Some("account-456")
+                    {
+                        posts.fetch_add(1, Ordering::SeqCst);
+                        return (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from(completed_codex_sse("wrong candidate")),
+                        );
+                    }
+                    let (gate, dropped) = gate.lock().unwrap().take().unwrap();
+                    let stream = futures_util::stream::once(async move {
+                        Ok::<_, std::io::Error>(Bytes::from(prefix))
+                    })
+                    .chain(futures_util::stream::once(async move {
+                        let _dropped = dropped;
+                        gate.await.unwrap();
+                        Ok::<_, std::io::Error>(Bytes::from(suffix))
+                    }));
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        Body::from_stream(stream),
+                    )
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let response = tokio::time::timeout(
+                Duration::from_secs(3),
+                send_codex_route_to_endpoint(
+                    &fixture,
+                    endpoint,
+                    "/v1/responses",
+                    json!({"model":fixture.model,"input":"slow reasoning","stream":true}),
+                ),
+            )
+            .await
+            .expect("headers must precede upstream release");
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body().into_data_stream();
+            let first = tokio::time::timeout(Duration::from_secs(3), body.next())
+                .await
+                .expect("first event must precede release")
+                .unwrap()
+                .unwrap();
+            let mut rendered = String::from_utf8(first.to_vec()).unwrap();
+            assert!(
+                rendered.contains(if comment {
+                    ": heartbeat"
+                } else {
+                    "response.created"
+                }),
+                "{rendered}"
+            );
+            assert_eq!(standby_posts.load(Ordering::SeqCst), 0);
+            if ending == "cancel" {
+                drop(body);
+                cancellation::assert_single_unknown_receipt(
+                    &fixture,
+                    499,
+                    Some("client_cancelled"),
+                )
+                .await;
+                tokio::time::timeout(Duration::from_secs(5), observed_drop)
+                    .await
+                    .expect("cancellation must release upstream body")
+                    .unwrap_err();
+                drop(release);
+            } else {
+                if !comment && ending == "complete" {
+                    tokio::time::timeout(Duration::from_secs(25), async {
+                        while !rendered.contains(": keep-alive") {
+                            rendered.push_str(
+                                std::str::from_utf8(&body.next().await.unwrap().unwrap()).unwrap(),
+                            );
+                        }
+                    })
+                    .await
+                    .expect("existing progress heartbeat must run before release");
+                }
+                release.send(()).unwrap();
+                while let Some(chunk) = body.next().await {
+                    rendered.push_str(std::str::from_utf8(&chunk.unwrap()).unwrap());
+                }
+                if ending == "complete" {
+                    assert!(rendered.contains("selected complete"));
+                    assert_eq!(rendered.matches("event: response.completed").count(), 1);
+                    wait_for_request_settlement(&fixture, 1).await;
+                    let rows = fixture
+                        .state
+                        .db
+                        .list_requests(fixture.key_id, 10)
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        rows[0].upstream_account_id,
+                        Some(fixture.upstream_account_id)
+                    );
+                    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+                    assert_exactly_once_side_effects(
+                        &fixture,
+                        rows[0].request_id,
+                        Some("resp-codex"),
+                    )
+                    .await;
+                } else {
+                    assert!(rendered.contains("response.failed"));
+                    assert!(!rendered.contains("response.completed"));
+                    cancellation::assert_single_unknown_receipt(
+                        &fixture,
+                        502,
+                        Some("upstream_failed_response"),
+                    )
+                    .await;
+                }
+            }
+            assert_eq!(standby_posts.load(Ordering::SeqCst), 0);
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
 async fn preoutput_nonquota_sse_error_remains_failure_without_replay() {
-    let fixture = codex_route_fixture("sse-auth-no-replay").await;
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(header_matcher("chatgpt-account-id", "account-123"))
-        .respond_with(ResponseTemplate::new(200).set_body_raw(
-            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"invalid_api_key\"}}}\n\n",
-            "text/event-stream",
-        )).expect(1).mount(&upstream).await;
-    Mock::given(method("POST"))
-        .and(header_matcher("chatgpt-account-id", "account-456"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_raw(completed_codex_sse("must not replay"), "text/event-stream"),
+    for (label, error, execution) in [
+        ("auth", json!({"type":"authentication_error"}), json!({})),
+        ("overload", json!({"type":"overloaded_error"}), json!({})),
+        (
+            "conflict",
+            json!({"code":"invalid_api_key","type":"usage_limit_reached"}),
+            json!({}),
+        ),
+        (
+            "message-conflict",
+            json!({"type":"rate_limit_error","message":"Invalid API key"}),
+            json!({}),
+        ),
+        (
+            "rate-usage",
+            json!({"type":"rate_limit_error"}),
+            json!({"usage":{"input_tokens":4}}),
+        ),
+        (
+            "quota-usage",
+            json!({"code":null,"type":"usage_limit_reached"}),
+            json!({"usage":{"input_tokens":4}}),
+        ),
+        (
+            "rate-tool",
+            json!({"type":"rate_limit_error"}),
+            json!({"output":[{"type":"function_call","id":"call-a"}]}),
+        ),
+        (
+            "quota-tool",
+            json!({"code":null,"type":"usage_limit_reached"}),
+            json!({"output":[{"type":"function_call","id":"call-a"}]}),
+        ),
+        (
+            "rate-content",
+            json!({"type":"rate_limit_error"}),
+            json!({"output":[{"type":"message","content":[{"type":"output_text","text":"generated"}]}]}),
+        ),
+        (
+            "quota-content",
+            json!({"code":null,"type":"usage_limit_reached"}),
+            json!({"output":[{"type":"message","content":[{"type":"output_text","text":"generated"}]}]}),
+        ),
+    ] {
+        let label = format!("sse-{label}-no-replay");
+        let fixture = codex_route_fixture(&label).await;
+        let upstream = MockServer::start().await;
+        let mut rejected = execution;
+        rejected["error"] = error;
+        Mock::given(method("POST"))
+            .and(header_matcher("chatgpt-account-id", "account-123"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                format!(
+                    "event: response.failed\ndata: {}\n\n",
+                    json!({"type":"response.failed","response":rejected})
+                ),
+                "text/event-stream",
+            ))
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("POST"))
+            .and(header_matcher("chatgpt-account-id", "account-456"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(completed_codex_sse("must not replay"), "text/event-stream"),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        add_codex_standby_route(&fixture, &format!("codex-route-{label}"), "account-456").await;
+        let response = send_codex_route(
+            &fixture,
+            &upstream,
+            "/v1/responses",
+            json!({"model":fixture.model,"input":"denied","stream":true}),
         )
-        .expect(0)
-        .mount(&upstream)
         .await;
-    add_codex_standby_route(&fixture, "codex-route-sse-auth-no-replay", "account-456").await;
-    let response = send_codex_route(
-        &fixture,
-        &upstream,
-        "/v1/responses",
-        json!({"model":fixture.model,"input":"denied","stream":true}),
-    )
-    .await;
-    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
-        .await
-        .unwrap();
-    let text = String::from_utf8_lossy(&body);
-    assert!(text.contains("response.failed"), "{text}");
-    assert!(!text.contains("must not replay"), "{text}");
-    assert!(!text.contains("response.completed"), "{text}");
-    fixture.state.routing_persistence.drain_for_test().await;
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_supplier_availability")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(count, 0);
-    upstream.verify().await;
-    pool.close().await;
+        let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("response.failed"), "{text}");
+        assert!(!text.contains("must not replay"), "{text}");
+        assert!(!text.contains("response.completed"), "{text}");
+        fixture.state.routing_persistence.drain_for_test().await;
+        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_supplier_availability")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        upstream.verify().await;
+        pool.close().await;
+    }
 }
 
 #[tokio::test]
@@ -153,17 +365,24 @@ async fn preoutput_sse_quota_and_rate_rejection_fail_over_with_one_complete_resp
             "nested",
             "event: error\ndata: {\"type\":\"error\",\"error\":{\"code\":\"insufficient_user_quota\"}}\n\n",
         ),
+        (
+            "provider-type",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"retry after plan window\"}}\n\n",
+        ),
+        (
+            "null-code",
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":null,\"type\":\"usage_limit_reached\"}}}\n\n",
+        ),
     ] {
         let name = format!("stream-quota-{label}");
         let fixture = codex_route_fixture(&name).await;
         let upstream = MockServer::start().await;
-        let prefix = "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-rejected\",\"output\":[],\"usage\":null}}\n\n";
         Mock::given(method("POST"))
             .and(header_matcher("chatgpt-account-id", "account-123"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("retry-after", "120")
-                    .set_body_raw(format!("{prefix}{rejection}"), "text/event-stream"),
+                    .set_body_raw(rejection, "text/event-stream"),
             )
             .expect(1)
             .mount(&upstream)
