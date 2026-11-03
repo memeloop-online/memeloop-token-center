@@ -2999,10 +2999,16 @@ async fn execute_component_provider(
             .await;
         }
     };
-    if !request.memory.response_capture_fits(normalized.body.len())
-        || !request.memory.response_json_fits(&normalized.body)
+    if normalized.body.len() > maximum.min(MAX_PROXY_RESPONSE_BODY)
+        || !request.memory.reserve_response_json(&normalized.body)
     {
+        tracing::warn!(request_id = %request.request_id,
+            stage = "component_normalized_json",
+            reserved_bytes = request.memory.buffered_response_reserved_bytes(),
+            actual_bytes = normalized.body.len(),
+            "normalized response JSON memory unavailable");
         drop(normalized);
+        request.memory.release_buffered_response();
         return finish_component_provider_failure(
             &request,
             Some("component_response"),

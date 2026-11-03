@@ -3,10 +3,9 @@ use super::*;
 #[tokio::test]
 async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
     let upstream = MockServer::start().await;
-    // Small encoded input, but a JSON tree larger than the reserved envelope.
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [], "dense": vec![0; 2000]
+            "choices": [], "dense": vec![0; 1_100_000]
         })))
         .expect(1)
         .mount(&upstream)
@@ -62,6 +61,38 @@ async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
                 "memeloop_token_center_proxy_memory_rejections_total{{stage=\"{stage}\"}} 0"
             )));
     }
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn dense_small_json_is_delivered_once_instead_of_failing_its_initial_byte_envelope() {
+    let upstream = MockServer::start().await;
+    let body = json!({
+        "id": "dense-small", "object": "chat.completion",
+        "choices": [{"index":0,"message":{"role":"assistant","content":"complete"},"finish_reason":"stop"}],
+        "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},
+        "dense": vec![0; 2000]
+    });
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = resilient_route_fixture("dense-small-response", &[(upstream.uri(), 0)]).await;
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let delivered: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
+            .unwrap();
+    assert_eq!(delivered, body);
+    let rendered = fixture
+        .state
+        .metrics
+        .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(
+        rendered.lines().any(|line| line
+            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"response\"} 0")
+    );
     upstream.verify().await;
 }
 

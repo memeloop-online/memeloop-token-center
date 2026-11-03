@@ -80,6 +80,23 @@ pub(super) fn is_local_response_boundary(error_code: &str) -> bool {
     )
 }
 
+struct ResponseReadMemory<'a> {
+    memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
+    conversation: Option<&'a ProxyConversation>,
+    keep: bool,
+}
+
+impl Drop for ResponseReadMemory<'_> {
+    fn drop(&mut self) {
+        if !self.keep {
+            self.memory.release_buffered_response();
+            if let Some(conversation) = self.conversation {
+                conversation.reject_projection();
+            }
+        }
+    }
+}
+
 pub(super) async fn read_bounded_upstream(
     response: UpstreamResponse,
     maximum: usize,
@@ -102,6 +119,7 @@ pub(super) async fn read_bounded_upstream(
     {
         return Err(BoundedUpstreamError::ResponseTooLarge);
     }
+    let has_content_length = response.content_length().is_some();
     let declared_maximum = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
@@ -121,9 +139,17 @@ pub(super) async fn read_bounded_upstream(
         memory.reserve_buffered_response(reservation_maximum, deadline)
     };
     if !reserved {
+        tracing::warn!(request_id = %diagnostic_context.request_id,
+            stage = "buffered_response_admission", reserved_bytes = memory.buffered_response_reserved_bytes(),
+            actual_bytes = 0, has_content_length, "buffered response memory unavailable");
         capacity.finish("rejected", None, None);
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
+    let mut read_memory = ResponseReadMemory {
+        memory,
+        conversation,
+        keep: false,
+    };
     capacity.finish("completed", None, None);
     let mut first_byte = Some(proxy_diagnostics::Phase::new(
         diagnostic_context,
@@ -150,18 +176,154 @@ pub(super) async fn read_bounded_upstream(
         phase.finish("no_bytes", None, Some(0));
     }
     body.shrink_to_fit();
-    if !memory.response_json_fits(&body) {
+    let before = memory.buffered_response_reserved_bytes();
+    if !memory.reserve_response_json(&body) {
+        tracing::warn!(request_id = %diagnostic_context.request_id,
+            stage = "buffered_response_json", reserved_bytes = before,
+            actual_bytes = body.len(), has_content_length, "buffered response JSON memory unavailable");
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
     if !reserve_adapter_maximum {
         memory.shrink_buffered_response(&body);
     }
+    tracing::debug!(request_id = %diagnostic_context.request_id,
+        stage = "buffered_response_json", reserved_before_bytes = before,
+        reserved_bytes = memory.buffered_response_reserved_bytes(), actual_bytes = body.len(),
+        has_content_length, "buffered response JSON memory accounted");
+    read_memory.keep = true;
     Ok(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn dense_small_json_grows_its_response_envelope_at_low_global_occupancy() {
+        let body = Bytes::from(serde_json::json!({"dense": vec![0; 2000]}).to_string());
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(2 * 1024 * 1024 * 1024);
+        let other = budget.reservation();
+        assert!(other.try_grow(70 * 1024 * 1024, 1));
+        let baseline = budget.snapshot().0;
+        assert!((baseline as f64 / budget.snapshot().1 as f64) < 0.035);
+        let memory = budget.reservation();
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_11,
+            content_length: Some(body.len() as u64),
+            stream: Box::pin(futures_util::stream::iter([Ok(body.clone())])),
+        };
+        let result = read_bounded_upstream(
+            response,
+            1024 * 1024,
+            &memory,
+            Duration::from_secs(30),
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, body);
+        assert!(memory.response_json_fits(&body));
+        assert!(memory.buffered_response_reserved_bytes() > body.len() * 3);
+        memory.release_buffered_response();
+        assert_eq!(budget.snapshot().0, baseline);
+        drop(other);
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn response_json_top_up_failure_refunds_only_its_response_permits() {
+        let body = Bytes::from(serde_json::json!({"dense": vec![0; 2000]}).to_string());
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024);
+        let memory = budget.reservation();
+        assert!(memory.try_grow(1234, 1));
+        assert!(memory.finalize_request(tokio::time::Instant::now()));
+        let baseline = budget.snapshot();
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_11,
+            content_length: Some(body.len() as u64),
+            stream: Box::pin(futures_util::stream::iter([Ok(body)])),
+        };
+        assert!(matches!(
+            read_bounded_upstream(
+                response,
+                1024 * 1024,
+                &memory,
+                Duration::from_secs(30),
+                false,
+                None
+            )
+            .await,
+            Err(BoundedUpstreamError::MemoryCapacity)
+        ));
+        assert_eq!(budget.snapshot(), baseline);
+        assert!(!memory.has_buffered_response());
+        assert_eq!(memory.buffered_response_reserved_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn reader_cancel_size_error_and_stream_error_refund_response_while_request_owner_lives() {
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+        let memory = budget.reservation();
+        assert!(memory.try_grow(1234, 1));
+        let baseline = budget.snapshot();
+        for stream in [
+            Box::pin(futures_util::stream::iter([Ok(Bytes::from_static(
+                b"too big",
+            ))]))
+                as std::pin::Pin<
+                    Box<dyn futures_util::Stream<Item = Result<Bytes, &'static str>> + Send>,
+                >,
+            Box::pin(futures_util::stream::iter([Err("upstream_stream")])),
+        ] {
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                version: http::Version::HTTP_11,
+                content_length: Some(2),
+                stream,
+            };
+            assert!(
+                read_bounded_upstream(
+                    response,
+                    1024,
+                    &memory,
+                    Duration::from_secs(30),
+                    false,
+                    None
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(budget.snapshot(), baseline);
+        }
+        let owned = memory.clone();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                version: http::Version::HTTP_11,
+                content_length: None,
+                stream: Box::pin(futures_util::stream::once(async move {
+                    let _ = started.send(());
+                    futures_util::future::pending().await
+                })),
+            };
+            read_bounded_upstream(response, 1024, &owned, Duration::from_secs(30), false, None)
+                .await
+        });
+        waiting.await.unwrap();
+        assert!(memory.has_buffered_response());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.snapshot(), baseline);
+        assert!(!memory.has_buffered_response());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn buffered_body_outlives_twenty_minutes_without_relaxing_byte_admission() {

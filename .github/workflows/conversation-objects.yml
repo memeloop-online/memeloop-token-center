@@ -12,6 +12,7 @@ on:
       - src/gateway_body/**
       - src/api/traffic.rs
       - src/api/proxy/request_source.rs
+      - src/api/proxy/buffered_upstream.rs
       - src/api/sse/unique_json.rs
       - src/api/session_reading.rs
       - src/api/proxy/persistence.rs
@@ -82,6 +83,8 @@ jobs:
           done
           exit 1
       - run: cargo test --locked --lib api::proxy::request_source
+      - run: cargo test --locked --lib api::proxy::buffered_upstream
+      - run: cargo test --locked --lib api::proxy::tests::memory_metrics
       - run: cargo test --locked --lib gateway_body
       - run: cargo test --locked --lib api::proxy::tests::early_terminal
       - run: cargo test --locked --lib archive::conversation

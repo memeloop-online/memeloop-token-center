@@ -213,10 +213,6 @@ impl ProxyMemoryReservation {
         self.response_reserved.load(Ordering::Acquire)
     }
 
-    pub(crate) fn response_capture_fits(&self, bytes: usize) -> bool {
-        bytes.saturating_mul(CAPTURE_MEMORY_WEIGHT) <= self.response_bytes.load(Ordering::Acquire)
-    }
-
     pub(crate) fn finalize_request(&self, _deadline: tokio::time::Instant) -> bool {
         let units = {
             let Ok(held) = self.held.lock() else {
@@ -363,21 +359,66 @@ impl ProxyMemoryReservation {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn response_json_fits(&self, bytes: &[u8]) -> bool {
         bounded_json_fits(bytes, self.response_bytes.load(Ordering::Acquire))
     }
 
+    pub(crate) fn buffered_response_reserved_bytes(&self) -> usize {
+        self.response_bytes.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn reserve_response_json(&self, body: &[u8]) -> bool {
+        if !self.has_buffered_response() || body.len() > MAX_BUFFERED_RESPONSE_BYTES {
+            return false;
+        }
+        let Some(required) = buffered_response_json_bytes(body) else {
+            return false;
+        };
+        let Ok(mut held) = self.held.lock() else {
+            return false;
+        };
+        let previous = self.response_bytes.load(Ordering::Acquire);
+        let additional = required
+            .div_ceil(UNIT_BYTES)
+            .saturating_sub(previous / UNIT_BYTES);
+        let Ok(units) = u32::try_from(additional) else {
+            return false;
+        };
+        let Some(total) = held.0.checked_add(additional.saturating_mul(UNIT_BYTES)) else {
+            return false;
+        };
+        let Some(permit) = Self::acquire(&self.permits, units) else {
+            return false;
+        };
+        held.0 = total;
+        match held.1.as_mut() {
+            Some(existing) => existing.merge(permit),
+            None => held.1 = Some(permit),
+        }
+        self.response_bytes
+            .store(previous + additional * UNIT_BYTES, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn release_buffered_response(&self) {
+        let Ok(mut held) = self.held.lock() else {
+            return;
+        };
+        let bytes = self.response_bytes.swap(0, Ordering::AcqRel);
+        let total = held.0.saturating_sub(bytes);
+        let units = held.0.div_ceil(UNIT_BYTES) - total.div_ceil(UNIT_BYTES);
+        if let Some(permit) = held.1.as_mut() {
+            drop(permit.split(units));
+        }
+        held.0 = total;
+        self.response_reserved.store(false, Ordering::Release);
+    }
+
     pub(crate) fn shrink_buffered_response(&self, body: &[u8]) {
-        let nodes = JsonMemoryScanner::default().observe(body);
-        let required = body
-            .len()
-            .saturating_mul(CAPTURE_MEMORY_WEIGHT)
-            .max(
-                body.len()
-                    .saturating_mul(2)
-                    .saturating_add(nodes.saturating_mul(256)),
-            )
-            .max(UNIT_BYTES);
+        let Some(required) = buffered_response_json_bytes(body) else {
+            return;
+        };
         let Ok(mut held) = self.held.lock() else {
             return;
         };
@@ -506,6 +547,20 @@ impl ProxyMemoryReservation {
         held.0 = total;
         true
     }
+}
+
+fn buffered_response_json_bytes(body: &[u8]) -> Option<usize> {
+    let nodes = JsonMemoryScanner::default().observe(body);
+    Some(
+        body.len()
+            .checked_mul(CAPTURE_MEMORY_WEIGHT)?
+            .max(
+                body.len()
+                    .checked_mul(2)?
+                    .checked_add(nodes.checked_mul(256)?)?,
+            )
+            .max(UNIT_BYTES),
+    )
 }
 
 pub(crate) fn bounded_json_fits(bytes: &[u8], budget: usize) -> bool {
