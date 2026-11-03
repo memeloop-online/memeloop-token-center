@@ -130,7 +130,7 @@ mod output_validity_tests {
             )
             .is_err()
         );
-        assert!(
+        assert_eq!(
             normalize_proxy_usage_with_output_limit(
                 &TokenUsage {
                     input_tokens: 11,
@@ -140,7 +140,9 @@ mod output_validity_tests {
                 None,
                 None
             )
-            .is_err()
+            .unwrap()
+            .input_tokens,
+            11
         );
         assert!(
             normalize_proxy_usage_with_output_limit(
