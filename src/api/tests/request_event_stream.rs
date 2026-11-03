@@ -115,6 +115,25 @@ async fn http1_event_streams_reopen_after_abort_and_continue_after_write_fin() {
     .expect("reset HTTP1 subscriptions release their producers");
     live.set_zero_linger().unwrap();
     drop(live);
+    // After read EOF, HTTP half-close detects the peer's later reset on a
+    // response write. Commit a real event to exercise that write immediately.
+    let now = crate::db::unix_millis();
+    state
+        .db
+        .record_early_request_terminal(&crate::db::EarlyRequestTerminal {
+            request_id: Uuid::now_v7(),
+            tenant_id: key.tenant_id,
+            key_id: key.key_id,
+            created_at: now,
+            completed_at: now,
+            duration_ms: 0,
+            protocol: "openai".into(),
+            model: "sse-transport".into(),
+            status_code: 400,
+            error_code: "invalid_request".into(),
+        })
+        .await
+        .unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         while state.request_event_streams.active_count() != 0 {
             tokio::task::yield_now().await;
