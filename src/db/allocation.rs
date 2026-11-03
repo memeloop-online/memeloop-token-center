@@ -132,7 +132,7 @@ impl Database {
                     RETURNING 1
                 ), binding AS (
                     INSERT INTO group_allocation_sessions(tenant_id,session_key,account_id,generation,observed_at,expires_at,request_id)
-                    SELECT tenant_id,session_key,account_id,generation,created_at,created_at+86400000,request_id FROM inserted WHERE session_key<>''
+                    SELECT tenant_id,session_key,account_id,generation,created_at,created_at+86400000,request_id FROM inserted CROSS JOIN pending WHERE session_key<>''
                     ON CONFLICT(tenant_id,session_key) DO UPDATE SET account_id=excluded.account_id,generation=excluded.generation,observed_at=excluded.observed_at,expires_at=excluded.expires_at,request_id=excluded.request_id WHERE group_allocation_sessions.observed_at<=excluded.observed_at
                     RETURNING 1
                 ) SELECT COUNT(*) FROM inserted"
