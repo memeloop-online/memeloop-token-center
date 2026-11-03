@@ -170,7 +170,7 @@ pub(in crate::api::proxy) async fn classify_stream_quota(
         if batch.rejection.is_some() {
             break None;
         }
-        for event in batch.events {
+        if let Some(event) = batch.events.into_iter().next() {
             let Ok((name, data)) = crate::api::sse::parse_sse_event(&event) else {
                 break 'read None;
             };
