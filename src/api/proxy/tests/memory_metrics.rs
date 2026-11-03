@@ -99,6 +99,27 @@ async fn dense_small_response_is_delivered_once_and_client_body_retains_its_leas
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let refs = fixture
+                .state
+                .db
+                .request_archive_refs(fixture.key_id, rows[0].request_id)
+                .await
+                .unwrap();
+            if refs
+                .response_object
+                .as_deref()
+                .is_some_and(|locator| !locator.starts_with("gap://"))
+            {
+                break;
+            }
+            crate::response_archive_spool::process_one_for_test(&fixture.state).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable archive upload follows successful delivery independently");
     let refs = fixture
         .state
         .db

@@ -1948,7 +1948,6 @@ pub(super) async fn buffer_response(
     ));
     let mut parser = BufferedResponsesParser::with_limits(sse_framing_limits);
     let mut total = 0_usize;
-    let mut pending_bytes = 0_usize;
     let mut stream = response.bytes_stream();
     loop {
         let next = stream.next().await;
@@ -1963,7 +1962,7 @@ pub(super) async fn buffer_response(
         if total > maximum {
             return Err("upstream_response_too_large");
         }
-        pending_bytes = pending_bytes.saturating_add(chunk.len());
+        let pending_bytes = parser.pending_wire_bytes.saturating_add(chunk.len());
         if !memory.grow_buffered_response(pending_bytes) {
             tracing::warn!(request_id = %diagnostic_context.request_id,
                 stage = "codex_response_frame", reserved_bytes = memory.buffered_response_reserved_bytes(),
@@ -1971,10 +1970,7 @@ pub(super) async fn buffer_response(
             return Err("upstream_response_memory_capacity");
         }
         parser.push_accounted(&chunk, Some(memory))?;
-        if parser.framer.is_complete() && !parser.framer.has_pending_crlf_continuation() {
-            pending_bytes = 0;
-            memory.shrink_buffered_response(&[]);
-        }
+        memory.shrink_buffered_response_capacity(parser.pending_wire_bytes);
     }
     if let Some(phase) = first_byte.take() {
         phase.finish("no_bytes", None, Some(0));
@@ -1997,6 +1993,7 @@ pub(super) async fn buffer_response(
 #[derive(Default)]
 struct BufferedResponsesParser {
     framer: BoundedSseFramer,
+    pending_wire_bytes: usize,
     output_items: BTreeMap<usize, Value>,
     identity: ResponseIdentityGate,
     terminal_response: Option<(Value, BufferedCodexTerminal)>,
@@ -2067,6 +2064,7 @@ impl BufferedResponsesParser {
         chunk: &[u8],
         memory: Option<&std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
     ) -> Result<(), &'static str> {
+        self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(chunk.len());
         let batch = self.framer.push(chunk);
         if let Some(rejection) = batch.rejection {
             return Err(match rejection {
@@ -2075,6 +2073,7 @@ impl BufferedResponsesParser {
             });
         }
         for event in batch.events {
+            self.pending_wire_bytes = self.pending_wire_bytes.saturating_sub(event.bytes.len());
             self.dispatch(event, memory)?;
         }
         Ok(())
@@ -2985,6 +2984,19 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[test]
+    fn buffered_parser_counts_only_unemitted_wire_bytes_across_partial_events() {
+        let mut parser = BufferedResponsesParser::default();
+        let progress = b"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-1\",\"status\":\"in_progress\"}}\r\n\r\n";
+        for _ in 0..1000 {
+            for chunk in progress.chunks(17) {
+                parser.push(chunk).unwrap();
+                assert!(parser.pending_wire_bytes <= progress.len());
+            }
+            assert_eq!(parser.pending_wire_bytes, 0);
+        }
     }
 
     #[test]

@@ -357,6 +357,12 @@ impl ProxyMemoryReservation {
         self.resize_buffered_response(capacity * CAPTURE_MEMORY_WEIGHT, false)
     }
 
+    pub(crate) fn shrink_buffered_response_capacity(&self, capacity: usize) {
+        if capacity <= MAX_BUFFERED_RESPONSE_BYTES {
+            self.resize_buffered_response(capacity * CAPTURE_MEMORY_WEIGHT, true);
+        }
+    }
+
     pub(crate) fn reserve_response_json(&self, body: &[u8]) -> bool {
         if body.len() > MAX_BUFFERED_RESPONSE_BYTES {
             return false;
