@@ -6,12 +6,15 @@ impl Database {
         external: &str,
         key: &[u8],
     ) -> Result<Value, AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         let rows = sqlx::query("SELECT g.*, (SELECT COUNT(*) FROM transport_proxy_bindings b WHERE b.group_id = g.id) AS bound_account_count FROM transport_proxy_groups g JOIN tenants t ON t.id = g.tenant_id WHERE t.external_id = $1 ORDER BY g.name, g.id")
             .bind(external).fetch_all(&self.pool).await?;
-        let items = rows
-            .iter()
-            .map(|row| view(row, external, key))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut items = Vec::new();
+        for row in rows {
+            let members =
+                load_group_members(&self.pool, &row.try_get::<String, _>("id")?, key).await?;
+            items.push(view(&row, external, members)?);
+        }
         Ok(serde_json::json!({"items":items}))
     }
 
@@ -21,9 +24,14 @@ impl Database {
         external: &str,
         key: &[u8],
     ) -> Result<Value, AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         let row = sqlx::query("SELECT g.*, (SELECT COUNT(*) FROM transport_proxy_bindings b WHERE b.group_id = g.id) AS bound_account_count FROM transport_proxy_groups g JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1 AND t.external_id = $2")
             .bind(id.to_string()).bind(external).fetch_optional(&self.pool).await?.ok_or(AppError::NotFound)?;
-        view(&row, external, key)
+        view(
+            &row,
+            external,
+            load_group_members(&self.pool, &id.to_string(), key).await?,
+        )
     }
 
     pub(crate) async fn create_transport_group(
@@ -33,18 +41,37 @@ impl Database {
         key: &[u8],
     ) -> Result<Value, AppError> {
         validate_name(&body.name)?;
-        let members = members(body.members, &[])?;
-        validate_endpoints(&members).await?;
+        normalize_legacy_members(&self.pool, key).await?;
+        for member in &body.members {
+            if let Some(proxy) = &member.proxy_url {
+                crate::network::validate_managed_codex_proxy(proxy).await?;
+            }
+        }
         let (probe_url, probe_attempts) = probe_settings(body.probe_url, body.probe_attempts)?;
-        let stored_members = serde_json::to_string(&members).map_err(|_| invalid())?;
+        let ciphertext = "";
         let mut tx = self.begin_write_transaction().await?;
         lock(&mut tx).await?;
         let tenant_id = tenant(&mut tx, &body.tenant_external_id).await?;
+        let members = self
+            .resolve_proxy_members(&mut tx, &tenant_id, body.members, &[], key)
+            .await?;
         let id = Uuid::now_v7();
         available_name(&mut tx, &tenant_id, &body.name, id).await?;
         let now = unix_millis();
         sqlx::query("INSERT INTO transport_proxy_groups (id, tenant_id, name, version, members_ciphertext, probe_url, probe_attempts, created_at, updated_at) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $7)")
-            .bind(id.to_string()).bind(&tenant_id).bind(&body.name).bind(stored_members).bind(&probe_url).bind(probe_attempts).bind(now).execute(&mut *tx).await?;
+            .bind(id.to_string()).bind(&tenant_id).bind(&body.name).bind(ciphertext).bind(&probe_url).bind(probe_attempts).bind(now).execute(&mut *tx).await?;
+        store_group_members(
+            self,
+            &mut tx,
+            &id.to_string(),
+            &tenant_id,
+            &members,
+            probe_url.as_deref(),
+            probe_attempts,
+            probe_url.is_some(),
+            key,
+        )
+        .await?;
         budget(&mut tx, key).await?;
         audit(&mut tx, &tenant_id, id, "create", 1, actor).await?;
         let row = sqlx::query(
@@ -53,7 +80,7 @@ impl Database {
         .bind(id.to_string())
         .fetch_one(&mut *tx)
         .await?;
-        let result = view(&row, &body.tenant_external_id, key)?;
+        let result = view(&row, &body.tenant_external_id, members)?;
         tx.commit().await?;
         Ok(result)
     }
@@ -66,6 +93,7 @@ impl Database {
         key: &[u8],
     ) -> Result<Value, AppError> {
         validate_name(&body.name)?;
+        normalize_legacy_members(&self.pool, key).await?;
         for member in &body.members {
             if let Some(proxy) = &member.proxy_url {
                 crate::network::validate_managed_codex_proxy(proxy).await?;
@@ -85,9 +113,11 @@ impl Database {
         if version != body.expected_version {
             return Err(conflict("proxy_group_version_conflict"));
         }
-        let previous = open_members(&row, key)?;
+        let previous = load_group_members(&mut *tx, &id.to_string(), key).await?;
         available_name(&mut tx, &tenant_id, &body.name, id).await?;
-        let next = members(body.members, &previous)?;
+        let next = self
+            .resolve_proxy_members(&mut tx, &tenant_id, body.members, &previous, key)
+            .await?;
         let destructive = previous.iter().any(|old| {
             !next
                 .iter()
@@ -95,21 +125,35 @@ impl Database {
         });
         let accounts = sqlx::query("SELECT account_id, version, initial_member_id FROM transport_proxy_bindings WHERE group_id = $1 ORDER BY account_id")
             .bind(id.to_string()).fetch_all(&mut *tx).await?;
-        if destructive && !accounts.is_empty() && body.replacement_member_id.is_none() {
-            return Err(invalid());
-        }
         if let Some(replacement) = body.replacement_member_id
             && !next.iter().any(|member| member.id == replacement)
         {
             return Err(invalid());
         }
+        let replacement_member_id = body
+            .replacement_member_id
+            .or_else(|| destructive.then_some(next[0].id));
         let version = version
             .checked_add(1)
             .ok_or(AppError::internal("groups_update_transport_group_1"))?;
-        let stored_members = serde_json::to_string(&next).map_err(|_| invalid())?;
+        let ciphertext = "";
         let (probe_url, probe_attempts) = probe_settings(body.probe_url, body.probe_attempts)?;
+        let update_probe = probe_url != row.try_get::<Option<String>, _>("probe_url")?
+            || probe_attempts != row.try_get::<i64, _>("probe_attempts")?;
         sqlx::query("UPDATE transport_proxy_groups SET name = $1, version = $2, members_ciphertext = $3, probe_url = $4, probe_attempts = $5, updated_at = $6 WHERE id = $7")
-            .bind(&body.name).bind(version).bind(stored_members).bind(&probe_url).bind(probe_attempts).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
+            .bind(&body.name).bind(version).bind(ciphertext).bind(&probe_url).bind(probe_attempts).bind(unix_millis()).bind(id.to_string()).execute(&mut *tx).await?;
+        store_group_members(
+            self,
+            &mut tx,
+            &id.to_string(),
+            &tenant_id,
+            &next,
+            probe_url.as_deref(),
+            probe_attempts,
+            update_probe,
+            key,
+        )
+        .await?;
         for account in accounts {
             let account_id = parse_uuid(account.try_get("account_id")?)?;
             let initial = parse_uuid(account.try_get("initial_member_id")?)?;
@@ -122,7 +166,7 @@ impl Database {
             let base = retained
                 .or_else(|| {
                     next.iter()
-                        .find(|member| Some(member.id) == body.replacement_member_id)
+                        .find(|member| Some(member.id) == replacement_member_id)
                 })
                 .ok_or_else(invalid)?;
             let binding_version: i64 = account.try_get("version")?;
@@ -148,18 +192,18 @@ impl Database {
                 &previous,
                 &next,
                 base.id,
-                body.replacement_member_id,
+                replacement_member_id,
                 key,
             )
             .await?;
             sqlx::query("UPDATE transport_proxy_bindings SET initial_member_id = $1, replacement_member_id = $2, updated_at = $3 WHERE account_id = $4")
-                .bind(base.id.to_string()).bind(body.replacement_member_id.map(|id| id.to_string())).bind(unix_millis()).bind(account_id.to_string()).execute(&mut *tx).await?;
+                .bind(base.id.to_string()).bind(replacement_member_id.map(|id| id.to_string())).bind(unix_millis()).bind(account_id.to_string()).execute(&mut *tx).await?;
         }
         budget(&mut tx, key).await?;
         audit(&mut tx, &tenant_id, id, "update", version, actor).await?;
         let row = sqlx::query("SELECT g.*, (SELECT COUNT(*) FROM transport_proxy_bindings b WHERE b.group_id = g.id) AS bound_account_count FROM transport_proxy_groups g WHERE id = $1")
             .bind(id.to_string()).fetch_one(&mut *tx).await?;
-        let result = view(&row, &body.tenant_external_id, key)?;
+        let result = view(&row, &body.tenant_external_id, next)?;
         tx.commit().await?;
         Ok(result)
     }
@@ -200,11 +244,4 @@ impl Database {
         tx.commit().await?;
         Ok(())
     }
-}
-
-async fn validate_endpoints(members: &[Member]) -> Result<(), AppError> {
-    for member in members {
-        crate::network::validate_managed_codex_proxy(&member.proxy_url).await?;
-    }
-    Ok(())
 }

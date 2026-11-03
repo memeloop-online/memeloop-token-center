@@ -11,7 +11,7 @@ async fn codex_explicit_quota_rejection_fails_over_and_is_observed_without_admis
             "error": {"type":"usage_limit_reached", "resets_in_seconds":3600,
                 "message":"fixture private exhausted quota"}
         })))
-        .expect(2)
+        .expect(1)
         .mount(&upstream)
         .await;
     Mock::given(method("POST"))
@@ -39,12 +39,24 @@ async fn codex_explicit_quota_rejection_fails_over_and_is_observed_without_admis
             .await
             .unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("fixture private exhausted quota"));
+        fixture.state.routing_persistence.drain_for_test().await;
     }
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1 AND consecutive_failures > 0")
         .bind(fixture.upstream_account_id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(health_rows, 0);
+    let evidence = sqlx::query(
+        "SELECT failure_kind, reset_at, reset_source, upstream_model
+         FROM upstream_supplier_availability WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(evidence.get::<String, _>("failure_kind"), "quota_exhausted");
+    assert_eq!(evidence.get::<String, _>("reset_source"), "provider_reset");
+    assert!(evidence.get::<Option<i64>, _>("reset_at").unwrap() > unix_millis());
     let actual: String = sqlx::query_scalar("SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(actual, standby.to_string());

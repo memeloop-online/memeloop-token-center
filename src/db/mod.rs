@@ -53,6 +53,7 @@ mod archive_staging;
 mod gateway_persistence;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
+pub(crate) mod allocation;
 mod billing;
 mod constants;
 mod credentials;
@@ -66,6 +67,7 @@ mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
+pub(crate) mod plugin_background_actions;
 mod plugin_configurations;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installations;
@@ -79,6 +81,7 @@ mod plugin_revisions;
 mod plugin_service_data;
 mod projection_lock;
 mod providers;
+mod request_history;
 mod requests;
 pub(crate) use requests::EarlyRequestTerminal;
 #[allow(unused_imports)] // Consumed by the separately owned API receipt integration.
@@ -100,19 +103,22 @@ mod session_responses;
 pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
 pub(crate) use session_responses::SessionResponseTask;
 mod session_projection;
+pub(crate) mod session_tasks;
 mod session_titles;
 pub(crate) use session_titles::{
     SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
 };
+pub(crate) mod network_proxies;
 mod tenants;
-mod transport_proxy_groups;
+pub(crate) mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
 pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
-mod upstream_service_probes;
+pub(crate) mod upstream_service_probes;
+pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
 mod usage_analysis;
 mod validation;
 

@@ -510,11 +510,16 @@ impl Database {
         identity: ArchiveSpoolIdentity,
     ) -> Result<(), AppError> {
         let mut transaction = self.begin_write_transaction().await?;
-        let row = sqlx::query("SELECT * FROM request_records WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3")
+        // Source completion may follow the financial terminal. Lock an open
+        // owner before allocating the started event and its global locator.
+        let row = sqlx::query("UPDATE request_records SET completed_at = completed_at WHERE id = $1 AND tenant_id = $2 AND reservation_id = $3 AND completed_at IS NULL RETURNING *")
             .bind(identity.request_id.to_string())
             .bind(identity.tenant_id.to_string())
             .bind(identity.reservation_id.to_string())
-            .fetch_one(&mut *transaction).await?;
+            .fetch_optional(&mut *transaction).await?;
+        let Some(row) = row else {
+            return Ok(());
+        };
         let started = NewRequest {
             request_id: identity.request_id,
             tenant_id: identity.tenant_id,
@@ -2615,12 +2620,10 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
         .as_ref()
         .map(|usage| usage.billing_unit)
         .unwrap_or("");
-    // Archive binding and terminal persistence finish independently. A stale
-    // terminal placeholder must not downgrade a locator already bound by the
-    // archive owner; resolve this under the same row lock as terminal facts.
+    // Preserve the response locator bound by this request's archive owner
+    // when the terminal receipt still carries its pending/gap marker.
     let updated = sqlx::query(
         "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = CASE WHEN $10 LIKE 'gap://%' AND response_object IS NOT NULL AND response_object <> '' AND response_object NOT LIKE 'gap://%' THEN response_object ELSE $10 END, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19, cache_known_read_tokens = $20, cache_known_input_tokens = $21 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
-
     )
     .bind(request.status_code)
     .bind(request.duration_ms)

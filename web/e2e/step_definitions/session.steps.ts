@@ -138,13 +138,17 @@ Then('同时间戳会话详情分页无重复遗漏且 USD 与 CNY 分行', asyn
   const page = this.requirePage();
   await page.route('**/internal/v1/sessions/**', async (route) => {
     const url = new URL(route.request().url());
+    if (route.request().method() !== 'GET' || !/^\/internal\/v1\/sessions\/[^/]+$/.test(url.pathname)) {
+      await route.fallback();
+      return;
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify(detailFixture(url.searchParams.has('before_request_id'))),
     });
   });
-  const firstCard = page.locator('.session-card').first();
+  const firstCard = page.locator('.session-card[data-session-association="confirmed"]').first();
   await visible(firstCard);
   await firstCard.getByRole('button', { name: /^打开 / }).click();
   const drawer = page.locator('.session-detail-region .session-detail');
@@ -187,7 +191,7 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   assert.match(await candidate.textContent() ?? '', /不计入会话统计/);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
-  await page.locator('.session-card').first().getByRole('button', { name: /^Open / }).click();
+  await page.locator('.session-card[data-session-association="confirmed"]').first().getByRole('button', { name: /^Open / }).click();
   const englishDrawer = page.locator('.session-detail-region .session-detail');
   await visible(englishDrawer);
   const englishText = await englishDrawer.textContent() ?? '';

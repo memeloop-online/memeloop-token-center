@@ -57,6 +57,8 @@
 }
 .session-title-action { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .session-title-action p { flex-basis: 100%; margin: 0; }
+.session-title-guidance { display: grid; flex-basis: 100%; gap: 4px; }
+.session-title-guidance small { display: block; }
 
 .session-replay-heading,
 .session-replay-heading > div,

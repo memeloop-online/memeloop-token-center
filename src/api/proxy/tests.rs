@@ -58,6 +58,7 @@ mod passthrough_reservation;
 mod pending_delivery;
 mod persistence_isolation;
 mod phase_diagnostics;
+mod playground_port;
 mod postgres_attempt_deadline;
 mod recovery_wait;
 mod responses_transport;
@@ -67,6 +68,7 @@ mod shutdown_durability;
 mod soonest_reset;
 mod source_r2;
 mod sse_delivery;
+mod supplier_quota;
 mod upstream_error_details;
 
 fn pinned_request_envelope_changed(

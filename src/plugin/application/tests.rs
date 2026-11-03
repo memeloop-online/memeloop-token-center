@@ -450,6 +450,8 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     );
     first.refresh_application_plugins().await.unwrap();
     let warm_counts = pin_work_counts(&authority_a);
+    let warm_other = authority_b.pin().await.unwrap();
+    let other_counts = pin_work_counts(&authority_b);
     std::fs::rename(&a_root, directory.join("removed-inventory-a")).unwrap();
     let offline_inventory = directory.join("offline-inventory.json");
     std::fs::rename(&inventory_path, &offline_inventory).unwrap();
@@ -560,7 +562,8 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     assert_eq!(pin_work_counts(&authority_a), warm_counts);
     assert!(authority_a.status().await.is_err());
     assert!(authority_a.stage("a").await.is_err());
-    assert!(authority_b.pin().await.is_err());
+    assert!(Arc::ptr_eq(&warm_other, &authority_b.pin().await.unwrap()));
+    assert_eq!(pin_work_counts(&authority_b), other_counts);
     std::fs::rename(&offline_inventory, &inventory_path).unwrap();
     assert!(cold_authority.pin().await.is_err());
     assert!(
@@ -571,7 +574,11 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     );
     assert!(authority_a.pin_historical(1).await.is_err());
     assert!(authority_a.stage("a").await.is_err());
-    assert!(second.refresh_application_plugins().await.is_err());
+    second.refresh_application_plugins().await.unwrap();
+    assert!(Arc::ptr_eq(
+        &warm_other,
+        &authority_b.current_snapshot().unwrap().unwrap()
+    ));
     let retained = second.clone().pin_application_plugins().await.unwrap();
     assert_policy(&retained, false).await;
     assert_provider_phases(&retained, false).await;

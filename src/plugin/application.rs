@@ -113,6 +113,8 @@ pub struct ApplicationPlugins {
     compilations: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     compile_gate: std::sync::Mutex<Option<CompileGate>>,
+    #[cfg(test)]
+    snapshot_cache_waiting: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[derive(Default)]
@@ -295,6 +297,8 @@ impl ApplicationPlugins {
             compilations: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             compile_gate: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            snapshot_cache_waiting: std::sync::Mutex::new(None),
         })
     }
 
@@ -697,6 +701,10 @@ impl ApplicationPlugins {
         self: &Arc<Self>,
         head: ApplicationRevision,
     ) -> Result<Arc<ApplicationPluginSnapshot>, AppError> {
+        #[cfg(test)]
+        if let Some(waiting) = self.snapshot_cache_waiting.lock().unwrap().take() {
+            let _ = waiting.send(());
+        }
         {
             let cache = self.snapshots.lock().await;
             if let Some(snapshot) = cache

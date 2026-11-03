@@ -414,6 +414,27 @@ impl Database {
         &self,
         request_id: Uuid,
     ) -> Result<Vec<crate::model::RequestTransportDiagnosticView>, AppError> {
+        if let Some(client) = self.history_reader().await? {
+            let Some(snapshot) = client
+                .request_snapshot(
+                    crate::request_history::HistoryScope::GlobalOperator,
+                    request_id,
+                )
+                .await?
+            else {
+                return Ok(Vec::new());
+            };
+            return serde_json::from_value(snapshot.read_model["transport_diagnostics"].clone())
+                .map_err(|_| AppError::internal("history_transport_projection_missing"));
+        }
+        self.source_request_upstream_transport_diagnostics(request_id)
+            .await
+    }
+
+    pub(crate) async fn source_request_upstream_transport_diagnostics(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Vec<crate::model::RequestTransportDiagnosticView>, AppError> {
         let rows = sqlx::query(
             "SELECT route_id, upstream_account_id, credential_generation,
                     transport_revision, failure_kind, failure_stage,
@@ -757,31 +778,6 @@ impl Database {
             None,
         )
         .await
-    }
-
-    /// Provider quota exhaustion is not a transport probe. Customer forwarding
-    /// still has to leave that account alone until its deadline.
-    pub(crate) async fn customer_attempt_blocked_by_quota(
-        &self,
-        upstream_account_id: Uuid,
-        credential_generation: i64,
-        transport_revision: i64,
-    ) -> Result<bool, AppError> {
-        let blocked: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM upstream_account_health
-             WHERE upstream_account_id = $1
-               AND credential_generation = $2
-               AND transport_revision = $3
-               AND cooldown_until > $4
-               AND last_failure_kind IN ('quota_exhausted', 'rate_limited')",
-        )
-        .bind(upstream_account_id.to_string())
-        .bind(credential_generation)
-        .bind(transport_revision)
-        .bind(unix_millis())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(blocked.is_some())
     }
 
     async fn claim_upstream_attempt_inner(
@@ -1300,11 +1296,7 @@ impl Database {
         .bind(success_epoch.to_string())
         .execute(&self.pool)
         .await?;
-        let recovered = result.rows_affected() == 1;
-        if recovered {
-            self.note_service_available(upstream_account_id).await;
-        }
-        Ok(recovered)
+        Ok(result.rows_affected() == 1)
     }
 
     #[cfg(test)]
@@ -1438,11 +1430,7 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await?;
-        let recovered = result.rows_affected() == 1;
-        if recovered {
-            self.note_service_available(upstream_account_id).await;
-        }
-        Ok(recovered)
+        Ok(result.rows_affected() == 1)
     }
 
     #[cfg(test)]
@@ -2395,7 +2383,7 @@ mod tests {
         .fetch_one(&database.pool)
         .await
         .unwrap();
-        assert_eq!(status, "healthy");
+        assert_eq!(status, "unhealthy");
         assert!(
             database
                 .claim_upstream_account_attempt(account_id, 1)

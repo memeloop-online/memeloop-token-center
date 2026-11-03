@@ -25,6 +25,9 @@ use crate::{
 use super::plugin_execution::{self, Phase};
 
 #[cfg(test)]
+mod tests;
+
+#[cfg(test)]
 tokio::task_local! {
     static TEST_COMPONENT_PREPARE_COUNTER: std::sync::Arc<std::sync::atomic::AtomicUsize>;
 }
@@ -441,26 +444,6 @@ async fn apply_traffic_plugin(
             request_rewrite_supplied: false,
         });
     }
-    let temporary_memory = if memory.is_some() {
-        let input_length =
-            crate::gateway_body::memory::json_encoded_length(&original_request_json)?;
-        Some(
-            state
-                .proxy_memory_budget
-                .temporary(input_length.saturating_mul(5))
-                .map_err(|error| {
-                    named_memory_rejection(
-                        "proxy_memory_plugin",
-                        state.metrics.observe_proxy_memory_error(
-                            crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                            error,
-                        ),
-                    )
-                })?,
-        )
-    } else {
-        None
-    };
     let plugin_configurations = plugins
         .resolved_traffic_configurations(key.tenant_id)
         .await?;
@@ -478,22 +461,20 @@ async fn apply_traffic_plugin(
     let metrics = state.metrics.clone();
     let (plugin_decision, original_request_json) =
         plugin_execution::run(state.metrics.clone(), Phase::PostAuth, move || {
-            let _temporary_memory = temporary_memory;
+            let _memory = memory;
             let result = (|| {
                 #[cfg(feature = "experimental-plugin-revisions")]
                 if let Some(snapshot) = application_snapshot {
-                    return snapshot.runtime.apply_traffic_with_config_and_memory(
+                    return snapshot.runtime.apply_traffic_with_config(
                         plugin_context,
                         &plugin_request,
                         &plugin_configurations,
-                        memory.as_deref(),
                     );
                 }
-                plugins.apply_traffic_with_config_and_memory(
+                plugins.apply_traffic_with_config(
                     plugin_context,
                     &plugin_request,
                     &plugin_configurations,
-                    memory.as_deref(),
                 )
             })();
             result
@@ -589,23 +570,12 @@ pub(super) async fn normalize_component_provider(
     status: u16,
     headers: BTreeMap<String, String>,
     body: Vec<u8>,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<NormalizedProviderResponse, AppError> {
-    let temporary_memory = state
-        .proxy_memory_budget
-        .temporary(64 * 1024 * 1024 + body.len().saturating_mul(6))
-        .map_err(|error| {
-            named_memory_rejection(
-                "proxy_memory_plugin",
-                state.metrics.observe_proxy_memory_error(
-                    crate::metrics::ProxyMemoryRejectionStage::Plugin,
-                    error,
-                ),
-            )
-        })?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
-        let _temporary_memory = temporary_memory;
+        let _memory = memory;
         plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
     })
     .await?

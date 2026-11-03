@@ -1,20 +1,15 @@
-//! Read-only classification of definite HTTP 429 rejection, never a supplier
-//! retry or quota reset. SSE failures do not establish that execution was free.
+//! Classify structured supplier quota rejections while preserving response ownership.
 use super::super::super::*;
-use crate::db::UpstreamFailureKind;
+use crate::db::{SupplierQuotaEvidence, UpstreamFailureKind};
 use futures_util::{StreamExt, stream};
 
 const MAX_BODY: usize = 64 * 1024;
 const MAX_CHUNKS: usize = 256;
-const MAX_COOLDOWN: i64 = 7 * 24 * 60 * 60 * 1_000;
-const UNKNOWN_RESET_COOLDOWN: i64 = 15 * 60 * 1_000;
-
 fn bounded_future(deadline: i64, now: i64) -> Option<i64> {
-    (deadline > now).then(|| deadline.min(now.saturating_add(MAX_COOLDOWN)))
+    (deadline > now).then_some(deadline)
 }
 
 fn retry_after(headers: &HeaderMap, now: i64) -> Option<i64> {
-    // Duplicate timing headers are ambiguous; never choose one arbitrarily.
     let mut values = headers.get_all(header::RETRY_AFTER).iter();
     let value = values.next()?;
     if values.next().is_some() {
@@ -26,23 +21,63 @@ fn retry_after(headers: &HeaderMap, now: i64) -> Option<i64> {
     }
     if value.bytes().all(|byte| byte.is_ascii_digit()) {
         let seconds: i64 = value.parse().ok()?;
-        return bounded_future(now.saturating_add(seconds.saturating_mul(1_000)), now);
+        return bounded_future(now.checked_add(seconds.checked_mul(1_000)?)?, now);
     }
     let date = chrono::DateTime::parse_from_rfc2822(value).ok()?;
     bounded_future(date.timestamp_millis(), now)
 }
 
 fn classify(headers: &HeaderMap, body: Option<&[u8]>, now: i64) -> UpstreamFailureKind {
+    let evidence = quota_evidence(headers, body, now);
+    match (evidence.exhausted, evidence.reset_at) {
+        (false, None) => UpstreamFailureKind::RateLimited,
+        (exhausted, deadline) => UpstreamFailureKind::RateLimitedUntil {
+            exhausted,
+            // Diagnostic compatibility only. Durable evidence retains None.
+            until: deadline.unwrap_or(0),
+        },
+    }
+}
+
+fn exhausted_error(error: &Value) -> bool {
+    use crate::supplier_error::SafeReason;
+    let message = match (error.get("message"), error.get("msg")) {
+        (Some(_), Some(_)) => return false,
+        (Some(message), None) | (None, Some(message)) => message.as_str(),
+        _ => None,
+    };
+    let code = error.get("code").and_then(Value::as_str);
+    let kind = error.get("type").and_then(Value::as_str);
+    let reason = SafeReason::from_supplier(code.or(kind), message);
+    if kind == Some("usage_limit_reached") {
+        return [
+            SafeReason::from_supplier(code, None),
+            SafeReason::from_supplier(None, message),
+        ]
+        .into_iter()
+        .all(|reason| reason.is_none_or(|reason| reason == SafeReason::InsufficientQuota));
+    }
+    matches!(
+        code.or(kind),
+        Some("insufficient_quota" | "insufficient_user_quota")
+    ) && reason == Some(SafeReason::InsufficientQuota)
+}
+
+pub(in crate::api::proxy) fn quota_evidence(
+    headers: &HeaderMap,
+    body: Option<&[u8]>,
+    now: i64,
+) -> SupplierQuotaEvidence {
     let header_deadline = retry_after(headers, now);
     let value = body.and_then(|body| crate::api::sse::parse_unique_json(body).ok());
-    let error = value.as_ref().and_then(|value| {
-        // Only the exact structured supplier signal qualifies as exhaustion.
-        // Text matching and guessed HTTP200/5xx semantics are deliberately absent.
-        [value.get("error"), Some(value)]
-            .into_iter()
-            .flatten()
-            .find(|error| error.get("type").and_then(Value::as_str) == Some("usage_limit_reached"))
-    });
+    let error = value
+        .as_ref()
+        .and_then(|value| match value.get("error") {
+            Some(error) if error.is_object() => Some(error),
+            None if value.is_object() => Some(value),
+            _ => None,
+        })
+        .filter(|error| exhausted_error(error));
     let reset = error.and_then(|error| {
         error
             .get("resets_at")
@@ -55,16 +90,19 @@ fn classify(headers: &HeaderMap, body: Option<&[u8]>, now: i64) -> UpstreamFailu
                     .and_then(Value::as_i64)
                     .filter(|seconds| *seconds > 0)
                     .and_then(|seconds| {
-                        bounded_future(now.saturating_add(seconds.saturating_mul(1_000)), now)
+                        bounded_future(now.checked_add(seconds.checked_mul(1_000)?)?, now)
                     })
             })
     });
     let deadline = header_deadline.into_iter().chain(reset).max();
-    match (error.is_some(), deadline) {
-        (false, None) => UpstreamFailureKind::RateLimited,
-        (exhausted, deadline) => UpstreamFailureKind::RateLimitedUntil {
-            exhausted,
-            until: deadline.unwrap_or_else(|| now.saturating_add(UNKNOWN_RESET_COOLDOWN)),
+    SupplierQuotaEvidence {
+        exhausted: error.is_some(),
+        reset_at: deadline,
+        reset_source: match (header_deadline, reset) {
+            (Some(header), Some(reset)) if reset > header => "provider_reset",
+            (Some(_), _) => "retry_after",
+            (_, Some(_)) => "provider_reset",
+            _ => "unknown",
         },
     }
 }
@@ -72,56 +110,85 @@ fn classify(headers: &HeaderMap, body: Option<&[u8]>, now: i64) -> UpstreamFailu
 pub(in crate::api::proxy) async fn classify_rate_limit(
     response: UpstreamResponse,
 ) -> (UpstreamResponse, UpstreamFailureKind) {
-    if response.status() != StatusCode::TOO_MANY_REQUESTS {
-        return (response, UpstreamFailureKind::RateLimited);
+    let (response, kind, _) = classify_supplier_quota(response).await;
+    (response, kind)
+}
+
+pub(in crate::api::proxy) async fn classify_supplier_quota(
+    response: UpstreamResponse,
+) -> (UpstreamResponse, UpstreamFailureKind, SupplierQuotaEvidence) {
+    if !matches!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
+    ) {
+        let evidence = quota_evidence(response.headers(), None, unix_millis());
+        return (response, UpstreamFailureKind::RateLimited, evidence);
     }
     let mut parts = response.into_parts();
+    let forbidden = parts.status == StatusCode::FORBIDDEN;
+    if forbidden
+        && (upstream_error::rejection_content_class(&parts.headers) != "json"
+            || parts
+                .headers
+                .get_all(header::CONTENT_ENCODING)
+                .iter()
+                .any(|encoding| !encoding.as_bytes().eq_ignore_ascii_case(b"identity")))
+    {
+        return (
+            UpstreamResponse::Prefetched {
+                status: parts.status,
+                headers: parts.headers,
+                version: parts.version,
+                content_length: parts.content_length,
+                stream: parts.stream,
+            },
+            UpstreamFailureKind::Authentication,
+            SupplierQuotaEvidence {
+                exhausted: false,
+                reset_at: None,
+                reset_source: "unknown",
+            },
+        );
+    }
     let mut prefix = Vec::new();
     let mut body = Vec::new();
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-    let read = async {
-        loop {
-            // Empty and permanently-ready chunks consume work and metadata
-            // even when the byte budget is unchanged. Bound both, and yield
-            // so a ready stream cannot starve the timeout/cancellation owner.
-            if prefix.len() >= MAX_CHUNKS || tokio::time::Instant::now() >= deadline {
-                return false;
-            }
-            if !prefix.is_empty() && prefix.len().is_multiple_of(16) {
-                tokio::task::yield_now().await;
-                if tokio::time::Instant::now() >= deadline {
-                    return false;
+    let max_body = if forbidden {
+        upstream_error::MAX_ERROR_BYTES
+    } else {
+        MAX_BODY
+    };
+    let complete = loop {
+        if prefix.len() >= MAX_CHUNKS {
+            break false;
+        }
+        if !prefix.is_empty() && prefix.len().is_multiple_of(16) {
+            tokio::task::yield_now().await;
+        }
+        match parts.stream.next().await {
+            Some(Ok(chunk)) => {
+                let fits = body.len().saturating_add(chunk.len()) <= max_body;
+                if fits {
+                    body.extend_from_slice(&chunk);
+                }
+                prefix.push(Ok(chunk));
+                if !fits {
+                    break false;
                 }
             }
-            match parts.stream.next().await {
-                Some(Ok(chunk)) => {
-                    let fits = body.len().saturating_add(chunk.len()) <= MAX_BODY;
-                    if fits {
-                        body.extend_from_slice(&chunk);
-                    }
-                    prefix.push(Ok(chunk));
-                    if !fits {
-                        return false;
-                    }
-                }
-                Some(Err(error)) => {
-                    prefix.push(Err(error));
-                    return false;
-                }
-                None => return true,
+            Some(Err(error)) => {
+                prefix.push(Err(error));
+                break false;
             }
+            None => break true,
         }
     };
-    let complete = tokio::time::timeout_at(deadline, read)
-        .await
-        .unwrap_or(false);
-    let kind = classify(
-        &parts.headers,
-        complete.then_some(body.as_slice()),
-        unix_millis(),
-    );
-    // Preserve the entire original stream including errors and unread suffix.
-    // No secret error JSON enters logs, metrics, health rows or new archives.
+    let now = unix_millis();
+    let evidence = quota_evidence(&parts.headers, complete.then_some(body.as_slice()), now);
+    let kind = if forbidden && !evidence.exhausted {
+        UpstreamFailureKind::Authentication
+    } else {
+        classify(&parts.headers, complete.then_some(body.as_slice()), now)
+    };
     let response = UpstreamResponse::Prefetched {
         status: parts.status,
         headers: parts.headers,
@@ -129,7 +196,7 @@ pub(in crate::api::proxy) async fn classify_rate_limit(
         content_length: parts.content_length,
         stream: Box::pin(stream::iter(prefix).chain(parts.stream)),
     };
-    (response, kind)
+    (response, kind, evidence)
 }
 
 #[cfg(test)]
@@ -137,6 +204,193 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn structured_quota_codes_reuse_safe_supplier_classification_not_message_substrings() {
+        for body in [
+            r#"{"error":{"code":"insufficient_user_quota","type":"new_api_error","message":"用户额度不足, private-canary"}}"#,
+            r#"{"error":{"code":"insufficient_quota"}}"#,
+            r#"{"error":{"type":"insufficient_quota"}}"#,
+        ] {
+            assert!(quota_evidence(&HeaderMap::new(), Some(body.as_bytes()), NOW).exhausted);
+        }
+        for body in [
+            r#"{"error":{"code":"invalid_api_key","message":"Invalid API key"}}"#,
+            r#"{"error":{"code":"insufficient_user_quota","message":"Invalid API key"}}"#,
+            r#"{"error":{"type":"usage_limit_reached","code":"invalid_api_key","message":"Insufficient quota"}}"#,
+            r#"{"error":{"message":"The upstream account has insufficient quota"}}"#,
+            r#"{"error":{"code":"insufficient_quota","code":"invalid_api_key"}}"#,
+            r#"{"error":"permission denied","code":"insufficient_quota"}"#,
+            r#"{"error":{"code":"insufficient_quota","message":"Insufficient quota","msg":"Invalid API key"}}"#,
+        ] {
+            assert!(
+                !quota_evidence(&HeaderMap::new(), Some(body.as_bytes()), NOW).exhausted,
+                "{body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn forbidden_capture_requires_complete_json_and_preserves_every_original_chunk() {
+        for (body, content_type, exhausted) in [
+            (
+                r#"{"error":{"code":"insufficient_user_quota"}}"#,
+                "application/json",
+                true,
+            ),
+            (
+                r#"{"error":{"code":"invalid_api_key"}}"#,
+                "application/json",
+                false,
+            ),
+            (
+                r#"{"error":{"code":"insufficient_user_quota"}}"#,
+                "text/html",
+                false,
+            ),
+            (
+                r#"{"error":{"code":"insufficient_user_quota"}}"#,
+                "text/event-stream",
+                false,
+            ),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            let chunks = vec![Ok(Bytes::from(body.to_owned()))];
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::FORBIDDEN,
+                headers,
+                version: http::Version::HTTP_2,
+                content_length: None,
+                stream: Box::pin(stream::iter(chunks.clone())),
+            };
+            let (response, kind, evidence) = classify_supplier_quota(response).await;
+            assert_eq!(evidence.exhausted, exhausted);
+            assert_eq!(
+                kind.as_str(),
+                if exhausted {
+                    "quota_exhausted"
+                } else {
+                    "authentication"
+                }
+            );
+            assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, chunks);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_rejection_preserves_shared_transport_deadline_and_read_errors() {
+        use crate::api::proxy::upstream_response::{
+            UPSTREAM_READ_TIMEOUT, UPSTREAM_REQUEST_TIMEOUT,
+        };
+        for status in [StatusCode::FORBIDDEN, StatusCode::TOO_MANY_REQUESTS] {
+            for (request_seconds, read_seconds, error) in [
+                (5, 1, UPSTREAM_READ_TIMEOUT),
+                (1, 5, UPSTREAM_REQUEST_TIMEOUT),
+            ] {
+                let prefix = Bytes::from_static(br#"{"error":{"code":"insufficient_quota""#);
+                let mut headers = HeaderMap::new();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                let response = UpstreamResponse::Prefetched {
+                    status,
+                    headers,
+                    version: http::Version::HTTP_2,
+                    content_length: None,
+                    stream: Box::pin(stream::iter([Ok(prefix.clone())]).chain(stream::once(
+                        async {
+                            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                            Ok(Bytes::from_static(b"}}"))
+                        },
+                    ))),
+                }
+                .with_body_timeouts(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(request_seconds),
+                    std::time::Duration::from_secs(read_seconds),
+                );
+                let (response, kind, evidence) = classify_supplier_quota(response).await;
+                assert!(!evidence.exhausted);
+                assert_eq!(
+                    kind,
+                    if status == StatusCode::FORBIDDEN {
+                        UpstreamFailureKind::Authentication
+                    } else {
+                        UpstreamFailureKind::RateLimited
+                    }
+                );
+                assert_eq!(
+                    response.bytes_stream().collect::<Vec<_>>().await,
+                    vec![Ok(prefix), Err(error)]
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_the_owned_rejection_body() {
+        let (polled, body_polled) = tokio::sync::oneshot::channel();
+        let (owned, body_dropped) = tokio::sync::oneshot::channel::<()>();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::FORBIDDEN,
+            headers,
+            version: http::Version::HTTP_2,
+            content_length: None,
+            stream: Box::pin(stream::once(async move {
+                let _owned = owned;
+                polled.send(()).unwrap();
+                std::future::pending::<Result<Bytes, &'static str>>().await
+            })),
+        };
+        let task = tokio::spawn(classify_supplier_quota(response));
+        body_polled.await.unwrap();
+        task.abort();
+        assert!(matches!(task.await, Err(error) if error.is_cancelled()));
+        assert!(body_dropped.await.is_err());
+    }
+
+    #[test]
+    fn unknown_malformed_and_duplicate_resets_remain_unknown() {
+        let mut headers = HeaderMap::new();
+        let exhausted = br#"{"error":{"type":"usage_limit_reached","resets_at":"tomorrow","resets_in_seconds":-3}}"#;
+        for value in ["", "-1", "garbage", "9999999999999999999999999999"] {
+            headers.insert(header::RETRY_AFTER, HeaderValue::from_str(value).unwrap());
+            let evidence = quota_evidence(&headers, Some(exhausted), NOW);
+            assert!(evidence.exhausted);
+            assert_eq!(evidence.reset_at, None);
+            assert_eq!(evidence.reset_source, "unknown");
+        }
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("120"));
+        let evidence = quota_evidence(&headers, Some(exhausted), NOW);
+        assert_eq!(evidence.reset_at, Some(NOW + 120_000));
+        assert_eq!(evidence.reset_source, "retry_after");
+        headers.append(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        assert_eq!(
+            quota_evidence(&headers, Some(exhausted), NOW).reset_at,
+            None
+        );
+        let evidence = quota_evidence(
+            &HeaderMap::new(),
+            Some(br#"{"error":{"type":"usage_limit_reached","resets_in_seconds":42}}"#),
+            NOW,
+        );
+        assert_eq!(evidence.reset_at, Some(NOW + 42_000));
+        assert_eq!(evidence.reset_source, "provider_reset");
+        assert!(
+            !quota_evidence(
+                &HeaderMap::new(),
+                Some(br#"{"error":{"type":"rate_limit_error"}}"#),
+                NOW
+            )
+            .exhausted
+        );
+    }
 
     #[test]
     fn exact_exhaustion_reset_and_header_are_bounded_and_distinct_from_throttling() {
@@ -150,7 +404,6 @@ mod tests {
                 r#"{"type":"usage_limit_reached","resets_in_seconds":123}"#,
                 123,
             ),
-            (r#"{"error":{"type":"usage_limit_reached"}}"#, 900),
         ] {
             assert_eq!(
                 classify(&headers, Some(body.as_bytes()), NOW),
@@ -177,7 +430,7 @@ mod tests {
             classify(&headers, None, NOW),
             UpstreamFailureKind::RateLimitedUntil {
                 exhausted: false,
-                until: NOW + MAX_COOLDOWN
+                until: NOW + 999999999000
             }
         );
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("-1"));
@@ -258,7 +511,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timeout_restores_captured_prefix_and_delayed_unread_suffix() {
+    async fn delayed429_body_uses_transport_policy_and_preserves_original_chunks() {
         let prefix = Bytes::from_static(b"{\"error\":");
         let suffix = Bytes::from_static(b"{\"type\":\"usage_limit_reached\"}}");
         let expected = vec![Ok(prefix.clone()), Ok(suffix.clone())];
@@ -274,11 +527,13 @@ mod tests {
             stream: Box::pin(stream::once(async move { Ok(prefix) }).chain(delayed)),
         };
         let (response, kind) = classify_rate_limit(response).await;
-        assert_eq!(
+        assert!(matches!(
             kind,
-            UpstreamFailureKind::RateLimited,
-            "partial JSON is not exhaustion evidence"
-        );
+            UpstreamFailureKind::RateLimitedUntil {
+                exhausted: true,
+                ..
+            }
+        ));
         assert_eq!(response.bytes_stream().collect::<Vec<_>>().await, expected);
     }
 }

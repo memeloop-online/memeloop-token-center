@@ -106,9 +106,9 @@ test('real form composition keeps OAuth proxy optional and route drafts across d
           await page.setViewportSize({ width, height: 1000 });
           await page.screenshot({ path: `${artifacts}/credential-list-${locale}-${theme}-${width}-round3.png`, fullPage: true });
         }
-        assert.equal(await page.getByRole('menuitem', { name: locale === 'en' ? 'Rename' : '修改别名', exact: true }).isVisible(), false);
+        assert.equal(await page.getByRole('menuitem', { name: locale === 'en' ? 'Edit' : '编辑', exact: true }).isVisible(), false);
         await page.getByRole('button', { name: locale === 'en' ? 'More actions' : '更多操作', exact: true }).click();
-        assert.equal(await page.getByRole('menuitem', { name: locale === 'en' ? 'Rename' : '修改别名', exact: true }).isVisible(), true);
+        assert.equal(await page.getByRole('menuitem', { name: locale === 'en' ? 'Edit' : '编辑', exact: true }).isVisible(), true);
         for (const width of [320, 1440]) {
           await page.setViewportSize({ width, height: 1000 });
           await page.getByRole('menu').waitFor();

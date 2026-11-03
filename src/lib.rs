@@ -54,6 +54,8 @@ pub mod pricing;
 pub mod provider;
 mod proxy_lifecycle;
 mod request_event_stream;
+pub mod request_history;
+pub mod request_history_api;
 mod response_archive_spool;
 pub mod schema;
 pub mod server;
@@ -115,7 +117,7 @@ pub struct AppState {
     pub(crate) pinned_application_plugins:
         Option<Arc<plugin::application::ApplicationPluginSnapshot>>,
     pub metrics: metrics::Metrics,
-    pub(crate) request_event_streams: request_event_stream::RequestEventStreamLimiter,
+    pub(crate) request_event_streams: request_event_stream::RequestEventStreams,
     pub(crate) gateway_body_read_permits: Arc<tokio::sync::Semaphore>,
     pub(crate) gateway_body_reads: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) responses_body_read_permits: Arc<tokio::sync::Semaphore>,
@@ -301,7 +303,12 @@ impl AppState {
         let transport_proxy_groups =
             Arc::new(transport_proxy_groups.with_http_clients(http_clients.clone()));
         transport_proxy_groups
-            .start(&config.database_url)
+            .start(
+                &config.database_url,
+                plugins.clone(),
+                #[cfg(feature = "experimental-plugin-revisions")]
+                application_plugins.clone(),
+            )
             .map_err(|_| InitializationError::TransportProxyGroups)?;
         Ok(Self {
             config: Arc::new(config),
@@ -323,7 +330,7 @@ impl AppState {
             #[cfg(feature = "experimental-plugin-revisions")]
             pinned_application_plugins: None,
             metrics: metrics::Metrics::default(),
-            request_event_streams: request_event_stream::RequestEventStreamLimiter::default(),
+            request_event_streams: request_event_stream::RequestEventStreams::default(),
             upstream_quota: Arc::new(upstream_quota::QuotaCache::default()),
             gateway_body_read_permits: Arc::new(tokio::sync::Semaphore::new(
                 gateway_body_read_concurrency,
