@@ -23,25 +23,20 @@ impl Reservation {
     ) -> Result<Self, AppError> {
         let now = crate::db::unix_millis();
         let session = (session != request).then_some(session);
-        let binding = if let Some(session) = session {
-            state.db.allocation_session(tenant, session, now).await?
-        } else {
-            None
-        };
-        let actual = if let Some(identity) = session_identity {
+        let preference = if let Some(identity) = session_identity {
             if identity.key.tenant_id != tenant {
                 return Err(AppError::internal("allocation_session_scope"));
             }
             state
                 .db
-                .allocation_actual_session(identity, now)
+                .allocation_preferred_session(identity, session, now)
                 .await?
-                .map(|account| (account, u64::MAX))
+        } else if let Some(session) = session {
+            state.db.allocation_session(tenant, session, now).await?
         } else {
             None
         };
-        let preferred = actual
-            .or(binding)
+        let preferred = preference
             .filter(|(id, generation)| {
                 input.candidates.iter().any(|candidate| {
                     candidate.account_id == *id
