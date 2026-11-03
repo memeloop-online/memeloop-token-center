@@ -19,12 +19,16 @@ use crate::{
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-fn confirmed_not_executed(input: &FinishProxyRequest<'_>) -> bool {
+/// Admission rejection or explicit transport non-delivery permits a zero-cost
+/// settlement. A request-stage error alone leaves provider execution unknown.
+fn confirmed_not_executed(input: &FinishProxyRequest<'_>, transport_not_delivered: bool) -> bool {
     use crate::model::{RequestTerminalCause, RequestUsageBasis};
-    matches!(
-        input.terminal_cause,
-        Some(RequestTerminalCause::GatewayPreAdmission)
-    ) && input.usage == TokenUsage::default()
+    (transport_not_delivered
+        || matches!(
+            input.terminal_cause,
+            Some(RequestTerminalCause::GatewayPreAdmission)
+        ))
+        && input.usage == TokenUsage::default()
         && input.usage_basis == Some(RequestUsageBasis::NotObserved)
         && (400..=599).contains(&input.status_code)
 }
@@ -179,6 +183,8 @@ pub(crate) struct Snapshot {
     pub(crate) queued_billable: bool,
     claim: Option<crate::db::PendingProxySettlementClaim>,
     #[serde(default)]
+    transport_not_delivered: bool,
+    #[serde(default)]
     operational_terminal: Option<crate::db::PendingProxyOperationalTerminal>,
     #[serde(default)]
     financial_ack: Option<crate::db::PendingProxySettlementAck>,
@@ -233,6 +239,7 @@ impl Snapshot {
             response_id,
             queued_billable,
             claim: None,
+            transport_not_delivered: false,
             operational_terminal: Some(operational_terminal),
             financial_ack: None,
         }
@@ -244,6 +251,13 @@ impl Snapshot {
         } else {
             ProxyRequestUpstreamAttribution::LastDispatched(self.last_dispatched)
         }
+    }
+
+    fn financial_evidence_unavailable(&self) -> bool {
+        self.usage_basis != Some(crate::model::RequestUsageBasis::ProviderReported)
+            && !self.transport_not_delivered
+            && self.terminal_cause.as_deref()
+                != Some(crate::model::RequestTerminalCause::GatewayPreAdmission.as_str())
     }
 
     fn operational_digest(&self) -> Result<String, crate::error::AppError> {
@@ -374,6 +388,7 @@ pub(crate) struct Journal {
 
 struct ClaimState {
     claim: crate::db::PendingProxySettlementClaim,
+    transport_not_delivered: bool,
     unknown: bool,
     running: bool,
 }
@@ -564,7 +579,10 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&request_id)
-            .map(|entry| entry.claim);
+            .map(|entry| {
+                snapshot.transport_not_delivered = entry.transport_not_delivered;
+                entry.claim
+            });
         let mut pending = self
             .pending
             .lock()
@@ -575,6 +593,7 @@ impl Journal {
         {
             if snapshot.claim.is_none() {
                 snapshot.claim = existing.snapshot.claim.clone();
+                snapshot.transport_not_delivered = existing.snapshot.transport_not_delivered;
             }
             tracing::error!(%request_id, %receipt_id, financial_state = "unknown", "multiple terminal receipts retained for database arbitration");
         }
@@ -686,6 +705,7 @@ impl Journal {
                 claim.request_id,
                 ClaimState {
                     claim,
+                    transport_not_delivered: false,
                     unknown: false,
                     running: false,
                 },
@@ -697,6 +717,21 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .contains_key(&request_id)
+    }
+
+    pub(crate) fn record_transport_non_delivery(
+        &self,
+        request_id: Uuid,
+        all_attempts_not_delivered: bool,
+    ) {
+        if let Some(entry) = self
+            .claims
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get_mut(&request_id)
+        {
+            entry.transport_not_delivered = all_attempts_not_delivered;
+        }
     }
 
     pub(crate) fn submit_cancelled(
@@ -1026,8 +1061,7 @@ impl Journal {
                 && !entry.operational_running
                 && !entry.operational_reconcile
                 && (!entry.operational_acknowledged
-                    || (entry.snapshot.usage_basis
-                        != Some(crate::model::RequestUsageBasis::ProviderReported)
+                    || (entry.snapshot.financial_evidence_unavailable()
                         && !entry.unknown_annotated))
         }) {
             entry.operational_running = true;
@@ -1075,9 +1109,7 @@ impl Journal {
                         }
                         tracing::info!(%request_id, %receipt_id, operational_state = "acknowledged", "runtime terminal recorded independently of financial settlement");
                     }
-                    if snapshot.usage_basis
-                        != Some(crate::model::RequestUsageBasis::ProviderReported)
-                    {
+                    if snapshot.financial_evidence_unavailable() {
                         database
                             .mark_pending_proxy_settlement_unknown(claim)
                             .await?;
@@ -1099,9 +1131,7 @@ impl Journal {
                     entry.operational_running = false;
                     match result {
                         Ok(()) => {
-                            if snapshot.usage_basis
-                                != Some(crate::model::RequestUsageBasis::ProviderReported)
-                            {
+                            if snapshot.financial_evidence_unavailable() {
                                 entry.activity = None;
                             }
                         }
@@ -1205,9 +1235,15 @@ impl Journal {
                             Some(crate::model::RequestUsageBasis::ProviderReported) => {
                                 Some(crate::db::PendingProxySettlementEvidence::ProviderReported)
                             }
-                            _ if confirmed_not_executed(&input) => Some(
-                                crate::db::PendingProxySettlementEvidence::ConfirmedNotExecuted,
-                            ),
+                            _ if confirmed_not_executed(
+                                &input,
+                                snapshot.transport_not_delivered,
+                            ) =>
+                            {
+                                Some(
+                                    crate::db::PendingProxySettlementEvidence::ConfirmedNotExecuted,
+                                )
+                            }
                             _ => None,
                         };
                         if let Some(evidence) = evidence {
