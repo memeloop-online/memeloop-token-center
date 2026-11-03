@@ -904,17 +904,14 @@ pub(super) async fn internal_request_events(
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "requests:read").await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
-    let stream_permit = state
-        .request_event_streams
-        .try_acquire(service.service_id)
-        .ok_or(AppError::RateLimited)?;
+    let stream_owner = state.request_event_streams.start();
     let stream_activity = state
         .metrics
         .active_stream(crate::metrics::ActiveStreamKind::RequestEvents);
     let database = state.db.clone();
     let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
     tokio::spawn(async move {
-        let _stream_permit = stream_permit;
+        let _stream_owner = stream_owner;
         let _stream_activity = stream_activity;
         let mut event_at = query
             .after_event_at

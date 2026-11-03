@@ -14,6 +14,7 @@ use super::*;
 use crate::config::{ArchiveBackend, Config};
 
 mod optional_limits;
+mod request_event_stream;
 
 pub(super) async fn test_state() -> (AppState, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
@@ -2212,7 +2213,7 @@ async fn public_responses_include_browser_security_headers() {
 }
 
 #[tokio::test]
-async fn quiet_request_event_streams_disconnect_promptly_and_are_service_bounded() {
+async fn quiet_request_event_streams_support_multiple_tabs_and_disconnect_promptly() {
     let (state, _directory) = test_state().await;
     let service_token = state.config.service_token.clone();
     let application = router_for_role(state.clone(), RuntimeRole::Control);
@@ -2226,20 +2227,17 @@ async fn quiet_request_event_streams_disconnect_promptly_and_are_service_bounded
     };
 
     let mut streams = Vec::new();
-    for _ in 0..crate::request_event_stream::REQUEST_EVENT_STREAMS_PER_SERVICE {
+    for _ in 0..8 {
         let response = open_stream().await.expect("open request event stream");
         assert_eq!(response.status(), StatusCode::OK);
         streams.push(response);
     }
-    let rejected = open_stream().await.expect("bounded request event stream");
-    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(state.request_event_streams.active_count(), 8);
     drop(streams);
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if state.request_event_streams.global_available_permits()
-                == crate::request_event_stream::GLOBAL_REQUEST_EVENT_STREAMS
-            {
+            if state.request_event_streams.active_count() == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2250,7 +2248,7 @@ async fn quiet_request_event_streams_disconnect_promptly_and_are_service_bounded
 
     for _ in 0..4 {
         let mut dropped_batch = Vec::new();
-        for _ in 0..crate::request_event_stream::REQUEST_EVENT_STREAMS_PER_SERVICE {
+        for _ in 0..8 {
             let response = open_stream().await.expect("reopened request event stream");
             assert_eq!(response.status(), StatusCode::OK);
             dropped_batch.push(response);
@@ -2258,16 +2256,14 @@ async fn quiet_request_event_streams_disconnect_promptly_and_are_service_bounded
         drop(dropped_batch);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if state.request_event_streams.global_available_permits()
-                    == crate::request_event_stream::GLOBAL_REQUEST_EVENT_STREAMS
-                {
+                if state.request_event_streams.active_count() == 0 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("immediately dropped stream bodies release every permit");
+        .expect("immediately dropped stream bodies release every producer");
     }
 }
 
