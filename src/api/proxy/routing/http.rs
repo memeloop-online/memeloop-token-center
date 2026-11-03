@@ -311,15 +311,34 @@ where
     );
     match upstream_result {
         Ok(response) => {
-            let response = if let Some(context) = route.responses_chat.clone() {
+            let response = if route.compact_v2_bridge {
+                translate_new_api_compact_v2(response, route.wrap_compact_as_sse).await?
+            } else {
+                UpstreamResponse::Reqwest(response)
+            };
+            let response = match (request_deadline, timeout) {
+                (Some(deadline), Some(timeout)) => response.with_body_timeouts(deadline, timeout),
+                _ => response,
+            };
+            let (response, preoutput_quota) = if route.inspect_stream_rejection {
+                super::classify_stream_quota(
+                    response,
+                    sse_framing_limits,
+                    &state.proxy_memory_budget,
+                )
+                .await
+            } else {
+                (response, None)
+            };
+            let response = if preoutput_quota.is_some() {
+                response
+            } else if let Some(context) = route.responses_chat.clone() {
                 super::kimi::translate(
                     response,
                     context,
                     route.upstream_stream,
                     sse_framing_limits,
                 )?
-            } else if route.compact_v2_bridge {
-                translate_new_api_compact_v2(response, route.wrap_compact_as_sse).await?
             } else if let Some(context) = route.responses_anthropic.clone() {
                 super::anthropic::translate(
                     response,
@@ -328,16 +347,12 @@ where
                     sse_framing_limits,
                 )?
             } else {
-                UpstreamResponse::Reqwest(response)
+                response
             };
             Ok(ProxyRouteResponse {
+                preoutput_quota,
                 egress_selection: None,
-                response: match (request_deadline, timeout) {
-                    (Some(deadline), Some(timeout)) => {
-                        response.with_body_timeouts(deadline, timeout)
-                    }
-                    _ => response,
-                },
+                response,
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::inactive(),
                 sse_framing_limits,
@@ -772,6 +787,7 @@ mod tests {
         let request_id = Uuid::now_v7();
         let account_id = Uuid::now_v7();
         let route = PreparedProxyRoute {
+            inspect_stream_rejection: false,
             route: ResolvedUpstream {
                 route_id: Uuid::now_v7(),
                 account_id,

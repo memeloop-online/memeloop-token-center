@@ -13,6 +13,10 @@ pub(in crate::api::proxy) enum FailoverDisposition {
 }
 
 impl FailoverDisposition {
+    pub(in crate::api::proxy) fn is_definite_rejection(&self) -> bool {
+        matches!(self, Self::RateLimitRejected | Self::QuotaRejected)
+    }
+
     pub(in crate::api::proxy) fn reason(&self) -> Option<UpstreamHealthReason> {
         match self {
             Self::CandidateNotDispatched => Some(UpstreamHealthReason::Unavailable),
@@ -49,6 +53,9 @@ pub(in crate::api::proxy) fn failover_disposition(
             FailoverDisposition::ConnectionNotDelivered
         }
         (Some(StatusCode::TOO_MANY_REQUESTS), None) => FailoverDisposition::RateLimitRejected,
+        (Some(status), None) if status.is_success() && quota_failure.is_some() => {
+            FailoverDisposition::QuotaRejected
+        }
         (Some(StatusCode::FORBIDDEN), None)
             if matches!(
                 quota_failure,
@@ -121,6 +128,9 @@ fn classify_response_failure(
     rate_limit: Option<UpstreamFailureKind>,
 ) -> Option<(UpstreamFailureKind, UpstreamHealthReason)> {
     match status {
+        status if status.is_success() => {
+            rate_limit.map(|kind| (kind, UpstreamHealthReason::RateLimited))
+        }
         StatusCode::FORBIDDEN
             if matches!(
                 rate_limit,
@@ -186,11 +196,7 @@ mod tests {
             failover_disposition(Some(StatusCode::FORBIDDEN), None, quota),
             FailoverDisposition::QuotaRejected
         );
-        for status in [
-            StatusCode::OK,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ] {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::SERVICE_UNAVAILABLE] {
             assert_eq!(
                 failover_disposition(Some(status), None, quota),
                 FailoverDisposition::Stop

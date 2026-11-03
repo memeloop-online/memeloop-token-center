@@ -376,6 +376,7 @@ mod tests {
         const PREPARED_BODY_LENGTH: usize = 8_192;
 
         let prepared = PreparedProxyRoute {
+            inspect_stream_rejection: false,
             route: ResolvedUpstream {
                 route_id: Uuid::nil(),
                 account_id: Uuid::nil(),

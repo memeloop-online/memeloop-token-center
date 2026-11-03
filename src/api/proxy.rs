@@ -1073,7 +1073,7 @@ async fn proxy_with_cancellation_guard(
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
-    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
+    let mut attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
     let route_preparation_recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     if let Some(mut candidates) = strategy_candidates {
@@ -1434,8 +1434,12 @@ async fn proxy_with_cancellation_guard(
             None,
             None,
         );
-        let Some((active_route, mut upstream_attempt, selected_candidate_rank, outbound_attempt)) =
-            selected
+        let Some((
+            mut active_route,
+            mut upstream_attempt,
+            selected_candidate_rank,
+            outbound_attempt,
+        )) = selected
         else {
             return finish_unavailable(&buffered_request, "upstream_unavailable", last_dispatch)
                 .await;
@@ -1468,8 +1472,6 @@ async fn proxy_with_cancellation_guard(
                 }
             }
         }
-        // Attempt count still bounds how many accounts one request may try.
-        // A failover clock does not refuse a candidate that is ready to send.
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
             tracing::warn!(%request_id, outbound_attempts, stage = reason,
                 failure_domain = "local_admission", delivery_evidence = "candidate_not_dispatched",
@@ -1492,6 +1494,9 @@ async fn proxy_with_cancellation_guard(
             return Ok(response);
         }
         IndependentProbeTarget::validate_target(&active_route.route)?;
+        active_route.inspect_stream_rejection = !route_candidates.as_slice().is_empty()
+            || !deferred_shared_probes.is_empty()
+            || independent_probe::TARGET.try_with(|_| ()).is_ok();
         let result = attempt_budget
             .send(
                 send_proxy_route(
@@ -1551,6 +1556,20 @@ async fn proxy_with_cancellation_guard(
                     observed_at,
                 );
                 (Ok(result), None)
+            }
+            Ok(mut result) if result.response.status().is_success() => {
+                let observed_at = unix_millis();
+                let kind = result.preoutput_quota.take().map(|(kind, evidence)| {
+                    publish_supplier_quota(
+                        &state,
+                        &active_route.route,
+                        request_id,
+                        observed_at,
+                        evidence,
+                    );
+                    kind
+                });
+                (Ok(result), kind)
             }
             result => (result, None),
         };
@@ -1645,12 +1664,16 @@ async fn proxy_with_cancellation_guard(
             result.as_ref().err(),
             rate_limit,
         );
+        if disposition.is_definite_rejection() {
+            attempt_budget.note_definite_rejection();
+        }
         let has_standby =
             !route_candidates.as_slice().is_empty() || !deferred_shared_probes.is_empty();
         let failover_reason = disposition.reason().filter(|_| has_standby);
-        if !result
-            .as_ref()
-            .is_ok_and(|result| result.response.status().is_success())
+        if disposition.is_definite_rejection()
+            || !result
+                .as_ref()
+                .is_ok_and(|result| result.response.status().is_success())
         {
             tracing::warn!(%request_id, route_id = %active_route.route.route_id,
                 upstream_account_id = %active_route.route.account_id,
