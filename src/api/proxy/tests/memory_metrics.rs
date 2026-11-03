@@ -73,8 +73,13 @@ async fn dense_small_json_is_delivered_once_instead_of_failing_its_initial_byte_
         "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},
         "dense": vec![0; 2000]
     });
+    let original = serde_json::to_vec(&body).unwrap();
     Mock::given(method("POST"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(body.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(original.clone())
+                .insert_header("content-type", "application/json"),
+        )
         .expect(1)
         .mount(&upstream)
         .await;
@@ -93,6 +98,44 @@ async fn dense_small_json_is_delivered_once_instead_of_failing_its_initial_byte_
         rendered.lines().any(|line| line
             == "memeloop_token_center_proxy_memory_rejections_total{stage=\"response\"} 0")
     );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: Option<(String, String)> =
+                sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            if let Some((tenant, request)) = row {
+                let tenant = Uuid::parse_str(&tenant).unwrap();
+                let request = Uuid::parse_str(&request).unwrap();
+                if let Some(reference) = fixture
+                    .state
+                    .archive
+                    .raw_capture_reference(tenant, request, "response")
+                    .await
+                    .unwrap()
+                {
+                    let restored = fixture
+                        .state
+                        .archive
+                        .get_tenant_content(tenant, &reference, 1024 * 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(restored.as_ref(), original.as_slice());
+                    assert_eq!(
+                        reference.blake3_digest,
+                        blake3::hash(&original).to_hex().to_string()
+                    );
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful delivery and exact durable original are separate assertions");
+    pool.close().await;
     upstream.verify().await;
 }
 
