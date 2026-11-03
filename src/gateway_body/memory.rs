@@ -195,8 +195,8 @@ impl ProxyMemoryReservation {
         self.response_reserved.load(Ordering::Acquire)
     }
 
-    pub(crate) fn response_capture_fits(&self, bytes: usize) -> bool {
-        bytes.saturating_mul(CAPTURE_MEMORY_WEIGHT) <= self.response_bytes.load(Ordering::Acquire)
+    pub(crate) fn buffered_response_reserved_bytes(&self) -> usize {
+        self.response_bytes.load(Ordering::Acquire)
     }
 
     pub(crate) fn finalize_request(&self, _deadline: tokio::time::Instant) -> bool {
@@ -280,20 +280,20 @@ impl ProxyMemoryReservation {
         maximum: usize,
         _deadline: tokio::time::Instant,
     ) -> bool {
-        if self.has_buffered_response() {
-            return true;
-        }
         if maximum > MAX_BUFFERED_RESPONSE_BYTES {
             return false;
+        }
+        let Ok(mut held) = self.held.lock() else {
+            return false;
+        };
+        if self.has_buffered_response() {
+            return true;
         }
         let bytes = maximum
             .saturating_mul(CAPTURE_MEMORY_WEIGHT)
             .max(UNIT_BYTES);
         let units = bytes.div_ceil(UNIT_BYTES) as u32;
         let Some(permit) = Self::acquire(&self.permits, units) else {
-            return false;
-        };
-        let Ok(mut held) = self.held.lock() else {
             return false;
         };
         held.0 += units as usize * UNIT_BYTES;
@@ -317,6 +317,9 @@ impl ProxyMemoryReservation {
         projection_weight: usize,
         _deadline: tokio::time::Instant,
     ) -> Option<ConversationProjectionPermit> {
+        let Ok(mut held) = self.held.lock() else {
+            return None;
+        };
         if self.has_buffered_response() || maximum > MAX_BUFFERED_RESPONSE_BYTES {
             return None;
         }
@@ -329,9 +332,6 @@ impl ProxyMemoryReservation {
         let total_units = response_units.checked_add(projection_units)?;
         let mut permit = Self::acquire(&self.permits, total_units)?;
         let projection = permit.split(projection_units as usize)?;
-        let Ok(mut held) = self.held.lock() else {
-            return None;
-        };
         held.0 = held.0.checked_add(response_units as usize * UNIT_BYTES)?;
         match held.1.as_mut() {
             Some(existing) => existing.merge(permit),
@@ -345,35 +345,124 @@ impl ProxyMemoryReservation {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn response_json_fits(&self, bytes: &[u8]) -> bool {
         bounded_json_fits(bytes, self.response_bytes.load(Ordering::Acquire))
     }
 
+    pub(crate) fn grow_buffered_response(&self, capacity: usize) -> bool {
+        if capacity > MAX_BUFFERED_RESPONSE_BYTES {
+            return false;
+        }
+        self.resize_buffered_response(capacity * CAPTURE_MEMORY_WEIGHT, false)
+    }
+
+    pub(crate) fn reserve_response_json(&self, body: &[u8]) -> bool {
+        if body.len() > MAX_BUFFERED_RESPONSE_BYTES {
+            return false;
+        }
+        buffered_response_json_bytes(body)
+            .is_some_and(|required| self.resize_buffered_response(required, false))
+    }
+
     pub(crate) fn shrink_buffered_response(&self, body: &[u8]) {
-        let nodes = JsonMemoryScanner::default().observe(body);
-        let required = body
-            .len()
-            .saturating_mul(CAPTURE_MEMORY_WEIGHT)
-            .max(
-                body.len()
-                    .saturating_mul(2)
-                    .saturating_add(nodes.saturating_mul(256)),
-            )
-            .max(UNIT_BYTES);
+        if let Some(required) = buffered_response_json_bytes(body) {
+            self.resize_buffered_response(required, true);
+        }
+    }
+
+    fn resize_buffered_response(&self, required: usize, shrink: bool) -> bool {
+        let Ok(mut held) = self.held.lock() else {
+            return false;
+        };
+        if !self.has_buffered_response() {
+            return false;
+        }
+        let Some(required) = required
+            .max(UNIT_BYTES)
+            .div_ceil(UNIT_BYTES)
+            .checked_mul(UNIT_BYTES)
+        else {
+            return false;
+        };
+        let previous = self.response_bytes.load(Ordering::Acquire);
+        if required > previous {
+            let extra = required - previous;
+            let Some(total) = held.0.checked_add(extra) else {
+                return false;
+            };
+            let Ok(units) = u32::try_from(extra / UNIT_BYTES) else {
+                return false;
+            };
+            let Some(permit) = Self::acquire(&self.permits, units) else {
+                return false;
+            };
+            match held.1.as_mut() {
+                Some(existing) => existing.merge(permit),
+                None => held.1 = Some(permit),
+            }
+            held.0 = total;
+        } else if shrink {
+            let released = previous - required;
+            if let Some(permit) = held.1.as_mut() {
+                drop(permit.split(released / UNIT_BYTES));
+            }
+            held.0 -= released;
+        } else {
+            return true;
+        }
+        self.response_bytes.store(required, Ordering::Release);
+        true
+    }
+
+    pub(crate) fn release_buffered_response(&self) {
         let Ok(mut held) = self.held.lock() else {
             return;
         };
-        let previous = self.response_bytes.load(Ordering::Acquire);
-        let required = required.div_ceil(UNIT_BYTES).saturating_mul(UNIT_BYTES);
-        let released = previous.saturating_sub(required);
-        if released == 0 {
-            return;
-        }
+        let released = self.response_bytes.swap(0, Ordering::AcqRel);
         if let Some(permit) = held.1.as_mut() {
             drop(permit.split(released / UNIT_BYTES));
         }
         held.0 = held.0.saturating_sub(released);
-        self.response_bytes.store(required, Ordering::Release);
+        self.response_reserved.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn own_response_bytes(&self, bytes: bytes::Bytes) -> Option<bytes::Bytes> {
+        struct Payload {
+            bytes: bytes::Bytes,
+            _permit: OwnedSemaphorePermit,
+        }
+        impl AsRef<[u8]> for Payload {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        let required = bytes.len().checked_mul(CAPTURE_MEMORY_WEIGHT)?;
+        let units = u32::try_from(required.div_ceil(UNIT_BYTES)).ok()?;
+        let mut held = self.held.lock().ok()?;
+        let previous = self.response_bytes.load(Ordering::Acquire);
+        let previous_units = previous / UNIT_BYTES;
+        let permit = if units == 0 {
+            Self::acquire(&self.permits, 0)?
+        } else if units as usize <= previous_units {
+            held.1.as_mut()?.split(units as usize)?
+        } else {
+            let mut permit = Self::acquire(&self.permits, units - previous_units as u32)?;
+            if previous_units > 0 {
+                permit.merge(held.1.as_mut()?.split(previous_units)?);
+            }
+            permit
+        };
+        if previous_units > units as usize {
+            drop(held.1.as_mut()?.split(previous_units - units as usize));
+        }
+        held.0 = held.0.saturating_sub(previous);
+        self.response_bytes.store(0, Ordering::Release);
+        self.response_reserved.store(false, Ordering::Release);
+        Some(bytes::Bytes::from_owner(Payload {
+            bytes,
+            _permit: permit,
+        }))
     }
 
     pub(crate) fn release(&self, bytes: usize, weight: usize) {
@@ -445,7 +534,14 @@ impl ProxyMemoryReservation {
         // input bytes and tree/map nodes separately, so tiny-token arrays and
         // objects cannot evade the memory contract through expansion.
         let nodes = JsonMemoryScanner::default().observe(body);
-        if !self.try_grow(body.len(), 3) || !self.try_grow(nodes, 256) {
+        let Some(required) = body.len().checked_mul(3).and_then(|bytes| {
+            nodes
+                .checked_mul(256)
+                .and_then(|nodes| bytes.checked_add(nodes))
+        }) else {
+            return false;
+        };
+        if !self.try_grow(required, 1) {
             return false;
         }
         self.json_body_ceiling.store(body.len(), Ordering::Release);
@@ -482,6 +578,15 @@ impl ProxyMemoryReservation {
     }
 }
 
+fn buffered_response_json_bytes(body: &[u8]) -> Option<usize> {
+    let nodes = JsonMemoryScanner::default().observe(body);
+    let tree = body
+        .len()
+        .checked_mul(2)?
+        .checked_add(nodes.checked_mul(256)?)?;
+    Some(body.len().checked_mul(CAPTURE_MEMORY_WEIGHT)?.max(tree))
+}
+
 pub(crate) fn bounded_json_fits(bytes: &[u8], budget: usize) -> bool {
     let nodes = JsonMemoryScanner::default().observe(bytes);
     bytes
@@ -516,6 +621,90 @@ pub(crate) fn json_encoded_length(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_admission_is_atomic_when_bytes_fit_but_nodes_do_not() {
+        let budget = ProxyMemoryBudget::new(4 * UNIT_BYTES as u32);
+        let blocker = budget.reservation();
+        assert!(blocker.try_grow(2 * UNIT_BYTES, 1));
+        let memory = budget.reservation();
+        assert!(memory.try_grow(17, 1));
+        assert!(memory.finalize_request(tokio::time::Instant::now()));
+        let baseline = budget.snapshot();
+        let held = memory.held.lock().unwrap().0;
+        let body = format!("[{}0]", "0,".repeat(499));
+        assert!(!memory.try_reserve_json(body.as_bytes()));
+        assert_eq!(budget.snapshot(), baseline);
+        assert_eq!(memory.held.lock().unwrap().0, held);
+        assert_eq!(memory.json_body_ceiling.load(Ordering::Acquire), 0);
+        assert_eq!(memory.json_node_ceiling.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn dense_601_byte_response_grows_from_one_unit_without_changing_budget() {
+        let budget = ProxyMemoryBudget::new(2 * 1024 * 1024 * 1024);
+        let memory = budget.reservation();
+        let body = format!("[{}0]", "0,".repeat(299));
+        assert_eq!(body.len(), 601);
+        assert_eq!(buffered_response_json_bytes(body.as_bytes()), Some(78_258));
+        assert!(memory.reserve_buffered_response(body.len(), tokio::time::Instant::now()));
+        assert_eq!(memory.buffered_response_reserved_bytes(), UNIT_BYTES);
+        assert!(!memory.response_json_fits(body.as_bytes()));
+        assert!(memory.reserve_response_json(body.as_bytes()));
+        assert!(memory.response_json_fits(body.as_bytes()));
+        assert_eq!(budget.snapshot().0, 2 * UNIT_BYTES);
+        memory.release_buffered_response();
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn response_payload_owns_charge_across_client_archive_and_request_drop_orders() {
+        for client_first in [false, true] {
+            let budget = ProxyMemoryBudget::new(1024 * 1024);
+            let memory = budget.reservation();
+            assert!(memory.try_grow(17, 1));
+            assert!(memory.reserve_buffered_response(128 * 1024, tokio::time::Instant::now()));
+            let payload = memory
+                .own_response_bytes(bytes::Bytes::from_static(b"{\"ok\":true}"))
+                .unwrap();
+            assert_eq!(memory.buffered_response_reserved_bytes(), 0);
+            let archive = payload.clone();
+            let client = axum::body::Body::from(payload);
+            drop(memory);
+            assert_eq!(budget.snapshot().0, UNIT_BYTES);
+            if client_first {
+                let delivered = axum::body::to_bytes(client, 1024).await.unwrap();
+                drop(archive);
+                assert_eq!(budget.snapshot().0, UNIT_BYTES);
+                assert_eq!(delivered.as_ref(), b"{\"ok\":true}");
+                drop(delivered);
+            } else {
+                drop(archive);
+                assert_eq!(budget.snapshot().0, UNIT_BYTES);
+                drop(client);
+            }
+            assert_eq!(budget.snapshot().0, 0);
+        }
+    }
+
+    #[test]
+    fn failed_response_growth_and_payload_transfer_preserve_existing_permits() {
+        let budget = ProxyMemoryBudget::new(2 * UNIT_BYTES as u32);
+        let memory = budget.reservation();
+        assert!(memory.try_grow(1234, 1));
+        assert!(memory.reserve_buffered_response(1, tokio::time::Instant::now()));
+        let baseline = budget.snapshot();
+        assert!(!memory.reserve_response_json(format!("[{}0]", "0,".repeat(2000)).as_bytes()));
+        assert!(
+            memory
+                .own_response_bytes(bytes::Bytes::from(vec![0; UNIT_BYTES]))
+                .is_none()
+        );
+        assert_eq!(budget.snapshot(), baseline);
+        memory.release_buffered_response();
+        assert_eq!(budget.snapshot().0, UNIT_BYTES);
+        assert_eq!(memory.held.lock().unwrap().0, 1234);
+    }
 
     #[test]
     fn unaligned_budget_snapshot_reports_actual_units_and_returns_to_zero() {

@@ -2883,6 +2883,7 @@ async fn execute_component_provider(
     else {
         return finish_component_provider_failure(&request, None, "provider_configuration").await;
     };
+    let has_content_length = upstream.content_length().is_some();
     let upstream_body = match read_bounded_upstream(
         upstream.into(),
         maximum.min(MAX_PROXY_RESPONSE_BODY),
@@ -2942,10 +2943,22 @@ async fn execute_component_provider(
             .await;
         }
     };
-    if !request.memory.response_capture_fits(normalized.body.len())
-        || !request.memory.response_json_fits(&normalized.body)
-    {
+    if normalized.body.len() > maximum.min(MAX_PROXY_RESPONSE_BODY) {
         drop(normalized);
+        request.memory.release_buffered_response();
+        return finish_component_provider_failure(
+            &request,
+            Some("component_response"),
+            "upstream_response_too_large",
+        )
+        .await;
+    }
+    if !request.memory.reserve_response_json(&normalized.body) {
+        tracing::warn!(request_id = %request.request_id,
+            stage = "component_response_json", reserved_bytes = request.memory.buffered_response_reserved_bytes(),
+            actual_bytes = normalized.body.len(), has_content_length, "normalized response JSON memory unavailable");
+        drop(normalized);
+        request.memory.release_buffered_response();
         return finish_component_provider_failure(
             &request,
             Some("component_response"),
@@ -2954,6 +2967,10 @@ async fn execute_component_provider(
         .await;
     }
     normalized.body.shrink_to_fit();
+    request.memory.shrink_buffered_response(&normalized.body);
+    tracing::debug!(request_id = %request.request_id,
+        stage = "component_response_ready", reserved_bytes = request.memory.buffered_response_reserved_bytes(),
+        actual_bytes = normalized.body.len(), has_content_length, "normalized response memory accounted");
     let status = match StatusCode::from_u16(normalized.status) {
         Ok(status) => status,
         Err(_) => {
@@ -3399,6 +3416,12 @@ async fn finish_buffered_request_before_deadline(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
+    if archive_response || request.memory.has_buffered_response() {
+        body = request
+            .memory
+            .own_response_bytes(body)
+            .ok_or_else(|| AppError::capacity_error("upstream_response_memory_capacity"))?;
+    }
     let stored_response =
         inline_response_object.unwrap_or_else(|| format!("gap://{request_id}/response"));
     let routing_session_id = request

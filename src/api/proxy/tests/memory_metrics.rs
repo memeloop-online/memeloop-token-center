@@ -3,10 +3,9 @@ use super::*;
 #[tokio::test]
 async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
     let upstream = MockServer::start().await;
-    // Small encoded input, but a JSON tree larger than the reserved envelope.
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [], "dense": vec![0; 2000]
+            "choices": [], "dense": vec![0; 1_100_000]
         })))
         .expect(1)
         .mount(&upstream)
@@ -62,6 +61,69 @@ async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
                 "memeloop_token_center_proxy_memory_rejections_total{{stage=\"{stage}\"}} 0"
             )));
     }
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn dense_small_response_is_delivered_once_and_client_body_retains_its_lease() {
+    let upstream = MockServer::start().await;
+    let original = serde_json::to_vec(&json!({
+        "id":"dense-small", "object":"chat.completion",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"complete"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},
+        "dense":vec![0;300]
+    })).unwrap();
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(original.clone())
+                .insert_header("content-type", "application/json"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = resilient_route_fixture("dense-response-lease", &[(upstream.uri(), 0)]).await;
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    fixture.state.persistence.drain_for_test().await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.state.pending_terminals.drain(),
+    )
+    .await
+    .unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let refs = fixture
+        .state
+        .db
+        .request_archive_refs(fixture.key_id, rows[0].request_id)
+        .await
+        .unwrap();
+    let archived = fixture
+        .state
+        .archive
+        .get(refs.response_object.as_deref().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(blake3::hash(&archived), blake3::hash(&original));
+    assert_eq!(archived.as_ref(), original);
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 >= 64 * 1024);
+    let delivered = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(delivered.as_ref(), original);
+    let rendered = fixture
+        .state
+        .metrics
+        .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(
+        rendered.lines().any(|line| line
+            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"response\"} 0")
+    );
     upstream.verify().await;
 }
 

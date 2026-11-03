@@ -1883,6 +1883,21 @@ pub(super) async fn buffer_response(
     conversation: Option<&super::ProxyConversation>,
     sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<BufferedCodexResponse, &'static str> {
+    struct ReadMemory<'a> {
+        memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
+        conversation: Option<&'a super::ProxyConversation>,
+        keep: bool,
+    }
+    impl Drop for ReadMemory<'_> {
+        fn drop(&mut self) {
+            if !self.keep {
+                self.memory.release_buffered_response();
+                if let Some(conversation) = self.conversation {
+                    conversation.reject_projection();
+                }
+            }
+        }
+    }
     if response
         .headers()
         .get_all(header::CONTENT_ENCODING)
@@ -1900,6 +1915,7 @@ pub(super) async fn buffer_response(
     {
         return Err("upstream_response_too_large");
     }
+    let has_content_length = response.content_length().is_some();
     let maximum = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
@@ -1909,14 +1925,22 @@ pub(super) async fn buffer_response(
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     let reserved = if let Some(conversation) = conversation {
-        conversation.reserve_for_buffered_response(memory, maximum, deadline)
+        conversation.reserve_for_buffered_response(memory, 0, deadline)
     } else {
-        memory.reserve_buffered_response(maximum, deadline)
+        memory.reserve_buffered_response(0, deadline)
     };
     if !reserved {
+        tracing::warn!(request_id = %diagnostic_context.request_id,
+            stage = "codex_response_admission", reserved_bytes = memory.buffered_response_reserved_bytes(),
+            actual_bytes = 0, has_content_length, "Codex response memory unavailable");
         capacity.finish("rejected", None, None);
         return Err("upstream_response_memory_capacity");
     }
+    let mut read_memory = ReadMemory {
+        memory,
+        conversation,
+        keep: false,
+    };
     capacity.finish("completed", None, None);
     let mut first_byte = Some(proxy_diagnostics::Phase::new(
         diagnostic_context,
@@ -1924,6 +1948,7 @@ pub(super) async fn buffer_response(
     ));
     let mut parser = BufferedResponsesParser::with_limits(sse_framing_limits);
     let mut total = 0_usize;
+    let mut pending_bytes = 0_usize;
     let mut stream = response.bytes_stream();
     loop {
         let next = stream.next().await;
@@ -1938,12 +1963,35 @@ pub(super) async fn buffer_response(
         if total > maximum {
             return Err("upstream_response_too_large");
         }
+        pending_bytes = pending_bytes.saturating_add(chunk.len());
+        if !memory.grow_buffered_response(pending_bytes) {
+            tracing::warn!(request_id = %diagnostic_context.request_id,
+                stage = "codex_response_frame", reserved_bytes = memory.buffered_response_reserved_bytes(),
+                actual_bytes = pending_bytes, has_content_length, "Codex response frame memory unavailable");
+            return Err("upstream_response_memory_capacity");
+        }
         parser.push_accounted(&chunk, Some(memory))?;
+        if parser.framer.is_complete() && !parser.framer.has_pending_crlf_continuation() {
+            pending_bytes = 0;
+            memory.shrink_buffered_response(&[]);
+        }
     }
     if let Some(phase) = first_byte.take() {
         phase.finish("no_bytes", None, Some(0));
     }
-    parser.finish()
+    let result = parser.finish()?;
+    if !memory.reserve_response_json(&result.body) {
+        tracing::warn!(request_id = %diagnostic_context.request_id,
+            stage = "codex_response_json", reserved_bytes = memory.buffered_response_reserved_bytes(),
+            actual_bytes = result.body.len(), has_content_length, "Codex response JSON memory unavailable");
+        return Err("upstream_response_memory_capacity");
+    }
+    memory.shrink_buffered_response(&result.body);
+    tracing::debug!(request_id = %diagnostic_context.request_id,
+        stage = "codex_response_ready", reserved_bytes = memory.buffered_response_reserved_bytes(),
+        actual_bytes = result.body.len(), has_content_length, "Codex response memory accounted");
+    read_memory.keep = true;
+    Ok(result)
 }
 
 #[derive(Default)]
@@ -2871,6 +2919,72 @@ mod tests {
         assert_eq!(body["output"][1]["id"], "item-1");
         assert_eq!(result.usage.input_tokens, 3);
         assert_eq!(result.usage.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn buffered_codex_small_output_does_not_hold_maximum_and_cancel_refunds() {
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+        let memory = budget.reservation();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let response = UpstreamResponse::Prefetched {
+            status: http::StatusCode::OK,
+            headers: headers.clone(),
+            version: http::Version::HTTP_11,
+            content_length: None,
+            stream: Box::pin(futures_util::stream::iter(
+                completed_stream()
+                    .chunks(17)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect::<Vec<_>>(),
+            )),
+        };
+        let result = buffer_response(
+            response,
+            &memory,
+            std::time::Duration::from_secs(30),
+            None,
+            crate::provider::SseFramingLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.usage.output_tokens, 2);
+        assert!(memory.response_json_fits(&result.body));
+        assert!(budget.snapshot().0 < 1024 * 1024);
+        drop(result);
+        memory.release_buffered_response();
+        assert_eq!(budget.snapshot().0, 0);
+        let owned = memory.clone();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let response = UpstreamResponse::Prefetched {
+                status: http::StatusCode::OK,
+                headers,
+                version: http::Version::HTTP_11,
+                content_length: None,
+                stream: Box::pin(futures_util::stream::once(async move {
+                    let _ = started.send(());
+                    futures_util::future::pending().await
+                })),
+            };
+            buffer_response(
+                response,
+                &owned,
+                std::time::Duration::from_secs(30),
+                None,
+                crate::provider::SseFramingLimits::default(),
+            )
+            .await
+            .is_ok()
+        });
+        waiting.await.unwrap();
+        assert_eq!(budget.snapshot().0, 64 * 1024);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.snapshot().0, 0);
     }
 
     #[test]
