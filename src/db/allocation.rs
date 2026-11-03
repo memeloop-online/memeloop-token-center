@@ -84,10 +84,7 @@ impl Database {
         let (account, generation) = selected;
         let mut tx = self.begin_write_transaction().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::query("SET LOCAL lock_timeout='5ms'")
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("SET LOCAL statement_timeout='20ms'")
+            sqlx::query("SELECT set_config('lock_timeout','5ms',true),set_config('statement_timeout','20ms',true)")
                 .execute(&mut *tx)
                 .await?;
         }
@@ -119,6 +116,41 @@ impl Database {
         if changed != 1 {
             tx.rollback().await?;
             return Ok(false);
+        }
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            // Both projections consume the exact newly inserted reservation in this transaction.
+            let inserted: i64 = sqlx::query_scalar(
+                "WITH inserted AS (
+                    INSERT INTO group_allocation_reservations(tenant_id,request_id,account_id,session_key,generation,created_at)
+                    VALUES($1,$2,$3,$4,$5,$6)
+                    ON CONFLICT(tenant_id,request_id) DO NOTHING
+                    RETURNING tenant_id,request_id,account_id,session_key,generation,created_at
+                ), pending AS (
+                    INSERT INTO group_allocation_pending(tenant_id,account_id,hour_bucket,requests)
+                    SELECT tenant_id,account_id,created_at/3600000,1 FROM inserted
+                    ON CONFLICT(tenant_id,account_id,hour_bucket) DO UPDATE SET requests=group_allocation_pending.requests+1
+                    RETURNING 1
+                ), binding AS (
+                    INSERT INTO group_allocation_sessions(tenant_id,session_key,account_id,generation,observed_at,expires_at,request_id)
+                    SELECT tenant_id,session_key,account_id,generation,created_at,created_at+86400000,request_id FROM inserted WHERE session_key<>''
+                    ON CONFLICT(tenant_id,session_key) DO UPDATE SET account_id=excluded.account_id,generation=excluded.generation,observed_at=excluded.observed_at,expires_at=excluded.expires_at,request_id=excluded.request_id WHERE group_allocation_sessions.observed_at<=excluded.observed_at
+                    RETURNING 1
+                ) SELECT COUNT(*) FROM inserted"
+            )
+                .bind(tenant.to_string())
+                .bind(request.to_string())
+                .bind(account)
+                .bind(session.map(|id| id.to_string()).unwrap_or_default())
+                .bind(generation as i64)
+                .bind(now)
+                .fetch_one(&mut *tx)
+                .await?;
+            if inserted != 1 {
+                tx.rollback().await?;
+                return Ok(false);
+            }
+            tx.commit().await?;
+            return Ok(true);
         }
         let inserted=sqlx::query("INSERT INTO group_allocation_reservations(tenant_id,request_id,account_id,session_key,generation,created_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id,request_id) DO NOTHING")
             .bind(tenant.to_string()).bind(request.to_string()).bind(account).bind(session.map(|id|id.to_string()).unwrap_or_default()).bind(generation as i64).bind(now).execute(&mut *tx).await?.rows_affected();
@@ -402,6 +434,57 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(usage.iter().map(|row| row.requests).sum::<u64>(), 2);
+        }
+        let duplicate_tenant = Uuid::now_v7();
+        let duplicate_request = Uuid::now_v7();
+        let duplicate_session = Uuid::now_v7();
+        assert!(
+            restarted
+                .allocation_reserve(
+                    duplicate_tenant,
+                    Some(0),
+                    duplicate_request,
+                    Some(duplicate_session),
+                    ("a", 1),
+                    now
+                )
+                .await
+                .unwrap()
+        );
+        for revision in [Some(1), None] {
+            assert!(
+                !second
+                    .allocation_reserve(
+                        duplicate_tenant,
+                        revision,
+                        duplicate_request,
+                        Some(duplicate_session),
+                        ("b", 1),
+                        now + 1
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                second.allocation_revision(duplicate_tenant).await.unwrap(),
+                1
+            );
+            let usage = second
+                .allocation_usage(duplicate_tenant, &accounts, now)
+                .await
+                .unwrap();
+            assert_eq!(usage.len(), 1);
+            assert_eq!(usage[0].account, "a");
+            assert_eq!(usage[0].requests, 1);
+            assert_eq!(
+                second
+                    .allocation_session(duplicate_tenant, duplicate_session, now)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .0,
+                "a"
+            );
         }
         let concurrent_tenant = Uuid::now_v7();
         let mut committed = 0_i64;
