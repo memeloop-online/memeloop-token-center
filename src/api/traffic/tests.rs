@@ -34,7 +34,7 @@ async fn fixture_with_normalize_log(
     if normalize_log {
         manifest["capabilities"] = json!([{"kind":"log"}]);
         manifest["contributions"]["providers"][0]["component_adapter"]["max_response_bytes"] =
-            json!(64 * 1024 * 1024);
+            json!(crate::plugin::MAX_COMPONENT_PROVIDER_BODY);
     }
     std::fs::write(
         package.join("plugin.json"),

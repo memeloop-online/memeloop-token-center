@@ -648,47 +648,55 @@ async fn install_component_provider_with_limit(
 }
 
 #[tokio::test]
-async fn gateway_component_small_normalized_response_fits_beside_128_mib_owner() {
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/vendor/infer"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"vendor_answer":"small"})))
-        .expect(1)
-        .mount(&upstream)
+async fn gateway_component_small_normalized_response_fits_without_declared_maximum_prepaid() {
+    for occupied_mib in [128, 248] {
+        let upstream = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/vendor/infer"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"vendor_answer":"small"})),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let mut fixture =
+            resilient_route_fixture("component-actual-memory", &[(upstream.uri(), 0)]).await;
+        assert_eq!(
+            fixture.state.config.proxy_memory_budget_bytes,
+            256 * 1024 * 1024
+        );
+        install_component_provider_with_limit(
+            &mut fixture,
+            Some(crate::plugin::MAX_COMPONENT_PROVIDER_BODY),
+        )
         .await;
-    let mut fixture =
-        resilient_route_fixture("component-actual-memory", &[(upstream.uri(), 0)]).await;
-    assert_eq!(
-        fixture.state.config.proxy_memory_budget_bytes,
-        256 * 1024 * 1024
-    );
-    install_component_provider_with_limit(&mut fixture, Some(MAX_PROXY_RESPONSE_BODY)).await;
-    assert_eq!(
-        fixture
-            .state
-            .providers
-            .get("example-oauth-http")
-            .unwrap()
-            .component_adapter
-            .as_ref()
-            .unwrap()
-            .max_response_bytes,
-        64 * 1024 * 1024
-    );
-    let occupied = fixture.state.proxy_memory_budget.reservation();
-    assert!(occupied.try_grow(128 * 1024 * 1024, 1));
-    let response = send_resilient_chat(&fixture, None, false).await;
-    assert_eq!(response.status(), StatusCode::OK);
-    let delivered = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
-    let body: Value = serde_json::from_slice(&delivered).unwrap();
-    assert_eq!(
-        body["choices"][0]["message"]["content"],
-        "normalized by component"
-    );
-    assert_eq!(body["usage"]["prompt_tokens"], 7);
-    assert_eq!(body["usage"]["completion_tokens"], 3);
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 < 130 * 1024 * 1024);
-    upstream.verify().await;
+        assert_eq!(
+            fixture
+                .state
+                .providers
+                .get("example-oauth-http")
+                .unwrap()
+                .component_adapter
+                .as_ref()
+                .unwrap()
+                .max_response_bytes,
+            4 * 1024 * 1024
+        );
+        let occupied = fixture.state.proxy_memory_budget.reservation();
+        assert!(occupied.try_grow(occupied_mib * 1024 * 1024, 1));
+        let response = send_resilient_chat(&fixture, None, false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let delivered = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        let body: Value = serde_json::from_slice(&delivered).unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "normalized by component"
+        );
+        assert_eq!(body["usage"]["prompt_tokens"], 7);
+        assert_eq!(body["usage"]["completion_tokens"], 3);
+        assert!(fixture.state.proxy_memory_budget.snapshot().0 < (occupied_mib + 2) * 1024 * 1024);
+        upstream.verify().await;
+    }
 }
 
 #[tokio::test]
