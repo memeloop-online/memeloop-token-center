@@ -1373,6 +1373,7 @@ async fn proxy_with_cancellation_guard(
         model_route_id.ok_or(AppError::internal("proxy_site_3"))?,
     );
     let mut outbound_attempts = 0_usize;
+    let mut rejected_models = std::collections::HashSet::new();
     let mut h2_recovery_available = true;
     let mut last_dispatch = None;
     let mut candidate_rank = 0_usize;
@@ -1444,6 +1445,18 @@ async fn proxy_with_cancellation_guard(
             return finish_unavailable(&buffered_request, "upstream_unavailable", last_dispatch)
                 .await;
         };
+        let candidate_model = (
+            active_route.route.account_id,
+            active_route.route.upstream_model.clone(),
+            active_route.route.credential_generation,
+            active_route.route.transport_revision,
+        );
+        if rejected_models.contains(&candidate_model) {
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            continue;
+        }
         if !active_route.is_codex()
             || !dispatch_permit
                 .as_ref()
@@ -1666,6 +1679,7 @@ async fn proxy_with_cancellation_guard(
         );
         if disposition.is_definite_rejection() {
             attempt_budget.note_definite_rejection();
+            rejected_models.insert(candidate_model);
         }
         let has_standby =
             !route_candidates.as_slice().is_empty() || !deferred_shared_probes.is_empty();
