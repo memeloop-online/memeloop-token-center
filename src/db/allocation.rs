@@ -62,13 +62,45 @@ impl Database {
         }))
     }
 
-    pub(crate) async fn allocation_actual_session(
+    pub(crate) async fn allocation_preferred_session(
         &self,
         identity: AllocationSession<'_>,
+        session: Option<Uuid>,
         now: i64,
-    ) -> Result<Option<String>, AppError> {
-        sqlx::query_scalar("SELECT upstream_account_id FROM session_routing_terminals WHERE tenant_id=$1 AND principal_id=$2 AND key_id=$3 AND explicit_session_id=$4 AND model=$5 AND protocol=$6 AND expires_at>$7 AND status_code>=200 AND status_code<400 AND COALESCE(error_code,'')='' AND upstream_account_id IS NOT NULL ORDER BY observed_at DESC,request_id DESC LIMIT 1")
-            .bind(identity.key.tenant_id.to_string()).bind(identity.key.principal_id.to_string()).bind(identity.key.key_id.to_string()).bind(identity.session).bind(identity.model).bind(identity.protocol).bind(now).fetch_optional(&self.pool).await.map_err(Into::into)
+    ) -> Result<Option<(String, u64)>, AppError> {
+        let row = sqlx::query(
+            "WITH actual AS (
+                SELECT upstream_account_id AS account_id,CAST(-1 AS BIGINT) AS generation
+                FROM session_routing_terminals
+                WHERE tenant_id=$1 AND principal_id=$2 AND key_id=$3 AND explicit_session_id=$4 AND model=$5 AND protocol=$6 AND expires_at>$7 AND status_code>=200 AND status_code<400 AND COALESCE(error_code,'')='' AND upstream_account_id IS NOT NULL
+                ORDER BY observed_at DESC,request_id DESC LIMIT 1
+            ), binding AS (
+                SELECT CASE WHEN t.status_code>=200 AND t.status_code<400 AND COALESCE(t.error_code,'')='' THEN COALESCE(t.upstream_account_id,s.account_id) ELSE s.account_id END AS account_id,
+                    CASE WHEN t.status_code>=200 AND t.status_code<400 AND COALESCE(t.error_code,'')='' AND t.upstream_account_id IS NOT NULL THEN -1 ELSE s.generation END AS generation
+                FROM group_allocation_sessions s LEFT JOIN session_routing_terminals t ON t.request_id=s.request_id AND t.tenant_id=s.tenant_id
+                WHERE s.tenant_id=$1 AND s.session_key=$8 AND s.expires_at>$7
+            )
+            SELECT account_id,generation FROM (
+                SELECT account_id,generation,0 AS priority FROM actual
+                UNION ALL SELECT account_id,generation,1 AS priority FROM binding
+            ) AS preferences ORDER BY priority LIMIT 1"
+        )
+            .bind(identity.key.tenant_id.to_string())
+            .bind(identity.key.principal_id.to_string())
+            .bind(identity.key.key_id.to_string())
+            .bind(identity.session)
+            .bind(identity.model)
+            .bind(identity.protocol)
+            .bind(now)
+            .bind(session.map(|id| id.to_string()))
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|row| {
+            (
+                row.get("account_id"),
+                row.get::<i64, _>("generation") as u64,
+            )
+        }))
     }
 
     /// New-session selections share a revision fence. Established sessions append their request count.
@@ -378,6 +410,119 @@ mod tests {
         );
         sqlx::query("INSERT INTO session_routing_terminals(tenant_id,principal_id,key_id,explicit_session_id,model,protocol,request_id,observed_at,status_code,upstream_account_id,expires_at) VALUES($1,$2,$3,'session','model','openai',$4,$5,200,'b',$6)")
             .bind(tenant.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).bind(request.to_string()).bind(now+101).bind(now+DAY_MS).execute(&first.pool).await.unwrap();
+        let key = crate::model::AuthenticatedKey {
+            key_id: Uuid::now_v7(),
+            tenant_id: tenant,
+            principal_id: Uuid::now_v7(),
+            account_id: Uuid::now_v7(),
+            alias: "allocation".into(),
+            currency: "USD".into(),
+            credential_generation: 1,
+            policy: Default::default(),
+        };
+        let identity = AllocationSession {
+            key: &key,
+            session: "conversation",
+            model: "model",
+            protocol: "openai",
+        };
+        assert_eq!(
+            first
+                .allocation_preferred_session(identity, Some(session), now + 102)
+                .await
+                .unwrap(),
+            Some(("b".into(), u64::MAX))
+        );
+        assert!(
+            first
+                .allocation_preferred_session(identity, None, now + 102)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("INSERT INTO session_routing_terminals(tenant_id,principal_id,key_id,explicit_session_id,model,protocol,request_id,observed_at,status_code,upstream_account_id,expires_at) VALUES($1,$2,$3,'conversation','model','openai',$4,$5,200,'actual',$6)")
+            .bind(tenant.to_string()).bind(key.principal_id.to_string()).bind(key.key_id.to_string()).bind(Uuid::now_v7().to_string()).bind(now+102).bind(now+DAY_MS).execute(&first.pool).await.unwrap();
+        for binding in [Some(session), None] {
+            assert_eq!(
+                first
+                    .allocation_preferred_session(identity, binding, now + 103)
+                    .await
+                    .unwrap(),
+                Some(("actual".into(), u64::MAX))
+            );
+        }
+        for other in [
+            AllocationSession {
+                session: "other",
+                ..identity
+            },
+            AllocationSession {
+                model: "other",
+                ..identity
+            },
+            AllocationSession {
+                protocol: "other",
+                ..identity
+            },
+        ] {
+            assert_eq!(
+                first
+                    .allocation_preferred_session(other, Some(session), now + 103)
+                    .await
+                    .unwrap(),
+                Some(("b".into(), u64::MAX))
+            );
+        }
+        for other_key in [
+            crate::model::AuthenticatedKey {
+                key_id: Uuid::now_v7(),
+                ..key.clone()
+            },
+            crate::model::AuthenticatedKey {
+                principal_id: Uuid::now_v7(),
+                ..key.clone()
+            },
+        ] {
+            assert_eq!(
+                first
+                    .allocation_preferred_session(
+                        AllocationSession {
+                            key: &other_key,
+                            ..identity
+                        },
+                        Some(session),
+                        now + 103
+                    )
+                    .await
+                    .unwrap(),
+                Some(("b".into(), u64::MAX))
+            );
+        }
+        let other_tenant = crate::model::AuthenticatedKey {
+            tenant_id: Uuid::now_v7(),
+            ..key.clone()
+        };
+        assert!(
+            first
+                .allocation_preferred_session(
+                    AllocationSession {
+                        key: &other_tenant,
+                        ..identity
+                    },
+                    Some(session),
+                    now + 103
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            first
+                .allocation_preferred_session(identity, Some(session), now + DAY_MS + 101)
+                .await
+                .unwrap()
+                .is_none()
+        );
         drop(first);
         let restarted = Database::connect(url).await.unwrap();
         assert_eq!(
