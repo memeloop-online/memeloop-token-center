@@ -58,6 +58,7 @@ mod passthrough_reservation;
 mod pending_delivery;
 mod persistence_isolation;
 mod phase_diagnostics;
+mod playground_port;
 mod postgres_attempt_deadline;
 mod recovery_wait;
 mod responses_transport;
