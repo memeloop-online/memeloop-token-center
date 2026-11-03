@@ -527,7 +527,7 @@ mod response_body_guard_tests {
         let body = std::str::from_utf8(&body).expect("UTF-8 error");
         assert!(body.contains("proxy_memory_ingress"));
         assert!(body.contains(
-            "gateway memory budget could not hold the request body, and the body was not written to object storage"
+            "gateway memory is currently insufficient to receive the request body; retry later"
         ));
     }
 

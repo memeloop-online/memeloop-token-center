@@ -646,6 +646,8 @@ impl RequestSpool {
     pub(crate) async fn open_stream(
         &self,
     ) -> Result<crate::archive::ArchiveDownload, RequestSpoolReadError> {
+        #[cfg(test)]
+        self.read_count.fetch_add(1, Ordering::AcqRel);
         let resident = self
             .shared
             .body

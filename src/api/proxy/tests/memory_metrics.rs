@@ -66,7 +66,7 @@ async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
 }
 
 #[tokio::test]
-async fn ingress_memory_counter_has_no_fabricated_route_label() {
+async fn source_json_memory_counter_has_no_fabricated_ingress_or_route_label() {
     let fixture = codex_route_fixture("ingress-memory-metrics").await;
     let held = fixture.state.proxy_memory_budget.reservation();
     assert!(held.try_grow(fixture.state.config.proxy_memory_budget_bytes as usize, 1));
@@ -85,9 +85,12 @@ async fn ingress_memory_counter_has_no_fabricated_route_label() {
         .state
         .metrics
         .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(rendered.lines().any(
+        |line| line == "memeloop_token_center_proxy_memory_rejections_total{stage=\"json\"} 1"
+    ));
     assert!(
         rendered.lines().any(|line| line
-            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"ingress\"} 1")
+            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"ingress\"} 0")
     );
     assert!(!rendered.lines().any(|line| {
         line.starts_with("memeloop_token_center_gateway_body_rejections_total{")
