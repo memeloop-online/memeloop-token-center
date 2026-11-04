@@ -2,9 +2,141 @@ use super::super::*;
 use super::probe_model::{CatalogModel, select_probe_model};
 
 const PROBE_INSTRUCTIONS: &str = "Reply with ok.";
-const HEALTHY_INTERVAL: i64 = 60_000;
-const UNHEALTHY_INTERVAL: i64 = 10_000;
+const HEALTHY_INTERVAL: i64 = 3_600_000;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct HealthProbeSettings {
+    pub enabled: bool,
+    pub billing_key_id: Option<Uuid>,
+    pub interval_seconds: i64,
+    pub model: Option<String>,
+    pub prompt: String,
+}
+
+impl Default for HealthProbeSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            billing_key_id: None,
+            interval_seconds: 3600,
+            model: None,
+            prompt: PROBE_INSTRUCTIONS.into(),
+        }
+    }
+}
+
+fn periodic_probe_due(settings: &HealthProbeSettings, last: Option<i64>, now: i64) -> bool {
+    settings.enabled
+        && last
+            .is_none_or(|v| now.saturating_sub(v) >= settings.interval_seconds.saturating_mul(1000))
+}
+
+async fn load_probe_settings(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<HealthProbeSettings, AppError> {
+    match state
+        .db
+        .plugin_kv_get("upstream-health-probe", &account_id.to_string())
+        .await?
+    {
+        Some(value) => {
+            serde_json::from_slice(&value).map_err(|_| AppError::internal("health_probe_settings"))
+        }
+        None => Ok(HealthProbeSettings::default()),
+    }
+}
+
+async fn authorize_probe_settings(
+    state: &AppState,
+    headers: &HeaderMap,
+    tenant: Option<&str>,
+    account_id: Uuid,
+    scope: &str,
+) -> Result<(), AppError> {
+    let service = require_service(headers, state, scope).await?;
+    if let Some(tenant) = tenant.or(service.tenant_external_id.as_deref()) {
+        require_service_tenant(&service, tenant)?;
+        state.db.require_upstream_tenant(account_id, tenant).await?;
+    }
+    state.db.probe_account_context(account_id).await?;
+    Ok(())
+}
+
+pub(in crate::api) async fn get_health_probe_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<ManagementTenantQuery>,
+) -> Result<Json<HealthProbeSettings>, AppError> {
+    authorize_probe_settings(
+        &state,
+        &headers,
+        query.tenant_external_id.as_deref(),
+        account_id,
+        "providers:read",
+    )
+    .await?;
+    Ok(Json(load_probe_settings(&state, account_id).await?))
+}
+
+pub(in crate::api) async fn put_health_probe_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<ManagementTenantQuery>,
+    Json(settings): Json<HealthProbeSettings>,
+) -> Result<Json<HealthProbeSettings>, AppError> {
+    authorize_probe_settings(
+        &state,
+        &headers,
+        query.tenant_external_id.as_deref(),
+        account_id,
+        "providers:write",
+    )
+    .await?;
+    require_service(&headers, &state, "keys:write").await?;
+    if settings.interval_seconds < 3600
+        || settings.interval_seconds > 2_592_000
+        || settings.prompt.trim().is_empty()
+        || settings.prompt.len() > 1024
+        || settings
+            .model
+            .as_ref()
+            .is_some_and(|v| v.trim().is_empty() || v.len() > 200)
+        || (settings.enabled && settings.billing_key_id.is_none())
+    {
+        return Err(AppError::BadRequest("invalid health probe settings".into()));
+    }
+    let account = state.db.probe_account_context(account_id).await?;
+    if let Some(key) = settings.billing_key_id {
+        state
+            .db
+            .filter_assistant_identity(&account.tenant_external_id, key)
+            .await?;
+        if super::super::control_requests::load_filter_assistant_settings(
+            &state,
+            &account.tenant_external_id,
+        )
+        .await?
+        .and_then(|s| s.billing_key_id)
+            == Some(key)
+        {
+            return Err(AppError::BadRequest(
+                "health probe and system AI must use different credentials".into(),
+            ));
+        }
+    }
+    let value =
+        serde_json::to_vec(&settings).map_err(|_| AppError::internal("health_probe_settings"))?;
+    state
+        .db
+        .plugin_kv_put("upstream-health-probe", &account_id.to_string(), &value)
+        .await?;
+    Ok(Json(settings))
+}
 
 fn health_probe_error(status: StatusCode) -> Option<&'static str> {
     match status {
@@ -120,7 +252,7 @@ pub(crate) async fn run_upstream_service_probes(
     state: crate::AppState,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut ticks = tokio::time::interval(Duration::from_secs(10));
+    let mut ticks = tokio::time::interval(Duration::from_secs(60));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! { biased;
@@ -130,11 +262,7 @@ pub(crate) async fn run_upstream_service_probes(
         let now = unix_millis();
         let due = match state
             .db
-            .upstream_service_probes_due(
-                now.saturating_sub(HEALTHY_INTERVAL),
-                now.saturating_sub(UNHEALTHY_INTERVAL),
-                32,
-            )
+            .configured_upstream_service_probes_due(now.saturating_sub(HEALTHY_INTERVAL), 10_000)
             .await
         {
             Ok(due) => due,
@@ -148,30 +276,48 @@ pub(crate) async fn run_upstream_service_probes(
         };
         let mut inflight = tokio::task::JoinSet::new();
         for account_id in due {
+            let Ok(settings) = load_probe_settings(&state, account_id).await else {
+                continue;
+            };
+            let Ok(last) = state
+                .db
+                .upstream_service_probe_last_attempt(account_id)
+                .await
+            else {
+                continue;
+            };
+            if !periodic_probe_due(&settings, last, unix_millis()) {
+                continue;
+            }
+            if inflight.len() >= 32 {
+                break;
+            }
             let state = state.clone();
             inflight.spawn(async move {
-                let result = run_upstream_service_probe(&state, account_id, "periodic", None).await;
-                // Recovery remains background and pinned; a cheap default
-                // success cannot establish availability for another model.
-                match state.db.supplier_quota_recovery_models(account_id).await {
-                    Ok(models) => {
-                        for model in models {
-                            if result["selected_model"].as_str() != Some(&model) {
-                                run_upstream_service_probe(
-                                    &state,
-                                    account_id,
-                                    "periodic_recovery",
-                                    Some(&model),
-                                )
-                                .await;
-                            }
-                        }
+                // At most one request per account per interval. Rotate scoped
+                // quota recovery models; a probe of a different model cannot
+                // prove that the exhausted model recovered.
+                let recovery = match state.db.supplier_quota_recovery_models(account_id).await {
+                    Ok(models) if !models.is_empty() => {
+                        let slot = (unix_millis() / settings.interval_seconds.saturating_mul(1000))
+                            as usize;
+                        Some(models[slot % models.len()].clone())
                     }
-                    Err(error) => tracing::warn!(
-                        error_category = error.diagnostic_category(),
-                        "supplier quota recovery schedule failed"
-                    ),
-                }
+                    Ok(_) => None,
+                    Err(error) => {
+                        tracing::warn!(
+                            error_category = error.diagnostic_category(),
+                            "supplier quota recovery schedule failed"
+                        );
+                        return;
+                    }
+                };
+                let trigger = if recovery.is_some() {
+                    "periodic_recovery"
+                } else {
+                    "periodic"
+                };
+                run_upstream_service_probe(&state, account_id, trigger, recovery.as_deref()).await;
             });
         }
         while !inflight.is_empty() {
@@ -267,13 +413,13 @@ struct PreparedProbe {
     transport_revision: i64,
 }
 
-fn probe_envelope(protocol: &str, public_model: &str) -> Option<(Protocol, Value)> {
+fn probe_envelope(protocol: &str, public_model: &str, prompt: &str) -> Option<(Protocol, Value)> {
     match protocol {
         "openai" => Some((
             Protocol::OpenAiResponses,
             json!({
                 "model": public_model,
-                "instructions": PROBE_INSTRUCTIONS,
+                "instructions": prompt,
                 "input": "hi",
                 "max_output_tokens": 16,
                 "stream": false,
@@ -284,7 +430,7 @@ fn probe_envelope(protocol: &str, public_model: &str) -> Option<(Protocol, Value
             Protocol::AnthropicMessages,
             json!({
                 "model": public_model,
-                "system": PROBE_INSTRUCTIONS,
+                "system": prompt,
                 "messages": [{"role": "user", "content": "hi"}],
                 "max_tokens": 16,
                 "stream": false
@@ -341,8 +487,10 @@ async fn prepare_model_probe(
             ));
         }
     };
-    let configured =
-        recovery_model.or_else(|| account.config.get("probe_model").and_then(Value::as_str));
+    let settings = load_probe_settings(state, account_id)
+        .await
+        .map_err(|error| prepare_failed(account_id, &error, "probe_state_unavailable"))?;
+    let configured = recovery_model.or(settings.model.as_deref());
     if select_probe_model(configured, &catalog).is_none() {
         return Err(skipped(account_id, "probe_model_unavailable"));
     }
@@ -357,20 +505,32 @@ async fn bill_model_probe(
     mut catalog: Vec<CatalogModel>,
 ) -> Result<PreparedProbe, (Value, bool)> {
     let tenant = &account.tenant_external_id;
-    let settings =
-        match super::super::control_requests::load_filter_assistant_settings(state, tenant).await {
-            Ok(settings) => settings,
-            Err(error) => {
-                return Err(prepare_failed(
-                    account_id,
-                    &error,
-                    "probe_state_unavailable",
-                ));
-            }
-        };
-    let Some(billing_key_id) = settings.and_then(|settings| settings.billing_key_id) else {
+    let settings = match load_probe_settings(state, account_id).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            return Err(prepare_failed(
+                account_id,
+                &error,
+                "probe_state_unavailable",
+            ));
+        }
+    };
+    let Some(billing_key_id) = settings.billing_key_id else {
         return Err(skipped(account_id, "probe_billing_unavailable"));
     };
+    match super::super::control_requests::load_filter_assistant_settings(state, tenant).await {
+        Ok(Some(system)) if system.billing_key_id == Some(billing_key_id) => {
+            return Err(skipped(account_id, "probe_billing_unavailable"));
+        }
+        Err(error) => {
+            return Err(prepare_failed(
+                account_id,
+                &error,
+                "probe_state_unavailable",
+            ));
+        }
+        _ => {}
+    }
     let key = match state
         .db
         .filter_assistant_identity(tenant, billing_key_id)
@@ -395,7 +555,14 @@ async fn bill_model_probe(
             .await
         {
             Ok(price) => {
-                candidate.input_price = Some(price.input_micros_per_million);
+                // Rank by the estimated price of a small probe, including output.
+                // The prompt is bounded and the response is capped at 16 tokens.
+                candidate.input_price = Some(
+                    price
+                        .input_micros_per_million
+                        .saturating_mul(64)
+                        .saturating_add(price.output_micros_per_million.saturating_mul(16)),
+                );
                 billable.push(candidate);
             }
             Err(AppError::UnpricedModel) => {
@@ -446,7 +613,9 @@ async fn bill_model_probe(
             }
         }
     };
-    let Some((protocol, request)) = probe_envelope(&route.protocol, &route.public_model) else {
+    let Some((protocol, request)) =
+        probe_envelope(&route.protocol, &route.public_model, &settings.prompt)
+    else {
         return Err(skipped(account_id, "probe_route_unavailable"));
     };
     let body =
@@ -597,6 +766,29 @@ async fn upstream_service_probe_body(
 mod tests {
     use super::{StatusCode, classify_probe_error, health_probe_error};
     use crate::error::AppError;
+
+    #[test]
+    fn automatic_probe_can_be_disabled_and_waits_at_least_one_hour() {
+        let mut settings = super::HealthProbeSettings::default();
+        assert!(!super::periodic_probe_due(&settings, None, 10_000_000));
+        settings.enabled = true;
+        assert!(!super::periodic_probe_due(
+            &settings,
+            Some(1_000_000),
+            4_599_999
+        ));
+        assert!(super::periodic_probe_due(
+            &settings,
+            Some(1_000_000),
+            4_600_000
+        ));
+        settings.interval_seconds = 7200;
+        assert!(!super::periodic_probe_due(
+            &settings,
+            Some(1_000_000),
+            4_600_000
+        ));
+    }
 
     #[test]
     fn probe_rejections_are_not_reported_as_healthy() {

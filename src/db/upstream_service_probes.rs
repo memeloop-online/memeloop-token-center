@@ -30,6 +30,65 @@ pub(crate) struct ProbeBillingRoute {
 }
 
 impl Database {
+    pub(crate) async fn health_probe_credential_in_use(
+        &self,
+        tenant: &str,
+        key_id: Uuid,
+    ) -> Result<bool, AppError> {
+        let values: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT k.value FROM plugin_kv k
+             JOIN upstream_accounts a ON a.id = k.key
+             JOIN tenants t ON t.id = a.tenant_id
+             WHERE k.plugin_id = 'upstream-health-probe' AND t.external_id = $1",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await?;
+        for value in values {
+            let settings: Value = serde_json::from_slice(&value)
+                .map_err(|_| AppError::internal("health_probe_settings"))?;
+            if settings["billing_key_id"].as_str() == Some(key_id.to_string().as_str()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) async fn configured_upstream_service_probes_due(
+        &self,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let rows = sqlx::query(
+            "SELECT a.id FROM upstream_accounts a
+             JOIN plugin_kv k ON k.plugin_id = 'upstream-health-probe' AND k.key = a.id
+             LEFT JOIN upstream_service_probes p ON p.upstream_account_id = a.id
+             WHERE a.status = 'active'
+               AND (COALESCE(p.last_attempt_at, p.checked_at) IS NULL
+                    OR COALESCE(p.last_attempt_at, p.checked_at) <= $1)
+             ORDER BY COALESCE(p.last_attempt_at, p.checked_at, 0), a.id LIMIT $2",
+        )
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("id")?;
+                Uuid::parse_str(&id)
+                    .map_err(|_| AppError::internal("configured_upstream_service_probes_due"))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn upstream_service_probe_last_attempt(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<i64>, AppError> {
+        Ok(sqlx::query_scalar("SELECT COALESCE(last_attempt_at, checked_at) FROM upstream_service_probes WHERE upstream_account_id = $1")
+            .bind(account_id.to_string()).fetch_optional(&self.pool).await?)
+    }
+
     pub(crate) async fn upstream_service_probes_due(
         &self,
         healthy_before: i64,

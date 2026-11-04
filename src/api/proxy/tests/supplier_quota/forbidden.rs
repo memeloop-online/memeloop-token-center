@@ -133,22 +133,10 @@ async fn explicit403_quota_fails_over_avoids_failed_model_and_recovers_only_from
             .fetch_one(&pool)
             .await
             .unwrap();
-    fixture
-        .state
-        .db
-        .plugin_kv_put(
-            "typed-filter",
-            &format!(
-                "settings/{}",
-                &blake3::hash(tenant.as_bytes()).to_hex()[..32]
-            ),
-            &serde_json::to_vec(
-                &json!({"model_route_id":route_id,"billing_key_id":fixture.key_id,"updated_at":1}),
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
+    fixture.state.db.plugin_kv_put(
+        "upstream-health-probe", &account.to_string(),
+        &serde_json::to_vec(&json!({"enabled":true,"billing_key_id":fixture.key_id,"interval_seconds":3600,"model":null,"prompt":"Reply with ok."})).unwrap(),
+    ).await.unwrap();
     for _ in 0..2 {
         let response = send_resilient_chat(&fixture, None, false).await;
         assert_eq!(response.status(), StatusCode::OK);

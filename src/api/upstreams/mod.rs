@@ -35,7 +35,10 @@ pub(in crate::api) use accounts::{
 };
 pub(in crate::api) use availability::upstream_account_availability;
 pub(crate) use health::run_upstream_service_probes;
-pub(in crate::api) use health::{probe_upstream_health, read_upstream_service_probe};
+pub(in crate::api) use health::{
+    get_health_probe_settings, probe_upstream_health, put_health_probe_settings,
+    read_upstream_service_probe,
+};
 pub(crate) use models::sync_upstream_models_after_refresh;
 pub(crate) use models::trigger_upstream_model_sync;
 pub(in crate::api) use models::{
