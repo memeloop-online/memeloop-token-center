@@ -330,9 +330,31 @@ async fn exercise_coverage(url: &str) {
         skipped_receipts, 0,
         "tenants without active capture incur no receipt storage"
     );
-    db.prune_allocation_history(now + DAY_MS + HOUR_MS)
+    let sweep_at = now + DAY_MS + HOUR_MS;
+    for (session_tenant, expires_at) in [(tenant, sweep_at), (fresh, sweep_at + 1)] {
+        sqlx::query("INSERT INTO group_allocation_sessions(tenant_id,session_key,request_id,account_id,generation,observed_at,expires_at) VALUES($1,'shared-session',$2,$3,1,$4,$5)")
+            .bind(session_tenant.to_string())
+            .bind(Uuid::now_v7().to_string())
+            .bind(a.to_string())
+            .bind(now)
+            .bind(expires_at)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    db.prune_allocation_history(sweep_at)
         .await
         .unwrap();
+    let session_tenants: Vec<String> =
+        sqlx::query_scalar("SELECT tenant_id FROM group_allocation_sessions WHERE session_key='shared-session'")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        session_tenants,
+        vec![fresh.to_string()],
+        "ClickHouse expiry removes the expired full identity while preserving another tenant's live binding"
+    );
     let retained: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM group_allocation_history_contributions WHERE tenant_id=$1",
     )

@@ -156,6 +156,12 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
         }
+        // ClickHouse refreshes no longer pass through the SQL usage refresh,
+        // so session affinity expiry must also run in the shared background sweep.
+        sqlx::query("DELETE FROM group_allocation_sessions WHERE (tenant_id,session_key) IN (SELECT tenant_id,session_key FROM group_allocation_sessions WHERE expires_at<=$1 ORDER BY expires_at LIMIT 512)")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
