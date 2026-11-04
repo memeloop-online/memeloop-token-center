@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import { requestFailureCause, requestStatusCopy, requestSupplierDetail } from '../src/requestStatusPresentation.js';
+import { requestFailureCause, requestStatusCopy, requestSupplierDetail, supplierErrorPresentation } from '../src/requestStatusPresentation.js';
 import { requestViewFromEvent } from '../src/operator/traffic/requestTraffic.js';
 import type { RequestView, RequestEvent } from '../src/types.js';
 
@@ -13,7 +13,7 @@ const types = await readFile(new URL('../src/types.ts', import.meta.url), 'utf8'
 const copyButton = await readFile(new URL('../src/CopyButton.tsx', import.meta.url), 'utf8');
 const fixture = await readFile(new URL('./fixtures/request-diagnostics.tsx', import.meta.url), 'utf8');
 
-test('canonical supplier messages expose complete bounded provider details without trusting arbitrary text', () => {
+test('raw supplier details stay viewable without allowlist parsing, and mapped copy stays supplemental', () => {
   const request: RequestView = { request_id: 'fixture', created_at: 1, protocol: 'openai', model: 'fixture', status_code: 402, duration_ms: 1, input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'http_402' };
   for (const [code, base, providerCode, message] of [
     ['no_active_plan', '当前账号没有可用套餐', '402', '当前账号没有可用套餐'],
@@ -26,26 +26,31 @@ test('canonical supplier messages expose complete bounded provider details witho
     const safe = { ...request, supplier_error: { code, message: canonical } };
     for (const locale of ['zh-CN', 'en'] as const) {
       const detail = requestSupplierDetail(safe, locale);
-      assert.ok(detail?.includes(providerCode) && detail.includes(message));
+      assert.ok(detail?.includes(canonical), 'the whole raw upstream message stays viewable without allowlist parsing');
       const copy = requestStatusCopy(safe, locale);
-      assert.equal(copy.hint, `${copy.cause} · ${detail}`);
+      assert.ok(copy.hint.startsWith(copy.cause));
+      assert.ok(copy.hint.includes(detail!));
       assert.equal(copy.supplierDetail, detail);
-      assert.doesNotMatch(copy.hint, /Recorded status|记录状态码|http_402/);
-      assert.equal(requestSupplierDetail({ ...safe, supplier_error: { code, message: base } }, locale), null);
-      for (const unsafe of ['', `${canonical}\n`, `${canonical}; extra: secret`, canonical.replace(message, 'Authorization: Bearer secret'), `${base}; provider message: https://example.invalid/?X-Amz-Signature=secret`, `${base}; provider code: 01900000-0000-7000-8000-000000000001`, `${base}; provider message: ${'x'.repeat(4096)}`, `${base}; provider message: Too many requests`]) {
-        assert.equal(requestSupplierDetail({ ...safe, supplier_error: { code, message: unsafe } }, locale), null);
+      assert.doesNotMatch(copy.cause, /provider code|http_402/, 'raw concatenated text never becomes the primary reason');
+      assert.equal(copy.cause, `${locale === 'zh-CN' ? '已记录原因' : 'Recorded cause'}: ${supplierErrorPresentation(safe.supplier_error, locale)?.reason}`);
+      // Arbitrary, hostile, URL-bearing and long raw messages stay viewable
+      // as escaped technical text instead of being discarded.
+      for (const unsafe of [`${canonical}\n`, `${canonical}; extra: secret`, canonical.replace(message, 'Authorization: Bearer secret'), `${base}; provider message: https://example.invalid/?X-Amz-Signature=secret`, `${base}; provider code: 01900000-0000-7000-8000-000000000001`, `${base}; provider message: ${'x'.repeat(4096)}`, `${base}; provider message: Too many requests`]) {
+        const raw = requestSupplierDetail({ ...safe, supplier_error: { code, message: unsafe } }, locale);
+        assert.ok(raw?.includes(unsafe.trim()), 'raw upstream detail is preserved, not dropped');
       }
-      assert.equal(requestSupplierDetail({ ...safe, supplier_error: { code: 'unknown', message: canonical } }, locale), null);
+      const unknown = requestSupplierDetail({ ...safe, supplier_error: { code: 'unknown', message: canonical } }, locale);
+      assert.ok(unknown?.includes('unknown') && unknown.includes(canonical), 'an unknown code keeps both raw values viewable');
     }
   }
   const quotaOnlyCode = { ...request, supplier_error: { code: 'insufficient_quota', message: 'The upstream account has insufficient quota; provider code: insufficient_user_quota' } };
   for (const locale of ['zh-CN', 'en'] as const) {
     const detail = requestSupplierDetail(quotaOnlyCode, locale);
-    assert.ok(detail?.includes('insufficient_user_quota'), 'a safe provider code survives without any provider message');
-    assert.doesNotMatch(detail ?? '', /剩余额度|request id/);
+    assert.ok(detail?.includes('insufficient_user_quota'), 'the raw code survives without a provider message');
+    assert.ok(detail?.includes('insufficient_quota'), 'the original code remains viewable too');
   }
   assert.match(components, /request-supplier-detail/);
-  assert.match(components, /<span>\{supplierDetail\}<\/span>/);
+  assert.match(components, /failureDetails\.map\(\(entry\) => `\$\{entry\.label\}: \$\{entry\.value\}`\)\.join\(' · '\)/);
 });
 
 test('request table exposes copyable durable IDs and its recorded token billing split', () => {
@@ -105,21 +110,28 @@ test('supplier reasons share localized tooltip/detail copy, preserve transport p
     input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'http_402',
     supplier_error: { code: 'no_active_plan', message: 'untrusted-message-canary' } };
   for (const [locale, reason, prefix] of [
-    ['zh-CN', '当前上游账号没有可用套餐，需在提供商处开通或更换账号。', '已记录原因'],
-    ['en', 'The upstream account has no active plan. Activate a plan with the provider or use another account.', 'Recorded cause'],
+    ['zh-CN', '当前上游账号没有可用套餐', '已记录原因'],
+    ['en', 'The upstream account has no active plan', 'Recorded cause'],
   ] as const) {
     const copy = requestStatusCopy(safe, locale);
     assert.equal(requestFailureCause(safe, locale), reason);
-    assert.equal(copy.hint, `${prefix}: ${reason}`);
-    assert.equal(copy.cause, copy.hint);
-    assert.doesNotMatch(copy.hint, /untrusted-message-canary|no_active_plan|http_402|402|请求失败|The request failed/);
+    assert.equal(copy.cause, `${prefix}: ${reason}`);
+    assert.ok(copy.hint.startsWith(copy.cause));
+    assert.match(copy.hint, locale === 'zh-CN' ? /开通套餐或更换上游账号/ : /Activate a plan with the provider/,
+      'the mapped next step is visible alongside the reason');
+    assert.doesNotMatch(copy.cause, /untrusted-message-canary|no_active_plan|http_402|请求失败|The request failed/);
     const unknown = requestStatusCopy({ ...safe, supplier_error: { code: 'private-canary', message: reason } }, locale);
-    assert.equal(unknown.hint, requestStatusCopy({ ...safe, supplier_error: null }, locale).hint);
-    assert.equal(requestStatusCopy({ ...safe, supplier_error: undefined }, locale).hint, unknown.hint);
+    assert.equal(unknown.cause, `${prefix}: ${reason}`,
+      'an unrecognized supplier code preserves its original message');
+    assert.equal(unknown.upstreamNote, null, 'the original message already appears in provider details');
+    assert.ok(unknown.details.some((entry) => entry.value === reason));
+    assert.ok(unknown.details.some((entry) => entry.value === 'private-canary'),
+      'the unrecognized code stays in labeled technical details');
+    assert.notEqual(requestStatusCopy({ ...safe, supplier_error: undefined }, locale).cause, unknown.cause);
     assert.equal(requestFailureCause({ ...safe, status_code: null, error_code: null }, locale), null);
   }
   assert.equal(requestFailureCause({ ...safe, terminal_cause_code: 'upstream_read_timeout' }, 'zh-CN'), '读取上游响应超时');
-  assert.equal(requestFailureCause({ ...safe, error_code: 'upstream_stream_read_error' }, 'en'), 'The upstream response stream was interrupted');
+  assert.equal(requestFailureCause({ ...safe, error_code: 'upstream_stream_read_error' }, 'en'), 'The upstream account has no active plan');
   const event: RequestEvent = { ...safe, event_id: 'finished', event_at: 2, event_kind: 'finished', key_id: 'key', archive_state: 'bound' };
   const running = { ...safe, status_code: null, completed_at: null, error_code: null, supplier_error: null };
   assert.deepEqual(requestViewFromEvent(event, running)?.supplier_error, safe.supplier_error);
@@ -165,8 +177,8 @@ test('typed failure diagnostics explain stage and source without guessing from t
     // A safe supplier reason stays more specific than the generic HTTP observation.
     const withSupplier = { ...supplierStatus, supplier_error: { code: 'model_unavailable', message: 'untrusted-message-canary' } };
     assert.equal(requestFailureCause(withSupplier, locale), locale === 'zh-CN'
-      ? '上游账号无法使用所请求的模型，需检查模型权限或更换模型。'
-      : 'The requested model is unavailable to the upstream account. Check model access or use another model.');
+      ? '所请求的模型对该上游账号不可用'
+      : 'The requested model is unavailable to the upstream account');
   }
   // Transport terminal evidence keeps precedence over the diagnostic explanation.
   assert.equal(requestFailureCause({ ...downstream, terminal_cause_code: 'upstream_read_timeout' }, 'zh-CN'), '读取上游响应超时');
@@ -224,4 +236,81 @@ test('recorded pre-admission evidence explains non-forwarding without guessing t
       ? '网关内存装不下这次请求体，也没有写入对象存储'
       : 'The gateway memory budget could not hold the request body, and the body was not written to object storage');
   }
+});
+
+test('structured supplier fields cover context and policy reasons, raw details stay visible, and nothing is dropped', () => {
+  const base: RequestView = { request_id: 'structured-supplier-fixture', created_at: 1, completed_at: 2,
+    protocol: 'openai', model: 'fixture', status_code: 400, duration_ms: 1,
+    input_tokens: 0, output_tokens: 0, cost: '0', error_code: 'upstream_rejected' };
+  for (const locale of ['zh-CN', 'en'] as const) {
+    const zh = locale === 'zh-CN';
+    // A generic SSE/HTTP wrapper yields to the semantic supplier reason…
+    const context = {
+      ...base,
+      supplier_error: {
+        code: 'context_length_exceeded', message: 'maximum context length is 8192 tokens',
+        category: 'request', retryable: false, action: 'shorten_context',
+        provider_code: 'context_length_exceeded', provider_message: 'maximum context length is 8192 tokens',
+      },
+    };
+    const contextCause = zh ? '请求超过模型的上下文窗口' : 'The input exceeds the model context window';
+    assert.equal(requestFailureCause(context, locale), contextCause, 'the semantic reason beats the generic wrapper');
+    const contextCopy = requestStatusCopy(context, locale);
+    assert.match(contextCopy.hint, new RegExp(zh ? '缩短请求内容或上下文后再试' : 'Shorten the request content or context'),
+      'the recorded action is visible even though a cause exists');
+    assert.ok(contextCopy.details.some((entry) => entry.label === (zh ? '供应商说明' : 'Provider message')
+      && entry.value === 'maximum context length is 8192 tokens'), 'raw provider details stay viewable');
+    assert.ok(contextCopy.details.some((entry) => entry.label === (zh ? '可重试' : 'Retryable')));
+    assert.equal(contextCopy.details.filter((entry) => entry.value === 'context_length_exceeded').length, 1,
+      'a code equal to the provider code is not repeated');
+    // …while an explicit physical transport failure still wins.
+    const physical = { ...context, terminal_cause_code: 'upstream_transport_connection_reset' };
+    assert.equal(requestFailureCause(physical, locale), zh ? '上游连接被重置' : 'The upstream connection was reset');
+    // Policy reasons carry their own fixed copy and review action.
+    const policy = { ...base, supplier_error: { code: 'cyber_policy', message: 'content blocked', category: 'policy', retryable: false, action: 'review_request' } };
+    assert.equal(requestFailureCause(policy, locale), zh ? '上游安全系统因网络安全风险拒绝了请求' : 'The upstream safety system blocked the request for cybersecurity risk');
+    assert.match(requestStatusCopy(policy, locale).hint, new RegExp(zh ? '检查请求内容' : 'Review the request content'));
+    // An unknown code keeps the raw upstream message as a labeled note, the
+    // code in technical details, and a clear inspect next step.
+    const unknown = { ...base, supplier_error: { code: 'upstream_new_code_v3', message: 'Provider says no: capacity tier exhausted', category: 'upstream', action: 'inspect_upstream_error' } };
+    const unknownCopy = requestStatusCopy(unknown, locale);
+    assert.equal(unknownCopy.upstreamNote, null);
+    assert.ok(unknownCopy.details.some((entry) => entry.value === 'Provider says no: capacity tier exhausted'));
+    assert.doesNotMatch(unknownCopy.cause, /upstream_new_code_v3|Provider says no/, 'raw values never become primary copy');
+    assert.match(unknownCopy.hint, new RegExp(zh ? '查看下方的上游错误详情' : 'Inspect the upstream error details'));
+    assert.ok(unknownCopy.details.some((entry) => entry.value === 'upstream_new_code_v3'), 'the unknown code stays in labeled details');
+    // Long, URL-bearing raw provider messages are kept, not allowlist-dropped.
+    const longMessage = { ...base, supplier_error: { code: 'upstream_new_code_v4', message: `see https://provider.example/docs/errors?x=${'y'.repeat(300)}`, provider_message: `see https://provider.example/docs/errors?x=${'y'.repeat(300)}` } };
+    const longPresentation = supplierErrorPresentation(longMessage.supplier_error, locale);
+    assert.ok(longPresentation?.details.some((entry) => entry.value.includes('https://provider.example')), 'raw upstream details are never dropped');
+    // Legacy canonical concatenation still parses into labeled details.
+    const legacy = { ...base, supplier_error: { code: 'insufficient_quota', message: 'The upstream account has insufficient quota; provider code: insufficient_user_quota; provider message: Insufficient quota' } };
+    const legacyDetail = requestSupplierDetail(legacy, locale);
+    assert.ok(legacyDetail?.includes('provider code: insufficient_user_quota'), 'the whole raw legacy message stays viewable');
+    assert.ok(legacyDetail?.includes('insufficient_quota'), 'the original code stays viewable too');
+    assert.equal(requestFailureCause(legacy, locale), zh ? '当前上游账号额度不足' : 'The upstream account has insufficient quota');
+    assert.match(requestStatusCopy(legacy, locale).hint, new RegExp(zh ? '补充额度或更换上游账号' : 'Add quota with the provider'),
+      'a legacy record without the action field still gets the locally mapped next step');
+    // A known code without provider_message keeps its raw message in details,
+    // while the mapped copy stays the supplemental explanation.
+    const rawOnly = { ...base, supplier_error: { code: 'rate_limited', message: 'Provider raw note: slow down' } };
+    const rawCopy = requestStatusCopy(rawOnly, locale);
+    assert.equal(requestFailureCause(rawOnly, locale), zh ? '请求触发了上游速率限制' : 'The upstream request rate limit was exceeded');
+    assert.ok(rawCopy.details.some((entry) => entry.value === 'Provider raw note: slow down'), 'raw message never hides for a known code');
+    assert.equal(rawCopy.upstreamNote, null, 'a known code needs no unknown note');
+    // An unknown raw note duplicating the provider message renders once.
+    const duplicated = { ...base, supplier_error: { code: 'upstream_code_v9', message: 'same raw text', provider_message: 'same raw text', category: 'upstream' } };
+    const duplicatedCopy = requestStatusCopy(duplicated, locale);
+    assert.equal(duplicatedCopy.upstreamNote, null, 'the note is omitted when the provider message already carries the raw text');
+    assert.equal(duplicatedCopy.details.filter((entry) => entry.value === 'same raw text').length, 1, 'the raw text appears exactly once');
+  }
+  // The shared status presentation exposes bilingual section labels and a concise trigger.
+  const status = requestStatusCopy({ ...base, supplier_error: { code: 'rate_limited', message: 'slow down', category: 'rate_limit', retryable: true, action: 'retry_later' } }, 'en');
+  assert.equal(status.labels.nextStep, 'Next step');
+  assert.equal(status.labels.technicalDetails, 'Technical details');
+  assert.equal(status.triggerLabel, 'Failed 400', 'the trigger stays the concise outcome plus recorded status');
+  assert.doesNotMatch(status.triggerLabel, /Provider error code|Recorded status/, 'the trigger stays concise');
+  const statusZh = requestStatusCopy(base, 'zh-CN');
+  assert.equal(statusZh.labels.nextStep, '下一步');
+  assert.equal(statusZh.labels.technicalDetails, '技术细节');
 });

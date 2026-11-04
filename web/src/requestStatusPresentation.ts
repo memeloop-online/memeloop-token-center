@@ -1,6 +1,8 @@
 import { egressAddress } from './operator/requestEgress.js';
 import { requestEgressCopy } from './operator/requestEgressCopy.js';
-import type { RequestEgressObservation, RequestView } from './types.js';
+import type { RequestEgressObservation, RequestView, SupplierError } from './types.js';
+
+type RequestLocale = 'zh-CN' | 'en';
 
 export type RequestOutcome = 'running' | 'waiting_upstream' | 'reading_body' | 'delivering' | 'completed' | 'cancelled' | 'interrupted' | 'failed' | 'unknown';
 
@@ -140,37 +142,164 @@ const recordedStageCopy: Record<string, [string, string]> = {
   ],
 };
 
-const supplierFailureCopy: Record<string, [string, string]> = {
-  no_active_plan: ['当前上游账号没有可用套餐，需在提供商处开通或更换账号。', 'The upstream account has no active plan. Activate a plan with the provider or use another account.'],
-  insufficient_quota: ['当前上游账号额度不足，需在提供商处补充额度或更换账号。', 'The upstream account has insufficient quota. Add quota with the provider or use another account.'],
-  authentication_invalid: ['上游账号凭据无效，需检查或更换该账号的凭据。', 'The upstream account credentials are invalid. Check or replace the account credentials.'],
-  authentication_expired: ['上游账号凭据已过期，需更新该账号的凭据。', 'The upstream account credentials have expired. Update the account credentials.'],
-  rate_limited: ['上游服务已限制请求频率，请稍后重试。', 'The upstream service has limited the request rate. Try again later.'],
-  model_unavailable: ['上游账号无法使用所请求的模型，需检查模型权限或更换模型。', 'The requested model is unavailable to the upstream account. Check model access or use another model.'],
+// Reason-only copy mirroring the backend SafeReason catalog (src/supplier_error/reason.rs):
+// every stable code, alias-free, with its local fallback action so records
+// without the optional action field still carry a useful next step.
+const supplierReasonCopy: Record<string, { copy: [string, string]; action: string }> = {
+  no_active_plan: { copy: ['当前上游账号没有可用套餐', 'The upstream account has no active plan'], action: 'check_plan' },
+  insufficient_quota: { copy: ['当前上游账号额度不足', 'The upstream account has insufficient quota'], action: 'check_quota' },
+  authentication_invalid: { copy: ['上游账号凭据无效', 'The upstream account credentials are invalid'], action: 'check_credentials' },
+  authentication_expired: { copy: ['上游账号凭据已过期', 'The upstream account credentials have expired'], action: 'check_credentials' },
+  rate_limited: { copy: ['请求触发了上游速率限制', 'The upstream request rate limit was exceeded'], action: 'retry_later' },
+  model_unavailable: { copy: ['所请求的模型对该上游账号不可用', 'The requested model is unavailable to the upstream account'], action: 'check_model' },
+  context_length_exceeded: { copy: ['请求超过模型的上下文窗口', 'The input exceeds the model context window'], action: 'shorten_context' },
+  invalid_encrypted_content: { copy: ['上游无法验证加密上下文', 'The upstream could not validate the encrypted context'], action: 'rebuild_context' },
+  invalid_prompt: { copy: ['上游判定请求内容无效', 'The upstream rejected the prompt as invalid'], action: 'revise_request' },
+  misalignment_policy_violation: { copy: ['上游安全系统因潜在的非预期活动拒绝了请求', 'The upstream safety system blocked the request for potentially unintended activity'], action: 'review_request' },
+  cyber_policy: { copy: ['上游安全系统因网络安全风险拒绝了请求', 'The upstream safety system blocked the request for cybersecurity risk'], action: 'review_request' },
+  bio_policy: { copy: ['上游安全系统因生物安全风险拒绝了请求', 'The upstream safety system blocked the request for biological safety risk'], action: 'review_request' },
+  usage_not_included: { copy: ['当前上游套餐不包含此次用量', 'The upstream plan does not include this usage'], action: 'check_plan' },
+  server_is_overloaded: { copy: ['上游服务当前过载', 'The upstream service is overloaded'], action: 'retry_later' },
+  invalid_value: { copy: ['请求参数的值无效', 'A request parameter has an invalid value'], action: 'revise_request' },
+  invalid_type: { copy: ['请求参数的类型无效', 'A request parameter has an invalid type'], action: 'revise_request' },
+  missing_required_parameter: { copy: ['请求缺少必填参数', 'A required request parameter is missing'], action: 'revise_request' },
+  unsupported_parameter: { copy: ['上游不支持请求中的参数', 'The upstream does not support a request parameter'], action: 'revise_request' },
+  unsupported_value: { copy: ['上游不支持请求中的参数值', 'The upstream does not support a request parameter value'], action: 'revise_request' },
+  invalid_request_error: { copy: ['上游拒绝了请求格式', 'The upstream rejected the request format'], action: 'revise_request' },
 };
 
-const supplierVocabulary: Record<string, { base: string; codes: string[]; messages: string[] }> = {
-  no_active_plan: { base: '当前账号没有可用套餐', codes: ['no_active_plan', 'NoAvailablePlan', 'NoActivePlan', 'NoPlan', '402'], messages: ['当前账号没有可用套餐', 'No active plan', 'No available plan'] },
-  insufficient_quota: { base: 'The upstream account has insufficient quota', codes: ['insufficient_quota', 'insufficient_user_quota'], messages: ['Quota exhausted', 'Quota exhausted for this account', 'Insufficient quota', '用户额度不足'] },
-  authentication_invalid: { base: 'The upstream authentication credentials are invalid', codes: ['authentication_invalid', 'invalid_api_key'], messages: ['Invalid API key', 'Invalid authentication credentials'] },
-  authentication_expired: { base: 'The upstream authentication credentials have expired', codes: ['authentication_expired', 'api_key_expired', 'token_expired'], messages: ['API key expired', 'Authentication token expired'] },
-  rate_limited: { base: 'The upstream request rate limit was exceeded', codes: ['rate_limited', 'rate_limit_exceeded'], messages: ['Rate limit exceeded', 'Too many requests'] },
-  model_unavailable: { base: 'The requested upstream model is unavailable', codes: ['model_unavailable', 'model_not_found', 'unsupported_model', '400'], messages: ['Model unavailable', 'Unsupported model', 'Model not found'] },
+// Generic transport wrappers whose message only restates "the upstream said
+// no". A semantic supplier reason beats these; an explicit physical failure
+// (timeout, reset, EOF before terminal) still wins over supplier copy.
+const genericTransportWrapperCodes = new Set(['upstream_rejected', 'upstream_http_operation_failed', 'upstream_stream_read_error', 'upstream_eof_without_terminal', 'upstream_incomplete_response']);
+
+// Coarse category recorded alongside the fixed reason. Each one is a sentence
+// about the kind of problem; the suggestion carries the next step.
+const supplierCategoryCopy: Record<string, [string, string]> = {
+  upstream: ['上游返回了未归类的错误', 'The upstream returned an unclassified error'],
+  request: ['请求内容不符合上游接口要求', 'The request did not match the upstream API'],
+  policy: ['上游拒绝了这类内容', 'The upstream refused this content'],
+  authentication: ['上游账号凭据无法通过验证', 'The upstream account credentials did not authenticate'],
+  quota: ['上游账号额度不足或没有可用套餐', 'The upstream account lacks quota or an active plan'],
+  rate_limit: ['上游服务已达到请求频率上限', 'The upstream service reached its request rate limit'],
+  availability: ['上游服务或所请求的模型暂时不可用', 'The upstream service or requested model is temporarily unavailable'],
 };
 
-export function requestSupplierDetail(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
-  const supplier = request.supplier_error;
-  if (!supplier || !Object.hasOwn(supplierVocabulary, supplier.code)) return null;
-  const vocabulary = supplierVocabulary[supplier.code];
-  const match = /^(.*?)(?:; provider code: ([^;]+))?(?:; provider message: ([^;]+))?$/.exec(supplier.message);
-  if (!match || match[0] !== supplier.message || match[1] !== vocabulary.base) return null;
-  const [, , code, message] = match;
-  if ((!code && !message) || (code && !vocabulary.codes.includes(code)) || (message && !vocabulary.messages.includes(message))) return null;
-  return [code && `${locale === 'zh-CN' ? '供应商错误码' : 'Provider error code'}: ${code}`,
-    message && `${locale === 'zh-CN' ? '供应商说明' : 'Provider message'}: ${message}`].filter(Boolean).join(' · ');
+// Stable suggested next step. Copy is the action to take, not the token name.
+const supplierActionCopy: Record<string, [string, string]> = {
+  inspect_upstream_error: ['查看下方的上游错误详情；需要时带着错误码和说明联系上游提供商', 'Inspect the upstream error details below; contact the upstream provider with the code and message if needed'],
+  check_plan: ['在提供商处开通套餐或更换上游账号', 'Activate a plan with the provider or switch the upstream account'],
+  check_quota: ['在提供商处补充额度或更换上游账号', 'Add quota with the provider or switch the upstream account'],
+  rebuild_context: ['重新开始会话或重建上下文后再试', 'Start a fresh session or rebuild the context, then try again'],
+  review_request: ['检查请求内容，移除可能触发安全策略的部分后再试', 'Review the request content, remove anything that may trip safety policy, then try again'],
+  shorten_context: ['缩短请求内容或上下文后再试', 'Shorten the request content or context, then try again'],
+  revise_request: ['修改请求内容后再试', 'Revise the request content, then try again'],
+  contact_provider: ['联系上游提供商处理该账号问题', 'Contact the upstream provider about this account'],
+  retry_later: ['稍后重试；仍然失败时更换上游账号', 'Retry later; switch the upstream account if it keeps failing'],
+  check_credentials: ['检查或更换该上游账号的凭据', 'Check or replace the upstream account credentials'],
+  check_model: ['检查该账号的模型权限，或更换模型', 'Check the account’s model access, or use another model'],
+};
+
+/** One labeled technical fact; rendered by React, so raw upstream text is
+    escaped and wraps instead of being dropped by an allowlist. */
+export interface SupplierDetailEntry { label: string; value: string }
+
+/**
+ * Structured provider error presentation. Known codes map to a fixed
+ * bilingual reason; an unknown code keeps the raw upstream message as a
+ * labeled upstream note instead of being hidden. The next step comes from
+ * the recorded action or the local mapping for the fixed code. Raw provider
+ * identifiers stay as labeled details and are never interpolated into copy;
+ * every optional field may be absent on older records.
+ */
+export function supplierErrorPresentation(supplier: SupplierError | null | undefined, locale: RequestLocale): {
+  reason: string | null;
+  action: string | null;
+  details: SupplierDetailEntry[];
+} | null {
+  if (!supplier) return null;
+  const zh = locale === 'zh-CN';
+  const known = Object.hasOwn(supplierReasonCopy, supplier.code) ? supplierReasonCopy[supplier.code] : null;
+  const rawMessage = typeof supplier.message === 'string' ? supplier.message.trim() : '';
+  // Mapped copy explains the known code; an unknown code falls back to its
+  // category sentence, then to the raw upstream message so nothing hides.
+  const reason = known ? known.copy[zh ? 0 : 1]
+    : supplier.category && Object.hasOwn(supplierCategoryCopy, supplier.category)
+      ? supplierCategoryCopy[supplier.category][zh ? 0 : 1]
+      : rawMessage || null;
+  // Prefer the server-recorded action; older records without the field fall
+  // back to the local action mapped from the fixed reason code.
+  const actionToken = supplier.action && Object.hasOwn(supplierActionCopy, supplier.action) ? supplier.action : (known?.action ?? 'inspect_upstream_error');
+  const action = actionToken ? supplierActionCopy[actionToken][zh ? 0 : 1] : null;
+  const details: SupplierDetailEntry[] = [];
+  const push = (label: string, value: unknown) => {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (trimmed && !details.some((entry) => entry.value === trimmed)) details.push({ label, value: trimmed });
+  };
+  // Every recorded provider fact stays viewable: structured fields first,
+  // then the original code/message so older records without the structured
+  // fields lose nothing. Values deduplicate across labels; raw text is never
+  // dropped for being unrecognized, long, or URL-bearing.
+  push(zh ? '供应商错误码' : 'Provider error code', supplier.provider_code ?? supplier.code);
+  push(zh ? '供应商说明' : 'Provider message', supplier.provider_message ?? rawMessage);
+  if (supplier.retryable !== undefined) details.push({ label: zh ? '可重试' : 'Retryable', value: supplier.retryable ? (zh ? '是' : 'yes') : (zh ? '否' : 'no') });
+  if (!reason && !action && details.length === 0) return null;
+  return { reason, action, details };
 }
 
-function recordedCause(errorCode: string, locale: 'zh-CN' | 'en'): string | null {
+/** Raw upstream note for an unclassified reason: shown as the upstream's own
+    message, labeled as such, and omitted when the same raw text already sits
+    in the technical provider message. */
+export function supplierUnknownNote(supplier: SupplierError | null | undefined, locale: RequestLocale): string | null {
+  if (!supplier || Object.hasOwn(supplierReasonCopy, supplier.code)) return null;
+  const rawMessage = typeof supplier.message === 'string' ? supplier.message.trim() : '';
+  if (!rawMessage || supplier.provider_message == null || rawMessage === supplier.provider_message.trim()) return null;
+  return locale === 'zh-CN' ? `上游说明: ${rawMessage}` : `Upstream message: ${rawMessage}`;
+}
+
+/**
+ * Labeled technical detail entries for a failed request: deduplicated status,
+ * error and terminal-cause codes, the typed diagnostic, and all recorded
+ * provider identifiers. Identifiers stay out of primary copy; anything
+ * already explained by the cause sentence is omitted instead of repeated.
+ * Raw recorded values are kept viewable (React escapes them at render).
+ */
+export function requestFailureDetails(request: RequestView, locale: RequestLocale): SupplierDetailEntry[] {
+  const zh = locale === 'zh-CN';
+  const details: SupplierDetailEntry[] = [];
+  const push = (label: string, value: string | null | undefined) => {
+    if (typeof value !== 'string') return;
+    const trimmed = value.trim();
+    if (trimmed && !details.some((entry) => entry.value === trimmed)) details.push({ label, value: trimmed });
+  };
+  push(zh ? '记录状态码' : 'Recorded status', request.status_code === null ? null : String(request.status_code));
+  // An http_NNN wrapper only restates the recorded status above it.
+  push(zh ? '错误码' : 'Error code', request.error_code && request.error_code !== `http_${request.status_code}` ? request.error_code : null);
+  push(zh ? '终态原因码' : 'Terminal cause code', request.terminal_cause_code && request.terminal_cause_code !== request.error_code ? request.terminal_cause_code : null);
+  const diagnostic = request.failure_diagnostic;
+  if (diagnostic) {
+    const stage = typeof diagnostic.stage === 'string' ? diagnostic.stage.trim() : '';
+    const reason = typeof diagnostic.reason === 'string' ? diagnostic.reason.trim() : '';
+    const parts = [stage, reason].filter(Boolean).join(' / ');
+    if (parts && reason !== request.error_code) push(zh ? '失败阶段' : 'Failure stage', parts);
+  }
+  return details;
+}
+
+/** Provider technical entries: the full recorded detail set (structured
+    fields, or the canonical legacy fields) with nothing dropped. */
+export function requestProviderDetails(request: RequestView, locale: RequestLocale): SupplierDetailEntry[] {
+  return supplierErrorPresentation(request.supplier_error, locale)?.details ?? [];
+}
+
+export function requestSupplierDetail(request: RequestView, locale: RequestLocale): string | null {
+  if (!request.supplier_error) return null;
+  const entries = requestProviderDetails(request, locale).filter((entry) => entry.label !== (locale === 'zh-CN' ? '可重试' : 'Retryable'));
+  return entries.map((entry) => `${entry.label}: ${entry.value}`).join(' · ') || null;
+}
+
+function recordedCause(errorCode: string, locale: RequestLocale): string | null {
   const cause = recordedFailureCopy[errorCode];
   return cause ? cause[locale === 'zh-CN' ? 0 : 1] : null;
 }
@@ -187,13 +316,7 @@ function storedGatewaySentence(request: RequestView): string | null {
   return message.replace(/[。.\s]+$/, '');
 }
 
-function unmappedErrorCopy(code: string, locale: 'zh-CN' | 'en'): string {
-  return locale === 'zh-CN'
-    ? `记录了错误码 ${code}，没有更细的对应说明`
-    : `Recorded error code ${code}; this record has no finer mapped sentence`;
-}
-
-function withDiagnostic(base: string | null, request: RequestView, locale: 'zh-CN' | 'en'): string | null {
+function withDiagnostic(base: string | null, request: RequestView, locale: RequestLocale): string | null {
   if (!base) return null;
   const diagnostic = request.failure_diagnostic;
   if (!diagnostic || (diagnostic.source !== 'upstream' && diagnostic.source !== 'gateway')) return base;
@@ -208,7 +331,7 @@ function withDiagnostic(base: string | null, request: RequestView, locale: 'zh-C
   return sentence;
 }
 
-function clientDisconnectCopy(request: RequestView, locale: 'zh-CN' | 'en'): string {
+function clientDisconnectCopy(request: RequestView, locale: RequestLocale): string {
   const zh = locale === 'zh-CN';
   const stage = request.failure_diagnostic?.stage ?? request.operational_terminal?.stage ?? null;
   const sent = Boolean(request.upstream_account_id);
@@ -229,7 +352,7 @@ function clientDisconnectCopy(request: RequestView, locale: 'zh-CN' | 'en'): str
 
 // Localized explanations keyed by the server's typed stage/source/reason triple.
 // Unknown typed evidence renders nothing; a null stage never adds a phase claim.
-function diagnosticCause(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
+function diagnosticCause(request: RequestView, locale: RequestLocale): string | null {
   const diagnostic = request.failure_diagnostic;
   const zh = locale === 'zh-CN';
   if (request.terminal_cause_code === 'gateway_pre_admission'
@@ -258,7 +381,7 @@ function diagnosticCause(request: RequestView, locale: 'zh-CN' | 'en'): string |
   return null;
 }
 
-export function requestFailureCause(request: RequestView, locale: 'zh-CN' | 'en'): string | null {
+export function requestFailureCause(request: RequestView, locale: RequestLocale): string | null {
   const diagnostic = request.failure_diagnostic;
   if (request.terminal_cause_code === 'gateway_pre_admission'
     || (diagnostic?.source === 'gateway' && diagnostic.stage === 'pre_admission' && diagnostic.reason === 'gateway_pre_admission')) {
@@ -266,20 +389,25 @@ export function requestFailureCause(request: RequestView, locale: 'zh-CN' | 'en'
   }
   const stored = storedGatewaySentence(request);
   if (stored) return withDiagnostic(stored, request, locale);
+  const supplierReason = supplierErrorPresentation(request.supplier_error, locale)?.reason ?? null;
+  // A semantic supplier reason explains a generic "the upstream said no"
+  // wrapper; an explicit physical transport failure still wins.
+  const wrapper = (code: string | null | undefined) => Boolean(code && genericTransportWrapperCodes.has(code));
+  if (supplierReason && (wrapper(request.terminal_cause_code) || (!request.terminal_cause_code && wrapper(request.error_code)))) {
+    return supplierReason;
+  }
   const terminal = request.terminal_cause_code ? recordedCause(request.terminal_cause_code, locale) : null;
   const transport = terminal ?? (request.error_code ? recordedCause(request.error_code, locale) : null);
   if (transport) return withDiagnostic(transport, request, locale);
   if (!['failed', 'interrupted', 'cancelled'].includes(requestOutcome(request))) return null;
-  const supplier = request.supplier_error?.code;
-  const copy = supplier && Object.hasOwn(supplierFailureCopy, supplier) ? supplierFailureCopy[supplier] : null;
-  if (copy) return copy[locale === 'zh-CN' ? 0 : 1];
+  if (supplierReason) return supplierReason;
   return diagnosticCause(request, locale)
     ?? (['client_cancelled', 'downstream_disconnected'].includes(request.error_code ?? '')
       ? clientDisconnectCopy(request, locale)
       : serverErrorCode(request.error_code) ? requestErrorCopy(request.error_code, locale) : null);
 }
 
-export function requestErrorCopy(errorCode: string, locale: 'zh-CN' | 'en') {
+export function requestErrorCopy(errorCode: string, locale: RequestLocale) {
   const cause = recordedCause(errorCode, locale);
   if (cause) return cause;
   if (!serverErrorCode(errorCode)) return locale === 'zh-CN' ? '请求失败' : 'The request failed';
@@ -290,9 +418,9 @@ export function requestErrorCopy(errorCode: string, locale: 'zh-CN' | 'en') {
       : errorCode.startsWith('client_')
         ? (locale === 'zh-CN' ? '客户端未完成请求' : 'The client did not complete the request')
         : null;
-  const unmapped = unmappedErrorCopy(errorCode, locale);
-  if (!prefix) return unmapped;
-  return locale === 'zh-CN' ? `${prefix}。${unmapped}` : `${prefix}. ${unmapped}`;
+  // Unknown codes never appear in primary copy; they stay in labeled details.
+  const unmapped = locale === 'zh-CN' ? '记录了未识别的错误码' : 'An unrecognized error code was recorded';
+  return prefix ?? unmapped;
 }
 
 /** Recorded terminal evidence, never an inference from initial HTTP headers. */
@@ -327,7 +455,7 @@ export function requestOutcome(request: RequestView): RequestOutcome {
   return requestCompletedAt(request) !== null ? 'completed' : 'unknown';
 }
 
-export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') {
+export function requestStatusCopy(request: RequestView, locale: RequestLocale) {
   const outcome = requestOutcome(request);
   const copy = locale === 'zh-CN' ? {
     running: ['运行中', '尚未记录完成状态，用量和费用仍待结算。'],
@@ -359,10 +487,46 @@ export function requestStatusCopy(request: RequestView, locale: 'zh-CN' | 'en') 
     : (locale === 'zh-CN' ? '这条记录没有写下原因' : 'This record has no stored cause');
   const failureDetail = hasFailure
     ? `${locale === 'zh-CN' ? '已记录原因' : 'Recorded cause'}: ${cause ?? unexplained}` : '';
+  const supplier = hasFailure ? supplierErrorPresentation(request.supplier_error, locale) : null;
+  // Reason copy never embeds the next step; the action is always a separate
+  // line so a failure shows both what happened and what to do next.
+  const nextAction = supplier?.action ?? null;
+  // An unknown supplier code keeps the raw upstream message visible as a
+  // labeled note; the unmapped code itself stays in technical details.
+  const upstreamNote = hasFailure ? supplierUnknownNote(request.supplier_error, locale) : null;
+  // One deduplicated technical block: recorded identifiers first, then every
+  // provider detail; nothing is dropped for being unrecognized.
+  const details = hasFailure ? (() => {
+    // One value renders once across labels; provider entries keep precedence
+    // so a raw upstream fact is never lost to a gateway-side duplicate.
+    const merged = [...requestFailureDetails(request, locale), ...requestProviderDetails(request, locale)];
+    const seen = new Set<string>();
+    return merged.filter((entry) => {
+      const key = entry.value;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  })() : [];
+  const supplierDetail = requestSupplierDetail(request, locale);
+  const zh = locale === 'zh-CN';
+  const labels = {
+    nextStep: zh ? '下一步' : 'Next step',
+    technicalDetails: zh ? '技术细节' : 'Technical details',
+  };
   return { outcome, label, tone: outcome === 'completed' ? 'ok' : ['cancelled', 'interrupted', 'failed'].includes(outcome) ? 'bad' : outcome === 'unknown' ? 'unknown' : 'pending',
     cause: failureDetail,
-    supplierDetail: requestSupplierDetail(request, locale),
-    hint: hasFailure ? [failureDetail, requestSupplierDetail(request, locale)].filter(Boolean).join(' · ') : [explanation, code].filter(Boolean).join(' · ') };
+    supplierDetail,
+    nextAction,
+    upstreamNote,
+    details,
+    labels,
+    // Concise trigger: the outcome plus the recorded status. Reason, next
+    // step and identifiers arrive through the tooltip's description.
+    triggerLabel: `${label}${request.status_code === null ? '' : ` ${request.status_code}`}`,
+    hint: hasFailure
+      ? [failureDetail, upstreamNote, nextAction, supplierDetail].filter(Boolean).join(' · ')
+      : [explanation, code].filter(Boolean).join(' · ') };
 }
 
 export type RequestEgressLineKind = 'proxy' | 'direct';
@@ -373,7 +537,7 @@ export interface RequestEgressLine {
   hover: string;
 }
 
-function egressObservedTime(observation: RequestEgressObservation, locale: 'zh-CN' | 'en'): string | null {
+function egressObservedTime(observation: RequestEgressObservation, locale: RequestLocale): string | null {
   const at = observation.observed_at;
   return typeof at === 'number' && Number.isFinite(at) ? new Date(at).toLocaleString(locale) : null;
 }
@@ -386,7 +550,7 @@ function egressObservedTime(observation: RequestEgressObservation, locale: 'zh-C
  * snapshot with neither a name nor a usable address — returns null so the
  * list omits the line instead of guessing or showing a placeholder.
  */
-export function requestEgressLine(request: RequestView, locale: 'zh-CN' | 'en'): RequestEgressLine | null {
+export function requestEgressLine(request: RequestView, locale: RequestLocale): RequestEgressLine | null {
   const zh = locale === 'zh-CN';
   const copy = requestEgressCopy(locale);
   if (request.terminal_cause_code === 'gateway_pre_admission') {
