@@ -11,7 +11,7 @@ test('account status derives expiry independently of enabled state and keeps mis
   const account = { status: 'active', auth_kind: 'oauth', credential_expires_at: null } as const;
   assert.equal(providerAccountStatus(account, 1000).accountLabel, 'providers.accountEnabledUnknown');
   assert.equal(providerAccountStatus(account, 1000).tone, 'pending');
-  assert.equal(providerAccountStatus({ ...account, credential_expires_at: 1000 }, 1000).accountLabel, 'providers.authorizationExpired');
+  assert.equal(providerAccountStatus({ ...account, credential_expires_at: 1000 }, 1000).accountLabel, 'providers.accessTokenExpired');
   assert.equal(providerAccountStatus({ ...account, credential_expires_at: 999 }, 1000).expired, true);
   assert.equal(providerAccountStatus({ ...account, credential_expires_at: 1001 }, 1000).accountLabel, 'providers.accountEnabled');
   assert.equal(providerAccountStatus({ ...account, status: 'disabled', credential_expires_at: 999 }, 1000).accountLabel, 'status.disabled');
