@@ -14,6 +14,7 @@ import * as ReactDOMRuntime from 'react-dom';
 import * as ReactJSXRuntime from 'react/jsx-runtime';
 import * as FluentRuntime from '@fluentui/react-components';
 import { api } from '../api.js';
+import { LoadingState } from '../design-system/index.js';
 import { createOperatorApiBridge } from './operatorApiBridge.js';
 import type { PluginOperatorUiContribution, PluginServiceDataResponse } from '../types.js';
 import {
@@ -24,6 +25,7 @@ import {
   type OperatorUiContributionV1,
   type OperatorUiHostApiV1,
   type OperatorUiModuleV1,
+  type OperatorUiEChartPropsV1,
   type OperatorUiPackageV1,
 } from '../../operator-ui-sdk/index.js';
 
@@ -66,6 +68,13 @@ class PluginContributionBoundary extends Component<BoundaryProps, { failed: bool
 }
 
 const packageLoads = new Map<string, Promise<OperatorUiPackageV1>>();
+const SharedEChart = lazy(() => import('../charts/EChart.js').then(module => ({ default: module.EChart })));
+
+function PluginEChart(props: OperatorUiEChartPropsV1) {
+  return <Suspense fallback={<div className={props.className} style={props.style}>
+    <LoadingState label={props.locale === 'en' ? 'Loading chart' : '正在加载图表'} level="section" />
+  </div>}><SharedEChart {...props} /></Suspense>;
+}
 
 function serviceDataPath(pluginId: string, endpointId: string, tenant: string) {
   const query = tenant ? `?${new URLSearchParams({ tenant_external_id: tenant }).toString()}` : '';
@@ -94,6 +103,7 @@ async function loadPackage(url: string): Promise<OperatorUiPackageV1> {
     ReactDOM: ReactDOMRuntime,
     ReactJSXRuntime,
     Fluent: FluentRuntime,
+    EChart: PluginEChart,
     defineOperatorUiPackage,
   }));
   if (!packageValue || typeof packageValue !== 'object') throw new Error('Plugin UI module returned an invalid package');

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type CSSProperties } from 'react';
 import { init, use, type EChartsType } from 'echarts/core';
 import type { EChartsCoreOption } from 'echarts/types/dist/core';
 import { BarChart, HeatmapChart, LineChart } from 'echarts/charts';
@@ -38,6 +38,7 @@ interface EChartProps {
   locale: 'zh-CN' | 'en';
   onClick?: (event: EChartClick) => void;
   option: EChartsCoreOption;
+  style?: CSSProperties;
   timeZone: string;
 }
 
@@ -57,7 +58,7 @@ function currentTheme(): 'light' | 'dark' {
   return document.documentElement.dataset.theme === 'light' ? 'light' : 'dark';
 }
 
-export function EChart({ ariaLabel, className = '', locale, onClick, option, timeZone }: EChartProps) {
+export function EChart({ ariaLabel, className = '', locale, onClick, option, style, timeZone }: EChartProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<EChartsType | null>(null);
   const clickRef = useRef(onClick);
@@ -104,5 +105,6 @@ export function EChart({ ariaLabel, className = '', locale, onClick, option, tim
     className={`usage-echart ${className}`.trim()}
     ref={hostRef}
     role="img"
+    style={style}
   />;
 }
