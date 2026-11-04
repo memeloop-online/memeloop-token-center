@@ -409,20 +409,15 @@ async fn translate_new_api_compact_v2(
     wrap_as_sse: bool,
 ) -> Result<UpstreamResponse, ProxySendError> {
     let status = response.status();
+    // Only successful compact payloads require translation. Preserve an
+    // upstream rejection as a live response so ordinary error handling owns
+    // its body, accounting, and delivery without waiting for EOF here.
+    if !status.is_success() {
+        return Ok(UpstreamResponse::Reqwest(response));
+    }
     let version = response.version();
     let mut headers = response.headers().clone();
     let bytes = read_compact_body(response.bytes_stream(), MAX_COMPACT_RESPONSE_BYTES).await?;
-    if !status.is_success() {
-        let stream: crate::api::proxy::upstream_response::UpstreamByteStream =
-            Box::pin(futures_util::stream::once(async move { Ok(bytes) }));
-        return Ok(UpstreamResponse::Prefetched {
-            status,
-            headers,
-            version,
-            content_length: None,
-            stream,
-        });
-    }
     let value = crate::api::sse::parse_unique_json(&bytes)
         .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
     let responses = crate::api::new_api_transport::compact_to_responses(&value)
@@ -539,6 +534,29 @@ mod tests {
             Bytes::from_static(b"private-canary error")
         );
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn compact_rejection_returns_before_body_is_polled() {
+        for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::BAD_GATEWAY] {
+            let body = futures_util::stream::poll_fn(
+                |_| -> std::task::Poll<Option<Result<Bytes, std::io::Error>>> {
+                    panic!("compact translation must not poll an upstream rejection body")
+                },
+            );
+            let response = http::Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "text/plain")
+                .header(header::RETRY_AFTER, "7")
+                .body(reqwest::Body::wrap_stream(body))
+                .unwrap()
+                .into();
+            let response = translate_new_api_compact_v2(response, true).await.unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+            assert_eq!(response.headers()[header::RETRY_AFTER], "7");
+            assert!(matches!(response, UpstreamResponse::Reqwest(_)));
+        }
     }
 
     #[tokio::test]
