@@ -254,14 +254,31 @@ async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
         )
         .await?;
     select_allocation_refreshes(&mut targets);
-    let results = stream::iter(targets)
-        .map(|target| async move {
-            if target.allocation_history {
-                let _ = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    state.db.refresh_allocation_usage(target.tenant_id, target.account_id, crate::db::unix_millis()),
-                ).await;
+    let history_targets = targets
+        .iter()
+        .filter(|target| target.allocation_history)
+        .map(|target| (target.tenant_id, target.account_id))
+        .collect::<Vec<_>>();
+    // History I/O proceeds alongside quota publication with its own bounded background budget.
+    let history =
+        stream::iter(history_targets).for_each_concurrent(2, |(tenant, account)| async move {
+            match tokio::time::timeout(
+                Duration::from_secs(2),
+                state
+                    .db
+                    .refresh_allocation_history(tenant, account, crate::db::unix_millis()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                _ => tracing::warn!(
+                    operation = "allocation_history_refresh",
+                    "allocation history refresh deferred"
+                ),
             }
+        });
+    let observations = stream::iter(targets)
+        .map(|target| async move {
             let Ok((account, credential)) = state
                 .db
                 .upstream_account_with_credential(
@@ -351,8 +368,8 @@ async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
                 .await
         })
         .buffer_unordered(4)
-        .collect::<Vec<Result<(), AppError>>>()
-        .await;
+        .collect::<Vec<Result<(), AppError>>>();
+    let (_, results) = tokio::join!(history, observations);
     for result in results {
         result?;
     }
