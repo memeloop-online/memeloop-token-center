@@ -164,6 +164,12 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     let delivered = delivered.await.unwrap();
     assert!(String::from_utf8_lossy(&delivered).contains("projected after EOF"));
     upstream.await.unwrap();
+    assert_eq!(
+        fixture.state.responses_request_spool.read_count_for_test(),
+        spool_reads + 1,
+        "terminal journal preparation must reuse the semantic projection without rereading raw input"
+    );
+    // The independent archive worker below may legitimately read the spool.
     wait_for_request_settlement(&fixture, 1).await;
 
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
@@ -186,11 +192,6 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     .expect("large source-backed request must financially settle");
     drain_completed_response_archive(&fixture).await;
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
-    assert_eq!(
-        fixture.state.responses_request_spool.read_count_for_test(),
-        spool_reads + 1,
-        "terminal journal preparation must reuse the semantic projection without rereading raw input"
-    );
     let mut found_receipt = false;
     for receipt in fixture.state.pending_terminals.receipt_jsons_for_test() {
         if receipt["request_id"] != request_id.to_string() {
