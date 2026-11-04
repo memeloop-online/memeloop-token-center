@@ -170,7 +170,6 @@
       "additionalProperties": false,
       "required": [
         "databaseMaxConnections",
-        "proxyLifecycleConcurrency",
         "proxyMemoryBudgetBytes",
         "gatewayBodyReadConcurrency",
         "responsesBodyMaxBytes",
@@ -191,7 +190,6 @@
       "properties": {
         "databaseMaxConnections": { "type": "integer", "minimum": 1, "maximum": 64 },
         "terminalProjectionEnabled": { "type": "boolean" },
-        "proxyLifecycleConcurrency": { "type": "integer", "minimum": 1, "maximum": 4096 },
         "proxyMemoryBudgetBytes": { "type": "integer", "minimum": 268435456, "maximum": 2147483648 },
         "gatewayBodyReadConcurrency": { "type": "integer", "minimum": 1, "maximum": 8192 },
         "responsesBodyMaxBytes": { "type": "integer", "minimum": 4194304, "maximum": 67108864 },
