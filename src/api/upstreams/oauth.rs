@@ -1202,9 +1202,24 @@ async fn refresh_managed_upstream_oauth_impl(
         }
     };
     if let Some(blocking) = blocking {
-        // The worker owns this future: no detached model-sync survives its
-        // role's shutdown/join boundary.
-        super::models::sync_upstream_models_after_refresh(state, account.id, Some(blocking)).await;
+        // The credential is already durable. Catalog and public price-source
+        // work must yield the serial renewal lane even when a price semaphore
+        // or a remote catalog never completes. This deadline never wraps the
+        // OAuth exchange, and blocking plugin work remains worker-owned.
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::models::sync_upstream_models_after_refresh(state, account.id, Some(blocking)),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                %account_id,
+                credential_generation = account.credential_generation,
+                stage = "oauth_refresh_catalog_followup",
+                "credential renewal completed; catalog follow-up yielded the renewal lane"
+            );
+        }
     } else {
         super::trigger_upstream_model_sync(state.clone(), account.id);
     }

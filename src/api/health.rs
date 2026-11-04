@@ -149,20 +149,12 @@ pub(super) async fn readiness_snapshot(state: AppState) -> (StatusCode, Value) {
         .await;
     let (status, mut body) = readiness_contract(database_ready, archive_ready);
     #[cfg(feature = "experimental-plugin-revisions")]
-    let status = if let Some(authority) = &state.application_plugins {
-        let snapshot = authority.refresh_status();
-        let ready = snapshot["ready"] == true;
-        body["application_plugins"] = snapshot;
-        if ready {
-            status
-        } else {
-            body["status"] = json!("not_ready");
-            body["error"] = json!({"code": "application_plugin_snapshot_unavailable"});
-            StatusCode::SERVICE_UNAVAILABLE
-        }
-    } else {
-        status
-    };
+    if let Some(authority) = &state.application_plugins {
+        // Optional application runtime refresh does not determine whether the
+        // core gateway can receive traffic. Required plugin dependencies are
+        // resolved by their request path.
+        body["application_plugins"] = authority.refresh_status();
+    }
     if !database_ready.is_ready() {
         let code = match database_ready {
             crate::metrics::DatabaseReadiness::SchemaOutdated { .. } => "database_schema_outdated",
