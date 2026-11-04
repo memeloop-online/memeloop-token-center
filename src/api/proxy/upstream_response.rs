@@ -27,31 +27,6 @@ pub(super) fn terminal_cause_from_stream_error(
     }
 }
 
-pub(super) async fn rejected_response_terminal_cause(
-    response: UpstreamResponse,
-) -> Option<crate::model::RequestTerminalCause> {
-    let mut stream = response.bytes_stream();
-    let observed = async {
-        let mut discarded_bytes = 0usize;
-        while let Some(chunk) = stream.next().await {
-            match chunk {
-                Err(error) => return terminal_cause_from_stream_error(error),
-                Ok(bytes) => {
-                    discarded_bytes = discarded_bytes.saturating_add(bytes.len());
-                    if discarded_bytes >= 64 * 1024 {
-                        return None;
-                    }
-                }
-            }
-        }
-        None
-    };
-    tokio::time::timeout(std::time::Duration::from_millis(100), observed)
-        .await
-        .ok()
-        .flatten()
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CodexHttp2Failure {
     Reset,
@@ -375,27 +350,8 @@ impl From<reqwest::Response> for UpstreamResponse {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
-    async fn diagnostic_observation_limits_do_not_invent_terminal_causes() {
-        let silent = UpstreamResponse::Prefetched {
-            status: StatusCode::BAD_GATEWAY,
-            headers: HeaderMap::new(),
-            version: Version::HTTP_2,
-            content_length: None,
-            stream: Box::pin(stream::pending()),
-        };
-        assert_eq!(rejected_response_terminal_cause(silent).await, None);
-        let bounded = UpstreamResponse::Prefetched {
-            status: StatusCode::BAD_GATEWAY,
-            headers: HeaderMap::new(),
-            version: Version::HTTP_2,
-            content_length: None,
-            stream: Box::pin(stream::iter([
-                Ok(Bytes::from(vec![b'x'; 64 * 1024])),
-                Err(UPSTREAM_HTTP2_RESET),
-            ])),
-        };
-        assert_eq!(rejected_response_terminal_cause(bounded).await, None);
+    #[test]
+    fn only_recorded_transport_errors_map_to_terminal_causes() {
         assert_eq!(terminal_cause_from_stream_error("http_502"), None);
         assert_eq!(
             terminal_cause_from_stream_error("Bearer untrusted-diagnostic"),
