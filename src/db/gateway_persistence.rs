@@ -52,7 +52,10 @@ pub(super) struct GatewayPersistence {
 
 impl GatewayPersistence {
     pub(super) fn new(url: &str, backend: DatabaseBackend) -> Result<Self, sqlx::Error> {
-        let acquire_timeout = Duration::from_millis(250);
+        let acquire_timeout = match backend {
+            DatabaseBackend::PostgreSql => Duration::from_secs(30),
+            DatabaseBackend::Sqlite => Duration::from_millis(250),
+        };
         #[cfg(test)]
         let acquire_timeout = TEST_SOURCE_POOL_TIMEOUT
             .try_with(|timeout| *timeout)
@@ -72,9 +75,9 @@ impl GatewayPersistence {
                         }
                         DatabaseBackend::PostgreSql => {
                             for statement in [
-                                "SET statement_timeout = '250ms'",
-                                "SET lock_timeout = '100ms'",
-                                "SET idle_in_transaction_session_timeout = '1s'",
+                                super::POSTGRES_SERVE_STATEMENT_TIMEOUT,
+                                super::POSTGRES_SERVE_LOCK_TIMEOUT,
+                                super::POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
                             ] {
                                 sqlx::query(statement).execute(&mut *connection).await?;
                             }
@@ -277,19 +280,22 @@ impl Database {
         database.pool = self.gateway_persistence.pool.clone();
         database.pool_role = "gateway_archive";
         #[cfg(not(test))]
-        let timeout = Duration::from_secs(2);
+        let timeout = JOB_TIMEOUT;
         #[cfg(test)]
         let timeout = self.gateway_persistence.source_timeout;
         let deadline = tokio::time::Instant::now() + timeout;
-        let result = tokio::time::timeout_at(
-            deadline,
-            ARCHIVE_DEADLINE.scope(
-                (self.gateway_persistence.clone(), deadline),
-                database
-                    .record_request_source_state(identity, locator, length, digest, success, false),
-            ),
-        )
-        .await;
+        let persist =
+            database.record_request_source_state(identity, locator, length, digest, success, false);
+        let result = match self.backend {
+            DatabaseBackend::PostgreSql => Ok(persist.await),
+            DatabaseBackend::Sqlite => {
+                tokio::time::timeout_at(
+                    deadline,
+                    ARCHIVE_DEADLINE.scope((self.gateway_persistence.clone(), deadline), persist),
+                )
+                .await
+            }
+        };
         match result {
             Ok(Ok(owned)) => Some(owned),
             _ => {
@@ -660,11 +666,17 @@ impl Database {
                     .capture_deferred_request_archive(identity, &body, &pepper, compression_enabled)
                     .await
             };
-            let result = tokio::time::timeout_at(
-                deadline,
-                ARCHIVE_DEADLINE.scope((database.gateway_persistence.clone(), deadline), capture),
-            )
-            .await;
+            let result = match database.backend {
+                DatabaseBackend::PostgreSql => Ok(capture.await),
+                DatabaseBackend::Sqlite => {
+                    tokio::time::timeout_at(
+                        deadline,
+                        ARCHIVE_DEADLINE
+                            .scope((database.gateway_persistence.clone(), deadline), capture),
+                    )
+                    .await
+                }
+            };
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
