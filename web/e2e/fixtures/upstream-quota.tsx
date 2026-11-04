@@ -13,6 +13,7 @@ const now = Date.now();
 const params = new URLSearchParams(location.search);
 const mode = params.get('mode');
 const recoveryMode = mode?.startsWith('recover') === true;
+const settledMode = mode?.startsWith('reset-settled') === true;
 const snapshot: UpstreamQuotaSnapshot = {
   contract_version: 'upstream_quota_v1', upstream_account_id: 'quota-account', tenant_external_id: 'default',
   provider: mode === 'unsupported' ? 'cursor' : 'openai-codex', status: mode === 'unsupported' ? 'unsupported' : 'ready',
@@ -30,7 +31,7 @@ const snapshot: UpstreamQuotaSnapshot = {
   reset_credits: [],
   error_code: mode === 'stale-error' ? 'quota_destination_invalid' : mode === 'rate-limited' ? 'quota_rate_limited' : null,
 };
-if (recoveryMode || mode === 'reset-settled' || mode === 'status-retry') snapshot.reset_capability = { ...snapshot.reset_capability, implementation_available: true, prepare_available: true };
+if (recoveryMode || settledMode || mode === 'status-retry') snapshot.reset_capability = { ...snapshot.reset_capability, implementation_available: true, prepare_available: true };
 if (mode === 'kimi') {
   snapshot.provider = 'kimi-oauth'; snapshot.stale = false; snapshot.stale_after = now + 300_000;
   snapshot.freshness = 'fresh'; snapshot.capabilities = { ...snapshot.capabilities, plan: false, window_amounts: true, reset_credit_expiry: false };
@@ -38,7 +39,7 @@ if (mode === 'kimi') {
   snapshot.windows = snapshot.windows.map((window, index) => ({ ...window, id: index ? 'summary' : 'limit-0', label: index ? 'summary' : 'limit-0', source: 'kimi_usage', unit: null, used_percent: index ? 25 : 0, remaining: 100, limit: 100, reset_at: now + (index ? 604_800_000 : 18_000_000) }));
   if (params.has('units')) snapshot.windows.push(...['requests', 'tokens', 'Vendor Compute Units'].map(unit => ({ ...snapshot.windows[0], id: unit, label: unit, period_seconds: null, reset_at: null, used_percent: null, remaining: 25, limit: 100, unit })));
 }
-declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number; quotaCurrents: number } }
+declare global { interface Window { quotaReads: number; quotaWrites: number; quotaPrepares: number; quotaConfirms: number; quotaStatuses: number; quotaReconciles: number; quotaCurrents: number; releaseQuotaRead?: () => void } }
 window.quotaReads = 0; window.quotaWrites = 0;
 window.quotaPrepares = 0; window.quotaConfirms = 0;
 window.quotaStatuses = 0; window.quotaReconciles = 0; window.quotaCurrents = 0;
@@ -77,7 +78,7 @@ window.fetch = async (_input, init) => {
       if (body.confirmation !== 'consume_one_supplier_reset_credit' || body.confirmation_token !== 'mock-confirmation-not-a-real-credential') throw new Error('Invalid mock confirmation');
       window.quotaConfirms += 1;
       operation = { ...operation, state: mode === 'unknown' ? 'unknown' : 'accepted', quota_refresh_status: recoveryMode ? 'pending' : 'not_attempted' };
-      if (mode === 'reset-settled') {
+      if (settledMode) {
         operation = { ...operation, settled_at: Date.now(), reconciled_available_credits: 1, reconciled_applicable_credits: 1, quota_refresh_status: 'succeeded' };
         snapshot.windows = snapshot.windows.map(window => ({ ...window, used_percent: 0, remaining: 100 }));
         snapshot.credits.balance = '20.00';
@@ -97,7 +98,9 @@ window.fetch = async (_input, init) => {
     return new Response(JSON.stringify(operation));
   }
   const denied = mode === 'permission';
-  return new Response(JSON.stringify(mode === 'error' || denied ? { error: { message: 'fixture-sensitive-message-must-not-render' } } : snapshot), { status: denied ? 403 : mode === 'error' ? 503 : 200 });
+  const response = JSON.stringify(mode === 'error' || denied ? { error: { message: 'fixture-sensitive-message-must-not-render' } } : snapshot);
+  if (mode === 'reset-settled-busy' && window.quotaReads === 2) await new Promise<void>(resolve => { window.releaseQuotaRead = resolve; });
+  return new Response(response, { status: denied ? 403 : mode === 'error' ? 503 : 200 });
 };
 const renewal: OAuthRefreshStatus = { credential_generation: 1, access_state: 'expired', refresh_state: 'outcome_unknown', failure_class: 'network', reauthorization_required: false, automatic_refresh_paused: true };
 const stateAccount: AccountStatusInput = { status: 'active', auth_kind: 'oauth', credential_generation: 1, credential_expires_at: now - 1000 };

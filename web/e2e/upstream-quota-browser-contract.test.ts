@@ -141,6 +141,17 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     assert.deepEqual(await page.getByRole('meter').evaluateAll(nodes => nodes.map(node => node.getAttribute('value'))), ['0', '0']);
     assert.match(await page.locator('.upstream-quota').innerText(), /20\.00/);
     assert.match(await page.locator('.upstream-quota-reset').innerText(), /1/);
+    await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=reset-settled-busy`);
+    await view.click();
+    await page.getByRole('button', { name: 'Refresh quota', exact: true }).click();
+    await page.waitForFunction(() => typeof window.releaseQuotaRead === 'function');
+    await reset.click();
+    await dialog.getByRole('button', { name: 'Confirm and continue', exact: true }).click();
+    await page.waitForFunction(() => window.quotaConfirms === 1);
+    assert.equal(await page.evaluate(() => window.quotaReads), 2, 'a reset queues a refresh behind the pre-reset read');
+    await page.evaluate(() => window.releaseQuotaRead?.());
+    await page.waitForFunction(() => window.quotaReads === 3);
+    assert.deepEqual(await page.getByRole('meter').evaluateAll(nodes => nodes.map(node => node.getAttribute('value'))), ['0', '0'], 'the late pre-reset response is followed by a fresh quota read');
     // Fresh mount starts an independent operation; only explicit confirmation consumes.
     await page.goto(quotaUrl);
     await view.click();
