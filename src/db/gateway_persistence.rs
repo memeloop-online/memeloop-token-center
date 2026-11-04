@@ -57,12 +57,14 @@ impl GatewayPersistence {
         let acquire_timeout = TEST_SOURCE_POOL_TIMEOUT
             .try_with(|timeout| *timeout)
             .unwrap_or(acquire_timeout);
+        let application_name = super::postgres_application_name("mtc-gateway-archive");
         let pool = AnyPoolOptions::new()
             .max_connections(1)
             .min_connections(0)
             .acquire_timeout(acquire_timeout)
             .idle_timeout(Some(Duration::from_secs(60)))
             .after_connect(move |connection, _| {
+                let application_name = application_name.clone();
                 Box::pin(async move {
                     match backend {
                         DatabaseBackend::Sqlite => {
@@ -71,6 +73,10 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
+                            sqlx::query("SELECT set_config('application_name', $1, false)")
+                                .bind(application_name)
+                                .execute(&mut *connection)
+                                .await?;
                             for statement in [
                                 "SET statement_timeout = '250ms'",
                                 "SET lock_timeout = '100ms'",

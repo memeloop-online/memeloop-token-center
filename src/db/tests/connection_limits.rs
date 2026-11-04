@@ -377,3 +377,30 @@ async fn two_connection_pool_keeps_all_control_pages_bounded_under_concurrent_re
             .all(|page| page.expect("control page read succeeds") == 100)
     );
 }
+
+#[tokio::test]
+async fn auxiliary_pool_limit_keeps_independent_pools_and_survives_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("auxiliary-pools.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 2)
+        .await
+        .unwrap()
+        .with_auxiliary_pool_max_connections(1);
+    let mut first = database.independent_persistence_pool();
+    let second = database.independent_persistence_pool();
+    assert_eq!(first.pool.options().get_max_connections(), 1);
+    let held = first.pool.acquire().await.unwrap();
+    let other = tokio::time::timeout(Duration::from_secs(1), second.pool.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(held);
+    drop(other);
+    first.close().await;
+    first.refresh_closed_persistence_pool();
+    assert_eq!(first.pool.options().get_max_connections(), 1);
+    first.pool.acquire().await.unwrap();
+}

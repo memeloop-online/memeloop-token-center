@@ -157,6 +157,8 @@ pub struct Config {
     pub listen: String,
     pub database_url: String,
     pub database_max_connections: u32,
+    #[serde(default = "default_database_aux_pool_max_connections")]
+    pub database_aux_pool_max_connections: u32,
     #[serde(default = "default_terminal_projection_enabled")]
     pub terminal_projection_enabled: bool,
     /// Legacy deployment compatibility value; lifecycle admission uses bytes.
@@ -237,6 +239,10 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("database_url", &"[redacted]")
             .field("database_max_connections", &self.database_max_connections)
+            .field(
+                "database_aux_pool_max_connections",
+                &self.database_aux_pool_max_connections,
+            )
             .field(
                 "terminal_projection_enabled",
                 &self.terminal_projection_enabled,
@@ -426,6 +432,8 @@ impl Config {
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
             database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
+            database_aux_pool_max_connections: env_u32("MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS", 2)?
+                .clamp(1, 2),
             terminal_projection_enabled: env_bool(
                 "MTC_TERMINAL_PROJECTION_ENABLED",
                 DEFAULT_TERMINAL_PROJECTION_ENABLED,
@@ -538,6 +546,7 @@ impl Config {
             listen: "127.0.0.1:0".to_owned(),
             database_url,
             database_max_connections: 8,
+            database_aux_pool_max_connections: 2,
             terminal_projection_enabled: false,
             proxy_lifecycle_concurrency: 64,
             proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
@@ -1066,4 +1075,8 @@ mod tests {
             UpstreamHealthConfig::DEFAULT
         );
     }
+}
+
+fn default_database_aux_pool_max_connections() -> u32 {
+    2
 }
