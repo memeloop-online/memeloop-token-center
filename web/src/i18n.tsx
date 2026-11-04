@@ -4,6 +4,17 @@ export type Locale = 'zh-CN' | 'en';
 type Variables = Record<string, string | number>;
 
 const zh = {
+  'filter.field.session_id': 'MTC 会话 ID',
+  'filter.field.client_session_id': '客户端会话标识',
+  'sessions.identitySource': '会话标识来源',
+  'sessions.identityUnrecorded': '未记录来源，无法确认客户端聊天',
+  'sessions.identityHeaderThread': '客户端 thread-id 请求头',
+  'sessions.identityBodyThread': '客户端 thread_id 元数据',
+  'sessions.identityExplicit': '客户端明确指定的 MTC 会话',
+  'sessions.identityCompatibility': '兼容会话标识，未验证聊天身份',
+  'sessions.identityCache': '缓存亲和提示，不能确认聊天身份',
+  'sessions.clientSharedSession': '客户端共享 Session ID',
+  'sessions.parentThread': '客户端声明的父聊天 ID',
   'monitoring.upstreamQuota': '主要上游剩余额度', 'monitoring.upstreamQuotaScope': '当前总览中的账号 · 展示已用比例最高的额度窗口，可查看全部窗口。',
   'monitoring.unnamedUpstream': '未命名账号',
   'quota.remainingUnknown': '剩余额度未知', 'quota.remainingWindow': '{{name}} 剩余比例', 'quota.usedPercentValue': '已用 {{percent}}',
@@ -897,6 +908,17 @@ const zh = {
 } as const;
 
 const en = {
+  'filter.field.session_id': 'MTC session ID',
+  'filter.field.client_session_id': 'Client session identifier',
+  'sessions.identitySource': 'Session identity source',
+  'sessions.identityUnrecorded': 'Source not recorded; client chat unconfirmed',
+  'sessions.identityHeaderThread': 'Client thread-id header',
+  'sessions.identityBodyThread': 'Client thread_id metadata',
+  'sessions.identityExplicit': 'Client-declared MTC conversation',
+  'sessions.identityCompatibility': 'Compatibility session hint; chat identity unverified',
+  'sessions.identityCache': 'Cache affinity hint; chat identity unconfirmed',
+  'sessions.clientSharedSession': 'Client shared session ID',
+  'sessions.parentThread': 'Client-declared parent chat ID',
   'monitoring.upstreamQuota': 'Remaining quota for leading upstreams', 'monitoring.upstreamQuotaScope': 'Accounts in this overview. Shows the window with the highest used percentage; all windows are available in details.',
   'monitoring.unnamedUpstream': 'Unnamed account',
   'quota.remainingUnknown': 'Remaining quota unknown', 'quota.remainingWindow': '{{name}} remaining percentage', 'quota.usedPercentValue': '{{percent}} used',

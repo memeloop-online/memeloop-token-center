@@ -177,6 +177,8 @@ pub fn query_from_request_filter(
                 Some("key_alias") => Dimension::KeyAlias,
                 Some("principal") => Dimension::Principal,
                 Some("session_association") => Dimension::SessionAssociation,
+                Some("session_id") => Dimension::SessionId,
+                Some("client_session_id") => Dimension::ClientSessionId,
                 _ => return Err(HistoryError::Invalid("unsupported typed history field")),
             };
             let comparison = match condition.operator {
