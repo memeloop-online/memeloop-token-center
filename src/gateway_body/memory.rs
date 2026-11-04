@@ -68,6 +68,7 @@ impl ProxyMemoryBudget {
             retained: Mutex::new(None),
             json_body_ceiling: AtomicUsize::new(0),
             json_node_ceiling: AtomicUsize::new(0),
+            json_reserved_bytes: AtomicUsize::new(0),
         })
     }
 
@@ -106,6 +107,7 @@ pub(crate) struct ProxyMemoryReservation {
     retained: Mutex<Option<OwnedSemaphorePermit>>,
     json_body_ceiling: AtomicUsize,
     json_node_ceiling: AtomicUsize,
+    json_reserved_bytes: AtomicUsize,
 }
 
 pub(crate) struct ConversationProjectionPermit {
@@ -534,20 +536,36 @@ impl ProxyMemoryReservation {
         self.response_bytes.store(0, Ordering::Release);
         self.json_body_ceiling.store(0, Ordering::Release);
         self.json_node_ceiling.store(0, Ordering::Release);
+        self.json_reserved_bytes.store(0, Ordering::Release);
     }
 
     /// Keep one raw request-body copy charged after the routed request JSON and
     /// provider working buffers have both been dropped. Terminal projection
     /// reacquires the two transient copies before reparsing the retained body.
     pub(crate) fn release_conversation_working_copies(&self, bytes: usize) {
-        self.release(bytes, REQUEST_MEMORY_WEIGHT.saturating_sub(1));
+        let reserved = self.json_reserved_bytes.swap(0, Ordering::AcqRel);
+        self.release(
+            reserved
+                .saturating_sub(bytes)
+                .max(bytes.saturating_mul(REQUEST_MEMORY_WEIGHT.saturating_sub(1))),
+            1,
+        );
     }
 
     /// A durable request spool can replace the raw in-memory conversation copy
     /// after routing. Unlike the in-memory path, no byte-sized reservation
     /// remains live while the upstream response is in flight.
     pub(crate) fn release_source_backed_conversation_working_copies(&self, bytes: usize) {
-        self.release(bytes, REQUEST_MEMORY_WEIGHT);
+        let reserved = self.json_reserved_bytes.swap(0, Ordering::AcqRel);
+        self.release(reserved.max(bytes.saturating_mul(REQUEST_MEMORY_WEIGHT)), 1);
+    }
+
+    pub(crate) fn release_unretained_json(&self) {
+        self.release(self.json_reserved_bytes.swap(0, Ordering::AcqRel), 1);
+    }
+
+    pub(crate) fn request_json_reserved_bytes(&self) -> usize {
+        self.json_reserved_bytes.load(Ordering::Acquire)
     }
 
     /// Reserve the transient JSON-tree copies required to project a retained
@@ -583,6 +601,8 @@ impl ProxyMemoryReservation {
         }
         self.json_body_ceiling.store(body.len(), Ordering::Release);
         self.json_node_ceiling.store(nodes, Ordering::Release);
+        self.json_reserved_bytes
+            .fetch_add(required, Ordering::AcqRel);
         true
     }
 
@@ -658,6 +678,20 @@ pub(crate) fn json_encoded_length(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dispatched_durable_source_releases_json_nodes_with_working_copies() {
+        let budget = ProxyMemoryBudget::new(8 * 1024 * 1024);
+        let memory = budget.reservation();
+        let body = format!("[{}0]", "0,".repeat(2000));
+        assert!(memory.try_grow(body.len(), REQUEST_MEMORY_WEIGHT));
+        assert!(memory.try_reserve_json(body.as_bytes()));
+        memory.release(body.len(), REQUEST_MEMORY_WEIGHT);
+        assert!(budget.snapshot().0 > body.len() * REQUEST_MEMORY_WEIGHT);
+        memory.release_source_backed_conversation_working_copies(body.len());
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(memory.request_json_reserved_bytes(), 0);
+    }
 
     #[test]
     fn json_admission_is_atomic_when_bytes_fit_but_nodes_do_not() {
