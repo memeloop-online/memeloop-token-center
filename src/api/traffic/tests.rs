@@ -325,8 +325,19 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
             .await
             .expect("normalize blocking invocation tears down its dispatch after work exits")
             .unwrap();
-        assert!(owner.upgrade().is_none());
-        assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+        // The last Arc becomes unobservable before its destructor finishes
+        // returning the reservation. Wait for that independently observable
+        // cleanup while retaining the bounded guarantee under test.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if owner.upgrade().is_none() && state.proxy_memory_budget.snapshot().0 == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("normalize reservation is released after the guest exits");
         assert!(replacement.try_grow(1024 * 1024, 1));
         drop(replacement);
         assert_eq!(state.proxy_memory_budget.snapshot().0, 0);

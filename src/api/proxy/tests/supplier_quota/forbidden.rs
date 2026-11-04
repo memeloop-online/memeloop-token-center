@@ -127,12 +127,6 @@ async fn explicit403_quota_fails_over_avoids_failed_model_and_recovers_only_from
         )
         .await
         .unwrap();
-    let route_id: String =
-        sqlx::query_scalar("SELECT id FROM model_routes WHERE upstream_account_id=$1")
-            .bind(account.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
     fixture.state.db.plugin_kv_put(
         "upstream-health-probe", &account.to_string(),
         &serde_json::to_vec(&json!({"enabled":true,"billing_key_id":fixture.key_id,"interval_seconds":3600,"model":null,"prompt":"Reply with ok."})).unwrap(),
