@@ -11,6 +11,8 @@ export interface SupplierError {
   /** Optional provider identifiers kept as labeled technical details, never primary copy. */
   provider_code?: string;
   provider_message?: string;
+  /** Optional provider-supplied payload kept verbatim as a labeled technical detail. */
+  provider_details?: unknown;
 }
 
 /** Typed server-recorded failure evidence; a null stage means the observation phase was not recorded. */

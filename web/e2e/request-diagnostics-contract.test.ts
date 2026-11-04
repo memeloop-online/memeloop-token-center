@@ -303,6 +303,10 @@ test('structured supplier fields cover context and policy reasons, raw details s
     const duplicatedCopy = requestStatusCopy(duplicated, locale);
     assert.equal(duplicatedCopy.upstreamNote, null, 'the note is omitted when the provider message already carries the raw text');
     assert.equal(duplicatedCopy.details.filter((entry) => entry.value === 'same raw text').length, 1, 'the raw text appears exactly once');
+    // A nested unknown provider payload stays viewable as pretty JSON details.
+    const additional = { ...base, supplier_error: { code: 'upstream_code_v10', message: 'capacity note', provider_details: { tier: 'capacity', limits: { rpm: 3 } } } };
+    assert.ok(requestStatusCopy(additional, locale).details.some((entry) => entry.label === (zh ? '上游附加详情' : 'Upstream additional details')
+      && entry.value === JSON.stringify({ tier: 'capacity', limits: { rpm: 3 } }, null, 2)), 'nested provider details appear as pretty JSON in status.details');
   }
   // The shared status presentation exposes bilingual section labels and a concise trigger.
   const status = requestStatusCopy({ ...base, supplier_error: { code: 'rate_limited', message: 'slow down', category: 'rate_limit', retryable: true, action: 'retry_later' } }, 'en');

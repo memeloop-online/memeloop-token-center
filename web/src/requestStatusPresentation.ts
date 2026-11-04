@@ -244,6 +244,12 @@ export function supplierErrorPresentation(supplier: SupplierError | null | undef
   push(zh ? '供应商错误码' : 'Provider error code', supplier.provider_code ?? supplier.code);
   push(zh ? '供应商说明' : 'Provider message', supplier.provider_message ?? rawMessage);
   if (supplier.retryable !== undefined) details.push({ label: zh ? '可重试' : 'Retryable', value: supplier.retryable ? (zh ? '是' : 'yes') : (zh ? '否' : 'no') });
+  // The optional provider payload is unknown JSON: serialize it for viewing
+  // and skip any value JSON.stringify cannot represent as a string.
+  if (supplier.provider_details != null) {
+    const serialized = JSON.stringify(supplier.provider_details, null, 2);
+    if (typeof serialized === 'string') push(zh ? '上游附加详情' : 'Upstream additional details', serialized);
+  }
   if (!reason && !action && details.length === 0) return null;
   return { reason, action, details };
 }
