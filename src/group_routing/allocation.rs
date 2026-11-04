@@ -67,9 +67,26 @@ impl Reservation {
             .collect();
         let ids: Vec<_> = identities.keys().cloned().collect();
         let usage = state.db.allocation_usage(tenant, &ids, now).await?;
+        let mut usage_by_account: BTreeMap<&str, Vec<_>> = BTreeMap::new();
+        for row in &usage {
+            usage_by_account
+                .entry(row.account.as_str())
+                .or_default()
+                .push(row);
+        }
+        let mut quotas = BTreeMap::new();
+        for row in input
+            .quota_context
+            .iter()
+            .flat_map(|context| &context.accounts)
+        {
+            quotas
+                .entry((row.account_id.as_str(), row.generation))
+                .or_insert(row);
+        }
         let mut accounts = Vec::new();
         for (id, generation) in identities {
-            let rows: Vec<_> = usage.iter().filter(|row| row.account == id).collect();
+            let rows = usage_by_account.remove(id.as_str()).unwrap_or_default();
             let requests = rows
                 .iter()
                 .fold(0_u64, |sum, row| sum.saturating_add(row.requests));
@@ -77,12 +94,7 @@ impl Reservation {
                 .iter()
                 .fold(0_u64, |sum, row| sum.saturating_add(row.tokens));
             let mut baselines = serde_json::Map::new();
-            if let Some(quota) = input.quota_context.as_ref().and_then(|context| {
-                context
-                    .accounts
-                    .iter()
-                    .find(|row| row.account_id == id && row.generation == generation)
-            }) {
+            if let Some(quota) = quotas.get(&(id.as_str(), generation)) {
                 for window in &quota.windows {
                     let start = window
                         .reset_at

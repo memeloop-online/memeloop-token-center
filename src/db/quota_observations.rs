@@ -81,6 +81,7 @@ impl Database {
     pub(crate) async fn quota_observation_targets(
         &self,
         plugins: &[String],
+        allocation_plugins: &[String],
         now: i64,
         limit: i64,
     ) -> Result<Vec<QuotaObservationTarget>, AppError> {
@@ -92,29 +93,30 @@ impl Database {
             DatabaseBackend::PostgreSql => "SELECT jsonb_array_elements_text(CAST($1 AS jsonb))",
             DatabaseBackend::Sqlite => "SELECT value FROM json_each($1)",
         };
+        let allocation_list = plugin_list.replace("$1", "$4");
         // Normal quota observations are drawn only from enabled route candidates
         // attached to opt-in strategy groups. Exhausted Codex accounts are also
         // observed independently so an external quota reset can restore routing
         // without an operator opening the account page. Both paths share the same
         // persisted lease and refresh cadence below.
         let statement = format!("WITH bound AS (
-            SELECT e.upstream_account_id AS id, e.tenant_id FROM model_route_eligible_upstream_accounts e
+            SELECT e.upstream_account_id AS id, e.tenant_id, CASE WHEN {plugin_id} IN ({allocation_list}) THEN 1 ELSE 0 END AS allocation_history FROM model_route_eligible_upstream_accounts e
             JOIN model_routes r ON r.id=e.model_route_id AND r.tenant_id=e.tenant_id AND r.enabled=1 AND r.archived_at IS NULL
             JOIN model_route_included_provider_groups i ON i.model_route_id=r.id AND i.tenant_id=r.tenant_id
             JOIN provider_groups g ON g.id=i.provider_group_id AND g.tenant_id=r.tenant_id
             JOIN upstream_account_provider_groups m ON m.provider_group_id=g.id AND m.tenant_id=g.tenant_id AND m.upstream_account_id=e.upstream_account_id
             WHERE {plugin_id} IN ({plugin_list})
             UNION
-            SELECT e.upstream_account_id AS id, e.tenant_id FROM model_route_eligible_upstream_accounts e
+            SELECT e.upstream_account_id AS id, e.tenant_id, CASE WHEN {plugin_id} IN ({allocation_list}) THEN 1 ELSE 0 END AS allocation_history FROM model_route_eligible_upstream_accounts e
             JOIN model_routes r ON r.id=e.model_route_id AND r.tenant_id=e.tenant_id AND r.enabled=1 AND r.archived_at IS NULL
             JOIN model_route_group_memberships m ON m.model_route_id=r.id AND m.tenant_id=r.tenant_id
             JOIN route_groups g ON g.id=m.route_group_id AND g.tenant_id=r.tenant_id
             WHERE {plugin_id} IN ({plugin_list})
         ), targets AS (
-            SELECT id,tenant_id,1 AS recovery_priority,0 AS recovery_mark FROM bound
+            SELECT id,tenant_id,1 AS recovery_priority,0 AS recovery_mark,allocation_history FROM bound
             UNION ALL
             SELECT h.upstream_account_id AS id,a.tenant_id,0 AS recovery_priority,
-                h.updated_at AS recovery_mark
+                h.updated_at AS recovery_mark,0 AS allocation_history
             FROM upstream_account_health h
             JOIN upstream_accounts a ON a.id=h.upstream_account_id
                 AND a.credential_generation=h.credential_generation
@@ -122,11 +124,11 @@ impl Database {
                 AND h.last_failure_kind='quota_exhausted' AND h.probe_lease_until<=$2
         ), prioritized AS (
             SELECT id,tenant_id,MIN(recovery_priority) AS recovery_priority,
-                MAX(recovery_mark) AS recovery_mark
+                MAX(recovery_mark) AS recovery_mark,MAX(allocation_history) AS allocation_history
             FROM targets GROUP BY id,tenant_id
         ) SELECT a.id,a.tenant_id,t.external_id,a.credential_generation,a.updated_at,
                 CASE WHEN p.recovery_priority=0 THEN 1 ELSE 0 END AS recovering_quota,
-                p.recovery_mark,
+                p.recovery_mark,p.allocation_history,
                 COALESCE(q.last_attempt_at,0) AS previous_attempt_at,
                 COALESCE(q.next_refresh_at,0) AS previous_next_refresh_at
             FROM prioritized p JOIN upstream_accounts a ON a.id=p.id AND a.tenant_id=p.tenant_id
@@ -144,6 +146,10 @@ impl Database {
             })?)
             .bind(now)
             .bind(limit.clamp(1, 16))
+            .bind(
+                serde_json::to_string(allocation_plugins)
+                    .map_err(|_| AppError::internal("quota_observations_allocation_plugins"))?,
+            )
             .fetch_all(&self.pool)
             .await?
             .into_iter()
@@ -159,6 +165,7 @@ impl Database {
                     generation: row.try_get("credential_generation")?,
                     config_revision: row.try_get("updated_at")?,
                     recovering_quota: row.try_get::<i64, _>("recovering_quota")? == 1,
+                    allocation_history: row.try_get::<i64, _>("allocation_history")? == 1,
                     recovery_mark: row.try_get("recovery_mark")?,
                     previous_attempt_at: row.try_get("previous_attempt_at")?,
                     previous_next_refresh_at: row.try_get("previous_next_refresh_at")?,

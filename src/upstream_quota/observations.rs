@@ -2,7 +2,7 @@
 use crate::{AppState, error::AppError, provider::AuthorizedUpstreamCandidate};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -49,6 +49,7 @@ pub(crate) struct QuotaObservationTarget {
     pub generation: i64,
     pub config_revision: i64,
     pub recovering_quota: bool,
+    pub allocation_history: bool,
     pub recovery_mark: i64,
     pub previous_attempt_at: i64,
     pub previous_next_refresh_at: i64,
@@ -214,30 +215,53 @@ pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Recei
     }
 }
 
+fn select_allocation_refreshes(targets: &mut [QuotaObservationTarget]) {
+    let mut tenants = BTreeSet::new();
+    for target in targets {
+        target.allocation_history = target.allocation_history && tenants.insert(target.tenant_id);
+    }
+}
+
 async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
     // Core Codex recovery must remain available even when an optional
     // application-plugin snapshot cannot be pinned. In that case only the
     // plugin-owned observation targets are skipped for this batch.
-    let plugins = match state.clone().pin_application_plugins().await {
-        Ok(pinned) => pinned.plugins.quota_observation_plugin_ids(),
+    let (plugins, allocation_plugins) = match state.clone().pin_application_plugins().await {
+        Ok(pinned) => {
+            let plugins = pinned.plugins.quota_observation_plugin_ids();
+            let allocation = plugins
+                .iter()
+                .filter(|id| pinned.plugins.group_routing_uses_allocation_context(id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (plugins, allocation)
+        }
         Err(error) => {
             tracing::warn!(
                 error_category = error.diagnostic_category(),
                 "quota observation plugin snapshot unavailable; continuing core Codex recovery"
             );
-            Vec::new()
+            (Vec::new(), Vec::new())
         }
     };
-    let targets = state
+    let mut targets = state
         .db
         .quota_observation_targets(
             &plugins,
+            &allocation_plugins,
             crate::db::unix_millis(),
             state.config.quota_observation_batch_limit.into(),
         )
         .await?;
+    select_allocation_refreshes(&mut targets);
     let results = stream::iter(targets)
         .map(|target| async move {
+            if target.allocation_history {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    state.db.refresh_allocation_usage(target.tenant_id, target.account_id, crate::db::unix_millis()),
+                ).await;
+            }
             let Ok((account, credential)) = state
                 .db
                 .upstream_account_with_credential(
@@ -255,7 +279,6 @@ async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
             {
                 return Ok(());
             }
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(100), state.db.refresh_allocation_usage(target.tenant_id, target.account_id, crate::db::unix_millis())).await;
             let lease = Uuid::now_v7();
             let now = crate::db::unix_millis();
             let timeout_ms = observation_timeout_millis(
@@ -397,6 +420,48 @@ mod tests {
     }
 
     #[test]
+    fn history_refresh_selects_one_opted_in_account_per_tenant() {
+        let target = QuotaObservationTarget {
+            account_id: Uuid::from_u128(1),
+            tenant_id: Uuid::from_u128(2),
+            tenant_external_id: "tenant".into(),
+            generation: 1,
+            config_revision: 1,
+            recovering_quota: true,
+            allocation_history: false,
+            recovery_mark: 0,
+            previous_attempt_at: 0,
+            previous_next_refresh_at: 0,
+        };
+        let mut targets = vec![
+            target.clone(),
+            QuotaObservationTarget {
+                allocation_history: true,
+                ..target.clone()
+            },
+            QuotaObservationTarget {
+                allocation_history: true,
+                account_id: Uuid::from_u128(3),
+                ..target.clone()
+            },
+            QuotaObservationTarget {
+                allocation_history: true,
+                tenant_id: Uuid::from_u128(4),
+                ..target
+            },
+        ];
+        select_allocation_refreshes(&mut targets);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.allocation_history)
+                .collect::<Vec<_>>(),
+            [false, true, false, true]
+        );
+        assert!(targets.iter().all(|target| target.recovering_quota));
+    }
+
+    #[test]
     fn failed_observations_back_off_while_success_returns_to_configured_cadence() {
         let mut target = QuotaObservationTarget {
             account_id: Uuid::from_u128(1),
@@ -405,6 +470,7 @@ mod tests {
             generation: 1,
             config_revision: 10,
             recovering_quota: true,
+            allocation_history: false,
             recovery_mark: 1,
             previous_attempt_at: 0,
             previous_next_refresh_at: 0,
@@ -458,6 +524,7 @@ mod tests {
             generation: 1,
             config_revision: 10,
             recovering_quota: false,
+            allocation_history: false,
             recovery_mark: 0,
             previous_attempt_at: 0,
             previous_next_refresh_at: 0,
@@ -564,6 +631,7 @@ mod tests {
             generation: 1,
             config_revision: 10,
             recovering_quota: true,
+            allocation_history: false,
             recovery_mark: 1,
             previous_attempt_at: 0,
             previous_next_refresh_at: 0,
