@@ -36,7 +36,11 @@ test('quota reset discovery survives missing and failed reads without performing
       assert.equal(await section.getByRole('region', { name: 'Quota reset', exact: true }).count(), 1);
       assert.equal(await section.getByRole('button', { name: 'Quota reset options', exact: true }).count(), 0);
       const reset = section.getByRole('button', { name: 'Reset upstream quota', exact: true });
-      assert.equal(await reset.isEnabled(), state === 'snapshot');
+      assert.equal(await reset.isEnabled(), false);
+      if (state === 'snapshot') {
+        await section.getByText('The operation status has not loaded yet. This check did not start another reset.', { exact: true }).waitFor();
+        assert.equal(await section.getByRole('button', { name: 'Check operation status', exact: true }).isEnabled(), true);
+      }
       // Never click reset or issue a quota read, preparation, confirmation or reconciliation.
       if (state === 'pending') assert.equal(await section.getByText('Select View quota to check whether this account supports resets. Viewing quota only reads the current window.', { exact: true }).count(), 1);
       if (state === 'failed') assert.equal(await section.getByText('Quota could not be loaded. Check the account connection, then select View quota. No reset was performed and no reset credit was used.', { exact: true }).count(), 1);

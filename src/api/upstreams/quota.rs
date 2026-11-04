@@ -337,17 +337,25 @@ pub(in crate::api) async fn confirm_quota_reset(
         ));
     }
     let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
-    let result = crate::upstream_quota::reset::confirm(
-        &state,
-        &account,
-        &credential,
-        query.tenant_external_id.trim(),
-        &actor,
-        &operation_id.to_string(),
-        &body.confirmation_token,
-        idempotency_key,
-    )
-    .await?;
+    let idempotency_key = idempotency_key.to_owned();
+    // A browser disconnect must not cancel an already authorized consumption
+    // or its durable result. Dropping the JoinHandle detaches this single task;
+    // the database claim still permits exactly one supplier dispatch.
+    let result = tokio::spawn(async move {
+        crate::upstream_quota::reset::confirm(
+            &state,
+            &account,
+            &credential,
+            query.tenant_external_id.trim(),
+            &actor,
+            &operation_id.to_string(),
+            &body.confirmation_token,
+            &idempotency_key,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| AppError::internal("quota_reset_dispatch_task"))??;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 

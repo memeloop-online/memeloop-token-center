@@ -486,8 +486,8 @@ fn canonical_chat_usage(
                 .flatten()
                 .all(|tokens| (0..=usage.completion_tokens).contains(&tokens))
             });
-    if usage.prompt_tokens < 0
-        || usage.completion_tokens < 0
+    if !(0..=super::MAX_REPORTED_TOKENS).contains(&usage.prompt_tokens)
+        || !(0..=super::MAX_REPORTED_TOKENS).contains(&usage.completion_tokens)
         || usage.total_tokens <= 0
         || cached < 0
         || cache_write < 0
@@ -527,6 +527,26 @@ pub(super) fn canonical_chat_chunk_is_accepted(data: &[u8]) -> bool {
 mod cache_coverage_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn canonical_chat_validates_reported_input_before_subtracting_cache() {
+        for prompt in [
+            super::super::MAX_REPORTED_TOKENS,
+            super::super::MAX_REPORTED_TOKENS + 1,
+        ] {
+            let value = json!({
+                "prompt_tokens": prompt,
+                "completion_tokens": 1,
+                "total_tokens": prompt + 1,
+                "prompt_tokens_details": {"cached_tokens": 11}
+            });
+            let parsed = canonical_chat_usage(serde_json::from_value(value).unwrap(), None);
+            assert_eq!(
+                parsed.is_some(),
+                prompt == super::super::MAX_REPORTED_TOKENS
+            );
+        }
+    }
 
     #[test]
     fn canonical_chat_cache_presence_preserves_financial_counts() {

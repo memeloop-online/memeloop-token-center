@@ -8,6 +8,35 @@ use crate::{
 
 const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
+/// Dropping a dispatch never proves that the supplier did not consume a credit.
+/// Preserve uncertainty and the durable idempotency record, but do not strand
+/// an operation in submitted after its owning future has actually ended.
+struct DispatchCompletion {
+    db: crate::db::Database,
+    operation: String,
+    finished: bool,
+}
+
+impl Drop for DispatchCompletion {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let db = self.db.clone();
+        let operation = self.operation.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = db
+                    .finish_quota_reset(&operation, false, Some("reset_dispatch_owner_ended"))
+                    .await
+                {
+                    tracing::error!(operation_id = %operation, error = %error, "quota reset dispatch outcome could not be persisted");
+                }
+            });
+        }
+    }
+}
+
 // Test binaries may redirect the fixed supplier to a loopback fixture.
 // Production builds retain the fixed supplier endpoints.
 #[cfg(test)]
@@ -598,6 +627,11 @@ async fn confirm_guarded(
         QuotaResetClaim::Claimed { redeem_request_id } => redeem_request_id,
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
+    let mut completion = DispatchCompletion {
+        db: state.db.clone(),
+        operation: operation.to_owned(),
+        finished: false,
+    };
     // Each durable operation keeps one redeem ID and one supplier dispatch.
     let result = if guard.is_some_and(|guard| unix_millis() >= guard.deadline_ms) {
         Err("quota_reset_deadline_elapsed")
@@ -624,6 +658,7 @@ async fn confirm_guarded(
         .db
         .finish_quota_reset(operation, accepted, result.err())
         .await?;
+    completion.finished = true;
     state
         .upstream_quota
         .entries
@@ -758,7 +793,9 @@ async fn dispatch_once(
             crate::oauth::managed::codex::USER_AGENT,
         )
         .header("originator", crate::oauth::managed::codex::ORIGINATOR)
-        .timeout(Duration::from_secs(8))
+        // A slow successful consumption must not become unknown merely because
+        // eight seconds elapsed. Use the configured transport policy, with no
+        // extra reset response deadline and no implicit HTTP retry.
         .json(&json!({"redeem_request_id":redeem}));
     let request = credential
         .apply(request, unix_millis())

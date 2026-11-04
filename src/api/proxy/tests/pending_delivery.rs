@@ -88,6 +88,7 @@ async fn durable_unknown_receipt_releases_projection_memory_without_discarding_e
         .await
         .unwrap();
     assert!(!String::from_utf8_lossy(&delivered).contains("PRIVATE_OWNED_UNKNOWN_INPUT"));
+    drop(delivered);
     assert!(
         fixture.state.proxy_memory_budget.snapshot().0 > 0,
         "unacknowledged journal must retain its accounted payload"
@@ -787,6 +788,7 @@ async fn provider_reported_authority_arbitration_keeps_durable_bytes_and_release
             String::from_utf8_lossy(&delivered)
                 .contains("authority conflict retains original usage")
         );
+        drop(delivered);
         let record = wait_for_operational(&fixture).await;
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         if already_finished {

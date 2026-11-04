@@ -257,6 +257,7 @@ async fn successful_inference(protocol: Protocol) {
     let upstream = MockServer::start().await;
     let anthropic = matches!(protocol, Protocol::AnthropicMessages);
     let responses = matches!(protocol, Protocol::OpenAiResponses);
+    let reported_input = if responses { 2048 } else { 3 };
     let completion = if anthropic {
         json!({
             "id":"msg_operator_fixture","type":"message","role":"assistant","model":"fixture",
@@ -267,7 +268,7 @@ async fn successful_inference(protocol: Protocol) {
         json!({
             "id":"resp_operator_fixture", "object":"response", "status":"completed", "model":"fixture",
             "output":[{"type":"image_generation_call","id":"ig_fixture","status":"completed","result":IMAGE_FIXTURE_PNG}],
-            "usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}
+            "usage":{"input_tokens":reported_input,"output_tokens":2,"total_tokens":reported_input + 2}
         })
     } else {
         json!({
@@ -375,6 +376,9 @@ async fn successful_inference(protocol: Protocol) {
     } else {
         json!({"model":"fixture","messages":[{"role":"user","content":"hello"}],"stream":false})
     };
+    if responses {
+        assert!(serde_json::to_vec(&provider_request).unwrap().len() < reported_input as usize);
+    }
     *request.body_mut() = Body::from(
         json!({
             "key_id":key.key_id,"request":provider_request,
@@ -404,6 +408,8 @@ async fn successful_inference(protocol: Protocol) {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let core_request_id =
+        Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
     let bytes = axum::body::to_bytes(response.into_body(), 65_536)
         .await
         .unwrap();
@@ -436,8 +442,12 @@ async fn successful_inference(protocol: Protocol) {
     .await
     .unwrap();
     let rows = state.db.list_requests(key.key_id, 10).await.unwrap();
+    assert_eq!(rows[0].request_id, core_request_id);
     assert_eq!(rows[0].status_code, Some(200));
-    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
+    assert_eq!(
+        (rows[0].input_tokens, rows[0].output_tokens),
+        (reported_input, 2)
+    );
     let settlements = state
         .db
         .list_account_settlements(key.account_id, 10, None, None)
@@ -447,7 +457,7 @@ async fn successful_inference(protocol: Protocol) {
     assert_eq!(settlements.items[0].key_id, key.key_id);
     assert_eq!(
         Decimal::from_str(&settlements.items[0].cost).unwrap(),
-        Decimal::new(5, 6)
+        Decimal::new(reported_input + 2, 6)
     );
     let forwarded = upstream.received_requests().await.unwrap();
     assert_eq!(forwarded.len(), 1);

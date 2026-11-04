@@ -87,17 +87,21 @@ async fn execute(
     // Operator authorization and caller-controlled forwarding headers must not
     // enter provider requests. Normal gateway routing, policy, usage and billing
     // all execute against the selected existing downstream identity.
-    let mut response = proxy::proxy_with_identity(
-        state,
-        inference_headers,
-        bytes,
-        protocol,
-        key,
-        None,
-        memory,
-        None,
-    )
-    .await?;
+    let mut response = proxy_diagnostics::CONTEXT
+        .scope(
+            proxy_diagnostics::Context::current(),
+            proxy::proxy_with_identity(
+                state,
+                inference_headers,
+                bytes,
+                protocol,
+                key,
+                None,
+                memory,
+                None,
+            ),
+        )
+        .await?;
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));

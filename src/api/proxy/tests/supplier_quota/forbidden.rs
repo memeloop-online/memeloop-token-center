@@ -50,15 +50,38 @@ async fn delayed_complete403_body_fails_over_only_for_definite_quota() {
 
 #[tokio::test]
 async fn explicit403_quota_fails_over_avoids_failed_model_and_recovers_only_from_real_probe() {
+    assert_quota_failover_and_real_probe_recovery(
+        ResponseTemplate::new(403).set_body_json(json!({
+            "error": {"code":"insufficient_user_quota", "type":"new_api_error",
+                "message":"用户额度不足, 剩余额度: private-quota-canary"}
+        })),
+        403,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn explicit_sse_quota_avoids_failed_model_and_recovers_only_from_real_probe() {
+    assert_quota_failover_and_real_probe_recovery(
+        ResponseTemplate::new(200).set_body_raw(
+            "data: {\"error\":{\"code\":\"insufficient_user_quota\"}}\n\n",
+            "text/event-stream",
+        ),
+        200,
+    )
+    .await;
+}
+
+async fn assert_quota_failover_and_real_probe_recovery(
+    rejection: ResponseTemplate,
+    upstream_status: u16,
+) {
     let exhausted = MockServer::start().await;
     let healthy = MockServer::start().await;
     let unauthorized = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
-            "error": {"code":"insufficient_user_quota", "type":"new_api_error",
-                "message":"用户额度不足, 剩余额度: private-quota-canary"}
-        })))
+        .respond_with(rejection.clone())
         .expect(1)
         .mount(&exhausted)
         .await;
@@ -245,9 +268,7 @@ async fn explicit403_quota_fails_over_avoids_failed_model_and_recovers_only_from
     assert_eq!(ledger_count, 2);
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
-        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
-            "error":{"code":"insufficient_user_quota","message":"用户额度不足"}
-        })))
+        .respond_with(rejection)
         .expect(1)
         .mount(&exhausted)
         .await;
@@ -260,7 +281,7 @@ async fn explicit403_quota_fails_over_avoids_failed_model_and_recovers_only_from
     .await;
     assert_eq!(failed_probe["status"], "unhealthy", "{failed_probe}");
     assert_eq!(failed_probe["error_code"], "quota_exhausted");
-    assert_eq!(failed_probe["upstream_status"], 403);
+    assert_eq!(failed_probe["upstream_status"], upstream_status);
     assert_eq!(failed_probe["actual_model"], "upstream-0");
     fixture.state.routing_persistence.drain_for_test().await;
     exhausted.verify().await;

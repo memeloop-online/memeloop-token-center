@@ -1166,6 +1166,21 @@ fn push_typed_filters(
             }
             TypedFilterField::CreatedAt => format!("{source_alias}.created_at"),
             TypedFilterField::KeyId => format!("{source_alias}.key_id"),
+            TypedFilterField::SessionId => match source {
+                RequestSourceKind::Generation => "CAST(NULL AS TEXT)".to_owned(),
+                _ => format!("{source_alias}.conversation_cluster_id"),
+            },
+            TypedFilterField::ClientSessionId => match source {
+                RequestSourceKind::Generation => "CAST(NULL AS TEXT)".to_owned(),
+                _ => {
+                    let id_column = if source == RequestSourceKind::Archive {
+                        "archive_request_id"
+                    } else {
+                        "id"
+                    };
+                    format!("(SELECT session_observation.explicit_session_id FROM conversation_observations session_observation WHERE session_observation.request_id = {source_alias}.{id_column} AND session_observation.key_id = {source_alias}.key_id AND session_observation.cluster_id = {source_alias}.conversation_cluster_id LIMIT 1)")
+                }
+            },
             TypedFilterField::SessionAssociation => match source {
                 RequestSourceKind::Generation => "'unlinked'".to_owned(),
                 _ => format!("(CASE WHEN {source_alias}.conversation_cluster_id IS NULL THEN 'unlinked' ELSE 'confirmed' END)"),

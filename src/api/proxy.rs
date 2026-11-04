@@ -579,6 +579,7 @@ async fn finish_non_sse_proxy_response(
             let (response_status, response_body, terminal_error) = if valid_output {
                 (status, response_body, "upstream_incomplete_response")
             } else {
+                drop(response_body);
                 (
                     StatusCode::BAD_GATEWAY,
                     Bytes::from(crate::error::explained_failure_body(
@@ -608,6 +609,7 @@ async fn finish_non_sse_proxy_response(
                 .await;
             return result;
         }
+        drop(response_body);
         let result = finish_proxy_failure(buffered_request, error_code).await;
         upstream_attempt
             .complete(UpstreamAttemptTerminal::invalid_response())
@@ -635,6 +637,7 @@ async fn finish_non_sse_proxy_response(
                     selected_driver,
                     protocol,
                 );
+                drop(response_body);
                 let result = finish_proxy_failure(buffered_request, "upstream_invalid_usage").await;
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::invalid_response())
@@ -1073,7 +1076,7 @@ async fn proxy_with_cancellation_guard(
     let primary = route_plan.primary_route();
     // Freeze before reservation and archive work: later candidates/reloads may
     // change account transport settings, never replenish the request budget.
-    let attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
+    let mut attempt_budget = routing::RequestAttemptBudget::from_primary(primary, request_id)?;
     let route_preparation_recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     if let Some(mut candidates) = strategy_candidates {
@@ -1373,6 +1376,7 @@ async fn proxy_with_cancellation_guard(
         model_route_id.ok_or(AppError::internal("proxy_site_3"))?,
     );
     let mut outbound_attempts = 0_usize;
+    let mut rejected_models = std::collections::HashSet::new();
     let mut h2_recovery_available = true;
     let mut last_dispatch = None;
     let mut candidate_rank = 0_usize;
@@ -1434,12 +1438,28 @@ async fn proxy_with_cancellation_guard(
             None,
             None,
         );
-        let Some((active_route, mut upstream_attempt, selected_candidate_rank, outbound_attempt)) =
-            selected
+        let Some((
+            mut active_route,
+            mut upstream_attempt,
+            selected_candidate_rank,
+            outbound_attempt,
+        )) = selected
         else {
             return finish_unavailable(&buffered_request, "upstream_unavailable", last_dispatch)
                 .await;
         };
+        let candidate_model = (
+            active_route.route.account_id,
+            active_route.route.upstream_model.clone(),
+            active_route.route.credential_generation,
+            active_route.route.transport_revision,
+        );
+        if rejected_models.contains(&candidate_model) {
+            upstream_attempt
+                .complete(UpstreamAttemptTerminal::Inconclusive)
+                .await;
+            continue;
+        }
         if !active_route.is_codex()
             || !dispatch_permit
                 .as_ref()
@@ -1468,8 +1488,6 @@ async fn proxy_with_cancellation_guard(
                 }
             }
         }
-        // Attempt count still bounds how many accounts one request may try.
-        // A failover clock does not refuse a candidate that is ready to send.
         if let Some(reason) = attempt_budget.terminal_reason(outbound_attempts) {
             tracing::warn!(%request_id, outbound_attempts, stage = reason,
                 failure_domain = "local_admission", delivery_evidence = "candidate_not_dispatched",
@@ -1492,6 +1510,9 @@ async fn proxy_with_cancellation_guard(
             return Ok(response);
         }
         IndependentProbeTarget::validate_target(&active_route.route)?;
+        active_route.inspect_stream_rejection = !route_candidates.as_slice().is_empty()
+            || !deferred_shared_probes.is_empty()
+            || independent_probe::TARGET.try_with(|_| ()).is_ok();
         let result = attempt_budget
             .send(
                 send_proxy_route(
@@ -1551,6 +1572,20 @@ async fn proxy_with_cancellation_guard(
                     observed_at,
                 );
                 (Ok(result), None)
+            }
+            Ok(mut result) if result.response.status().is_success() => {
+                let observed_at = unix_millis();
+                let kind = result.preoutput_quota.take().map(|(kind, evidence)| {
+                    publish_supplier_quota(
+                        &state,
+                        &active_route.route,
+                        request_id,
+                        observed_at,
+                        evidence,
+                    );
+                    kind
+                });
+                (Ok(result), kind)
             }
             result => (result, None),
         };
@@ -1654,12 +1689,17 @@ async fn proxy_with_cancellation_guard(
             result.as_ref().err(),
             rate_limit,
         );
+        if disposition.is_definite_rejection() {
+            attempt_budget.note_definite_rejection();
+            rejected_models.insert(candidate_model);
+        }
         let has_standby =
             !route_candidates.as_slice().is_empty() || !deferred_shared_probes.is_empty();
         let failover_reason = disposition.reason().filter(|_| has_standby);
-        if !result
-            .as_ref()
-            .is_ok_and(|result| result.response.status().is_success())
+        if disposition.is_definite_rejection()
+            || !result
+                .as_ref()
+                .is_ok_and(|result| result.response.status().is_success())
         {
             tracing::warn!(%request_id, route_id = %active_route.route.route_id,
                 upstream_account_id = %active_route.route.account_id,
@@ -2883,6 +2923,7 @@ async fn execute_component_provider(
     else {
         return finish_component_provider_failure(&request, None, "provider_configuration").await;
     };
+    let has_content_length = upstream.content_length().is_some();
     let upstream_body = match read_bounded_upstream(
         upstream.into(),
         maximum.min(MAX_PROXY_RESPONSE_BODY),
@@ -2942,10 +2983,27 @@ async fn execute_component_provider(
             .await;
         }
     };
-    if !request.memory.response_capture_fits(normalized.body.len())
-        || !request.memory.response_json_fits(&normalized.body)
-    {
+    if normalized.body.len() > maximum.min(MAX_PROXY_RESPONSE_BODY) {
         drop(normalized);
+        request.memory.release_buffered_response();
+        return finish_component_provider_failure(
+            &request,
+            Some("component_response"),
+            "upstream_response_too_large",
+        )
+        .await;
+    }
+    if !normalized
+        .input_memory
+        .take()
+        .is_some_and(|permit| request.memory.restore_response_envelope(permit))
+        || !request.memory.reserve_response_json(&normalized.body)
+    {
+        tracing::warn!(request_id = %request.request_id,
+            stage = "component_response_json", reserved_bytes = request.memory.buffered_response_reserved_bytes(),
+            actual_bytes = normalized.body.len(), has_content_length, "normalized response JSON memory unavailable");
+        drop(normalized);
+        request.memory.release_buffered_response();
         return finish_component_provider_failure(
             &request,
             Some("component_response"),
@@ -2954,9 +3012,14 @@ async fn execute_component_provider(
         .await;
     }
     normalized.body.shrink_to_fit();
+    request.memory.shrink_buffered_response(&normalized.body);
+    tracing::debug!(request_id = %request.request_id,
+        stage = "component_response_ready", reserved_bytes = request.memory.buffered_response_reserved_bytes(),
+        actual_bytes = normalized.body.len(), has_content_length, "normalized response memory accounted");
     let status = match StatusCode::from_u16(normalized.status) {
         Ok(status) => status,
         Err(_) => {
+            drop(normalized);
             if let Some(attempt) = upstream_attempt.as_mut() {
                 attempt
                     .complete(UpstreamAttemptTerminal::invalid_response())
@@ -2967,6 +3030,7 @@ async fn execute_component_provider(
         }
     };
     if !status.is_success() {
+        drop(normalized);
         if let Some(attempt) = upstream_attempt.as_mut() {
             attempt
                 .complete(UpstreamAttemptTerminal::invalid_response())
@@ -2998,6 +3062,7 @@ async fn execute_component_provider(
                 .is_none_or(|limit| tokens <= limit)
     });
     if !usage_is_valid {
+        drop(normalized);
         if let Some(attempt) = upstream_attempt.as_mut() {
             attempt
                 .complete(UpstreamAttemptTerminal::invalid_response())
@@ -3399,6 +3464,12 @@ async fn finish_buffered_request_before_deadline(
         && matches!(request.protocol, Protocol::OpenAiResponses))
     .then(|| extract_response_id(&body))
     .flatten();
+    if archive_response || request.memory.has_buffered_response() {
+        body = request
+            .memory
+            .own_response_bytes(body)
+            .ok_or_else(|| AppError::capacity_error("upstream_response_memory_capacity"))?;
+    }
     let stored_response =
         inline_response_object.unwrap_or_else(|| format!("gap://{request_id}/response"));
     let routing_session_id = request
