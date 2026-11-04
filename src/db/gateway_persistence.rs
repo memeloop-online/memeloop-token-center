@@ -280,7 +280,7 @@ impl Database {
         database.pool = self.gateway_persistence.pool.clone();
         database.pool_role = "gateway_archive";
         #[cfg(not(test))]
-        let timeout = JOB_TIMEOUT;
+        let timeout = Duration::from_secs(2);
         #[cfg(test)]
         let timeout = self.gateway_persistence.source_timeout;
         let deadline = tokio::time::Instant::now() + timeout;
