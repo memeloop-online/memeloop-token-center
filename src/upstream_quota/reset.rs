@@ -820,6 +820,51 @@ pub(crate) async fn reconcile(
         .await
 }
 
+pub(crate) async fn recover(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+    actor: &str,
+    operation: &str,
+) -> Result<QuotaResetOperation, AppError> {
+    let tenant_id = account.tenant_id.to_string();
+    let account_id = account.id.to_string();
+    let original = state
+        .db
+        .quota_reset_operation(&tenant_id, &account_id, operation)
+        .await?;
+    if original.state != "unknown" {
+        return Err(AppError::Conflict(
+            "reset recovery requires an unknown result and recorded dispatch completion".into(),
+        ));
+    }
+    // A current balance informs the operator; it cannot attribute an unknown
+    // supplier outcome. Recovery releases the local slot, never consumes.
+    let snapshot = fresh(state, account, credential, tenant).await?;
+    state
+        .db
+        .release_unknown_quota_reset(
+            account,
+            operation,
+            actor,
+            snapshot
+                .reset_capability
+                .available_credits
+                .ok_or_else(blocked)?,
+            snapshot
+                .reset_capability
+                .applicable_credits
+                .ok_or_else(blocked)?,
+            snapshot.observed_at.ok_or_else(blocked)?,
+        )
+        .await?;
+    state
+        .db
+        .quota_reset_operation(&tenant_id, &account_id, operation)
+        .await
+}
+
 async fn dispatch_once(
     http: &reqwest::Client,
     credential: &UpstreamCredential,
@@ -858,6 +903,112 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_json, method, path},
     };
+
+    #[tokio::test]
+    async fn explicit_unknown_recovery_only_reads_credits_and_never_consumes() {
+        let supplier = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/credits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "available_count": 1,
+                "credits": [{
+                    "id": "fixture-credit",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2020-01-01T00:00:00Z",
+                    "expires_at": "2099-01-01T00:00:00Z"
+                }]
+            })))
+            .expect(2)
+            .mount(&supplier)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&supplier)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reset-recovery.db").display()
+        )))
+        .await
+        .unwrap();
+        let tenant = "reset-recovery-fixture";
+        let credential = UpstreamCredential::OAuth {
+            access_token: "fixture-only".into(),
+            refresh_token: None,
+            expires_at: None,
+            header: "authorization".into(),
+            prefix: "Bearer ".into(),
+            adapter_state: Some(json!({
+                "schema": "openai-codex-oauth-v1", "account_id": "fixture-account"
+            })),
+            proxy_url: None,
+            proxy_network_scope: None,
+        };
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.into(),
+                    name: "reset recovery".into(),
+                    driver: "openai-codex".into(),
+                    config: json!({
+                        "base_url": "https://chatgpt.com",
+                        "reset_test_supplier_url": format!("{}/", supplier.uri())
+                    }),
+                    credential: credential.clone(),
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let operation = state
+            .db
+            .prepare_quota_reset(PrepareQuotaReset {
+                id: Uuid::now_v7(),
+                account: account.clone(),
+                actor: "fixture".into(),
+                confirmation_hash: "fixture".into(),
+                prepare_idempotency_hash: "fixture".into(),
+                available: 2,
+                applicable: 2,
+                observed_at: unix_millis() - 1_000,
+            })
+            .await
+            .unwrap()
+            .operation;
+        state
+            .db
+            .claim_quota_reset(&account, &operation.id, "fixture", "fixture", "fixture")
+            .await
+            .unwrap();
+        state
+            .db
+            .finish_quota_reset(&operation.id, false, Some("reset_dispatch_owner_ended"))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let recovered = recover(
+                &state,
+                &account,
+                &credential,
+                tenant,
+                "operator",
+                &operation.id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.state, "unknown");
+            assert!(recovered.settled_at.is_some());
+            assert_eq!(recovered.reconciled_available_credits, Some(1));
+        }
+        assert_eq!(supplier.received_requests().await.unwrap().len(), 2);
+    }
 
     #[tokio::test]
     async fn consumption_does_not_retry_retry_after_or_auth_errors() {
