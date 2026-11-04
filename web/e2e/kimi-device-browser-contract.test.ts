@@ -171,7 +171,7 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       assert.equal(await details.getByText(chinese ? '访问令牌已过期' : 'Access token expired', { exact: true }).count(), 1, 'renaming preserves the expired access-token status');
       const edit = details.getByRole('button', { name: chinese ? '编辑' : 'Edit', exact: true });
       assert.equal(await edit.evaluate(button => document.activeElement === button), true, 'successful save returns focus to account editing');
-      await details.getByRole('button', { name: chinese ? '账号设置与授权操作' : 'Account settings and authorization', exact: true }).click();
+      await details.getByRole('region', { name: chinese ? '账号设置与授权操作' : 'Account settings and authorization', exact: true }).waitFor();
       await details.getByRole('button', { name: copy[locale].reauthorize, exact: true }).click();
       await reauthorization.getByText('Kimi OAuth 0142', { exact: true }).waitFor();
       await reauthorization.getByRole('button', { name: text.editDisplayName, exact: true }).click();

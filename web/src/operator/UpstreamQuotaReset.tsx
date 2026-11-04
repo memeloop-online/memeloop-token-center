@@ -24,8 +24,8 @@ export interface QuotaResetOperation {
   dispatch_diagnostic?: { stage: 'prepare' | 'send' | 'response'; reason: string; supplier_http_status: number | null } | null;
 }
 
-export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snapshot, canRecover = false }: {
-  accountId: string; accountName: string; tenant: string; token: string; snapshot: UpstreamQuotaSnapshot; canRecover?: boolean;
+export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snapshot, canRecover = false, onQuotaChanged }: {
+  accountId: string; accountName: string; tenant: string; token: string; snapshot: UpstreamQuotaSnapshot; canRecover?: boolean; onQuotaChanged?: () => void;
 }) {
   const { locale, t } = useI18n();
   const now = useQuotaClock();
@@ -59,7 +59,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
       .then((value) => {
         if (!alive.current || identity.current !== expectedScope || !value) return;
         if (value.upstream_account_id !== accountId || !value.id) throw new Error('Invalid reset scope');
-        setOperation(value);
+        acceptOperation(value);
       })
       .catch(() => { if (alive.current && identity.current === expectedScope && !controller.signal.aborted) setError('status-unavailable'); })
       .finally(() => {
@@ -71,6 +71,19 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     return () => { controller.abort(); alive.current = false; secret.current = null; prepareIdempotencyKey.current = null; confirmIdempotencyKey.current = null; };
   }, [scope, currentPath, token, accountId]);
   const current = () => alive.current && identity.current === scope;
+  function acceptOperation(response: QuotaResetOperation | null) {
+    if (!response || response.state === 'expired' || response.state === 'accepted' && response.settled_at != null) {
+      secret.current = null; prepareIdempotencyKey.current = null; confirmIdempotencyKey.current = null;
+      setOperation(undefined);
+      if (response?.settled_at != null) setSettled({ available: response.reconciled_available_credits, applicable: response.reconciled_applicable_credits });
+    } else setOperation(response);
+  }
+  // Poll only the local operation record. Never retry a supplier reset.
+  useEffect(() => {
+    if (!operation || operation.settled_at != null || operation.state === 'unknown') return;
+    const timer = window.setInterval(() => { void reloadCurrent(); }, 5_000);
+    return () => window.clearInterval(timer);
+  }, [scope, operation?.id, operation?.state, operation?.settled_at]);
   async function reloadCurrent() {
     if (working.current || !current()) return;
     working.current = true; setBusy(true);
@@ -78,25 +91,27 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
       const response = await api<QuotaResetOperation | null>(currentPath, token, { cache: 'no-store', signal: AbortSignal.timeout(20_000) });
       if (!current()) return;
       if (response && !valid(response)) throw new Error('Invalid reset scope');
-      setOperation(response ?? undefined); setError(undefined); setRecoveryError(undefined);
+      acceptOperation(response); setError(undefined); setRecoveryError(undefined);
+      if (operation && (!response || response.state !== operation.state || response.settled_at !== operation.settled_at)) onQuotaChanged?.();
     } catch { if (current()) setError('status-unavailable'); }
     finally { if (current()) { working.current = false; setBusy(false); } }
   }
   async function dispatchPrepared(prepared: QuotaResetOperation, confirmationToken: string) {
     setOperation({ ...prepared, state: 'submitted' });
     confirmIdempotencyKey.current ??= `quota-confirm-${crypto.randomUUID()}`;
-    const response = await api<QuotaResetOperation>(path(`${encodeURIComponent(prepared.id)}/confirm`), token, { method: 'POST', headers: { 'Idempotency-Key': confirmIdempotencyKey.current }, body: JSON.stringify({ confirmation_token: confirmationToken, confirmation: 'consume_one_supplier_reset_credit' }), signal: AbortSignal.timeout(20_000) });
+    const response = await api<QuotaResetOperation>(path(`${encodeURIComponent(prepared.id)}/confirm`), token, { method: 'POST', headers: { 'Idempotency-Key': confirmIdempotencyKey.current }, body: JSON.stringify({ confirmation_token: confirmationToken, confirmation: 'consume_one_supplier_reset_credit' }), signal: AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS) });
     if (!current()) return;
     if (!valid(response) || response.id !== prepared.id) throw new Error('Invalid reset scope');
     secret.current = null;
-    setOperation(response);
+    acceptOperation(response);
+    onQuotaChanged?.();
   }
   async function prepare() {
     if (working.current || operation || error === 'status-unavailable' || !current()) return;
     working.current = true; setBusy(true); setError(undefined); setSettled(undefined);
     prepareIdempotencyKey.current ??= `quota-prepare-${crypto.randomUUID()}`;
     try {
-      const result = await api<{ operation: QuotaResetOperation; confirmation_token: string; idempotency_replayed: boolean }>(path('prepare'), token, { method: 'POST', headers: { 'Idempotency-Key': prepareIdempotencyKey.current }, signal: AbortSignal.timeout(20_000) });
+      const result = await api<{ operation: QuotaResetOperation; confirmation_token: string; idempotency_replayed: boolean }>(path('prepare'), token, { method: 'POST', headers: { 'Idempotency-Key': prepareIdempotencyKey.current }, signal: AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS) });
       if (!current()) return;
       if (!valid(result.operation) || result.operation.effect !== 'supplier_defined_codex_rate_limits' || result.operation.consumes_credits !== 1) throw new Error('Invalid reset contract');
       if (result.operation.state === 'expired') { prepareIdempotencyKey.current = null; throw new Error('Reset preparation expired'); }
@@ -106,7 +121,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
       const accepted = await confirm(t('quota.resetConfirm', { account: accountName, id: accountId, expiry: new Date(result.operation.expires_at).toLocaleString(locale) }));
       if (!current()) return;
       const confirmationToken = secret.current;
-      if (!accepted || !confirmationToken || result.operation.expires_at <= Date.now()) { secret.current = null; return; }
+      if (!accepted || !confirmationToken || result.operation.expires_at <= Date.now()) return;
       // The durable idempotency key makes an exact user-requested retry safe;
       // this component never retries a credit-consuming request automatically.
       try { await dispatchPrepared(result.operation, confirmationToken); }
@@ -131,7 +146,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
       if (!current()) return;
       if (!valid(response) || response.id !== reviewed.id || response.state !== 'unknown' || response.settled_at == null) throw new Error('Invalid recovery scope');
       secret.current = null; prepareIdempotencyKey.current = null; confirmIdempotencyKey.current = null;
-      setOperation(response); setReleased(true);
+      setOperation(response); setReleased(true); onQuotaChanged?.();
     } catch (reason) {
       if (current()) setRecoveryError(reason instanceof ApiError && reason.status === 409 ? 'stale' : reason instanceof ApiError && [401, 403].includes(reason.status) ? 'forbidden' : 'unavailable');
     } finally { if (current()) { working.current = false; setBusy(false); } }
@@ -140,7 +155,10 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     const confirmationToken = secret.current;
     if (!operation || operation.state !== 'prepared' || !confirmationToken || operation.expires_at <= Date.now() || working.current) return;
     working.current = true; setBusy(true); setError(undefined);
-    try { await dispatchPrepared(operation, confirmationToken); }
+    try {
+      const accepted = await confirm(t('quota.resetConfirm', { account: accountName, id: accountId, expiry: new Date(operation.expires_at).toLocaleString(locale) }));
+      if (accepted && current() && operation.expires_at > Date.now()) await dispatchPrepared(operation, confirmationToken);
+    }
     catch { if (current()) setError('dispatch-unknown'); }
     finally { if (current()) { working.current = false; setBusy(false); } }
   }
@@ -148,9 +166,10 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     if (!operation || working.current) return;
     working.current = true; setBusy(true); setError(undefined);
     try {
-      const response = await api<QuotaResetOperation>(path(`${encodeURIComponent(operation.id)}${reconcile ? '/reconcile' : ''}`), token, { ...(reconcile ? { method: 'POST' } : {}), signal: AbortSignal.timeout(20_000) });
+      const response = await api<QuotaResetOperation>(path(`${encodeURIComponent(operation.id)}${reconcile ? '/reconcile' : ''}`), token, { ...(reconcile ? { method: 'POST' } : {}), signal: AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS) });
       if (!current()) return;
       if (!valid(response) || response.id !== operation.id) throw new Error('Invalid reset scope');
+      if (reconcile) onQuotaChanged?.();
       if (response.state === 'unknown' && response.settled_at != null) {
         secret.current = null; prepareIdempotencyKey.current = null; confirmIdempotencyKey.current = null;
         setOperation(response); setReleased(true); return;
@@ -176,12 +195,11 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
   const unlocked = released || operation?.state === 'unknown' && operation.settled_at != null;
   const recoverable = !unlocked && operation?.state === 'unknown' && canRecover && operation.manual_unlock_available === true && Number.isFinite(operation.updated_at);
   const operationDetails = operation && <>
-    <p>{t(dispatchState ? operation.state === 'accepted' ? 'quota.resetAccepted' : 'quota.resetUncertain' : 'quota.resetPrepared')}</p>
     <code>{operation.id}</code>
     {operation.state === 'prepared' && <p data-reset-operation-expiry={operation.expires_at}>{t('quota.resetPreparedExpiresAt', { time: new Date(operation.expires_at).toLocaleString(locale) })} · {operation.expires_at <= now
       ? t('quota.resetPreparedExpired')
       : t('quota.resetPreparedExpiresIn', { time: formatCountdown(operation.expires_at - now, locale) })}</p>}
-    <p>{t(unlocked ? 'quota.recoverReleased' : 'quota.resetLocked')}</p>
+    {unlocked && <p>{t('quota.recoverReleased')}</p>}
     {operation.quota_refresh_status && <p>{t(operation.quota_refresh_status === 'succeeded' ? 'quota.resetReadbackSucceeded' : operation.quota_refresh_status === 'pending' ? 'quota.resetReadbackPending' : 'quota.resetReadbackNotAttempted')}</p>}
     {operation.dispatch_diagnostic && <p>{t(['timeout', 'connect_timeout', 'connect_failed'].includes(operation.dispatch_diagnostic.reason) ? 'quota.resetNetworkUnknown' : 'quota.resetDispatchUnknown')}</p>}
     {operation.last_reconciled_at !== null && <p>{t('quota.resetReconciled', { time: new Date(operation.last_reconciled_at).toLocaleString(locale), available: operation.reconciled_available_credits ?? '—', applicable: operation.reconciled_applicable_credits ?? '—' })}</p>}
@@ -196,13 +214,12 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
     {!operation && error === 'status-unavailable' && <Button disabled={busy} onClick={() => void reloadCurrent()}>{t('quota.resetCheckStatus')}</Button>}
     {recoveryError && <p role="alert">{t(recoveryError === 'stale' ? 'quota.recoverStale' : recoveryError === 'forbidden' ? 'quota.recoverForbidden' : 'quota.recoverUnavailable')}</p>}
     {operation && <div role="status">
-      {operation.state === 'unknown' ? <>
-        <p>{t(unlocked ? 'quota.recoverReady' : recoverable ? 'quota.recoverHelp' : 'quota.resetUncertain')}</p>
-        <Disclosure title={t('quota.resetOperationDetails')}>{operationDetails}</Disclosure>
-      </> : operationDetails}
+      <p>{t(unlocked ? 'quota.recoverReady' : recoverable ? 'quota.recoverHelp' : operation.state === 'accepted' ? 'quota.resetAccepted' : operation.state === 'prepared' ? secret.current ? 'quota.resetPrepared' : 'quota.resetPreparedWaiting' : operation.state === 'unknown' && !canRecover ? 'quota.resetAskOperator' : 'quota.resetUncertain')}</p>
+      {operation.quota_refresh_status === 'pending' && <p>{t('quota.resetReadbackPending')}</p>}
+      <Disclosure title={t('quota.resetOperationDetails')}>{operationDetails}</Disclosure>
       <div className="button-row">
-        {(!recoverable && !unlocked || recoveryError || error) && <button type="button" className="secondary" disabled={busy} onClick={() => void inspect(false)}>{t('quota.resetCheckStatus')}</button>}
-        {operation.state === 'prepared' && secret.current && <button type="button" className="danger" disabled={busy} onClick={() => void retryConfirmation()}>{t('quota.resetRetryConfirmation')}</button>}
+        {(recoveryError || error || operation.state === 'prepared' && !secret.current) && <button type="button" className="secondary" disabled={busy} onClick={() => void inspect(false)}>{t('quota.resetCheckStatus')}</button>}
+        {operation.state === 'prepared' && secret.current && <button type="button" className="danger" disabled={busy || operation.expires_at <= now} onClick={() => void retryConfirmation()}>{t('quota.resetRetryConfirmation')}</button>}
         {dispatchState && !recoverable && !unlocked && <button type="button" className="secondary" disabled={busy} onClick={() => void inspect(true)}>{t('quota.resetReconcile')}</button>}
       </div>
       {recoverable && <div style={{ display: 'grid', gap: 12, justifyItems: 'start', maxWidth: '100%' }}>

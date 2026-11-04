@@ -101,22 +101,46 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await page.screenshot({ path: join(artifacts, 'upstream-quota-confirm-mobile.png'), fullPage: true });
     await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
     await dialog.waitFor({ state: 'hidden' });
-    const status = page.getByRole('button', { name: 'Check operation status', exact: true });
-    await status.waitFor();
+    await page.getByRole('button', { name: 'Continue reset confirmation', exact: true }).waitFor();
     assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [1, 0, 1], 'cancel permits only non-consuming preparation');
     assert.equal(await reset.count(), 0, 'cancelled preparation remains locked');
     // Re-entering the page recovers the durable prepared operation without its
     // confirmation secret, while keeping the exact deadline and live countdown visible.
     await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=prepared-current`);
     await view.click();
+    await page.getByRole('button', { name: 'Previous operation details', exact: true }).click();
     const recoveredExpiry = page.locator('[data-reset-operation-expiry]');
     await recoveredExpiry.waitFor();
     const exactPreparedExpiry = await page.evaluate(() => new Date(Date.now() + 120_000).toLocaleString('en'));
     assert.equal(await recoveredExpiry.innerText(), `Confirmation expires ${exactPreparedExpiry} · Expires in 2m`);
     assert.deepEqual(await page.evaluate(() => [window.quotaCurrents, window.quotaPrepares, window.quotaConfirms]), [1, 0, 0], 'page re-entry only recovers the prepared operation');
-    assert.equal(await page.getByRole('button', { name: 'Retry this confirmation', exact: true }).count(), 0, 'the confirmation secret is never recovered from durable state');
+    assert.equal(await page.getByRole('button', { name: 'Continue reset confirmation', exact: true }).count(), 0, 'the confirmation secret is never recovered from durable state');
     await page.clock.fastForward(61_000);
     await page.getByText(/Expires in less than 1 min/, { exact: false }).waitFor();
+    await page.clock.fastForward(65_000);
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
+    await reset.waitFor();
+    assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms]), [0, 0], 'expired preparation unlocks automatically without consuming a credit');
+    // A failed status read has an explicit retry; a settled reset refreshes all
+    // displayed values and permits a separately confirmed future reset.
+    await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=status-retry`);
+    await view.click();
+    await page.getByRole('button', { name: 'Check operation status', exact: true }).click();
+    await page.waitForFunction(() => window.quotaCurrents === 2);
+    assert.equal(await reset.isEnabled(), true);
+    await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=reset-settled`);
+    await view.click();
+    await reset.click();
+    await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
+    await page.getByRole('button', { name: 'Continue reset confirmation', exact: true }).click();
+    await dialog.waitFor();
+    assert.equal(await page.evaluate(() => window.quotaConfirms), 0, 'resuming canceled preparation still requires explicit confirmation');
+    await dialog.getByRole('button', { name: 'Confirm and continue', exact: true }).click();
+    await page.waitForFunction(() => window.quotaReads === 2 && window.quotaConfirms === 1);
+    assert.equal(await reset.isEnabled(), true, 'a settled accepted operation no longer locks this account');
+    assert.deepEqual(await page.getByRole('meter').evaluateAll(nodes => nodes.map(node => node.getAttribute('value'))), ['0', '0']);
+    assert.match(await page.locator('.upstream-quota').innerText(), /20\.00/);
+    assert.match(await page.locator('.upstream-quota-reset').innerText(), /1/);
     // Fresh mount starts an independent operation; only explicit confirmation consumes.
     await page.goto(quotaUrl);
     await view.click();
@@ -126,11 +150,9 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     const reconcile = page.getByRole('button', { name: 'Reconcile upstream quota (read only)', exact: true });
     await reconcile.waitFor();
     assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms]), [1, 1]);
-    await status.click();
-    await page.waitForFunction(() => window.quotaStatuses === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     await reconcile.click();
     await page.waitForFunction(() => window.quotaReconciles === 1 && !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
-    assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaStatuses, window.quotaReconciles, window.quotaWrites]), [1, 1, 1, 1, 3], 'inspection never repeats preparation or consumption');
+    assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaStatuses, window.quotaReconciles, window.quotaWrites]), [1, 1, 0, 1, 3], 'inspection never repeats preparation or consumption');
     assert.equal(await reset.count(), 0);
     // A driver with no quota adapter is an explicit product limitation, not
     // evidence that the supplier has no quota or that reset is unsupported.

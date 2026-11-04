@@ -30,7 +30,7 @@ const snapshot: UpstreamQuotaSnapshot = {
   reset_credits: [],
   error_code: mode === 'stale-error' ? 'quota_destination_invalid' : mode === 'rate-limited' ? 'quota_rate_limited' : null,
 };
-if (recoveryMode) snapshot.reset_capability = { ...snapshot.reset_capability, implementation_available: true, prepare_available: true };
+if (recoveryMode || mode === 'reset-settled' || mode === 'status-retry') snapshot.reset_capability = { ...snapshot.reset_capability, implementation_available: true, prepare_available: true };
 if (mode === 'kimi') {
   snapshot.provider = 'kimi-oauth'; snapshot.stale = false; snapshot.stale_after = now + 300_000;
   snapshot.freshness = 'fresh'; snapshot.capabilities = { ...snapshot.capabilities, plan: false, window_amounts: true, reset_credit_expiry: false };
@@ -62,7 +62,9 @@ window.fetch = async (_input, init) => {
   const path = String(_input);
   if (url.pathname === `${reset}current`) {
     window.quotaCurrents += 1;
-    return new Response(mode === 'prepared-current' || recoveryMode ? JSON.stringify(operation) : 'null');
+    if (mode === 'status-retry' && window.quotaCurrents === 1) return new Response('{}', { status: 503 });
+    if (operation.state === 'prepared' && operation.expires_at <= Date.now()) operation = { ...operation, state: 'expired' };
+    return new Response(operation.state === 'expired' || operation.state === 'accepted' && operation.settled_at != null ? 'null' : mode === 'prepared-current' || recoveryMode || window.quotaPrepares > 0 ? JSON.stringify(operation) : 'null');
   }
   if (path.includes('/quota-reset/')) {
     if (path.includes('/prepare')) {
@@ -75,6 +77,12 @@ window.fetch = async (_input, init) => {
       if (body.confirmation !== 'consume_one_supplier_reset_credit' || body.confirmation_token !== 'mock-confirmation-not-a-real-credential') throw new Error('Invalid mock confirmation');
       window.quotaConfirms += 1;
       operation = { ...operation, state: mode === 'unknown' ? 'unknown' : 'accepted', quota_refresh_status: recoveryMode ? 'pending' : 'not_attempted' };
+      if (mode === 'reset-settled') {
+        operation = { ...operation, settled_at: Date.now(), reconciled_available_credits: 1, reconciled_applicable_credits: 1, quota_refresh_status: 'succeeded' };
+        snapshot.windows = snapshot.windows.map(window => ({ ...window, used_percent: 0, remaining: 100 }));
+        snapshot.credits.balance = '20.00';
+        snapshot.reset_capability.available_credits = 1;
+      }
     }
     if (path.includes('/recover')) {
       const body = JSON.parse(String(init?.body));
