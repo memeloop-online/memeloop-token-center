@@ -29,6 +29,7 @@ pub mod uninstall;
 pub use empty::RegisterEmptyInventory;
 pub mod installation;
 pub mod prepare;
+mod request_dependencies;
 mod retained_installation;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
@@ -62,6 +63,7 @@ pub struct ApplicationRevision {
 pub struct ApplicationPluginStatus {
     pub current: Option<ApplicationRevision>,
     pub candidates: Vec<ApplicationPluginCandidate>,
+    pub runtime: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -96,6 +98,8 @@ pub struct RollbackApplicationPlugin {
 pub struct ApplicationPlugins {
     db: Database,
     current: std::sync::RwLock<CurrentSnapshot>,
+    baseline_provider_ids: std::collections::BTreeSet<String>,
+    request_dependencies: tokio::sync::Mutex<Option<(ApplicationRevision, bool)>>,
     refresh: tokio::sync::Mutex<()>,
     inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
     inventory_file: Option<PathBuf>,
@@ -243,6 +247,7 @@ impl ApplicationPlugins {
         let staged = self.db.staged_application_plugin_ids().await?;
         Ok(ApplicationPluginStatus {
             current,
+            runtime: self.refresh_status(),
             candidates: self
                 .inventory
                 .read()
@@ -269,7 +274,7 @@ impl ApplicationPlugins {
     pub fn new(
         db: Database,
         inventory: BTreeMap<String, PreinstalledInventory>,
-        _baseline: &PluginRuntime,
+        baseline: &PluginRuntime,
     ) -> Result<Self, AppError> {
         for (id, entry) in &inventory {
             validate_inventory_id(id)?;
@@ -280,6 +285,12 @@ impl ApplicationPlugins {
         Ok(Self {
             db,
             current: std::sync::RwLock::new(CurrentSnapshot::default()),
+            baseline_provider_ids: baseline
+                .provider_types()
+                .into_iter()
+                .map(|provider| provider.id)
+                .collect(),
+            request_dependencies: tokio::sync::Mutex::new(None),
             refresh: tokio::sync::Mutex::new(()),
             inventory: tokio::sync::RwLock::new(inventory),
             inventory_file: None,
@@ -646,6 +657,9 @@ impl ApplicationPlugins {
             if current.initialized {
                 return Ok(current.snapshot.clone());
             }
+        }
+        if self.baseline_is_independent().await? {
+            return Ok(None);
         }
         self.refresh_current_inner(true).await?;
         self.current_snapshot()
