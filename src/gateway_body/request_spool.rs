@@ -677,6 +677,7 @@ impl RequestSpool {
 
     /// Drop the in-memory copy. A settled object, when one was written, stays
     /// until this spool is dropped so a replacement pod can still read it.
+    #[cfg(test)]
     pub(crate) fn release_retained(&self) {
         release_resident_memory(&self.shared);
     }

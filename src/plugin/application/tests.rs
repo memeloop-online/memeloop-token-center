@@ -1181,7 +1181,7 @@ async fn configured_empty_inventory_preserves_baseline_and_reports_no_revision()
     );
     assert_eq!(
         control_get(&state, "/internal/v1/plugin-runtime").await,
-        json!({"current":null,"candidates":[]})
+        json!({"current":null,"candidates":[],"runtime":{"ready":true,"revision":null,"error":null}})
     );
     let authority = state.application_plugins.as_ref().unwrap();
     assert_eq!(

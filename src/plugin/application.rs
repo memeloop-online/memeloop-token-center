@@ -658,10 +658,16 @@ impl ApplicationPlugins {
                 return Ok(current.snapshot.clone());
             }
         }
-        if self.baseline_is_independent().await? {
+        if self
+            .baseline_is_independent()
+            .await
+            .map_err(|_| AppError::capacity_error("plugin_snapshot_unavailable"))?
+        {
             return Ok(None);
         }
-        self.refresh_current_inner(true).await?;
+        self.refresh_current_inner(true)
+            .await
+            .map_err(|_| AppError::capacity_error("plugin_snapshot_unavailable"))?;
         self.current_snapshot()
     }
 
