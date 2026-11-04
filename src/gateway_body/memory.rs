@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn json_admission_is_atomic_when_bytes_fit_but_nodes_do_not() {
-        let budget = ProxyMemoryBudget::new(4 * UNIT_BYTES as u32);
+        let budget = ProxyMemoryBudget::new(4 * UNIT_BYTES as u64);
         let blocker = budget.reservation();
         assert!(blocker.try_grow(2 * UNIT_BYTES, 1));
         let memory = budget.reservation();
@@ -783,7 +783,7 @@ mod tests {
 
     #[test]
     fn failed_response_growth_and_payload_transfer_preserve_existing_permits() {
-        let budget = ProxyMemoryBudget::new(2 * UNIT_BYTES as u32);
+        let budget = ProxyMemoryBudget::new(2 * UNIT_BYTES as u64);
         let memory = budget.reservation();
         assert!(memory.try_grow(1234, 1));
         assert!(memory.reserve_buffered_response(1, tokio::time::Instant::now()));
@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn sse_streaming_envelope_limits_concurrency_and_releases_capacity() {
         let framed_bytes = 8 * UNIT_BYTES;
-        let budget = ProxyMemoryBudget::new((framed_bytes * SSE_STREAMING_MEMORY_WEIGHT) as u32);
+        let budget = ProxyMemoryBudget::new((framed_bytes * SSE_STREAMING_MEMORY_WEIGHT) as u64);
         let first = budget.reservation();
         let first_permit = first
             .try_reserve_sse_streaming(framed_bytes)
