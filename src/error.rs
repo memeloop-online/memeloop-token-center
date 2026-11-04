@@ -837,6 +837,34 @@ pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'stat
         ),
         "upstream_unavailable" => ("配置的上游不可用", "the configured upstream is unavailable"),
         "upstream_rejected" => ("上游拒绝了这次请求", "the upstream rejected the request"),
+        "context_length_exceeded" => (
+            "请求超过模型的上下文窗口，需要压缩或缩短上下文",
+            "the input exceeds the model context window; compact or shorten the context",
+        ),
+        "usage_not_included" => (
+            "当前上游套餐不包含此次请求的用量",
+            "the upstream plan does not include this usage",
+        ),
+        "invalid_prompt" => (
+            "上游判定请求内容无效，需要调整请求",
+            "the upstream rejected the prompt as invalid; adjust the request",
+        ),
+        "misalignment_policy_violation" => (
+            "上游安全系统因潜在的非预期活动拒绝了此次请求",
+            "the upstream safety system blocked this request for potentially unintended activity",
+        ),
+        "cyber_policy" => (
+            "上游安全系统因网络安全风险拒绝了此次请求",
+            "the upstream safety system blocked this request for cybersecurity risk",
+        ),
+        "bio_policy" => (
+            "上游安全系统因生物安全风险拒绝了此次请求",
+            "the upstream safety system blocked this request for biological safety risk",
+        ),
+        "server_is_overloaded" | "slow_down" => (
+            "上游服务当前过载",
+            "the upstream service is currently overloaded",
+        ),
         "idempotency_claim_lost" => (
             "图片幂等声明在发给上游之前丢失了",
             "the image idempotency claim was lost before the upstream request was sent",
