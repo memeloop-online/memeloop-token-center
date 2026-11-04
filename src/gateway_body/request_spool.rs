@@ -942,15 +942,26 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                     };
                     let (wrote, permit) = tokio::join!(lease, handoff);
                     if let (Some(_permit), Some(wrote)) = (permit, wrote) {
-                        database
-                            .complete_request_source(
-                                identity,
-                                &key,
-                                source.length,
-                                source.digest,
-                                wrote,
-                            )
-                            .await;
+                        if wrote {
+                            database
+                                .complete_uploaded_request_source(
+                                    identity,
+                                    &key,
+                                    source.length,
+                                    source.digest,
+                                )
+                                .await;
+                        } else {
+                            database
+                                .complete_request_source(
+                                    identity,
+                                    &key,
+                                    source.length,
+                                    source.digest,
+                                    false,
+                                )
+                                .await;
+                        }
                     }
                     break;
                 }
