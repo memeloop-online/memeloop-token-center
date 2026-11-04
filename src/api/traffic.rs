@@ -64,10 +64,12 @@ pub(super) async fn proxy_openai_responses(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !memory.try_grow(
-        spool.len(),
-        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
-    ) {
+    if !state.responses_request_spool.reclaim_for(|| {
+        memory.try_grow(
+            spool.len(),
+            crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+        )
+    }) {
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
@@ -102,10 +104,12 @@ pub(super) async fn proxy_openai_responses_compact(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !memory.try_grow(
-        spool.len(),
-        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
-    ) {
+    if !state.responses_request_spool.reclaim_for(|| {
+        memory.try_grow(
+            spool.len(),
+            crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+        )
+    }) {
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
