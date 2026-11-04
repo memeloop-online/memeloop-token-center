@@ -677,6 +677,7 @@ impl RequestSpool {
 
     /// Drop the in-memory copy. A settled object, when one was written, stays
     /// until this spool is dropped so a replacement pod can still read it.
+    #[cfg(test)]
     pub(crate) fn release_retained(&self) {
         release_resident_memory(&self.shared);
     }
@@ -941,15 +942,26 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                     };
                     let (wrote, permit) = tokio::join!(lease, handoff);
                     if let (Some(_permit), Some(wrote)) = (permit, wrote) {
-                        database
-                            .complete_request_source(
-                                identity,
-                                &key,
-                                source.length,
-                                source.digest,
-                                wrote,
-                            )
-                            .await;
+                        if wrote {
+                            database
+                                .complete_uploaded_request_source(
+                                    identity,
+                                    &key,
+                                    source.length,
+                                    source.digest,
+                                )
+                                .await;
+                        } else {
+                            database
+                                .complete_request_source(
+                                    identity,
+                                    &key,
+                                    source.length,
+                                    source.digest,
+                                    false,
+                                )
+                                .await;
+                        }
                     }
                     break;
                 }
