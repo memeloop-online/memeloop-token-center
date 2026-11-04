@@ -176,12 +176,17 @@ impl SynchronousImageUpstreamResponse {
         }
     }
 
-    async fn classify_rate_limit(self) -> crate::db::UpstreamFailureKind {
+    async fn read_rejection(
+        self,
+    ) -> (
+        crate::api::proxy::upstream_error::Rejection,
+        Option<crate::db::UpstreamFailureKind>,
+    ) {
         match self {
-            Self::Reqwest(response) => crate::api::classify_media_rate_limit(response).await,
-            Self::Codex(response) => {
-                crate::api::proxy::classify_codex_media_rate_limit(response).await
+            Self::Reqwest(response) => {
+                crate::api::proxy::read_media_rejection(response, false).await
             }
+            Self::Codex(response) => crate::api::proxy::read_media_rejection(response, true).await,
         }
     }
 }
@@ -438,15 +443,21 @@ pub(super) async fn execute_synchronous_image_request(
             .store(true, std::sync::atomic::Ordering::Release);
     }
     if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-        let kind = upstream.classify_rate_limit().await;
+        let (rejection, kind) = upstream.read_rejection().await;
         attempt
             .complete(crate::api::MediaAttemptTerminal::Failed {
-                kind,
+                kind: kind.unwrap_or(crate::db::UpstreamFailureKind::RateLimited),
                 reason: crate::metrics::UpstreamHealthReason::RateLimited,
                 failure_stage: "upstream_response",
             })
             .await;
-        return fail_image_request(context, "upstream_http_429").await;
+        return fail_image_request_with_details(
+            context,
+            "upstream_http_429",
+            None,
+            Some(rejection.body),
+        )
+        .await;
     }
     let failure = if matches!(
         upstream_status,
@@ -474,16 +485,13 @@ pub(super) async fn execute_synchronous_image_request(
             .await;
     }
     if !upstream_status.is_success() {
-        let response = match upstream {
-            SynchronousImageUpstreamResponse::Reqwest(response)
-            | SynchronousImageUpstreamResponse::Codex(response) => response,
-        };
-        let rejection = crate::api::proxy::upstream_error::read_reqwest_rejection(response).await;
+        let (rejection, _) = upstream.read_rejection().await;
         let error_code = rejection.reason().map_or_else(
             || format!("upstream_http_{}", upstream_status.as_u16()),
             |reason| reason.code().to_owned(),
         );
-        return fail_image_request(context, &error_code).await;
+        return fail_image_request_with_details(context, &error_code, None, Some(rejection.body))
+            .await;
     }
     let response_bytes = match read_synchronous_image_response_bounded(upstream).await {
         Ok(bytes) => bytes,
@@ -655,13 +663,14 @@ pub(super) async fn fail_image_request(
     context: &SyncImageRequest<'_>,
     error_code: &str,
 ) -> Result<Response, AppError> {
-    fail_image_request_with_staging(context, error_code, None).await
+    fail_image_request_with_details(context, error_code, None, None).await
 }
 
-async fn fail_image_request_with_staging(
+async fn fail_image_request_with_details(
     context: &SyncImageRequest<'_>,
     error_code: &str,
     result_lease: Option<&crate::archive_staging::ArchiveStagingWriteLease>,
+    upstream_details: Option<Bytes>,
 ) -> Result<Response, AppError> {
     if submission_may_have_started(context).await?
         && !context
@@ -692,11 +701,28 @@ async fn fail_image_request_with_staging(
             tracing::warn!(request_id=%context.request_id, error_category=error.diagnostic_category(),
                 "uncertain image result cleanup publication failed; lease expiry retains recovery");
         }
-        return Ok(quarantine_image_request(context).await);
+        let response = quarantine_image_request(context).await;
+        if let Some(details) = upstream_details {
+            let (mut parts, body) = response.into_parts();
+            let body = axum::body::to_bytes(body, 128 * 1024)
+                .await
+                .map_err(|_| AppError::internal("image_rejection_response"))?;
+            let mut value: Value = serde_json::from_slice(&body)
+                .map_err(|_| AppError::internal("image_rejection_projection"))?;
+            value["error"]["upstream_error"] = serde_json::from_slice::<Value>(&details)
+                .map_err(|_| AppError::internal("image_upstream_rejection_projection"))?["error"]
+                .clone();
+            parts.headers.remove(header::CONTENT_LENGTH);
+            return Ok(Response::from_parts(parts, Body::from(value.to_string())));
+        }
+        return Ok(response);
     }
     let state = context.state;
     let request_id = context.request_id;
-    let response_object = format!("gap://{request_id}/response");
+    let response_object = upstream_details.as_ref().map_or_else(
+        || format!("gap://{request_id}/response"),
+        |body| format!("inline-json:{}", String::from_utf8_lossy(body)),
+    );
     let (response, cleanup_staging) = match commit_synchronous_image_terminal(
         context,
         502,
@@ -710,7 +736,22 @@ async fn fail_image_request_with_staging(
     .await?
     {
         FinishSynchronousImageResult::Finished { .. } => {
-            (replayed_image_failure(request_id, error_code), false)
+            let response = upstream_details.map_or_else(
+                || replayed_image_failure(request_id, error_code),
+                |body| {
+                    let mut response = (
+                        StatusCode::BAD_GATEWAY,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        body,
+                    )
+                        .into_response();
+                    if let Ok(id) = request_id.to_string().parse() {
+                        response.headers_mut().insert(REQUEST_ID_HEADER, id);
+                    }
+                    response
+                },
+            );
+            (response, false)
         }
         FinishSynchronousImageResult::Replay(replay) => {
             let cleanup = matches!(&replay, SynchronousImageIdempotencyClaim::Failed { .. });

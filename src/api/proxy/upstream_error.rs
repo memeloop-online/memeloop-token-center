@@ -6,7 +6,7 @@ use http::{HeaderMap, StatusCode, header};
 use serde_json::{Value, json};
 
 use super::upstream_response::UpstreamResponse;
-use crate::{model::RequestTerminalCause, supplier_error::SafeReason};
+use crate::{model::RequestTerminalCause, supplier_error::UpstreamReason};
 
 pub(super) const MAX_ERROR_BYTES: usize = 16 * 1024;
 const MAX_ERROR_WAIT: Duration = Duration::from_secs(5);
@@ -54,7 +54,7 @@ pub(super) fn fallback_body() -> Bytes {
     )
 }
 
-pub(in crate::api) fn safe_error_body(raw: &[u8]) -> Bytes {
+pub(in crate::api) fn normalized_error_body(raw: &[u8]) -> Bytes {
     if raw.is_empty() {
         return fallback_body();
     }
@@ -92,15 +92,15 @@ pub(in crate::api) async fn read_rejection(response: UpstreamResponse) -> Reject
                     body.extend_from_slice(
                         b"\n[MTC: upstream error body truncated at 16384 bytes]",
                     );
-                    return (safe_error_body(&body), None);
+                    return (normalized_error_body(&body), None);
                 }
                 Some(Err(error)) => {
                     return (
-                        safe_error_body(&body),
+                        normalized_error_body(&body),
                         super::upstream_response::terminal_cause_from_stream_error(error),
                     );
                 }
-                None => return (safe_error_body(&body), None),
+                None => return (normalized_error_body(&body), None),
             }
         }
     };
@@ -110,7 +110,7 @@ pub(in crate::api) async fn read_rejection(response: UpstreamResponse) -> Reject
             body.extend_from_slice(
                 b"\n[MTC: timed out reading upstream error body after 5 seconds]",
             );
-            (safe_error_body(&body), None)
+            (normalized_error_body(&body), None)
         });
     Rejection {
         body,
@@ -119,7 +119,7 @@ pub(in crate::api) async fn read_rejection(response: UpstreamResponse) -> Reject
 }
 
 impl Rejection {
-    pub(in crate::api) fn reason(&self) -> Option<SafeReason> {
+    pub(in crate::api) fn reason(&self) -> Option<UpstreamReason> {
         let value = crate::api::sse::parse_unique_json(&self.body).ok()?;
         crate::supplier_error::reason_from_value(&value)
     }

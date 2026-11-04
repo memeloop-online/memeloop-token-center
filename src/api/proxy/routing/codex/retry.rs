@@ -29,7 +29,7 @@ impl CodexRetryState {
     ) -> AttemptControl {
         let error = match disposition {
             codex_transport::BadRequestDisposition::DefiniteRejection(reason) => {
-                ProxySendError::CodexRejection(crate::api::proxy::upstream_error::safe_error_body(
+                ProxySendError::CodexRejection(crate::api::proxy::upstream_error::normalized_error_body(
                     serde_json::json!({"error":{"code":reason.code(),"message":reason.message()}})
                         .to_string()
                         .as_bytes(),

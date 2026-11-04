@@ -257,44 +257,46 @@ pub(super) async fn create_audio_transcription(
             );
             let upstream_status = upstream.status();
             if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-                let kind =
-                    match tokio::time::timeout_at(deadline, classify_media_rate_limit(upstream))
-                        .await
-                    {
-                        Ok(kind) => kind,
-                        Err(_) => {
-                            attempt.complete(audio_transport_failure()).await;
-                            finish_audio_failure(
-                                &state,
-                                &reservation,
-                                request_id,
-                                key.tenant_id,
-                                audio,
-                                started,
-                                "audio_upstream_timeout",
-                            )
-                            .await?;
-                            return Err(AppError::upstream("audio_upstream_timed_out"));
-                        }
-                    };
+                let (rejection, kind) = match tokio::time::timeout_at(
+                    deadline,
+                    crate::api::proxy::read_media_rejection(upstream, false),
+                )
+                .await
+                {
+                    Ok(kind) => kind,
+                    Err(_) => {
+                        attempt.complete(audio_transport_failure()).await;
+                        finish_audio_failure(
+                            &state,
+                            &reservation,
+                            request_id,
+                            key.tenant_id,
+                            audio,
+                            started,
+                            "audio_upstream_timeout",
+                        )
+                        .await?;
+                        return Err(AppError::upstream("audio_upstream_timed_out"));
+                    }
+                };
                 attempt
                     .complete(MediaAttemptTerminal::Failed {
-                        kind,
+                        kind: kind.unwrap_or(crate::db::UpstreamFailureKind::RateLimited),
                         reason: crate::metrics::UpstreamHealthReason::RateLimited,
                         failure_stage: "upstream_response",
                     })
                     .await;
-                finish_audio_failure(
+                return finish_audio_rejection(
                     &state,
                     &reservation,
                     request_id,
                     key.tenant_id,
                     audio,
                     started,
+                    rejection,
                     "audio_upstream_rate_limited",
                 )
-                .await?;
-                return Err(AppError::upstream("audio_upstream_rate_limited"));
+                .await;
             }
             if !upstream_status.is_success() {
                 let terminal = if matches!(
@@ -318,23 +320,17 @@ pub(super) async fn create_audio_transcription(
                 attempt.complete(terminal).await;
                 let rejection =
                     crate::api::proxy::upstream_error::read_reqwest_rejection(upstream).await;
-                let error_code = rejection
-                    .reason()
-                    .map_or("audio_upstream_rejected", |reason| reason.code());
-                finish_audio_failure(
+                return finish_audio_rejection(
                     &state,
                     &reservation,
                     request_id,
                     key.tenant_id,
                     audio,
                     started,
-                    error_code,
+                    rejection,
+                    "audio_upstream_rejected",
                 )
-                .await?;
-                return Err(AppError::upstream_with(
-                    error_code,
-                    crate::error::ErrorFacts::new().stage("audio_upstream"),
-                ));
+                .await;
             }
             let upstream_body = match read_audio_response_bounded(upstream, deadline).await {
                 Ok(body) => body,
@@ -938,6 +934,35 @@ fn metadata_only_locator(metadata: Value) -> Result<String, AppError> {
         serde_json::to_string(&metadata)
             .map_err(|_| AppError::internal("audio_metadata_only_locator_1"))?
     ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_audio_rejection(
+    state: &AppState,
+    reservation: &crate::model::MeteredUsageReservation,
+    request_id: Uuid,
+    tenant_id: Uuid,
+    audio: Pcm16WavDuration,
+    started: Instant,
+    rejection: crate::api::proxy::upstream_error::Rejection,
+    fallback_code: &'static str,
+) -> Result<Response, AppError> {
+    let error_code = rejection
+        .reason()
+        .map_or(fallback_code, |reason| reason.code());
+    let details: Value = serde_json::from_slice(&rejection.body)
+        .map_err(|_| AppError::internal("audio_rejection_projection"))?;
+    finish_audio_request(
+        state, reservation, request_id, tenant_id, audio, started,
+        StatusCode::BAD_GATEWAY, 0, Some(error_code),
+        json!({"kind":"audio_transcription","media_archived":false,"succeeded":false,"upstream_error":details}),
+    ).await?;
+    Ok((
+        StatusCode::BAD_GATEWAY,
+        [(header::CONTENT_TYPE, "application/json")],
+        rejection.body,
+    )
+        .into_response())
 }
 
 async fn finish_audio_failure(

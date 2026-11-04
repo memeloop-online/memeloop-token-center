@@ -40,7 +40,7 @@ fn classify(headers: &HeaderMap, body: Option<&[u8]>, now: i64) -> UpstreamFailu
 }
 
 fn exhausted_error(error: &Value) -> bool {
-    use crate::supplier_error::SafeReason;
+    use crate::supplier_error::UpstreamReason;
     let message = match (error.get("message"), error.get("msg")) {
         (Some(_), Some(_)) => return false,
         (Some(message), None) | (None, Some(message)) => message.as_str(),
@@ -48,19 +48,19 @@ fn exhausted_error(error: &Value) -> bool {
     };
     let code = error.get("code").and_then(Value::as_str);
     let kind = error.get("type").and_then(Value::as_str);
-    let reason = SafeReason::from_supplier(code.or(kind), message);
+    let reason = UpstreamReason::from_supplier(code.or(kind), message);
     if kind == Some("usage_limit_reached") {
         return [
-            SafeReason::from_supplier(code, None),
-            SafeReason::from_supplier(None, message),
+            UpstreamReason::from_supplier(code, None),
+            UpstreamReason::from_supplier(None, message),
         ]
         .into_iter()
-        .all(|reason| reason.is_none_or(|reason| reason == SafeReason::InsufficientQuota));
+        .all(|reason| reason.is_none_or(|reason| reason == UpstreamReason::InsufficientQuota));
     }
     matches!(
         code.or(kind),
         Some("insufficient_quota" | "insufficient_user_quota")
-    ) && reason == Some(SafeReason::InsufficientQuota)
+    ) && reason == Some(UpstreamReason::InsufficientQuota)
 }
 
 pub(in crate::api::proxy) fn quota_evidence(
@@ -251,7 +251,7 @@ fn stream_quota_evidence(
     headers: &HeaderMap,
     error: &Value,
 ) -> Option<(UpstreamFailureKind, SupplierQuotaEvidence)> {
-    use crate::supplier_error::SafeReason;
+    use crate::supplier_error::UpstreamReason;
     let field = |name| match error.get(name) {
         None | Some(Value::Null) => Some(None),
         Some(Value::String(value)) => Some(Some(value.as_str())),
@@ -260,15 +260,15 @@ fn stream_quota_evidence(
     let code = field("code")?;
     let kind = field("type")?;
     let reason_for = |value| match value {
-        "rate_limit_error" => Some(SafeReason::RateLimited),
-        "usage_limit_reached" => Some(SafeReason::InsufficientQuota),
-        "authentication_error" | "permission_error" => Some(SafeReason::AuthenticationInvalid),
-        _ => SafeReason::from_supplier(Some(value), None),
+        "rate_limit_error" => Some(UpstreamReason::RateLimited),
+        "usage_limit_reached" => Some(UpstreamReason::InsufficientQuota),
+        "authentication_error" | "permission_error" => Some(UpstreamReason::AuthenticationInvalid),
+        _ => UpstreamReason::from_supplier(Some(value), None),
     };
     let reason = reason_for(code.or(kind)?)?;
     if !matches!(
         reason,
-        SafeReason::RateLimited | SafeReason::InsufficientQuota
+        UpstreamReason::RateLimited | UpstreamReason::InsufficientQuota
     ) || [code, kind]
         .into_iter()
         .flatten()
@@ -286,13 +286,13 @@ fn stream_quota_evidence(
         (Some(message), None) | (None, Some(message)) => Some(message.as_str()?),
         _ => None,
     };
-    if SafeReason::from_supplier(None, message).is_some_and(|other| other != reason) {
+    if UpstreamReason::from_supplier(None, message).is_some_and(|other| other != reason) {
         return None;
     }
     let body = serde_json::to_vec(error).ok()?;
     let now = unix_millis();
     let mut evidence = quota_evidence(headers, Some(&body), now);
-    evidence.exhausted = reason == SafeReason::InsufficientQuota;
+    evidence.exhausted = reason == UpstreamReason::InsufficientQuota;
     let failure = if evidence.exhausted || evidence.reset_at.is_some() {
         UpstreamFailureKind::RateLimitedUntil {
             exhausted: evidence.exhausted,

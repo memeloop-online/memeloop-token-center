@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 const MAX_INLINE_JSON_BYTES: usize = 128 * 1024;
 mod reason;
-pub(crate) use reason::SafeReason;
+pub(crate) use reason::UpstreamReason;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupplierError {
@@ -10,8 +10,8 @@ pub struct SupplierError {
     pub message: String,
     #[serde(default)]
     pub category: String,
-    #[serde(default)]
-    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
     #[serde(default)]
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -40,7 +40,7 @@ struct InlineError<'a> {
     mtc_provider_message: Option<&'a str>,
 }
 
-impl SafeReason {
+impl UpstreamReason {
     pub(crate) fn from_supplier(code: Option<&str>, message: Option<&str>) -> Option<Self> {
         let code_reason = code.and_then(Self::from_code);
         let message_reason = message.and_then(|message| match message {
@@ -73,7 +73,7 @@ impl SafeReason {
             code: self.code().to_owned(),
             message: self.message().to_owned(),
             category: self.category().to_owned(),
-            retryable: self.retryable(),
+            retryable: Some(self.retryable()),
             action: self.action().to_owned(),
             provider_code: None,
             provider_message: None,
@@ -81,7 +81,7 @@ impl SafeReason {
     }
 }
 
-/// The stream terminal records this existing safe reason without changing its
+/// The stream terminal records its classified reason without changing its
 /// archive locator. HTTP rejections retain their native inline projection.
 pub(crate) fn supplier_error_from_record(
     inline: Option<&str>,
@@ -91,8 +91,8 @@ pub(crate) fn supplier_error_from_record(
     supplier_error_from_inline_json(inline).or_else(|| {
         status_code
             .filter(|status| *status >= 400)
-            .and_then(|_| error_code.and_then(SafeReason::from_code))
-            .map(SafeReason::supplier_error)
+            .and_then(|_| error_code.and_then(UpstreamReason::from_code))
+            .map(UpstreamReason::supplier_error)
     })
 }
 
@@ -107,26 +107,29 @@ pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierEr
     if error.error_type != "upstream_error" {
         return None;
     }
-    let reason = error.mtc_safe_reason.and_then(SafeReason::from_marker);
+    let reason = error.mtc_safe_reason.and_then(UpstreamReason::from_marker);
     let mut supplier = reason
-        .map(SafeReason::supplier_error)
+        .map(UpstreamReason::supplier_error)
         .unwrap_or_else(|| SupplierError {
             code: error.code.to_owned(),
             message: error.message.to_owned(),
             category: "upstream".to_owned(),
-            retryable: false,
+            retryable: None,
             action: "inspect_upstream_error".to_owned(),
             provider_code: None,
             provider_message: None,
         });
     supplier.provider_code = error.mtc_provider_code.map(str::to_owned);
-    supplier.provider_message = error.mtc_provider_message.map(str::to_owned);
+    supplier.provider_message = error
+        .mtc_provider_message
+        .or_else(|| (error.message != supplier.message).then_some(error.message))
+        .map(str::to_owned);
     Some(supplier)
 }
 
 /// Classification supplements provider details; an unfamiliar code is still an
 /// observable upstream error, even when we have no recovery advice for it.
-pub(crate) fn reason_from_value(value: &serde_json::Value) -> Option<SafeReason> {
+pub(crate) fn reason_from_value(value: &serde_json::Value) -> Option<UpstreamReason> {
     let error = value
         .pointer("/response/error")
         .filter(|error| !error.is_null())
@@ -136,7 +139,7 @@ pub(crate) fn reason_from_value(value: &serde_json::Value) -> Option<SafeReason>
     if object.contains_key("message") && object.contains_key("msg") {
         return None;
     }
-    SafeReason::from_supplier(
+    UpstreamReason::from_supplier(
         object.get("code").and_then(serde_json::Value::as_str),
         object
             .get("message")
@@ -169,7 +172,7 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
     let reason = reason_from_value(value);
     let mut projected = json!({
         "type": "upstream_error",
-        "code": reason.map(SafeReason::client_code).or(code.as_deref()).unwrap_or("upstream_rejected"),
+        "code": reason.map(UpstreamReason::client_code).or(code.as_deref()).unwrap_or("upstream_rejected"),
         "message": message,
         "mtc_provider_message": message,
     });
@@ -220,7 +223,7 @@ mod tests {
                 assert_eq!(record.provider_message.as_deref(), Some(message));
                 assert_eq!(record.provider_code.as_deref(), Some(code));
                 assert_eq!(record.category, category);
-                assert!(!record.retryable);
+                assert_eq!(record.retryable, (category != "upstream").then_some(false));
             }
         }
     }

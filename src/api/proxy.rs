@@ -19,12 +19,25 @@ pub(crate) async fn classify_media_rate_limit(
     kind
 }
 
-pub(in crate::api) async fn classify_codex_media_rate_limit(
+pub(in crate::api) async fn read_media_rejection(
     response: reqwest::Response,
-) -> crate::db::UpstreamFailureKind {
-    let (response, kind) = routing::classify_rate_limit(UpstreamResponse::Codex(response)).await;
-    drop(response);
-    kind
+    codex: bool,
+) -> (
+    upstream_error::Rejection,
+    Option<crate::db::UpstreamFailureKind>,
+) {
+    let response = if codex {
+        UpstreamResponse::Codex(response)
+    } else {
+        UpstreamResponse::Reqwest(response)
+    };
+    let (response, kind) = if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let (response, kind) = routing::classify_rate_limit(response).await;
+        (response, Some(kind))
+    } else {
+        (response, None)
+    };
+    (upstream_error::read_rejection(response).await, kind)
 }
 
 #[path = "codex_transport.rs"]

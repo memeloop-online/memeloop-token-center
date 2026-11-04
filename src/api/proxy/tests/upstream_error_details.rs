@@ -183,7 +183,7 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         assert_eq!(delivered["error"]["mtc_provider_code"], code);
         assert_eq!(delivered["error"]["mtc_provider_message"], message);
         if let Some(reason) =
-            crate::supplier_error::SafeReason::from_supplier(Some(code), Some(message))
+            crate::supplier_error::UpstreamReason::from_supplier(Some(code), Some(message))
         {
             assert_eq!(delivered["error"]["code"], reason.client_code());
             assert_eq!(delivered["error"]["mtc_safe_reason"], reason.code());
@@ -515,7 +515,7 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
         assert_eq!(supplier.code, "rate_limited");
         assert_eq!(
             supplier.message,
-            crate::supplier_error::SafeReason::RateLimited.message()
+            crate::supplier_error::UpstreamReason::RateLimited.message()
         );
         let stored = sse_delivery::pending_response_archive(&fixture, &receipt).await;
         assert_eq!(stored, delivered);

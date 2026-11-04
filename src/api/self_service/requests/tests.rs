@@ -386,7 +386,7 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
         code: "no_active_plan".to_owned(),
         message: "当前账号没有可用套餐".to_owned(),
         category: "quota".to_owned(),
-        retryable: false,
+        retryable: Some(false),
         action: "check_plan".to_owned(),
         provider_code: None,
         provider_message: None,

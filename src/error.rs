@@ -571,7 +571,7 @@ pub(crate) fn render_bilingual(code: &str, facts: ErrorFacts) -> (String, String
 }
 
 pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'static str)> {
-    if let Some(reason) = crate::supplier_error::SafeReason::from_marker(code) {
+    if let Some(reason) = crate::supplier_error::UpstreamReason::from_marker(code) {
         return Some((reason.message_zh(), reason.message()));
     }
     Some(match code {

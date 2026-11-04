@@ -50,7 +50,7 @@ impl BoundedUpstreamError {
 }
 
 pub(super) fn upstream_error_health_terminal(error_code: &str) -> UpstreamAttemptTerminal {
-    if crate::supplier_error::SafeReason::from_code(error_code).is_some()
+    if crate::supplier_error::UpstreamReason::from_code(error_code).is_some()
         || is_local_response_boundary(error_code)
         || matches!(
             error_code,

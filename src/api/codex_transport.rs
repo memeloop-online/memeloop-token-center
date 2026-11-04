@@ -2023,7 +2023,7 @@ struct BufferedResponsesParser {
     identity: ResponseIdentityGate,
     terminal_response: Option<(Value, BufferedCodexTerminal)>,
     terminal_failure: bool,
-    supplier_reason: Option<crate::supplier_error::SafeReason>,
+    supplier_reason: Option<crate::supplier_error::UpstreamReason>,
     supplier_error: Option<Bytes>,
     invalid: bool,
     retained_memory: Vec<crate::gateway_body::memory::ArchiveOutputMemory>,

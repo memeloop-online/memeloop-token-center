@@ -62,7 +62,7 @@ pub(super) fn classify_streaming_terminal(
         Some(ResponsesSseOutcome::Failed)
             if sse_summary.is_some_and(|summary| summary.supplier_rate_limited) =>
         {
-            Some(crate::supplier_error::SafeReason::RateLimited.code())
+            Some(crate::supplier_error::UpstreamReason::RateLimited.code())
         }
         Some(ResponsesSseOutcome::Failed) => Some(
             sse_summary

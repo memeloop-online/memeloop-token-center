@@ -51,7 +51,7 @@ pub(super) struct ResponsesSseCapture {
     terminal_failure: bool,
     supplier_rate_limited: bool,
     supplier_failure: bool,
-    supplier_reason: Option<crate::supplier_error::SafeReason>,
+    supplier_reason: Option<crate::supplier_error::UpstreamReason>,
     terminal_incomplete: bool,
     usage: Option<TokenUsage>,
     usage_invalid: bool,
@@ -93,7 +93,7 @@ pub(super) enum ResponsesSseOutcome {
 pub(super) struct ResponsesSseSummary {
     pub(super) outcome: ResponsesSseOutcome,
     pub(super) supplier_rate_limited: bool,
-    pub(super) supplier_reason: Option<crate::supplier_error::SafeReason>,
+    pub(super) supplier_reason: Option<crate::supplier_error::UpstreamReason>,
     pub(super) usage: Option<TokenUsage>,
     pub(super) usage_invalid: bool,
     pub(super) observed_protocol_invalid: bool,
@@ -379,7 +379,7 @@ impl ResponsesSseCapture {
 
     fn safe_supplier_failure(
         data: &[u8],
-    ) -> Option<(Option<crate::supplier_error::SafeReason>, Bytes)> {
+    ) -> Option<(Option<crate::supplier_error::UpstreamReason>, Bytes)> {
         if data.len() > upstream_error::MAX_ERROR_BYTES {
             return None;
         }
@@ -388,7 +388,7 @@ impl ResponsesSseCapture {
             return None;
         }
         let reason = crate::supplier_error::reason_from_value(&value);
-        let body = upstream_error::safe_error_body(data);
+        let body = upstream_error::normalized_error_body(data);
         Some((reason, body))
     }
 
@@ -507,7 +507,7 @@ impl ResponsesSseCapture {
             self.terminal_failure = true;
             self.supplier_failure = true;
             self.supplier_rate_limited =
-                reason == Some(crate::supplier_error::SafeReason::RateLimited);
+                reason == Some(crate::supplier_error::UpstreamReason::RateLimited);
             self.supplier_reason = reason;
             // Preserve the compatible failure frame's delivery attribution.
             return ChatSseDeliveryClass::Billable;

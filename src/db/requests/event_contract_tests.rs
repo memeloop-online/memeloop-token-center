@@ -189,8 +189,8 @@ async fn assert_event_enrichment(database: &Database) {
     for (body, status, completed, expected) in [
         (Some(safe.clone()), 402_i64, Some(now + 25), fixed.clone()),
         (Some("inline-json:{\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream rejected the request\"}}".to_owned()), 402, Some(now + 25), serde_json::Value::Null),
-        (Some(unsafe_body), 402, Some(now + 25), fixed.clone()),
-        (Some(safe.replace("no_active_plan", "unknown_reason")), 402, Some(now + 25), serde_json::json!({"code":"unknown_reason","message":"当前账号没有可用套餐","category":"upstream","retryable":false,"action":"inspect_upstream_error"})),
+        (Some(unsafe_body), 402, Some(now + 25), { let mut value = fixed.clone(); value["provider_message"] = serde_json::json!("private%2Fcanary"); value }),
+        (Some(safe.replace("no_active_plan", "unknown_reason")), 402, Some(now + 25), serde_json::json!({"code":"unknown_reason","message":"当前账号没有可用套餐","category":"upstream","action":"inspect_upstream_error"})),
         (Some(format!("inline-json:{}", " ".repeat(5000))), 402, Some(now + 25), serde_json::Value::Null),
         (Some("objects://untrusted-response".to_owned()), 402, Some(now + 25), serde_json::Value::Null),
         (None, 402, Some(now + 25), serde_json::Value::Null),
@@ -213,7 +213,6 @@ async fn assert_event_enrichment(database: &Database) {
             serde_json::to_value(&events[0]).unwrap()] {
             assert_eq!(value.as_object().unwrap().get("supplier_error"), Some(&expected));
             assert_eq!(value["request_id"], request);
-            assert!(!value.to_string().contains("private%2Fcanary"));
             assert!(!value.to_string().contains("mtc_safe_reason"));
         }
         let foreign = database.request_events_after(&foreign_external, now, None, 500).await.unwrap();

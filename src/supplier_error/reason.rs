@@ -4,9 +4,9 @@ macro_rules! reasons {
     ($( $variant:ident => ($code:literal, $message:literal, $category:literal,
         $retryable:literal, $action:literal, [$($alias:literal),*]) ),+ $(,)?) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub(crate) enum SafeReason { $($variant),+ }
+        pub(crate) enum UpstreamReason { $($variant),+ }
 
-        impl SafeReason {
+        impl UpstreamReason {
             pub(crate) fn from_marker(code: &str) -> Option<Self> {
                 match code { $($code => Some(Self::$variant),)+ _ => None }
             }
@@ -55,7 +55,7 @@ reasons! {
     InvalidRequest => ("invalid_request_error", "The upstream rejected the request format", "request", false, "revise_request", []),
 }
 
-impl SafeReason {
+impl UpstreamReason {
     pub(crate) const fn message_zh(self) -> &'static str {
         match self {
             Self::NoActivePlan => "当前上游账号没有可用套餐",

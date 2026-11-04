@@ -18,7 +18,7 @@ const MAX_RETRYABLE_ERROR_WAIT: std::time::Duration = std::time::Duration::from_
 pub(in crate::api) enum BadRequestDisposition {
     DefiniteTransient,
     DefiniteOrdinary,
-    DefiniteRejection(crate::supplier_error::SafeReason),
+    DefiniteRejection(crate::supplier_error::UpstreamReason),
     Unclassifiable(BadRequestUnclassifiableReason),
 }
 
@@ -121,7 +121,7 @@ async fn inspect_bad_request(
         }
         Ok(BoundedBadRequestBody::Value(value)) => {
             observe_ordinary_bad_request(request_id, &value);
-            *details = Some(crate::api::proxy::upstream_error::safe_error_body(
+            *details = Some(crate::api::proxy::upstream_error::normalized_error_body(
                 value.to_string().as_bytes(),
             ));
             crate::supplier_error::reason_from_value(&value).map_or(
@@ -1199,7 +1199,7 @@ mod tests {
                 "unsupported_value",
                 "Unsupported parameter: 'temperature'",
                 BadRequestDisposition::DefiniteRejection(
-                    crate::supplier_error::SafeReason::UnsupportedValue,
+                    crate::supplier_error::UpstreamReason::UnsupportedValue,
                 ),
             ),
             (
@@ -1207,7 +1207,7 @@ mod tests {
                 "unknown_parameter",
                 "Unknown parameter: 'temperature'",
                 BadRequestDisposition::DefiniteRejection(
-                    crate::supplier_error::SafeReason::UnsupportedParameter,
+                    crate::supplier_error::UpstreamReason::UnsupportedParameter,
                 ),
             ),
             (
