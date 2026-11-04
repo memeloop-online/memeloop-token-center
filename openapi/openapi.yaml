@@ -1620,6 +1620,39 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/plugins/mtc-health-intelligence/private-data/concurrency-advice:
+    get:
+      tags: [System]
+      operationId: getPrivatePluginConcurrencyAdvice
+      summary: Read tenant-bound private concurrency observations
+      description: |
+        Requires an installed Health Intelligence plugin and plugins:read.
+        Private data additionally requires providers:read and requests:read.
+        The authorized tenant must match the host-provisioned companion tenant.
+        Reads never trigger collection or modify routing. Responses are private, no-store.
+      parameters:
+        - name: tenant_external_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Observations or an explicit unavailable/configuration/permission state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state:
+                    type: string
+                    enum: [ready, select_tenant, not_configured, permission_required, unavailable]
+                  data:
+                    type: object
+                    additionalProperties: true
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/plugins/{plugin_id}/data/{endpoint_id}:
     parameters:
       - name: plugin_id
