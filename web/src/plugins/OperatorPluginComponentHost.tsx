@@ -14,7 +14,6 @@ import * as ReactDOMRuntime from 'react-dom';
 import * as ReactJSXRuntime from 'react/jsx-runtime';
 import * as FluentRuntime from '@fluentui/react-components';
 import { api } from '../api.js';
-import { LoadingState } from '../design-system/loading.js';
 import { createOperatorApiBridge } from './operatorApiBridge.js';
 import type { PluginOperatorUiContribution, PluginServiceDataResponse } from '../types.js';
 import {
@@ -72,7 +71,7 @@ const SharedEChart = lazy(() => import('../charts/EChart.js').then(module => ({ 
 
 function PluginEChart(props: OperatorUiEChartPropsV1) {
   return <Suspense fallback={<div className={props.className} style={props.style}>
-    <LoadingState label={props.locale === 'en' ? 'Loading chart' : '正在加载图表'} level="section" />
+    <FluentRuntime.Spinner label={props.locale === 'en' ? 'Loading chart' : '正在加载图表'} size="small" />
   </div>}><SharedEChart {...props} /></Suspense>;
 }
 
