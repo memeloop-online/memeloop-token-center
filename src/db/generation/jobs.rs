@@ -134,9 +134,13 @@ impl Database {
                 "generation model route snapshot is required".into(),
             ));
         }
-        if input.estimated_units <= 0 {
+        if input.estimated_units < 0
+            || (input.estimated_units == 0
+                && !(input.billing_unit == "million_tokens"
+                    && input.key.policy.enforcement_mode == EnforcementMode::MeteredUnlimited))
+        {
             return Err(AppError::BadRequest(
-                "generation estimated units must be positive".into(),
+                "generation requires a positive estimate or metered-unlimited native tokens".into(),
             ));
         }
         if !is_sha256_hex(&input.request_hash) {
@@ -1084,7 +1088,10 @@ impl Database {
                 .ok_or(AppError::internal("jobs_claim_generation_job_1"))?,
                 reserved_micros: row.try_get("reserved_micros")?,
                 input_micros_per_million: 0,
-                output_micros_per_million: if billing_unit == "megapixel" {
+                output_micros_per_million: if matches!(
+                    billing_unit.as_str(),
+                    "megapixel" | "million_tokens"
+                ) {
                     micros_per_unit
                 } else {
                     micros_per_unit

@@ -214,11 +214,14 @@ async fn admit_authenticated_gateway_body(
         request.uri().path(),
         "/v1/images/generations" | "/v1/audio/transcriptions"
     ) {
+        // Wait before reading the upload. Contention is not a request failure;
+        // dropping the caller cancels its queue entry without starting media work.
         Some(
             state
                 .image_response_permits
                 .clone()
-                .try_acquire_owned()
+                .acquire_owned()
+                .await
                 .map_err(|_| AppError::capacity_error("media_concurrency_permit"))?,
         )
     } else {
@@ -514,6 +517,49 @@ mod response_body_guard_tests {
         assert!(body.contains(
             "gateway memory budget could not hold the request body, and the body was not written to object storage"
         ));
+    }
+
+    #[tokio::test]
+    async fn media_capacity_waits_without_reading_upload_or_rejecting_request() {
+        use tower::ServiceExt;
+        let (mut state, _directory) = crate::api::tests::test_state().await;
+        state.image_response_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let held = state
+            .image_response_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = polls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/images/generations",
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                state,
+                |State(state): State<AppState>, request: Request, next: Next| async move {
+                    admit_authenticated_gateway_body(&state, request, next, None).await
+                },
+            ));
+        let task = tokio::spawn(
+            app.oneshot(
+                Request::post("/v1/images/generations")
+                    .body(Body::from_stream(futures_util::stream::once(async move {
+                        observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"{}"))
+                    })))
+                    .unwrap(),
+            ),
+        );
+        tokio::task::yield_now().await;
+        assert!(!task.is_finished());
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(held);
+        let response = task.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

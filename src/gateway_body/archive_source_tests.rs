@@ -30,7 +30,9 @@ async fn chat_messages_and_responses_share_the_captured_source() {
             request,
             Arc::new(tokio::sync::Semaphore::new(0)),
             Arc::new(tokio::sync::Semaphore::new(0)),
-            1024 * 1024,
+            // A hot-body setting must not truncate or reject an authenticated
+            // Responses upload that has a durable source.
+            1,
             1024 * 1024,
             Some(&budget),
             &admission,
