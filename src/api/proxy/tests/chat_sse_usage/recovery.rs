@@ -386,117 +386,52 @@ async fn oversized_chat_event_errors_downstream_and_cannot_recover_into_done() {
 }
 
 #[tokio::test]
-async fn total_chat_response_limit_does_not_poison_upstream_health() {
-    let first = b": keepalive\n\n".to_vec();
-    let second = chat_chunk(
+async fn streamed_chat_can_exceed_buffered_response_limit_and_settle() {
+    let chunk = chat_chunk(
         "chatcmpl-total-limit",
         json!([{
             "index": 0,
-            "delta": {"content": "x".repeat(768)},
+            "delta": {"content": "x".repeat(64 * 1024)},
             "finish_reason": null,
         }]),
         None,
     )
     .into_bytes();
-    let (uri, upstream) = fragmented_sse_upstream(vec![first, second]).await;
+    let count = MAX_PROXY_RESPONSE_BODY / chunk.len() + 1;
+    let mut chunks = vec![chunk; count];
+    chunks.push(
+        [
+            chat_finish("chatcmpl-total-limit"),
+            chat_usage_only("chatcmpl-total-limit", usage(29, 7, 36)),
+            done().to_owned(),
+        ]
+        .concat()
+        .into_bytes(),
+    );
+    let (uri, upstream) = fragmented_sse_upstream(chunks).await;
     let fixture = response_usage_fixture_with_uri("chat-total-limit", uri, 0).await;
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let credential_generation: i64 =
-        sqlx::query_scalar("SELECT credential_generation FROM upstream_accounts WHERE id = $1")
-            .bind(fixture.upstream_account_id.to_string())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    fixture
-        .state
-        .db
-        .record_upstream_account_failure(
-            fixture.upstream_account_id,
-            credential_generation,
-            UpstreamFailureKind::Connection,
-        )
-        .await
-        .unwrap();
-    sqlx::query(
-        "UPDATE upstream_account_health SET cooldown_until = 0
-         WHERE upstream_account_id = $1 AND credential_generation = $2",
-    )
-    .bind(fixture.upstream_account_id.to_string())
-    .bind(credential_generation)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let health_before = sqlx::query(
-        "SELECT consecutive_failures, cooldown_until, last_failure_kind
-         FROM upstream_account_health
-         WHERE upstream_account_id = $1 AND credential_generation = $2",
-    )
-    .bind(fixture.upstream_account_id.to_string())
-    .bind(credential_generation)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-
-    let response = streaming::with_test_response_body_limit(
-        512,
-        send_chat_usage_request(&fixture, &chat_request(&fixture.model)),
-    )
-    .await;
+    let response = send_chat_usage_request(&fixture, &chat_request(&fixture.model)).await;
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    let mut saw_error = false;
+    let mut delivered_bytes = 0;
     while let Some(next) = body.next().await {
-        if next.is_err() {
-            saw_error = true;
-        }
+        delivered_bytes += next
+            .expect("valid streaming body remains deliverable")
+            .len();
     }
-    assert!(saw_error);
+    assert!(delivered_bytes > MAX_PROXY_RESPONSE_BODY);
     upstream.await.unwrap();
 
-    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_response_too_large"))
-        .await;
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let probe_lease_until: i64 = sqlx::query_scalar(
-                "SELECT probe_lease_until FROM upstream_account_health
-                 WHERE upstream_account_id = $1 AND credential_generation = $2",
-            )
-            .bind(fixture.upstream_account_id.to_string())
-            .bind(credential_generation)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            if probe_lease_until == 0 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("record_terminal must release the probe lease");
-    let health_after = sqlx::query(
-        "SELECT consecutive_failures, cooldown_until, last_failure_kind
-         FROM upstream_account_health
-         WHERE upstream_account_id = $1 AND credential_generation = $2",
-    )
-    .bind(fixture.upstream_account_id.to_string())
-    .bind(credential_generation)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        health_after.get::<i64, _>("consecutive_failures"),
-        health_before.get::<i64, _>("consecutive_failures")
-    );
-    assert_eq!(
-        health_after.get::<i64, _>("cooldown_until"),
-        health_before.get::<i64, _>("cooldown_until")
-    );
-    assert_eq!(
-        health_after.get::<String, _>("last_failure_kind"),
-        health_before.get::<String, _>("last_failure_kind")
-    );
-    pool.close().await;
+    wait_for_request_settlement(&fixture, 1).await;
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!(rows[0].cost, "0.000036");
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
 }
 
 #[tokio::test]
