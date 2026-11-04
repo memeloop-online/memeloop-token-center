@@ -1,5 +1,4 @@
 import type { ComponentType, CSSProperties } from 'react';
-import type { EChartsCoreOption } from 'echarts/types/dist/core';
 import type * as ReactRuntime from 'react';
 import type * as ReactDOMRuntime from 'react-dom';
 import type * as ReactJSXRuntime from 'react/jsx-runtime';
@@ -90,7 +89,8 @@ export interface OperatorUiEChartPropsV1 {
   className?: string;
   locale: 'zh-CN' | 'en';
   onClick?: (event: { dataIndex: number; seriesIndex?: number; value: unknown }) => void;
-  option: EChartsCoreOption;
+  /** ECharts options passed to the host renderer; plugins share its runtime. */
+  option: Readonly<Record<string, unknown>>;
   /** Give the chart a height within the plugin's responsive layout. */
   style?: CSSProperties;
   timeZone: string;
