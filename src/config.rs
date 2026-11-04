@@ -159,8 +159,6 @@ pub struct Config {
     pub database_max_connections: u32,
     #[serde(default = "default_terminal_projection_enabled")]
     pub terminal_projection_enabled: bool,
-    /// Legacy deployment compatibility value; lifecycle admission uses bytes.
-    pub proxy_lifecycle_concurrency: u32,
     /// Weighted raw body/JSON/ciphertext memory admission, shared by all text routes.
     pub proxy_memory_budget_bytes: u32,
     /// Maximum concurrent readers without complete shared byte admission.
@@ -242,10 +240,6 @@ impl std::fmt::Debug for Config {
                 &self.terminal_projection_enabled,
             )
             .field("proxy_memory_budget_bytes", &self.proxy_memory_budget_bytes)
-            .field(
-                "proxy_lifecycle_concurrency",
-                &self.proxy_lifecycle_concurrency,
-            )
             .field(
                 "gateway_body_read_concurrency",
                 &self.gateway_body_read_concurrency,
@@ -430,8 +424,6 @@ impl Config {
                 "MTC_TERMINAL_PROJECTION_ENABLED",
                 DEFAULT_TERMINAL_PROJECTION_ENABLED,
             ),
-            proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
-                .clamp(1, 4_096),
             proxy_memory_budget_bytes: env_u32(
                 "MTC_PROXY_MEMORY_BUDGET_BYTES",
                 DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
@@ -539,7 +531,6 @@ impl Config {
             database_url,
             database_max_connections: 8,
             terminal_projection_enabled: false,
-            proxy_lifecycle_concurrency: 64,
             proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             gateway_body_read_concurrency: DEFAULT_GATEWAY_BODY_READ_CONCURRENCY,
             responses_body_max_bytes: DEFAULT_RESPONSES_BODY_MAX_BYTES,

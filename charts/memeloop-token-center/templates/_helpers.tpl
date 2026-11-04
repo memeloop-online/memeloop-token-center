@@ -50,8 +50,6 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
       key: {{ .Values.config.databaseUrlSecret.key }}
 - name: MTC_DATABASE_MAX_CONNECTIONS
   value: {{ .Values.config.databaseMaxConnections | quote }}
-- name: MTC_PROXY_LIFECYCLE_CONCURRENCY
-  value: {{ .Values.config.proxyLifecycleConcurrency | quote }}
 - name: MTC_PROXY_MEMORY_BUDGET_BYTES
   value: {{ printf "%d" (int64 .Values.config.proxyMemoryBudgetBytes) | quote }}
 - name: MTC_GATEWAY_BODY_READ_CONCURRENCY

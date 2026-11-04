@@ -144,8 +144,6 @@ config:
   terminalProjectionEnabled: false
   # Keep the sum across replicas below the PostgreSQL/PgBouncer connection budget.
   databaseMaxConnections: 4
-  # Legacy compatibility value; proxy lifecycle admission uses the byte budget.
-  proxyLifecycleConcurrency: 64
   # Weighted text-body/JSON/ciphertext admission. Keep pod memory at least
   # this budget + 256Mi. The budget is not a multiple of the maximum body.
   proxyMemoryBudgetBytes: 2147483648
