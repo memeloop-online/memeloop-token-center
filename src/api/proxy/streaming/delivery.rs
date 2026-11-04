@@ -171,7 +171,10 @@ mod backpressure_tests {
     async fn slow_reader_receives_first_and_later_frames_after_old_deadline() {
         for queued_before in [false, true] {
             let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
-            sender.send(Ok(Bytes::from_static(b"previous"))).await.unwrap();
+            sender
+                .send(Ok(Bytes::from_static(b"previous")))
+                .await
+                .unwrap();
             let task = tokio::spawn(async move {
                 let mut waits = wait_diagnostics::WaitDiagnostics::default();
                 let mut queued = queued_before;
@@ -202,7 +205,10 @@ mod backpressure_tests {
     #[tokio::test]
     async fn disconnected_reader_releases_pending_send() {
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
-        sender.send(Ok(Bytes::from_static(b"previous"))).await.unwrap();
+        sender
+            .send(Ok(Bytes::from_static(b"previous")))
+            .await
+            .unwrap();
         let task = tokio::spawn(async move {
             let mut waits = wait_diagnostics::WaitDiagnostics::default();
             let mut queued = false;

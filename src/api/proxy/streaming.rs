@@ -343,10 +343,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 progress_heartbeat_deadline = None;
                                 continue;
                             };
-                            match waits
-                                .downstream(body_sender.send(Ok(heartbeat)))
-                                .await
-                            {
+                            match waits.downstream(body_sender.send(Ok(heartbeat))).await {
                                 Ok(()) => {
                                     waits.heartbeat();
                                     progress_heartbeat_deadline = Some(
