@@ -50,7 +50,20 @@ pub(crate) struct ProxyMemoryBudget {
 }
 
 impl ProxyMemoryBudget {
-    pub(crate) fn new(bytes: u32) -> Self {
+    pub(crate) fn supports(bytes: u64) -> bool {
+        usize::try_from(bytes).is_ok_and(|bytes| {
+            let units = bytes / UNIT_BYTES;
+            units <= u32::MAX as usize && units <= Semaphore::MAX_PERMITS
+        })
+    }
+
+    pub(crate) fn new(bytes: u64) -> Self {
+        // Production configuration is validated before constructing the budget.
+        // The bound is the semaphore's representation, not a fixed pod size.
+        assert!(
+            Self::supports(bytes),
+            "memory budget exceeds counter representation"
+        );
         Self {
             capacity: bytes as usize,
             permits: Arc::new(Semaphore::new(bytes as usize / UNIT_BYTES)),
@@ -674,6 +687,20 @@ pub(crate) fn json_encoded_length(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn four_gib_budget_keeps_full_capacity_and_releases_large_reservations() {
+        let capacity = 4_u64 * 1024 * 1024 * 1024;
+        let budget = ProxyMemoryBudget::new(capacity);
+        assert_eq!(budget.snapshot().1 as u64, capacity);
+        let request = budget.reservation();
+        assert!(request.try_grow(3 * 1024 * 1024 * 1024, 1));
+        assert_eq!(budget.snapshot().0, 3 * 1024 * 1024 * 1024);
+        assert!(!request.try_grow(2 * 1024 * 1024 * 1024, 1));
+        drop(request);
+        assert_eq!(budget.snapshot().0, 0);
+        assert!(!ProxyMemoryBudget::supports(u64::MAX));
+    }
 
     #[test]
     fn dispatched_durable_source_releases_json_nodes_with_working_copies() {
