@@ -69,6 +69,13 @@ pub(crate) mod proxy;
 pub(crate) use proxy::MediaAttemptBudget;
 pub(crate) use proxy::{MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit};
 mod proxy_diagnostics;
+
+pub(crate) fn current_proxy_request_id() -> Option<Uuid> {
+    proxy_diagnostics::CONTEXT
+        .try_with(|context| context.request_id)
+        .ok()
+}
+
 mod request_detail;
 mod request_normalization;
 mod responses_via_anthropic;

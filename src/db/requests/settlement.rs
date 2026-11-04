@@ -3,6 +3,8 @@ use crate::model::MeteredUsageReservation;
 
 #[cfg(test)]
 mod optional_limits;
+#[cfg(test)]
+mod usage_normalization_tests;
 
 impl Database {
     pub async fn delete_expired_rate_windows(&self, limit: i64) -> Result<u64, AppError> {
@@ -292,21 +294,72 @@ pub(crate) fn normalize_proxy_usage_with_output_limit(
     output_token_limit: Option<i64>,
     requested_service_tier: Option<&str>,
 ) -> Result<TokenUsage, AppError> {
-    validate_token_usage(usage)
-        .map_err(|_| AppError::upstream("upstream_returned_invalid_token_usage"))?;
+    let observe_rejection = |reason: &'static str| {
+        let safe_tier = |tier: Option<&str>| match tier {
+            None => "absent",
+            Some("default") => "default",
+            Some("auto") => "auto",
+            Some("priority") => "priority",
+            Some("flex") => "flex",
+            Some("scale") => "scale",
+            Some("batch") => "batch",
+            Some("standard_only") => "standard_only",
+            Some(_) => "invalid",
+        };
+        tracing::warn!(
+            reason,
+            request_id = crate::api::current_proxy_request_id()
+                .map(|id| id.to_string())
+                .as_deref()
+                .unwrap_or("absent"),
+            reported_input_tokens = usage.input_tokens,
+            reported_cached_input_tokens = usage.cached_input_tokens,
+            reported_cache_write_tokens = usage.cache_write_tokens,
+            reported_output_tokens = usage.output_tokens,
+            admitted_input_tokens = input_token_ceiling,
+            admitted_output_token_limit = output_token_limit.unwrap_or_default(),
+            has_output_token_limit = output_token_limit.is_some(),
+            requested_service_tier = safe_tier(requested_service_tier),
+            reported_service_tier = safe_tier(usage.service_tier.as_deref()),
+            "provider usage normalization rejected"
+        );
+    };
+    validate_token_usage(usage).map_err(|_| {
+        observe_rejection(
+            if [
+                usage.input_tokens,
+                usage.cached_input_tokens,
+                usage.cache_write_tokens,
+                usage.output_tokens,
+            ]
+            .into_iter()
+            .any(|tokens| !(0..=1_000_000_000).contains(&tokens))
+            {
+                "token_count_out_of_range"
+            } else {
+                "invalid_reported_service_tier"
+            },
+        );
+        AppError::upstream("upstream_returned_invalid_token_usage")
+    })?;
     if input_token_ceiling < 0 || output_token_limit.is_some_and(|limit| limit < 0) {
+        observe_rejection("invalid_admission_bound");
         return Err(AppError::internal(
             "settlement_normalize_proxy_usage_with_output_limit_1",
         ));
     }
-    let total_input = usage
+    usage
         .input_tokens
         .checked_add(usage.cached_input_tokens)
         .and_then(|tokens| tokens.checked_add(usage.cache_write_tokens))
-        .ok_or_else(|| AppError::upstream("upstream_returned_invalid_token_usage"))?;
-    if total_input > input_token_ceiling
-        || output_token_limit.is_some_and(|limit| usage.output_tokens > limit)
-    {
+        .ok_or_else(|| {
+            observe_rejection("input_arithmetic_overflow");
+            AppError::upstream("upstream_returned_invalid_token_usage")
+        })?;
+    // Admission estimates input from the wire body. Provider-added tool and
+    // image context can exceed that estimate; settlement prices actual usage.
+    if output_token_limit.is_some_and(|limit| usage.output_tokens > limit) {
+        observe_rejection("explicit_output_limit_exceeded");
         return Err(AppError::upstream_with(
             "upstream_unavailable",
             crate::error::ErrorFacts::new()
@@ -316,6 +369,7 @@ pub(crate) fn normalize_proxy_usage_with_output_limit(
 
     if let Some(requested) = requested_service_tier {
         validate_service_tier(requested).map_err(|_| {
+            observe_rejection("invalid_requested_service_tier");
             AppError::internal("settlement_normalize_proxy_usage_with_output_limit_1")
         })?;
     }
@@ -335,6 +389,7 @@ pub(crate) fn normalize_proxy_usage_with_output_limit(
         Some(requested) => reported.is_none() || reported == Some(requested),
     };
     if !tier_matches {
+        observe_rejection("service_tier_mismatch");
         return Err(AppError::upstream_with(
             "upstream_unavailable",
             crate::error::ErrorFacts::new()
