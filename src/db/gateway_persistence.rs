@@ -248,12 +248,13 @@ impl Database {
             // archive pool; otherwise a durable object can retain raw memory
             // behind an unrelated database wait.
             let persisted = tokio::select! {
-                result = self.persist_request_source(identity, locator, length, digest, None) => result,
+                biased;
                 changed = outcome.changed() => {
                     if changed.is_err() { return None; }
                     if let Some(success) = *outcome.borrow_and_update() { return Some(success); }
                     continue;
                 }
+                result = self.persist_request_source(identity, locator, length, digest, None) => result,
             };
             let delay = match persisted {
                 Some(false) => return None,
