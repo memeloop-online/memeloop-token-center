@@ -282,8 +282,22 @@ pub(super) async fn observe_http(
                 .get("x-request-id")
                 .and_then(|value| value.to_str().ok()),
         );
+        // Parse only UUID-shaped client identifiers. These are declarations,
+        // not authorization, and remain separate from the server-owned id.
+        // Recording them before admission also covers failures without a
+        // durable request record; no request body or arbitrary header is logged.
+        let client_thread_id = request
+            .headers()
+            .get("thread-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok());
+        let client_session_id = request
+            .headers()
+            .get("session-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok());
         proxy_diagnostics::CONTEXT.scope(context, async move {
-            tracing::info!(request_id = %context.request_id, ?ingress_request_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
+            tracing::info!(request_id = %context.request_id, ?ingress_request_id, ?client_thread_id, ?client_session_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
             let phase = proxy_diagnostics::Phase::new(context, "gateway_response_headers");
             let mut response = next.run(request).await;
             phase.finish("completed", Some(response.status().as_u16()), None);
