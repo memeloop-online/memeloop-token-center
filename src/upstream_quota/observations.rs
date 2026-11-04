@@ -260,23 +260,13 @@ async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
         .map(|target| (target.tenant_id, target.account_id))
         .collect::<Vec<_>>();
     // History I/O proceeds alongside quota publication with its own bounded background budget.
-    let history =
-        stream::iter(history_targets).for_each_concurrent(2, |(tenant, account)| async move {
-            match tokio::time::timeout(
-                Duration::from_secs(2),
-                state
-                    .db
-                    .refresh_allocation_history(tenant, account, crate::db::unix_millis()),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                _ => tracing::warn!(
-                    operation = "allocation_history_refresh",
-                    "allocation history refresh deferred"
-                ),
-            }
-        });
+    let history = stream::iter(
+        history_targets
+            .into_iter()
+            .map(|(tenant, account)| refresh_history_target(state.clone(), tenant, account)),
+    )
+    .buffer_unordered(2)
+    .collect::<Vec<()>>();
     let observations = stream::iter(targets)
         .map(|target| async move {
             let Ok((account, credential)) = state
@@ -374,6 +364,23 @@ async fn refresh_batch(state: &AppState, tick_at: i64) -> Result<(), AppError> {
         result?;
     }
     Ok(())
+}
+
+async fn refresh_history_target(state: AppState, tenant: Uuid, account: Uuid) {
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        state
+            .db
+            .refresh_allocation_history(tenant, account, crate::db::unix_millis()),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        _ => tracing::warn!(
+            operation = "allocation_history_refresh",
+            "allocation history refresh deferred"
+        ),
+    }
 }
 
 pub(crate) async fn routing_observations(

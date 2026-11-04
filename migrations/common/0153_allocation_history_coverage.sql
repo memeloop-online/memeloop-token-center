@@ -24,10 +24,14 @@ CREATE TABLE group_allocation_history_receipts (
     requests BIGINT NOT NULL,
     tokens BIGINT NOT NULL,
     covered BIGINT NOT NULL,
+    bootstrap BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, source, request_id, revision)
 );
 CREATE INDEX group_allocation_history_receipts_time
     ON group_allocation_history_receipts(tenant_id, created_at);
+
+CREATE INDEX group_allocation_history_receipts_ready
+    ON group_allocation_history_receipts(tenant_id, bootstrap, source, request_id, revision);
 
 CREATE TABLE group_allocation_history_contributions (
     tenant_id TEXT NOT NULL,

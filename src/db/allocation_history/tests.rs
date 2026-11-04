@@ -152,6 +152,7 @@ async fn exercise_coverage(url: &str) {
         &mut tx,
         &[AllocationContribution::from_snapshot(&original).unwrap()],
         now,
+        true,
     )
     .await
     .unwrap();
@@ -259,7 +260,13 @@ async fn allocation_history_real_services_acceptance() {
     let b = Uuid::now_v7();
     let now = super::super::unix_millis();
     let values = (0..ALLOCATION_PAGE + 3)
-        .map(|index| snapshot(tenant, Uuid::now_v7(), a, now - 1000, index as i64 + 1))
+        .map(|index| {
+            // UUID halves run in opposite directions to expose string/native UUID order mismatches.
+            let request = Uuid::from_u128(
+                ((index as u128 + 1) << 64) | (ALLOCATION_PAGE + 3 - index) as u128,
+            );
+            snapshot(tenant, request, a, now - 1000, index as i64 + 1)
+        })
         .collect::<Vec<_>>();
     client.append(&values).await.unwrap();
     sqlx::query("UPDATE request_history_state SET mode='clickhouse' WHERE id=1")
@@ -272,7 +279,7 @@ async fn allocation_history_real_services_acceptance() {
             .await
             .unwrap()
     );
-    db.refresh_allocation_clickhouse(&client, tenant, now)
+    db.refresh_allocation_clickhouse_batches(&client, tenant, now, 1)
         .await
         .unwrap();
     let ready: i64 =

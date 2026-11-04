@@ -102,9 +102,9 @@ impl ClickHouse {
                 FROM request_history_v1 FINAL
                 WHERE tenant_id={tenant} AND created_at>={from} AND created_at<={to}
                     AND source IN ('native','generation')
-                    AND (created_at,toString(key_id),toString(request_id),source)>({created},{key},{request},{source})
+                    AND (toString(key_id),created_at,toString(request_id),source)>({key},{created},{request},{source})
              )
-             ORDER BY created_at,key_id,request_id,source LIMIT {ALLOCATION_PAGE} FORMAT JSONEachRow"
+             ORDER BY toString(key_id),created_at,toString(request_id),source LIMIT {ALLOCATION_PAGE} FORMAT JSONEachRow"
         );
         self.rows(query).await
     }

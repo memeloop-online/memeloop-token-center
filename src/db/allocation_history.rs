@@ -45,6 +45,7 @@ async fn receipts(
     tx: &mut Transaction<'_, Any>,
     values: &[AllocationContribution],
     now: i64,
+    bootstrap: bool,
 ) -> Result<(), AppError> {
     if values.is_empty() {
         return Ok(());
@@ -53,12 +54,12 @@ async fn receipts(
     // The interpolation contains generated parameter positions only.
     let sql = format!(
         "WITH incoming(tenant_id,source,request_id,revision,created_at,account_id,requests,tokens,covered) AS (VALUES {})
-         INSERT INTO group_allocation_history_receipts(tenant_id,source,request_id,revision,created_at,account_id,requests,tokens,covered)
-         SELECT i.tenant_id,i.source,i.request_id,i.revision,i.created_at,i.account_id,i.requests,i.tokens,i.covered
+         INSERT INTO group_allocation_history_receipts(tenant_id,source,request_id,revision,created_at,account_id,requests,tokens,covered,bootstrap)
+         SELECT i.tenant_id,i.source,i.request_id,i.revision,i.created_at,i.account_id,i.requests,i.tokens,i.covered,${marker}
          FROM incoming i JOIN group_allocation_history_state s ON s.tenant_id=i.tenant_id
          WHERE s.capture_until>${clock} AND i.created_at>=(${clock}/3600000-23)*3600000
-         ON CONFLICT(tenant_id,source,request_id,revision) DO NOTHING",
-        placeholders(values.len(), 9)
+         ON CONFLICT(tenant_id,source,request_id,revision) DO UPDATE SET bootstrap=CASE WHEN excluded.bootstrap=1 THEN 1 ELSE group_allocation_history_receipts.bootstrap END",
+        placeholders(values.len(), 9), marker=clock+1
     );
     let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
     for value in values {
@@ -73,7 +74,11 @@ async fn receipts(
             .bind(value.tokens)
             .bind(value.covered);
     }
-    query.bind(now).execute(&mut **tx).await?;
+    query
+        .bind(now)
+        .bind(i64::from(bootstrap))
+        .execute(&mut **tx)
+        .await?;
     Ok(())
 }
 
@@ -103,7 +108,7 @@ impl Database {
             .iter()
             .filter_map(AllocationContribution::from_snapshot)
             .collect::<Vec<_>>();
-        receipts(tx, &compact, super::unix_millis()).await
+        receipts(tx, &compact, super::unix_millis(), false).await
     }
 
     /// Background source selection uses the same verified reader switch as history APIs.
@@ -135,8 +140,20 @@ impl Database {
         tenant: Uuid,
         now: i64,
     ) -> Result<(), AppError> {
+        self.refresh_allocation_clickhouse_batches(reader, tenant, now, 16)
+            .await
+    }
+
+    async fn refresh_allocation_clickhouse_batches(
+        &self,
+        reader: &ClickHouse,
+        tenant: Uuid,
+        now: i64,
+        batches: usize,
+    ) -> Result<(), AppError> {
         let lease = Uuid::now_v7().to_string();
-        let state = sqlx::query(
+        for _ in 0..batches {
+            let state = sqlx::query(
             "INSERT INTO group_allocation_history_state(tenant_id,scan_from,scan_to,capture_until,lease,lease_until)
              VALUES($1,$2,$3,$4,$5,$6)
              ON CONFLICT(tenant_id) DO UPDATE SET
@@ -149,59 +166,66 @@ impl Database {
                 scanned=CASE WHEN group_allocation_history_state.capture_until<=$3 THEN 0 ELSE group_allocation_history_state.scanned END,
                 ready=CASE WHEN group_allocation_history_state.capture_until<=$3 THEN 0 ELSE group_allocation_history_state.ready END,
                 capture_until=$4,lease=$5,lease_until=$6
-             WHERE group_allocation_history_state.lease_until<=$3
+             WHERE group_allocation_history_state.lease_until<=$3 OR group_allocation_history_state.lease=$5
              RETURNING scan_from,scan_to,cursor_created,cursor_key,cursor_request,cursor_source,scanned"
         ).bind(tenant.to_string()).bind((now/HOUR_MS-23)*HOUR_MS).bind(now).bind(now+CAPTURE_MS)
             .bind(&lease).bind(now+LEASE_MS).fetch_optional(&self.pool).await?;
-        let Some(state) = state else {
-            return Ok(());
-        };
-        if state.try_get::<i64, _>("scanned")? == 0 {
-            let cursor = AllocationCursor {
-                created_at: state.try_get("cursor_created")?,
-                key_id: state.try_get("cursor_key")?,
-                request_id: state.try_get("cursor_request")?,
-                source: state.try_get("cursor_source")?,
+            let Some(state) = state else {
+                return Ok(());
             };
-            let page = reader
-                .allocation_page(
-                    tenant,
-                    state.try_get("scan_from")?,
-                    state.try_get("scan_to")?,
-                    &cursor,
-                )
-                .await?;
-            let next = page
-                .last()
-                .map(|row| AllocationCursor {
-                    created_at: row.contribution.created_at,
-                    key_id: row.key_id.clone(),
-                    request_id: row.contribution.request_id.to_string(),
-                    source: row.contribution.source.clone(),
-                })
-                .unwrap_or(cursor);
-            let scanned = i64::from(page.len() < ALLOCATION_PAGE);
-            let values = page
-                .into_iter()
-                .map(|row| row.contribution)
-                .collect::<Vec<_>>();
-            let mut tx = self.begin_write_transaction().await?;
-            let changed = sqlx::query("UPDATE group_allocation_history_state SET cursor_created=$3,cursor_key=$4,cursor_request=$5,cursor_source=$6,scanned=$7 WHERE tenant_id=$1 AND lease=$2 AND lease_until>$8")
+            if state.try_get::<i64, _>("scanned")? == 0 {
+                let cursor = AllocationCursor {
+                    created_at: state.try_get("cursor_created")?,
+                    key_id: state.try_get("cursor_key")?,
+                    request_id: state.try_get("cursor_request")?,
+                    source: state.try_get("cursor_source")?,
+                };
+                let page = reader
+                    .allocation_page(
+                        tenant,
+                        state.try_get("scan_from")?,
+                        state.try_get("scan_to")?,
+                        &cursor,
+                    )
+                    .await?;
+                let next = page
+                    .last()
+                    .map(|row| AllocationCursor {
+                        created_at: row.contribution.created_at,
+                        key_id: row.key_id.clone(),
+                        request_id: row.contribution.request_id.to_string(),
+                        source: row.contribution.source.clone(),
+                    })
+                    .unwrap_or(cursor);
+                let scanned = i64::from(page.len() < ALLOCATION_PAGE);
+                let values = page
+                    .into_iter()
+                    .map(|row| row.contribution)
+                    .collect::<Vec<_>>();
+                let mut tx = self.begin_write_transaction().await?;
+                let changed = sqlx::query("UPDATE group_allocation_history_state SET cursor_created=$3,cursor_key=$4,cursor_request=$5,cursor_source=$6,scanned=$7 WHERE tenant_id=$1 AND lease=$2 AND lease_until>$8")
                 .bind(tenant.to_string()).bind(&lease).bind(next.created_at).bind(next.key_id)
                 .bind(next.request_id).bind(next.source).bind(scanned).bind(super::unix_millis())
                 .execute(&mut *tx).await?.rows_affected();
-            if changed == 0 {
-                return Ok(());
+                if changed == 0 {
+                    return Ok(());
+                }
+                receipts(&mut tx, &values, now, true).await?;
+                tx.commit().await?;
             }
-            receipts(&mut tx, &values, now).await?;
-            tx.commit().await?;
+            let more = tokio::time::timeout(
+                Duration::from_millis(100),
+                self.apply_allocation_history(tenant, &lease, now),
+            )
+            .await
+            .map_err(|_| AppError::internal("allocation_history_apply_timeout"))??;
+            if !more {
+                break;
+            }
         }
-        tokio::time::timeout(
-            Duration::from_millis(100),
-            self.apply_allocation_history(tenant, &lease, now),
-        )
-        .await
-        .map_err(|_| AppError::internal("allocation_history_apply_timeout"))?
+        sqlx::query("UPDATE group_allocation_history_state SET lease_until=0 WHERE tenant_id=$1 AND lease=$2")
+            .bind(tenant.to_string()).bind(&lease).execute(&self.pool).await?;
+        Ok(())
     }
 
     async fn apply_allocation_history(
@@ -209,7 +233,7 @@ impl Database {
         tenant: Uuid,
         lease: &str,
         now: i64,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         let mut tx = self.begin_write_transaction().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -217,14 +241,6 @@ impl Database {
                 .await?;
             sqlx::query("SELECT set_config('lock_timeout','5ms',true),set_config('statement_timeout','80ms',true),set_config('jit','off',true)").execute(&mut *tx).await?;
         }
-        // Serialize compact snapshots with new-session selection, then claim this worker's state.
-        sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision,refreshed_at) VALUES($1,1,$2) ON CONFLICT(tenant_id) DO UPDATE SET revision=group_allocation_revisions.revision+1,refreshed_at=$2")
-            .bind(tenant.to_string()).bind(now).execute(&mut *tx).await?;
-        let state = sqlx::query("UPDATE group_allocation_history_state SET lease_until=$3 WHERE tenant_id=$1 AND lease=$2 AND lease_until>$4 RETURNING scanned,ready")
-            .bind(tenant.to_string()).bind(lease).bind(now+LEASE_MS).bind(now).fetch_optional(&mut *tx).await?;
-        let Some(state) = state else {
-            return Ok(());
-        };
         let mode_sql = if matches!(self.backend, DatabaseBackend::PostgreSql) {
             "SELECT mode FROM request_history_state WHERE id=1 FOR SHARE"
         } else {
@@ -234,9 +250,17 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
         if mode != "clickhouse" {
-            return Ok(());
+            return Ok(false);
         }
-        let rows = sqlx::query("SELECT source,request_id,revision,created_at,account_id,requests,tokens,covered FROM group_allocation_history_receipts WHERE tenant_id=$1 ORDER BY source,request_id,revision LIMIT 256")
+        // Match the PostgreSQL-source lock order: source mode, selection revision, worker state.
+        sqlx::query("INSERT INTO group_allocation_revisions(tenant_id,revision,refreshed_at) VALUES($1,1,$2) ON CONFLICT(tenant_id) DO UPDATE SET revision=group_allocation_revisions.revision+1,refreshed_at=$2")
+            .bind(tenant.to_string()).bind(now).execute(&mut *tx).await?;
+        let state = sqlx::query("UPDATE group_allocation_history_state SET lease_until=$3 WHERE tenant_id=$1 AND lease=$2 AND lease_until>$4 RETURNING scanned,ready")
+            .bind(tenant.to_string()).bind(lease).bind(now+LEASE_MS).bind(now).fetch_optional(&mut *tx).await?;
+        let Some(state) = state else {
+            return Ok(false);
+        };
+        let rows = sqlx::query("SELECT source,request_id,revision,created_at,account_id,requests,tokens,covered FROM group_allocation_history_receipts WHERE tenant_id=$1 ORDER BY bootstrap DESC,source,request_id,revision LIMIT 256")
             .bind(tenant.to_string()).fetch_all(&mut *tx).await?;
         let mut latest = BTreeMap::new();
         for row in &rows {
@@ -342,8 +366,9 @@ impl Database {
         }
         let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT 1 FROM group_allocation_history_receipts WHERE tenant_id=$1 LIMIT 1) q")
             .bind(tenant.to_string()).fetch_one(&mut *tx).await?;
-        let ready = state.try_get::<i64, _>("ready")? != 0
-            || (state.try_get::<i64, _>("scanned")? != 0 && pending == 0);
+        let bootstrap_pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT 1 FROM group_allocation_history_receipts WHERE tenant_id=$1 AND bootstrap=1 LIMIT 1) q").bind(tenant.to_string()).fetch_one(&mut *tx).await?;
+        let scanned = state.try_get::<i64, _>("scanned")? != 0;
+        let ready = state.try_get::<i64, _>("ready")? != 0 || (scanned && bootstrap_pending == 0);
         if ready {
             sqlx::query("DELETE FROM group_allocation_usage WHERE tenant_id=$1")
                 .bind(tenant.to_string())
@@ -387,10 +412,11 @@ impl Database {
         .bind(now / HOUR_MS - 23)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE group_allocation_history_state SET ready=$3,lease_until=0 WHERE tenant_id=$1 AND lease=$2")
-            .bind(tenant.to_string()).bind(lease).bind(i64::from(ready)).execute(&mut *tx).await?;
+        let more = !scanned || pending != 0;
+        sqlx::query("UPDATE group_allocation_history_state SET ready=$3,lease_until=$4 WHERE tenant_id=$1 AND lease=$2")
+            .bind(tenant.to_string()).bind(lease).bind(i64::from(ready)).bind(if more {now+LEASE_MS} else {0}).execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(())
+        Ok(more)
     }
 }
 
