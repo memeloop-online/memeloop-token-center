@@ -99,7 +99,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
   async function dispatchPrepared(prepared: QuotaResetOperation, confirmationToken: string) {
     setOperation({ ...prepared, state: 'submitted' });
     confirmIdempotencyKey.current ??= `quota-confirm-${crypto.randomUUID()}`;
-    const response = await api<QuotaResetOperation>(path(`${encodeURIComponent(prepared.id)}/confirm`), token, { method: 'POST', headers: { 'Idempotency-Key': confirmIdempotencyKey.current }, body: JSON.stringify({ confirmation_token: confirmationToken, confirmation: 'consume_one_supplier_reset_credit' }), signal: AbortSignal.timeout(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS) });
+    const response = await api<QuotaResetOperation>(path(`${encodeURIComponent(prepared.id)}/confirm`), token, { method: 'POST', headers: { 'Idempotency-Key': confirmIdempotencyKey.current }, body: JSON.stringify({ confirmation_token: confirmationToken, confirmation: 'consume_one_supplier_reset_credit' }) });
     if (!current()) return;
     if (!valid(response) || response.id !== prepared.id) throw new Error('Invalid reset scope');
     secret.current = null;
