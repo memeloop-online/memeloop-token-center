@@ -648,8 +648,8 @@ async fn install_component_provider_with_limit(
 }
 
 #[tokio::test]
-async fn gateway_component_small_normalized_response_fits_without_declared_maximum_prepaid() {
-    for occupied_mib in [128, 248] {
+async fn gateway_component_small_normalized_response_fits_without_route_maximum_prepaid() {
+    for occupied_mib in [128, 240] {
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/vendor/infer"))

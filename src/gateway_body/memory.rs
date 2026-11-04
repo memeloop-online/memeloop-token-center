@@ -434,6 +434,18 @@ impl ProxyMemoryReservation {
     }
 
     pub(crate) fn own_response_bytes(&self, bytes: bytes::Bytes) -> Option<bytes::Bytes> {
+        self.own_response_bytes_inner(bytes, false)
+    }
+
+    pub(crate) fn own_response_envelope(&self, bytes: bytes::Bytes) -> Option<bytes::Bytes> {
+        self.own_response_bytes_inner(bytes, true)
+    }
+
+    fn own_response_bytes_inner(
+        &self,
+        bytes: bytes::Bytes,
+        preserve_envelope: bool,
+    ) -> Option<bytes::Bytes> {
         struct Payload {
             bytes: bytes::Bytes,
             _permit: OwnedSemaphorePermit,
@@ -444,9 +456,14 @@ impl ProxyMemoryReservation {
             }
         }
         let required = bytes.len().checked_mul(CAPTURE_MEMORY_WEIGHT)?;
-        let units = u32::try_from(required.div_ceil(UNIT_BYTES)).ok()?;
         let mut held = self.held.lock().ok()?;
         let previous = self.response_bytes.load(Ordering::Acquire);
+        let required = if preserve_envelope {
+            required.max(previous)
+        } else {
+            required
+        };
+        let units = u32::try_from(required.div_ceil(UNIT_BYTES)).ok()?;
         let previous_units = previous / UNIT_BYTES;
         let permit = if units == 0 {
             Self::acquire(&self.permits, 0)?

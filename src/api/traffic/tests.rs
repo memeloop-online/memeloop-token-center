@@ -224,6 +224,7 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
             "usage":{"prompt_tokens":7,"completion_tokens":3}
         })
     );
+    drop(normalized);
     assert_eq!(state.proxy_memory_budget.snapshot().0, 1024 * 1024);
     drop(held);
     assert_eq!(state.proxy_memory_budget.snapshot().0, 0);

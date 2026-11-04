@@ -576,13 +576,18 @@ pub(super) async fn normalize_component_provider(
     // independently of the request, whose error response may be finalized
     // while the guest still holds its raw/enveloped input.
     let body = memory
-        .own_response_bytes(Bytes::from(body))
+        .own_response_envelope(Bytes::from(body))
         .ok_or_else(|| AppError::capacity_error("upstream_response_memory_capacity"))?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
         let _memory = memory;
-        plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
+        let mut normalized =
+            plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)?;
+        if let Some(normalized) = normalized.as_mut() {
+            normalized.input_memory = Some(body);
+        }
+        Ok(normalized)
     })
     .await?
     .ok_or_else(|| AppError::upstream("component_provider_adapter_is_declared_but_unavailable"))

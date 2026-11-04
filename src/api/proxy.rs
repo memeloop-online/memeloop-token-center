@@ -2975,6 +2975,7 @@ async fn execute_component_provider(
     }
     normalized.body.shrink_to_fit();
     request.memory.shrink_buffered_response(&normalized.body);
+    drop(normalized.input_memory.take());
     tracing::debug!(request_id = %request.request_id,
         stage = "component_response_ready", reserved_bytes = request.memory.buffered_response_reserved_bytes(),
         actual_bytes = normalized.body.len(), has_content_length, "normalized response memory accounted");

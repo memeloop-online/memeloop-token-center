@@ -128,10 +128,14 @@ pub(super) async fn read_bounded_upstream(
     let deadline = tokio::time::Instant::now() + memory_admission_wait;
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
+    // Component normalization can expand a small input before the host can
+    // inspect its output. Keep that existing adapter envelope until the
+    // separate component-output accounting work is complete.
+    let initial_bytes = if component_response { maximum } else { 0 };
     let reserved = if let Some(conversation) = conversation {
-        conversation.reserve_for_buffered_response(memory, 0, deadline)
+        conversation.reserve_for_buffered_response(memory, initial_bytes, deadline)
     } else {
-        memory.reserve_buffered_response(0, deadline)
+        memory.reserve_buffered_response(initial_bytes, deadline)
     };
     if !reserved {
         tracing::warn!(request_id = %diagnostic_context.request_id,
@@ -190,7 +194,9 @@ pub(super) async fn read_bounded_upstream(
             actual_bytes = body.len(), has_content_length, "buffered response JSON memory unavailable");
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
-    memory.shrink_buffered_response(&body);
+    if !component_response {
+        memory.shrink_buffered_response(&body);
+    }
     tracing::debug!(request_id = %diagnostic_context.request_id,
         stage = "buffered_response_ready", reserved_bytes = memory.buffered_response_reserved_bytes(),
         actual_bytes = body.len(), has_content_length, component_response, "buffered response memory accounted");
@@ -203,7 +209,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn component_small_body_uses_actual_memory_despite_large_adapter_limit() {
+    async fn native_small_body_uses_actual_memory_despite_large_response_limit() {
         for content_length in [None, Some(2)] {
             let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024 * 1024);
             let occupied = budget.reservation();
@@ -221,7 +227,7 @@ mod tests {
                 MAX_PROXY_RESPONSE_BODY,
                 &memory,
                 Duration::from_secs(30),
-                true,
+                false,
                 None,
             )
             .await

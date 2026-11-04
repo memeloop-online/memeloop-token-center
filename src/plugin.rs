@@ -566,6 +566,9 @@ pub struct NormalizedProviderResponse {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub estimated: bool,
+    // Gateway-owned input/envelope lease, retained across blocking-task
+    // completion until the normalized output has its own accounted owner.
+    pub(crate) input_memory: Option<bytes::Bytes>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1611,6 +1614,7 @@ impl PluginRuntime {
             input_tokens: envelope.usage.input_tokens,
             output_tokens: envelope.usage.output_tokens,
             estimated: envelope.usage.estimated,
+            input_memory: None,
         }))
     }
 
