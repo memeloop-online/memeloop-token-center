@@ -46,4 +46,5 @@ function ScopedProvidersFixture() {
   return new URLSearchParams(location.search).has('app-shell') ? <AppShell surface="operator" route="providers" onNavigate={() => {}}>{content}</AppShell> : content;
 }
 const params = new URLSearchParams(location.search);
-createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{params.has('scope-controls') ? <ScopedProvidersFixture /> : params.has('full-page') ? <ProvidersPage token="fixture-token" tenant="fixture-a" /> : <Fixture />}</MtcFluentProvider></I18nProvider>);
+const providersPage = <ProvidersPage token="fixture-token" tenant="fixture-a" />;
+createRoot(document.getElementById('root')!).render(<I18nProvider><MtcFluentProvider>{params.has('scope-controls') ? <ScopedProvidersFixture /> : params.has('full-page') ? params.has('app-shell') ? <AppShell surface="operator" route="providers" onNavigate={() => {}}>{providersPage}</AppShell> : providersPage : <Fixture />}</MtcFluentProvider></I18nProvider>);

@@ -208,6 +208,19 @@ pub(crate) struct RequestSpoolAdmission {
 }
 
 impl RequestSpoolAdmission {
+    /// Resident bodies are a cache. Reclaim settled objects before denying a
+    /// real parsing/forwarding allocation, not only while capturing uploads.
+    pub(crate) fn reclaim_for(&self, mut reserve: impl FnMut() -> bool) -> bool {
+        loop {
+            if reserve() {
+                return true;
+            }
+            if !evict_oldest_settled(&self.usage) {
+                return false;
+            }
+        }
+    }
+
     pub(crate) async fn drain_uploads(&self) {
         self.usage.uploads.wait_for_idle().await;
     }
@@ -668,6 +681,12 @@ impl RequestSpool {
         release_resident_memory(&self.shared);
     }
 
+    pub(crate) fn release_durable_retained(&self) {
+        if self.shared.durable_ok.load(Ordering::Acquire) {
+            release_resident_memory(&self.shared);
+        }
+    }
+
     pub(crate) async fn read_all(&self) -> Result<Bytes, RequestSpoolReadError> {
         #[cfg(test)]
         self.read_count.fetch_add(1, Ordering::AcqRel);
@@ -774,7 +793,10 @@ fn evict_oldest_settled(usage: &RequestSpoolUsage) -> bool {
     let Ok(mut residents) = usage.residents.lock() else {
         return false;
     };
-    while let Some(resident) = residents.pop_front() {
+    for _ in 0..residents.len() {
+        let Some(resident) = residents.pop_front() else {
+            break;
+        };
         let Some(shared) = resident.upgrade() else {
             continue;
         };
@@ -786,9 +808,11 @@ fn evict_oldest_settled(usage: &RequestSpoolUsage) -> bool {
         if !still_resident {
             continue;
         }
-        if !shared.residency.durable_settled.load(Ordering::Acquire) {
-            residents.push_front(Arc::downgrade(&shared));
-            return false;
+        if !shared.residency.durable_settled.load(Ordering::Acquire)
+            || !shared.durable_ok.load(Ordering::Acquire)
+        {
+            residents.push_back(Arc::downgrade(&shared));
+            continue;
         }
         release_resident_memory(&shared);
         return true;

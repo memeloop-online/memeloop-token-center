@@ -13,6 +13,10 @@ pub(in crate::api::proxy) enum FailoverDisposition {
 }
 
 impl FailoverDisposition {
+    pub(in crate::api::proxy) fn is_definite_rejection(&self) -> bool {
+        matches!(self, Self::RateLimitRejected | Self::QuotaRejected)
+    }
+
     pub(in crate::api::proxy) fn reason(&self) -> Option<UpstreamHealthReason> {
         match self {
             Self::CandidateNotDispatched => Some(UpstreamHealthReason::Unavailable),
@@ -49,6 +53,15 @@ pub(in crate::api::proxy) fn failover_disposition(
             FailoverDisposition::ConnectionNotDelivered
         }
         (Some(StatusCode::TOO_MANY_REQUESTS), None) => FailoverDisposition::RateLimitRejected,
+        (Some(status), None) if status.is_success() => match quota_failure {
+            Some(UpstreamFailureKind::RateLimitedUntil {
+                exhausted: true, ..
+            }) => FailoverDisposition::QuotaRejected,
+            Some(
+                UpstreamFailureKind::RateLimited | UpstreamFailureKind::RateLimitedUntil { .. },
+            ) => FailoverDisposition::RateLimitRejected,
+            _ => FailoverDisposition::Stop,
+        },
         (Some(StatusCode::FORBIDDEN), None)
             if matches!(
                 quota_failure,
@@ -121,6 +134,9 @@ fn classify_response_failure(
     rate_limit: Option<UpstreamFailureKind>,
 ) -> Option<(UpstreamFailureKind, UpstreamHealthReason)> {
     match status {
+        status if status.is_success() => {
+            rate_limit.map(|kind| (kind, UpstreamHealthReason::RateLimited))
+        }
         StatusCode::FORBIDDEN
             if matches!(
                 rate_limit,
@@ -151,6 +167,33 @@ fn classify_response_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_quota_evidence_is_distinct_from_http_success_and_authentication() {
+        for (kind, expected) in [
+            (None, FailoverDisposition::Stop),
+            (
+                Some(UpstreamFailureKind::Authentication),
+                FailoverDisposition::Stop,
+            ),
+            (
+                Some(UpstreamFailureKind::RateLimited),
+                FailoverDisposition::RateLimitRejected,
+            ),
+            (
+                Some(UpstreamFailureKind::RateLimitedUntil {
+                    exhausted: true,
+                    until: 0,
+                }),
+                FailoverDisposition::QuotaRejected,
+            ),
+        ] {
+            assert_eq!(
+                failover_disposition(Some(StatusCode::OK), None, kind),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn authentication_is_hard_health_evidence_but_never_replay_permission() {
@@ -186,11 +229,7 @@ mod tests {
             failover_disposition(Some(StatusCode::FORBIDDEN), None, quota),
             FailoverDisposition::QuotaRejected
         );
-        for status in [
-            StatusCode::OK,
-            StatusCode::UNAUTHORIZED,
-            StatusCode::SERVICE_UNAVAILABLE,
-        ] {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::SERVICE_UNAVAILABLE] {
             assert_eq!(
                 failover_disposition(Some(status), None, quota),
                 FailoverDisposition::Stop

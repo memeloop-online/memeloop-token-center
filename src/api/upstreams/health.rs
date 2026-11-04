@@ -713,6 +713,7 @@ async fn send_model_probe(
         body["error_code"] = json!("probe_admission_skipped");
     }
     if let Some(quota) = observation.quota {
+        body["status"] = json!("unhealthy");
         body["error_code"] = json!(if quota.exhausted {
             "quota_exhausted"
         } else {

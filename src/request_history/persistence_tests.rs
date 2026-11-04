@@ -596,6 +596,61 @@ async fn request_history_real_services_acceptance() {
             });
         assert_eq!(client.list(&filtered).await.unwrap().requests.len(), count);
     }
+    // Both live relational reads and exported history must resolve a client
+    // chat id without confusing it with the internal conversation cluster.
+    for (field, value, expected) in [
+        (
+            crate::filter_ast::TypedFilterField::ClientSessionId,
+            "history-explicit".to_owned(),
+            1,
+        ),
+        (
+            crate::filter_ast::TypedFilterField::ClientSessionId,
+            cluster.to_string(),
+            0,
+        ),
+        (
+            crate::filter_ast::TypedFilterField::SessionId,
+            cluster.to_string(),
+            1,
+        ),
+        (
+            crate::filter_ast::TypedFilterField::ClientSessionId,
+            "other-thread".to_owned(),
+            0,
+        ),
+    ] {
+        let filter = RequestListFilter {
+            limit: 100,
+            key_id: Some(key.key_id),
+            typed_ast: Some(crate::filter_ast::TypedFilterAst {
+                conditions: vec![crate::filter_ast::TypedFilterCondition {
+                    field,
+                    operator: crate::filter_ast::TypedFilterOperator::Equals,
+                    value: crate::filter_ast::TypedFilterValue::Text(value),
+                    upper: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let source = database.source_history_list(&filter).await.unwrap();
+        let history_query = crate::request_history_api::query_from_request_filter(
+            crate::request_history::HistoryScope::Key {
+                tenant_id: key.tenant_id,
+                key_id: key.key_id,
+            },
+            &filter,
+        )
+        .unwrap();
+        let history = client.list(&history_query).await.unwrap();
+        assert_eq!(source.len(), expected);
+        assert_eq!(history.requests.len(), expected);
+        if expected == 1 {
+            assert_eq!(source[0].request_id, request_id);
+            assert_eq!(history.requests[0]["request_id"], request_id.to_string());
+        }
+    }
     let linked = database
         .request_archive_refs(key.key_id, request_id)
         .await

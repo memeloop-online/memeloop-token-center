@@ -149,20 +149,12 @@ pub(super) async fn readiness_snapshot(state: AppState) -> (StatusCode, Value) {
         .await;
     let (status, mut body) = readiness_contract(database_ready, archive_ready);
     #[cfg(feature = "experimental-plugin-revisions")]
-    let status = if let Some(authority) = &state.application_plugins {
-        let snapshot = authority.refresh_status();
-        let ready = snapshot["ready"] == true;
-        body["application_plugins"] = snapshot;
-        if ready {
-            status
-        } else {
-            body["status"] = json!("not_ready");
-            body["error"] = json!({"code": "application_plugin_snapshot_unavailable"});
-            StatusCode::SERVICE_UNAVAILABLE
-        }
-    } else {
-        status
-    };
+    if let Some(authority) = &state.application_plugins {
+        // Optional application runtime refresh does not determine whether the
+        // core gateway can receive traffic. Required plugin dependencies are
+        // resolved by their request path.
+        body["application_plugins"] = authority.refresh_status();
+    }
     if !database_ready.is_ready() {
         let code = match database_ready {
             crate::metrics::DatabaseReadiness::SchemaOutdated { .. } => "database_schema_outdated",
@@ -282,8 +274,22 @@ pub(super) async fn observe_http(
                 .get("x-request-id")
                 .and_then(|value| value.to_str().ok()),
         );
+        // Parse only UUID-shaped client identifiers. These are declarations,
+        // not authorization, and remain separate from the server-owned id.
+        // Recording them before admission also covers failures without a
+        // durable request record; no request body or arbitrary header is logged.
+        let client_thread_id = request
+            .headers()
+            .get("thread-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok());
+        let client_session_id = request
+            .headers()
+            .get("session-id")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| Uuid::parse_str(value).ok());
         proxy_diagnostics::CONTEXT.scope(context, async move {
-            tracing::info!(request_id = %context.request_id, ?ingress_request_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
+            tracing::info!(request_id = %context.request_id, ?ingress_request_id, ?client_thread_id, ?client_session_id, route_class, phase = "gateway_entry", "proxy request entered gateway");
             let phase = proxy_diagnostics::Phase::new(context, "gateway_response_headers");
             let mut response = next.run(request).await;
             phase.finish("completed", Some(response.status().as_u16()), None);

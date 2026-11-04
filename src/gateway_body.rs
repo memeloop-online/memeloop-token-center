@@ -278,6 +278,20 @@ async fn admit_request_body_for_route(
     reservation: Option<Arc<memory::ProxyMemoryReservation>>,
     request_spool: Option<&request_spool::RequestSpoolAdmission>,
 ) -> Result<Request, GatewayBodyAdmissionError> {
+    let source_backed = matches!(
+        request.uri().path(),
+        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
+    );
+    // Authenticated inference uploads with a durable source are not bounded
+    // by a hot-buffer setting. Capture already spills incrementally when its
+    // resident cache cannot grow; preserve the complete authorized payload.
+    let maximum = if (route_class == GatewayBodyRouteClass::Responses || source_backed)
+        && request_spool.is_some_and(request_spool::RequestSpoolAdmission::has_durable_store)
+    {
+        usize::MAX
+    } else {
+        maximum
+    };
     let declared_content_length = declared_content_length(request.headers());
     if request
         .headers()
@@ -302,10 +316,6 @@ async fn admit_request_body_for_route(
     {
         return Err(GatewayBodyAdmissionError::UnsupportedEncoding);
     }
-    let source_backed = matches!(
-        parts.uri.path(),
-        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
-    );
     if route_class == GatewayBodyRouteClass::Responses
         || (source_backed
             && request_spool.is_some_and(request_spool::RequestSpoolAdmission::has_durable_store))
@@ -378,7 +388,9 @@ async fn admit_request_body_for_route(
             Body::empty()
         } else {
             if let Some(reservation) = reservation.as_ref()
-                && !reservation.try_grow(spool.len(), memory::REQUEST_MEMORY_WEIGHT)
+                && !request_spool.unwrap().reclaim_for(|| {
+                    reservation.try_grow(spool.len(), memory::REQUEST_MEMORY_WEIGHT)
+                })
             {
                 return Err(GatewayBodyAdmissionError::CapacityExhausted);
             }

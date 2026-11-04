@@ -208,6 +208,10 @@ pub enum PluginOperatorUiSlot {
     PageAfter,
     #[serde(rename = "operator.model-route.action")]
     ModelRouteAction,
+    /// A component embedded in the existing settings for one upstream account.
+    /// The host supplies only that account's bounded identity as context.
+    #[serde(rename = "operator.upstream-account.reset-settings")]
+    UpstreamAccountResetSettings,
 }
 
 /// Closed, core-owned visual presentation choices for declarative operator
@@ -558,7 +562,7 @@ pub struct PreparedProviderRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct NormalizedProviderResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
@@ -566,6 +570,9 @@ pub struct NormalizedProviderResponse {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub estimated: bool,
+    // Gateway-owned envelope, retained across blocking-task completion and
+    // transferred back without releasing/reacquiring global capacity.
+    pub(crate) input_memory: Option<crate::gateway_body::memory::BufferedResponsePermit>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1611,6 +1618,7 @@ impl PluginRuntime {
             input_tokens: envelope.usage.input_tokens,
             output_tokens: envelope.usage.output_tokens,
             estimated: envelope.usage.estimated,
+            input_memory: None,
         }))
     }
 
@@ -2488,6 +2496,18 @@ fn validate_operator_ui_contributions(manifest: &PluginManifest) -> Result<(), A
                 {
                     return Err(AppError::BadRequest(format!(
                         "plugin {} model-route action requires a component without route or category",
+                        manifest.id
+                    )));
+                }
+            }
+            PluginOperatorUiSlot::UpstreamAccountResetSettings => {
+                if contribution.renderer != "component_v1"
+                    || contribution.route.is_some()
+                    || contribution.category.is_some()
+                    || contribution.target_route.is_some()
+                {
+                    return Err(AppError::BadRequest(format!(
+                        "plugin {} upstream-account reset settings require a component without route or category",
                         manifest.id
                     )));
                 }
@@ -3592,6 +3612,45 @@ mod tests {
         ] {
             assert!(!safe_operator_ui_module_entry(entry), "accepted {entry}");
         }
+    }
+
+    #[test]
+    fn upstream_account_reset_settings_are_component_only_and_unrouted() {
+        let manifest = |slot: &str, renderer: &str, route: Option<&str>| {
+            serde_json::from_value::<PluginManifest>(serde_json::json!({
+                "id": "account-settings", "version": "1.0.0", "wit_version": "0.2.0",
+                "capabilities": [], "contributions": {"operator_ui": [{
+                    "id": "reset-settings", "slot": slot, "label": "Reset settings",
+                    "icon": "activity", "renderer": renderer, "module_entry": "ui/settings.mjs",
+                    "component_id": "reset-settings", "route": route
+                }]}
+            }))
+            .unwrap()
+        };
+        assert!(
+            validate_operator_ui_contributions(&manifest(
+                "operator.upstream-account.reset-settings",
+                "component_v1",
+                None,
+            ))
+            .is_ok()
+        );
+        assert!(
+            validate_operator_ui_contributions(&manifest(
+                "operator.upstream-account.reset-settings",
+                "typed_data_v1",
+                None,
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_operator_ui_contributions(&manifest(
+                "operator.upstream-account.reset-settings",
+                "component_v1",
+                Some("settings"),
+            ))
+            .is_err()
+        );
     }
 
     fn configurable_manifest(schema: Value, default: Value) -> PluginManifest {

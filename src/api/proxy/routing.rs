@@ -30,7 +30,7 @@ pub(super) use clock::credential_application_now;
 #[cfg(test)]
 pub(super) use clock::with_test_credential_application_now_once;
 pub(super) use codex::quota::classify_rate_limit;
-pub(super) use codex::quota::{classify_supplier_quota, quota_evidence};
+pub(super) use codex::quota::{classify_stream_quota, classify_supplier_quota, quota_evidence};
 #[cfg(test)]
 pub(super) use codex::with_test_pre_delivery_connect_failures;
 #[cfg(test)]
@@ -379,7 +379,7 @@ pub(super) async fn materialize_proxy_route(
     let encoded_length = crate::gateway_body::memory::json_encoded_length(&planned.forwarded_json)?;
     // Allocate temporary serialization/adapter work before cloning any payload.
     let temporary_bytes = if planned.component_context.is_some() {
-        64 * 1024 * 1024 + encoded_length.saturating_mul(6)
+        encoded_length.saturating_mul(6)
     } else {
         encoded_length.saturating_mul(2)
     };
@@ -442,6 +442,7 @@ pub(super) async fn materialize_proxy_route(
         forwarded_body = outcome.request_json.into_bytes();
     }
     Ok(PreparedProxyRoute {
+        inspect_stream_rejection: false,
         wait_for_compaction: planned.wait_for_compaction,
         route: planned.route,
         forwarded_body: Bytes::from(forwarded_body),

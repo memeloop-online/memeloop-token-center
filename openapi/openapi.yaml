@@ -9278,6 +9278,16 @@ components:
       additionalProperties: false
       required: [current, candidates]
       properties:
+        runtime:
+          type: object
+          description: Local plugin availability; does not determine core gateway readiness.
+          properties:
+            ready: { type: boolean }
+            error: { type: [string, 'null'] }
+            revision:
+              oneOf:
+                - { $ref: '#/components/schemas/ApplicationPluginRevision' }
+                - { type: 'null' }
         current:
           oneOf:
             - { $ref: '#/components/schemas/ApplicationPluginRevision' }

@@ -8,7 +8,7 @@ export declare const OPERATOR_UI_PACKAGE_API_V1: 'operator-ui-package-v1';
 
 export interface OperatorUiContributionV1 {
   id: string;
-  slot: 'operator.sidebar.tab' | 'operator.overview.card' | 'operator.page.before' | 'operator.page.after' | 'operator.model-route.action';
+  slot: 'operator.sidebar.tab' | 'operator.overview.card' | 'operator.page.before' | 'operator.page.after' | 'operator.model-route.action' | 'operator.upstream-account.reset-settings';
   category?: { id: string; label?: string | null } | null;
   route?: string | null;
   target_route?: string | null;
@@ -63,6 +63,18 @@ export interface OperatorUiComponentPropsV1 {
   compact: boolean;
   api: OperatorUiHostApiV1;
   context?: Record<string, unknown>;
+}
+
+/** Context supplied to operator.upstream-account.reset-settings components. */
+export interface OperatorUiUpstreamAccountContextV1 {
+  /** Existing host observation; absent until available. Does not initiate a quota read. */
+  quotaSnapshot?: Record<string, unknown>;
+  upstreamAccount: {
+    id: string;
+    name: string;
+    provider: string;
+    tenantExternalId: string;
+  };
 }
 
 export interface OperatorUiPackageV1 {

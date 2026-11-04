@@ -64,10 +64,12 @@ pub(super) async fn proxy_openai_responses(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !memory.try_grow(
-        spool.len(),
-        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
-    ) {
+    if !state.responses_request_spool.reclaim_for(|| {
+        memory.try_grow(
+            spool.len(),
+            crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+        )
+    }) {
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
@@ -102,10 +104,12 @@ pub(super) async fn proxy_openai_responses_compact(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !memory.try_grow(
-        spool.len(),
-        crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
-    ) {
+    if !state.responses_request_spool.reclaim_for(|| {
+        memory.try_grow(
+            spool.len(),
+            crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
+        )
+    }) {
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
@@ -572,11 +576,23 @@ pub(super) async fn normalize_component_provider(
     body: Vec<u8>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<NormalizedProviderResponse, AppError> {
+    // The blocking guest can outlive this future. Its input must own a lease
+    // independently of the request, whose error response may be finalized
+    // while the guest still holds its raw/enveloped input. Transfer the permit
+    // back on success without releasing it to competing requests.
+    let input_memory = memory
+        .take_response_envelope()
+        .ok_or_else(|| AppError::capacity_error("upstream_response_memory_capacity"))?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
         let _memory = memory;
-        plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)
+        let mut normalized =
+            plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)?;
+        if let Some(normalized) = normalized.as_mut() {
+            normalized.input_memory = Some(input_memory);
+        }
+        Ok(normalized)
     })
     .await?
     .ok_or_else(|| AppError::upstream("component_provider_adapter_is_declared_but_unavailable"))

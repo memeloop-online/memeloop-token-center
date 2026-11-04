@@ -272,13 +272,14 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
             const parent = heading.parentElement!;
             const title = heading.getBoundingClientRect();
             const container = parent.getBoundingClientRect();
-            const action = parent.querySelector('button')!.getBoundingClientRect();
+            const action = heading.closest('.provider-detail-workspace')!.querySelector('nav button')!.getBoundingClientRect();
             const text = document.createRange();
             text.selectNodeContents(heading);
-            return { titleWidth: title.width, containerWidth: container.width, titleRight: title.right, titleBottom: title.bottom, actionLeft: action.left, actionTop: action.top, lines: text.getClientRects().length };
+            return { titleWidth: title.width, containerWidth: container.width, titleLeft: title.left, titleTop: title.top, actionLeft: action.left, actionBottom: action.bottom, lines: text.getClientRects().length };
           });
           assert.ok(titleLayout.titleWidth <= titleLayout.containerWidth, 'the account name stays inside the narrow-screen workspace navigation');
-          assert.ok(titleLayout.titleRight <= titleLayout.actionLeft + 1 || titleLayout.actionTop >= titleLayout.titleBottom - 1, 'the return action never overlaps the account name');
+          assert.ok(titleLayout.actionBottom <= titleLayout.titleTop + 1, 'the return action stays above the account name');
+          assert.ok(titleLayout.actionLeft <= titleLayout.titleLeft + 1, 'the return action stays at the top left');
           assert.equal(titleLayout.lines, 1, 'the real reauthorization account name is not squeezed onto an orphan final-character line');
         }
         await page.screenshot({ path: `${screenshotRoot}/codex-reauthorization-saved-${locale}-${width}.png`, fullPage: true });
