@@ -525,36 +525,22 @@ impl Database {
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-        insert_audit(
-            &mut tx,
-            id,
-            &tenant,
-            &account_id,
-            "confirmation_claimed",
-            Some(actor),
-            None,
-            now,
-        )
-        .await?;
-        if let Some(owner) = owner {
-            // The owner identity commits with the dispatch claim. A cancelled
-            // caller or lost COMMIT acknowledgement may only recover its own
-            // claim, never a concurrent confirmation's dispatch.
-            sqlx::query(
-                "INSERT INTO upstream_quota_reset_audit
+        // The existing confirmation audit ID is also the dispatch owner nonce.
+        // It commits with the claim and never changes on a confirmation replay.
+        sqlx::query(
+            "INSERT INTO upstream_quota_reset_audit
                  (id, operation_id, tenant_id, upstream_account_id, event,
                   actor_service_id, created_at)
-                 VALUES ($1, $2, $3, $4, 'dispatch_owner_claimed', $5, $6)",
-            )
-            .bind(owner.to_string())
-            .bind(id)
-            .bind(&tenant)
-            .bind(&account_id)
-            .bind(actor)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
-        }
+                 VALUES ($1, $2, $3, $4, 'confirmation_claimed', $5, $6)",
+        )
+        .bind(owner.unwrap_or_else(Uuid::now_v7).to_string())
+        .bind(id)
+        .bind(&tenant)
+        .bind(&account_id)
+        .bind(actor)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(QuotaResetClaim::Claimed { redeem_request_id })
     }
@@ -600,7 +586,7 @@ impl Database {
                AND ($5 IS NULL OR EXISTS (
                    SELECT 1 FROM upstream_quota_reset_audit owner
                    WHERE owner.operation_id = upstream_quota_reset_operations.id
-                     AND owner.id = $5 AND owner.event = 'dispatch_owner_claimed'
+                     AND owner.id = $5 AND owner.event = 'confirmation_claimed'
                ))",
         )
         .bind(state)
@@ -1306,7 +1292,7 @@ mod tests {
             still_owned
                 .audit
                 .iter()
-                .filter(|event| event.event == "dispatch_owner_claimed")
+                .filter(|event| event.event == "confirmation_claimed")
                 .count(),
             1,
             "a replay cannot acquire or finish another dispatch owner's claim"
