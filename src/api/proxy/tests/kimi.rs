@@ -3,7 +3,7 @@ use super::*;
 mod buffered_usage;
 
 #[tokio::test]
-async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks() {
+async fn native_kimi_rejections_preserve_classification_and_original_explanation() {
     let canary = "kimi-upstream-token-prompt-canary";
     let cases = [
         (

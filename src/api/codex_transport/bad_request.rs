@@ -35,17 +35,32 @@ pub(in crate::api) enum BadRequestUnclassifiableReason {
 /// to replay before downstream delivery. A complete, bounded JSON body without
 /// known transient semantics is a definite ordinary rejection and must not be
 /// replayed; bodies which cannot be inspected safely remain unclassifiable.
+#[cfg(test)]
 pub(in crate::api) async fn classify_bad_request(
     response: UpstreamResponse,
     request_id: Uuid,
 ) -> BadRequestDisposition {
+    classify_bad_request_with_details(response, request_id)
+        .await
+        .0
+}
+
+pub(in crate::api) async fn classify_bad_request_with_details(
+    response: UpstreamResponse,
+    request_id: Uuid,
+) -> (BadRequestDisposition, Option<bytes::Bytes>) {
     if response.status() == http::StatusCode::BAD_REQUEST
         && !has_single_json_content_type(&response)
     {
         non_json::observe(&response, request_id);
-        return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType);
+        let rejection = crate::api::proxy::upstream_error::read_rejection(response).await;
+        return (
+            BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType),
+            Some(rejection.body),
+        );
     }
-    let disposition = inspect_bad_request(response, request_id).await;
+    let mut details = None;
+    let disposition = inspect_bad_request(response, request_id, &mut details).await;
     // Ordinary JSON errors already emit their bounded diagnostic below. All
     // other exits must also be attributable to the request, without recording
     // untrusted headers, error bodies, or transport error strings.
@@ -58,7 +73,7 @@ pub(in crate::api) async fn classify_bad_request(
             "Codex upstream rejected the request"
         );
     }
-    disposition
+    (disposition, details)
 }
 
 fn classification_diagnostic(
@@ -85,6 +100,7 @@ fn classification_diagnostic(
 async fn inspect_bad_request(
     response: UpstreamResponse,
     request_id: Uuid,
+    details: &mut Option<bytes::Bytes>,
 ) -> BadRequestDisposition {
     if response.status() != http::StatusCode::BAD_REQUEST {
         return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ContentType);
@@ -105,6 +121,9 @@ async fn inspect_bad_request(
         }
         Ok(BoundedBadRequestBody::Value(value)) => {
             observe_ordinary_bad_request(request_id, &value);
+            *details = Some(crate::api::proxy::upstream_error::safe_error_body(
+                value.to_string().as_bytes(),
+            ));
             crate::supplier_error::reason_from_value(&value).map_or(
                 BadRequestDisposition::DefiniteOrdinary,
                 BadRequestDisposition::DefiniteRejection,

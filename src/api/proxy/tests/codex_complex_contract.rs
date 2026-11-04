@@ -84,7 +84,12 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
             .unwrap();
         assert!(!String::from_utf8_lossy(&returned).contains("private-upstream-diagnostic-canary"));
         if rejected {
-            cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
+            cancellation::assert_single_unknown_receipt(
+                &fixture,
+                400,
+                Some("unsupported_parameter"),
+            )
+            .await;
         } else {
             wait_for_request_settlement(&fixture, 1).await;
         }
