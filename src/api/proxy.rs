@@ -2956,7 +2956,11 @@ async fn execute_component_provider(
         )
         .await;
     }
-    if !request.memory.reserve_response_json(&normalized.body) {
+    if !request
+        .memory
+        .reserve_buffered_response(0, tokio::time::Instant::now())
+        || !request.memory.reserve_response_json(&normalized.body)
+    {
         tracing::warn!(request_id = %request.request_id,
             stage = "component_response_json", reserved_bytes = request.memory.buffered_response_reserved_bytes(),
             actual_bytes = normalized.body.len(), has_content_length, "normalized response JSON memory unavailable");

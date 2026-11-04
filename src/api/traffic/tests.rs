@@ -164,7 +164,8 @@ async fn occupied_budget_keeps_large_real_policy_allow_deny_and_rewrite_semantic
 
 #[tokio::test]
 async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() {
-    let (_directory, state, key) = fixture(None).await;
+    let (_directory, mut state, key) = fixture(None).await;
+    state.proxy_memory_budget = Arc::new(ProxyMemoryBudget::new(4 * 1024 * 1024));
     let held = state.proxy_memory_budget.reservation();
     assert!(held.try_grow(1024 * 1024, 1));
     let context = RequestContext {
@@ -196,6 +197,7 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
         json!({"prompt":"from-component", "model":"vendor-model"})
     );
     let memory = state.proxy_memory_budget.reservation();
+    assert!(memory.reserve_buffered_response(1024 * 1024, tokio::time::Instant::now()));
     let owner = Arc::downgrade(&memory);
     let normalized = normalize_component_provider(
         &state,
@@ -267,10 +269,8 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
     for cancel in [false, true] {
         let memory = state.proxy_memory_budget.reservation();
         assert!(memory.try_grow(64 * 1024, 1));
-        assert!(memory.reserve_buffered_response(0, tokio::time::Instant::now()));
-        assert!(memory.reserve_response_json(b"{}"));
-        memory.shrink_buffered_response(b"{}");
-        assert_eq!(memory.buffered_response_reserved_bytes(), 64 * 1024);
+        assert!(memory.reserve_buffered_response(128 * 1024, tokio::time::Instant::now()));
+        let failure_memory = memory.clone();
         let owner = Arc::downgrade(&memory);
         let admitted = state.proxy_memory_budget.snapshot().0;
         let context = RequestContext {
@@ -298,7 +298,7 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
                     context,
                     200,
                     BTreeMap::new(),
-                    b"{}".to_vec(),
+                    vec![b'x'; 128 * 1024],
                     memory,
                 )
                 .await
@@ -313,7 +313,15 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
             let caller = caller.take().unwrap();
             caller.abort();
             assert!(caller.await.unwrap_err().is_cancelled());
+            // Finalizing a gateway failure must not transfer the still-live
+            // blocking guest's input lease into the tiny client error body.
+            let failure = failure_memory
+                .own_response_bytes(Bytes::from_static(b"{\"error\":\"provider_normalize\"}"))
+                .unwrap();
+            assert_eq!(state.proxy_memory_budget.snapshot().0, admitted + 64 * 1024);
+            drop(failure);
         }
+        drop(failure_memory);
         assert!(owner.upgrade().is_some());
         assert_eq!(state.proxy_memory_budget.snapshot().0, admitted);
         let replacement = state.proxy_memory_budget.reservation();

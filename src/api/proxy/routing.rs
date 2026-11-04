@@ -379,7 +379,7 @@ pub(super) async fn materialize_proxy_route(
     let encoded_length = crate::gateway_body::memory::json_encoded_length(&planned.forwarded_json)?;
     // Allocate temporary serialization/adapter work before cloning any payload.
     let temporary_bytes = if planned.component_context.is_some() {
-        64 * 1024 * 1024 + encoded_length.saturating_mul(6)
+        encoded_length.saturating_mul(6)
     } else {
         encoded_length.saturating_mul(2)
     };

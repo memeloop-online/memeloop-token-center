@@ -572,6 +572,12 @@ pub(super) async fn normalize_component_provider(
     body: Vec<u8>,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<NormalizedProviderResponse, AppError> {
+    // The blocking guest can outlive this future. Its input must own a lease
+    // independently of the request, whose error response may be finalized
+    // while the guest still holds its raw/enveloped input.
+    let body = memory
+        .own_response_bytes(Bytes::from(body))
+        .ok_or_else(|| AppError::capacity_error("upstream_response_memory_capacity"))?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
     plugin_execution::run(state.metrics.clone(), Phase::Normalize, move || {
