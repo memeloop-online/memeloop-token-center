@@ -35,6 +35,8 @@ pub enum TypedFilterField {
     KeyAlias,
     Principal,
     SessionAssociation,
+    SessionId,
+    ClientSessionId,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -164,6 +166,8 @@ fn validate_condition(condition: &TypedFilterCondition) -> Result<(), AppError> 
         | TypedFilterField::RouteId
         | TypedFilterField::Protocol
         | TypedFilterField::Status
+        | TypedFilterField::SessionId
+        | TypedFilterField::ClientSessionId
         | TypedFilterField::SessionAssociation => matches!(
             condition.operator,
             TypedFilterOperator::Equals | TypedFilterOperator::NotEquals
@@ -222,6 +226,8 @@ fn expected_value_kind(field: TypedFilterField) -> fn(&TypedFilterValue) -> bool
         TypedFilterField::ErrorCode
         | TypedFilterField::KeyAlias
         | TypedFilterField::Principal
+        | TypedFilterField::SessionId
+        | TypedFilterField::ClientSessionId
         | TypedFilterField::SessionAssociation => {
             |value| matches!(value, TypedFilterValue::Text(_))
         }
