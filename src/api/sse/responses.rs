@@ -468,13 +468,16 @@ impl ResponsesStreamingSanitizer {
             self.terminal_hold.begin();
         }
         if failure {
+            let failure = json!({
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": crate::supplier_error::upstream_error_value(&value),
+                },
+            });
             self.append_output(
                 output,
-                &safe_failure_event(
-                    crate::supplier_error::reason_from_value(&value)
-                        .map_or("upstream_rejected", |reason| reason.client_code()),
-                    "response_failed",
-                ),
+                format!("event: response.failed\ndata: {failure}\n\n").as_bytes(),
             )
             .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
         } else {

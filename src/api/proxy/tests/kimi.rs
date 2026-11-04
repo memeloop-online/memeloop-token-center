@@ -3,7 +3,7 @@ use super::*;
 mod buffered_usage;
 
 #[tokio::test]
-async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks() {
+async fn native_kimi_rejections_preserve_classification_and_original_explanation() {
     let canary = "kimi-upstream-token-prompt-canary";
     let cases = [
         (
@@ -101,19 +101,24 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
             assert!(retained.is_none());
             let rejection = rejection.expect("native Kimi non-success uses the safe reader");
             let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
-            assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
+            assert!(
+                delivered["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+            );
             assert_eq!(
                 rejection.terminal_cause,
                 Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
             );
-            if let Some(reason) = expected_reason {
-                assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
-                assert_eq!(
-                    delivered["error"]["mtc_safe_reason"].as_str(),
-                    Some(*reason)
-                );
+            if let Some(reason) = expected_reason.or(if *slow_body {
+                Some("insufficient_quota")
             } else {
-                assert_eq!(rejection.body, upstream_error::fallback_body());
+                None
+            }) {
+                assert_eq!(delivered["error"]["code"].as_str(), Some(reason));
+                assert_eq!(delivered["error"]["mtc_safe_reason"].as_str(), Some(reason));
+            } else {
+                assert!(delivered["error"].get("mtc_safe_reason").is_none());
             }
             let key = fixture
                 .state

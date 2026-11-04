@@ -184,13 +184,13 @@ async fn assert_event_enrichment(database: &Database) {
             "message": "当前账号没有可用套餐", "mtc_safe_reason": "no_active_plan"
         }})
     );
-    let fixed = serde_json::json!({"code": "no_active_plan", "message": "当前账号没有可用套餐"});
+    let fixed = serde_json::json!({"code": "no_active_plan", "message": "当前账号没有可用套餐", "category": "quota", "retryable": false, "action": "check_plan"});
     let unsafe_body = safe.replace("当前账号没有可用套餐", "private%2Fcanary");
     for (body, status, completed, expected) in [
         (Some(safe.clone()), 402_i64, Some(now + 25), fixed.clone()),
         (Some("inline-json:{\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream rejected the request\"}}".to_owned()), 402, Some(now + 25), serde_json::Value::Null),
-        (Some(unsafe_body), 402, Some(now + 25), serde_json::Value::Null),
-        (Some(safe.replace("no_active_plan", "unknown_reason")), 402, Some(now + 25), serde_json::Value::Null),
+        (Some(unsafe_body), 402, Some(now + 25), fixed.clone()),
+        (Some(safe.replace("no_active_plan", "unknown_reason")), 402, Some(now + 25), serde_json::json!({"code":"unknown_reason","message":"当前账号没有可用套餐","category":"upstream","retryable":false,"action":"inspect_upstream_error"})),
         (Some(format!("inline-json:{}", " ".repeat(5000))), 402, Some(now + 25), serde_json::Value::Null),
         (Some("objects://untrusted-response".to_owned()), 402, Some(now + 25), serde_json::Value::Null),
         (None, 402, Some(now + 25), serde_json::Value::Null),

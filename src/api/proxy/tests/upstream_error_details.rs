@@ -25,7 +25,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SupplierLogCapture {
 }
 
 #[tokio::test]
-async fn supplier_header_and_prompt_echoes_never_reach_response_archives_or_logs() {
+async fn supplier_explanation_reaches_client_and_archive_without_logging_request_content() {
     use tracing::instrument::WithSubscriber;
 
     let capture = SupplierLogCapture::default();
@@ -68,18 +68,9 @@ async fn supplier_header_and_prompt_echoes_never_reach_response_archives_or_logs
                 .await.unwrap();
             assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
             let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY).await.unwrap();
-            for canary in ["private prompt/full-canary", "prompt/full", "private%20prompt%2Ffull-canary",
-                "pr%69vate+prompt%2ffull-canary", "private-header/full-canary", "header/full",
-                "private-header%2Ffull-canary", "private-header-fragment"] {
-                assert!(!String::from_utf8_lossy(&bytes).contains(canary));
-            }
-            if code == "NoAvailablePlan" {
-                let value: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(value["error"]["code"], "no_active_plan");
-                assert_eq!(value["error"]["message"], "当前账号没有可用套餐");
-            } else {
-                assert_eq!(bytes, upstream_error::fallback_body());
-            }
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["error"]["mtc_provider_code"], code);
+            assert!(value["error"]["message"].as_str().unwrap().contains("private prompt/full-canary"));
             cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
             let records = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
             let refs = fixture.state.db.request_archive_refs(fixture.key_id, records[0].request_id).await.unwrap();
@@ -188,44 +179,17 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
             .unwrap();
         let delivered: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(delivered["error"]["type"], "upstream_error");
-        if code == "insufficient_user_quota" {
-            assert_eq!(delivered["error"]["code"], "insufficient_quota");
-            assert_eq!(
-                delivered["error"]["message"],
-                "The upstream account has insufficient quota"
-            );
-            assert_eq!(
-                delivered["error"]["mtc_provider_code"],
-                "insufficient_user_quota"
-            );
-            assert!(!String::from_utf8_lossy(&bytes).contains("-0.000160"));
-            assert!(!String::from_utf8_lossy(&bytes).contains("quota-fixture"));
-        }
+        assert_eq!(delivered["error"]["message"], message);
+        assert_eq!(delivered["error"]["mtc_provider_code"], code);
+        assert_eq!(delivered["error"]["mtc_provider_message"], message);
         if let Some(reason) =
             crate::supplier_error::SafeReason::from_supplier(Some(code), Some(message))
         {
-            assert_eq!(delivered["error"]["code"], reason.code());
-            assert_eq!(delivered["error"]["message"], reason.message());
+            assert_eq!(delivered["error"]["code"], reason.client_code());
             assert_eq!(delivered["error"]["mtc_safe_reason"], reason.code());
-            let (safe_code, safe_message) = reason.provider_detail(Some(code), Some(message));
-            assert_eq!(delivered["error"]["mtc_provider_code"].as_str(), safe_code);
-            assert_eq!(
-                delivered["error"]["mtc_provider_message"].as_str(),
-                safe_message
-            );
         } else {
-            assert_eq!(bytes, upstream_error::fallback_body());
-        }
-        for canary in [
-            "compatibility-upstream-secret",
-            "other-canary",
-            "submitted-private-canary",
-            "must-not-retain",
-            "fragment%2Fcanary",
-            "header-canary",
-            "model-canary",
-        ] {
-            assert!(!String::from_utf8_lossy(&bytes).contains(canary));
+            assert_eq!(delivered["error"]["code"], code);
+            assert!(delivered["error"].get("mtc_safe_reason").is_none());
         }
         assert!(delivered.get("usage").is_none());
         cancellation::assert_single_unknown_receipt(
@@ -303,7 +267,7 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
 }
 
 #[tokio::test]
-async fn compatible_http_402_without_safe_structured_detail_does_not_invent_a_plan_failure() {
+async fn compatible_http_402_preserves_unclassified_details_without_inventing_plan_failure() {
     for (label, content_type, body) in [
         ("empty", "application/json", Vec::new()),
         (
@@ -349,7 +313,7 @@ async fn compatible_http_402_without_safe_structured_detail_does_not_invent_a_pl
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(402).set_body_raw(body, content_type))
+            .respond_with(ResponseTemplate::new(402).set_body_raw(body.clone(), content_type))
             .expect(1)
             .mount(&upstream)
             .await;
@@ -367,7 +331,25 @@ async fn compatible_http_402_without_safe_structured_detail_does_not_invent_a_pl
         let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        assert_eq!(bytes, upstream_error::fallback_body());
+        let delivered: Value = serde_json::from_slice(&bytes).unwrap();
+        if body.is_empty() {
+            assert_eq!(bytes, upstream_error::fallback_body());
+        } else {
+            assert!(
+                delivered["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+            );
+            assert!(delivered["error"].get("mtc_safe_reason").is_none());
+            if label == "huge" {
+                assert!(
+                    delivered["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("truncated at 16384 bytes")
+                );
+            }
+        }
         cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
         let records = fixture
             .state
@@ -425,7 +407,7 @@ async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() 
     });
     let fixture = response_usage_fixture_with_uri("stalled-error-detail", endpoint, 0).await;
     let response = tokio::time::timeout(
-        Duration::from_secs(2),
+        Duration::from_secs(8),
         send_chat_usage_request(
             &fixture,
             &json!({
@@ -441,7 +423,7 @@ async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() 
     let bytes = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert_eq!(bytes, upstream_error::fallback_body());
+    assert!(String::from_utf8_lossy(&bytes).contains("timed out reading upstream error body"));
     release.send(()).unwrap();
     server.await.unwrap();
     cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;

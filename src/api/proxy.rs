@@ -103,7 +103,9 @@ async fn read_safe_proxy_rejection(
     if !upstream.status().is_success()
         && !protocol.is_anthropic()
         && !responses_anthropic_route
-        && (crate::provider::is_openai_compatible_http_driver(driver) || native_kimi)
+        && (crate::provider::is_openai_compatible_http_driver(driver)
+            || native_kimi
+            || codex_transport::is_driver(driver))
     {
         (None, Some(upstream_error::read_rejection(upstream).await))
     } else {
@@ -1779,17 +1781,14 @@ async fn proxy_with_cancellation_guard(
                     .await;
             }
             Err(error @ (ProxySendError::CodexBadRequest | ProxySendError::CodexRejection(_))) => {
-                let reason = match error {
-                    ProxySendError::CodexRejection(reason) => Some(reason),
-                    _ => None,
+                let body = match error {
+                    ProxySendError::CodexRejection(body) => body,
+                    _ => upstream_error::fallback_body(),
                 };
-                let body = reason.map_or_else(upstream_error::fallback_body, |reason| {
-                    upstream_error::safe_error_body(
-                        serde_json::json!({"error":{"code":reason.code()}})
-                            .to_string()
-                            .as_bytes(),
-                    )
-                });
+                let reason = serde_json::from_slice(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(crate::supplier_error::reason_from_value);
                 let stored_response = format!("inline-json:{}", String::from_utf8_lossy(&body));
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)

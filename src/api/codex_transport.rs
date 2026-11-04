@@ -37,7 +37,7 @@ mod chat_tools;
 #[cfg(test)]
 use bad_request::codex_transient_error;
 pub(super) use bad_request::{
-    BadRequestDisposition, BadRequestUnclassifiableReason, classify_bad_request,
+    BadRequestDisposition, BadRequestUnclassifiableReason, classify_bad_request_with_details,
 };
 
 pub(in crate::api) const DRIVER: &str = "openai-codex";
@@ -2087,7 +2087,10 @@ impl BufferedResponsesParser {
         if !self.framer.is_complete() {
             return Err("upstream_incomplete_response");
         }
-        if self.invalid || self.terminal_failure {
+        if self.invalid {
+            return Err("upstream_failed_response");
+        }
+        if self.terminal_failure {
             return Err(self
                 .supplier_reason
                 .map_or("upstream_failed_response", |reason| reason.client_code()));
