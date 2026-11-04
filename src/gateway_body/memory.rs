@@ -112,6 +112,9 @@ pub(crate) struct ConversationProjectionPermit {
     _permit: OwnedSemaphorePermit,
 }
 
+#[derive(Debug)]
+pub(crate) struct BufferedResponsePermit(OwnedSemaphorePermit);
+
 pub(crate) struct ArchiveOutputMemory {
     reservation: Arc<ProxyMemoryReservation>,
     bytes: usize,
@@ -433,19 +436,35 @@ impl ProxyMemoryReservation {
         self.response_reserved.store(false, Ordering::Release);
     }
 
+    pub(crate) fn take_response_envelope(&self) -> Option<BufferedResponsePermit> {
+        let mut held = self.held.lock().ok()?;
+        let previous = self.response_bytes.load(Ordering::Acquire);
+        let permit = held.1.as_mut()?.split(previous / UNIT_BYTES)?;
+        held.0 -= previous;
+        self.response_bytes.store(0, Ordering::Release);
+        self.response_reserved.store(false, Ordering::Release);
+        Some(BufferedResponsePermit(permit))
+    }
+
+    pub(crate) fn restore_response_envelope(&self, permit: BufferedResponsePermit) -> bool {
+        let Ok(mut held) = self.held.lock() else {
+            return false;
+        };
+        if self.has_buffered_response() {
+            return false;
+        }
+        let bytes = permit.0.num_permits() * UNIT_BYTES;
+        held.0 += bytes;
+        match held.1.as_mut() {
+            Some(existing) => existing.merge(permit.0),
+            None => held.1 = Some(permit.0),
+        }
+        self.response_bytes.store(bytes, Ordering::Release);
+        self.response_reserved.store(true, Ordering::Release);
+        true
+    }
+
     pub(crate) fn own_response_bytes(&self, bytes: bytes::Bytes) -> Option<bytes::Bytes> {
-        self.own_response_bytes_inner(bytes, false)
-    }
-
-    pub(crate) fn own_response_envelope(&self, bytes: bytes::Bytes) -> Option<bytes::Bytes> {
-        self.own_response_bytes_inner(bytes, true)
-    }
-
-    fn own_response_bytes_inner(
-        &self,
-        bytes: bytes::Bytes,
-        preserve_envelope: bool,
-    ) -> Option<bytes::Bytes> {
         struct Payload {
             bytes: bytes::Bytes,
             _permit: OwnedSemaphorePermit,
@@ -458,11 +477,6 @@ impl ProxyMemoryReservation {
         let required = bytes.len().checked_mul(CAPTURE_MEMORY_WEIGHT)?;
         let mut held = self.held.lock().ok()?;
         let previous = self.response_bytes.load(Ordering::Acquire);
-        let required = if preserve_envelope {
-            required.max(previous)
-        } else {
-            required
-        };
         let units = u32::try_from(required.div_ceil(UNIT_BYTES)).ok()?;
         let previous_units = previous / UNIT_BYTES;
         let permit = if units == 0 {

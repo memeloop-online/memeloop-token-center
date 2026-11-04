@@ -558,7 +558,7 @@ pub struct PreparedProviderRequest {
     pub body: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct NormalizedProviderResponse {
     pub status: u16,
     pub headers: BTreeMap<String, String>,
@@ -566,9 +566,9 @@ pub struct NormalizedProviderResponse {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub estimated: bool,
-    // Gateway-owned input/envelope lease, retained across blocking-task
-    // completion until the normalized output has its own accounted owner.
-    pub(crate) input_memory: Option<bytes::Bytes>,
+    // Gateway-owned envelope, retained across blocking-task completion and
+    // transferred back without releasing/reacquiring global capacity.
+    pub(crate) input_memory: Option<crate::gateway_body::memory::BufferedResponsePermit>,
 }
 
 #[derive(Debug, Deserialize)]

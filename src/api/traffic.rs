@@ -574,9 +574,10 @@ pub(super) async fn normalize_component_provider(
 ) -> Result<NormalizedProviderResponse, AppError> {
     // The blocking guest can outlive this future. Its input must own a lease
     // independently of the request, whose error response may be finalized
-    // while the guest still holds its raw/enveloped input.
-    let body = memory
-        .own_response_envelope(Bytes::from(body))
+    // while the guest still holds its raw/enveloped input. Transfer the permit
+    // back on success without releasing it to competing requests.
+    let input_memory = memory
+        .take_response_envelope()
         .ok_or_else(|| AppError::capacity_error("upstream_response_memory_capacity"))?;
     let plugins = state.plugins.clone();
     let provider_id = provider_id.to_owned();
@@ -585,7 +586,7 @@ pub(super) async fn normalize_component_provider(
         let mut normalized =
             plugins.normalize_provider_response(&provider_id, context, status, &headers, &body)?;
         if let Some(normalized) = normalized.as_mut() {
-            normalized.input_memory = Some(body);
+            normalized.input_memory = Some(input_memory);
         }
         Ok(normalized)
     })
