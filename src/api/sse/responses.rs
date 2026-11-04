@@ -49,6 +49,31 @@ pub(in crate::api) fn safe_failure_event(code: &'static str, stage: &'static str
     Bytes::from(frame)
 }
 
+/// These exact protocol codes select client recovery behavior. Keep only the
+/// allowlisted code, never the provider's message, identifiers, or other fields.
+fn client_failure_code(value: &Value) -> &'static str {
+    let error = value
+        .pointer("/response/error")
+        .filter(|error| !error.is_null())
+        .or_else(|| value.get("error"));
+    match error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+    {
+        Some("context_length_exceeded") => "context_length_exceeded",
+        Some("insufficient_quota") => "insufficient_quota",
+        Some("usage_not_included") => "usage_not_included",
+        Some("invalid_prompt") => "invalid_prompt",
+        Some("misalignment_policy_violation") => "misalignment_policy_violation",
+        Some("cyber_policy") => "cyber_policy",
+        Some("bio_policy") => "bio_policy",
+        Some("server_is_overloaded") => "server_is_overloaded",
+        Some("slow_down") => "slow_down",
+        Some("rate_limit_exceeded") => "rate_limit_exceeded",
+        _ => "upstream_rejected",
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StreamTerminal {
     Completed,
@@ -470,7 +495,7 @@ impl ResponsesStreamingSanitizer {
         if failure {
             self.append_output(
                 output,
-                &safe_failure_event("upstream_rejected", "response_failed"),
+                &safe_failure_event(client_failure_code(&value), "response_failed"),
             )
             .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
         } else {
