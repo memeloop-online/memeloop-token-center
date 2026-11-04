@@ -1,4 +1,4 @@
-import type { UpstreamQuotaSnapshot } from './upstreamQuota';
+import type { UpstreamQuotaSnapshot } from './upstreamQuota.js';
 import { useEffect, useState } from 'react';
 import { ApiError, api } from '../api.js';
 import { PluginUiSlot } from '../plugins/PluginUiSlot.js';
