@@ -16,30 +16,24 @@ pub(super) async fn send_frame(
     input: FrameDelivery<'_>,
     frame: SseDeliveryFrame,
 ) -> Result<bool, &'static str> {
+    // Backpressure is flow control, not evidence of a failed request. Keep the
+    // bounded channel and wait until it has room or its receiver disconnects.
     let SseDeliveryFrame {
         bytes, billable, ..
     } = frame;
     if billable && !*input.queued {
         let permit = input
             .waits
-            .downstream(tokio::time::timeout(
-                MAX_DOWNSTREAM_SEND_WAIT,
-                input.sender.reserve(),
-            ))
+            .downstream(input.sender.reserve())
             .await
-            .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
         permit.send(Ok(bytes));
         *input.queued = true;
     } else {
         input
             .waits
-            .downstream(tokio::time::timeout(
-                MAX_DOWNSTREAM_SEND_WAIT,
-                input.sender.send(Ok(bytes)),
-            ))
+            .downstream(input.sender.send(Ok(bytes)))
             .await
-            .map_err(|_| "downstream_backpressure")?
             .map_err(|_| "downstream_disconnected")?;
     }
     if billable && let Some(probe) = input.probe {
@@ -168,3 +162,67 @@ pub(super) fn capture_sse_delivery(
 #[cfg(test)]
 #[path = "delivery_log_tests.rs"]
 mod delivery_log_tests;
+
+#[cfg(test)]
+mod backpressure_tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_reader_receives_first_and_later_frames_after_old_deadline() {
+        for queued_before in [false, true] {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            sender.send(Ok(Bytes::from_static(b"previous"))).await.unwrap();
+            let task = tokio::spawn(async move {
+                let mut waits = wait_diagnostics::WaitDiagnostics::default();
+                let mut queued = queued_before;
+                send_frame(
+                    FrameDelivery {
+                        waits: &mut waits,
+                        sender: &sender,
+                        queued: &mut queued,
+                        probe: None,
+                    },
+                    SseDeliveryFrame {
+                        bytes: Bytes::from_static(b"next"),
+                        billable: true,
+                        terminal: false,
+                    },
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(31)).await;
+            assert!(!task.is_finished());
+            assert_eq!(receiver.recv().await.unwrap().unwrap(), "previous");
+            assert!(task.await.unwrap().unwrap());
+            assert_eq!(receiver.recv().await.unwrap().unwrap(), "next");
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnected_reader_releases_pending_send() {
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        sender.send(Ok(Bytes::from_static(b"previous"))).await.unwrap();
+        let task = tokio::spawn(async move {
+            let mut waits = wait_diagnostics::WaitDiagnostics::default();
+            let mut queued = false;
+            send_frame(
+                FrameDelivery {
+                    waits: &mut waits,
+                    sender: &sender,
+                    queued: &mut queued,
+                    probe: None,
+                },
+                SseDeliveryFrame {
+                    bytes: Bytes::from_static(b"next"),
+                    billable: true,
+                    terminal: false,
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        drop(receiver);
+        assert_eq!(task.await.unwrap(), Err("downstream_disconnected"));
+    }
+}
