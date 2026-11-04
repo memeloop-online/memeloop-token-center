@@ -1,5 +1,7 @@
 # Operator UI extensions
 
+`operator.upstream-account.reset-settings` embeds a component in the current upstream account’s reset settings. `context.upstreamAccount` contains `id`, `name`, `provider`, and `tenantExternalId`; optional `context.quotaSnapshot` shares the host’s current observation. The slot has no navigation fields and does not start quota reads. Components must validate context before requesting account-scoped data.
+
 An installed, signed plugin can contribute pages, cards, page extensions and model-route actions without rebuilding Token Center. Its self-contained ESM module exports `activateOperatorUi(host)`, uses the host's React and Fluent runtimes, and returns an `operator-ui-package-v1` component registry. Each manifest contribution identifies the component, module entry and SHA-256 digest; the installed snapshot serves the verified asset.
 
 `operator.sidebar.tab` supports a custom category (`id` and `label`) and a plugin route. `operator.model-route.action` renders a `component_v1` component in each model-route row and supplies `props.context.modelRoute`. The action can use `props.api.navigate(destination, { modelRoute })` to pass the selected resource to a separate plugin page. Navigation uses the existing unsaved-change guard. Context stays in memory and expires when the user leaves the page or changes the tenant or credential.
