@@ -154,7 +154,7 @@ impl TransportFailureKind {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 pub(in crate::api::proxy) enum ProxySendError {
     RetryableConnection(&'static str),
     RetryableCodexBadRequest,
@@ -166,6 +166,43 @@ pub(in crate::api::proxy) enum ProxySendError {
     NonRetryableTransport(TransportFailureKind),
     CredentialUnavailable,
     Credential,
+}
+
+impl std::fmt::Debug for ProxySendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CodexRejection(body) | Self::CodexTransientRejection(body) => {
+                // The response and request archive carry the complete payload.
+                // Transport telemetry references that evidence by request ID.
+                let variant = if matches!(self, Self::CodexRejection(_)) {
+                    "CodexRejection"
+                } else {
+                    "CodexTransientRejection"
+                };
+                formatter
+                    .debug_struct(variant)
+                    .field("body_bytes", &body.len())
+                    .finish()
+            }
+            Self::RetryableConnection(stage) => formatter
+                .debug_tuple("RetryableConnection")
+                .field(stage)
+                .finish(),
+            Self::AmbiguousResponse(code) => formatter
+                .debug_tuple("AmbiguousResponse")
+                .field(code)
+                .finish(),
+            Self::NonRetryableTransport(kind) => formatter
+                .debug_tuple("NonRetryableTransport")
+                .field(kind)
+                .finish(),
+            Self::RetryableCodexBadRequest => formatter.write_str("RetryableCodexBadRequest"),
+            Self::CodexBadRequest => formatter.write_str("CodexBadRequest"),
+            Self::CandidateUnavailable => formatter.write_str("CandidateUnavailable"),
+            Self::CredentialUnavailable => formatter.write_str("CredentialUnavailable"),
+            Self::Credential => formatter.write_str("Credential"),
+        }
+    }
 }
 
 pub(in crate::api::proxy) struct ProxyRouteResponse {
