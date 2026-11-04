@@ -11,7 +11,7 @@ import {
   VisualMapComponent,
 } from 'echarts/components';
 import { CanvasRenderer } from 'echarts/renderers';
-import { dataThemes } from '../design-system/dataTheme';
+import { dataThemes } from '../design-system/dataTheme.js';
 
 use([
   LineChart,

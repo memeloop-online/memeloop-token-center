@@ -14,7 +14,7 @@ import * as ReactDOMRuntime from 'react-dom';
 import * as ReactJSXRuntime from 'react/jsx-runtime';
 import * as FluentRuntime from '@fluentui/react-components';
 import { api } from '../api.js';
-import { LoadingState } from '../design-system/index.js';
+import { LoadingState } from '../design-system/loading.js';
 import { createOperatorApiBridge } from './operatorApiBridge.js';
 import type { PluginOperatorUiContribution, PluginServiceDataResponse } from '../types.js';
 import {
