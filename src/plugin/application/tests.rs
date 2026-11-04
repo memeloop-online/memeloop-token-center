@@ -560,7 +560,7 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
     ));
     assert!(authority_a.pin_historical(i64::MAX).await.is_err());
     assert_eq!(pin_work_counts(&authority_a), warm_counts);
-    assert!(authority_a.status().await.is_err());
+    assert!(authority_a.status().await.unwrap().runtime["error"].is_string());
     assert!(authority_a.stage("a").await.is_err());
     assert!(Arc::ptr_eq(&warm_other, &authority_b.pin().await.unwrap()));
     assert_eq!(pin_work_counts(&authority_b), other_counts);
@@ -1125,7 +1125,7 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
         &warm_historical,
         &authority.pin_historical(2).await.unwrap(),
     ));
-    assert!(authority.status().await.is_err());
+    assert!(authority.status().await.unwrap().runtime["error"].is_string());
     std::fs::rename(&offline_inventory, &inventory_path).unwrap();
     let cold_authority = Arc::new(
         ApplicationPlugins::new(state.db.clone(), trusted.clone(), &state.plugins).unwrap(),
@@ -1148,7 +1148,8 @@ async fn running_authority_admits_new_contract_and_pins_history_without_restart(
     // A host publication cannot silently mutate or remove an observed ID.
     trusted.remove("empty");
     std::fs::write(&inventory_path, serde_json::to_vec(&trusted).unwrap()).unwrap();
-    assert!(authority.status().await.is_err());
+    assert!(authority.status().await.unwrap().runtime["error"].is_string());
+    assert!(authority.refresh_inventory().await.is_err());
     let warm_counts = pin_work_counts(&authority);
     assert!(Arc::ptr_eq(
         &warm_historical,
@@ -1181,7 +1182,7 @@ async fn configured_empty_inventory_preserves_baseline_and_reports_no_revision()
     );
     assert_eq!(
         control_get(&state, "/internal/v1/plugin-runtime").await,
-        json!({"current":null,"candidates":[]})
+        json!({"current":null,"candidates":[],"runtime":{"ready":true,"revision":null,"error":null}})
     );
     let authority = state.application_plugins.as_ref().unwrap();
     assert_eq!(
@@ -1202,10 +1203,19 @@ async fn configured_empty_inventory_preserves_baseline_and_reports_no_revision()
         2
     );
     std::fs::write(&inventory_path, b"{invalid").unwrap();
-    assert!(matches!(
-        AppState::initialize(config).await,
-        Err(crate::InitializationError::Plugin)
-    ));
+    let recovering = AppState::initialize(config).await.unwrap();
+    let authority = recovering.application_plugins.as_ref().unwrap();
+    assert_eq!(
+        authority.status().await.unwrap().runtime["error"],
+        "inventory_unavailable"
+    );
+    assert!(recovering.clone().pin_application_plugins().await.is_ok());
+    assert!(authority.stage("missing").await.is_err());
+    std::fs::write(&inventory_path, b"{}").unwrap();
+    assert_eq!(
+        authority.status().await.unwrap().runtime["error"],
+        serde_json::Value::Null
+    );
 }
 
 #[tokio::test]

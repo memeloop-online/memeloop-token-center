@@ -2538,7 +2538,10 @@ printf '{"format_version":1,"source":"%s","digest":"%s","signature_policy":"cosi
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(value, json!({"current":null,"candidates":[]}));
+        assert_eq!(
+            value,
+            json!({"current":null,"candidates":[],"runtime":{"ready":true,"error":null}})
+        );
         let (status, history) = call(
             &state,
             "GET",
