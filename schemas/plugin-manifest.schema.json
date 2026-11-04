@@ -429,7 +429,7 @@
             "required": ["id", "slot", "label", "icon", "renderer"],
             "properties": {
               "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
-              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after", "operator.model-route.action"] },
+              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after", "operator.model-route.action", "operator.upstream-account.reset-settings"] },
               "category": {
                 "type": "object",
                 "additionalProperties": false,
@@ -480,7 +480,7 @@
                 "then": { "not": { "anyOf": [{ "required": ["route"] }, { "required": ["category"] }, { "required": ["target_route"] }] } }
               },
               {
-                "if": { "properties": { "slot": { "const": "operator.model-route.action" } }, "required": ["slot"] },
+                "if": { "properties": { "slot": { "enum": ["operator.model-route.action", "operator.upstream-account.reset-settings"] } }, "required": ["slot"] },
                 "then": {
                   "properties": { "renderer": { "const": "component_v1" } },
                   "not": { "anyOf": [{ "required": ["route"] }, { "required": ["category"] }, { "required": ["target_route"] }] }

@@ -43,6 +43,7 @@ import {
 import { directCredentialSchema, isKimiDeviceProvider, oauthCreationProxyMode, supportsDirectConnection } from '../providerConnectionMethods';
 import { UpstreamAvailability } from '../UpstreamAvailability';
 import { UpstreamQuota } from '../UpstreamQuotaPanel';
+import type { UpstreamQuotaSnapshot } from '../upstreamQuota';
 import { QuotaSummary } from '../QuotaSummary';
 import { useUpstreamQuotaReads } from '../useUpstreamQuotaReads';
 import { connectionSchema, isPrivateProxyUrl, ProxyInput, UpstreamConnection } from '../UpstreamConnection';
@@ -181,7 +182,7 @@ function isPositiveDecimal(value: string) {
 
 class AccountListRefreshError extends Error {}
 
-function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onOpenPricing, onOpenProxyGroups, onReadFeedbackOwnerChange, onChanged: reloadAccounts }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void; onReadFeedbackOwnerChange: (caller: boolean) => void; onChanged: (saved?: boolean, caller?: boolean) => Promise<void> }) {
+function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = tenant, providers, values, availabilitySnapshot, availabilityWindow, availabilityError, availabilityLoading, onOpenRequest, onOpenPricing, onOpenProxyGroups, onReadFeedbackOwnerChange, onChanged: reloadAccounts }: { token: string; tenant: string; writeTenant?: string; providers: ProviderType[]; values: UpstreamAccount[]; renderResetSettings?: (account: UpstreamAccount, snapshot?: UpstreamQuotaSnapshot) => ReactNode; availabilitySnapshot?: OperatorMonitoringSnapshot; availabilityWindow?: UpstreamAvailabilityWindow; availabilityError?: string; availabilityLoading?: boolean; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void; onReadFeedbackOwnerChange: (caller: boolean) => void; onChanged: (saved?: boolean, caller?: boolean) => Promise<void> }) {
   const { locale, t } = useI18n();
   const onChanged = reloadAccounts;
   const accountStatusNow = useQuotaClock();
@@ -606,7 +607,7 @@ function UpstreamProviders({ token, tenant, writeTenant = tenant, providers, val
             <ProviderAccountIdentity account={value} />
             <UpstreamConnection key={`connection\0${token}\0${writeTenant}\0${value.id}`} readOnOpen account={value} token={token} tenant={writeTenant} disabled={!manageable || Boolean(busy)} onChanged={onChanged} onEditingChange={setProxyEditorOpen} />
             <Disclosure title={t('providers.recentAvailability')}><UpstreamAvailability account={value} snapshot={availabilitySnapshot} window={availabilityWindow} loading={availabilityLoading} manualHealth={currentHealth} onOpenRequest={onOpenRequest} /></Disclosure>
-            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} readState={cachedQuota?.generation === generation ? cachedQuota : undefined} onRefresh={() => void quotaReads.read(value)} refreshDisabled={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} canRecover={manageable && value.can_update_transport_proxy === true} />
+            <UpstreamQuota key={`${token}\0${tenant}\0${value.id}\0${generation}`} accountId={value.id} accountName={value.name} resetSettings={snapshot => renderResetSettings?.(value, snapshot)} credentialGeneration={generation} tenant={value.tenant_external_id ?? tenant} token={token} readState={cachedQuota?.generation === generation ? cachedQuota : undefined} onRefresh={() => void quotaReads.read(value)} refreshDisabled={Boolean(cachedQuota?.generation === generation && cachedQuota.busy)} canRecover={manageable && value.can_update_transport_proxy === true} />
             {currentReadiness && <small className={`status ${currentReadiness.can_delete ? 'ok' : 'pending'}`}>{deletionBlockers.join(' · ')}</small>}
           </div>
           <div className="account-meta">
@@ -2244,7 +2245,7 @@ interface OperatorPageProps {
   tenants?: TenantView[];
 }
 
-export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpenPricing, onOpenProxyGroups }: OperatorPageProps & { onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void }) {
+export function ProvidersPage({ renderResetSettings, token, tenant, writeTenant, onOpenRequest, onOpenPricing, onOpenProxyGroups }: OperatorPageProps & { renderResetSettings?: (account: UpstreamAccount, snapshot?: UpstreamQuotaSnapshot) => ReactNode; onOpenRequest?: (requestId: string) => void; onOpenPricing?: (tenant: string) => void; onOpenProxyGroups?: (accountId?: string) => void }) {
   const { t } = useI18n();
   const savedRefresh = useRef(false);
   const [callerReadFeedback, setCallerReadFeedback] = useState(false);
@@ -2297,7 +2298,7 @@ export function ProvidersPage({ token, tenant, writeTenant, onOpenRequest, onOpe
     ? { ...resource.state, refreshError: callerReadFeedback ? undefined : t(savedRefresh.current ? 'providers.savedListUnavailable' : 'common.requestFailed') }
     : resource.state;
   return <ResourceBoundary resource={accountResource} scopeKey={`${token}\0${tenant}`} onRetry={() => void resource.reload()}>{({ providers, values }) =>
-    <UpstreamProviders token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onReadFeedbackOwnerChange={setCallerReadFeedback} onChanged={async (saved = false, caller = false) => {
+    <UpstreamProviders renderResetSettings={renderResetSettings} token={token} tenant={tenant} writeTenant={writeTenant} providers={providers} values={values} {...availability} onOpenRequest={onOpenRequest} onOpenPricing={onOpenPricing} onOpenProxyGroups={onOpenProxyGroups} onReadFeedbackOwnerChange={setCallerReadFeedback} onChanged={async (saved = false, caller = false) => {
       savedRefresh.current = saved;
       setCallerReadFeedback(caller);
       void statistics.reload();

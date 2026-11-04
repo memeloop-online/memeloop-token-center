@@ -200,7 +200,7 @@ export function UpstreamQuotaReset({ accountId, accountName, tenant, token, snap
       ? t('quota.resetPreparedExpired')
       : t('quota.resetPreparedExpiresIn', { time: formatCountdown(operation.expires_at - now, locale) })}</p>}
     {unlocked && <p>{t('quota.recoverReleased')}</p>}
-    {operation.quota_refresh_status && <p>{t(operation.quota_refresh_status === 'succeeded' ? 'quota.resetReadbackSucceeded' : operation.quota_refresh_status === 'pending' ? 'quota.resetReadbackPending' : 'quota.resetReadbackNotAttempted')}</p>}
+    {operation.quota_refresh_status && operation.quota_refresh_status !== 'pending' && <p>{t(operation.quota_refresh_status === 'succeeded' ? 'quota.resetReadbackSucceeded' : 'quota.resetReadbackNotAttempted')}</p>}
     {operation.dispatch_diagnostic && <p>{t(['timeout', 'connect_timeout', 'connect_failed'].includes(operation.dispatch_diagnostic.reason) ? 'quota.resetNetworkUnknown' : 'quota.resetDispatchUnknown')}</p>}
     {operation.last_reconciled_at !== null && <p>{t('quota.resetReconciled', { time: new Date(operation.last_reconciled_at).toLocaleString(locale), available: operation.reconciled_available_credits ?? '—', applicable: operation.reconciled_applicable_credits ?? '—' })}</p>}
   </>;
