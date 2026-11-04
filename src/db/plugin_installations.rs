@@ -4,6 +4,26 @@ use crate::plugin::application::installation::{
 };
 
 impl Database {
+    pub(crate) async fn application_plugin_review_manifests(
+        &self,
+        inventory_id: &str,
+    ) -> Result<Option<serde_json::Value>, AppError> {
+        let review: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT review_json FROM application_plugin_installations WHERE inventory_id = $1 AND status = 'registered' ORDER BY updated_at DESC LIMIT 1",
+        )
+        .bind(inventory_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        review
+            .flatten()
+            .map(|review| {
+                serde_json::from_str::<serde_json::Value>(&review)
+                    .map(|review| review["plugins"].clone())
+                    .map_err(|_| AppError::internal("application_plugin_review_manifests"))
+            })
+            .transpose()
+    }
+
     pub(crate) async fn replay_plugin_installation(
         &self,
         key: &str,
