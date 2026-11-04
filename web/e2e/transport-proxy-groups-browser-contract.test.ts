@@ -651,10 +651,16 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       const workspace = page.locator('.network-proxy-workspace');
       await workspace.getByRole('button', { name: copy.edit('CSIL'), exact: true }).click();
       await page.getByRole('dialog', { name: copy.edit('CSIL'), exact: true }).waitFor();
+      await page.setViewportSize({ width: 390, height: 640 });
       await workspace.locator('.proxy-address-input').fill('http://invalid-proxy');
       assert.equal(await workspace.getByRole('button', { name: copy.save, exact: true }).isEnabled(), true);
       await workspace.getByRole('button', { name: copy.save, exact: true }).click();
       await page.getByRole('dialog').getByText(copy.errors.invalid, { exact: true }).waitFor();
+      const invalidBounds = await page.getByRole('dialog').getByText(copy.errors.invalid, { exact: true }).boundingBox();
+      assert.ok(invalidBounds && invalidBounds.y >= 0 && invalidBounds.y + invalidBounds.height <= 640);
+      await workspace.getByRole('button', { name: copy.save, exact: true }).click();
+      const repeatedInvalidBounds = await page.getByRole('dialog').getByText(copy.errors.invalid, { exact: true }).boundingBox();
+      assert.ok(repeatedInvalidBounds && repeatedInvalidBounds.y >= 0 && repeatedInvalidBounds.y + repeatedInvalidBounds.height <= 640);
       assert.equal(await page.evaluate(() => window.proxyGroupFixture.writes.length), 0);
       await workspace.locator('.proxy-address-input').fill('socks5h://100.64.0.16:1080');
       await workspace.getByRole('textbox', { name: /^出口名称\s*\*?$/ }).fill('CSIL 主出口');

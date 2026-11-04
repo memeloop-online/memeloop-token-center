@@ -86,7 +86,10 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
   });
 
   useLayoutEffect(() => {
-    if (busy || error || message) feedback.current?.focus({ preventScroll: true });
+    if (busy || error || message) {
+      feedback.current?.focus({ preventScroll: true });
+      if (editing !== undefined && (error || message)) feedback.current?.scrollIntoView({ block: 'nearest' });
+    }
   }, [busy, error, message]);
 
   useEffect(() => {
@@ -170,7 +173,12 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
 
   async function saveProxy() {
     if (editing === undefined) return;
-    if (!validForm) { setError(copy.errors.invalid); return; }
+    if (!validForm) {
+      setError(copy.errors.invalid);
+      feedback.current?.focus({ preventScroll: true });
+      feedback.current?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
     const probe = {
       enabled: probeEnabled, target_url: probeTarget.trim(),
       interval_ms: intervalValue, attempts: attemptsValue,

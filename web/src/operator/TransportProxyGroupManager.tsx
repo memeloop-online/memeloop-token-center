@@ -153,7 +153,10 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
   });
 
   useLayoutEffect(() => {
-    if (busy || error || message) feedback.current?.focus({ preventScroll: true });
+    if (busy || error || message) {
+      feedback.current?.focus({ preventScroll: true });
+      if (editing !== undefined && (error || message)) feedback.current?.scrollIntoView({ block: 'nearest' });
+    }
   }, [busy, error, message]);
 
   useEffect(() => {
@@ -230,7 +233,12 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
 
   async function saveGroup() {
     if (editing === undefined) return;
-    if (!name.trim() || !validMembers || !validProbe) { setError(copy.errors.invalid); return; }
+    if (!name.trim() || !validMembers || !validProbe) {
+      setError(copy.errors.invalid);
+      feedback.current?.focus({ preventScroll: true });
+      feedback.current?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
     const body = {
       tenant_external_id: tenant, name: name.trim(),
       ...(editing ? { expected_version: editing.version } : {}),
