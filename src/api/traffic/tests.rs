@@ -339,6 +339,15 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
             .await
             .expect("normalize blocking invocation tears down its dispatch after work exits")
             .unwrap();
+        // Dispatch teardown can precede the blocking closure's remaining field
+        // destructors. Wait for both the owner and its semaphore permits.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.upgrade().is_some() || state.proxy_memory_budget.snapshot().0 != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("normalize guest releases its memory owner and admission permits");
         assert!(owner.upgrade().is_none());
         assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
         assert!(replacement.try_grow(1024 * 1024, 1));

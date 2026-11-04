@@ -98,6 +98,7 @@ pub(in crate::api) async fn application_plugin_status(
         None => crate::plugin::application::ApplicationPluginStatus {
             current: None,
             candidates: Vec::new(),
+            runtime: serde_json::json!({"ready": true, "error": null}),
         },
     };
     Ok((

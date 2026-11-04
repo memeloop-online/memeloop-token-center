@@ -98,6 +98,13 @@ pub(in crate::api) async fn create_generation_for_modality(
         .generation_price(&body.model, &key.currency)
         .await?;
     let estimated_units = adapter.estimated_units(&generation_price.billing_unit, &body.input)?;
+    if adapter == crate::generation::GenerationProtocolAdapter::TkmarketSeedanceV1
+        && key.policy.enforcement_mode != crate::model::EnforcementMode::MeteredUnlimited
+    {
+        return Err(AppError::BadRequest(
+            "tkmarket video requires metered_unlimited: the supplier publishes no guaranteed token bound".into(),
+        ));
+    }
     let mut reservation_price = generation_price
         .reservation_price()
         .ok_or_else(|| AppError::BadRequest("generation price is too large".into()))?;
