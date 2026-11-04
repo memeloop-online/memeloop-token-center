@@ -122,7 +122,18 @@ impl ArchiveStore {
                 continue;
             }
             pass.observed_bytes = pass.observed_bytes.saturating_add(metadata.size);
-            if cached_reference(&key).is_none() {
+            let Some((tenant, original)) = cached_reference(&key) else {
+                pass.protected_objects += 1;
+                continue;
+            };
+            // Protected old entries must not occupy the bounded candidate
+            // batch forever and starve later disposable copies.
+            if metadata.size != original.size_bytes
+                || durable
+                    .verify_tenant_content(tenant, &original)
+                    .await
+                    .is_err()
+            {
                 pass.protected_objects += 1;
                 continue;
             }
@@ -193,6 +204,41 @@ mod tests {
 
     use super::*;
     use crate::archive::tests::memory_store;
+
+    #[tokio::test]
+    async fn protected_old_entries_do_not_starve_later_verified_copies() {
+        let durable = memory_store();
+        let cache = memory_store();
+        let tenant = Uuid::now_v7();
+        for _ in 0..CANDIDATES {
+            let key = format!(
+                "{PREFIX}{}/{tenant}/{}/1/plain",
+                Uuid::now_v7(),
+                "0".repeat(64)
+            );
+            cache.put(&key, Bytes::from_static(b"x")).await.unwrap();
+        }
+        let original = durable
+            .put_tenant_content(tenant, Bytes::from_static(b"original"))
+            .await
+            .unwrap();
+        let disposable = cache
+            .cache_original(&durable, tenant, &original)
+            .await
+            .unwrap();
+        let applied = cache
+            .evict_cached_originals(&durable, 128, 127, true)
+            .await
+            .unwrap();
+        assert_eq!(applied.protected_objects, CANDIDATES as u64);
+        assert_eq!(applied.deleted_objects, 1);
+        assert_eq!(applied.remaining_observed_bytes, 128);
+        assert!(cache.head_size(&disposable).await.is_err());
+        durable
+            .verify_tenant_content(tenant, &original)
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn fifo_reclaims_only_verified_duplicates_and_preserves_durable_originals() {
