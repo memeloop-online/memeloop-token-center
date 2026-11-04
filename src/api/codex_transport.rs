@@ -65,7 +65,6 @@ const MAX_OUTPUT_ITEMS: usize = 16_384;
 // health. Keep the exceptional definite-rejection inspection deliberately
 // small: it happens before any downstream bytes are delivered and its body is
 // never retained, archived, logged, or returned.
-const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(super) fn is_driver(driver: &str) -> bool {
     driver == DRIVER
@@ -1208,14 +1207,13 @@ pub(super) async fn admit_event_stream_response(
     }
 
     let mut parts = response.into_parts();
-    let deadline = tokio::time::Instant::now() + MISSING_CONTENT_TYPE_SNIFF_TIMEOUT;
     let mut prefetched = Vec::new();
     let mut inspected = Vec::new();
     let mut sanitizer = ResponsesStreamingSanitizer::with_limits(sse_framing_limits);
     loop {
-        let next = tokio::time::timeout_at(deadline, parts.stream.next())
-            .await
-            .map_err(|_| ResponseAdmissionError::Ambiguous("upstream_timeout"))?;
+        // Admission shares the upstream body's timeout/cancellation policy.
+        // Missing Content-Type must not introduce a separate response deadline.
+        let next = parts.stream.next().await;
         let Some(next) = next else {
             return Err(ResponseAdmissionError::Invalid(
                 "upstream_invalid_content_type",
