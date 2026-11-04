@@ -745,7 +745,6 @@ async fn failed_source_metadata_contract(database_url: String) {
         .db
         .hold_gateway_archive_connection_for_test()
         .await;
-    let before = fixture.state.db.request_source_write_failures_for_test();
     release.send(()).unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(300), source.upload_outcome())
@@ -758,9 +757,7 @@ async fn failed_source_metadata_contract(database_url: String) {
     source.release_retained();
     drop(source);
     tokio::time::timeout(Duration::from_secs(5), async {
-        while fixture.state.db.request_source_write_failures_for_test() == before
-            || fixture.state.proxy_memory_budget.snapshot().0 != 0
-        {
+        while fixture.state.proxy_memory_budget.snapshot().0 != 0 {
             tokio::task::yield_now().await;
         }
     })

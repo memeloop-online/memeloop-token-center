@@ -244,10 +244,18 @@ impl Database {
             if let Some(success) = *outcome.borrow_and_update() {
                 return Some(success);
             }
-            let delay = match self
-                .persist_request_source(identity, locator, length, digest, None)
-                .await
-            {
+            // Upload completion must interrupt a metadata write waiting for the
+            // archive pool; otherwise a durable object can retain raw memory
+            // behind an unrelated database wait.
+            let persisted = tokio::select! {
+                result = self.persist_request_source(identity, locator, length, digest, None) => result,
+                changed = outcome.changed() => {
+                    if changed.is_err() { return None; }
+                    if let Some(success) = *outcome.borrow_and_update() { return Some(success); }
+                    continue;
+                }
+            };
+            let delay = match persisted {
                 Some(false) => return None,
                 Some(true) => Duration::from_millis(
                     crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
