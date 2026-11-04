@@ -319,7 +319,20 @@ async fn background_refresh_timeout_keeps_serving_verified_snapshot() {
 }
 
 #[tokio::test]
-async fn cold_snapshot_keeps_liveness_healthy_and_readiness_unavailable_until_background_warm() {
+async fn unpublished_application_inventory_does_not_require_background_warmup() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority = authority(directory.path()).await;
+    let before = work_counts(&authority);
+    assert_eq!(authority.refresh_status()["ready"], false);
+    assert!(authority.request_snapshot().await.unwrap().is_none());
+    assert_eq!(work_counts(&authority), before);
+    assert_eq!(authority.refresh_status()["ready"], true);
+    authority.db.close().await;
+    assert!(authority.request_snapshot().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn cold_snapshot_keeps_core_ready_and_resolves_required_policy_on_first_request() {
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -337,7 +350,7 @@ async fn cold_snapshot_keeps_liveness_healthy_and_readiness_unavailable_until_ba
     let app = crate::api::router_for_role(state.clone(), crate::config::RuntimeRole::Gateway);
     for (path, expected) in [
         ("/livez", StatusCode::OK),
-        ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
+        ("/readyz", StatusCode::OK),
     ] {
         let response = app
             .clone()
@@ -346,8 +359,9 @@ async fn cold_snapshot_keeps_liveness_healthy_and_readiness_unavailable_until_ba
             .unwrap();
         assert_eq!(response.status(), expected);
     }
-    assert!(state.clone().pin_application_plugins().await.is_err());
-    state.refresh_application_plugins().await.unwrap();
+    let pinned = state.clone().pin_application_plugins().await.unwrap();
+    assert_eq!(pinned.application_plugin_revision(), Some(1));
+    assert!(pinned.plugins.manifests()[0].contributions.traffic_policy);
     assert!(state.pin_application_plugins().await.is_ok());
     let response = app
         .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())

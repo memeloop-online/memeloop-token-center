@@ -631,6 +631,26 @@ impl ApplicationPlugins {
         Ok(current.snapshot.clone())
     }
 
+    /// A cold background refresh is not request admission. Resolve the actual
+    /// published dependency instead: an empty head uses the startup runtime,
+    /// while a published policy must still be loaded and validated. Warm
+    /// requests retain the last verified atomic runtime/catalog without I/O.
+    pub async fn request_snapshot(
+        self: &Arc<Self>,
+    ) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
+        {
+            let current = self
+                .current
+                .read()
+                .map_err(|_| AppError::internal("application_current_snapshot_1"))?;
+            if current.initialized {
+                return Ok(current.snapshot.clone());
+            }
+        }
+        self.refresh_current_inner(true).await?;
+        self.current_snapshot()
+    }
+
     pub fn refresh_status(&self) -> serde_json::Value {
         let Ok(current) = self.current.read() else {
             return json!({"ready": false, "error": "snapshot_lock_failed"});
@@ -643,7 +663,20 @@ impl ApplicationPlugins {
     }
 
     pub async fn refresh_current(self: &Arc<Self>) -> Result<(), AppError> {
+        self.refresh_current_inner(false).await
+    }
+
+    async fn refresh_current_inner(self: &Arc<Self>, only_if_cold: bool) -> Result<(), AppError> {
         let _refresh = self.refresh.lock().await;
+        if only_if_cold
+            && self
+                .current
+                .read()
+                .map_err(|_| AppError::internal("application_current_snapshot_1"))?
+                .initialized
+        {
+            return Ok(());
+        }
         let mut attempt = RefreshAttempt {
             current: &self.current,
             completed: false,
