@@ -1793,10 +1793,17 @@ async fn proxy_with_cancellation_guard(
                 return finish_unavailable(&buffered_request, "upstream_rejected", last_dispatch)
                     .await;
             }
-            Err(error @ (ProxySendError::CodexBadRequest | ProxySendError::CodexRejection(_))) => {
-                let body = match error {
-                    ProxySendError::CodexRejection(body) => body,
-                    _ => upstream_error::fallback_body(),
+            Err(
+                error @ (ProxySendError::CodexBadRequest
+                | ProxySendError::CodexRejection(_)
+                | ProxySendError::CodexTransientRejection(_)),
+            ) => {
+                let (status, body) = match error {
+                    ProxySendError::CodexRejection(body) => (StatusCode::BAD_REQUEST, body),
+                    ProxySendError::CodexTransientRejection(body) => {
+                        (StatusCode::SERVICE_UNAVAILABLE, body)
+                    }
+                    _ => (StatusCode::BAD_REQUEST, upstream_error::fallback_body()),
                 };
                 let reason = serde_json::from_slice(&body)
                     .ok()
@@ -1806,25 +1813,37 @@ async fn proxy_with_cancellation_guard(
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_buffered_request_with_upstream_attribution_and_response_object(
-                    &buffered_request,
-                    StatusCode::BAD_REQUEST,
-                    body,
-                    "application/json",
-                    (
-                        TokenUsage::default(),
-                        crate::model::RequestUsageBasis::NotObserved,
-                    ),
-                    Some(reason.map_or("http_400", |reason| reason.code()).to_owned()),
-                    BufferedFinishPolicy {
-                        upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                        response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
-                        terminal_cause: Some(
-                            crate::model::RequestTerminalCause::UpstreamHttpStatus,
+                let mut response =
+                    finish_buffered_request_with_upstream_attribution_and_response_object(
+                        &buffered_request,
+                        status,
+                        body,
+                        "application/json",
+                        (
+                            TokenUsage::default(),
+                            crate::model::RequestUsageBasis::NotObserved,
                         ),
-                    },
-                )
-                .await;
+                        Some(reason.map_or_else(
+                            || format!("http_{}", status.as_u16()),
+                            |reason| reason.code().to_owned(),
+                        )),
+                        BufferedFinishPolicy {
+                            upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                            response_storage: BufferedResponseStorage::InlineLocalJson(
+                                stored_response,
+                            ),
+                            terminal_cause: Some(
+                                crate::model::RequestTerminalCause::UpstreamHttpStatus,
+                            ),
+                        },
+                    )
+                    .await?;
+                if status == StatusCode::SERVICE_UNAVAILABLE {
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                }
+                return Ok(response);
             }
             Err(ProxySendError::AmbiguousResponse(error_code)) => {
                 upstream_attempt

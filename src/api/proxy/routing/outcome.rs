@@ -85,7 +85,9 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
         Ok(result) => classify_response_failure(result.response.status(), rate_limit),
         // A complete rejected response may mark the account unavailable, but
         // it remains non-replayable across accounts.
-        Err(ProxySendError::RetryableCodexBadRequest) => Some((
+        Err(
+            ProxySendError::RetryableCodexBadRequest | ProxySendError::CodexTransientRejection(_),
+        ) => Some((
             UpstreamFailureKind::Unavailable,
             UpstreamHealthReason::Unavailable,
         )),
@@ -118,6 +120,7 @@ pub(in crate::api::proxy) fn attempt_failure_stage(
         Err(ProxySendError::NonRetryableTransport(kind)) => kind.failure_stage(),
         Err(
             ProxySendError::RetryableCodexBadRequest
+            | ProxySendError::CodexTransientRejection(_)
             | ProxySendError::CodexBadRequest
             | ProxySendError::CodexRejection(_)
             | ProxySendError::AmbiguousResponse(_),

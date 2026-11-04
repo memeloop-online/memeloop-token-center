@@ -238,7 +238,13 @@ pub(super) async fn send_proxy_route(
                     retry
                         .outcome()
                         .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
-                    return Err(details.map_or(error, ProxySendError::CodexRejection));
+                    return Err(match (error, details) {
+                        (ProxySendError::RetryableCodexBadRequest, Some(body)) => {
+                            ProxySendError::CodexTransientRejection(body)
+                        }
+                        (_, Some(body)) => ProxySendError::CodexRejection(body),
+                        (error, None) => error,
+                    });
                 }
             }
         }

@@ -16,6 +16,7 @@ fn classification(status: Option<StatusCode>, error: Option<&ProxySendError>) ->
             Some(
                 ProxySendError::CodexBadRequest
                 | ProxySendError::RetryableCodexBadRequest
+                | ProxySendError::CodexTransientRejection(_)
                 | ProxySendError::CodexRejection(_),
             ),
         ) => "upstream_rejected_request",

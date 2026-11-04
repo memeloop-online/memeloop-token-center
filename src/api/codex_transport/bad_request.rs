@@ -112,10 +112,21 @@ async fn inspect_bad_request(
         .content_length()
         .is_some_and(|length| length > MAX_RETRYABLE_ERROR_BYTES as u64)
     {
+        *details = Some(
+            crate::api::proxy::upstream_error::read_rejection(response)
+                .await
+                .body,
+        );
         return BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TooLarge);
     }
 
-    match tokio::time::timeout(MAX_RETRYABLE_ERROR_WAIT, read_bounded_body(response)).await {
+    let mut body = Vec::new();
+    let inspected = tokio::time::timeout(
+        MAX_RETRYABLE_ERROR_WAIT,
+        read_bounded_body(response, &mut body),
+    )
+    .await;
+    let disposition = match inspected {
         Ok(BoundedBadRequestBody::Value(value)) if codex_transient_error(&value) => {
             BadRequestDisposition::DefiniteTransient
         }
@@ -130,16 +141,29 @@ async fn inspect_bad_request(
             )
         }
         Ok(BoundedBadRequestBody::TooLarge) => {
+            body.extend_from_slice(b"\n[MTC: upstream error body truncated at 16384 bytes]");
             BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TooLarge)
         }
         Ok(BoundedBadRequestBody::ReadFailed) => {
+            body.extend_from_slice(b"\n[MTC: upstream error body read failed]");
             BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::ReadFailed)
         }
         Ok(BoundedBadRequestBody::InvalidJson) => {
             BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::InvalidJson)
         }
-        Err(_) => BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TimedOut),
+        Err(_) => {
+            body.extend_from_slice(
+                b"\n[MTC: timed out reading upstream error body after 5 seconds]",
+            );
+            BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TimedOut)
+        }
+    };
+    if details.is_none() {
+        *details = Some(crate::api::proxy::upstream_error::normalized_error_body(
+            &body,
+        ));
     }
+    disposition
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -538,17 +562,23 @@ enum BoundedBadRequestBody {
     InvalidJson,
 }
 
-async fn read_bounded_body(response: UpstreamResponse) -> BoundedBadRequestBody {
-    let mut body = Vec::new();
+async fn read_bounded_body(
+    response: UpstreamResponse,
+    body: &mut Vec<u8>,
+) -> BoundedBadRequestBody {
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else {
             return BoundedBadRequestBody::ReadFailed;
         };
         if chunk.len() > MAX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len()) {
+            body.extend_from_slice(&chunk[..MAX_RETRYABLE_ERROR_BYTES.saturating_sub(body.len())]);
             return BoundedBadRequestBody::TooLarge;
         }
         body.extend_from_slice(&chunk);
+        if chunk.is_empty() {
+            tokio::task::yield_now().await;
+        }
     }
     match serde_json::from_slice(&body) {
         Ok(value) => BoundedBadRequestBody::Value(value),
@@ -574,7 +604,6 @@ fn has_single_json_content_type(response: &UpstreamResponse) -> bool {
         })
 }
 
-#[cfg(test)]
 pub(super) fn codex_transient_error(value: &Value) -> bool {
     let Some(error) = value.get("error").and_then(Value::as_object) else {
         return false;
@@ -590,21 +619,6 @@ pub(super) fn codex_transient_error(value: &Value) -> bool {
         .get("message")
         .and_then(Value::as_str)
         .is_some_and(is_known_high_demand_message)
-}
-
-#[cfg(not(test))]
-fn codex_transient_error(value: &Value) -> bool {
-    let Some(error) = value.get("error").and_then(Value::as_object) else {
-        return false;
-    };
-    error
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(is_explicit_transient_error_type)
-        || error
-            .get("message")
-            .and_then(Value::as_str)
-            .is_some_and(is_known_high_demand_message)
 }
 
 fn is_explicit_transient_error_type(error_type: &str) -> bool {
