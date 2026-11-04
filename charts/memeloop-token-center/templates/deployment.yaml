@@ -95,6 +95,7 @@ spec:
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           args:
             - prepare-plugin-inventory
+            - --allow-unavailable
             - --directory
             - /var/lib/memeloop-token-center/plugin-runtime
             {{- if not $runtimeWriter }}

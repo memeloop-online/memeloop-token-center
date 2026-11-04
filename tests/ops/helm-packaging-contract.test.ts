@@ -190,6 +190,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(volume.persistentVolumeClaim?.claimName, 'shared-plugin-inventories');
       assert.equal(volume.persistentVolumeClaim?.readOnly, !writer);
       const prepare = pod.initContainers.find(item => item.name === 'prepare-plugin-inventory')!;
+      assert.equal(prepare.args.includes('--allow-unavailable'), true, `${role}: optional inventory must not block startup`);
       assert.equal(prepare.args.includes('--read-only'), !writer, `${role}: readers never initialize`);
       assert.equal(prepare.volumeMounts[0]!.readOnly, !writer);
       assert.equal(pod.volumes.some(item => item.secret?.secretName === 'publisher-trust'), writer);
