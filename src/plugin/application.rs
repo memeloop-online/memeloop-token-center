@@ -28,6 +28,7 @@ mod empty;
 pub mod uninstall;
 pub use empty::RegisterEmptyInventory;
 pub mod installation;
+mod inventory_lock;
 pub mod prepare;
 mod request_dependencies;
 mod retained_installation;

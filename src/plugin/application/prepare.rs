@@ -32,6 +32,7 @@ pub fn check_inventory_directory(directory: &Path) -> Result<(), AppError> {
 pub fn prepare_inventory_directory(directory: &Path) -> Result<(), AppError> {
     validate_directory(directory)?;
     let inventory = directory.join("inventory.json");
+    let _lock = super::inventory_lock::write_lock(&inventory)?;
     if inventory
         .try_exists()
         .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_1"))?

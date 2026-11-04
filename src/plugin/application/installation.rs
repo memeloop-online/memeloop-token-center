@@ -1655,15 +1655,7 @@ pub(super) async fn append_inventory_file(
     let entry = entry.clone();
     tokio::task::spawn_blocking(move || {
         use std::io::{Read, Write};
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path.with_extension("lock"))
-            .map_err(|_| AppError::internal("installation_append_inventory_file_1"))?;
-        lock.try_lock()
-            .map_err(|_| AppError::capacity_error("plugin_installation_lock"))?;
+        let _lock = super::inventory_lock::write_lock(&path)?;
         let mut bytes = Vec::new();
         std::fs::File::open(&path)
             .map_err(|_| AppError::internal("installation_append_inventory_file_2"))?

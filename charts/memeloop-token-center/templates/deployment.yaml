@@ -46,6 +46,11 @@ spec:
   revisionHistoryLimit: {{ $.Values.revisionHistoryLimit }}
   strategy:
     type: {{ $.Values.deploymentStrategy }}
+    {{- if eq $.Values.deploymentStrategy "RollingUpdate" }}
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
   {{- if not $roleConfig.autoscaling.enabled }}
   replicas: {{ $roleConfig.replicaCount }}
   {{- end }}

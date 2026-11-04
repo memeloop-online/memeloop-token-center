@@ -606,9 +606,16 @@ async fn exercise_authority(database_url: String, directory: &std::path::Path, c
                 .unwrap();
         assert_eq!(
             response.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::INTERNAL_SERVER_ERROR,
             "{path} must not use baseline"
         );
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // A cold pin now resolves the actual published dependency. Its missing
+        // directory is the failure, not the former generic readiness 503.
+        assert_eq!(body["error"]["code"], "application_pin_revision_1");
     }
     std::fs::rename(&b_root, directory.join("removed-inventory-b")).unwrap();
     sqlx::query("UPDATE application_plugin_head SET revision = 2 WHERE scope = 'global'")
