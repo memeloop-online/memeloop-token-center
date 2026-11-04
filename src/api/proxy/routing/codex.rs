@@ -243,6 +243,7 @@ pub(super) async fn send_proxy_route(
         }
         if !response.status().is_success() {
             return Ok(ProxyRouteResponse {
+                preoutput_quota: None,
                 egress_selection,
                 response,
                 upstream_activity,
@@ -259,7 +260,18 @@ pub(super) async fn send_proxy_route(
         .await
         {
             Ok(response) => {
+                let (response, preoutput_quota) = if route.inspect_stream_rejection {
+                    super::classify_stream_quota(
+                        response,
+                        transport_policy.sse_framing_limits,
+                        &state.proxy_memory_budget,
+                    )
+                    .await
+                } else {
+                    (response, None)
+                };
                 return Ok(ProxyRouteResponse {
+                    preoutput_quota,
                     egress_selection,
                     response,
                     upstream_activity,

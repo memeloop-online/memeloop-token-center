@@ -184,10 +184,10 @@ impl Database {
     ) -> Result<(), AppError> {
         let query = match self.backend {
             DatabaseBackend::PostgreSql => {
-                "SELECT a.driver, a.auth_kind, a.config_json, a.credential_generation, a.updated_at, c.credential_ciphertext FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND a.tenant_id = $2 FOR UPDATE OF a, c"
+                "SELECT a.tenant_id, a.driver, a.auth_kind, a.config_json, a.credential_generation, a.updated_at, c.credential_ciphertext FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND a.tenant_id = $2 FOR UPDATE OF a, c"
             }
             DatabaseBackend::Sqlite => {
-                "SELECT a.driver, a.auth_kind, a.config_json, a.credential_generation, a.updated_at, c.credential_ciphertext FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND a.tenant_id = $2"
+                "SELECT a.tenant_id, a.driver, a.auth_kind, a.config_json, a.credential_generation, a.updated_at, c.credential_ciphertext FROM upstream_accounts a JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND a.tenant_id = $2"
             }
         };
         let row = sqlx::query(query)
@@ -244,6 +244,14 @@ impl Database {
             }
         }
         let credential = current_credential.with_transport_proxy(proxy.to_owned())?;
+        super::super::providers::oauth_catalog::carry_forward_refresh_catalog(
+            tx,
+            id,
+            &row,
+            &credential,
+            key,
+        )
+        .await?;
         let ciphertext = seal_credential(&credential, key)?;
         let mut config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
             .map_err(|_| AppError::internal("bindings_write_transport_account_1"))?;
