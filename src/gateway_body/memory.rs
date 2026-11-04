@@ -543,13 +543,9 @@ impl ProxyMemoryReservation {
     /// provider working buffers have both been dropped. Terminal projection
     /// reacquires the two transient copies before reparsing the retained body.
     pub(crate) fn release_conversation_working_copies(&self, bytes: usize) {
-        let reserved = self.json_reserved_bytes.swap(0, Ordering::AcqRel);
-        self.release(
-            reserved
-                .saturating_sub(bytes)
-                .max(bytes.saturating_mul(REQUEST_MEMORY_WEIGHT.saturating_sub(1))),
-            1,
-        );
+        // Unlike a durable source, this path reparses with only a byte-copy
+        // permit at terminal projection. Keep its existing node allowance.
+        self.release(bytes, REQUEST_MEMORY_WEIGHT.saturating_sub(1));
     }
 
     /// A durable request spool can replace the raw in-memory conversation copy
