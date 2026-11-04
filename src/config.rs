@@ -14,7 +14,7 @@ pub const MAX_RESPONSES_BODY_MAX_BYTES: u32 = 256 * 1024 * 1024;
 pub const DEFAULT_RESPONSES_BODY_READ_CONCURRENCY: u32 = DEFAULT_GATEWAY_BODY_READ_CONCURRENCY;
 pub const DEFAULT_RESPONSES_REQUEST_SPOOL_PATH: &str =
     "/var/lib/memeloop-token-center/request-spool";
-pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u32 = 256 * 1024 * 1024;
+pub const DEFAULT_PROXY_MEMORY_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_RESPONSES_BODY_READ_CONCURRENCY: u32 = MAX_GATEWAY_BODY_READ_CONCURRENCY;
 pub const DEFAULT_AUDIO_BODY_MAX_BYTES: u32 = 25 * 1024 * 1024;
 pub const DEFAULT_UPSTREAM_SHARED_PROBE_ATTEMPTS: u32 = 1;
@@ -164,7 +164,7 @@ pub struct Config {
     /// Legacy deployment compatibility value; lifecycle admission uses bytes.
     pub proxy_lifecycle_concurrency: u32,
     /// Weighted raw body/JSON/ciphertext memory admission, shared by all text routes.
-    pub proxy_memory_budget_bytes: u32,
+    pub proxy_memory_budget_bytes: u64,
     /// Maximum concurrent readers without complete shared byte admission.
     /// Byte-metered default text bodies do not consume these count permits.
     pub gateway_body_read_concurrency: u32,
@@ -440,7 +440,7 @@ impl Config {
             ),
             proxy_lifecycle_concurrency: env_u32("MTC_PROXY_LIFECYCLE_CONCURRENCY", 64)?
                 .clamp(1, 4_096),
-            proxy_memory_budget_bytes: env_u32(
+            proxy_memory_budget_bytes: env_u64(
                 "MTC_PROXY_MEMORY_BUDGET_BYTES",
                 DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
             )?,
@@ -518,8 +518,10 @@ impl Config {
 
     pub(crate) fn validate_proxy_memory_budget(&self) -> Result<(), ConfigError> {
         if self.proxy_memory_budget_bytes < DEFAULT_PROXY_MEMORY_BUDGET_BYTES
-            || self.proxy_memory_budget_bytes > 2 * 1024 * 1024 * 1024
-            || u64::from(self.proxy_memory_budget_bytes) < u64::from(self.audio_body_max_bytes) * 3
+            || !crate::gateway_body::memory::ProxyMemoryBudget::supports(
+                self.proxy_memory_budget_bytes,
+            )
+            || self.proxy_memory_budget_bytes < u64::from(self.audio_body_max_bytes) * 3
         {
             return Err(ConfigError::InvalidProxyMemoryBudget);
         }
@@ -691,6 +693,15 @@ fn env_u32(name: &'static str, default: u32) -> Result<u32, ConfigError> {
     }
 }
 
+fn env_u64(name: &'static str, default: u64) -> Result<u64, ConfigError> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|_| ConfigError::InvalidInteger(name, value)),
+        Err(_) => Ok(default),
+    }
+}
+
 fn health_millis(name: &'static str, default: i64) -> Result<i64, ConfigError> {
     const MINIMUM: i64 = 100;
     const MAXIMUM: i64 = 86_400_000;
@@ -731,7 +742,7 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "MTC_PROXY_MEMORY_BUDGET_BYTES must be 256 MiB..2 GiB and at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
+        "MTC_PROXY_MEMORY_BUDGET_BYTES must be at least 256 MiB, fit the process memory counter, and be at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
     )]
     InvalidProxyMemoryBudget,
     #[error(
@@ -812,9 +823,13 @@ mod tests {
         config.responses_body_max_bytes = MAX_RESPONSES_BODY_MAX_BYTES;
         assert!(config.validate_proxy_memory_budget().is_ok());
         config.proxy_memory_budget_bytes = 2 * 1024 * 1024 * 1024 + 1;
+        assert!(config.validate_proxy_memory_budget().is_ok());
+        config.proxy_memory_budget_bytes = 4 * 1024 * 1024 * 1024;
+        assert!(config.validate_proxy_memory_budget().is_ok());
+        config.proxy_memory_budget_bytes = u64::MAX;
         assert!(config.validate_proxy_memory_budget().is_err());
         config.proxy_memory_budget_bytes = DEFAULT_PROXY_MEMORY_BUDGET_BYTES;
-        config.audio_body_max_bytes = config.proxy_memory_budget_bytes / 3 + 1;
+        config.audio_body_max_bytes = (config.proxy_memory_budget_bytes / 3 + 1) as u32;
         assert!(config.validate_proxy_memory_budget().is_err());
     }
 

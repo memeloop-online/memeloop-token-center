@@ -39,7 +39,8 @@ impl Server {
     }
 
     async fn start_with_response_gate(gate: Option<(Arc<Notify>, Arc<Notify>)>) -> Self {
-        let (state, directory) = crate::api::tests::test_state().await;
+        let (mut state, directory) = crate::api::tests::test_state().await;
+        Arc::make_mut(&mut state.config).audio_body_max_bytes = LIMIT as u32;
         let issued = state
             .db
             .create_key(
@@ -62,13 +63,35 @@ impl Server {
         // middleware, with a counted upstream substitute after admission.
         let app = Router::new()
             .route(
-                "/v1/chat/completions",
+                "/v1/audio/transcriptions",
                 post(move || {
                     let calls = calls.clone();
                     async move {
                         calls.fetch_add(1, Ordering::Relaxed);
                         "ok"
                     }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|request: axum::extract::Request| async move {
+                    let source = request
+                        .extensions()
+                        .get::<Arc<crate::gateway_body::request_spool::RequestSpool>>()
+                        .expect("durable chat retains its captured source")
+                        .clone();
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
+                        .await
+                        .unwrap();
+                    assert!(bytes.len() > LIMIT);
+                    assert_eq!(source.read_all().await.unwrap(), bytes);
+                    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        document["messages"][0]["content"].as_str().unwrap().len(),
+                        LIMIT + 1024
+                    );
+                    assert_eq!(document["sentinel"], "complete upload");
+                    "ok"
                 }),
             )
             .layer(middleware::from_fn_with_state(
@@ -115,7 +138,7 @@ impl Server {
 
     fn headers(&self, framing: &str) -> Vec<u8> {
         format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\n{framing}\r\n",
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\n{framing}\r\n",
             self.key
         )
         .into_bytes()
@@ -343,4 +366,37 @@ async fn http1_never_ending_rejected_upload_does_not_block_shutdown() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn http1_durable_chat_exceeds_hot_body_limit_without_truncation_or_resource_leaks() {
+    let server = Server::start().await;
+    let initial_permits = server.state.gateway_body_read_permits.available_permits();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "messages": [{"role": "user", "content": "x".repeat(LIMIT + 1024)}],
+        "sentinel": "complete upload"
+    }))
+    .unwrap();
+    let mut socket = TcpStream::connect(server.address).await.unwrap();
+    let headers = String::from_utf8(server.headers(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    )))
+    .unwrap()
+    .replace("/v1/audio/transcriptions", "/v1/chat/completions");
+    socket.write_all(headers.as_bytes()).await.unwrap();
+    socket.write_all(&body).await.unwrap();
+    let response = read_response(&mut socket).await;
+    assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    assert_eq!(response_body(&response), b"ok");
+    assert_eq!(server.state.gateway_body_reads.load(Ordering::Acquire), 0);
+    assert_eq!(server.state.proxy_memory_budget.snapshot().0, 0);
+    let spool = server.state.responses_request_spool.snapshot();
+    assert_eq!(spool.used_bytes, 0);
+    assert_eq!(spool.active_files, 0);
+    assert_eq!(
+        server.state.gateway_body_read_permits.available_permits(),
+        initial_permits
+    );
+    server.stop().await;
 }

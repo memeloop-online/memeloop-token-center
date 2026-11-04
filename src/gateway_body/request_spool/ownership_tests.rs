@@ -19,7 +19,7 @@ use crate::gateway_body::{
 
 const ROUTES: [&str; 2] = ["/v1/responses", "/v1/responses/compact"];
 const TRANSPORT_SIZED_FRAMES: [usize; 2] = [16 * 1024, 64 * 1024];
-const BUDGET_BYTES: u32 = 1024 * 1024;
+const BUDGET_BYTES: u64 = 1024 * 1024;
 
 #[test]
 fn pause_hooks_do_not_enlarge_cloned_admission_state() {

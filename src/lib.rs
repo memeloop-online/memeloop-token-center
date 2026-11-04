@@ -449,7 +449,7 @@ impl AppState {
             if !state.application_plugins_pinned
                 && let Some(authority) = &state.application_plugins
             {
-                if let Some(snapshot) = authority.current_snapshot()? {
+                if let Some(snapshot) = authority.request_snapshot().await? {
                     state = state.with_pinned_application_plugins(snapshot);
                 }
                 state.application_plugins_pinned = true;

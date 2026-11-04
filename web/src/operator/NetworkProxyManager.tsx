@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState, type RefObject } from 'react';
-import { Button, Checkbox, Disclosure, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select, Textarea } from '../design-system';
+import { Button, Checkbox, DetailTooltip, Disclosure, Field, FormSection, Input, Label, LoadingProgress, LoadingState, Select, Textarea } from '../design-system';
+import { DrawerFrame } from '../components';
 import { useI18n } from '../i18n';
 import type { UpstreamAccount } from '../types';
 import { useConfirmDialog } from '../useConfirmDialog';
@@ -85,7 +86,10 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
   });
 
   useLayoutEffect(() => {
-    if (busy || error || message) feedback.current?.focus({ preventScroll: true });
+    if (busy || error || message) {
+      feedback.current?.focus({ preventScroll: true });
+      if (editing !== undefined && (error || message)) feedback.current?.scrollIntoView({ block: 'nearest' });
+    }
   }, [busy, error, message]);
 
   useEffect(() => {
@@ -168,7 +172,13 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
   }
 
   async function saveProxy() {
-    if (editing === undefined || !validForm) return;
+    if (editing === undefined) return;
+    if (!validForm) {
+      setError(copy.errors.invalid);
+      feedback.current?.focus({ preventScroll: true });
+      feedback.current?.scrollIntoView({ block: 'nearest' });
+      return;
+    }
     const probe = {
       enabled: probeEnabled, target_url: probeTarget.trim(),
       interval_ms: intervalValue, attempts: attemptsValue,
@@ -242,11 +252,11 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
         setMessage(''); void refresh();
       }}>{busy ? t('common.loading') : copy.refresh}</Button>
     </div>
-    <div ref={feedback} tabIndex={-1} aria-label={copy.operationStatus}>
+    {editing === undefined && <div ref={feedback} tabIndex={-1} aria-label={copy.operationStatus}>
       <LoadingProgress active={busy} label={t('common.loading')} level={ready ? 'section' : 'page'} />
       {error && <p className="notice error" role="alert">{error}</p>}
       {message && <p className="notice success" role="status">{message}</p>}
-    </div>
+    </div>}
     <fieldset disabled={!ready || busy} style={{ border: 0, padding: 0, minWidth: 0 }}>
       <FormSection title={copy.title}>
         <div className="proxy-group-list">
@@ -263,11 +273,14 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
                 <span className="muted">{egressAddress(proxy.address, locale)}</span>
                 <span>{copy.healthTitle}: {health}{proxy.active_health.latency_ms !== null ? ` · ${proxy.active_health.latency_ms}ms` : ''}</span>
                 <Button type="button" disabled={editing !== undefined} onClick={() => editProxy(proxy)}>{copy.edit(proxy.name)}</Button>
-                <Button type="button" disabled={editing !== undefined || (references ?? 0) > 0} aria-describedby={(references ?? 0) > 0 ? `${inputPrefix}-in-use-${proxy.id}` : undefined}
-                  onClick={() => void removeProxy(proxy)}>{t('common.remove')}</Button>
+                <DetailTooltip content={(references ?? 0) > 0 ? copy.inUseHint : copy.confirmDelete(proxy.name)}>
+                  <span tabIndex={(references ?? 0) > 0 ? 0 : undefined}>
+                    <Button type="button" disabled={editing !== undefined || (references ?? 0) > 0}
+                      onClick={() => void removeProxy(proxy)}>{t('common.remove')}</Button>
+                  </span>
+                </DetailTooltip>
                 <Button type="button" disabled={editing !== undefined} onClick={() => void probeNow(proxy)}>{copy.probeNow}</Button>
               </div>
-              {(references ?? 0) > 0 && <p id={`${inputPrefix}-in-use-${proxy.id}`} className="muted">{copy.inUseHint}</p>}
               <Disclosure title={copy.details} open={detail?.open ?? false} onOpenChange={open => toggleDetails(proxy, open)}>
                 {detail?.loading && <LoadingState label={t('common.loading')} variant="compact" />}
                 {detail?.error && <p className="notice error" role="alert">{detail.error}</p>}
@@ -297,7 +310,19 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
         </div>
         <Button type="button" disabled={editing !== undefined} onClick={() => editProxy(null)}>{copy.create}</Button>
       </FormSection>
-      {editing !== undefined && <form onSubmit={event => { event.preventDefault(); void saveProxy(); }}>
+    </fieldset>
+      {editing !== undefined && <DrawerFrame title={editing ? copy.edit(editing.name) : copy.create} eyebrow={copy.title}
+        onClose={() => { void requestClose().then(closed => { if (closed) clearForm(); }); }}>
+        <form onSubmit={event => { event.preventDefault(); void saveProxy(); }}>
+        <div ref={feedback} tabIndex={-1} aria-label={copy.operationStatus}>
+        <LoadingProgress active={busy} label={t('common.loading')} level="section" />
+        {error && <p className="notice error" role="alert">{error}</p>}
+        {message && <p className="notice success" role="status">{message}</p>}
+        </div>
+        {!ready && <Button type="button" disabled={busy} onClick={async () => {
+          if (await confirm(copy.refreshDraft)) void refresh();
+        }}>{copy.refresh}</Button>}
+        <fieldset disabled={busy || !ready} style={{ border: 0, padding: 0, minWidth: 0 }}>
         <FormSection title={editing ? copy.edit(editing.name) : copy.create}>
           <Field label={copy.name} required><Input required maxLength={64} value={name} onChange={(_, data) => setName(data.value)} /></Field>
           <div className="proxy-address-field">
@@ -313,12 +338,12 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
           <Field label={copy.probeAttempts} required><Input type="number" required min={1} max={8} value={probeAttempts} onChange={(_, data) => setProbeAttempts(data.value)} /></Field>
           <p>{copy.probeHint}</p>
           <div className="button-row">
-            <Button type="submit" appearance="primary" disabled={!validForm}>{copy.save}</Button>
+            <Button type="submit" appearance="primary">{copy.save}</Button>
             <Button type="button" onClick={async () => { if (await confirm(copy.discardEdit)) clearForm(); }}>{copy.cancelEdit}</Button>
           </div>
         </FormSection>
-      </form>}
-    </fieldset>
+        </fieldset>
+      </form></DrawerFrame>}
   </div>;
 }
 
