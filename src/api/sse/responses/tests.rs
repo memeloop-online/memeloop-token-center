@@ -5,6 +5,33 @@ use crate::api::limits::{
     MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK, MAX_SSE_FRAMES_PER_NETWORK_CHUNK,
 };
 
+#[test]
+fn known_policy_and_unknown_upstream_errors_keep_original_explanations() {
+    for code in ["misalignment_policy_violation", "future_provider_error"] {
+        let original = json!({
+            "type": "error",
+            "code": code,
+            "message": "Specific provider explanation, including the affected field",
+        });
+        let frame = format!("data: {original}\n\n");
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        let mut output = Vec::new();
+        for byte in frame.bytes() {
+            output.extend_from_slice(&sanitizer.push(&[byte]).unwrap());
+        }
+        output.extend_from_slice(&sanitizer.finish().unwrap());
+        let output = String::from_utf8(output).unwrap();
+        let payload = output
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload["response"]["error"]["code"], code);
+        assert_eq!(payload["response"]["error"]["message"], original["message"]);
+        assert_eq!(payload["type"], "response.failed");
+    }
+}
+
 fn event_with_field_count(fields: usize) -> Vec<u8> {
     let mut event = b"x\n".repeat(fields);
     event.push(b'\n');

@@ -2388,6 +2388,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unknown_upstream_failure_keeps_details_in_chat_and_buffered_adapters() {
+        let value = json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"code": "new_provider_error", "message": "tools[3] schema is unsupported"},
+            },
+        });
+        let frame = format!("event: response.failed\ndata: {value}\n\n");
+        let mut chat = CodexChatStreamTranslator::new(Uuid::nil(), "public".into(), false);
+        let delivered = chat.translate_frame(frame.as_bytes()).unwrap().unwrap();
+        let delivered: Value = serde_json::from_slice(&sse_data(&delivered).unwrap()).unwrap();
+        assert_eq!(delivered["error"]["code"], "new_provider_error");
+        assert_eq!(
+            delivered["error"]["message"],
+            "tools[3] schema is unsupported"
+        );
+
+        let mut buffered = BufferedResponsesParser::default();
+        for byte in frame.bytes() {
+            buffered.push(&[byte]).unwrap();
+        }
+        let details: Value =
+            serde_json::from_slice(buffered.supplier_error.as_ref().unwrap()).unwrap();
+        assert_eq!(details, delivered);
+        assert_eq!(buffered.finish().err(), Some("upstream_failed_response"));
+    }
+
+    #[test]
     fn canonical_responses_cache_presence_preserves_financial_validation() {
         for (details, read) in [
             (None, None),

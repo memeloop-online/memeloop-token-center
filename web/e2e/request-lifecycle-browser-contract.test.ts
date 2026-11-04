@@ -538,7 +538,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
       await mkdir(artifactRoot, { recursive: true });
       await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-narrow.png`, fullPage: true });
-      assert.doesNotMatch(await drawer.innerText(), /http_402|no_active_plan|请求失败|The request failed/);
+      assert.doesNotMatch(await drawer.innerText(), /http_402|请求失败|The request failed/);
       await drawer.locator('.request-outcome').scrollIntoViewIfNeeded();
       await drawer.locator('.request-outcome').press('Shift+Tab');
       await page.keyboard.press('Tab');
