@@ -1574,8 +1574,9 @@ impl CodexChatStreamTranslator {
                 self.complete(&value, finish_reason, true).map(Some)
             }
             "response.failed" | "response.error" | "error" => {
-                Err(crate::supplier_error::reason_from_value(&value)
-                    .map_or("upstream_failed_response", |reason| reason.client_code()))
+                self.terminal = true;
+                let error = json!({"error": crate::supplier_error::upstream_error_value(&value)});
+                Ok(Some(Bytes::from(format!("data: {error}\n\n"))))
             }
             _ => Err("upstream_unsupported_chat_output"),
         }
@@ -1879,12 +1880,32 @@ fn response_chat_content(
     }
 }
 
+#[cfg(test)]
 pub(super) async fn buffer_response(
     response: UpstreamResponse,
     memory: &std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     memory_admission_wait: std::time::Duration,
     conversation: Option<&super::ProxyConversation>,
     sse_framing_limits: crate::provider::SseFramingLimits,
+) -> Result<BufferedCodexResponse, &'static str> {
+    buffer_response_with_details(
+        response,
+        memory,
+        memory_admission_wait,
+        conversation,
+        sse_framing_limits,
+        &mut None,
+    )
+    .await
+}
+
+pub(super) async fn buffer_response_with_details(
+    response: UpstreamResponse,
+    memory: &std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    memory_admission_wait: std::time::Duration,
+    conversation: Option<&super::ProxyConversation>,
+    sse_framing_limits: crate::provider::SseFramingLimits,
+    error_details: &mut Option<Bytes>,
 ) -> Result<BufferedCodexResponse, &'static str> {
     struct ReadMemory<'a> {
         memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
@@ -1978,6 +1999,7 @@ pub(super) async fn buffer_response(
     if let Some(phase) = first_byte.take() {
         phase.finish("no_bytes", None, Some(0));
     }
+    *error_details = parser.supplier_error.take();
     let result = parser.finish()?;
     if !memory.reserve_response_json(&result.body) {
         tracing::warn!(request_id = %diagnostic_context.request_id,
@@ -2002,6 +2024,7 @@ struct BufferedResponsesParser {
     terminal_response: Option<(Value, BufferedCodexTerminal)>,
     terminal_failure: bool,
     supplier_reason: Option<crate::supplier_error::SafeReason>,
+    supplier_error: Option<Bytes>,
     invalid: bool,
     retained_memory: Vec<crate::gateway_body::memory::ArchiveOutputMemory>,
 }
@@ -2173,6 +2196,9 @@ impl BufferedResponsesParser {
         {
             self.terminal_failure = true;
             self.supplier_reason = crate::supplier_error::reason_from_value(&value);
+            self.supplier_error = Some(Bytes::from(
+                json!({"error": crate::supplier_error::upstream_error_value(&value)}).to_string(),
+            ));
             return Ok(());
         }
         self.identity.observe(kind, &value)?;

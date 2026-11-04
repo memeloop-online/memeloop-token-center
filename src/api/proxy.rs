@@ -2046,12 +2046,14 @@ async fn proxy_with_cancellation_guard(
             Some(active_route.route.account_id),
             Some(active_route.route.credential_generation),
         );
-        let buffered = match codex_transport::buffer_response(
+        let mut error_details = None;
+        let buffered = match codex_transport::buffer_response_with_details(
             upstream,
             &buffered_request.memory,
             buffered_request.memory_admission_wait,
             buffered_request.conversation.as_ref(),
             sse_framing_limits,
+            &mut error_details,
         )
         .await
         {
@@ -2059,6 +2061,32 @@ async fn proxy_with_cancellation_guard(
             Err(error_code) => {
                 buffer_phase.finish(error_code, None, None);
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
+                if let Some(body) = error_details {
+                    let stored = format!("inline-json:{}", String::from_utf8_lossy(&body));
+                    let result =
+                        finish_buffered_request_with_upstream_attribution_and_response_object(
+                            &buffered_request,
+                            StatusCode::BAD_GATEWAY,
+                            body,
+                            "application/json",
+                            (
+                                TokenUsage::default(),
+                                crate::model::RequestUsageBasis::NotObserved,
+                            ),
+                            Some(error_code.to_owned()),
+                            BufferedFinishPolicy {
+                                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                                response_storage: BufferedResponseStorage::InlineLocalJson(stored),
+                                terminal_cause: None,
+                            },
+                        )
+                        .await;
+                    upstream_attempt
+                        .complete(UpstreamAttemptTerminal::Inconclusive)
+                        .await;
+                    codex_retry.complete(CodexRetryTerminal::Failed);
+                    return result;
+                }
                 let result = finish_proxy_failure_with_cause(
                     &buffered_request,
                     error_code,

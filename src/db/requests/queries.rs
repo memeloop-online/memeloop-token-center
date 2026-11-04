@@ -1814,7 +1814,7 @@ SELECT e.*, COALESCE(r.created_at, g.created_at) AS created_at,
        COALESCE(NULLIF(facts.currency, ''), NULLIF(r.currency, '')) AS currency,
        COALESCE(r.error_code, g.error_code, e.error_code) AS current_error_code,
        r.terminal_cause_code AS current_terminal_cause_code, r.in_flight_stage AS in_flight_stage,
-       CASE WHEN r.completed_at IS NOT NULL AND r.status_code >= 400 AND r.response_object LIKE 'inline-json:%' AND LENGTH(r.response_object) <= 2048 THEN r.response_object ELSE NULL END AS supplier_error_inline_json,
+       CASE WHEN r.completed_at IS NOT NULL AND r.status_code >= 400 AND r.response_object LIKE 'inline-json:%' AND LENGTH(r.response_object) <= 131072 THEN r.response_object ELSE NULL END AS supplier_error_inline_json,
        CASE WHEN g.id IS NOT NULL THEN
             CASE WHEN g.status IN ('preparing', 'queued') THEN 'pending'
                  WHEN g.status IN ('submitting', 'running', 'cancelling') THEN 'uploading'

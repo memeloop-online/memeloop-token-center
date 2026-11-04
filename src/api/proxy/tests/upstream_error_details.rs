@@ -487,15 +487,11 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
             .await
             .unwrap();
         let delivered = String::from_utf8(body.to_vec()).unwrap();
-        assert!(delivered.contains("rate_limited"));
+        assert!(delivered.contains("rate_limit_exceeded"));
         assert!(delivered.contains("ModelAccountTpmRateLimitExceeded"));
-        for forbidden in [
-            "private-token-canary",
-            "private-body-canary",
-            "private-debug-canary",
-            "[DONE]",
-            "response.completed",
-        ] {
+        assert!(delivered.contains("private-token-canary"));
+        assert!(delivered.contains("private-body-canary"));
+        for forbidden in ["private-debug-canary", "[DONE]", "response.completed"] {
             assert!(!delivered.contains(forbidden));
         }
         let receipt =

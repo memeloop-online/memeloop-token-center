@@ -12,7 +12,7 @@ fn event_with_field_count(fields: usize) -> Vec<u8> {
 }
 
 #[test]
-fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
+fn sanitizer_preserves_failure_explanation_and_rejects_terminal_conflicts() {
     let failed = concat!(
         "event: response.failed\n",
         "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\",\"token\":\"secret-token\"}}}\n\n",
@@ -26,9 +26,8 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
         output.extend_from_slice(&sanitizer.push(&[*byte]).unwrap());
     }
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("upstream request failed"));
+    assert!(output.contains("provider-secret"));
     for secret in [
-        "provider-secret",
         "secret-token",
         "failure-comment-secret",
         "post-terminal-secret",
@@ -199,9 +198,8 @@ fn failed_terminal_drops_a_bare_secret_event_before_done() {
     }
     output.extend_from_slice(&sanitizer.finish().unwrap());
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("upstream request failed"));
+    assert!(output.contains("provider-secret"));
     assert!(output.contains("data: [DONE]"));
-    assert!(!output.contains("provider-secret"));
     assert!(!output.contains("bare-event-secret"));
 }
 
