@@ -3,7 +3,7 @@
 use std::{cmp::Reverse, collections::BinaryHeap};
 
 use futures_util::StreamExt;
-use object_store::{ObjectStore, path::Path};
+use object_store::{ObjectStore, ObjectStoreExt, path::Path};
 use uuid::Uuid;
 
 use super::{ArchiveStore, CasArchiveObject};
