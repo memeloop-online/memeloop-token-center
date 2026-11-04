@@ -58,12 +58,15 @@ export function PluginConcurrencyAdvice({ token, tenant, locale }: { token: stri
   const [refresh, setRefresh] = useState(0);
   useEffect(() => {
     let active = true;
+    const controller = new AbortController();
     setResult(undefined);
     const query = tenant ? `?tenant_external_id=${encodeURIComponent(tenant)}` : '';
-    void api<unknown>(`/internal/v1/plugins/mtc-health-intelligence/private-data/concurrency-advice${query}`, token)
+    void api<unknown>(`/internal/v1/plugins/mtc-health-intelligence/private-data/concurrency-advice${query}`, token, {
+      signal: controller.signal, cache: 'no-store',
+    })
       .then((value) => { if (active) setResult({ token, tenant, value: object(value) ?? { state: 'unavailable' } }); })
       .catch(() => { if (active) setResult({ token, tenant, value: { state: 'unavailable' } }); });
-    return () => { active = false; };
+    return () => { active = false; controller.abort(); };
   }, [token, tenant, refresh]);
 
   const data = object(response?.data);
