@@ -3,7 +3,8 @@ use std::sync::atomic::Ordering;
 
 #[tokio::test]
 async fn failed_uploads_keep_typed_status_without_dispatch_billing_or_resource_leaks() {
-    let fixture = codex_route_fixture("body-read-errors").await;
+    let mut fixture = codex_route_fixture("body-read-errors").await;
+    std::sync::Arc::make_mut(&mut fixture.state.config).audio_body_max_bytes = 4 * 1024 * 1024;
     let upstream = MockServer::start().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let initial_account: (i64, i64) = sqlx::query_as(
@@ -25,8 +26,16 @@ async fn failed_uploads_keep_typed_status_without_dispatch_billing_or_resource_l
             fixture.state.config.responses_body_max_bytes as usize,
         ),
         ("/v1/chat/completions", 4 * 1024 * 1024),
+        ("/v1/audio/transcriptions", 4 * 1024 * 1024),
     ] {
-        for failure in ["read", "declared_limit", "stream_limit"] {
+        // Durable inference has no hot-body size cap; audio retains a real
+        // admission limit. Exercise transport failures on both kinds of route.
+        let failures: &[&str] = if path == "/v1/audio/transcriptions" {
+            &["read", "declared_limit", "stream_limit"]
+        } else {
+            &["read"]
+        };
+        for &failure in failures {
             let (body, declared) = match failure {
                 "declared_limit" => (Body::empty(), Some(maximum + 1)),
                 "stream_limit" => (Body::from(vec![b'x'; maximum + 1]), None),
