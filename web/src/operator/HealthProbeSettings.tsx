@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Button } from '@fluentui/react-components';
 import { api } from '../api';
 import { useI18n } from '../i18n';
 
@@ -20,10 +21,13 @@ export function HealthProbeSettings({ token, tenant, accountId, disabled }: { to
     Promise.all([
       api<Settings>(path, token, { signal: controller.signal }),
       api<Key[]>(`/internal/v1/keys?tenant_external_id=${encodeURIComponent(tenant)}&limit=500`, token, { signal: controller.signal }),
-    ]).then(([settings, credentials]) => { setValue(settings); setKeys(credentials.filter(key => key.status === 'active')); })
+    ]).then(([settings, credentials]) => {
+      if (!settings || typeof settings.enabled !== 'boolean' || typeof settings.interval_seconds !== 'number' || typeof settings.prompt !== 'string' || !Array.isArray(credentials)) throw new Error(zh ? '探测设置格式无效' : 'Invalid probe settings');
+      setValue(settings); setKeys(credentials.filter(key => key.status === 'active'));
+    })
       .catch(reason => { if (!controller.signal.aborted) setError(String(reason)); });
     return () => controller.abort();
-  }, [path, tenant, token]);
+  }, [path, tenant, token, zh]);
   async function save() {
     if (!value) return;
     setSaving(true); setError(''); setSaved(false);
@@ -40,7 +44,7 @@ export function HealthProbeSettings({ token, tenant, accountId, disabled }: { to
       <label>{zh ? '探测间隔（小时）' : 'Interval (hours)'}<input type="number" min="1" max="720" step="1" value={value.interval_seconds / 3600} onChange={e => setValue({ ...value, interval_seconds: Number(e.target.value) * 3600 })} /></label>
       <label>{zh ? '模型（留空自动选择低成本模型）' : 'Model (leave empty to choose a low-cost model)'}<input value={value.model ?? ''} maxLength={200} onChange={e => setValue({ ...value, model: e.target.value || null })} /></label>
       <label>{zh ? '探测提示词' : 'Probe prompt'}<textarea value={value.prompt} maxLength={1024} onChange={e => setValue({ ...value, prompt: e.target.value })} /></label>
-      <button type="button" onClick={() => void save()}>{zh ? '保存探测设置' : 'Save probe settings'}</button>
+      <Button appearance="primary" type="button" style={{ minHeight: 44, maxWidth: "100%" }} onClick={() => void save()}>{zh ? '保存探测设置' : 'Save probe settings'}</Button>
     </fieldset>}
   </section>;
 }
