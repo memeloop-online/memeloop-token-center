@@ -101,6 +101,7 @@ pub(in crate::api::proxy) fn classify_attempt_failure(
         )),
         Err(
             ProxySendError::CodexBadRequest
+            | ProxySendError::CodexRejection(_)
             | ProxySendError::AmbiguousResponse(_)
             | ProxySendError::CandidateUnavailable
             | ProxySendError::CredentialUnavailable
@@ -118,6 +119,7 @@ pub(in crate::api::proxy) fn attempt_failure_stage(
         Err(
             ProxySendError::RetryableCodexBadRequest
             | ProxySendError::CodexBadRequest
+            | ProxySendError::CodexRejection(_)
             | ProxySendError::AmbiguousResponse(_),
         )
         | Ok(_) => "upstream_response",

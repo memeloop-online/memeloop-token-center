@@ -474,12 +474,16 @@ pub(super) async fn execute_synchronous_image_request(
             .await;
     }
     if !upstream_status.is_success() {
-        drop(upstream);
-        return fail_image_request(
-            context,
-            &format!("upstream_http_{}", upstream_status.as_u16()),
-        )
-        .await;
+        let response = match upstream {
+            SynchronousImageUpstreamResponse::Reqwest(response)
+            | SynchronousImageUpstreamResponse::Codex(response) => response,
+        };
+        let rejection = crate::api::proxy::upstream_error::read_reqwest_rejection(response).await;
+        let error_code = rejection.reason().map_or_else(
+            || format!("upstream_http_{}", upstream_status.as_u16()),
+            |reason| reason.code().to_owned(),
+        );
+        return fail_image_request(context, &error_code).await;
     }
     let response_bytes = match read_synchronous_image_response_bounded(upstream).await {
         Ok(bytes) => bytes,

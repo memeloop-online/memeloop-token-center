@@ -9,11 +9,15 @@ use super::upstream_response::UpstreamResponse;
 use crate::{model::RequestTerminalCause, supplier_error::SafeReason};
 
 pub(super) const MAX_ERROR_BYTES: usize = 16 * 1024;
-const MAX_ERROR_WAIT: Duration = Duration::from_millis(100);
+const MAX_ERROR_WAIT: Duration = Duration::from_secs(5);
 
-pub(super) struct Rejection {
+pub(in crate::api) struct Rejection {
     pub(super) body: Bytes,
     pub(super) terminal_cause: Option<RequestTerminalCause>,
+}
+
+pub(in crate::api) async fn read_reqwest_rejection(response: reqwest::Response) -> Rejection {
+    read_rejection(UpstreamResponse::Reqwest(response)).await
 }
 
 pub(super) fn rejection_content_class(headers: &HeaderMap) -> &'static str {
@@ -79,7 +83,7 @@ pub(super) fn safe_error_body(raw: &[u8]) -> Bytes {
             _ => None,
         });
     let code = error.get("code").and_then(Value::as_str).or(numeric_code);
-    let Some(reason) = SafeReason::from_supplier(code, message) else {
+    let Some(reason) = crate::supplier_error::reason_from_value(&value) else {
         return fallback_body();
     };
     let mut envelope = json!({"error": {
@@ -102,14 +106,6 @@ pub(super) fn safe_error_body(raw: &[u8]) -> Bytes {
 
 pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
     let status = response.status();
-    if status == StatusCode::BAD_GATEWAY {
-        return Rejection {
-            body: fallback_body(),
-            terminal_cause: super::upstream_response::rejected_response_terminal_cause(response)
-                .await
-                .or(Some(RequestTerminalCause::UpstreamHttpStatus)),
-        };
-    }
     let json_content = rejection_content_class(response.headers()) == "json";
     let identity_encoding = response
         .headers()
@@ -159,11 +155,39 @@ pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
     }
 }
 
+impl Rejection {
+    pub(in crate::api) fn reason(&self) -> Option<SafeReason> {
+        let value = crate::api::sse::parse_unique_json(&self.body).ok()?;
+        crate::supplier_error::reason_from_value(&value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::stream;
     use http::{HeaderMap, HeaderValue, Version};
+
+    #[tokio::test]
+    async fn delayed_json_rejection_preserves_policy_reason_including_502() {
+        for status in [StatusCode::BAD_REQUEST, StatusCode::BAD_GATEWAY] {
+            let response = response(
+                status,
+                "application/json",
+                None,
+                Box::pin(stream::once(async {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Ok(Bytes::from_static(br#"{"error":{"code":"misalignment_policy_violation","message":"private prompt"}}"#))
+                })),
+            );
+            let rejection = read_rejection(response).await;
+            assert_eq!(
+                rejection.reason(),
+                Some(SafeReason::MisalignmentPolicyViolation)
+            );
+            assert!(!String::from_utf8_lossy(&rejection.body).contains("private"));
+        }
+    }
 
     #[test]
     fn rejection_header_classes_are_fixed_and_share_the_reader_eligibility_rule() {

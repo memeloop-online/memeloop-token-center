@@ -46,7 +46,7 @@ pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
 mod transport_protocol;
-mod upstream_error;
+pub(super) mod upstream_error;
 mod upstream_response;
 
 #[cfg(test)]
@@ -1778,22 +1778,39 @@ async fn proxy_with_cancellation_guard(
                 return finish_unavailable(&buffered_request, "upstream_rejected", last_dispatch)
                     .await;
             }
-            Err(ProxySendError::CodexBadRequest) => {
+            Err(error @ (ProxySendError::CodexBadRequest | ProxySendError::CodexRejection(_))) => {
+                let reason = match error {
+                    ProxySendError::CodexRejection(reason) => Some(reason),
+                    _ => None,
+                };
+                let body = reason.map_or_else(upstream_error::fallback_body, |reason| {
+                    upstream_error::safe_error_body(
+                        serde_json::json!({"error":{"code":reason.code()}})
+                            .to_string()
+                            .as_bytes(),
+                    )
+                });
+                let stored_response = format!("inline-json:{}", String::from_utf8_lossy(&body));
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_local_buffered_error(
+                return finish_buffered_request_with_upstream_attribution_and_response_object(
                     &buffered_request,
                     StatusCode::BAD_REQUEST,
-                    Bytes::from_static(
-                        b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
-                    ),
+                    body,
                     "application/json",
                     (
                         TokenUsage::default(),
                         crate::model::RequestUsageBasis::NotObserved,
                     ),
-                    Some("http_400".to_owned()),
+                    Some(reason.map_or("http_400", |reason| reason.code()).to_owned()),
+                    BufferedFinishPolicy {
+                        upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                        response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
+                        terminal_cause: Some(
+                            crate::model::RequestTerminalCause::UpstreamHttpStatus,
+                        ),
+                    },
                 )
                 .await;
             }

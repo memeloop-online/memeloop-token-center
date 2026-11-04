@@ -50,6 +50,7 @@ pub(super) struct ResponsesSseCapture {
     terminal_success: bool,
     terminal_failure: bool,
     supplier_rate_limited: bool,
+    supplier_reason: Option<crate::supplier_error::SafeReason>,
     terminal_incomplete: bool,
     usage: Option<TokenUsage>,
     usage_invalid: bool,
@@ -91,6 +92,7 @@ pub(super) enum ResponsesSseOutcome {
 pub(super) struct ResponsesSseSummary {
     pub(super) outcome: ResponsesSseOutcome,
     pub(super) supplier_rate_limited: bool,
+    pub(super) supplier_reason: Option<crate::supplier_error::SafeReason>,
     pub(super) usage: Option<TokenUsage>,
     pub(super) usage_invalid: bool,
     pub(super) observed_protocol_invalid: bool,
@@ -302,6 +304,7 @@ impl ResponsesSseCapture {
         ResponsesSseSummary {
             outcome,
             supplier_rate_limited: self.supplier_rate_limited,
+            supplier_reason: self.supplier_reason,
             usage: self.usage,
             usage_invalid: self.usage_invalid,
             observed_protocol_invalid: self.observed_protocol_invalid,
@@ -508,6 +511,7 @@ impl ResponsesSseCapture {
         if Self::safe_supplier_tpm_body(&data).is_some() {
             self.terminal_failure = true;
             self.supplier_rate_limited = true;
+            self.supplier_reason = Some(crate::supplier_error::SafeReason::RateLimited);
             // Preserve the compatible failure frame's delivery attribution.
             return ChatSseDeliveryClass::Billable;
         }
@@ -570,6 +574,9 @@ impl ResponsesSseCapture {
             || value
                 .pointer("/response/error")
                 .is_some_and(|error| !error.is_null());
+        if reports_error && self.supplier_reason.is_none() {
+            self.supplier_reason = crate::supplier_error::reason_from_value(&value);
+        }
         if reports_error
             && !matches!(
                 payload_kind.or(event_kind),

@@ -4,11 +4,23 @@ use serde::{
 };
 
 const MAX_INLINE_JSON_BYTES: usize = 2048;
+mod reason;
+pub(crate) use reason::SafeReason;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupplierError {
     pub code: String,
     pub message: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub retryable: bool,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_message: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -32,47 +44,9 @@ struct InlineError<'a> {
     mtc_provider_message: Option<&'a str>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SafeReason {
-    NoActivePlan,
-    InsufficientQuota,
-    AuthenticationInvalid,
-    AuthenticationExpired,
-    RateLimited,
-    ModelUnavailable,
-}
-
 impl SafeReason {
-    pub(crate) fn from_marker(marker: &str) -> Option<Self> {
-        match marker {
-            "no_active_plan" => Some(Self::NoActivePlan),
-            "insufficient_quota" => Some(Self::InsufficientQuota),
-            "authentication_invalid" => Some(Self::AuthenticationInvalid),
-            "authentication_expired" => Some(Self::AuthenticationExpired),
-            "rate_limited" => Some(Self::RateLimited),
-            "model_unavailable" => Some(Self::ModelUnavailable),
-            _ => None,
-        }
-    }
-
     pub(crate) fn from_supplier(code: Option<&str>, message: Option<&str>) -> Option<Self> {
-        let code_reason = code.and_then(|code| match code {
-            "no_active_plan" | "NoAvailablePlan" | "NoActivePlan" | "NoPlan" => {
-                Some(Self::NoActivePlan)
-            }
-            "insufficient_quota" | "insufficient_user_quota" => Some(Self::InsufficientQuota),
-            "authentication_invalid" | "invalid_api_key" => Some(Self::AuthenticationInvalid),
-            "authentication_expired" | "api_key_expired" | "token_expired" => {
-                Some(Self::AuthenticationExpired)
-            }
-            "rate_limited" | "rate_limit_exceeded" | "ModelAccountTpmRateLimitExceeded" => {
-                Some(Self::RateLimited)
-            }
-            "model_unavailable" | "model_not_found" | "unsupported_model" => {
-                Some(Self::ModelUnavailable)
-            }
-            _ => None,
-        });
+        let code_reason = code.and_then(Self::from_code);
         let message_reason = message.and_then(|message| match message {
             "当前账号没有可用套餐" | "No active plan" | "No available plan" => {
                 Some(Self::NoActivePlan)
@@ -98,32 +72,15 @@ impl SafeReason {
         }
     }
 
-    pub(crate) fn code(self) -> &'static str {
-        match self {
-            Self::NoActivePlan => "no_active_plan",
-            Self::InsufficientQuota => "insufficient_quota",
-            Self::AuthenticationInvalid => "authentication_invalid",
-            Self::AuthenticationExpired => "authentication_expired",
-            Self::RateLimited => "rate_limited",
-            Self::ModelUnavailable => "model_unavailable",
-        }
-    }
-
-    pub(crate) fn message(self) -> &'static str {
-        match self {
-            Self::NoActivePlan => "当前账号没有可用套餐",
-            Self::InsufficientQuota => "The upstream account has insufficient quota",
-            Self::AuthenticationInvalid => "The upstream authentication credentials are invalid",
-            Self::AuthenticationExpired => "The upstream authentication credentials have expired",
-            Self::RateLimited => "The upstream request rate limit was exceeded",
-            Self::ModelUnavailable => "The requested upstream model is unavailable",
-        }
-    }
-
     fn supplier_error(self) -> SupplierError {
         SupplierError {
             code: self.code().to_owned(),
             message: self.message().to_owned(),
+            category: self.category().to_owned(),
+            retryable: self.retryable(),
+            action: self.action().to_owned(),
+            provider_code: None,
+            provider_message: None,
         }
     }
 
@@ -151,8 +108,10 @@ pub(crate) fn supplier_error_from_record(
     error_code: Option<&str>,
 ) -> Option<SupplierError> {
     supplier_error_from_inline_json(inline).or_else(|| {
-        (status_code == Some(502) && error_code == Some(SafeReason::RateLimited.code()))
-            .then(|| SafeReason::RateLimited.supplier_error())
+        status_code
+            .filter(|status| *status >= 400)
+            .and_then(|_| error_code.and_then(SafeReason::from_code))
+            .map(SafeReason::supplier_error)
     })
 }
 
@@ -264,23 +223,83 @@ pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierEr
         return None;
     }
     let mut supplier = reason.supplier_error();
-    if let Some(code) = code {
-        supplier
-            .message
-            .push_str(&format!("; provider code: {code}"));
-    }
-    if let Some(message) = message {
-        supplier
-            .message
-            .push_str(&format!("; provider message: {message}"));
-    }
+    supplier.provider_code = code.map(str::to_owned);
+    supplier.provider_message = message.map(str::to_owned);
     Some(supplier)
+}
+
+/// Parse only known semantic reasons. Unknown provider text never becomes
+/// public copy. Both HTTP and stream adapters call this same boundary.
+pub(crate) fn reason_from_value(value: &serde_json::Value) -> Option<SafeReason> {
+    let error = value
+        .pointer("/response/error")
+        .filter(|error| !error.is_null())
+        .or_else(|| value.get("error"))
+        .unwrap_or(value);
+    let object = error.as_object()?;
+    if object.contains_key("message") && object.contains_key("msg") {
+        return None;
+    }
+    SafeReason::from_supplier(
+        object.get("code").and_then(serde_json::Value::as_str),
+        object
+            .get("message")
+            .or_else(|| object.get("msg"))
+            .and_then(serde_json::Value::as_str),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn policy_reason_survives_all_envelopes_and_record_projection() {
+        for value in [
+            json!({"error": {"code":"misalignment_policy_violation", "message":"private prompt"}}),
+            json!({"response": {"error": {"code":"misalignment_policy_violation", "message":"private prompt"}}}),
+            json!({"code":"misalignment_policy_violation", "message":"private prompt"}),
+        ] {
+            let reason = reason_from_value(&value).unwrap();
+            assert_eq!(reason, SafeReason::MisalignmentPolicyViolation);
+            assert!(!reason.retryable());
+            let projected =
+                supplier_error_from_record(None, Some(502), Some(reason.code())).unwrap();
+            assert_eq!(projected.category, "policy");
+            assert_eq!(projected.action, "review_request");
+            assert!(!projected.message.contains("private"));
+            assert!(supplier_error_from_record(None, Some(200), Some(reason.code())).is_none());
+        }
+    }
+
+    #[test]
+    fn recovery_catalog_rejects_conflicts_and_unknown_provider_values() {
+        assert_eq!(
+            reason_from_value(&json!({"error": {
+                "code":"context_length_exceeded", "message":"Quota exhausted"
+            }})),
+            None
+        );
+        assert_eq!(
+            reason_from_value(&json!({"error": {
+                "code":"private_unknown_code", "message":"private prompt"
+            }})),
+            None
+        );
+        for (code, expected) in [
+            ("context_length_exceeded", SafeReason::ContextLengthExceeded),
+            (
+                "invalid_encrypted_content",
+                SafeReason::InvalidEncryptedContent,
+            ),
+            ("rate_limit_exceeded", SafeReason::RateLimited),
+            ("slow_down", SafeReason::ServerOverloaded),
+        ] {
+            assert_eq!(SafeReason::from_code(code), Some(expected));
+            assert_eq!(SafeReason::from_marker(expected.code()), Some(expected));
+        }
+    }
 
     fn inline(reason: SafeReason) -> String {
         format!(
@@ -408,13 +427,9 @@ mod tests {
             let projected =
                 supplier_error_from_inline_json(Some(&format!("inline-json:{envelope}"))).unwrap();
             assert_eq!(projected.code, reason.code());
-            assert_eq!(
-                projected.message,
-                format!(
-                    "{}; provider code: {code}; provider message: {message}",
-                    reason.message()
-                )
-            );
+            assert_eq!(projected.message, reason.message());
+            assert_eq!(projected.provider_code.as_deref(), Some(code));
+            assert_eq!(projected.provider_message.as_deref(), Some(message));
             for field in ["mtc_provider_code", "mtc_provider_message"] {
                 for unsafe_text in [
                     "Authorization: Bearer private-canary",

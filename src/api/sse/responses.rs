@@ -470,7 +470,11 @@ impl ResponsesStreamingSanitizer {
         if failure {
             self.append_output(
                 output,
-                &safe_failure_event("upstream_rejected", "response_failed"),
+                &safe_failure_event(
+                    crate::supplier_error::reason_from_value(&value)
+                        .map_or("upstream_rejected", |reason| reason.client_code()),
+                    "response_failed",
+                ),
             )
             .map_err(|code| SanitizerRejection::new(code, "terminal_hold"))?;
         } else {

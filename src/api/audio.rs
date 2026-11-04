@@ -316,7 +316,11 @@ pub(super) async fn create_audio_transcription(
                     MediaAttemptTerminal::Inconclusive
                 };
                 attempt.complete(terminal).await;
-                drop(upstream);
+                let rejection =
+                    crate::api::proxy::upstream_error::read_reqwest_rejection(upstream).await;
+                let error_code = rejection
+                    .reason()
+                    .map_or("audio_upstream_rejected", |reason| reason.code());
                 finish_audio_failure(
                     &state,
                     &reservation,
@@ -324,11 +328,11 @@ pub(super) async fn create_audio_transcription(
                     key.tenant_id,
                     audio,
                     started,
-                    "audio_upstream_rejected",
+                    error_code,
                 )
                 .await?;
                 return Err(AppError::upstream_with(
-                    "upstream_unavailable",
+                    error_code,
                     crate::error::ErrorFacts::new().stage("audio_upstream"),
                 ));
             }

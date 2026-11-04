@@ -1573,7 +1573,10 @@ impl CodexChatStreamTranslator {
                 };
                 self.complete(&value, finish_reason, true).map(Some)
             }
-            "response.failed" | "response.error" | "error" => Err("upstream_failed_response"),
+            "response.failed" | "response.error" | "error" => {
+                Err(crate::supplier_error::reason_from_value(&value)
+                    .map_or("upstream_failed_response", |reason| reason.client_code()))
+            }
             _ => Err("upstream_unsupported_chat_output"),
         }
     }
@@ -1998,6 +2001,7 @@ struct BufferedResponsesParser {
     identity: ResponseIdentityGate,
     terminal_response: Option<(Value, BufferedCodexTerminal)>,
     terminal_failure: bool,
+    supplier_reason: Option<crate::supplier_error::SafeReason>,
     invalid: bool,
     retained_memory: Vec<crate::gateway_body::memory::ArchiveOutputMemory>,
 }
@@ -2084,7 +2088,9 @@ impl BufferedResponsesParser {
             return Err("upstream_incomplete_response");
         }
         if self.invalid || self.terminal_failure {
-            return Err("upstream_failed_response");
+            return Err(self
+                .supplier_reason
+                .map_or("upstream_failed_response", |reason| reason.client_code()));
         }
         let (mut response, terminal) = self
             .terminal_response
@@ -2163,6 +2169,7 @@ impl BufferedResponsesParser {
                 .is_some_and(|error| !error.is_null())
         {
             self.terminal_failure = true;
+            self.supplier_reason = crate::supplier_error::reason_from_value(&value);
             return Ok(());
         }
         self.identity.observe(kind, &value)?;
