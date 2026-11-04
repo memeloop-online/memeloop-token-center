@@ -14,6 +14,9 @@ const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 struct DispatchCompletion {
     db: crate::db::Database,
     operation: String,
+    owner: Uuid,
+    accepted: bool,
+    error: Option<&'static str>,
     finished: bool,
 }
 
@@ -24,13 +27,26 @@ impl Drop for DispatchCompletion {
         }
         let db = self.db.clone();
         let operation = self.operation.clone();
+        let owner = self.owner;
+        let accepted = self.accepted;
+        let error = self.error;
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                if let Err(error) = db
-                    .finish_quota_reset(&operation, false, Some("reset_dispatch_owner_ended"))
-                    .await
-                {
-                    tracing::error!(operation_id = %operation, error = %error, "quota reset dispatch outcome could not be persisted");
+                let mut delay = Duration::from_secs(1);
+                loop {
+                    match db
+                        .finish_quota_reset_owned(&operation, Some(owner), accepted, error)
+                        .await
+                    {
+                        Ok(()) => return,
+                        Err(error) => tracing::error!(
+                            operation_id = %operation,
+                            error = %error,
+                            "quota reset outcome persistence will retry without redispatch"
+                        ),
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
                 }
             });
         }
@@ -71,6 +87,7 @@ pub(crate) struct CreditInventory {
     pub fingerprint: String,
 }
 
+#[derive(Clone)]
 pub(crate) struct BackgroundResetGuard {
     pub grant: crate::db::plugin_background_actions::BackgroundActionGrant,
     /// Exact host-validated plugin snapshot, separate from business identity.
@@ -612,25 +629,44 @@ async fn confirm_guarded(
     } else {
         http
     };
-    let claim = state
-        .db
-        .claim_quota_reset_guarded(
-            account,
-            operation,
-            actor,
-            &confirmation_hash,
-            &confirm_idempotency_hash,
-            guard,
-        )
-        .await?;
+    // Keep the claim and its completion guard in one owned task. Cancellation
+    // while COMMIT is in flight cannot drop the only recovery owner before the
+    // claim's database outcome is known. This task never sends to the supplier.
+    let db = state.db.clone();
+    let claim_account = account.clone();
+    let claim_operation = operation.to_owned();
+    let claim_actor = actor.to_owned();
+    let claim_guard = guard.cloned();
+    let (claim, mut completion) = tokio::spawn(async move {
+        let mut completion = DispatchCompletion {
+            db: db.clone(),
+            operation: claim_operation.clone(),
+            owner: Uuid::now_v7(),
+            accepted: false,
+            error: Some("reset_dispatch_owner_ended"),
+            finished: false,
+        };
+        let claim = db
+            .claim_quota_reset_owned(
+                &claim_account,
+                &claim_operation,
+                &claim_actor,
+                &confirmation_hash,
+                &confirm_idempotency_hash,
+                claim_guard.as_ref(),
+                Some(completion.owner),
+            )
+            .await?;
+        if matches!(claim, QuotaResetClaim::Replayed(_)) {
+            completion.finished = true;
+        }
+        Ok::<_, AppError>((claim, completion))
+    })
+    .await
+    .map_err(|_| AppError::internal("quota_reset_claim_task"))??;
     let redeem = match claim {
         QuotaResetClaim::Claimed { redeem_request_id } => redeem_request_id,
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
-    };
-    let mut completion = DispatchCompletion {
-        db: state.db.clone(),
-        operation: operation.to_owned(),
-        finished: false,
     };
     // Each durable operation keeps one redeem ID and one supplier dispatch.
     let result = if guard.is_some_and(|guard| unix_millis() >= guard.deadline_ms) {
@@ -654,9 +690,16 @@ async fn confirm_guarded(
     };
     drop(_permit);
     let accepted = result.is_ok();
+    completion.accepted = accepted;
+    completion.error = result.err();
     state
         .db
-        .finish_quota_reset(operation, accepted, result.err())
+        .finish_quota_reset_owned(
+            operation,
+            Some(completion.owner),
+            accepted,
+            completion.error,
+        )
         .await?;
     completion.finished = true;
     state
