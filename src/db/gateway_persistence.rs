@@ -217,9 +217,35 @@ impl Database {
         digest: [u8; 32],
         success: bool,
     ) {
+        self.complete_request_source_state(identity, locator, length, digest, success, false)
+            .await;
+    }
+
+    /// A successful object-store Put is independent of the staging write lease.
+    /// Recover its metadata without granting a fenced writer a new write lease.
+    pub(crate) async fn complete_uploaded_request_source(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+    ) {
+        self.complete_request_source_state(identity, locator, length, digest, true, true)
+            .await;
+    }
+
+    async fn complete_request_source_state(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+        success: bool,
+        recovery: bool,
+    ) {
         loop {
             if self
-                .persist_request_source(identity, locator, length, digest, Some(success))
+                .persist_request_source(identity, locator, length, digest, Some(success), recovery)
                 .await
                 .is_some()
             {
@@ -242,7 +268,7 @@ impl Database {
                 return Some(success);
             }
             let delay = match self
-                .persist_request_source(identity, locator, length, digest, None)
+                .persist_request_source(identity, locator, length, digest, None, false)
                 .await
             {
                 Some(false) => return None,
@@ -272,6 +298,7 @@ impl Database {
         length: usize,
         digest: [u8; 32],
         success: Option<bool>,
+        recovery: bool,
     ) -> Option<bool> {
         let mut database = self.clone();
         database.pool = self.gateway_persistence.pool.clone();
@@ -285,8 +312,9 @@ impl Database {
             deadline,
             ARCHIVE_DEADLINE.scope(
                 (self.gateway_persistence.clone(), deadline),
-                database
-                    .record_request_source_state(identity, locator, length, digest, success, false),
+                database.record_request_source_state(
+                    identity, locator, length, digest, success, recovery,
+                ),
             ),
         )
         .await;
@@ -350,9 +378,15 @@ impl Database {
             {
                 return;
             }
-            database
-                .complete_request_source(identity, &locator, length, digest, success)
-                .await;
+            if success {
+                database
+                    .complete_uploaded_request_source(identity, &locator, length, digest)
+                    .await;
+            } else {
+                database
+                    .complete_request_source(identity, &locator, length, digest, false)
+                    .await;
+            }
         });
     }
 
@@ -450,7 +484,12 @@ impl Database {
                     .try_get::<Option<String>, _>("lease_token")?
                     .is_none_or(|token| token != identity.request_id.to_string())
             {
-                return Ok(false);
+                // Request ownership was checked above, including tenant,
+                // reservation and exact locator. A reaper fencing staging is
+                // not permission to cancel the only remaining original body.
+                // Do not renew or mutate the fenced stage. Once the Put is
+                // durable, its explicit recovery path can bind the metadata.
+                return Ok(!writing && success.is_none());
             }
         }
         if success.is_some() {

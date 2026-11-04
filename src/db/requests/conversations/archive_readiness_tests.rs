@@ -909,6 +909,106 @@ async fn expired_live_source_writer_contract(database_url: String) {
     fixture.assert_completed(true).await;
 }
 
+async fn fenced_source_upload_contract(database_url: String) {
+    use crate::gateway_body::request_spool::{MemoryObjectStore, RequestSpoolAdmission};
+    use std::time::Duration;
+
+    let store = MemoryObjectStore::new();
+    let release = store.pause_next_write();
+    let admission =
+        RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
+    let mut fixture =
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    let source = fixture.source.take().unwrap();
+    let locator = source.object_locator().unwrap().to_owned();
+    let length = source.len();
+    let digest = source.digest();
+    let (outcome, receiver) = tokio::sync::watch::channel(None);
+    // Register the actual owner while the only object-store Put is paused.
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture.state.db.wait_request_source_upload(
+                fixture.identity,
+                &locator,
+                length,
+                digest,
+                receiver.clone(),
+            ),
+        )
+        .await
+        .is_err()
+    );
+    sqlx::query("UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE attempt_id = $1")
+        .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            fixture.state.db.wait_request_source_upload(
+                fixture.identity,
+                &locator,
+                length,
+                digest,
+                receiver.clone(),
+            ),
+        )
+        .await
+        .is_err(),
+        "a staging fence must keep waiting for the original Put"
+    );
+    let stage: String =
+        sqlx::query_scalar("SELECT state FROM archive_staging_attempts WHERE attempt_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stage, "cleanup_pending",
+        "heartbeat cannot reclaim the fence"
+    );
+    let wrong_owner = ArchiveSpoolIdentity {
+        reservation_id: Uuid::now_v7(),
+        ..fixture.identity
+    };
+    assert_eq!(
+        fixture
+            .state
+            .db
+            .wait_request_source_upload(wrong_owner, &locator, length, digest, receiver)
+            .await,
+        None,
+        "a different request reservation must still cancel its upload"
+    );
+    drop(outcome);
+    assert!(!release.is_closed());
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    store.resume_writes_for_test(fixture.state.archive.clone());
+    release.send(()).unwrap();
+    assert!(source.upload_outcome().await);
+    drop(source);
+    let original = fixture.state.archive.get(&locator).await.unwrap();
+    assert_eq!(original.len(), length);
+    assert_eq!(*blake3::hash(&original).as_bytes(), digest);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM request_archive_spools WHERE request_id = $1",
+            )
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+            if state == "bound" {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("durable completion repairs the fenced metadata");
+    fixture.assert_completed(true).await;
+}
+
 async fn lost_source_writer_contract(database_url: String) {
     use crate::gateway_body::request_spool::{MemoryObjectStore, RequestSpoolAdmission};
     use std::time::Duration;
@@ -1001,6 +1101,7 @@ async fn sqlite_source_failed_state_write_retries_and_lost_writer_converges() {
     );
     failed_source_metadata_contract(database_url.clone()).await;
     expired_live_source_writer_contract(database_url.clone()).await;
+    fenced_source_upload_contract(database_url.clone()).await;
     lost_source_writer_contract(database_url).await;
 }
 
@@ -1013,6 +1114,7 @@ async fn postgres_source_failed_state_write_retries_and_lost_writer_converges() 
     let isolated = PostgresTestDatabase::create(&database_url).await;
     failed_source_metadata_contract(isolated.url().to_owned()).await;
     expired_live_source_writer_contract(isolated.url().to_owned()).await;
+    fenced_source_upload_contract(isolated.url().to_owned()).await;
     lost_source_writer_contract(isolated.url().to_owned()).await;
     isolated.cleanup().await;
 }
