@@ -85,11 +85,18 @@ impl ClickHouse {
         let from = query.bind(from, "Int64");
         let to = query.bind(to, "Int64");
         let created = query.bind(cursor.created_at, "Int64");
-        let key = query.bind(&cursor.key_id, "String");
-        let request = query.bind(&cursor.request_id, "String");
+        let cursor_uuid = |value: &str| {
+            if value.is_empty() {
+                Ok(Uuid::nil())
+            } else {
+                Uuid::parse_str(value).map_err(|_| HistoryError::Invalid("allocation cursor UUID"))
+            }
+        };
+        let key = query.bind(cursor_uuid(&cursor.key_id)?, "UUID");
+        let request = query.bind(cursor_uuid(&cursor.request_id)?, "UUID");
         let source = query.bind(&cursor.source, "String");
         query.sql = format!(
-            "SELECT tenant_id,source,request_id,toInt64(revision) AS revision,created_at,toString(key_id) AS key_id,
+            "SELECT tenant_id,source,request_id,toInt64(revision) AS revision,created_at,key_id,
                 if(settled,JSONExtractString(fact,'upstream_account_id'),'') AS account_id,
                 toInt64(settled) AS requests,
                 if(settled AND source='native',
@@ -102,9 +109,9 @@ impl ClickHouse {
                 FROM request_history_v1 FINAL
                 WHERE tenant_id={tenant} AND created_at>={from} AND created_at<={to}
                     AND source IN ('native','generation')
-                    AND (toString(key_id),created_at,toString(request_id),source)>({key},{created},{request},{source})
+                    AND (key_id,created_at,request_id,source)>({key},{created},{request},{source})
              )
-             ORDER BY toString(key_id),created_at,toString(request_id),source LIMIT {ALLOCATION_PAGE} FORMAT JSONEachRow"
+             ORDER BY key_id,created_at,request_id,source LIMIT {ALLOCATION_PAGE} FORMAT JSONEachRow"
         );
         self.rows(query).await
     }

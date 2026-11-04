@@ -273,7 +273,7 @@ async fn exercise_coverage(url: &str) {
     register(&db, paged, now, 1).await;
     let same_request = Uuid::now_v7();
     let mut high = snapshot(paged, same_request, b, now, 100_000);
-    let low = (1..=256)
+    let low = (1..=257)
         .map(|revision| snapshot(paged, same_request, a, now, revision))
         .collect::<Vec<_>>();
     let mut tx = db.begin_write_transaction().await.unwrap();
@@ -411,7 +411,7 @@ async fn allocation_history_real_services_acceptance() {
     let a = Uuid::now_v7();
     let b = Uuid::now_v7();
     let now = super::super::unix_millis();
-    let values = (0..ALLOCATION_PAGE + 3)
+    let mut values = (0..ALLOCATION_PAGE + 3)
         .map(|index| {
             // UUID halves run in opposite directions to expose string/native UUID order mismatches.
             let request = Uuid::from_u128(
@@ -420,6 +420,13 @@ async fn allocation_history_real_services_acceptance() {
             snapshot(tenant, request, a, now - 1000, index as i64 + 1)
         })
         .collect::<Vec<_>>();
+    // Nil key/request is a valid first tuple; a positive created_at makes it
+    // strictly follow the default (nil, 0, nil, "") cursor.
+    values[0].identity.request_id = Uuid::nil();
+    // Use a second key family with opposite UUID halves, crossing the page edge.
+    // Cursor ordering must match the MergeTree tuple, including native UUID order.
+    values[ALLOCATION_PAGE + 1].identity.key_id = Uuid::from_u128((1_u128 << 64) | 2);
+    values[ALLOCATION_PAGE + 2].identity.key_id = Uuid::from_u128((2_u128 << 64) | 1);
     client.append(&values).await.unwrap();
     sqlx::query("UPDATE request_history_state SET mode='clickhouse' WHERE id=1")
         .execute(&db.pool)

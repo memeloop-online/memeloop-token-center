@@ -68,35 +68,39 @@ async fn receipts(
         })
         .collect();
     let values: Vec<_> = unique.into_values().collect();
-    let clock = values.len() * 9 + 1;
-    // The interpolation contains generated parameter positions only.
-    let sql = format!(
-        "WITH incoming(tenant_id,source,request_id,revision,created_at,account_id,requests,tokens,covered) AS (VALUES {})
-         INSERT INTO group_allocation_history_receipts(tenant_id,source,request_id,revision,created_at,account_id,requests,tokens,covered,bootstrap)
-         SELECT i.tenant_id,i.source,i.request_id,i.revision,i.created_at,i.account_id,i.requests,i.tokens,i.covered,${marker}
-         FROM incoming i JOIN group_allocation_history_state s ON s.tenant_id=i.tenant_id
-         WHERE s.capture_until>${clock} AND i.created_at>=(${clock}/3600000-23)*3600000
-         ON CONFLICT(tenant_id,source,request_id,revision) DO UPDATE SET bootstrap=CASE WHEN excluded.bootstrap=1 THEN 1 ELSE group_allocation_history_receipts.bootstrap END",
-        placeholders(values.len(), 9), marker=clock+1
-    );
-    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
-    for value in values {
-        query = query
-            .bind(value.tenant_id.to_string())
-            .bind(&value.source)
-            .bind(value.request_id.to_string())
-            .bind(value.revision)
-            .bind(value.created_at)
-            .bind(&value.account_id)
-            .bind(value.requests)
-            .bind(value.tokens)
-            .bind(value.covered);
+    // Export CLI page sizes are user-configurable; each statement stays below
+    // backend parameter limits while every chunk shares the caller's ACK transaction.
+    for values in values.chunks(ALLOCATION_PAGE) {
+        let clock = values.len() * 9 + 1;
+        // The interpolation contains generated parameter positions only.
+        let sql = format!(
+            "WITH incoming(tenant_id,source,request_id,revision,created_at,account_id,requests,tokens,covered) AS (VALUES {})
+             INSERT INTO group_allocation_history_receipts(tenant_id,source,request_id,revision,created_at,account_id,requests,tokens,covered,bootstrap)
+             SELECT i.tenant_id,i.source,i.request_id,i.revision,i.created_at,i.account_id,i.requests,i.tokens,i.covered,${marker}
+             FROM incoming i JOIN group_allocation_history_state s ON s.tenant_id=i.tenant_id
+             WHERE s.capture_until>${clock} AND i.created_at>=(${clock}/3600000-23)*3600000
+             ON CONFLICT(tenant_id,source,request_id,revision) DO UPDATE SET bootstrap=CASE WHEN excluded.bootstrap=1 THEN 1 ELSE group_allocation_history_receipts.bootstrap END",
+            placeholders(values.len(), 9), marker=clock+1
+        );
+        let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+        for value in values {
+            query = query
+                .bind(value.tenant_id.to_string())
+                .bind(&value.source)
+                .bind(value.request_id.to_string())
+                .bind(value.revision)
+                .bind(value.created_at)
+                .bind(&value.account_id)
+                .bind(value.requests)
+                .bind(value.tokens)
+                .bind(value.covered);
+        }
+        query
+            .bind(now)
+            .bind(i64::from(bootstrap))
+            .execute(&mut **tx)
+            .await?;
     }
-    query
-        .bind(now)
-        .bind(i64::from(bootstrap))
-        .execute(&mut **tx)
-        .await?;
     Ok(())
 }
 
