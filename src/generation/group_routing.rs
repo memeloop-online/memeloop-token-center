@@ -81,6 +81,7 @@ pub(crate) async fn prepare_route_for_protocol(
         request_id,
         deadline,
         &mut candidates,
+        None,
     )
     .await?;
     if state.group_routing.is_none() {
@@ -114,8 +115,6 @@ pub(crate) async fn admit(
     {
         return Err(AppError::Forbidden);
     }
-    // A customer generation uses the selected account. Its success refreshes
-    // service availability through the same attempt terminal as a proxy send.
     Ok(MediaAttemptGuard::new(
         state,
         request_id,

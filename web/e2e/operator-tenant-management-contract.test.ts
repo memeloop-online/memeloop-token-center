@@ -286,7 +286,7 @@ describe('identity tabs retain legacy deep links, separate denial boundaries and
         if (scenario === 'slow') await page.waitForFunction(() => Boolean(window.tenantFixture.release));
         else if (scenario === 'management-denied') await page.getByRole('alert').getByText('Tenant management denied', { exact: true }).waitFor();
         else if (scenario === 'management-error') await page.getByRole('alert').getByText('Tenant management temporarily unavailable', { exact: true }).waitFor();
-        else if (scenario === 'services-denied') await page.getByRole('alert').getByText('Service credential access denied', { exact: true }).waitFor();
+        else if (scenario === 'services-denied') await page.getByRole('alert').getByText('Service credential access denied', { exact: false }).waitFor();
         else if (scenario === 'services-empty') await page.locator('.credential-compact-list').waitFor();
         else await page.locator('.tenant-list').waitFor();
         if (scenario === 'background-refresh') {

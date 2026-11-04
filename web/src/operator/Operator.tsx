@@ -9,6 +9,7 @@ import './managementSurfaces.css';
 import '../plugins/pluginUiSlot.css';
 import type { SessionFocus } from './SessionMonitor';
 import type { RequestDrilldown } from './overviewDrilldown';
+import { isUnlinkedSession, restoreRequestSessionOrigin, unlinkedRequestFilter, type SessionRequestOrigin } from './sessionNavigation';
 import { useOperatorScope } from './hooks/useOperatorScope';
 import { useOperatorResource } from './hooks/useOperatorResource';
 import { useOperatorRequestStream } from './hooks/useOperatorRequestStream';
@@ -87,7 +88,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   const restoredProxyContext = useRef<string | undefined>(undefined);
   const [internalRoute, setInternalRoute] = useState<OperatorApplicationRoute>('requests');
   const [sessionFocus, setSessionFocus] = useState<SessionFocus>();
-  const [requestFocus, setRequestFocus] = useState<{ requestId: string; revision: number }>();
+  const [requestFocus, setRequestFocus] = useState<{ requestId: string; revision: number; restore?: { scrollY: number; openDetail: boolean } }>();
   const [requestDrilldown, setRequestDrilldown] = useState<(RequestDrilldown & { token: string; tenant: string })>();
   const requestDrilldownRevision = useRef(0);
   const pluginCatalog = useOperatorResource(
@@ -183,14 +184,43 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     });
   }
 
-  function openSession(session: UsageAnalysisSessionBucket) {
+  function openSession(session: UsageAnalysisSessionBucket, source?: TypedFilterAst) {
+    if (isUnlinkedSession(session.id, session.unlinked)) {
+      openUnlinkedRequests(session.id, session.key_id, source);
+      return;
+    }
     setSessionFocus({ sessionId: session.id, keyId: session.key_id, revision: Date.now() });
     navigate('sessions');
   }
 
-  function openSessionById(sessionId: string) {
-    setSessionFocus({ sessionId, revision: Date.now() });
+  function openSessionById(sessionId: string, keyId?: string, origin?: string | SessionRequestOrigin) {
+    if (isUnlinkedSession(sessionId)) {
+      openUnlinkedRequests(sessionId, keyId);
+      return;
+    }
+    const requestOrigin = activeRoute === 'overview' || activeRoute === 'requests' ? {
+      route: activeRoute,
+      requestId: typeof origin === 'string' ? origin : origin?.requestId,
+      filters: typeof origin === 'object' ? origin.filters : undefined,
+      openDetail: typeof origin === 'object' ? origin.openDetail : undefined,
+      scrollY: typeof origin === 'object' ? origin.scrollY : window.scrollY,
+    } satisfies SessionRequestOrigin : undefined;
+    setSessionFocus({ sessionId, keyId, revision: Date.now(), origin: requestOrigin });
     navigate('sessions');
+  }
+
+  function returnFromSession(origin: SessionRequestOrigin) {
+    setSessionFocus(undefined);
+    if (origin.route === 'requests') {
+      if (origin.filters) queueRequestDrilldown(origin.filters);
+      if (origin.requestId) setRequestFocus({
+        requestId: origin.requestId, revision: Date.now(),
+        restore: { scrollY: origin.scrollY, openDetail: origin.openDetail === true },
+      });
+      void navigate('requests');
+      return;
+    }
+    void navigate('overview').then(() => restoreRequestSessionOrigin(origin));
   }
 
   function openRequestById(requestId: string) {
@@ -205,6 +235,15 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
       token: scope.activeCredential,
       tenant: scope.tenant,
     });
+  }
+
+  function openUnlinkedRequests(sessionId: string, keyId?: string, source?: TypedFilterAst) {
+    const ast = unlinkedRequestFilter(sessionId, keyId, source);
+    if (!ast) return;
+    setSessionFocus(undefined);
+    setRequestFocus(undefined);
+    queueRequestDrilldown(ast);
+    void navigate('requests');
   }
 
   const activeRequestDrilldown = requestDrilldown?.token === scope.activeCredential && requestDrilldown.tenant === scope.tenant
@@ -230,13 +269,13 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
   // This prevents a transient empty tenant from turning a
   // tenant-scoped resource request into an accidental all-tenant read.
   if (scope.activeCredential && scope.validated && (scope.tenant || (emptyTenantScope && globalBootstrapPage))) {
-    const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant };
+    const pageProps = { token: scope.activeCredential, tenant: scope.tenant, writeTenant: scope.writeTenant, tenants: scope.tenants };
     if (isOperatorRouteKey(activeRoute)) {
       switch (activeRoute) {
         case 'overview': page = <><OverviewPage {...pageProps} onNavigate={navigate} onRequestDrilldown={queueRequestDrilldown} onOpenUsageSession={openSession} onOpenRequest={openRequestById} onOpenSession={openSessionById} /><PluginOverviewCards cards={pluginRegistry.overviewCards} token={scope.activeCredential} tenant={scope.tenant} locale={locale} onNavigate={navigateFromPlugin} /></>; break;
         case 'requests':
         case 'generations': page = <RequestWorkspace mode={activeRoute === 'generations' ? 'generations' : 'requests'} onModeChange={(mode) => navigate(mode)} {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
-        case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} />; break;
+        case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} onOpenUnlinkedRequests={openUnlinkedRequests} onReturnOrigin={returnFromSession} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
         case 'providers': page = <ProvidersPage {...pageProps} onOpenProxyGroups={openProxyGroups} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {
           if (!scope.tenants.some(value => value.external_id === tenant)) return;
@@ -279,7 +318,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
     }}>{scope.tenants.map((value) => <option key={value.external_id} value={value.external_id}>{tenantDisplayName(value.external_id, locale)}</option>)}</select></label></div>}
     {showNavigation && <nav className="tabs" role="tablist" aria-label={t('operator.sections')}>{navigation.map((item) => {
       const selected = activeRoute === item.route || activeRoute === 'service-credentials' && item.route === 'tenants' || activeRoute === 'generations' && item.route === 'requests';
-      return <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={selected} aria-controls={`operator-panel-${item.domId}`} tabIndex={selected ? 0 : -1} key={item.route} className={selected ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{item.route === 'tenants' ? identityCopy(locale).title : item.route === 'proxy-groups' ? transportProxyGroupCopy(locale).title : t(item.label)}</button>;
+      return <button id={`operator-tab-${item.domId}`} role="tab" aria-selected={selected} aria-controls={`operator-panel-${item.domId}`} tabIndex={selected ? 0 : -1} key={item.route} className={selected ? 'active' : ''} onClick={() => navigate(item.route)} onKeyDown={(event) => changeRouteByKeyboard(event, item.route)}>{item.route === 'tenants' ? identityCopy(locale).title : item.route === 'proxy-groups' ? transportProxyGroupCopy(locale).pageTitle : t(item.label)}</button>;
     })}</nav>}
     {scope.error && <div className="notice error" role="alert">{scope.error}</div>}
     {scope.serviceFault && <div className="notice error" role="alert">{scope.serviceFault}<Button appearance="secondary" onClick={scope.retry} disabled={scope.authenticating}>{t('common.retry')}</Button></div>}

@@ -51,6 +51,7 @@ mod generation;
 mod generation_quarantine;
 mod groups;
 mod health;
+mod http_settings;
 mod image_generation_quarantine;
 mod kimi_transport;
 mod limits;
@@ -59,6 +60,7 @@ mod model_routes;
 mod monitoring_snapshot;
 mod new_api_transport;
 mod operator_inference;
+mod plugin_background_actions;
 pub(crate) mod plugin_execution;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installer_network;
@@ -67,6 +69,13 @@ pub(crate) mod proxy;
 pub(crate) use proxy::MediaAttemptBudget;
 pub(crate) use proxy::{MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit};
 mod proxy_diagnostics;
+
+pub(crate) fn current_proxy_request_id() -> Option<Uuid> {
+    proxy_diagnostics::CONTEXT
+        .try_with(|context| context.request_id)
+        .ok()
+}
+
 mod request_detail;
 mod request_normalization;
 mod responses_via_anthropic;
@@ -76,8 +85,10 @@ mod routes;
 mod routing;
 mod self_service;
 mod session_reading;
+mod session_tasks;
 mod session_titles;
 pub(crate) use session_titles::process_one as process_session_title;
+mod network_proxies;
 mod sessions;
 mod sse;
 pub mod startup;
@@ -146,10 +157,9 @@ use tenants::{
 use traffic::{
     AppliedTraffic, Protocol, TrafficPolicyProtocols,
     apply_traffic_plugin_for_existing_idempotency, apply_traffic_policy,
-    authorize_applied_traffic_policy, component_provider_timeout, component_provider_url,
-    inject_controlled_output_ceiling, negotiate_openai_responses_websocket,
-    normalize_component_provider, prepare_component_provider, proxy_anthropic,
-    proxy_anthropic_count_tokens, proxy_openai_alpha_search, proxy_openai_chat,
+    authorize_applied_traffic_policy, component_provider_url, inject_controlled_output_ceiling,
+    negotiate_openai_responses_websocket, normalize_component_provider, prepare_component_provider,
+    proxy_anthropic, proxy_anthropic_count_tokens, proxy_openai_alpha_search, proxy_openai_chat,
     proxy_openai_embeddings, proxy_openai_responses, proxy_openai_responses_compact,
 };
 pub(crate) use upstreams::sync_upstream_models_after_refresh;

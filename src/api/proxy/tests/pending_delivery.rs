@@ -326,6 +326,15 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
         receipt["operational_terminal"]["stage"],
         "upstream_response_headers"
     );
+    // The helper above observes the in-memory snapshot, not completion of the
+    // journal attempt released by `held`. Close the fixture's terminal work
+    // before asserting that runtime ACK preserved the unknown responsibility.
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        fixture.state.pending_terminals.drain(),
+    )
+    .await
+    .expect("unknown terminal shutdown must retain its responsibility");
     assert!(
         fixture
             .state
@@ -333,6 +342,23 @@ async fn second_candidate_claim_failure_records_original_responsibility_without_
             .contains_receipt_for_test(operational_receipt_id),
         "runtime ACK must not retire unknown finance"
     );
+    cancellation::assert_unknown_request(&fixture, request_id, 0).await;
+    let retained: Value = serde_json::from_slice(
+        &tokio::fs::read(
+            fixture
+                .state
+                .pending_terminals
+                .directory_for_test()
+                .join(format!("{operational_receipt_id}.json")),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(retained["receipt_id"], receipt["receipt_id"]);
+    assert_eq!(retained["claim"], receipt["claim"]);
+    assert_eq!(retained["usage_basis"], "not_observed");
+    assert!(retained["financial_ack"].is_null());
     assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
     upstream.verify().await;
     pool.close().await;
@@ -1593,6 +1619,10 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
         &json!({"model": fixture.model, "input": "cancel before provider terminal", "stream": true}),
     ).await;
     assert_eq!(enqueued["input"], "cancel before provider terminal");
+    // Enqueue precedes the compact journal write and the receipt attempt's
+    // durable flag. Acknowledge that owner, not just the outbox, before
+    // checking preservation; the upstream terminal is still withheld.
+    fixture.state.pending_terminals.drain().await;
     assert!(
         fixture
             .state
@@ -1600,6 +1630,21 @@ async fn runtime_ack_survives_unknown_annotation_failure_before_journal_publicat
             .contains_receipt_for_test(receipt_id),
         "runtime ACK is not a financial receipt ACK"
     );
+    let compact: Value = serde_json::from_slice(
+        &tokio::fs::read(
+            fixture
+                .state
+                .pending_terminals
+                .directory_for_test()
+                .join(format!("{receipt_id}.json")),
+        )
+        .await
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(compact["receipt_id"], receipt["receipt_id"]);
+    assert_eq!(compact["claim"], receipt["claim"]);
+    assert!(compact["financial_ack"].is_null());
     release.send(()).unwrap();
     server.await.unwrap();
     drain_archive_capture(&fixture).await;

@@ -1,4 +1,5 @@
 //! Request-owned group policy. Authorization and health leases stay in core.
+mod allocation;
 pub(crate) mod durable;
 mod quota;
 #[cfg(test)]
@@ -52,12 +53,13 @@ impl SnapshotPhase {
     }
 
     fn emit(&self, outcome: &'static str) {
-        tracing::info!(
-            request_id = %self.request_id,
-            stage = self.stage,
-            duration_ms = self.started.elapsed().as_millis() as u64,
-            outcome,
-        );
+        if outcome == "not_completed" {
+            tracing::info!(request_id = %self.request_id, stage = self.stage,
+                duration_ms = self.started.elapsed().as_millis() as u64, outcome);
+        } else {
+            tracing::debug!(request_id = %self.request_id, stage = self.stage,
+                duration_ms = self.started.elapsed().as_millis() as u64, outcome);
+        }
     }
 }
 
@@ -329,7 +331,9 @@ pub(crate) async fn prepare(
     request_id: Uuid,
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
+    session_identity: Option<crate::db::allocation::AllocationSession<'_>>,
 ) -> Result<(), AppError> {
+    state.group_routing = None;
     let stage_deadline = deadline.min(tokio::time::Instant::now() + Duration::from_millis(250));
     match tokio::time::timeout_at(
         stage_deadline,
@@ -340,11 +344,16 @@ pub(crate) async fn prepare(
             request_id,
             deadline,
             candidates,
+            session_identity,
         ),
     )
     .await
     {
-        Ok(result) => result,
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => {
+            tracing::warn!(%request_id, stage="group_routing_native_fallback", error_category=error.diagnostic_category(), "group strategy preparation failed; core routing continues");
+            Ok(())
+        }
         Err(_) => {
             tracing::warn!(%request_id, stage="group_routing_native_fallback", "group snapshot or execution exceeded request scheduling budget");
             Ok(())
@@ -359,6 +368,7 @@ async fn prepare_inner(
     request_id: Uuid,
     deadline: tokio::time::Instant,
     candidates: &mut [AuthorizedUpstreamCandidate],
+    session_identity: Option<crate::db::allocation::AllocationSession<'_>>,
 ) -> Result<(), AppError> {
     let started = tokio::time::Instant::now();
     // Many overlapping groups must not multiply per-component execution into
@@ -551,6 +561,12 @@ async fn prepare_inner(
         let quota_context = if state.plugins.group_routing_uses_quota_context(&plugin_id) {
             match quota::context_for_bucket(&members, &quota_observations, quota_now_ms) {
                 Some(context) => Some(context),
+                None if state
+                    .plugins
+                    .group_routing_uses_allocation_context(&plugin_id) =>
+                {
+                    None
+                }
                 None => {
                     tracing::debug!(%request_id, %group_id, stage="group_routing_quota_fallback", reason="missing_or_stale", "quota evidence incomplete; native group order retained");
                     continue;
@@ -584,7 +600,7 @@ async fn prepare_inner(
                 health,
             });
         }
-        let input = GroupRoutingInput {
+        let mut input = GroupRoutingInput {
             tenant_id: tenant_id.to_string(),
             seed,
             remaining_deadline_ms: remaining_deadline_ms
@@ -592,6 +608,7 @@ async fn prepare_inner(
             config: config.clone(),
             candidates: inputs,
             quota_context,
+            allocation_context: None,
         };
         let signal_now_ms = crate::db::unix_millis();
         let transient_signals = plugin_is_v2.then(|| {
@@ -615,31 +632,111 @@ async fn prepare_inner(
                 })
                 .collect::<Vec<_>>()
         });
-        let runtime = state.plugins.clone();
-        let execute_id = plugin_id.clone();
-        let execute_input = input.clone();
-        let result = tokio::time::timeout_at(
-            hook_deadline,
-            crate::api::plugin_execution::run_group(
-                state.metrics.clone(),
-                crate::metrics::plugin_execution::Phase::GroupRoutingPlan,
-                move || {
-                    runtime.execute_group_routing_plan_with_health(
-                        &execute_id,
-                        &execute_input,
-                        transient_signals.as_deref(),
+        let allocation_deadline =
+            hook_deadline.min(tokio::time::Instant::now() + Duration::from_millis(25));
+        let uses_allocation = state
+            .plugins
+            .group_routing_uses_allocation_context(&plugin_id);
+        let execution_deadline = if uses_allocation {
+            allocation_deadline
+        } else {
+            hook_deadline
+        };
+        let result = async {
+            for attempt in 0..2 {
+                let reservation = if uses_allocation {
+                    let read_phase = SnapshotPhase::new(request_id, "group_allocation_read");
+                    let reservation = allocation::Reservation::read(
+                        state,
+                        tenant_id,
+                        request_id,
+                        selection_seed,
+                        &input,
+                        session_identity,
                     )
-                },
-            ),
-        )
-        .await
-        .map_err(|_| AppError::internal("group_routing_site_1"))
-        .and_then(|result| result);
-        match result {
-            Ok(mut plan) => {
-                // Sticky candidates form a deterministic, tenant/key/session
-                // seeded rendezvous tier. Others preserve plugin plan order.
+                    .await?;
+                    read_phase.finish("returned");
+                    input.allocation_context = reservation.context.clone();
+                    Some(reservation)
+                } else {
+                    None
+                };
+                let mut plan = if let Some(preferred) = reservation
+                    .as_ref()
+                    .and_then(|reservation| reservation.preferred.as_deref())
+                {
+                    state
+                        .plugins
+                        .validate_group_routing_configuration(&plugin_id, &input.config)?;
+                    allocation::session_plan(&input, preferred)
+                } else {
+                    let runtime = state.plugins.clone();
+                    let execute_id = plugin_id.clone();
+                    let execute_input = input.clone();
+                    let execute_signals = transient_signals.clone();
+                    crate::api::plugin_execution::run_group(
+                        state.metrics.clone(),
+                        crate::metrics::plugin_execution::Phase::GroupRoutingPlan,
+                        move || {
+                            runtime.execute_group_routing_plan_with_health(
+                                &execute_id,
+                                &execute_input,
+                                execute_signals.as_deref(),
+                            )
+                        },
+                    )
+                    .await?
+                };
                 sort_execution_candidates(selection_seed, &mut plan.candidates);
+                if let Some(reservation) = reservation {
+                    if let Some(preferred) = &reservation.preferred {
+                        plan.candidates
+                            .sort_by_key(|item| item.directive.account_id != *preferred);
+                    }
+                    let selected = plan
+                        .candidates
+                        .iter()
+                        .filter_map(|item| planned_candidate(&input, &item.directive))
+                        .find(|candidate| candidate.health == GroupRoutingHealth::Healthy)
+                        .ok_or_else(|| AppError::internal("allocation_healthy_candidate"))?;
+                    let commit_phase = SnapshotPhase::new(request_id, "group_allocation_commit");
+                    if reservation.preferred.is_some() {
+                        let count_deadline = execution_deadline
+                            .min(tokio::time::Instant::now() + Duration::from_millis(5));
+                        let counted = matches!(
+                            tokio::time::timeout_at(
+                                count_deadline,
+                                reservation.commit(state, selected)
+                            )
+                            .await,
+                            Ok(Ok(true))
+                        );
+                        commit_phase.finish(if counted {
+                            "counted"
+                        } else {
+                            "background_reconciliation"
+                        });
+                        return Ok(plan);
+                    }
+                    let committed = reservation.commit(state, selected).await?;
+                    commit_phase.finish(if committed { "committed" } else { "conflict" });
+                    if !committed {
+                        if attempt == 0 {
+                            continue;
+                        }
+                        return Err(AppError::internal("allocation_contention"));
+                    }
+                }
+                return Ok(plan);
+            }
+            Err(AppError::internal("allocation_contention"))
+        };
+        let result = tokio::time::timeout_at(execution_deadline, result)
+            .await
+            .map_err(|_| AppError::internal("group_routing_site_1"))
+            .and_then(|result| result);
+        match result {
+            Ok(plan) => {
                 for (position, execution) in plan.candidates.into_iter().enumerate() {
                     let crate::plugin::routing::GroupRoutingExecutionDirective {
                         directive,
@@ -682,11 +779,10 @@ async fn prepare_inner(
                         );
                     }
                 }
-                tracing::info!(%request_id, %group_id, %plugin_id, strategy_version=members[0].3, stage="group_routing_plan", "group strategy snapshot applied");
+                tracing::debug!(%request_id, %group_id, %plugin_id, strategy_version=members[0].3, stage="group_routing_plan", "group strategy snapshot applied");
             }
             Err(error) => {
-                // Fail closed with respect to authority, fail open only to the
-                // native order/admission of these exact authorized candidates.
+                // Continue with the core ordering of this group's candidates.
                 tracing::warn!(%request_id, %group_id, %plugin_id, error_category=error.diagnostic_category(), stage="group_routing_native_fallback", "group strategy failed; native policy retained for its candidates");
             }
         }

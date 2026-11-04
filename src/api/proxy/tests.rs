@@ -58,14 +58,17 @@ mod passthrough_reservation;
 mod pending_delivery;
 mod persistence_isolation;
 mod phase_diagnostics;
+mod playground_port;
 mod postgres_attempt_deadline;
 mod recovery_wait;
 mod responses_transport;
 mod routing_persistence;
 mod routing_price_snapshot;
+mod shutdown_durability;
 mod soonest_reset;
 mod source_r2;
 mod sse_delivery;
+mod supplier_quota;
 mod upstream_error_details;
 
 fn pinned_request_envelope_changed(
@@ -1484,7 +1487,7 @@ async fn active_retired_provider_route_is_rejected_before_credential_or_network_
 }
 
 #[tokio::test]
-async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
+async fn default_routing_distributes_requests_within_the_same_session() {
     let first = MockServer::start().await;
     let second = MockServer::start().await;
     for upstream in [&first, &second] {
@@ -1494,8 +1497,20 @@ async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
             .mount(upstream)
             .await;
     }
-    let fixture = resilient_route_fixture("sticky", &[(first.uri(), 0), (second.uri(), 0)]).await;
-    for _ in 0..2 {
+    let fixture = resilient_route_fixture(
+        "default-session-fairness",
+        &[(first.uri(), 0), (second.uri(), 0)],
+    )
+    .await;
+    // This fixture's explicit admission limit is unrelated to scheduling;
+    // completed responses may still await their asynchronous settlement.
+    fixture
+        .state
+        .db
+        .update_key_policy(fixture.key_id, KeyPolicy::default())
+        .await
+        .unwrap();
+    for _ in 0..32 {
         let response = send_resilient_chat(&fixture, Some("logical-session-42"), false).await;
         assert_eq!(response.status(), StatusCode::OK);
         let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
@@ -1504,7 +1519,8 @@ async fn stable_session_keeps_the_same_candidate_when_the_set_is_unchanged() {
         first.received_requests().await.unwrap().len(),
         second.received_requests().await.unwrap().len(),
     ];
-    assert!(counts == [2, 0] || counts == [0, 2], "counts={counts:?}");
+    assert_eq!(counts.iter().sum::<usize>(), 32);
+    assert!(counts.iter().all(|count| *count > 0), "counts={counts:?}");
 }
 
 #[tokio::test]
@@ -5794,7 +5810,7 @@ async fn buffered_response_usage_uses_trusted_overhead_and_settles_http_200() {
 }
 
 #[tokio::test]
-async fn buffered_response_usage_rejects_usage_above_total_reservation() {
+async fn buffered_response_usage_settles_provider_context_above_total_reservation() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -5813,21 +5829,28 @@ async fn buffered_response_usage_rejects_usage_above_total_reservation() {
     });
     assert_eq!(serde_json::to_vec(&request).unwrap().len(), 98);
     let response = send_response_usage_request(&fixture, &request).await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_usage"))
-        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        completed_response_with_usage(400, 7)
+    );
+    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_invalid_usage")
-    );
-    assert!(rows[0].usage.tokens.is_none());
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (400, 7));
+    assert_eq!(rows[0].billing.cost.as_deref(), Some("0.000407"));
+    assert_eq!(rows[0].error_code, None);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
+        .await;
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -6064,13 +6087,7 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
             502,
             Some("upstream_failed_response"),
         ),
-        (
-            "stream-over-reservation",
-            400,
-            Value::Null,
-            502,
-            Some("upstream_invalid_usage"),
-        ),
+        ("stream-provider-context", 400, Value::Null, 200, None),
     ] {
         let upstream = MockServer::start().await;
         let completed = completed_response_with_usage(input_tokens, 7);
@@ -6131,7 +6148,14 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
         assert_eq!(rows[0].status_code, Some(expected_status));
         assert_eq!(rows[0].error_code.as_deref(), expected_error);
         if expected_status == 200 {
-            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (309, 7));
+            assert_eq!(
+                (rows[0].input_tokens, rows[0].output_tokens),
+                (input_tokens, 7)
+            );
+            assert_eq!(
+                rows[0].billing.cost,
+                Some(crate::model::micros_to_decimal_string(input_tokens + 7))
+            );
             assert_exactly_once_side_effects(
                 &fixture,
                 rows[0].request_id,

@@ -182,15 +182,27 @@ impl Drop for TokenCenterWorld {
 
 async fn spawn_cursor_socks5h_proxy(
     target: std::net::SocketAddr,
-) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+) -> (String, String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = listener.local_addr().unwrap();
+    // A direct connection to the advertised port cannot reach the mock server.
+    // Successful HTTP operations therefore prove proxy use even with pooling.
+    let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = direct.local_addr().unwrap().port();
     let requested_hosts = Arc::new(Mutex::new(Vec::new()));
     let recorded = requested_hosts.clone();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((mut client, _)) = listener.accept().await else {
-                return;
+            let (mut client, _) = tokio::select! {
+                connection = listener.accept() => match connection {
+                    Ok(connection) => connection,
+                    Err(_) => return,
+                },
+                connection = direct.accept() => {
+                    drop(connection);
+                    recorded.lock().await.push("direct-bypass".to_owned());
+                    continue;
+                }
             };
             let recorded = recorded.clone();
             tokio::spawn(async move {
@@ -212,7 +224,7 @@ async fn spawn_cursor_socks5h_proxy(
                 let hostname = String::from_utf8(hostname).unwrap();
                 let mut port = [0_u8; 2];
                 client.read_exact(&mut port).await.unwrap();
-                assert_eq!(u16::from_be_bytes(port), target.port());
+                assert_eq!(u16::from_be_bytes(port), target_port);
                 recorded.lock().await.push(hostname);
 
                 let mut upstream = TcpStream::connect(target).await.unwrap();
@@ -226,7 +238,12 @@ async fn spawn_cursor_socks5h_proxy(
             });
         }
     });
-    (format!("socks5h://{proxy_address}"), requested_hosts, task)
+    (
+        format!("socks5h://{proxy_address}"),
+        format!("http://localhost:{target_port}"),
+        requested_hosts,
+        task,
+    )
 }
 
 fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
@@ -6188,8 +6205,9 @@ async fn oauth_upstream_retains_id(world: &mut TokenCenterWorld) {
 #[given("the mock Cursor OAuth server and compatible upstream are ready")]
 async fn mock_cursor_oauth(world: &mut TokenCenterWorld) {
     let target = *world.mock.as_ref().expect("mock server").address();
-    let (proxy_url, proxy_hosts, proxy_task) = spawn_cursor_socks5h_proxy(target).await;
-    world.cursor_mock_origin = format!("http://localhost:{}", target.port());
+    let (proxy_url, mock_origin, proxy_hosts, proxy_task) =
+        spawn_cursor_socks5h_proxy(target).await;
+    world.cursor_mock_origin = mock_origin;
     world.cursor_proxy_url = proxy_url;
     world.cursor_proxy_hosts = proxy_hosts;
     world.cursor_proxy_task = Some(proxy_task);
@@ -6526,8 +6544,8 @@ async fn reauthorized_cursor_account_is_stable(world: &mut TokenCenterWorld) {
     assert_eq!(cursor_routes, 1);
     let proxy_hosts = world.cursor_proxy_hosts.lock().await;
     assert!(
-        proxy_hosts.len() >= 4,
-        "Cursor OAuth, refresh and routed calls must use the account proxy: {proxy_hosts:?}"
+        !proxy_hosts.is_empty(),
+        "Cursor operations must reach the proxy; pooled connections may serve multiple requests"
     );
     assert!(
         proxy_hosts.iter().all(|host| host == "localhost"),

@@ -453,24 +453,6 @@ impl ProxyMemoryReservation {
         true
     }
 
-    pub(crate) fn try_reserve_rewrite(&self, body: &[u8]) -> bool {
-        // The prepaid three-copy envelope already covers the current payload.
-        // Grow only its high-water mark before parsing a replacement; charging
-        // another entire envelope would reject unchanged maximum-size hooks.
-        let nodes = JsonMemoryScanner::default().observe(body);
-        let old_bytes = self.json_body_ceiling.load(Ordering::Acquire);
-        let old_nodes = self.json_node_ceiling.load(Ordering::Acquire);
-        if !self.try_grow(body.len().saturating_sub(old_bytes), 3)
-            || !self.try_grow(nodes.saturating_sub(old_nodes), 256)
-        {
-            return false;
-        }
-        self.json_body_ceiling
-            .fetch_max(body.len(), Ordering::AcqRel);
-        self.json_node_ceiling.fetch_max(nodes, Ordering::AcqRel);
-        true
-    }
-
     pub(crate) fn try_grow(&self, bytes: usize, weight: usize) -> bool {
         let Some(weighted) = bytes.checked_mul(weight) else {
             return false;

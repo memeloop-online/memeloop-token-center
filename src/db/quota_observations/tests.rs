@@ -104,7 +104,10 @@ async fn verify(config: Config) {
     )
     .await
     .unwrap();
-    let recovery_targets = db.quota_observation_targets(&[], 100, 4).await.unwrap();
+    let recovery_targets = db
+        .quota_observation_targets(&[], &[], 100, 4)
+        .await
+        .unwrap();
     assert_eq!(recovery_targets.len(), 1);
     assert_eq!(recovery_targets[0].account_id, recovering.id);
     assert!(recovery_targets[0].recovering_quota);
@@ -122,7 +125,7 @@ async fn verify(config: Config) {
         .bind(prior_attempt).bind(prior_attempt + 300_000)
         .execute(&db.pool).await.unwrap();
     assert!(
-        db.quota_observation_targets(&[], prior_attempt + 1, 4)
+        db.quota_observation_targets(&[], &[], prior_attempt + 1, 4)
             .await
             .unwrap()
             .is_empty(),
@@ -135,7 +138,7 @@ async fn verify(config: Config) {
         .await
         .unwrap();
     let renewed_recovery = db
-        .quota_observation_targets(&[], prior_attempt + 3, 4)
+        .quota_observation_targets(&[], &[], prior_attempt + 3, 4)
         .await
         .unwrap();
     assert_eq!(renewed_recovery.len(), 1);
@@ -155,7 +158,7 @@ async fn verify(config: Config) {
     sqlx::query("INSERT INTO model_route_group_memberships (tenant_id,route_group_id,model_route_id,created_at) VALUES ($1,$2,$3,1)")
         .bind(auth.tenant_id.to_string()).bind(group.to_string()).bind(route.id.to_string()).execute(&db.pool).await.unwrap();
     let non_opted_in = db
-        .quota_observation_targets(&["not-enabled".into()], 100, 4)
+        .quota_observation_targets(&["not-enabled".into()], &[], 100, 4)
         .await
         .unwrap();
     assert_eq!(non_opted_in.len(), 1);
@@ -208,14 +211,31 @@ async fn verify(config: Config) {
         .unwrap(),
         "a stale recovery target cannot probe after the matching health episode is gone"
     );
+    let opted_in = db
+        .quota_observation_targets(
+            std::slice::from_ref(&plugin_id),
+            std::slice::from_ref(&plugin_id),
+            100,
+            4,
+        )
+        .await
+        .unwrap();
+    assert!(
+        opted_in
+            .iter()
+            .find(|target| target.account_id == account.id)
+            .unwrap()
+            .allocation_history
+    );
     let target = db
-        .quota_observation_targets(&[plugin_id], 100, 4)
+        .quota_observation_targets(&[plugin_id], &[], 100, 4)
         .await
         .unwrap()
         .into_iter()
         .find(|target| target.account_id == account.id)
         .unwrap();
     assert!(!target.recovering_quota);
+    assert!(!target.allocation_history);
     let lease = Uuid::now_v7();
     assert!(
         db.claim_quota_observation(&target, lease, 100, 130)
@@ -282,6 +302,20 @@ async fn verify(config: Config) {
             .unwrap()
             .is_empty()
     );
+    let metadata = db
+        .quota_window_metadata(&[account.id], &tenant)
+        .await
+        .unwrap();
+    assert_eq!(metadata.len(), 1);
+    assert_eq!(metadata[0].provider, "kimi-oauth");
+    assert_eq!(metadata[0].windows[0].id, "summary");
+    assert_eq!(metadata[0].windows[0].period_seconds, Some(604800));
+    assert!(
+        db.quota_window_metadata(&[account.id], "other-tenant")
+            .await
+            .unwrap()
+            .is_empty()
+    );
     let failure_lease = Uuid::now_v7();
     assert!(
         db.claim_quota_observation(&target, failure_lease, 111, 141)
@@ -313,4 +347,9 @@ async fn verify(config: Config) {
             .unwrap()
             .is_empty()
     );
+    let metadata = db
+        .quota_window_metadata(&[account.id], &tenant)
+        .await
+        .unwrap();
+    assert!(metadata[0].windows.is_empty());
 }

@@ -12,6 +12,7 @@ use std::{
 mod codex;
 pub(crate) mod memory_admission;
 pub(crate) mod plugin_execution;
+pub(crate) mod upstream_concurrency;
 
 pub(crate) use codex::{CodexBadRequestClassification, CodexBadRequestRetry};
 
@@ -39,6 +40,7 @@ pub struct Metrics {
 }
 
 struct MetricsInner {
+    concurrency: upstream_concurrency::Observer,
     memory_admission: memory_admission::Counters,
     plugin_execution: plugin_execution::Counters,
     proxy_memory_rejections: [AtomicU64; 6],
@@ -69,6 +71,7 @@ struct MetricsInner {
 impl Default for MetricsInner {
     fn default() -> Self {
         Self {
+            concurrency: upstream_concurrency::Observer::default(),
             memory_admission: memory_admission::Counters::default(),
             plugin_execution: plugin_execution::Counters::default(),
             proxy_memory_rejections: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -476,6 +479,14 @@ impl Metrics {
     ) {
         self.inner.plugin_execution.observe(phase, outcome);
     }
+    pub(crate) fn start_upstream_concurrency(&self, database: crate::db::Database) {
+        self.inner.concurrency.start(database);
+    }
+
+    pub(crate) fn upstream_concurrency_snapshot(&self, tenant: Option<&str>) -> serde_json::Value {
+        self.inner.concurrency.snapshot(tenant)
+    }
+
     pub fn process_runtime_metrics(&self) -> ProcessRuntimeMetrics {
         process_runtime_metrics(self.inner.process_started)
     }

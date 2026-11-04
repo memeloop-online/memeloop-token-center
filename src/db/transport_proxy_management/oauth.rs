@@ -26,6 +26,7 @@ impl Database {
         selected_proxy: Option<&str>,
         key: &[u8],
     ) -> Result<OAuthGroupSnapshot, AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         let mut tx = self.begin_write_transaction().await?;
         lock(&mut tx).await?;
         let tenant_id = tenant(&mut tx, external).await?;
@@ -39,7 +40,7 @@ impl Database {
         if row.try_get::<i64, _>("version")? != reference.expected_group_version {
             return Err(conflict("proxy_group_version_conflict"));
         }
-        let members = open_members(&row, key)?;
+        let members = load_group_members(&mut *tx, &reference.group_id.to_string(), key).await?;
         let member = members
             .iter()
             .find(|member| member.id == reference.initial_member_id)
@@ -83,6 +84,7 @@ impl Database {
         snapshot: &OAuthGroupSnapshot,
         key: &[u8],
     ) -> Result<(), AppError> {
+        normalize_legacy_members(&self.pool, key).await?;
         let mut tx = self.begin_write_transaction().await?;
         lock(&mut tx).await?;
         self.validate_oauth_transport_group_tx(&mut tx, snapshot, key)
@@ -108,7 +110,8 @@ impl Database {
         if row.try_get::<i64, _>("version")? != snapshot.reference.expected_group_version {
             return Err(conflict("proxy_group_version_conflict"));
         }
-        let members = open_members(&row, key)?;
+        let members =
+            load_group_members(&mut **tx, &snapshot.reference.group_id.to_string(), key).await?;
         if !members.iter().any(|member| {
             member.id == snapshot.selected_member_id
                 && member.proxy_url == snapshot.selected_proxy_url

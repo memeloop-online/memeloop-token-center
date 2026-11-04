@@ -525,7 +525,10 @@ async fn send_codex_attempt_once(
                 body_consumption.clone(),
                 &http2_evidence,
             );
-            client.execute(request).await
+            IndependentProbeTarget::dispatched(&route.route);
+            let response = client.execute(request).await?;
+            IndependentProbeTarget::response(response.status());
+            Ok::<_, reqwest::Error>(response)
         }
         .await
         .map_err(|error| {
@@ -892,7 +895,7 @@ mod timeout_tests {
             ))
         ));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
+            failover_disposition(None, result.as_ref().err(), None),
             FailoverDisposition::Stop
         );
         let rendered = metrics.render(&crate::metrics::RuntimeMetrics::default());
@@ -951,7 +954,7 @@ mod timeout_tests {
             ))
         ));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
+            failover_disposition(None, result.as_ref().err(), None),
             FailoverDisposition::Stop
         );
     }
@@ -987,7 +990,7 @@ mod timeout_tests {
             ))
         ));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
+            failover_disposition(None, result.as_ref().err(), None),
             FailoverDisposition::Stop
         );
     }

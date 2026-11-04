@@ -179,7 +179,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
       const credential = credentialDisplayName(session.key_alias, t);
       const title = session.unlinked ? t('sessions.unlinkedRequests') : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credential, true);
       const isSelected = selected?.session_id === session.session_id && selected?.key_id === session.key_id;
-      return <article className="session-card session-sidebar-card" key={`${session.key_id}:${session.session_id}`}>
+      return <article className="session-card session-sidebar-card" data-session-association={session.unlinked ? 'unlinked' : 'confirmed'} key={`${session.key_id}:${session.session_id}`}>
         <button type="button" className={`session-sidebar-item${isSelected ? ' selected' : ''}`} onClick={() => onSelect(session)} aria-pressed={isSelected} aria-label={t('sessions.open', { name: title })}>
           <span className="session-sidebar-title"><b>{title}</b><span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span>
           <span className="session-sidebar-context">{showCredential && <span title={session.key_id}>{credential}</span>}<span>{session.model || t('common.none')}</span></span>
@@ -193,7 +193,7 @@ export function SessionList({ values, loading, showCredential, onSelect, selecte
     const title = session.unlinked
       ? t('sessions.unlinkedRequests')
       : session.session_name?.trim() || unnamedSessionName(t, locale, session.last_activity_at, credential);
-    return <article className="session-card" key={`${session.key_id}:${session.session_id}`}>
+    return <article className="session-card" data-session-association={session.unlinked ? 'unlinked' : 'confirmed'} key={`${session.key_id}:${session.session_id}`}>
       <div className="session-card-heading"><b>{title}</b><span>{session.task_kind && <span className="pill">{session.task_kind}</span>}<span className={`status ${statusTone(session.last_status)}`}>{t(`sessions.status.${session.last_status}`)}</span></span></div>
       {session.unlinked && <span className="session-unlinked-label">{t('sessions.unlinkedReason')}</span>}
       <span className="session-card-context">
@@ -286,7 +286,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
   </div>;
 }
 
-export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive, loadArchiveRange, titleAction, contextLoader }: {
+export function SessionDetailSurface({ detail, summary, currency, showDiagnosticIds = false, loading, onLoadOlder, onSelect, onClose, loadReplayArchive, loadArchiveRange, titleAction, taskRelations, backNav, parentNav, contextLoader }: {
   detail: LogicalSessionDetail;
   summary?: LogicalSessionSummary;
   currency?: string;
@@ -299,6 +299,11 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   loadReplayArchive?: SessionReplayArchiveLoader;
   loadArchiveRange?: ArchiveRangeLoader;
   titleAction?: ReactNode;
+  /** Owner-scoped task relations (parent/sub/manual) between stable sessions. */
+  taskRelations?: ReactNode;
+  backNav?: ReactNode;
+  /** Uniform top-left navigation back to the parent session. */
+  parentNav?: ReactNode;
   contextLoader?: SessionContextLoader;
 }) {
   const { locale, t } = useI18n();
@@ -317,8 +322,11 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
     return request ? t('sessions.timelinePoint', { index: request.index, time: new Date(request.createdAt).toLocaleString(locale) }) : t('sessions.timelineRequest');
   };
   return <section className="session-detail" aria-label={title}>
+    {backNav}
+    {parentNav}
     <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2>{detail.unlinked && <p className="mtc-secondary-text">{t('sessions.unlinkedDetail')}</p>}</div>{onClose && <Button appearance="secondary" onClick={onClose} aria-label={t('common.close')}>×</Button>}</header>
     {titleAction}
+    {taskRelations}
     {showDiagnosticIds && <div className="session-diagnostics"><Disclosure title={t('sessions.diagnostics')}><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</Disclosure></div>}
     {contextLoader && !detail.unlinked && <SessionContextPanel key={`${summary?.key_id}:${detail.session_id}`} detail={detail} loader={contextLoader} />}
     {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && (contextLoader && !detail.unlinked

@@ -14,6 +14,13 @@ struct Fixture {
     source: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ArchiveBeforeTerminal {
+    Pending,
+    Bound,
+    UnownedResponse,
+}
+
 impl Fixture {
     async fn new(database_url: String, inline_request: bool) -> Self {
         Self::new_with_protocol(database_url, inline_request, None).await
@@ -32,6 +39,23 @@ impl Fixture {
         inline_request: bool,
         protocol: Option<&str>,
         admission: Option<crate::gateway_body::request_spool::RequestSpoolAdmission>,
+    ) -> Self {
+        Self::new_with_source_order(
+            database_url,
+            inline_request,
+            protocol,
+            admission,
+            ArchiveBeforeTerminal::Pending,
+        )
+        .await
+    }
+
+    async fn new_with_source_order(
+        database_url: String,
+        inline_request: bool,
+        protocol: Option<&str>,
+        admission: Option<crate::gateway_body::request_spool::RequestSpoolAdmission>,
+        archive_before_terminal: ArchiveBeforeTerminal,
     ) -> Self {
         let mut state = AppState::initialize(Config::for_test(database_url))
             .await
@@ -129,6 +153,28 @@ impl Fixture {
         } else {
             state.db.start_proxy_request(input).await.unwrap()
         };
+        let identity = ArchiveSpoolIdentity {
+            request_id,
+            tenant_id: key.tenant_id,
+            reservation_id: reservation.id,
+        };
+        if archive_before_terminal == ArchiveBeforeTerminal::Bound {
+            for (purpose, body) in archive_bodies() {
+                assert!(
+                    response_archive_spool::capture_buffered(&state, identity, purpose, body).await
+                );
+            }
+            assert!(response_archive_spool::process_one_for_test(&state).await);
+            assert!(response_archive_spool::process_one_for_test(&state).await);
+        } else if archive_before_terminal == ArchiveBeforeTerminal::UnownedResponse {
+            sqlx::query(
+                "UPDATE request_records SET response_object = 'inline-json:{}' WHERE id = $1",
+            )
+            .bind(request_id.to_string())
+            .execute(&state.db.pool)
+            .await
+            .unwrap();
+        }
         let request = if inline_request {
             serde_json::json!({"messages": [{"role": "user", "content": "archive question"}]})
         } else {
@@ -185,11 +231,6 @@ impl Fixture {
                 .await
                 .unwrap()
         );
-        let identity = ArchiveSpoolIdentity {
-            request_id,
-            tenant_id: key.tenant_id,
-            reservation_id: reservation.id,
-        };
         Self {
             state,
             request_id,
@@ -593,6 +634,8 @@ async fn source_contract(database_url: String) {
         let original = fixture.state.archive.get(&locator).await.unwrap();
         source.release_retained();
         drop(source);
+        fixture.state.responses_request_spool.drain_uploads().await;
+        fixture.state.db.drain_gateway_persistence_for_test().await;
         assert!(String::from_utf8_lossy(&original).contains("provider_secret_field"));
         fixture
             .state
@@ -616,6 +659,15 @@ async fn source_contract(database_url: String) {
             .execute(&fixture.state.db.pool)
             .await
             .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1)
+                  + (SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1)",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0, "recovery must start without either binding");
         sqlx::query("UPDATE request_records SET completed_at = $1 WHERE id = $2")
             .bind(unix_millis() - 24 * 60 * 60 * 1000)
             .bind(fixture.request_id.to_string())
@@ -984,5 +1036,108 @@ async fn postgres_source_identity_recovers_after_request_drop_and_missing_bindin
     // still shares contention with other PostgreSQL regression tests.
     let isolated = PostgresTestDatabase::create(&database_url).await;
     source_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+fn archive_bodies() -> [(BufferedArchivePurpose, Bytes); 2] {
+    [
+        (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
+        (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
+    ]
+}
+
+async fn terminal_archive_order_contract(database_url: String) {
+    for archive_before_terminal in [
+        ArchiveBeforeTerminal::Bound,
+        ArchiveBeforeTerminal::Pending,
+        ArchiveBeforeTerminal::UnownedResponse,
+    ] {
+        let fixture = Fixture::new_with_source_order(
+            database_url.clone(),
+            false,
+            None,
+            None,
+            archive_before_terminal,
+        )
+        .await;
+        if archive_before_terminal != ArchiveBeforeTerminal::Bound {
+            let locator: String =
+                sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
+                    .bind(fixture.request_id.to_string())
+                    .fetch_one(&fixture.state.db.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(locator, format!("gap://{}/response", fixture.request_id));
+            fixture.capture().await;
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+            assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+        }
+        let row = sqlx::query(
+            "SELECT request_object, response_object FROM request_records WHERE id = $1",
+        )
+        .bind(fixture.request_id.to_string())
+        .fetch_one(&fixture.state.db.pool)
+        .await
+        .unwrap();
+        for ((purpose, expected), field) in archive_bodies()
+            .into_iter()
+            .zip(["request_object", "response_object"])
+        {
+            let locator = row.get::<String, _>(field);
+            assert!(!locator.starts_with("gap://"), "{field}: {locator}");
+            let actual = fixture.state.archive.get(&locator).await.unwrap();
+            assert_eq!(actual.as_ref(), expected.as_ref(), "{purpose:?}");
+            assert_eq!(blake3::hash(&actual), blake3::hash(&expected));
+        }
+        fixture.assert_completed(true).await;
+        let effects = sqlx::query("SELECT (SELECT COUNT(*) FROM ledger_entries WHERE source = $1 AND kind = 'usage') AS settlements, (SELECT COUNT(*) FROM request_events WHERE request_id = $2 AND event_kind = 'finished') AS finishes")
+            .bind(fixture.identity.reservation_id.to_string()).bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(effects.get::<i64, _>("settlements"), 1);
+        assert_eq!(effects.get::<i64, _>("finishes"), 1);
+
+        // A delayed source completion must not allocate an event cursor after
+        // the financial terminal has closed its request owner.
+        let cursors_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_event_locators WHERE request_id = $1")
+                .bind(fixture.request_id.to_string())
+                .fetch_one(&fixture.state.db.pool)
+                .await
+                .unwrap();
+        fixture
+            .state
+            .db
+            .publish_proxy_started_event(fixture.identity)
+            .await
+            .unwrap();
+        let cursors_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_event_locators WHERE request_id = $1")
+                .bind(fixture.request_id.to_string())
+                .fetch_one(&fixture.state.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(cursors_after, cursors_before);
+        let orphaned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_event_locators locator LEFT JOIN request_events event ON event.event_id = locator.id AND event.event_at = locator.created_at WHERE locator.request_id = $1 AND event.event_id IS NULL")
+            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+        assert_eq!(orphaned, 0);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_archive_binding_and_financial_terminal_preserve_bodies_in_both_orders() {
+    let directory = tempfile::tempdir().unwrap();
+    terminal_archive_order_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("terminal-order.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_archive_binding_and_financial_terminal_preserve_bodies_in_both_orders() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("archive terminal ordering PostgreSQL regression requires its CI database");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    terminal_archive_order_contract(isolated.url().to_owned()).await;
     isolated.cleanup().await;
 }

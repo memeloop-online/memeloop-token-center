@@ -147,7 +147,7 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
         await route.fulfill({ json: { id: 'resolved-release', base_revision: 1, descriptor_sha256: 'a'.repeat(64), release_url: body.url, source: 'ghcr.io/example/new', descriptor: { reference: `ghcr.io/example/new@sha256:${'b'.repeat(64)}`, signer: { issuer: 'https://token.actions.githubusercontent.com', identity: 'https://github.com/example/new/.github/workflows/release.yml@refs/tags/v1' } } } });
       } else if (path.endsWith('/installations')) {
         assert.deepEqual(body, { release_resolution_id: 'resolved-release', release_descriptor_sha256: 'a'.repeat(64), packages: [] });
-        job = { id: 'job', inventory_id: 'new-inventory', base_revision: 1, packages: [`ghcr.io/example/new@sha256:${'b'.repeat(64)}`], completed_packages: 1, actor: 'service:operator', status: 'review', review_digest: 'review-exact', review: { plugins: [{ id: 'new-plugin', version: '1.0.0', wit_version: '0.2.0', capabilities: [{ kind: 'http', allowed_origins: ['https://api.example.com'] }], contributions: {} }] }, failure_category: null, created_at: 1, updated_at: 2 };
+        job = { id: 'job', inventory_id: 'new-inventory', base_revision: 1, packages: [`ghcr.io/example/new@sha256:${'b'.repeat(64)}`], completed_packages: 1, actor: 'service:operator', status: 'review', review_digest: 'review-exact', review: { plugins: [{ id: 'new-plugin', version: '1.0.0', wit_version: '0.2.0', capabilities: [{ kind: 'http', allowed_origins: ['https://api.example.com'] }, { kind: 'group_routing_quota' }, { kind: 'quota_reset_credit' }], contributions: {} }] }, failure_category: null, created_at: 1, updated_at: 2 };
         await route.fulfill({ status: 202, json: job });
       } else if (path.endsWith('/approve')) {
         assert.equal(body.review_digest, 'review-exact');
@@ -218,6 +218,8 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     assert.equal(await approve.isDisabled(), true);
     await page.getByRole('button', { name: 'Review manifest and requested capabilities' }).click();
     await page.getByRole('listitem').filter({ hasText: 'https://api.example.com' }).waitFor();
+    assert.equal(await page.getByText('Use group routing quotas', { exact: true }).count(), 1);
+    await page.getByText('Use manual quota resets for authorized accounts', { exact: true }).waitFor();
     await page.getByRole('checkbox', { name: 'Approve permissions' }).check();
     await approve.click();
     await page.getByText('Ready to activate', { exact: true }).waitFor();
@@ -277,3 +279,83 @@ test('Operator plugin page installs, explicitly reviews, publishes and rolls bac
     assert.equal(tenantRuntimeReads, 0);
   } finally { releaseInitialHistory(); await browser.close(); await server.close(); }
 });
+
+for (const scenario of ['saved', 'edited-member', 'tenant-switch', 'missing-member'] as const) {
+  test(`Saved installer group refreshes its version: ${scenario}`, { timeout: 60_000 }, async context => {
+    if (!existsSync(chromium.executablePath())) {
+      if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium required');
+      context.skip('Chromium not installed'); return;
+    }
+    const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+    await server.listen();
+    const address = server.httpServer!.address();
+    assert.ok(address && typeof address === 'object');
+    const browser = await chromium.launch({ headless: true });
+    const page = await browser.newPage();
+    await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
+    const writes: { path: string; body: any }[] = [];
+    let releaseSave: () => void = () => undefined;
+    const saveGate = new Promise<void>(resolve => { releaseSave = resolve; });
+    let saved: () => void = () => undefined;
+    const saveStarted = new Promise<void>(resolve => { saved = resolve; });
+    try {
+      await page.route('**/internal/v1/**', async route => {
+        const request = route.request();
+        const url = new URL(request.url());
+        const path = url.pathname;
+        if (request.method() === 'GET') {
+          if (path.endsWith('/runtime-access')) await route.fulfill({ json: { can_view_runtime: true, can_manage_runtime: true } });
+          else if (path.endsWith('/history')) await route.fulfill({ json: { installation_enabled: true, installations: [], revisions: [], audit: [] } });
+          else if (path.endsWith('/installer-network/groups')) await route.fulfill({ json: { items: url.searchParams.get('tenant_external_id') === 'tenant' ? [{ id: 'group', name: 'Remembered network', version: 3, members: [{ id: 'member-a', label: 'First exit' }, { id: 'member-b', label: 'Second exit' }] }] : [] } });
+          else if (path.endsWith('/installer-network')) await route.fulfill({ json: { mode: 'group', tenant_external_id: 'tenant', group_id: 'group', group_version: 1, member_id: scenario === 'missing-member' ? 'removed' : 'member-a' } });
+          else await route.fulfill({ json: { current: null, candidates: [] } });
+          return;
+        }
+        const body = request.postDataJSON();
+        writes.push({ path, body });
+        if (path.endsWith('/installer-network')) {
+          saved();
+          if (scenario === 'tenant-switch') await saveGate;
+          await route.fulfill({ json: body });
+        } else if (path.endsWith('/release-resolutions')) {
+          await route.fulfill({ json: { id: 'resolved', base_revision: 1, descriptor_sha256: 'a'.repeat(64), release_url: body.url, source: 'fixture', descriptor: { reference: `ghcr.io/example/plugin@sha256:${'b'.repeat(64)}`, signer: { issuer: 'fixture', identity: 'fixture' } } } });
+        } else throw new Error(`Unexpected write ${path}`);
+      });
+      await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/plugin-runtime.html`);
+      await page.getByRole('button', { name: 'Install plugin', exact: true }).click();
+      await page.getByLabel('GitHub Release JSON URL', { exact: true }).fill('https://example.com/plugin.json');
+      await page.getByRole('button', { name: 'Download network', exact: true }).click();
+      await page.getByRole('option', { name: 'Remembered network', exact: true }).waitFor({ state: 'attached' });
+      const read = page.getByRole('button', { name: 'Read release', exact: true });
+      if (scenario === 'missing-member') {
+        assert.equal(await read.isDisabled(), true);
+        assert.deepEqual(writes, []);
+        return;
+      }
+      if (scenario === 'edited-member') await page.getByLabel(/^Proxy server/).selectOption('member-b');
+      assert.equal(await read.isEnabled(), true);
+      const resolutionResponse = scenario === 'tenant-switch' ? undefined : page.waitForResponse(response => response.url().endsWith('/release-resolutions'));
+      await read.click();
+      await saveStarted;
+      if (scenario === 'tenant-switch') {
+        await page.getByLabel('Fixture tenant').fill('other-tenant');
+        releaseSave();
+        await page.getByRole('button', { name: 'Install plugin', exact: true }).click();
+        assert.equal(await page.getByLabel('Fixture tenant').inputValue(), 'other-tenant');
+        await page.getByRole('button', { name: 'Download network', exact: true }).click();
+        await page.getByText('No proxy groups are available in this tenant.', { exact: true }).waitFor();
+        assert.equal(await page.getByLabel(/^Proxy group/).inputValue(), '');
+        assert.equal(await read.isDisabled(), true);
+        assert.equal(writes.length, 1);
+      } else {
+        await resolutionResponse;
+        assert.deepEqual(writes.map(write => write.path), ['/internal/v1/plugin-runtime/installer-network', '/internal/v1/plugin-runtime/release-resolutions']);
+      }
+      assert.deepEqual(writes[0].body, { mode: 'group', tenant_external_id: 'tenant', group_id: 'group', group_version: 3, member_id: scenario === 'edited-member' ? 'member-b' : 'member-a' });
+    } finally {
+      releaseSave();
+      await browser.close();
+      await server.close();
+    }
+  });
+}

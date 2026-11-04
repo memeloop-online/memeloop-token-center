@@ -52,27 +52,14 @@ fn record_preparation_failure(
 /// the immutable route snapshot so a later candidate cannot refresh an
 /// already-dispatched attempt's deadline.
 fn configured_timeout(config: &Value) -> Result<RequestTimeout, ProxySendError> {
-    let seconds = match config.get("timeout_seconds") {
-        None => {
-            return Ok(RequestTimeout {
-                duration: None,
-                deadline: None,
-            });
-        }
-        Some(value) => value
-            .as_u64()
-            .or_else(|| {
-                value
-                    .as_f64()
-                    .filter(|seconds| {
-                        seconds.fract() == 0.0 && *seconds > 0.0 && *seconds < u64::MAX as f64
-                    })
-                    .map(|seconds| seconds as u64)
-            })
-            .filter(|seconds| *seconds > 0)
-            .ok_or(ProxySendError::CandidateUnavailable)?,
+    let duration = crate::api::traffic::configured_http_timeout(config)
+        .map_err(|_| ProxySendError::CandidateUnavailable)?;
+    let Some(duration) = duration else {
+        return Ok(RequestTimeout {
+            duration: None,
+            deadline: None,
+        });
     };
-    let duration = std::time::Duration::from_secs(seconds);
     let deadline = tokio::time::Instant::now()
         .checked_add(duration)
         .ok_or(ProxySendError::CandidateUnavailable)?;
@@ -145,6 +132,18 @@ pub(super) async fn send_reqwest_proxy_route(
     result
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    static STALL_PROBE_PREPARATION: bool;
+}
+
+#[cfg(test)]
+pub(in crate::api::proxy) async fn with_stalled_probe_preparation<F: std::future::Future>(
+    future: F,
+) -> F::Output {
+    STALL_PROBE_PREPARATION.scope(true, future).await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn send_reqwest_proxy_route_once(
     state: &AppState,
@@ -162,13 +161,23 @@ async fn send_reqwest_proxy_route_once(
         request_id,
         route,
         request_timeout,
-        network::client_for_config_url_no_retry(
-            &state.http,
-            &route.route.base_url,
-            &route.route.config,
-            transport_credential.proxy(),
-            state.config.allow_oauth_loopback,
-        ),
+        async {
+            #[cfg(test)]
+            if STALL_PROBE_PREPARATION
+                .try_with(|stall| *stall)
+                .unwrap_or(false)
+            {
+                std::future::pending::<()>().await;
+            }
+            network::client_for_config_url_no_retry(
+                &state.http,
+                &route.route.base_url,
+                &route.route.config,
+                transport_credential.proxy(),
+                state.config.allow_oauth_loopback,
+            )
+            .await
+        },
     )
     .await
 }
@@ -285,7 +294,15 @@ where
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
-    let upstream_result = send_until_request_deadline(request_deadline, request.send()).await;
+    let upstream_result = send_until_request_deadline(request_deadline, async {
+        let (client, request) = request.build_split();
+        let request = request?;
+        IndependentProbeTarget::dispatched(&route.route);
+        let response = client.execute(request).await?;
+        IndependentProbeTarget::response(response.status());
+        Ok(response)
+    })
+    .await;
     state.metrics.observe_upstream(
         &route.route.driver,
         "proxy",
@@ -830,7 +847,7 @@ mod tests {
             Err(ProxySendError::RetryableConnection("preparation_timeout"))
         ));
         assert_eq!(
-            failover_disposition(None, result.as_ref().err()),
+            failover_disposition(None, result.as_ref().err(), None),
             super::super::outcome::FailoverDisposition::ConnectionNotDelivered
         );
         if drain_before_terminal {

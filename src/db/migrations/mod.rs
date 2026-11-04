@@ -1,8 +1,14 @@
 use super::*;
+use sqlx::Connection;
 
 #[cfg(test)]
 mod archive_numbering_tests;
+#[cfg(test)]
+mod execution_lock_tests;
 mod observation_prefix;
+mod online147;
+#[cfg(test)]
+mod online147_tests;
 mod plaintext_sweep;
 #[cfg(test)]
 mod transport_policy_tests;
@@ -758,6 +764,50 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "retire unused failover deadline config",
         sql: include_str!("../../../migrations/sqlite/0144_retire_failover_deadline.sql"),
     },
+    Migration {
+        version: 145,
+        name: "request history export queue",
+        sql: concat!(
+            include_str!("../../../migrations/common/0145_request_history_export.sql"),
+            "\n",
+            include_str!("../../../migrations/sqlite/0145_request_history_export.sql"),
+        ),
+    },
+    Migration {
+        version: 146,
+        name: "live request owner lease observation index",
+        sql: include_str!("../../../migrations/common/0146_request_live_owner_index.sql"),
+    },
+    Migration {
+        version: 147,
+        name: "session task relationships and explicit names",
+        sql: include_str!("../../../migrations/common/0147_session_task_relationships.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "account-scoped plugin background action authority",
+        sql: include_str!("../../../migrations/common/0148_plugin_background_actions.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "scoped supplier availability and independent probe provenance",
+        sql: include_str!("../../../migrations/common/0149_scoped_supplier_availability.sql"),
+    },
+    Migration {
+        version: 150,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0150_network_proxies.sql"),
+    },
+    Migration {
+        version: 151,
+        name: "transport proxy member indices without four member limit",
+        sql: include_str!("../../../migrations/common/0151_transport_proxy_member_indices.sql"),
+    },
+    Migration {
+        version: 152,
+        name: "group allocation usage projection",
+        sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1495,6 +1545,50 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         name: "retire unused failover deadline config",
         sql: include_str!("../../../migrations/postgres/0144_retire_failover_deadline.sql"),
     },
+    Migration {
+        version: 145,
+        name: "request history export queue",
+        sql: concat!(
+            include_str!("../../../migrations/common/0145_request_history_export.sql"),
+            "\n",
+            include_str!("../../../migrations/postgres/0145_request_history_export.sql"),
+        ),
+    },
+    Migration {
+        version: 146,
+        name: "live request owner lease observation index",
+        sql: include_str!("../../../migrations/common/0146_request_live_owner_index.sql"),
+    },
+    Migration {
+        version: 147,
+        name: "session task relationships and explicit names",
+        sql: include_str!("../../../migrations/common/0147_session_task_relationships.sql"),
+    },
+    Migration {
+        version: 148,
+        name: "account-scoped plugin background action authority",
+        sql: include_str!("../../../migrations/common/0148_plugin_background_actions.sql"),
+    },
+    Migration {
+        version: 149,
+        name: "scoped supplier availability and independent probe provenance",
+        sql: include_str!("../../../migrations/common/0149_scoped_supplier_availability.sql"),
+    },
+    Migration {
+        version: 150,
+        name: "first class network proxies",
+        sql: include_str!("../../../migrations/common/0150_network_proxies.sql"),
+    },
+    Migration {
+        version: 151,
+        name: "transport proxy member indices without four member limit",
+        sql: include_str!("../../../migrations/common/0151_transport_proxy_member_indices.sql"),
+    },
+    Migration {
+        version: 152,
+        name: "group allocation usage projection",
+        sql: include_str!("../../../migrations/common/0152_group_allocation_usage.sql"),
+    },
 ];
 
 impl Database {
@@ -1533,7 +1627,15 @@ impl Database {
     }
 
     pub async fn migrate(&self) -> Result<(), sqlx::Error> {
-        let mut transaction = self.pool.begin().await?;
+        let mut connection = self.pool.acquire().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            connection.close_on_drop();
+            sqlx::query("SELECT pg_advisory_lock(734627102948311)")
+                .execute(&mut *connection)
+                .await?;
+            online147::prepare(&mut connection).await?;
+        }
+        let mut transaction = connection.begin().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
             sqlx::query("SELECT pg_advisory_xact_lock(734627102948311)")
                 .execute(&mut *transaction)
@@ -1730,10 +1832,30 @@ pub(super) async fn apply_migration_range(
         if applied {
             continue;
         }
-        if let Err(error) = sqlx::raw_sql(migration.sql)
+        if migration.version == 143 && transaction.as_mut().backend_name() == "PostgreSQL" {
+            if last >= 146 && migrations.iter().any(|pending| pending.version == 146) {
+                sqlx::query(
+                    "LOCK TABLE request_records, request_events IN ACCESS EXCLUSIVE MODE NOWAIT",
+                )
+                .execute(&mut **transaction)
+                .await?;
+            }
+            sqlx::query(
+                "LOCK TABLE request_archive_spools, response_archive_spools, response_archive_spool_budget, archive_budget_reservations IN ACCESS EXCLUSIVE MODE NOWAIT",
+            )
             .execute(&mut **transaction)
-            .await
-        {
+            .await?;
+        }
+        let execution =
+            if migration.version == 147 && transaction.as_mut().backend_name() == "PostgreSQL" {
+                online147::apply(&mut *transaction, migration.sql).await
+            } else {
+                sqlx::raw_sql(migration.sql)
+                    .execute(&mut **transaction)
+                    .await
+                    .map(|_| ())
+            };
+        if let Err(error) = execution {
             tracing::error!(
                 migration_version = migration.version,
                 migration_name = migration.name,

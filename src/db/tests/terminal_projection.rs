@@ -2,7 +2,9 @@ use super::super::*;
 use crate::conversation::ConversationHints;
 use std::time::Duration;
 
+mod archive_binding;
 mod cache_coverage;
+mod recovery;
 mod semantic_isolation;
 mod semantic_retry;
 

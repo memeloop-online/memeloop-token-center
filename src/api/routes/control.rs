@@ -1,7 +1,39 @@
 use super::super::*;
 
 pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
+    state.metrics.start_upstream_concurrency(state.db.clone());
     let authenticated = Router::new()
+        .route(
+            "/internal/v1/system-settings/http",
+            get(super::super::http_settings::get).put(super::super::http_settings::put),
+        )
+        .route(
+            "/internal/v1/transport-proxies",
+            get(network_proxies::list_network_proxies).post(network_proxies::create_network_proxy),
+        )
+        .route(
+            "/internal/v1/transport-proxies/{proxy_id}",
+            get(network_proxies::get_network_proxy)
+                .put(network_proxies::update_network_proxy)
+                .delete(network_proxies::delete_network_proxy),
+        )
+        .route(
+            "/internal/v1/transport-proxies/{proxy_id}/observations",
+            get(network_proxies::network_proxy_observations),
+        )
+        .route(
+            "/internal/v1/transport-proxies/{proxy_id}/probe",
+            post(network_proxies::probe_network_proxy),
+        )
+        .route(
+            "/internal/v1/transport-proxy-strategies",
+            get(network_proxies::network_proxy_strategies),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/transport-proxy-selection",
+            get(network_proxies::get_network_proxy_selection)
+                .put(network_proxies::update_network_proxy_selection),
+        )
         .route(
             "/internal/v1/api-schema",
             get(super::super::api_schema::discover),
@@ -65,6 +97,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/service-tokens",
             get(list_service_tokens).post(create_service_token),
+        )
+        .route(
+            "/internal/v1/service-tokens/{service_id}",
+            patch(update_service_token),
         )
         .route(
             "/internal/v1/service-tokens/{service_id}/rotate",
@@ -168,12 +204,21 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(poll_cursor_oauth),
         )
         .route(
+            "/internal/v1/plugins/{plugin_id}/background-actions/{account_id}",
+            get(super::super::plugin_background_actions::get)
+                .put(super::super::plugin_background_actions::put),
+        )
+        .route(
             "/internal/v1/upstreams",
             get(list_upstreams).post(create_upstream),
         )
         .route(
             "/internal/v1/upstream-availability",
             get(upstream_account_availability),
+        )
+        .route(
+            "/internal/v1/upstreams/quota/windows",
+            post(upstream_quota_windows),
         )
         .route(
             "/internal/v1/upstreams/quota/batch",
@@ -267,6 +312,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/stats", get(internal_stats))
         .route(
+            "/internal/v1/upstream-concurrency",
+            get(monitoring_snapshot::internal_upstream_concurrency),
+        )
+        .route(
             "/internal/v1/monitoring-snapshot",
             get(monitoring_snapshot::internal_monitoring_snapshot),
         )
@@ -280,6 +329,29 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/request-events", get(internal_request_events))
         .route("/internal/v1/sessions", get(internal_sessions))
+        .route(
+            "/internal/v1/sessions/parents",
+            post(session_tasks::parents),
+        )
+        .route(
+            "/internal/v1/sessions/resolve",
+            post(session_tasks::resolve),
+        )
+        .route(
+            "/internal/v1/sessions/analyze",
+            post(session_tasks::analyze),
+        )
+        .route("/internal/v1/sessions/titles", post(session_tasks::titles))
+        .route(
+            "/internal/v1/sessions/{session_id}/name",
+            put(session_tasks::name),
+        )
+        .route(
+            "/internal/v1/sessions/{session_id}/relationships",
+            get(session_tasks::relationships)
+                .put(session_tasks::put_relationship)
+                .delete(session_tasks::delete_relationship),
+        )
         .route(
             "/internal/v1/sessions/{session_id}/title",
             get(get_session_title).post(generate_session_title),

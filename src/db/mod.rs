@@ -53,6 +53,7 @@ mod archive_staging;
 mod gateway_persistence;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
+pub(crate) mod allocation;
 mod billing;
 mod constants;
 mod credentials;
@@ -62,9 +63,11 @@ mod filter_assistant;
 mod generation;
 mod group_routing;
 mod groups;
+mod http_settings;
 mod migrations;
 mod monitoring_snapshot;
 mod oauth_sessions;
+pub(crate) mod plugin_background_actions;
 mod plugin_configurations;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installations;
@@ -78,6 +81,7 @@ mod plugin_revisions;
 mod plugin_service_data;
 mod projection_lock;
 mod providers;
+mod request_history;
 mod requests;
 pub(crate) use requests::EarlyRequestTerminal;
 #[allow(unused_imports)] // Consumed by the separately owned API receipt integration.
@@ -98,18 +102,22 @@ mod session_responses;
 pub(crate) use session_reading::{SessionContextNode, SessionContextScope};
 pub(crate) use session_responses::SessionResponseTask;
 mod session_projection;
+pub(crate) mod session_tasks;
 mod session_titles;
 pub(crate) use session_titles::{
     SessionTitleTask, SessionTitleView, enqueue_initial_session_title,
 };
+pub(crate) mod network_proxies;
 mod tenants;
-mod transport_proxy_groups;
+pub(crate) mod transport_proxy_groups;
 pub(crate) mod transport_proxy_management;
 pub(crate) use transport_proxy_groups::{ProxySelection, TransportProxyGroups};
 mod time;
 mod upstream_account_availability;
+pub(crate) mod upstream_concurrency;
 mod upstream_quota_reset;
-mod upstream_service_probes;
+pub(crate) mod upstream_service_probes;
+pub(crate) use upstream_service_probes::SupplierQuotaEvidence;
 mod usage_analysis;
 mod validation;
 
@@ -251,6 +259,7 @@ pub use usage_analysis::{
 
 #[derive(Clone)]
 pub struct Database {
+    pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
     pool_role: &'static str,
     backend: DatabaseBackend,
@@ -659,6 +668,7 @@ impl Database {
                 .await?;
         }
         Ok(Self {
+            http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
                 database_url.as_ref(),
                 backend,
@@ -732,6 +742,7 @@ impl Database {
 
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
+            http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
             pool: self

@@ -14,6 +14,7 @@ fn input(label: &str, proxy: &str) -> MemberInput {
 
 #[test]
 fn member_identity_validation_and_service_dns_contract() {
+    assert!(members(Vec::new(), &[]).is_err());
     let original = members(vec![input("primary", PRIMARY)], &[]).unwrap();
     assert!(
         members(
@@ -42,6 +43,17 @@ fn member_identity_validation_and_service_dns_contract() {
         "socks5h://fake.svc.cluster.local.attacker.example:1080",
     ] {
         assert!(crate::provider::validate_codex_proxy_url(address).is_err());
+    }
+}
+
+#[test]
+fn member_schema_requires_nonempty_without_a_count_cap() {
+    let document: Value =
+        serde_json::from_str(include_str!("../../../openapi/openapi.json")).unwrap();
+    for schema in ["CreateTransportProxyGroup", "UpdateTransportProxyGroup"] {
+        let members = &document["components"]["schemas"][schema]["properties"]["members"];
+        assert_eq!(members["minItems"], 1);
+        assert!(members.get("maxItems").is_none());
     }
 }
 
@@ -281,7 +293,7 @@ async fn contract(database: &Database) {
     };
     assert!(
         database
-            .update_transport_group(id, unchanged(None), None, KEY)
+            .update_transport_group(id, unchanged(Some(Uuid::now_v7())), None, KEY)
             .await
             .is_err()
     );
@@ -293,7 +305,7 @@ async fn contract(database: &Database) {
         1
     );
     database
-        .update_transport_group(id, unchanged(Some(backup)), None, KEY)
+        .update_transport_group(id, unchanged(None), None, KEY)
         .await
         .unwrap();
     let probed = database
@@ -379,12 +391,15 @@ async fn contract(database: &Database) {
             .0,
         BACKUP
     );
+    let (binding, backup) =
+        final_members_contract(database, &runtime, account.id, id, &tenant).await;
+    let group_version = binding["group_version"].as_i64().unwrap();
     let unbound = database
         .unbind_transport_group(
             account.id,
             UnbindGroup {
                 tenant_external_id: tenant.clone(),
-                expected_group_version: 2,
+                expected_group_version: group_version,
                 expected_binding_version: 1,
                 expected_credential_generation: binding["credential_generation"].as_i64().unwrap(),
                 expected_updated_at: binding["updated_at"].as_i64().unwrap(),
@@ -424,7 +439,7 @@ async fn contract(database: &Database) {
             id,
             DeleteGroup {
                 tenant_external_id: tenant,
-                expected_version: 2,
+                expected_version: group_version,
             },
             None,
         )
@@ -440,6 +455,178 @@ async fn contract(database: &Database) {
     assert_eq!(audits, 2);
 }
 
+async fn final_members_contract(
+    database: &Database,
+    runtime: &TransportProxyGroups,
+    account_id: Uuid,
+    group_id: Uuid,
+    tenant: &str,
+) -> (Value, Uuid) {
+    let mut group = database
+        .get_transport_group(group_id, tenant, KEY)
+        .await
+        .unwrap();
+    let mut binding = database
+        .get_transport_binding(account_id, tenant)
+        .await
+        .unwrap();
+    for stage in 0..4 {
+        let (account, credential) = database
+            .upstream_account_with_credential(account_id, KEY)
+            .await
+            .unwrap();
+        let before = runtime
+            .select_config(
+                account_id,
+                account.credential_generation,
+                &credential,
+                &account.config,
+            )
+            .unwrap();
+        let before_proxy = before.credential.proxy().unwrap().0.to_owned();
+        if stage == 1 {
+            assert!(before.advance_after_connect_failure(&[1]).unwrap());
+            runtime
+                .synchronize_managed_for_test(&database.pool)
+                .await
+                .unwrap();
+        }
+        let final_members = match stage {
+            0 => serde_json::json!([
+                {"label": "new first", "proxy_url": PRIMARY},
+                {"id": group["members"][0]["id"], "label": "retained selected"}
+            ]),
+            1 => serde_json::json!([
+                {"label": "new initial", "proxy_url": "socks5h://10.20.30.42:1080"},
+                {"id": group["members"][0]["id"], "label": "retained selected"}
+            ]),
+            2 => serde_json::json!([
+                {"id": group["members"][0]["id"], "label": "retained initial"},
+                {"id": group["members"][1]["id"], "label": "changed selected",
+                 "proxy_url": "socks5h://10.20.30.43:1080"}
+            ]),
+            _ => serde_json::json!([
+                {"label": "all new first", "proxy_url": BACKUP},
+                {"label": "all new second", "proxy_url": PRIMARY}
+            ]),
+        };
+        let update = serde_json::json!({
+            "tenant_external_id": tenant,
+            "expected_version": group["version"],
+            "name": "final members",
+            "members": final_members
+        });
+        let saved = database
+            .update_transport_group(
+                group_id,
+                serde_json::from_value(update.clone()).unwrap(),
+                None,
+                KEY,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            saved["version"].as_i64().unwrap(),
+            group["version"].as_i64().unwrap() + 1
+        );
+        assert!(matches!(
+            database
+                .update_transport_group(
+                    group_id,
+                    serde_json::from_value(update).unwrap(),
+                    None,
+                    KEY
+                )
+                .await,
+            Err(AppError::ProxyGroupConflict("proxy_group_version_conflict"))
+        ));
+        let current = database
+            .get_transport_binding(account_id, tenant)
+            .await
+            .unwrap();
+        assert_eq!(current["binding_version"], binding["binding_version"]);
+        assert_eq!(
+            current["credential_generation"].as_i64().unwrap(),
+            binding["credential_generation"].as_i64().unwrap() + 1
+        );
+        assert_eq!(current["group_version"], saved["version"]);
+        let initial_index = usize::from(stage == 0);
+        let selected_index = usize::from(stage < 2);
+        assert_eq!(
+            current["initial_member_id"],
+            saved["members"][initial_index]["id"]
+        );
+        if stage < 2 {
+            assert_eq!(saved["members"][1]["id"], group["members"][0]["id"]);
+        } else if stage == 3 {
+            for member in saved["members"].as_array().unwrap() {
+                assert!(
+                    group["members"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|old| old["id"] != member["id"])
+                );
+            }
+        }
+        let (updated_account, updated_credential) = database
+            .upstream_account_with_credential(account_id, KEY)
+            .await
+            .unwrap();
+        runtime
+            .synchronize_managed_for_test(&database.pool)
+            .await
+            .unwrap();
+        let cold = TransportProxyGroups::parse("[]", KEY).unwrap();
+        cold.refresh_managed(&database.pool).await.unwrap();
+        for reader in [runtime, &cold] {
+            let selected = reader
+                .select_config(
+                    account_id,
+                    updated_account.credential_generation,
+                    &updated_credential,
+                    &updated_account.config,
+                )
+                .unwrap()
+                .egress_snapshot()
+                .unwrap();
+            assert_eq!(
+                selected.member_id.unwrap().to_string(),
+                saved["members"][selected_index]["id"].as_str().unwrap()
+            );
+        }
+        assert_eq!(before.credential.proxy().unwrap().0, before_proxy);
+        group = saved;
+        binding = current;
+    }
+    assert!(
+        database
+            .update_transport_group(
+                group_id,
+                serde_json::from_value(serde_json::json!({
+                    "tenant_external_id": tenant,
+                    "expected_version": group["version"],
+                    "name": "empty",
+                    "members": []
+                }))
+                .unwrap(),
+                None,
+                KEY
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .get_transport_group(group_id, tenant, KEY)
+            .await
+            .unwrap(),
+        group
+    );
+    let selected = Uuid::parse_str(group["members"][0]["id"].as_str().unwrap()).unwrap();
+    (binding, selected)
+}
+
 #[tokio::test]
 async fn sqlite_management_transaction_and_tombstone_contract() {
     let directory = tempfile::tempdir().unwrap();
@@ -451,6 +638,7 @@ async fn sqlite_management_transaction_and_tombstone_contract() {
     .unwrap();
     database.migrate().await.unwrap();
     contract(&database).await;
+    large_group_contract(&database).await;
     generic_oauth_group_contract(&database).await;
     database.migrate().await.unwrap();
 }
@@ -463,7 +651,221 @@ async fn postgres_management_transaction_and_tombstone_contract() {
     let database = Database::connect(&url).await.unwrap();
     database.migrate().await.unwrap();
     contract(&database).await;
+    large_group_contract(&database).await;
     generic_oauth_group_contract(&database).await;
+}
+
+async fn large_group_contract(database: &Database) {
+    let external = format!("large-proxy-{}", Uuid::now_v7());
+    let account = database
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: external.clone(),
+                name: "large-group".into(),
+                driver: "openai-codex".into(),
+                config: serde_json::json!({"base_url":"https://chatgpt.com/backend-api/codex"}),
+                credential: UpstreamCredential::OAuth {
+                    access_token: "fixture".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                    adapter_state: None,
+                    proxy_url: Some(PRIMARY.into()),
+                    proxy_network_scope: Some(crate::network::OutboundScope::Private),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            KEY,
+        )
+        .await
+        .unwrap();
+    let group = database
+        .create_transport_group(
+            CreateGroup {
+                tenant_external_id: external.clone(),
+                name: "large-group".into(),
+                members: (0..6)
+                    .map(|index| {
+                        input(
+                            &format!("exit-{index}"),
+                            &format!("socks5h://10.20.31.{}:1080", index + 1),
+                        )
+                    })
+                    .collect(),
+                probe_url: None,
+                probe_attempts: None,
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    let group_id = Uuid::parse_str(group["id"].as_str().unwrap()).unwrap();
+    let initial = Uuid::parse_str(group["members"][5]["id"].as_str().unwrap()).unwrap();
+    assert_eq!(group["members"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        database
+            .get_transport_group(group_id, &external, KEY)
+            .await
+            .unwrap(),
+        group
+    );
+    assert!(matches!(
+        database
+            .get_transport_group(group_id, "other-tenant", KEY)
+            .await,
+        Err(AppError::NotFound)
+    ));
+    database
+        .bind_transport_group(
+            account.id,
+            BindGroup {
+                tenant_external_id: external.clone(),
+                group_id,
+                expected_group_version: 1,
+                initial_member_id: initial,
+                expected_binding_version: 0,
+                expected_credential_generation: account.credential_generation,
+                expected_updated_at: account.updated_at,
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    let runtime = TransportProxyGroups::parse("[]", KEY).unwrap();
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let (bound, credential) = database
+        .upstream_account_with_credential(account.id, KEY)
+        .await
+        .unwrap();
+    let selected = runtime
+        .select_config(
+            account.id,
+            bound.credential_generation,
+            &credential,
+            &bound.config,
+        )
+        .unwrap();
+    assert_eq!(selected.member_index(), Some(5));
+    assert_eq!(
+        selected.credential.proxy().unwrap().0,
+        "socks5h://10.20.31.6:1080"
+    );
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let mut retained = group["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|member| serde_json::json!({"id":member["id"],"label":member["label"]}))
+        .collect::<Vec<_>>();
+    retained.reverse();
+    retained.push(serde_json::json!({"label":"seventh","proxy_url":"socks5h://10.20.31.7:1080"}));
+    let update = serde_json::json!({"tenant_external_id":external,
+        "expected_version":1,"name":"large-group","members":retained});
+    let updated = database
+        .update_transport_group(
+            group_id,
+            serde_json::from_value(update.clone()).unwrap(),
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated["members"].as_array().unwrap().len(), 7);
+    assert!(matches!(
+        database
+            .update_transport_group(group_id, serde_json::from_value(update).unwrap(), None, KEY)
+            .await,
+        Err(AppError::ProxyGroupConflict("proxy_group_version_conflict"))
+    ));
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let (bound, credential) = database
+        .upstream_account_with_credential(account.id, KEY)
+        .await
+        .unwrap();
+    let selected = runtime
+        .select_config(
+            account.id,
+            bound.credential_generation,
+            &credential,
+            &bound.config,
+        )
+        .unwrap();
+    assert_eq!(selected.egress_snapshot().unwrap().member_id, Some(initial));
+    for _ in 0..5 {
+        assert!(runtime.advance_sticky_after_probe(account.id));
+    }
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let cold = TransportProxyGroups::parse("[]", KEY).unwrap();
+    cold.synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    for reader in [&runtime, &cold] {
+        let selected = reader
+            .select_config(
+                account.id,
+                bound.credential_generation,
+                &credential,
+                &bound.config,
+            )
+            .unwrap();
+        assert_eq!(selected.member_index(), Some(5));
+        assert_eq!(
+            selected.credential.proxy().unwrap().0,
+            "socks5h://10.20.31.1:1080"
+        );
+    }
+    let selection = database
+        .get_transport_binding(account.id, &external)
+        .await
+        .unwrap();
+    database
+        .unbind_transport_group(
+            account.id,
+            UnbindGroup {
+                tenant_external_id: external.clone(),
+                expected_group_version: 2,
+                expected_binding_version: selection["binding_version"].as_i64().unwrap(),
+                expected_credential_generation: bound.credential_generation,
+                expected_updated_at: bound.updated_at,
+                single_proxy_member_id: initial,
+            },
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    database
+        .delete_transport_group(
+            group_id,
+            DeleteGroup {
+                tenant_external_id: external.clone(),
+                expected_version: 2,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        database.get_transport_group(group_id, &external, KEY).await,
+        Err(AppError::NotFound)
+    ));
 }
 
 async fn generic_oauth_group_contract(database: &Database) {

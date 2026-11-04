@@ -5,7 +5,24 @@ pub(super) async fn assert_unknown_request(
     request_id: Uuid,
     active_owners: usize,
 ) {
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    assert_unknown_request_state(
+        &fixture.state,
+        &fixture.database_url,
+        fixture.key_id,
+        request_id,
+        active_owners,
+    )
+    .await;
+}
+
+pub(super) async fn assert_unknown_request_state(
+    state: &AppState,
+    database_url: &str,
+    key_id: Uuid,
+    request_id: Uuid,
+    active_owners: usize,
+) {
+    let pool = sqlx::AnyPool::connect(database_url).await.unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let row = sqlx::query(
@@ -24,7 +41,7 @@ pub(super) async fn assert_unknown_request(
                  WHERE q.id = $1 AND q.key_id = $2",
             )
             .bind(request_id.to_string())
-            .bind(fixture.key_id.to_string())
+            .bind(key_id.to_string())
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -45,7 +62,7 @@ pub(super) async fn assert_unknown_request(
             );
             if row.get::<Option<String>, _>("unknown_reason").as_deref()
                 == Some("authoritative_usage_unavailable")
-                && fixture.state.proxy_lifecycles.active() == active_owners
+                && state.proxy_lifecycles.active() == active_owners
                 && row.get::<Option<i64>, _>("operational_completed").is_some()
             {
                 assert_eq!(row.get::<Option<i64>, _>("status_code"), None);
@@ -58,7 +75,7 @@ pub(super) async fn assert_unknown_request(
                 for field in ["ledger_count", "event_count", "fact_count", "observation_count"] {
                     assert_eq!(row.get::<i64, _>(field), 0, "{field}");
                 }
-                let records = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
+                let records = state.db.list_requests(key_id, 10).await.unwrap();
                 let record = records.iter().find(|record| record.request_id == request_id).unwrap();
                 assert_eq!(record.status_code, row.get::<Option<i64>, _>("operational_status"));
                 assert_eq!(record.error_code, row.get::<Option<String>, _>("operational_error"));
