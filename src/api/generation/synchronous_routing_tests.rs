@@ -629,7 +629,6 @@ async fn cancelling_after_image_send_keeps_owner_and_durable_no_replay_fence() {
     let status: String = sqlx::query_scalar("SELECT r.status FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE q.key_id = $1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(status, "reserved");
-    pool.close().await;
     let repeated = post(
         fixture.state.clone(),
         &fixture.credential,
@@ -641,25 +640,34 @@ async fn cancelling_after_image_send_keeps_owner_and_durable_no_replay_fence() {
     release_tx.send(()).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let response = post(
-                fixture.state.clone(),
-                &fixture.credential,
-                "cancel-after-send",
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM synchronous_image_idempotency WHERE key_id = $1",
             )
-            .await;
-            if response.status() == StatusCode::OK {
+            .bind(fixture.key_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if status == "completed"
+                && fixture.state.image_response_permits.available_permits() == permits_before
+            {
                 break;
             }
-            assert_eq!(response.status(), StatusCode::CONFLICT);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .expect("the original owner finishes and its durable result becomes replayable");
-    assert_eq!(
-        fixture.state.image_response_permits.available_permits(),
-        permits_before
-    );
+    .expect("the original owner settles and releases its resources");
+    pool.close().await;
+    let replay = post(
+        fixture.state.clone(),
+        &fixture.credential,
+        "cancel-after-send",
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::CONFLICT);
+    let body = to_bytes(replay.into_body(), 4096).await.unwrap();
+    let body: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["error"]["code"], "image_result_not_retained");
     let listener = upstream.await.unwrap();
     assert!(
         tokio::time::timeout(Duration::from_millis(100), listener.accept())
