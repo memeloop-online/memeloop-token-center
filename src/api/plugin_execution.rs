@@ -59,17 +59,10 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, AppError> + Send + 'static,
 {
-    run_with_limits(
-        phase,
-        work,
-        PERMITS.clone(),
-        None,
-        None,
-        move |event| {
-            metrics.observe_plugin_execution(event.phase, event.outcome);
-            emit_event(event);
-        },
-    )
+    run_with_limits(phase, work, PERMITS.clone(), None, None, move |event| {
+        metrics.observe_plugin_execution(event.phase, event.outcome);
+        emit_event(event);
+    })
     .await
 }
 
@@ -199,7 +192,10 @@ mod tests {
         drop(held);
         started_rx.await.unwrap();
         tokio::time::advance(Duration::from_secs(36)).await;
-        assert!(!task.is_finished(), "an executing hook must retain its result");
+        assert!(
+            !task.is_finished(),
+            "an executing hook must retain its result"
+        );
         assert_eq!(permits.available_permits(), 0);
         release_tx.send(()).unwrap();
         assert_eq!(task.await.unwrap().unwrap(), 42);
