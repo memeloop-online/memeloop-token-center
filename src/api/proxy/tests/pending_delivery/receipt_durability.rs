@@ -24,14 +24,22 @@ async fn deliver(fixture: &CodexRouteFixture, upstream: &MockServer) {
     assert!(String::from_utf8_lossy(&body).contains("receipt independent"));
 }
 
+async fn block_projection(fixture: &CodexRouteFixture) {
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    sqlx::query("CREATE TRIGGER fail_receipt_projection BEFORE INSERT ON conversation_projection_outbox BEGIN SELECT RAISE(ABORT, 'RECEIPT_PROJECTION_FAULT'); END")
+        .execute(&pool).await.unwrap();
+    pool.close().await;
+}
+
 #[tokio::test]
-async fn finance_completes_while_conversation_preparation_is_blocked() {
+async fn finance_completes_while_conversation_projection_is_blocked() {
     let fixture = codex_route_fixture("receipt-before-preparation").await;
     let held = fixture
         .state
         .pending_terminals
         .hold_preparation_for_test()
         .await;
+    block_projection(&fixture).await;
     let upstream = MockServer::start().await;
     deliver(&fixture, &upstream).await;
     wait_for_request_settlement(&fixture, 1).await;
@@ -45,7 +53,7 @@ async fn finance_completes_while_conversation_preparation_is_blocked() {
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
     let (_, receipt) = wait_for_receipt(&fixture).await;
     assert_eq!(receipt["conversation_state"], "Pending");
-    assert!(receipt["conversation"].is_null());
+    assert_eq!(receipt["conversation"]["request_json"], json!({}));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1",
@@ -55,6 +63,10 @@ async fn finance_completes_while_conversation_preparation_is_blocked() {
     .await
     .unwrap();
     assert_eq!(count, 0, "held preparation has not enqueued its metadata");
+    sqlx::query("DROP TRIGGER fail_receipt_projection")
+        .execute(&pool)
+        .await
+        .unwrap();
     drop(held);
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     pool.close().await;
@@ -62,7 +74,7 @@ async fn finance_completes_while_conversation_preparation_is_blocked() {
 }
 
 #[tokio::test]
-async fn another_pod_recovers_finance_without_claiming_pending_conversation_is_done() {
+async fn another_pod_recovers_finance_and_conversation_seed_without_the_original_future() {
     let mut fixture = codex_route_fixture("receipt-remote-recovery").await;
     let held = fixture
         .state
@@ -70,6 +82,7 @@ async fn another_pod_recovers_finance_without_claiming_pending_conversation_is_d
         .hold_preparation_for_test()
         .await;
     install_terminal_fault(&fixture).await;
+    block_projection(&fixture).await;
     let upstream = MockServer::start().await;
     deliver(&fixture, &upstream).await;
     let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
@@ -85,15 +98,27 @@ async fn another_pod_recovers_finance_without_claiming_pending_conversation_is_d
         namespace.to_string_lossy(),
         receipt_id
     );
-    let persisted: Value =
-        serde_json::from_slice(&fixture.state.archive.get(&location).await.unwrap()).unwrap();
+    let persisted: Value = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(bytes) = fixture.state.archive.get(&location).await {
+                break serde_json::from_slice(&bytes).unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("financial receipt must be remotely durable before losing the Pod");
     assert_eq!(persisted["conversation_state"], "Pending");
     assert_eq!(persisted["usage"], receipt["usage"]);
-    assert!(persisted["conversation"].is_null());
+    assert_eq!(persisted["conversation"]["request_json"], json!({}));
     fixture.state.pending_terminals.stop_for_test().await;
     drop(held);
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("DROP TRIGGER fail_pending_terminal")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TRIGGER fail_receipt_projection")
         .execute(&pool)
         .await
         .unwrap();
@@ -120,10 +145,16 @@ async fn another_pod_recovers_finance_without_claiming_pending_conversation_is_d
             .await
             .unwrap();
     assert_eq!(state, "applied");
-    let still_pending: Value =
-        serde_json::from_slice(&fixture.state.archive.get(&location).await.unwrap()).unwrap();
-    assert_eq!(still_pending["conversation_state"], "Pending");
-    assert!(still_pending["conversation"].is_null());
+    let request_uuid = Uuid::parse_str(request_id).unwrap();
+    let source = owned_enqueued_source(
+        &fixture,
+        &pool,
+        request_uuid,
+        &json!({"model": fixture.model, "input": "retain source independently", "stream": false}),
+    )
+    .await;
+    assert_eq!(source["input"], "retain source independently");
+    assert_exactly_once_side_effects(&fixture, request_uuid, Some("resp-codex")).await;
     fixture.state.pending_terminals.stop_for_test().await;
     pool.close().await;
     upstream.verify().await;

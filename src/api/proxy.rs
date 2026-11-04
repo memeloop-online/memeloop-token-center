@@ -2476,6 +2476,21 @@ struct ProxyConversationProjection<'a> {
 }
 
 impl ProxyConversation {
+    fn terminal_receipt_seed(
+        &self,
+        upstream_response_id: Option<&str>,
+    ) -> crate::proxy_lifecycle::pending_terminal::OwnedConversation {
+        crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
+            ProxyConversationInput {
+                key: &self.key,
+                request_json: &serde_json::json!({}),
+                hints: &self.hints,
+                client_name: self.client_name.as_deref(),
+                upstream_response_id,
+            },
+        )
+    }
+
     fn take_for_terminal(&self) -> Option<Self> {
         let admission = std::mem::replace(
             &mut *self.projection_admission.lock().ok()?,
@@ -3504,7 +3519,9 @@ async fn finish_buffered_request_before_deadline(
     request.state.pending_terminals.submit_with_preparation(
         snapshot,
         (body.clone(), request.memory.clone(), _response_buffer),
-        conversation.is_some(),
+        conversation
+            .as_ref()
+            .map(|conversation| conversation.terminal_receipt_seed(response_id.as_deref())),
         prepare_terminal_conversation(
             conversation,
             request.memory.clone(),

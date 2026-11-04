@@ -19,6 +19,9 @@ use crate::{
 };
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const RECOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
+const RECOVERY_MAX_INTERVAL: Duration = Duration::from_secs(300);
+const RECOVERY_BATCH_SIZE: usize = 32;
 
 /// Admission rejection or explicit transport non-delivery permits a zero-cost
 /// settlement. A request-stage error alone leaves provider execution unknown.
@@ -487,11 +490,17 @@ impl Journal {
             .unwrap_or_else(|error| error.into_inner()) = Some(worker);
         let weak = Arc::downgrade(&journal);
         let recovery = tokio::spawn(async move {
+            let mut interval = RECOVERY_MIN_INTERVAL;
             while let Some(journal) = weak.upgrade() {
-                journal.recover(&recovery_database).await;
+                let progressed = journal.recover(&recovery_database).await;
                 journal.wake.notify_one();
                 drop(journal);
-                tokio::time::sleep(RETRY_INTERVAL).await;
+                interval = if progressed {
+                    RECOVERY_MIN_INTERVAL
+                } else {
+                    interval.saturating_mul(2).min(RECOVERY_MAX_INTERVAL)
+                };
+                tokio::time::sleep(interval).await;
             }
         });
         *journal
@@ -614,6 +623,10 @@ impl Journal {
             .values_mut()
             .filter(|entry| entry.durable && entry.reconcile && !entry.running)
         {
+            if entry.snapshot.separate_conversation {
+                // Keep the small recovery seed until source ownership transfers.
+                continue;
+            }
             // An unknown receipt keeps its parsed conversation only while
             // that is the sole copy: once the projection outbox row holds
             // the payload, the evidence is durable and the compact disk
@@ -643,10 +656,10 @@ impl Journal {
         &self,
         mut snapshot: Snapshot,
         retained: impl Send + 'static,
-        conversation_requested: bool,
+        conversation_seed: Option<OwnedConversation>,
         preparation: impl std::future::Future<Output = Option<PreparedConversation>> + Send + 'static,
     ) {
-        snapshot.conversation_state = if conversation_requested {
+        snapshot.conversation_state = if conversation_seed.is_some() {
             ConversationState::Pending
         } else {
             ConversationState::NotRequested
@@ -676,9 +689,13 @@ impl Journal {
             }
             tracing::error!(%request_id, %receipt_id, financial_state = "unknown", "multiple terminal receipts retained for database arbitration");
         }
-        if snapshot.claim.is_none() {
+        if snapshot.claim.is_none() || self.archive.is_none() {
             snapshot.separate_conversation = false;
+        } else if snapshot.separate_conversation {
+            snapshot.conversation = conversation_seed;
         }
+        let conversation_pending = !snapshot.separate_conversation
+            || snapshot.conversation_state == ConversationState::Pending;
         pending.insert(
             receipt_id,
             Pending {
@@ -697,7 +714,7 @@ impl Journal {
                 operational_reconcile: false,
                 preparation: Some(Box::pin(preparation)),
                 projection_retained: None,
-                conversation_pending: true,
+                conversation_pending,
                 preparation_running: false,
                 recovered: false,
             },
@@ -897,7 +914,7 @@ impl Journal {
             false,
             stage,
         );
-        self.submit_with_preparation(snapshot, (), false, async { None });
+        self.submit_with_preparation(snapshot, (), None, async { None });
     }
 
     pub(crate) fn mark_unknown(&self, request_id: Uuid) {
@@ -993,7 +1010,7 @@ impl Journal {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .values()
-            .filter(|entry| !entry.conversation_pending)
+            .filter(|entry| !entry.conversation_pending || entry.snapshot.separate_conversation)
             .filter_map(|entry| serde_json::to_value(entry.snapshot.as_ref()).ok())
             .collect();
         if let Ok(entries) = std::fs::read_dir(&self.directory) {
@@ -1055,7 +1072,13 @@ impl Journal {
             .unwrap_or_else(|error| error.into_inner())
             .get(&receipt_id)
             .filter(|entry| !entry.running)
-            .map(|entry| entry.snapshot.conversation.is_some())
+            .map(|entry| {
+                if entry.snapshot.separate_conversation {
+                    entry.preparation.is_some() || entry.projection_retained.is_some()
+                } else {
+                    entry.snapshot.conversation.is_some()
+                }
+            })
             .or_else(|| {
                 self.directory
                     .join(format!("{receipt_id}.json"))
@@ -1106,16 +1129,17 @@ impl Journal {
             .clear();
     }
 
-    async fn recover(&self, database: &Database) {
+    async fn recover(&self, database: &Database) -> bool {
+        let mut progressed = false;
         if let Some(archive) = &self.archive {
-            self.recover_archive(archive, database).await;
+            progressed |= self.recover_archive(archive, database).await;
         }
         let mut entries = match tokio::fs::read_dir(&self.directory).await {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return progressed,
             Err(error) => {
                 tracing::error!(financial_state = "unknown", io_error_kind = ?error.kind(), "pending terminal journal directory is unavailable; recovery deferred");
-                return;
+                return progressed;
             }
         };
         while let Ok(Some(entry)) = entries.next_entry().await {
@@ -1171,8 +1195,9 @@ impl Journal {
                     Ok(false) => {}
                 }
             }
-            self.recover_one(database, snapshot).await;
+            progressed |= self.recover_one(database, snapshot).await;
         }
+        progressed
     }
 
     fn start_operational(self: &Arc<Self>, database: &Database) {
@@ -1282,6 +1307,12 @@ impl Journal {
     fn start_preparations(self: &Arc<Self>) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         for entry in pending.values_mut() {
+            // Claimed requests already have a durable-source metadata seed.
+            // Keep the original future/body owned until source publication and
+            // enqueue succeed, without rereading/parsing it on the settlement lane.
+            if entry.snapshot.separate_conversation && entry.snapshot.claim.is_some() {
+                continue;
+            }
             let Some(preparation) = entry.preparation.take() else {
                 continue;
             };
@@ -1323,9 +1354,10 @@ impl Journal {
                 && (entry.snapshot.claim.is_some() || !entry.conversation_pending)
                 && (!entry.durable
                     || !entry.reconcile
-                    || (entry.unknown_annotated
-                        && !entry.conversation_enqueued
-                        && !entry.conversation_pending))
+                    || (!entry.conversation_enqueued
+                        && (!entry.conversation_pending
+                            || (entry.snapshot.separate_conversation
+                                && entry.snapshot.conversation.is_some()))))
                 && tokio::time::Instant::now() >= entry.retry_after
         }) {
             entry.running = true;
@@ -1361,10 +1393,9 @@ impl Journal {
     }
 
     async fn publish_receipt(&self, snapshot: &Snapshot) -> bool {
-        let mut compact = snapshot.clone();
-        if compact.separate_conversation {
-            compact.conversation = None;
-        }
+        let compact = snapshot.clone();
+        // New claimed receipts contain only the small source metadata seed;
+        // legacy receipts preserve their original conversation/digest.
         let result = async {
             let bytes = serde_json::to_vec(&compact)
                 .map_err(|_| crate::error::AppError::internal("terminal_receipt_encode"))?;
@@ -1398,12 +1429,24 @@ impl Journal {
         }
     }
 
-    async fn recover_archive(&self, archive: &crate::archive::ArchiveStore, database: &Database) {
+    async fn recover_archive(
+        &self,
+        archive: &crate::archive::ArchiveStore,
+        database: &Database,
+    ) -> bool {
         let Ok(entries) = archive.terminal_receipts(self.receipt_namespace()) else {
-            return;
+            return false;
         };
         tokio::pin!(entries);
+        let mut progressed = false;
+        let mut visited = 0;
         while let Some(entry) = entries.next().await {
+            visited += 1;
+            if visited % RECOVERY_BATCH_SIZE == 0 {
+                // Keep the backend's pagination stream alive across batches.
+                // A new scan from its first unknown receipt would starve later work.
+                tokio::time::sleep(RECOVERY_MIN_INTERVAL).await;
+            }
             let Ok(location) = entry else { break };
             let Some(receipt_id) = location
                 .rsplit('/')
@@ -1431,14 +1474,15 @@ impl Journal {
             if snapshot.receipt_id != receipt_id || snapshot.terminal().is_err() {
                 continue;
             }
-            self.recover_one(database, snapshot).await;
+            progressed |= self.recover_one(database, snapshot).await;
         }
+        progressed
     }
 
     /// One recovery attempt at a time. The object/local stream remains the
     /// checkpoint while waiting; unknown predecessors never fill an in-memory
     /// backlog or prevent later receipts from being visited.
-    async fn recover_one(&self, database: &Database, snapshot: Snapshot) {
+    async fn recover_one(&self, database: &Database, snapshot: Snapshot) -> bool {
         let snapshot = Arc::new(snapshot);
         let receipt_id = snapshot.receipt_id;
         let applied = snapshot.financial_ack.as_ref().is_some_and(|ack| {
@@ -1453,7 +1497,7 @@ impl Journal {
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             let std::collections::hash_map::Entry::Vacant(entry) = pending.entry(receipt_id) else {
-                return;
+                return false;
             };
             entry.insert(Pending {
                 snapshot: snapshot.clone(),
@@ -1472,7 +1516,8 @@ impl Journal {
                 preparation: None,
                 projection_retained: None,
                 conversation_pending: snapshot.separate_conversation
-                    && snapshot.conversation_state == ConversationState::Pending,
+                    && snapshot.conversation_state == ConversationState::Pending
+                    && snapshot.conversation.is_none(),
                 preparation_running: false,
                 recovered: true,
             });
@@ -1488,7 +1533,8 @@ impl Journal {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&receipt_id);
+            .remove(&receipt_id)
+            .is_none()
     }
 
     async fn attempt(
@@ -1610,11 +1656,17 @@ impl Journal {
             .unwrap_or_else(|e| e.into_inner())
             .get(&receipt_id)
             .is_some_and(|entry| entry.recovered);
+        let mut source_durable = false;
         let projection = {
             let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending
                 .get(&receipt_id)
-                .filter(|entry| !entry.conversation_pending && !entry.conversation_enqueued)
+                .filter(|entry| {
+                    !entry.conversation_enqueued
+                        && (!entry.conversation_pending
+                            || (entry.snapshot.separate_conversation
+                                && entry.snapshot.conversation.is_some()))
+                })
                 .map(|entry| entry.snapshot.clone())
         };
         if let Some(projection) = projection {
@@ -1634,9 +1686,29 @@ impl Journal {
                             client_name: conversation.client_name.as_deref(),
                             upstream_response_id: conversation.upstream_response_id.as_deref(),
                         };
-                        database
-                            .enqueue_operational_conversation_projection(claim, receipt_id, &input)
-                            .await
+                        let source = crate::gateway_body::request_spool::request_body_object_key(
+                            &request_id.to_string(),
+                        );
+                        let source_ready =
+                            if let (Some(archive), Some(source)) = (&self.archive, source) {
+                                archive.source_object_exists(&source).await.unwrap_or(false)
+                            } else {
+                                // Legacy local-only fixtures/receipts keep their original
+                                // full conversation path; a new source seed needs a store.
+                                false
+                            };
+                        source_durable = source_ready;
+                        if source_ready {
+                            database
+                                .enqueue_operational_conversation_projection(
+                                    claim, receipt_id, &input,
+                                )
+                                .await
+                        } else {
+                            Err(crate::error::AppError::storage(
+                                "terminal_conversation_source_pending",
+                            ))
+                        }
                     }
                     (_, None) if projection.conversation_state != ConversationState::Pending => {
                         Ok(())
@@ -1655,6 +1727,8 @@ impl Journal {
                     .get_mut(&receipt_id)
                 {
                     entry.conversation_enqueued = true;
+                    entry.conversation_pending = false;
+                    entry.preparation = None;
                     Arc::make_mut(&mut entry.snapshot).conversation_state =
                         ConversationState::Enqueued;
                     entry.projection_retained = None;
@@ -1731,7 +1805,9 @@ impl Journal {
         let evict_unknown = compact_published
             && (reconcile || applied)
             && operational_acknowledged
-            && (conversation_complete || preparation_failed);
+            && (conversation_complete
+                || preparation_failed
+                || (reconcile && source_durable && !snapshot.financial_evidence_unavailable()));
         if removed || evict_unknown {
             pending.remove(&receipt_id);
             if removed {
@@ -1856,7 +1932,7 @@ mod tests {
             "buffered_response_ready",
         );
         tokio::time::pause();
-        journal.submit_with_preparation(snapshot.clone(), (), false, async { None });
+        journal.submit_with_preparation(snapshot.clone(), (), None, async { None });
         journal.start_pending(&database);
         finish_attempts(&journal).await;
         journal.start_pending(&database);
@@ -1869,7 +1945,7 @@ mod tests {
         let mut second = snapshot.clone();
         second.request_id = Uuid::now_v7();
         second.receipt_id = Uuid::now_v7();
-        journal.submit_with_preparation(second, (), false, async { None });
+        journal.submit_with_preparation(second, (), None, async { None });
         journal.start_pending(&database);
         finish_attempts(&journal).await;
         journal.start_pending(&database);

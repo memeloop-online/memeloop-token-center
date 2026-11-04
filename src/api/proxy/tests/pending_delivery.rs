@@ -1003,16 +1003,26 @@ async fn already_finished_without_matching_receipt_ack_keeps_durable_evidence() 
     })
     .await
     .expect("unmatched existing terminal must require explicit arbitration");
-    assert_eq!(
-        fixture
-            .state
-            .pending_terminals
-            .receipt_jsons_for_test()
-            .into_iter()
-            .find(|item| item["receipt_id"] == receipt["receipt_id"])
-            .unwrap(),
-        receipt
-    );
+    let retained_receipt = fixture
+        .state
+        .pending_terminals
+        .receipt_jsons_for_test()
+        .into_iter()
+        .find(|item| item["receipt_id"] == receipt["receipt_id"])
+        .unwrap();
+    for field in [
+        "receipt_id",
+        "request_id",
+        "claim",
+        "usage",
+        "usage_basis",
+        "status_code",
+        "error_code",
+        "response_object",
+        "conversation",
+    ] {
+        assert_eq!(retained_receipt[field], receipt[field], "{field}");
+    }
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let terminal: (Option<i64>, Option<String>, i64) = sqlx::query_as(
         "SELECT status_code, error_code, cost_micros FROM request_records WHERE id = $1",
@@ -1131,7 +1141,8 @@ async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_
         fixture
             .state
             .pending_terminals
-            .failed_publications_for_test() > 0
+            .failed_publications_for_test()
+            > 0
     );
     let record = wait_for_operational(&fixture).await;
     assert_eq!(record.status_code, Some(200));
@@ -1229,7 +1240,7 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
             .unwrap(),
     )
     .unwrap();
-    assert!(compact["conversation"].is_null());
+    assert_eq!(compact["conversation"]["request_json"], json!({}));
     assert_eq!(compact["usage"], receipt["usage"]);
     assert_eq!(
         compact["financial_ack"]["receipt_id"],
@@ -1249,10 +1260,12 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
         .execute(&pool)
         .await
         .unwrap();
-    fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        directory.clone(),
-        fixture.state.db.independent_persistence_pool(),
-    );
+    fixture.state.pending_terminals =
+        crate::proxy_lifecycle::pending_terminal::Journal::with_archive(
+            directory.clone(),
+            fixture.state.db.independent_persistence_pool(),
+            fixture.state.archive.clone(),
+        );
     let record = wait_for_operational(&fixture).await;
     let operational = record.operational_terminal.unwrap();
     assert_eq!(
@@ -1464,10 +1477,8 @@ async fn unknown_failure_retries_operational_projection() {
     .await;
     // The durable source retains the entire ingress envelope; the receipt
     // deliberately keeps only the conversation fields.
-    assert_eq!(
-        payload["input"],
-        original["conversation"]["request_json"]["input"]
-    );
+    assert_eq!(payload["input"], "operational failure retry");
+    assert_eq!(original["conversation"]["request_json"], json!({}));
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             if fixture

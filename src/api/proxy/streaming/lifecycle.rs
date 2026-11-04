@@ -392,7 +392,9 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     state.pending_terminals.submit_with_preparation(
         snapshot,
         memory.clone(),
-        conversation.is_some(),
+        conversation
+            .as_ref()
+            .map(|conversation| conversation.terminal_receipt_seed(response_id.as_deref())),
         prepare_terminal_conversation(
             conversation,
             memory,
