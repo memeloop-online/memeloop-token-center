@@ -343,14 +343,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 progress_heartbeat_deadline = None;
                                 continue;
                             };
-                            match waits
-                                .downstream(tokio::time::timeout(
-                                    MAX_DOWNSTREAM_SEND_WAIT,
-                                    body_sender.send(Ok(heartbeat)),
-                                ))
-                                .await
-                            {
-                                Ok(Ok(())) => {
+                            match waits.downstream(body_sender.send(Ok(heartbeat))).await {
+                                Ok(()) => {
                                     waits.heartbeat();
                                     progress_heartbeat_deadline = Some(
                                         tokio::time::Instant::now()
@@ -358,8 +352,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     );
                                     continue;
                                 }
-                                Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
-                                Err(_) => transport_error = Some("downstream_backpressure"),
+                                Err(_) => transport_error = Some("downstream_disconnected"),
                             }
                             drop(archive_sender.take());
                             break;
