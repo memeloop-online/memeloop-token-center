@@ -685,8 +685,14 @@ async fn gateway_component_small_normalized_response_fits_without_declared_maxim
         let occupied = fixture.state.proxy_memory_budget.reservation();
         assert!(occupied.try_grow(occupied_mib * 1024 * 1024, 1));
         let response = send_resilient_chat(&fixture, None, false).await;
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
         let delivered = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "occupied_mib={occupied_mib}, response={}",
+            String::from_utf8_lossy(&delivered)
+        );
         let body: Value = serde_json::from_slice(&delivered).unwrap();
         assert_eq!(
             body["choices"][0]["message"]["content"],
