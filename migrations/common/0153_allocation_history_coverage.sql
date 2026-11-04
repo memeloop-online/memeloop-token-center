@@ -31,7 +31,9 @@ CREATE INDEX group_allocation_history_receipts_time
     ON group_allocation_history_receipts(tenant_id, created_at);
 
 CREATE INDEX group_allocation_history_receipts_ready
-    ON group_allocation_history_receipts(tenant_id, bootstrap, source, request_id, revision);
+    ON group_allocation_history_receipts(tenant_id, bootstrap DESC, source, request_id, revision);
+CREATE INDEX group_allocation_history_receipts_expiry
+    ON group_allocation_history_receipts(created_at);
 
 CREATE TABLE group_allocation_history_contributions (
     tenant_id TEXT NOT NULL,
@@ -47,6 +49,8 @@ CREATE TABLE group_allocation_history_contributions (
 );
 CREATE INDEX group_allocation_history_contributions_time
     ON group_allocation_history_contributions(tenant_id, created_at);
+CREATE INDEX group_allocation_history_contributions_expiry
+    ON group_allocation_history_contributions(created_at);
 
 CREATE TABLE group_allocation_history_hours (
     tenant_id TEXT NOT NULL,
@@ -56,3 +60,5 @@ CREATE TABLE group_allocation_history_hours (
     tokens BIGINT NOT NULL,
     PRIMARY KEY (tenant_id, account_id, hour_bucket)
 );
+CREATE INDEX group_allocation_history_hours_expiry
+    ON group_allocation_history_hours(hour_bucket);

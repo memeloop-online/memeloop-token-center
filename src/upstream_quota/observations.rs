@@ -199,6 +199,7 @@ pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Recei
         state.config.quota_observation_interval_millis.into(),
     ));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_history_cleanup = 0_i64;
     loop {
         let tick = tokio::select! { biased;
             _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
@@ -206,9 +207,22 @@ pub(crate) async fn run(state: AppState, mut shutdown: tokio::sync::watch::Recei
         };
         let elapsed = i64::try_from(tick.elapsed().as_millis()).unwrap_or(i64::MAX);
         let tick_at = crate::db::unix_millis().saturating_sub(elapsed);
+        let cleanup_due = tick_at.saturating_sub(last_history_cleanup) >= 60_000;
+        if cleanup_due {
+            last_history_cleanup = tick_at;
+        }
         tokio::select! { biased;
             _ = crate::worker::wait_for_shutdown(&mut shutdown) => return,
-            result = refresh_batch(&state, tick_at) => if let Err(error) = result {
+            result = async {
+                let cleanup = async {
+                    if cleanup_due {
+                        let _ = tokio::time::timeout(Duration::from_millis(100),
+                            state.db.prune_allocation_history(tick_at)).await;
+                    }
+                };
+                let (result, ()) = tokio::join!(refresh_batch(&state, tick_at), cleanup);
+                result
+            } => if let Err(error) = result {
                 tracing::warn!(%error, "quota observation batch failed");
             }
         }

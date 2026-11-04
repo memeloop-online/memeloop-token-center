@@ -192,6 +192,158 @@ async fn exercise_coverage(url: &str) {
             .await
             .unwrap();
     assert_eq!(reservations, 0);
+    let fresh = Uuid::now_v7();
+    register(&db, fresh, now, 1).await;
+    let old = snapshot(fresh, Uuid::now_v7(), a, now, 10);
+    let mut newer = old.clone();
+    newer.revision = 11;
+    newer.read_model["fact"]["upstream_account_id"] = json!(b);
+    let mut tx = db.begin_write_transaction().await.unwrap();
+    receipts(
+        &mut tx,
+        &[AllocationContribution::from_snapshot(&newer).unwrap()],
+        now,
+        true,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    db.history_acknowledge(&[old]).await.unwrap();
+    db.apply_allocation_history(fresh, "fixture", now)
+        .await
+        .unwrap();
+    let fresh_counts = counts(&db, fresh, &accounts, now).await;
+    assert!(!fresh_counts.contains_key(&a.to_string()));
+    assert_eq!(
+        fresh_counts.get(&b.to_string()),
+        Some(&(1, 20)),
+        "bootstrap priority preserves the maximum revision within a mixed receipt batch"
+    );
+    // Source changes must not publish a stale history batch or retire its pending count.
+    let switch_tenant = Uuid::now_v7();
+    register(&db, switch_tenant, now, 1).await;
+    let switch_request = Uuid::now_v7();
+    assert!(
+        db.allocation_reserve(
+            switch_tenant,
+            None,
+            switch_request,
+            None,
+            (&a.to_string(), 1),
+            now
+        )
+        .await
+        .unwrap()
+    );
+    db.history_acknowledge(&[snapshot(switch_tenant, switch_request, b, now, 100)])
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_history_state SET mode='shadow' WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        !db.apply_allocation_history(switch_tenant, "fixture", now)
+            .await
+            .unwrap()
+    );
+    let unchanged = counts(&db, switch_tenant, &accounts, now).await;
+    assert_eq!(unchanged.get(&a.to_string()), Some(&(1, 0)));
+    assert!(!unchanged.contains_key(&b.to_string()));
+    sqlx::query("UPDATE request_history_state SET mode='clickhouse' WHERE id=1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    db.refresh_allocation_usage(switch_tenant, a, now)
+        .await
+        .unwrap();
+    assert_eq!(counts(&db, switch_tenant, &accounts, now).await, unchanged);
+    db.apply_allocation_history(switch_tenant, "fixture", now)
+        .await
+        .unwrap();
+    assert_eq!(
+        counts(&db, switch_tenant, &accounts, now)
+            .await
+            .get(&b.to_string()),
+        Some(&(1, 20))
+    );
+
+    // A batch is bounded by exact keys, never by a global revision watermark.
+    let paged = Uuid::now_v7();
+    register(&db, paged, now, 1).await;
+    let same_request = Uuid::now_v7();
+    let mut high = snapshot(paged, same_request, b, now, 100_000);
+    let low = (1..=256)
+        .map(|revision| snapshot(paged, same_request, a, now, revision))
+        .collect::<Vec<_>>();
+    let mut tx = db.begin_write_transaction().await.unwrap();
+    receipts(
+        &mut tx,
+        &[AllocationContribution::from_snapshot(&high).unwrap()],
+        now,
+        true,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    db.history_acknowledge(&low).await.unwrap();
+    assert!(
+        db.apply_allocation_history(paged, "fixture", now)
+            .await
+            .unwrap()
+    );
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM group_allocation_history_receipts WHERE tenant_id=$1 AND revision=256")
+        .bind(paged.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(
+        remaining, 1,
+        "higher bootstrap revision does not retire an unconsumed key"
+    );
+    db.apply_allocation_history(paged, "fixture", now)
+        .await
+        .unwrap();
+    let paged_counts = counts(&db, paged, &accounts, now).await;
+    assert!(!paged_counts.contains_key(&a.to_string()));
+    assert_eq!(paged_counts.get(&b.to_string()), Some(&(1, 20)));
+    high.identity.source = "generation".into();
+    db.history_acknowledge(&[high]).await.unwrap();
+    renew(&db, paged, now).await;
+    db.apply_allocation_history(paged, "fixture", now)
+        .await
+        .unwrap();
+    assert_eq!(
+        counts(&db, paged, &accounts, now).await.get(&b.to_string()),
+        Some(&(2, 20)),
+        "source is part of the contribution identity"
+    );
+    let skipped = Uuid::now_v7();
+    db.history_acknowledge(&[snapshot(skipped, Uuid::now_v7(), a, now, 1)])
+        .await
+        .unwrap();
+    let skipped_receipts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM group_allocation_history_receipts WHERE tenant_id=$1",
+    )
+    .bind(skipped.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        skipped_receipts, 0,
+        "tenants without active capture incur no receipt storage"
+    );
+    db.prune_allocation_history(now + DAY_MS + HOUR_MS)
+        .await
+        .unwrap();
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM group_allocation_history_contributions WHERE tenant_id=$1",
+    )
+    .bind(fresh.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        retained, 0,
+        "retired tenants expire without another quota refresh target"
+    );
     db.close().await;
 }
 
@@ -279,7 +431,7 @@ async fn allocation_history_real_services_acceptance() {
             .await
             .unwrap()
     );
-    db.refresh_allocation_clickhouse_batches(&client, tenant, now, 1)
+    db.refresh_allocation_clickhouse_batches(&client, tenant, now - 2000, 1)
         .await
         .unwrap();
     let ready: i64 =

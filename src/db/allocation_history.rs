@@ -20,7 +20,8 @@ fn placeholders(rows: usize, width: usize) -> String {
             "TEXT", "TEXT", "TEXT", "BIGINT", "BIGINT", "TEXT", "BIGINT", "BIGINT", "BIGINT",
         ],
         5 => &["TEXT", "TEXT", "BIGINT", "BIGINT", "BIGINT"],
-        3 => &["TEXT", "TEXT", "BIGINT"],
+        4 => &["TEXT", "TEXT", "TEXT", "BIGINT"],
+        2 => &["TEXT", "TEXT"],
         _ => unreachable!("fixed compact history row shape"),
     };
     (0..rows)
@@ -50,6 +51,23 @@ async fn receipts(
     if values.is_empty() {
         return Ok(());
     }
+    // Export retry batches can repeat a request/revision. PostgreSQL cannot update
+    // the same conflict key twice in one INSERT, even when the payloads agree.
+    let unique: BTreeMap<_, _> = values
+        .iter()
+        .map(|value| {
+            (
+                (
+                    value.tenant_id,
+                    &value.source,
+                    value.request_id,
+                    value.revision,
+                ),
+                value,
+            )
+        })
+        .collect();
+    let values: Vec<_> = unique.into_values().collect();
     let clock = values.len() * 9 + 1;
     // The interpolation contains generated parameter positions only.
     let sql = format!(
@@ -98,6 +116,46 @@ fn contribution(row: &sqlx::any::AnyRow, tenant: Uuid) -> Result<AllocationContr
 }
 
 impl Database {
+    /// Retired tenants are collected in bounded batches as the worker continues serving active tenants.
+    pub(crate) async fn prune_allocation_history(&self, now: i64) -> Result<(), AppError> {
+        let mut tx = self.begin_write_transaction().await?;
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            sqlx::query("SELECT set_config('lock_timeout','5ms',true),set_config('statement_timeout','80ms',true)")
+                .execute(&mut *tx).await?;
+        }
+        for (table, key, time, cutoff) in [
+            (
+                "group_allocation_history_receipts",
+                "tenant_id,source,request_id,revision",
+                "created_at",
+                (now / HOUR_MS - 23) * HOUR_MS,
+            ),
+            (
+                "group_allocation_history_contributions",
+                "tenant_id,source,request_id",
+                "created_at",
+                (now / HOUR_MS - 23) * HOUR_MS,
+            ),
+            (
+                "group_allocation_history_hours",
+                "tenant_id,account_id,hour_bucket",
+                "hour_bucket",
+                now / HOUR_MS - 23,
+            ),
+        ] {
+            // Identifiers are fixed above; the expiry boundary is bound.
+            let sql = format!(
+                "DELETE FROM {table} WHERE ({key}) IN (SELECT {key} FROM {table} WHERE {time}<$1 ORDER BY {time} LIMIT 512)"
+            );
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(cutoff)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Called after the exporter has successfully appended these exact snapshots.
     pub(super) async fn allocation_history_acknowledged(
         &self,
@@ -180,13 +238,18 @@ impl Database {
                     request_id: state.try_get("cursor_request")?,
                     source: state.try_get("cursor_source")?,
                 };
+                // Capture must be committed before choosing the bootstrap upper
+                // bound: exports acknowledged before registration may otherwise
+                // land after the caller's timestamp and miss both paths.
+                let scan_to = if cursor.key_id.is_empty() {
+                    sqlx::query_scalar::<_, i64>("UPDATE group_allocation_history_state SET scan_to=CASE WHEN scan_to<$3 THEN $3 ELSE scan_to END WHERE tenant_id=$1 AND lease=$2 RETURNING scan_to")
+                        .bind(tenant.to_string()).bind(&lease).bind(super::unix_millis())
+                        .fetch_one(&self.pool).await?
+                } else {
+                    state.try_get("scan_to")?
+                };
                 let page = reader
-                    .allocation_page(
-                        tenant,
-                        state.try_get("scan_from")?,
-                        state.try_get("scan_to")?,
-                        &cursor,
-                    )
+                    .allocation_page(tenant, state.try_get("scan_from")?, scan_to, &cursor)
                     .await?;
                 let next = page
                     .last()
@@ -262,28 +325,32 @@ impl Database {
         };
         let rows = sqlx::query("SELECT source,request_id,revision,created_at,account_id,requests,tokens,covered FROM group_allocation_history_receipts WHERE tenant_id=$1 ORDER BY bootstrap DESC,source,request_id,revision LIMIT 256")
             .bind(tenant.to_string()).fetch_all(&mut *tx).await?;
-        let mut latest = BTreeMap::new();
+        let mut latest = BTreeMap::<(String, Uuid), AllocationContribution>::new();
         for row in &rows {
             let value = contribution(row, tenant)?;
-            latest.insert((value.source.clone(), value.request_id), value);
+            latest
+                .entry((value.source.clone(), value.request_id))
+                .and_modify(|current| {
+                    if value.revision > current.revision {
+                        *current = value.clone();
+                    }
+                })
+                .or_insert(value);
         }
         let mut previous = BTreeMap::new();
         if !latest.is_empty() {
-            let keys = latest
-                .keys()
-                .map(|(_, request)| request.to_string())
-                .collect::<Vec<_>>();
-            let params = (2..keys.len() + 2)
-                .map(|n| format!("${n}"))
-                .collect::<Vec<_>>()
-                .join(",");
+            // Probe the full primary key, including source. Request IDs alone skip
+            // the index's source column and scan unrelated contributions for a tenant.
             let sql = format!(
-                "SELECT source,request_id,revision,created_at,account_id,requests,tokens,covered FROM group_allocation_history_contributions WHERE tenant_id=$1 AND request_id IN ({params})"
+                "WITH batch(source,request_id) AS (VALUES {}) SELECT c.source,c.request_id,c.revision,c.created_at,c.account_id,c.requests,c.tokens,c.covered FROM batch b JOIN group_allocation_history_contributions c ON c.tenant_id=${} AND c.source=b.source AND c.request_id=b.request_id",
+                placeholders(latest.len(), 2),
+                latest.len() * 2 + 1
             );
-            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(tenant.to_string());
-            for key in &keys {
-                query = query.bind(key);
+            let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for (source, request) in latest.keys() {
+                query = query.bind(source).bind(request.to_string());
             }
+            let query = query.bind(tenant.to_string());
             for row in query.fetch_all(&mut *tx).await? {
                 let value = contribution(&row, tenant)?;
                 previous.insert((value.source.clone(), value.request_id), value);
@@ -351,18 +418,18 @@ impl Database {
         if !rows.is_empty() {
             // Only this bounded batch's exact revisions are acknowledged by the consumer.
             let sql = format!(
-                "WITH batch(source,request_id,revision) AS (VALUES {}) DELETE FROM group_allocation_history_receipts WHERE tenant_id=${} AND EXISTS (SELECT 1 FROM batch b WHERE b.source=group_allocation_history_receipts.source AND b.request_id=group_allocation_history_receipts.request_id AND b.revision=group_allocation_history_receipts.revision)",
-                placeholders(rows.len(), 3),
-                rows.len() * 3 + 1
+                "DELETE FROM group_allocation_history_receipts WHERE (tenant_id,source,request_id,revision) IN (VALUES {})",
+                placeholders(rows.len(), 4)
             );
             let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
             for row in &rows {
                 query = query
+                    .bind(tenant.to_string())
                     .bind(row.try_get::<String, _>("source")?)
                     .bind(row.try_get::<String, _>("request_id")?)
                     .bind(row.try_get::<i64, _>("revision")?);
             }
-            query.bind(tenant.to_string()).execute(&mut *tx).await?;
+            query.execute(&mut *tx).await?;
         }
         let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM (SELECT 1 FROM group_allocation_history_receipts WHERE tenant_id=$1 LIMIT 1) q")
             .bind(tenant.to_string()).fetch_one(&mut *tx).await?;
