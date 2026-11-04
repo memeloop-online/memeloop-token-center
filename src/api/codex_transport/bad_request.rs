@@ -580,7 +580,7 @@ async fn read_bounded_body(
             tokio::task::yield_now().await;
         }
     }
-    match serde_json::from_slice(&body) {
+    match serde_json::from_slice(body) {
         Ok(value) => BoundedBadRequestBody::Value(value),
         Err(_) => BoundedBadRequestBody::InvalidJson,
     }
