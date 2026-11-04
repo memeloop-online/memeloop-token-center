@@ -175,7 +175,8 @@ impl Database {
 
     /// Read only two small JSON prefixes from existing user-message atoms.
     /// Prefixes may end mid-JSON: they are untrusted model input, never parsed
-    /// as a protocol request. Neither tool bodies nor archive objects are read.
+    /// as a protocol request. Archive bytes are verified as a stream; only
+    /// the selected character prefix is retained in memory.
     pub(crate) async fn session_title_sample(
         &self,
         task: &SessionTitleTask,
@@ -207,8 +208,10 @@ impl Database {
             .await?;
         match reference {
             Some(reference) => {
-                let body = self.read_body_reference(task.tenant_id, &reference).await?;
-                Ok(body.chars().take(1024).collect())
+                let (sample, _) = self
+                    .read_body_reference_range(task.tenant_id, &reference, 0, 1024)
+                    .await?;
+                Ok(sample)
             }
             None => Ok(String::new()),
         }
@@ -336,7 +339,7 @@ mod tests {
         let session = observe(
             &db,
             &key,
-            &json!({"input":[{"role":"user","content":"Repair session history loading"}]}),
+            &json!({"input":[{"role":"user","content":format!("Repair session history loading {}", "工具😀".repeat(20_000))}]}),
             &ConversationHints::default(),
             Uuid::now_v7(),
             1,
@@ -368,12 +371,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            db.session_title_sample(&first, false)
-                .await
-                .unwrap()
-                .contains("Repair session")
-        );
+        let sample = db.session_title_sample(&first, false).await.unwrap();
+        assert!(sample.contains("Repair session"));
+        assert_eq!(sample.chars().count(), 1024);
+        assert!(sample.contains("工具😀"));
         assert!(
             db.session_title_tenant("other", key.key_id, session)
                 .await
