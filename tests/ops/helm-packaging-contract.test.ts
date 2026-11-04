@@ -251,8 +251,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(deployment.spec.template.spec.initContainers.find(item => item.name === 'prepare-plugin-inventory')!.image, expected, `${role}: init/runtime image compatibility`);
     }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
-    count('default', 'maxUnavailable: 0', 3);
-    count('default', 'maxSurge: 1', 3);
+    count('default', 'maxUnavailable: 0', 1);
+    count('default', 'maxSurge: 1', 1);
     count('default', /readinessProbe:\s+httpGet: \{ path: "?\/readyz"?, port: http \}/g, 3);
     const services = parseAllDocuments(output.default!).map(document => document.toJSON()).filter(document => document?.kind === 'Service');
     for (const role of ['gateway', 'control']) {

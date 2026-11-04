@@ -6,20 +6,31 @@ use std::{fs::File, path::Path};
 use crate::error::AppError;
 
 pub(super) fn write_lock(inventory: &Path) -> Result<File, AppError> {
-    let lock = std::fs::OpenOptions::new()
+    let lock = open_lock(inventory)?;
+    // The descriptor stays owned by the blocking task until publication + fsync
+    // finish, even if its HTTP caller disconnects.
+    lock.lock()
+        .map_err(|_| AppError::internal("plugin_inventory_lock_acquire"))?;
+    Ok(lock)
+}
+
+pub(super) fn try_write_lock(inventory: &Path) -> Result<File, AppError> {
+    let lock = open_lock(inventory)?;
+    // Optional startup preparation must not wait for a still-running writer.
+    // --allow-unavailable leaves recovery to the authority inside the server.
+    lock.try_lock()
+        .map_err(|_| AppError::capacity_error("plugin_installation_lock"))?;
+    Ok(lock)
+}
+
+fn open_lock(inventory: &Path) -> Result<File, AppError> {
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(inventory.with_extension("lock"))
-        .map_err(|_| AppError::internal("plugin_inventory_lock_open"))?;
-    // Called only from CLI initialization or an owned blocking task. Queue
-    // competing controls instead of returning a transient installation 503.
-    // The descriptor stays owned by that task until publication + fsync finish,
-    // even if its HTTP caller disconnects.
-    lock.lock()
-        .map_err(|_| AppError::internal("plugin_inventory_lock_acquire"))?;
-    Ok(lock)
+        .map_err(|_| AppError::internal("plugin_inventory_lock_open"))
 }
 
 #[cfg(test)]
@@ -53,6 +64,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let inventory = directory.path().join("inventory.json");
         let guard = write_lock(&inventory).unwrap();
+        assert!(super::super::prepare::prepare_inventory_directory(directory.path()).is_err());
         let run_child = |locked: bool| {
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
