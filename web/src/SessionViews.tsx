@@ -17,6 +17,26 @@ import { credentialDisplayName } from './identityPresentation.js';
 
 const semanticPalette = ['#6859d9', '#18a999', '#e68a2e', '#d74f70', '#4078c0', '#8a63b8'];
 
+function identitySourceLabel(source: string | undefined, t: (key: string) => string) {
+  if (source === 'header:thread-id') return t('sessions.identityHeaderThread');
+  if (source?.startsWith('body:') && source.endsWith('thread_id')) return t('sessions.identityBodyThread');
+  if (source === 'header:x-mtc-conversation-id') return t('sessions.identityExplicit');
+  if (source === 'body:prompt_cache_key') return t('sessions.identityCache');
+  if (source === 'compatibility_session_header' || source === 'compatibility_session_body' || source === 'legacy_compatibility_hint') return t('sessions.identityCompatibility');
+  return t('sessions.identityUnrecorded');
+}
+
+function executionLabelName(key: string, t: (key: string) => string) {
+  if (key === 'mtc_session_identity_source') return t('sessions.identitySource');
+  if (key === 'mtc_client_session_id') return t('sessions.clientSharedSession');
+  if (key === 'mtc_parent_thread_id') return t('sessions.parentThread');
+  return key;
+}
+
+function executionLabelValue(key: string, value: string, t: (key: string) => string) {
+  return key === 'mtc_session_identity_source' ? identitySourceLabel(value, t) : value;
+}
+
 const formatMetricNumber = formatMetricDisplay;
 const formatCurrency = (value: string, currency: string, locale: Locale) => formatCurrencyDisplay(value, currency, locale).text;
 const formatMilliseconds = (value: number | null, locale: Locale) => formatDurationDisplay(value, locale).text;
@@ -107,7 +127,7 @@ function SemanticExecutionPanel({ detail }: { detail: LogicalSessionDetail }) {
       {responseId && <span><small>{t('sessions.response')}</small><code>{responseId}</code></span>}
       {branchId && <span><small>{t('sessions.branch')}</small><code>{branchId}</code></span>}
       {compacted && <span><small>{t('sessions.compaction')}</small><b>{t('sessions.compacted')}</b></span>}
-      {semantics.labels.map(({ key, values, conflict }) => <span key={key} className={conflict ? 'status pending' : undefined}><small>{key}</small><b>{values.join(conflict ? ' ≠ ' : '')}</b></span>)}
+      {semantics.labels.map(({ key, values, conflict }) => <span key={key} className={conflict ? 'status pending' : undefined}><small>{executionLabelName(key, t)}</small><b>{values.map(value => executionLabelValue(key, value, t)).join(conflict ? ' ≠ ' : '')}</b></span>)}
     </div>}
     <div className="semantic-grid">
       <div className="execution-lanes"><div className="execution-title"><h4>{t('sessions.executionTimeline')}</h4><small>{t('sessions.timelineRange', { duration: formatMilliseconds(timelineDuration, locale) })}</small></div>{observations.map((request, index) => {
@@ -260,7 +280,7 @@ function SessionActivity({ detail, summary, currency, loading, onSelect }: {
     <aside className="session-actor-outline" aria-label={t('sessions.semantic')}>
       <div className="session-outline-heading"><span className="eyebrow">{t('sessions.semantic')}</span><b>{actors.size}</b></div>
       <div className="session-actor-list">{[...actors.values()].map((actor) => <span className="session-actor" key={actor.label} title={actor.label}><b>{actor.label}</b><small>{formatMetricNumber(actor.requestIds.length, locale).text}</small></span>)}</div>
-      {semantic.labels.length > 0 && <div className="session-labels">{semantic.labels.map((label) => <span key={label.key} className={label.conflict ? 'status pending' : undefined}><small>{label.key}</small><b>{label.values.join(label.conflict ? ' ≠ ' : '')}</b></span>)}</div>}
+      {semantic.labels.length > 0 && <div className="session-labels">{semantic.labels.map((label) => <span key={label.key} className={label.conflict ? 'status pending' : undefined}><small>{executionLabelName(label.key, t)}</small><b>{label.values.map(value => executionLabelValue(label.key, value, t)).join(label.conflict ? ' ≠ ' : '')}</b></span>)}</div>}
     </aside>
     <section className="session-event-feed" aria-label={t('sessions.timeline')}>
       <div className="session-feed-heading"><div><span className="eyebrow">{t('sessions.timeline')}</span><h3>{t('sessions.executionTimeline')}</h3></div><span>{formatMetricNumber(requests.length, locale).text}</span></div>
@@ -309,6 +329,9 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
   const { locale, t } = useI18n();
   const declaredSessionName = latestDeclaredSessionName(detail);
   const reportedSessionId = [...detail.requests].reverse().find((request) => request.structure?.session_id)?.structure?.session_id;
+  const reportedIdentitySources = [...new Set(detail.requests
+    .filter(request => request.structure?.session_id)
+    .map(request => identitySourceLabel(request.execution?.labels?.mtc_session_identity_source, t)))];
   const fallback = sessionFallback(detail, summary);
   const title = detail.unlinked
     ? t('sessions.unlinkedRequests')
@@ -327,7 +350,7 @@ export function SessionDetailSurface({ detail, summary, currency, showDiagnostic
     <header className="session-detail-heading"><div><span className="eyebrow">{t('sessions.logicalSession')}</span><h2>{title}</h2>{detail.unlinked && <p className="mtc-secondary-text">{t('sessions.unlinkedDetail')}</p>}</div>{onClose && <Button appearance="secondary" onClick={onClose} aria-label={t('common.close')}>×</Button>}</header>
     {titleAction}
     {taskRelations}
-    {showDiagnosticIds && <div className="session-diagnostics"><Disclosure title={t('sessions.diagnostics')}><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /></>}</Disclosure></div>}
+    {showDiagnosticIds && <div className="session-diagnostics"><Disclosure title={t('sessions.diagnostics')}><small>{t('filter.field.session_id')}</small><code className="break-anywhere">{detail.session_id}</code><CopyDiagnostic value={detail.session_id} kind="session" />{reportedSessionId && <><small>{t('sessions.reportedSession')}</small><code className="break-anywhere">{reportedSessionId}</code><CopyDiagnostic value={reportedSessionId} kind="session" /><small>{t('sessions.identitySource')}</small><span>{reportedIdentitySources.join(' · ')}</span></>}</Disclosure></div>}
     {contextLoader && !detail.unlinked && <SessionContextPanel key={`${summary?.key_id}:${detail.session_id}`} detail={detail} loader={contextLoader} />}
     {!(detail.unlinked && detail.session_id.startsWith('unlinked:')) && (contextLoader && !detail.unlinked
       ? <DeferredSessionDetails label={t('sessionReplay.originalArchives')}><SessionReplayPanel detail={detail} scopeKey={summary?.key_id ?? detail.session_id} loadArchiveDetail={loadReplayArchive} loadArchiveRange={loadArchiveRange} onLoadEarlierRequests={onLoadOlder} loadingEarlier={loading} /></DeferredSessionDetails>
