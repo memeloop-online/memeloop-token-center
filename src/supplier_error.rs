@@ -169,11 +169,14 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
     {
         return error.clone();
     }
-    let code = error.get("code").and_then(|code| match code {
-        Value::String(code) => Some(code.clone()),
-        Value::Number(code) => Some(code.to_string()),
-        _ => None,
-    });
+    let code = error
+        .get("code")
+        .filter(|code| !code.is_null())
+        .map(|code| {
+            code.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| code.to_string())
+        });
     let message = error
         .get("message")
         .or_else(|| error.get("msg"))
@@ -203,7 +206,10 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
     if let Some(fields) = error.as_object() {
         let details: serde_json::Map<String, Value> = fields
             .iter()
-            .filter(|(key, _)| !matches!(key.as_str(), "code" | "message" | "msg"))
+            .filter(|(key, _)| {
+                !matches!(key.as_str(), "code" | "message")
+                    && (key.as_str() != "msg" || error.get("message").is_some())
+            })
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         if !details.is_empty() {
