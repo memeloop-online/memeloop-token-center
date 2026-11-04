@@ -5810,7 +5810,7 @@ async fn buffered_response_usage_uses_trusted_overhead_and_settles_http_200() {
 }
 
 #[tokio::test]
-async fn buffered_response_usage_rejects_usage_above_total_reservation() {
+async fn buffered_response_usage_settles_provider_context_above_total_reservation() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/responses"))
@@ -5829,21 +5829,28 @@ async fn buffered_response_usage_rejects_usage_above_total_reservation() {
     });
     assert_eq!(serde_json::to_vec(&request).unwrap().len(), 98);
     let response = send_response_usage_request(&fixture, &request).await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_invalid_usage"))
-        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        completed_response_with_usage(400, 7)
+    );
+    wait_for_request_settlement(&fixture, 1).await;
     let rows = fixture
         .state
         .db
         .list_requests(fixture.key_id, 10)
         .await
         .unwrap();
-    assert_eq!(rows[0].status_code, Some(502));
-    assert_eq!(
-        rows[0].error_code.as_deref(),
-        Some("upstream_invalid_usage")
-    );
-    assert!(rows[0].usage.tokens.is_none());
+    assert_eq!(rows[0].status_code, Some(200));
+    assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (400, 7));
+    assert_eq!(rows[0].billing.cost.as_deref(), Some("0.000407"));
+    assert_eq!(rows[0].error_code, None);
+    assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-usage-contract"))
+        .await;
+    upstream.verify().await;
 }
 
 #[tokio::test]
@@ -6080,13 +6087,7 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
             502,
             Some("upstream_failed_response"),
         ),
-        (
-            "stream-over-reservation",
-            400,
-            Value::Null,
-            502,
-            Some("upstream_invalid_usage"),
-        ),
+        ("stream-provider-context", 400, Value::Null, 200, None),
     ] {
         let upstream = MockServer::start().await;
         let completed = completed_response_with_usage(input_tokens, 7);
@@ -6147,7 +6148,14 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
         assert_eq!(rows[0].status_code, Some(expected_status));
         assert_eq!(rows[0].error_code.as_deref(), expected_error);
         if expected_status == 200 {
-            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (309, 7));
+            assert_eq!(
+                (rows[0].input_tokens, rows[0].output_tokens),
+                (input_tokens, 7)
+            );
+            assert_eq!(
+                rows[0].billing.cost,
+                Some(crate::model::micros_to_decimal_string(input_tokens + 7))
+            );
             assert_exactly_once_side_effects(
                 &fixture,
                 rows[0].request_id,
