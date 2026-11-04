@@ -491,7 +491,8 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
         assert!(delivered.contains("ModelAccountTpmRateLimitExceeded"));
         assert!(delivered.contains("private-token-canary"));
         assert!(delivered.contains("private-body-canary"));
-        for forbidden in ["private-debug-canary", "[DONE]", "response.completed"] {
+        assert!(delivered.contains("private-debug-canary"));
+        for forbidden in ["[DONE]", "response.completed"] {
             assert!(!delivered.contains(forbidden));
         }
         let receipt =

@@ -27693,18 +27693,34 @@
         "properties": {
           "code": {
             "type": "string",
-            "enum": [
-              "no_active_plan",
-              "insufficient_quota",
-              "authentication_invalid",
-              "authentication_expired",
-              "rate_limited",
-              "model_unavailable"
-            ]
+            "description": "Classified reason code, or the original upstream code when unfamiliar."
           },
           "message": {
             "type": "string",
-            "description": "Fixed explanation reconstructed from the supported reason; never stored arbitrary supplier text."
+            "description": "Explanation of a classified reason, or the original upstream message when unfamiliar."
+          },
+          "category": {
+            "type": "string",
+            "description": "Coarse failure category; upstream indicates an unclassified provider error."
+          },
+          "retryable": {
+            "type": "boolean",
+            "description": "Retry advice for recognized failures. Omitted when unknown; does not authorize replay."
+          },
+          "action": {
+            "type": "string",
+            "description": "Suggested recovery action for display."
+          },
+          "provider_code": {
+            "type": "string",
+            "description": "Original upstream error code."
+          },
+          "provider_message": {
+            "type": "string",
+            "description": "Original upstream error message, including unfamiliar text."
+          },
+          "provider_details": {
+            "description": "Additional original upstream error fields, retained as JSON."
           }
         }
       },

@@ -18,6 +18,8 @@ pub struct SupplierError {
     pub provider_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_details: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -38,6 +40,8 @@ struct InlineError<'a> {
     mtc_provider_code: Option<&'a str>,
     #[serde(default)]
     mtc_provider_message: Option<&'a str>,
+    #[serde(default)]
+    mtc_provider_details: Option<serde_json::Value>,
 }
 
 impl UpstreamReason {
@@ -77,6 +81,7 @@ impl UpstreamReason {
             action: self.action().to_owned(),
             provider_code: None,
             provider_message: None,
+            provider_details: None,
         }
     }
 }
@@ -118,12 +123,14 @@ pub fn supplier_error_from_inline_json(value: Option<&str>) -> Option<SupplierEr
             action: "inspect_upstream_error".to_owned(),
             provider_code: None,
             provider_message: None,
+            provider_details: None,
         });
     supplier.provider_code = error.mtc_provider_code.map(str::to_owned);
     supplier.provider_message = error
         .mtc_provider_message
         .or_else(|| (error.message != supplier.message).then_some(error.message))
         .map(str::to_owned);
+    supplier.provider_details = error.mtc_provider_details;
     Some(supplier)
 }
 
@@ -181,6 +188,22 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
     }
     if let Some(reason) = reason {
         projected["mtc_safe_reason"] = json!(reason.code());
+    }
+    if let Some(kind) = error.get("type") {
+        projected["mtc_provider_type"] = kind.clone();
+    }
+    if let Some(param) = error.get("param") {
+        projected["param"] = param.clone();
+    }
+    if let Some(fields) = error.as_object() {
+        let details: serde_json::Map<String, Value> = fields
+            .iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "code" | "message" | "msg"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        if !details.is_empty() {
+            projected["mtc_provider_details"] = Value::Object(details);
+        }
     }
     projected
 }

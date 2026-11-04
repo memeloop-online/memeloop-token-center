@@ -567,7 +567,8 @@ impl ResponsesSseCapture {
                 }
             }
         }
-        let reports_error = value.get("error").is_some_and(|error| !error.is_null())
+        let reports_error = matches!(payload_kind, Some(ResponsesSseEventKind::Failed))
+            || value.get("error").is_some_and(|error| !error.is_null())
             || value
                 .pointer("/response/error")
                 .is_some_and(|error| !error.is_null());

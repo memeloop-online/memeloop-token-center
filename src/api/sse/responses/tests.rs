@@ -32,6 +32,36 @@ fn known_policy_and_unknown_upstream_errors_keep_original_explanations() {
     }
 }
 
+#[test]
+fn observed_policy_rejection_after_progress_reaches_client_with_original_reason() {
+    let explanation =
+        "This request was blocked by our safety systems. Reason: Potentially unintended activity.";
+    let input = format!(
+        "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-policy\"}}}}\n\n\
+         data: {{\"type\":\"response.in_progress\",\"response\":{{\"id\":\"resp-policy\"}}}}\n\n\
+         data: {{\"type\":\"response.metadata\",\"response_id\":\"resp-policy\"}}\n\n\
+         event: error\ndata: {}\n\n\
+         data: {{\"type\":\"response.output_text.delta\",\"delta\":\"after-failure\"}}\n\n",
+        json!({"type":"error","error":{
+            "code":"misalignment_policy_violation",
+            "type":"invalid_request_error",
+            "message":explanation,
+        }}),
+    );
+    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    let mut output = Vec::new();
+    for chunk in input.as_bytes().chunks(7) {
+        output.extend_from_slice(&sanitizer.push(chunk).unwrap());
+    }
+    output.extend_from_slice(&sanitizer.finish().unwrap());
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(text.matches("\"type\":\"response.failed\"").count(), 1);
+    assert!(text.contains("\"code\":\"misalignment_policy_violation\""));
+    assert!(text.contains(explanation));
+    assert!(!text.contains("\"code\":\"upstream_rejected\""));
+    assert!(!text.contains("after-failure"));
+}
+
 fn event_with_field_count(fields: usize) -> Vec<u8> {
     let mut event = b"x\n".repeat(fields);
     event.push(b'\n');
@@ -54,11 +84,8 @@ fn sanitizer_preserves_failure_explanation_and_rejects_terminal_conflicts() {
     }
     let output = String::from_utf8(output).unwrap();
     assert!(output.contains("provider-secret"));
-    for secret in [
-        "secret-token",
-        "failure-comment-secret",
-        "post-terminal-secret",
-    ] {
+    assert!(output.contains("secret-token"));
+    for secret in ["failure-comment-secret", "post-terminal-secret"] {
         assert!(!output.contains(secret));
     }
 
