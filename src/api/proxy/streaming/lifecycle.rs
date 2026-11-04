@@ -392,6 +392,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     state.pending_terminals.submit_with_preparation(
         snapshot,
         memory.clone(),
+        conversation.is_some(),
         prepare_terminal_conversation(
             conversation,
             memory,

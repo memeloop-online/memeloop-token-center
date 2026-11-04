@@ -3504,6 +3504,7 @@ async fn finish_buffered_request_before_deadline(
     request.state.pending_terminals.submit_with_preparation(
         snapshot,
         (body.clone(), request.memory.clone(), _response_buffer),
+        conversation.is_some(),
         prepare_terminal_conversation(
             conversation,
             request.memory.clone(),

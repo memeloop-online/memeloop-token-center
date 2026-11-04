@@ -1,4 +1,5 @@
 use super::*;
+mod receipt_durability;
 
 async fn owned_enqueued_source(
     fixture: &CodexRouteFixture,
@@ -1125,14 +1126,13 @@ async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_
         .await
         .unwrap();
     assert!(String::from_utf8_lossy(&delivered).contains("output despite unacknowledged journal"));
-    assert_eq!(
+    wait_for_request_settlement(&fixture, 1).await;
+    assert!(
         fixture
             .state
             .pending_terminals
-            .failed_publications_for_test(),
-        0
+            .failed_publications_for_test() > 0
     );
-    wait_for_request_settlement(&fixture, 1).await;
     let record = wait_for_operational(&fixture).await;
     assert_eq!(record.status_code, Some(200));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
