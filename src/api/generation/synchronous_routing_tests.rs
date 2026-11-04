@@ -280,6 +280,13 @@ async fn fixture_with_archive(
     upstream: &MockServer,
     archive_backend: crate::config::ArchiveBackend,
 ) -> Fixture {
+    fixture_with_uri(&upstream.uri(), archive_backend).await
+}
+
+async fn fixture_with_uri(
+    upstream_uri: &str,
+    archive_backend: crate::config::ArchiveBackend,
+) -> Fixture {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
         "sqlite://{}?mode=rwc",
@@ -290,11 +297,27 @@ async fn fixture_with_archive(
     config.archive_path = Some(directory.path().join("archive").display().to_string());
     let mut state = AppState::initialize(config).await.unwrap();
     let tenant_external = "synchronous-strategy";
-    let account=state.db.create_upstream_account(CreateUpstreamAccountInput {
-        tenant_external_id:tenant_external.into(), name:"image mock".into(), driver:"http-json".into(),
-        config:json!({"base_url":format!("{}/v1",upstream.uri()),"network_scope":"private"}),
-        credential:UpstreamCredential::ApiKey { value:"image-fixture-secret".into(),header:"authorization".into(),prefix:"Bearer ".into() },oauth_session_id:None,oauth_driver:None,oauth_refresh_url:None,
-    },state.config.key_pepper.as_bytes()).await.unwrap();
+    let account = state
+        .db
+        .create_upstream_account(
+            CreateUpstreamAccountInput {
+                tenant_external_id: tenant_external.into(),
+                name: "image mock".into(),
+                driver: "http-json".into(),
+                config: json!({"base_url":format!("{upstream_uri}/v1"),"network_scope":"private"}),
+                credential: UpstreamCredential::ApiKey {
+                    value: "image-fixture-secret".into(),
+                    header: "authorization".into(),
+                    prefix: "Bearer ".into(),
+                },
+                oauth_session_id: None,
+                oauth_driver: None,
+                oauth_refresh_url: None,
+            },
+            state.config.key_pepper.as_bytes(),
+        )
+        .await
+        .unwrap();
     let route = state
         .db
         .create_model_route(CreateModelRouteInput {
@@ -542,35 +565,61 @@ async fn image_claim_expired_before_send_can_be_taken_over_once() {
 }
 
 #[tokio::test]
-async fn cancelling_after_image_send_keeps_durable_no_replay_fence() {
-    let upstream = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/v1/images/generations"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_delay(Duration::from_secs(30))
-                .set_body_json(json!({"created":1,"data":[{"b64_json":"bW9jay1wbmc="}]})),
-        )
-        .expect(1)
-        .mount(&upstream)
-        .await;
-    let fixture = fixture(&upstream).await;
+async fn cancelling_after_image_send_keeps_owner_and_durable_no_replay_fence() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("http://{}", listener.local_addr().unwrap());
+    let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let upstream = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0; 4096];
+            let read = socket.read(&mut chunk).await.unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap();
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        received_tx.send(()).unwrap();
+        release_rx.await.unwrap();
+        let body = br#"{"created":1,"data":[{"b64_json":"bW9jay1wbmc="}]}"#;
+        socket.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ).as_bytes()).await.unwrap();
+        socket.write_all(body).await.unwrap();
+        socket.shutdown().await.unwrap();
+        listener
+    });
+    let fixture = fixture_with_uri(&uri, crate::config::ArchiveBackend::Memory).await;
+    let permits_before = fixture.state.image_response_permits.available_permits();
     let state = fixture.state.clone();
     let credential = fixture.credential.clone();
     let task = tokio::spawn(async move { post(state, &credential, "cancel-after-send").await });
-    tokio::time::timeout(Duration::from_secs(10), async {
-        while upstream.received_requests().await.unwrap().is_empty() {
-            assert!(
-                !task.is_finished(),
-                "request ended before mock observed the send"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), received_rx)
+        .await
+        .unwrap()
+        .unwrap();
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        fixture.state.image_response_permits.available_permits(),
+        permits_before - 1
+    );
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("UPDATE synchronous_image_idempotency SET lease_expires_at = 0 WHERE key_id = $1")
         .bind(fixture.key_id.to_string())
@@ -588,7 +637,36 @@ async fn cancelling_after_image_send_keeps_durable_no_replay_fence() {
     )
     .await;
     assert_eq!(repeated.status(), StatusCode::CONFLICT);
-    assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
+    drop(repeated);
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let response = post(
+                fixture.state.clone(),
+                &fixture.credential,
+                "cancel-after-send",
+            )
+            .await;
+            if response.status() == StatusCode::OK {
+                break;
+            }
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the original owner finishes and its durable result becomes replayable");
+    assert_eq!(
+        fixture.state.image_response_permits.available_permits(),
+        permits_before
+    );
+    let listener = upstream.await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err(),
+        "replaying the key must not resubmit the paid operation"
+    );
 }
 
 #[tokio::test]
