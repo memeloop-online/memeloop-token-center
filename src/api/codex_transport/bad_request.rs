@@ -18,6 +18,7 @@ const MAX_RETRYABLE_ERROR_WAIT: std::time::Duration = std::time::Duration::from_
 pub(in crate::api) enum BadRequestDisposition {
     DefiniteTransient,
     DefiniteOrdinary,
+    DefiniteRejection(crate::supplier_error::SafeReason),
     Unclassifiable(BadRequestUnclassifiableReason),
 }
 
@@ -64,7 +65,9 @@ fn classification_diagnostic(
     disposition: BadRequestDisposition,
 ) -> Option<(&'static str, &'static str)> {
     Some(match disposition {
-        BadRequestDisposition::DefiniteOrdinary => return None,
+        BadRequestDisposition::DefiniteOrdinary | BadRequestDisposition::DefiniteRejection(_) => {
+            return None;
+        }
         BadRequestDisposition::DefiniteTransient => ("transient", "known_transient"),
         BadRequestDisposition::Unclassifiable(reason) => (
             "unclassifiable",
@@ -102,7 +105,10 @@ async fn inspect_bad_request(
         }
         Ok(BoundedBadRequestBody::Value(value)) => {
             observe_ordinary_bad_request(request_id, &value);
-            BadRequestDisposition::DefiniteOrdinary
+            crate::supplier_error::reason_from_value(&value).map_or(
+                BadRequestDisposition::DefiniteOrdinary,
+                BadRequestDisposition::DefiniteRejection,
+            )
         }
         Ok(BoundedBadRequestBody::TooLarge) => {
             BadRequestDisposition::Unclassifiable(BadRequestUnclassifiableReason::TooLarge)
@@ -1173,13 +1179,17 @@ mod tests {
                 "invalid_request_error",
                 "unsupported_value",
                 "Unsupported parameter: 'temperature'",
-                BadRequestDisposition::DefiniteOrdinary,
+                BadRequestDisposition::DefiniteRejection(
+                    crate::supplier_error::SafeReason::UnsupportedValue,
+                ),
             ),
             (
                 "invalid_request_error",
                 "unknown_parameter",
                 "Unknown parameter: 'temperature'",
-                BadRequestDisposition::DefiniteOrdinary,
+                BadRequestDisposition::DefiniteRejection(
+                    crate::supplier_error::SafeReason::UnsupportedParameter,
+                ),
             ),
             (
                 "overloaded_error",
@@ -1232,7 +1242,11 @@ mod tests {
             assert!(!logged.contains("Unsupported parameter"));
             assert!(!logged.contains("Unknown parameter"));
             let event: Value = serde_json::from_str(logged.trim()).unwrap();
-            if expected == BadRequestDisposition::DefiniteOrdinary {
+            if matches!(
+                expected,
+                BadRequestDisposition::DefiniteOrdinary
+                    | BadRequestDisposition::DefiniteRejection(_)
+            ) {
                 assert_eq!(event["fields"]["upstream_error_param"], "sampling");
                 assert_eq!(
                     event["fields"]["upstream_error_reason"],

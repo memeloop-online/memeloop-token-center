@@ -28,6 +28,9 @@ impl CodexRetryState {
         disposition: codex_transport::BadRequestDisposition,
     ) -> AttemptControl {
         let error = match disposition {
+            codex_transport::BadRequestDisposition::DefiniteRejection(reason) => {
+                ProxySendError::CodexRejection(reason)
+            }
             codex_transport::BadRequestDisposition::DefiniteTransient => {
                 ProxySendError::RetryableCodexBadRequest
             }
@@ -135,7 +138,8 @@ pub(super) fn observe_bad_request_disposition(
         codex_transport::BadRequestDisposition::DefiniteTransient => {
             CodexBadRequestClassification::DefiniteTransient
         }
-        codex_transport::BadRequestDisposition::DefiniteOrdinary => {
+        codex_transport::BadRequestDisposition::DefiniteOrdinary
+        | codex_transport::BadRequestDisposition::DefiniteRejection(_) => {
             CodexBadRequestClassification::DefiniteOrdinary
         }
         codex_transport::BadRequestDisposition::Unclassifiable(reason) => match reason {

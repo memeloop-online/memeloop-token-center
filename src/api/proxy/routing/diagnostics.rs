@@ -13,7 +13,11 @@ fn classification(status: Option<StatusCode>, error: Option<&ProxySendError>) ->
         }
         (
             None,
-            Some(ProxySendError::CodexBadRequest | ProxySendError::RetryableCodexBadRequest),
+            Some(
+                ProxySendError::CodexBadRequest
+                | ProxySendError::RetryableCodexBadRequest
+                | ProxySendError::CodexRejection(_),
+            ),
         ) => "upstream_rejected_request",
         _ => "inconsistent_evidence",
     }

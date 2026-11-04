@@ -401,6 +401,11 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
     refs.view.supplier_error = Some(crate::supplier_error::SupplierError {
         code: "no_active_plan".to_owned(),
         message: "当前账号没有可用套餐".to_owned(),
+        category: "quota".to_owned(),
+        retryable: false,
+        action: "check_plan".to_owned(),
+        provider_code: None,
+        provider_message: None,
     });
     let response = request_detail_response(&state, refs).await.unwrap();
     let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
@@ -409,7 +414,8 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
     let detail: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         detail["supplier_error"],
-        json!({"code": "no_active_plan", "message": "当前账号没有可用套餐"})
+        json!({"code": "no_active_plan", "message": "当前账号没有可用套餐",
+            "category": "quota", "retryable": false, "action": "check_plan"})
     );
     assert_eq!(detail["status_code"], 402);
     assert_eq!(detail["error_code"], "http_402");
