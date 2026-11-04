@@ -164,6 +164,11 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
         .filter(|error| !error.is_null())
         .or_else(|| value.get("error"))
         .unwrap_or(value);
+    if error.get("type").and_then(Value::as_str) == Some("upstream_error")
+        && error.get("mtc_provider_message").is_some()
+    {
+        return error.clone();
+    }
     let code = error.get("code").and_then(|code| match code {
         Value::String(code) => Some(code.clone()),
         Value::Number(code) => Some(code.to_string()),
