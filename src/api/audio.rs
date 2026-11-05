@@ -183,7 +183,6 @@ pub(super) async fn create_audio_transcription(
         resources.raw_request.clone(),
         resources.memory.clone(),
     );
-    let deadline = tokio::time::Instant::now() + SYNCHRONOUS_AUDIO_DEADLINE;
     let worker = tokio::spawn(async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
         let result = async move {
@@ -215,10 +214,10 @@ pub(super) async fn create_audio_transcription(
                 }
             };
             let _activity = state.metrics.active_upstream(&route.driver, "audio");
-            let upstream_result = tokio::time::timeout_at(deadline, request.send()).await;
+            let upstream_result = request.send().await;
             let upstream = match upstream_result {
-                Ok(Ok(response)) => response,
-                Ok(Err(_error)) => {
+                Ok(response) => response,
+                Err(_error) => {
                     super::proxy::persistence::record_capture_failure(&state, identity);
                     attempt.complete(audio_transport_failure()).await;
                     finish_audio_request(
@@ -235,23 +234,6 @@ pub(super) async fn create_audio_transcription(
                     .await?;
                     return Err(AppError::upstream("audio_upstream_transport_failed"));
                 }
-                Err(_) => {
-                    super::proxy::persistence::record_capture_failure(&state, identity);
-                    attempt.complete(audio_transport_failure()).await;
-                    finish_audio_request(
-                        &state,
-                        &reservation,
-                        request_id,
-                        key.tenant_id,
-                        audio,
-                        started,
-                        StatusCode::BAD_GATEWAY,
-                        0,
-                        Some("audio_upstream_timeout"),
-                    )
-                    .await?;
-                    return Err(AppError::upstream("audio_upstream_timed_out"));
-                }
             };
             state.metrics.observe_upstream(
                 &route.driver,
@@ -262,33 +244,11 @@ pub(super) async fn create_audio_transcription(
             let upstream_status = upstream.status();
             // Parsing, rate-limit observation and safe delivery may stop early.
             // The same original-body reader owns the bounded archive and drains
-            // the remaining supplier bytes under this absolute audio deadline.
+            // the remaining supplier bytes independently of safe delivery.
             let upstream = super::proxy::upstream_response::UpstreamResponse::from(upstream)
-                .with_body_timeouts(deadline, SYNCHRONOUS_AUDIO_DEADLINE)
                 .with_original_archive_capture(&state, identity);
             if upstream_status == StatusCode::TOO_MANY_REQUESTS {
-                let kind = match tokio::time::timeout_at(
-                    deadline,
-                    super::proxy::classify_archived_media_rate_limit(upstream),
-                )
-                .await
-                {
-                    Ok(kind) => kind,
-                    Err(_) => {
-                        attempt.complete(audio_transport_failure()).await;
-                        finish_audio_failure(
-                            &state,
-                            &reservation,
-                            request_id,
-                            key.tenant_id,
-                            audio,
-                            started,
-                            "audio_upstream_timeout",
-                        )
-                        .await?;
-                        return Err(AppError::upstream("audio_upstream_timed_out"));
-                    }
-                };
+                let kind = super::proxy::classify_archived_media_rate_limit(upstream).await;
                 attempt
                     .complete(MediaAttemptTerminal::Failed {
                         kind,
@@ -344,7 +304,7 @@ pub(super) async fn create_audio_transcription(
                     crate::error::ErrorFacts::new().stage("audio_upstream"),
                 ));
             }
-            let upstream_body = match read_audio_response_bounded(upstream, deadline).await {
+            let upstream_body = match read_audio_response_bounded(upstream).await {
                 Ok(body) => body,
                 Err(error) => {
                     attempt.complete(error.terminal()).await;
@@ -718,7 +678,6 @@ fn upstream_form(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AudioResponseReadError {
-    Timeout,
     TooLarge,
     Transport,
 }
@@ -726,7 +685,6 @@ enum AudioResponseReadError {
 impl AudioResponseReadError {
     fn code(self) -> &'static str {
         match self {
-            Self::Timeout => "audio_upstream_timeout",
             Self::TooLarge => "audio_upstream_response_too_large",
             Self::Transport => "audio_upstream_response_stream",
         }
@@ -734,7 +692,7 @@ impl AudioResponseReadError {
 
     fn terminal(self) -> MediaAttemptTerminal {
         match self {
-            Self::Timeout | Self::Transport => audio_transport_failure(),
+            Self::Transport => audio_transport_failure(),
             Self::TooLarge => MediaAttemptTerminal::invalid_response(),
         }
     }
@@ -750,7 +708,6 @@ fn audio_transport_failure() -> MediaAttemptTerminal {
 
 async fn read_audio_response_bounded(
     response: super::proxy::upstream_response::UpstreamResponse,
-    deadline: tokio::time::Instant,
 ) -> Result<Bytes, AudioResponseReadError> {
     if response
         .content_length()
@@ -758,22 +715,17 @@ async fn read_audio_response_bounded(
     {
         return Err(AudioResponseReadError::TooLarge);
     }
-    collect_audio_response_stream(response.bytes_stream(), deadline).await
+    collect_audio_response_stream(response.bytes_stream()).await
 }
 
-async fn collect_audio_response_stream<S, E>(
-    stream: S,
-    deadline: tokio::time::Instant,
-) -> Result<Bytes, AudioResponseReadError>
+async fn collect_audio_response_stream<S, E>(stream: S) -> Result<Bytes, AudioResponseReadError>
 where
     S: futures_util::Stream<Item = Result<Bytes, E>>,
 {
     futures_util::pin_mut!(stream);
     let mut body = Vec::new();
     loop {
-        let next = tokio::time::timeout_at(deadline, stream.next())
-            .await
-            .map_err(|_| AudioResponseReadError::Timeout)?;
+        let next = stream.next().await;
         let Some(chunk) = next else {
             break;
         };
@@ -1079,24 +1031,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn upstream_body_reader_enforces_the_original_absolute_deadline() {
-        let stream = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
-        let error = collect_audio_response_stream(
-            stream,
-            tokio::time::Instant::now() + Duration::from_millis(10),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error, AudioResponseReadError::Timeout);
-        assert!(matches!(
-            error.terminal(),
-            MediaAttemptTerminal::Failed {
-                kind: crate::db::UpstreamFailureKind::Connection,
-                reason: crate::metrics::UpstreamHealthReason::Connection,
-                ..
-            }
-        ));
+    #[tokio::test(start_paused = true)]
+    async fn upstream_body_reader_waits_for_audio_after_ten_minutes() {
+        let stream = futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_secs(11 * 60)).await;
+            Ok::<_, std::io::Error>(Bytes::from_static(br#"{"text":"complete"}"#))
+        });
+        let body = collect_audio_response_stream(stream).await.unwrap();
+        assert_eq!(body, br#"{"text":"complete"}"#[..]);
     }
 
     #[tokio::test]

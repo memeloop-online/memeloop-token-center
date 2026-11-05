@@ -281,6 +281,27 @@ async fn admit_request_body_for_route(
     reservation: Option<Arc<memory::ProxyMemoryReservation>>,
     request_spool: Option<&request_spool::RequestSpoolAdmission>,
 ) -> Result<Request, GatewayBodyAdmissionError> {
+    let source_backed = matches!(
+        request.uri().path(),
+        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
+    );
+    // Request transport needs a correct replay, not a healthy archive service.
+    // Missing shared admission falls back to an owned local carrier.
+    let local_admission;
+    let request_spool = match request_spool {
+        Some(admission) => admission,
+        None => {
+            local_admission = request_spool::RequestSpoolAdmission::new(
+                std::env::temp_dir().join("memeloop-token-center-request-spool"),
+            );
+            &local_admission
+        }
+    };
+    let maximum = if route_class == GatewayBodyRouteClass::Responses || source_backed {
+        usize::MAX
+    } else {
+        maximum
+    };
     let declared_content_length = declared_content_length(request.headers());
     if request
         .headers()
@@ -305,14 +326,7 @@ async fn admit_request_body_for_route(
     {
         return Err(GatewayBodyAdmissionError::UnsupportedEncoding);
     }
-    let source_backed = matches!(
-        parts.uri.path(),
-        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
-    );
-    if route_class == GatewayBodyRouteClass::Responses
-        || (source_backed
-            && request_spool.is_some_and(request_spool::RequestSpoolAdmission::has_durable_store))
-    {
+    if route_class == GatewayBodyRouteClass::Responses || source_backed {
         let read_maximum = declared_content_length
             .and_then(|length| usize::try_from(length).ok())
             .unwrap_or(maximum)
@@ -325,35 +339,27 @@ async fn admit_request_body_for_route(
             .map(|key| key.0.clone());
         let spool = read_with_deadline(
             deadline,
-            request_spool
-                .ok_or(GatewayBodyAdmissionError::RequestSpoolUnavailable)?
-                .capture_with_memory(
-                    body,
-                    read_maximum,
-                    declared_content_length_usize,
-                    reservation.as_ref(),
-                    std::mem::size_of_val(&parts)
-                        .saturating_add(parts.uri.to_string().len())
-                        .saturating_add(parts.headers.iter().fold(
-                            0usize,
-                            |bytes, (name, value)| {
-                                bytes
-                                    .saturating_add(std::mem::size_of::<(
-                                        axum::http::HeaderName,
-                                        axum::http::HeaderValue,
-                                    )>())
-                                    .saturating_add(name.as_str().len())
-                                    .saturating_add(value.as_bytes().len())
-                            },
-                        )),
-                    body_key.as_deref(),
-                ),
+            request_spool.capture_with_memory(
+                body,
+                read_maximum,
+                declared_content_length_usize,
+                reservation.as_ref(),
+                std::mem::size_of_val(&parts)
+                    .saturating_add(parts.uri.to_string().len())
+                    .saturating_add(parts.headers.iter().fold(0usize, |bytes, (name, value)| {
+                        bytes
+                            .saturating_add(std::mem::size_of::<(
+                                axum::http::HeaderName,
+                                axum::http::HeaderValue,
+                            )>())
+                            .saturating_add(name.as_str().len())
+                            .saturating_add(value.as_bytes().len())
+                    })),
+                body_key.as_deref(),
+            ),
         )
         .await?
         .map_err(|error| match error {
-            request_spool::RequestSpoolCaptureError::MemoryExhausted => {
-                GatewayBodyAdmissionError::CapacityExhausted
-            }
             request_spool::RequestSpoolCaptureError::Unavailable => {
                 GatewayBodyAdmissionError::RequestSpoolUnavailable
             }
@@ -375,7 +381,7 @@ async fn admit_request_body_for_route(
             .as_deref()
             .and_then(|id| uuid::Uuid::parse_str(id).ok())
         {
-            request_spool.unwrap().register_source(request_id, &spool);
+            request_spool.register_source(request_id, &spool);
         }
         if let Some(reservation) = reservation {
             parts.extensions.insert(reservation);
@@ -599,69 +605,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_limit_is_path_specific_and_exact() {
-        let responses_maximum = 16 * 1024 * 1024;
-        for (path, maximum) in [
-            ("/v1/chat/completions", MAX_DEFAULT_BODY),
-            ("/v1/responses", responses_maximum),
-            ("/v1/responses/compact", responses_maximum),
-            ("/v1/images/generations", MAX_IMAGE_BODY),
+    async fn inference_transport_is_independent_of_the_legacy_hot_body_limit() {
+        for path in [
+            "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/responses/compact",
         ] {
-            let exact = Request::post(path)
-                .body(Body::from(vec![b'x'; maximum]))
-                .expect("exact request");
-            assert!(
-                admit_gateway_request_body(
-                    exact,
-                    Arc::new(tokio::sync::Semaphore::new(1)),
-                    Arc::new(tokio::sync::Semaphore::new(1)),
-                    responses_maximum,
-                )
-                .await
-                .is_ok(),
-                "{path} exact limit"
+            let bytes = Bytes::from(vec![b'x'; MAX_DEFAULT_BODY + 1]);
+            let request = Request::post(path)
+                .header(header::CONTENT_LENGTH, bytes.len())
+                .body(Body::from(bytes.clone()))
+                .unwrap();
+            let admitted = admit_gateway_request_body(
+                request,
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+                16,
+            )
+            .await
+            .unwrap();
+            let source = admitted
+                .extensions()
+                .get::<Arc<request_spool::RequestSpool>>()
+                .unwrap();
+            assert_eq!(
+                source.read_all().await.unwrap(),
+                bytes,
+                "{path} preserves every byte without configured archive admission"
             );
-            let over = Request::post(path)
-                .body(Body::from(vec![b'x'; maximum + 1]))
-                .expect("oversized request");
-            assert!(
-                matches!(
-                    admit_gateway_request_body(
-                        over,
-                        Arc::new(tokio::sync::Semaphore::new(1)),
-                        Arc::new(tokio::sync::Semaphore::new(1)),
-                        responses_maximum,
-                    )
-                    .await,
-                    Err(GatewayBodyAdmissionError::Rejected(_))
-                ),
-                "{path} over limit"
-            );
+            assert!(!source.upload_outcome().await);
         }
     }
 
     #[tokio::test]
-    async fn responses_declared_limit_rejection_has_only_safe_fixed_metadata() {
-        let maximum = 16 * 1024 * 1024;
-        let request = Request::post("/v1/responses")
+    async fn image_declared_limit_rejection_has_only_safe_fixed_metadata() {
+        let maximum = MAX_IMAGE_BODY;
+        let request = Request::post("/v1/images/generations")
             .header(header::CONTENT_LENGTH, (maximum + 1).to_string())
             .body(Body::empty())
-            .expect("declared oversized responses request");
-        assert!(matches!(
-            admit_gateway_request_body(
-                request,
-                Arc::new(tokio::sync::Semaphore::new(1)),
-                Arc::new(tokio::sync::Semaphore::new(1)),
-                maximum,
-            )
-            .await,
+            .unwrap();
+        assert!(matches!(admit_gateway_request_body(request,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Arc::new(tokio::sync::Semaphore::new(1)), 16).await,
             Err(GatewayBodyAdmissionError::Rejected(GatewayBodyRejection {
-                route_class: GatewayBodyRouteClass::Responses,
-                declared_content_length: Some(length),
-                limit_bytes,
+                route_class: GatewayBodyRouteClass::Images,
+                declared_content_length: Some(length), limit_bytes,
                 reason: GatewayBodyRejectionReason::DeclaredContentLengthExceedsLimit,
-            })) if length == u64::try_from(maximum + 1).unwrap() && limit_bytes == maximum
-        ));
+            })) if length == u64::try_from(maximum + 1).unwrap() && limit_bytes == maximum));
     }
 
     #[tokio::test]

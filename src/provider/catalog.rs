@@ -465,8 +465,8 @@ impl ProviderCatalog {
                 "video_api": {
                     "title": "Video generation API",
                     "type": "string",
-                    "enum": ["siliconflow-v1", "wasu-wan-v1"],
-                    "description": "Explicit asynchronous video contract: SiliconFlow submit/status or Wasu Wan video-synthesis/tasks. Wasu Wan supports only the verified wan3.0-video reference-image profile."
+                    "enum": ["siliconflow-v1", "wasu-wan-v1", "tkmarket-seedance-v1"],
+                    "description": "Explicit asynchronous video contract: SiliconFlow submit/status or Wasu Wan video-synthesis/tasks. Wasu Wan supports only the verified wan3.0-video reference-image profile. tkmarket Seedance supports the exact seedance-2.0-idle-ts and seedance-2.5-idle-ts text-only 720p/5s profile."
                 },
                 "video_models": {
                     "title": "Video generation models",

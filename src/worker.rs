@@ -395,6 +395,24 @@ pub async fn run_until_shutdown_with_oauth_stop(
             process_terminal_projection_batch(state, Uuid::now_v7()).await;
         }
     );
+    let terminal_recovery_cursor = Mutex::new(None::<String>);
+    periodic!(
+        "terminal_projection_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let after = terminal_recovery_cursor.lock().unwrap().clone();
+            match state
+                .db
+                .recover_unknown_terminal_projections(after.as_deref())
+                .await
+            {
+                Ok(next) => *terminal_recovery_cursor.lock().unwrap() = next,
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to recover unknown terminal projections");
+                }
+            }
+        }
+    );
     periodic!(
         "metered_projection",
         PROJECTION_INTERVAL,
@@ -1317,6 +1335,103 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_worker_keeps_durable_refresh_and_continues_after_stalled_price_followup() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let mut config = Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("worker-oauth-followup.db").display()
+        ));
+        config.pricing_models_dev_url = format!("{}/prices", server.uri());
+        config.pricing_litellm_url = format!("{}/missing-litellm", server.uri());
+        config.pricing_openrouter_url = format!("{}/missing-openrouter", server.uri());
+        let state = AppState::initialize(config).await.unwrap();
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessToken": "fresh-access"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id":"test-model"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let stalled = Mock::given(path("/prices"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(120))
+                    .set_body_json(json!({})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let blocking = BlockingTasks::new();
+        for name in ["first", "next"] {
+            let account = state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: "worker-oauth-followup".into(),
+                        name: name.into(),
+                        driver: "http-json".into(),
+                        config: json!({"base_url": server.uri()}),
+                        credential: UpstreamCredential::OAuth {
+                            access_token: "expired-access".into(),
+                            refresh_token: Some("refresh-token".into()),
+                            expires_at: Some(1),
+                            header: "authorization".into(),
+                            prefix: "Bearer ".into(),
+                            adapter_state: None,
+                            proxy_url: None,
+                            proxy_network_scope: None,
+                        },
+                        oauth_session_id: Some(Uuid::now_v7()),
+                        oauth_driver: Some("cursor".into()),
+                        oauth_refresh_url: Some(format!("{}/refresh", server.uri())),
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(45),
+                refresh_expiring_oauth(&state, account.id, 1, &blocking),
+            )
+            .await
+            .expect("price work must yield the renewal lane")
+            .unwrap();
+            let (current, _) = state
+                .db
+                .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(current.credential_generation, 2);
+            let catalog = state
+                .db
+                .upstream_model_catalog(account.id, "worker-oauth-followup", None, 100)
+                .await
+                .unwrap();
+            assert_eq!(catalog.status, "ready");
+            assert_eq!(catalog.models.len(), 1);
+            if name == "first" {
+                // Keep the first response stalled while the next account renews.
+                Mock::given(path("/prices"))
+                    .respond_with(ResponseTemplate::new(503))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+        }
+        drop(stalled);
+        server.verify().await;
+    }
 
     #[tokio::test]
     async fn oauth_worker_reclaims_stale_undispatched_claim_but_not_unknown_outcome() {

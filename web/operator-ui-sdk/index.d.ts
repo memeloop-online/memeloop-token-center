@@ -1,4 +1,4 @@
-import type { ComponentType } from 'react';
+import type { ComponentType, CSSProperties } from 'react';
 import type * as ReactRuntime from 'react';
 import type * as ReactDOMRuntime from 'react-dom';
 import type * as ReactJSXRuntime from 'react/jsx-runtime';
@@ -8,7 +8,7 @@ export declare const OPERATOR_UI_PACKAGE_API_V1: 'operator-ui-package-v1';
 
 export interface OperatorUiContributionV1 {
   id: string;
-  slot: 'operator.sidebar.tab' | 'operator.overview.card' | 'operator.page.before' | 'operator.page.after' | 'operator.model-route.action';
+  slot: 'operator.sidebar.tab' | 'operator.overview.card' | 'operator.page.before' | 'operator.page.after' | 'operator.model-route.action' | 'operator.upstream-account.reset-settings';
   category?: { id: string; label?: string | null } | null;
   route?: string | null;
   target_route?: string | null;
@@ -65,11 +65,35 @@ export interface OperatorUiComponentPropsV1 {
   context?: Record<string, unknown>;
 }
 
+/** Context supplied to operator.upstream-account.reset-settings components. */
+export interface OperatorUiUpstreamAccountContextV1 {
+  /** Existing host observation; absent until available. Does not initiate a quota read. */
+  quotaSnapshot?: Record<string, unknown>;
+  upstreamAccount: {
+    id: string;
+    name: string;
+    provider: string;
+    tenantExternalId: string;
+  };
+}
+
 export interface OperatorUiPackageV1 {
   apiVersion: typeof OPERATOR_UI_PACKAGE_API_V1;
   pluginId: string;
   compatiblePluginVersions: readonly string[];
   components: Readonly<Record<string, ComponentType<OperatorUiComponentPropsV1>>>;
+}
+
+export interface OperatorUiEChartPropsV1 {
+  ariaLabel: string;
+  className?: string;
+  locale: 'zh-CN' | 'en';
+  onClick?: (event: { dataIndex: number; seriesIndex?: number; value: unknown }) => void;
+  /** ECharts options passed to the host renderer; plugins share its runtime. */
+  option: Readonly<Record<string, unknown>>;
+  /** Give the chart a height within the plugin's responsive layout. */
+  style?: CSSProperties;
+  timeZone: string;
 }
 
 export interface OperatorUiModuleHostV1 {
@@ -80,6 +104,8 @@ export interface OperatorUiModuleHostV1 {
   /** The host's automatic JSX runtime, backed by the same React instance. */
   ReactJSXRuntime?: typeof ReactJSXRuntime;
   Fluent: typeof FluentRuntime;
+  /** Shared, lazily loaded ECharts renderer with host theme and lifecycle management. */
+  EChart?: ComponentType<OperatorUiEChartPropsV1>;
   defineOperatorUiPackage: typeof defineOperatorUiPackage;
 }
 

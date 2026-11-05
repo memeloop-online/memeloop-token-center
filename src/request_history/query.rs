@@ -26,6 +26,7 @@ pub enum Dimension {
     KeyAlias,
     Principal,
     SessionId,
+    ClientSessionId,
     TaskKind,
     SessionAssociation,
     RequestId,
@@ -48,6 +49,9 @@ impl Dimension {
             Self::KeyAlias => "key_alias",
             Self::Principal => "principal",
             Self::SessionId => "session_id",
+            Self::ClientSessionId => {
+                "nullIf(JSONExtractString(snapshot, 'read_model', 'structure', 'session_id'), '')"
+            }
             Self::TaskKind => "task_kind",
             Self::SessionAssociation => "session_id",
             Self::RequestId => "request_id",

@@ -27,6 +27,7 @@ import { Button, LoadingState, PageLoadingRegion } from '../design-system';
 import {
   PluginContributionPage,
   PluginModelRouteActions,
+  PluginUpstreamAccountResetSettings,
   PluginOverviewCards,
   PluginPageExtensions,
   registerOperatorPluginContributions,
@@ -277,7 +278,7 @@ export function Operator({ route, onRouteChange, onPluginNavigation, navigationC
         case 'generations': page = <RequestWorkspace mode={activeRoute === 'generations' ? 'generations' : 'requests'} onModeChange={(mode) => navigate(mode)} {...pageProps} requestRefresh={requestRefresh} streamOverflowRevision={stream.overflowRevision} onProtectRequests={stream.protectRequests} liveEvents={stream.events.current} streamRevision={stream.revision} streamState={stream.state} streamError={stream.error} onOpenSessions={() => navigate('sessions')} onOpenSession={openSessionById} requestFocus={requestFocus} onRequestFocusHandled={(revision) => setRequestFocus((current) => current?.revision === revision ? undefined : current)} requestDrilldown={activeRequestDrilldown} onRequestDrilldownHandled={(revision) => setRequestDrilldown((current) => current?.revision === revision ? undefined : current)} />; break;
         case 'sessions': page = <SessionsPage {...pageProps} focus={sessionFocus} sessionEvents={stream.sessionEvents} streamState={stream.state} streamError={stream.error} requestRefresh={requestRefresh} onOpenRequests={() => navigate('requests')} onOpenUnlinkedRequests={openUnlinkedRequests} onReturnOrigin={returnFromSession} />; break;
         case 'usage': page = <UsagePage {...pageProps} onOpenSession={openSession} />; break;
-        case 'providers': page = <ProvidersPage {...pageProps} onOpenProxyGroups={openProxyGroups} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {
+        case 'providers': page = <ProvidersPage {...pageProps} renderResetSettings={(account, snapshot) => <PluginUpstreamAccountResetSettings contributions={pluginRegistry.upstreamAccountResetSettings} quotaSnapshot={snapshot} token={scope.activeCredential} accountId={account.id} accountName={account.name} provider={account.driver} tenant={account.tenant_external_id ?? scope.tenant} locale={locale} onNavigate={navigateFromPlugin} />} onOpenProxyGroups={openProxyGroups} onOpenRequest={openRequestById} onOpenPricing={(tenant) => {
           if (!scope.tenants.some(value => value.external_id === tenant)) return;
           scope.setTenant(tenant);
           navigate('pricing');

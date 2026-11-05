@@ -245,7 +245,7 @@ impl AppState {
                 ),
             db.independent_persistence_pool(),
         );
-        let pending_terminals = proxy_lifecycle::pending_terminal::Journal::new(
+        let pending_terminals = proxy_lifecycle::pending_terminal::Journal::with_archive(
             std::path::Path::new(&config.responses_request_spool_path)
                 .join("pending-terminals-v1")
                 .join(
@@ -254,6 +254,7 @@ impl AppState {
                         .as_str(),
                 ),
             db.independent_persistence_pool(),
+            archive.clone(),
         );
         let plugins = PluginRuntime::load(config.plugin_dir.as_deref(), db.clone())
             .map_err(|_| InitializationError::Plugin)?;
@@ -452,7 +453,7 @@ impl AppState {
             if !state.application_plugins_pinned
                 && let Some(authority) = &state.application_plugins
             {
-                if let Some(snapshot) = authority.current_snapshot()? {
+                if let Some(snapshot) = authority.request_snapshot().await? {
                     state = state.with_pinned_application_plugins(snapshot);
                 }
                 state.application_plugins_pinned = true;

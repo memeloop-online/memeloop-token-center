@@ -190,6 +190,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(volume.persistentVolumeClaim?.claimName, 'shared-plugin-inventories');
       assert.equal(volume.persistentVolumeClaim?.readOnly, !writer);
       const prepare = pod.initContainers.find(item => item.name === 'prepare-plugin-inventory')!;
+      assert.equal(prepare.args.includes('--allow-unavailable'), true, `${role}: optional inventory must not block startup`);
       assert.equal(prepare.args.includes('--read-only'), !writer, `${role}: readers never initialize`);
       assert.equal(prepare.volumeMounts[0]!.readOnly, !writer);
       assert.equal(pod.volumes.some(item => item.secret?.secretName === 'publisher-trust'), writer);
@@ -250,6 +251,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(deployment.spec.template.spec.initContainers.find(item => item.name === 'prepare-plugin-inventory')!.image, expected, `${role}: init/runtime image compatibility`);
     }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
+    count('default', 'maxUnavailable: 0', 1);
+    count('default', 'maxSurge: 1', 1);
     count('default', /readinessProbe:\s+httpGet: \{ path: "?\/readyz"?, port: http \}/g, 3);
     const services = parseAllDocuments(output.default!).map(document => document.toJSON()).filter(document => document?.kind === 'Service');
     for (const role of ['gateway', 'control']) {
@@ -363,4 +366,22 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(result.status, 0, result.stderr);
     }
   } finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+
+test('worker shares bootstrap grant authority while gateway keeps its role sentinel', () => {
+  const documents = parseAllDocuments(run(helm, ['template', 'grant-authority', chart,
+    '--set', 'config.serviceTokenSecret.name=grant-authority-secret',
+    '--set', 'config.serviceTokenSecret.key=authority-token',
+  ])).map(document => document.toJSON()).filter(Boolean);
+  for (const role of ['control', 'worker', 'gateway']) {
+    const deployment = documents.find(document => document.kind === 'Deployment'
+      && document.metadata.name.endsWith(`-${role}`));
+    assert.ok(deployment, `${role} deployment is rendered`);
+    const environment = deployment.spec.template.spec.containers[0].env;
+    const token = environment.find((entry: any) => entry.name === 'MTC_SERVICE_TOKEN');
+    if (role === 'gateway') assert.equal(token.value, 'bootstrap-disabled-for-this-role');
+    else assert.deepEqual(token.valueFrom.secretKeyRef, { name: 'grant-authority-secret', key: 'authority-token' });
+    if (role === 'worker') assert.equal(environment.some((entry: any) => entry.name === 'MTC_RUNTIME_PROFILING_ENABLED'), false);
+  }
 });

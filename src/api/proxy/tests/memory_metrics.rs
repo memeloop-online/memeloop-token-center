@@ -65,15 +65,14 @@ async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
 }
 
 #[tokio::test]
-async fn dense_small_json_is_delivered_once_instead_of_failing_its_initial_byte_envelope() {
+async fn dense_small_response_is_delivered_once_and_client_body_retains_its_lease() {
     let upstream = MockServer::start().await;
-    let body = json!({
-        "id": "dense-small", "object": "chat.completion",
-        "choices": [{"index":0,"message":{"role":"assistant","content":"complete"},"finish_reason":"stop"}],
-        "usage": {"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},
-        "dense": vec![0; 2000]
-    });
-    let original = serde_json::to_vec(&body).unwrap();
+    let original = serde_json::to_vec(&json!({
+        "id":"dense-small", "object":"chat.completion",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"complete"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},
+        "dense":vec![0;300]
+    })).unwrap();
     Mock::given(method("POST"))
         .respond_with(
             ResponseTemplate::new(200)
@@ -83,13 +82,26 @@ async fn dense_small_json_is_delivered_once_instead_of_failing_its_initial_byte_
         .expect(1)
         .mount(&upstream)
         .await;
-    let fixture = resilient_route_fixture("dense-small-response", &[(upstream.uri(), 0)]).await;
+    let fixture = resilient_route_fixture("dense-response-lease", &[(upstream.uri(), 0)]).await;
     let response = send_resilient_chat(&fixture, None, false).await;
     assert_eq!(response.status(), StatusCode::OK);
-    let delivered: Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap())
-            .unwrap();
-    assert_eq!(delivered, body);
+    fixture.state.persistence.drain_for_test().await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.state.pending_terminals.drain(),
+    )
+    .await
+    .unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 >= 64 * 1024);
+    let delivered = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(delivered.as_ref(), original);
     let rendered = fixture
         .state
         .metrics

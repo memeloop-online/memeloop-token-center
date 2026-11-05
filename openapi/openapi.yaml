@@ -1620,6 +1620,39 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/plugins/mtc-health-intelligence/private-data/concurrency-advice:
+    get:
+      tags: [System]
+      operationId: getPrivatePluginConcurrencyAdvice
+      summary: Read tenant-bound private concurrency observations
+      description: |
+        Requires an installed Health Intelligence plugin and plugins:read.
+        Private data additionally requires providers:read and requests:read.
+        The authorized tenant must match the host-provisioned companion tenant.
+        Reads never trigger collection or modify routing. Responses are private, no-store.
+      parameters:
+        - name: tenant_external_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Observations or an explicit unavailable/configuration/permission state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state:
+                    type: string
+                    enum: [ready, select_tenant, not_configured, permission_required, unavailable]
+                  data:
+                    type: object
+                    additionalProperties: true
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/plugins/{plugin_id}/data/{endpoint_id}:
     parameters:
       - name: plugin_id
@@ -2355,6 +2388,54 @@ paths:
           description: Transient fresh-read or local-capacity failure; reconciliation remains read-only and retryable.
           headers:
             Retry-After: { schema: { type: integer, minimum: 1 } }
+
+  /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/recover:
+    post:
+      tags: [Upstream providers]
+      operationId: recoverUpstreamQuotaReset
+      summary: Release a completed unknown reset without consuming another credit
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Requires explicit operator acknowledgement and a fresh read of supplier
+        credits. Only unknown operations with a durable dispatch_unknown audit
+        may be released. Submitted operations cannot be released based on age or
+        balance. Keeps the unknown outcome and original baseline, records the
+        actor and fresh counts, and sets settled_at to release the local account
+        lock. Does not send a consume request or prove supplier success/failure.
+        Repeating recovery cannot consume or release a different operation.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: operation_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: tenant_external_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirmation]
+              properties:
+                confirmation: { const: release_unknown_reset_without_consuming }
+      responses:
+        '200':
+          description: Unknown outcome retained; local lock released with audited fresh counts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
+        '400': { description: Explicit recovery confirmation is required. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "Dispatch has not ended, outcome is not unknown, or the account revision changed." }
+        '503': { description: Fresh supplier evidence or database is temporarily unavailable; no consumption occurs. }
 
   /internal/v1/upstreams/{account_id}/health:
     get:
@@ -9295,6 +9376,16 @@ components:
       additionalProperties: false
       required: [current, candidates]
       properties:
+        runtime:
+          type: object
+          description: Local plugin availability; does not determine core gateway readiness.
+          properties:
+            ready: { type: boolean }
+            error: { type: [string, 'null'] }
+            revision:
+              oneOf:
+                - { $ref: '#/components/schemas/ApplicationPluginRevision' }
+                - { type: 'null' }
         current:
           oneOf:
             - { $ref: '#/components/schemas/ApplicationPluginRevision' }
@@ -9462,7 +9553,7 @@ components:
         last_reconciled_at: { type: [integer, 'null'], format: int64 }
         reconciled_available_credits: { type: [integer, 'null'], format: int64 }
         reconciled_applicable_credits: { type: [integer, 'null'], format: int64 }
-        settled_at: { type: [integer, 'null'], format: int64, description: Fresh observation time when an accepted operation's exact old available-credit balance no longer applied; not proof that this operation caused the change or reset a quota window. }
+        settled_at: { type: [integer, 'null'], format: int64, description: Fresh observation time when an accepted balance changed or an operator explicitly released a completed unknown dispatch; not proof of supplier reset completion. }
         error_code: { type: [string, 'null'] }
         audit:
           type: array
@@ -11577,7 +11668,7 @@ components:
       type: object
       required: [billing_unit, price_per_unit]
       properties:
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         price_per_unit: { $ref: '#/components/schemas/NonNegativeMoney' }
     GenerationPrice:
       type: object
@@ -11586,7 +11677,7 @@ components:
         id: { type: string, format: uuid }
         model: { type: string }
         currency: { $ref: '#/components/schemas/Currency' }
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         price_per_unit: { $ref: '#/components/schemas/NonNegativeMoney' }
     GrantRequest:
       type: object
@@ -13202,7 +13293,7 @@ components:
         completed_at: { type: [integer, 'null'], format: int64 }
         model: { type: string }
         driver: { type: string }
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         status: { type: string, enum: [queued, running, cancelling, succeeded, failed, cancelled] }
         upstream_job_id: { type: [string, 'null'] }
         estimated_units: { type: integer, format: int64 }

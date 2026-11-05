@@ -2725,7 +2725,7 @@ async fn proxy_lifecycle_is_atomic_fault_safe_and_exactly_replayable() {
                 status_code: 200,
                 duration_ms: 1,
                 usage: TokenUsage {
-                    input_tokens: 11,
+                    input_tokens: 1_000_000_001,
                     output_tokens: 1,
                     ..TokenUsage::default()
                 },

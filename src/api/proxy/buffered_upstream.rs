@@ -102,7 +102,7 @@ pub(super) async fn read_bounded_upstream(
     maximum: usize,
     memory: &crate::gateway_body::memory::ProxyMemoryReservation,
     memory_admission_wait: Duration,
-    reserve_adapter_maximum: bool,
+    component_response: bool,
     conversation: Option<&ProxyConversation>,
 ) -> Result<Vec<u8>, BoundedUpstreamError> {
     if response
@@ -126,17 +126,16 @@ pub(super) async fn read_bounded_upstream(
         .unwrap_or(maximum)
         .min(maximum);
     let deadline = tokio::time::Instant::now() + memory_admission_wait;
-    let reservation_maximum = if reserve_adapter_maximum {
-        maximum
-    } else {
-        declared_maximum
-    };
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
+    // Component normalization can expand a small input before the host can
+    // inspect its output. Keep that existing adapter envelope until the
+    // separate component-output accounting work is complete.
+    let initial_bytes = if component_response { maximum } else { 0 };
     let reserved = if let Some(conversation) = conversation {
-        conversation.reserve_for_buffered_response(memory, reservation_maximum, deadline)
+        conversation.reserve_for_buffered_response(memory, initial_bytes, deadline)
     } else {
-        memory.reserve_buffered_response(reservation_maximum, deadline)
+        memory.reserve_buffered_response(initial_bytes, deadline)
     };
     if !reserved {
         tracing::warn!(request_id = %diagnostic_context.request_id,
@@ -155,7 +154,6 @@ pub(super) async fn read_bounded_upstream(
         diagnostic_context,
         "buffered_first_byte",
     ));
-    let maximum = declared_maximum;
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -167,8 +165,22 @@ pub(super) async fn read_bounded_upstream(
         {
             phase.finish("received", None, Some(chunk.len()));
         }
-        if body.len().saturating_add(chunk.len()) > maximum {
+        let required = body.len().saturating_add(chunk.len());
+        if required > declared_maximum {
             return Err(BoundedUpstreamError::ResponseTooLarge);
+        }
+        if required > body.capacity() {
+            let capacity = required
+                .max(body.capacity().saturating_mul(2))
+                .min(declared_maximum);
+            if !memory.grow_buffered_response(capacity) {
+                tracing::warn!(request_id = %diagnostic_context.request_id,
+                    stage = "buffered_response_chunk", reserved_bytes = memory.buffered_response_reserved_bytes(),
+                    actual_bytes = required, has_content_length, "buffered response growth unavailable");
+                return Err(BoundedUpstreamError::MemoryCapacity);
+            }
+            body.try_reserve_exact(capacity - body.len())
+                .map_err(|_| BoundedUpstreamError::MemoryCapacity)?;
         }
         body.extend_from_slice(&chunk);
     }
@@ -176,20 +188,18 @@ pub(super) async fn read_bounded_upstream(
         phase.finish("no_bytes", None, Some(0));
     }
     body.shrink_to_fit();
-    let before = memory.buffered_response_reserved_bytes();
     if !memory.reserve_response_json(&body) {
         tracing::warn!(request_id = %diagnostic_context.request_id,
-            stage = "buffered_response_json", reserved_bytes = before,
+            stage = "buffered_response_json", reserved_bytes = memory.buffered_response_reserved_bytes(),
             actual_bytes = body.len(), has_content_length, "buffered response JSON memory unavailable");
         return Err(BoundedUpstreamError::MemoryCapacity);
     }
-    if !reserve_adapter_maximum {
+    if !component_response {
         memory.shrink_buffered_response(&body);
     }
     tracing::debug!(request_id = %diagnostic_context.request_id,
-        stage = "buffered_response_json", reserved_before_bytes = before,
-        reserved_bytes = memory.buffered_response_reserved_bytes(), actual_bytes = body.len(),
-        has_content_length, "buffered response JSON memory accounted");
+        stage = "buffered_response_ready", reserved_bytes = memory.buffered_response_reserved_bytes(),
+        actual_bytes = body.len(), has_content_length, component_response, "buffered response memory accounted");
     read_memory.keep = true;
     Ok(body)
 }
@@ -199,93 +209,90 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn dense_small_json_grows_its_response_envelope_at_low_global_occupancy() {
-        let body = Bytes::from(serde_json::json!({"dense": vec![0; 2000]}).to_string());
-        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(2 * 1024 * 1024 * 1024);
-        let other = budget.reservation();
-        assert!(other.try_grow(70 * 1024 * 1024, 1));
-        let baseline = budget.snapshot().0;
-        assert!((baseline as f64 / budget.snapshot().1 as f64) < 0.035);
-        let memory = budget.reservation();
-        let response = UpstreamResponse::Prefetched {
-            status: StatusCode::OK,
-            headers: HeaderMap::new(),
-            version: http::Version::HTTP_11,
-            content_length: Some(body.len() as u64),
-            stream: Box::pin(futures_util::stream::iter([Ok(body.clone())])),
-        };
-        let result = read_bounded_upstream(
-            response,
-            1024 * 1024,
-            &memory,
-            Duration::from_secs(30),
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(result, body);
-        assert!(memory.response_json_fits(&body));
-        assert!(memory.buffered_response_reserved_bytes() > body.len() * 3);
-        memory.release_buffered_response();
-        assert_eq!(budget.snapshot().0, baseline);
-        drop(other);
-        assert_eq!(budget.snapshot().0, 0);
-    }
-
-    #[tokio::test]
-    async fn response_json_top_up_failure_refunds_only_its_response_permits() {
-        let body = Bytes::from(serde_json::json!({"dense": vec![0; 2000]}).to_string());
-        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024);
-        let memory = budget.reservation();
-        assert!(memory.try_grow(1234, 1));
-        assert!(memory.finalize_request(tokio::time::Instant::now()));
-        let baseline = budget.snapshot();
-        let response = UpstreamResponse::Prefetched {
-            status: StatusCode::OK,
-            headers: HeaderMap::new(),
-            version: http::Version::HTTP_11,
-            content_length: Some(body.len() as u64),
-            stream: Box::pin(futures_util::stream::iter([Ok(body)])),
-        };
-        assert!(matches!(
-            read_bounded_upstream(
+    async fn native_small_body_uses_actual_memory_despite_large_response_limit() {
+        for content_length in [None, Some(2)] {
+            let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(256 * 1024 * 1024);
+            let occupied = budget.reservation();
+            assert!(occupied.try_grow(128 * 1024 * 1024, 1));
+            let memory = budget.reservation();
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                version: http::Version::HTTP_11,
+                content_length,
+                stream: Box::pin(futures_util::stream::iter([Ok(Bytes::from_static(b"{}"))])),
+            };
+            let body = read_bounded_upstream(
                 response,
-                1024 * 1024,
+                MAX_PROXY_RESPONSE_BODY,
                 &memory,
                 Duration::from_secs(30),
                 false,
-                None
+                None,
             )
-            .await,
-            Err(BoundedUpstreamError::MemoryCapacity)
-        ));
-        assert_eq!(budget.snapshot(), baseline);
-        assert!(!memory.has_buffered_response());
-        assert_eq!(memory.buffered_response_reserved_bytes(), 0);
+            .await
+            .unwrap();
+            assert_eq!(body, b"{}");
+            assert_eq!(memory.buffered_response_reserved_bytes(), 64 * 1024);
+            assert_eq!(budget.snapshot().0, 128 * 1024 * 1024 + 64 * 1024);
+            drop(body);
+            memory.release_buffered_response();
+            assert_eq!(budget.snapshot().0, 128 * 1024 * 1024);
+        }
     }
 
     #[tokio::test]
-    async fn reader_cancel_size_error_and_stream_error_refund_response_while_request_owner_lives() {
+    async fn dense_small_json_succeeds_with_declared_or_chunked_body_at_low_global_usage() {
+        let body = Bytes::from(format!("[{}0]", "0,".repeat(299)));
+        for content_length in [Some(body.len() as u64), None] {
+            let budget =
+                crate::gateway_body::memory::ProxyMemoryBudget::new(2 * 1024 * 1024 * 1024);
+            let other = budget.reservation();
+            assert!(other.try_grow(70 * 1024 * 1024, 1));
+            let baseline = budget.snapshot().0;
+            let memory = budget.reservation();
+            let response = UpstreamResponse::Prefetched {
+                status: StatusCode::OK,
+                headers: HeaderMap::new(),
+                version: http::Version::HTTP_11,
+                content_length,
+                stream: Box::pin(futures_util::stream::iter(
+                    body.chunks(11)
+                        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                        .collect::<Vec<_>>(),
+                )),
+            };
+            let result = read_bounded_upstream(
+                response,
+                MAX_PROXY_RESPONSE_BODY,
+                &memory,
+                Duration::from_secs(30),
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(result, body);
+            assert!(memory.response_json_fits(&body));
+            assert_eq!(memory.buffered_response_reserved_bytes(), 128 * 1024);
+            memory.release_buffered_response();
+            assert_eq!(budget.snapshot().0, baseline);
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_errors_and_cancellation_refund_response_with_request_owner_alive() {
         let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
         let memory = budget.reservation();
         assert!(memory.try_grow(1234, 1));
         let baseline = budget.snapshot();
-        for stream in [
-            Box::pin(futures_util::stream::iter([Ok(Bytes::from_static(
-                b"too big",
-            ))]))
-                as std::pin::Pin<
-                    Box<dyn futures_util::Stream<Item = Result<Bytes, &'static str>> + Send>,
-                >,
-            Box::pin(futures_util::stream::iter([Err("upstream_stream")])),
-        ] {
+        for chunk in [Ok(Bytes::from_static(b"too big")), Err("upstream_stream")] {
             let response = UpstreamResponse::Prefetched {
                 status: StatusCode::OK,
                 headers: HeaderMap::new(),
                 version: http::Version::HTTP_11,
                 content_length: Some(2),
-                stream,
+                stream: Box::pin(futures_util::stream::iter([chunk])),
             };
             assert!(
                 read_bounded_upstream(
@@ -314,15 +321,52 @@ mod tests {
                     futures_util::future::pending().await
                 })),
             };
-            read_bounded_upstream(response, 1024, &owned, Duration::from_secs(30), false, None)
-                .await
+            read_bounded_upstream(
+                response,
+                MAX_PROXY_RESPONSE_BODY,
+                &owned,
+                Duration::from_secs(30),
+                false,
+                None,
+            )
+            .await
         });
         waiting.await.unwrap();
-        assert!(memory.has_buffered_response());
+        assert_eq!(budget.snapshot().0, baseline.0 + 64 * 1024);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(budget.snapshot(), baseline);
-        assert!(!memory.has_buffered_response());
+    }
+
+    #[tokio::test]
+    async fn dense_response_global_shortage_releases_partial_buffer() {
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(128 * 1024);
+        let memory = budget.reservation();
+        assert!(memory.try_grow(1234, 1));
+        let baseline = budget.snapshot();
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_11,
+            content_length: None,
+            stream: Box::pin(futures_util::stream::iter([Ok(Bytes::from(format!(
+                "[{}0]",
+                "0,".repeat(299)
+            )))])),
+        };
+        assert!(matches!(
+            read_bounded_upstream(
+                response,
+                MAX_PROXY_RESPONSE_BODY,
+                &memory,
+                Duration::from_secs(30),
+                false,
+                None
+            )
+            .await,
+            Err(BoundedUpstreamError::MemoryCapacity)
+        ));
+        assert_eq!(budget.snapshot(), baseline);
     }
 
     #[tokio::test(start_paused = true)]

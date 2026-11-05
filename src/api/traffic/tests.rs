@@ -33,6 +33,8 @@ async fn fixture_with_normalize_log(
     .unwrap();
     if normalize_log {
         manifest["capabilities"] = json!([{"kind":"log"}]);
+        manifest["contributions"]["providers"][0]["component_adapter"]["max_response_bytes"] =
+            json!(crate::plugin::MAX_COMPONENT_PROVIDER_BODY);
     }
     std::fs::write(
         package.join("plugin.json"),
@@ -162,7 +164,8 @@ async fn occupied_budget_keeps_large_real_policy_allow_deny_and_rewrite_semantic
 
 #[tokio::test]
 async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() {
-    let (_directory, state, key) = fixture(None).await;
+    let (_directory, mut state, key) = fixture(None).await;
+    state.proxy_memory_budget = Arc::new(ProxyMemoryBudget::new(4 * 1024 * 1024));
     let held = state.proxy_memory_budget.reservation();
     assert!(held.try_grow(1024 * 1024, 1));
     let context = RequestContext {
@@ -194,6 +197,7 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
         json!({"prompt":"from-component", "model":"vendor-model"})
     );
     let memory = state.proxy_memory_budget.reservation();
+    assert!(memory.reserve_buffered_response(1024 * 1024, tokio::time::Instant::now()));
     let owner = Arc::downgrade(&memory);
     let normalized = normalize_component_provider(
         &state,
@@ -220,6 +224,7 @@ async fn occupied_budget_still_prepares_and_normalizes_the_component_protocol() 
             "usage":{"prompt_tokens":7,"completion_tokens":3}
         })
     );
+    drop(normalized);
     assert_eq!(state.proxy_memory_budget.snapshot().0, 1024 * 1024);
     drop(held);
     assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
@@ -265,7 +270,8 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
     for cancel in [false, true] {
         let memory = state.proxy_memory_budget.reservation();
         assert!(memory.try_grow(64 * 1024, 1));
-        assert!(memory.reserve_buffered_response(64 * 1024, tokio::time::Instant::now()));
+        assert!(memory.reserve_buffered_response(128 * 1024, tokio::time::Instant::now()));
+        let failure_memory = memory.clone();
         let owner = Arc::downgrade(&memory);
         let admitted = state.proxy_memory_budget.snapshot().0;
         let context = RequestContext {
@@ -293,7 +299,7 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
                     context,
                     200,
                     BTreeMap::new(),
-                    vec![b'x'; 64 * 1024],
+                    vec![b'x'; 128 * 1024],
                     memory,
                 )
                 .await
@@ -308,7 +314,15 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
             let caller = caller.take().unwrap();
             caller.abort();
             assert!(caller.await.unwrap_err().is_cancelled());
+            // Finalizing a gateway failure must not transfer the still-live
+            // blocking guest's input lease into the tiny client error body.
+            let failure = failure_memory
+                .own_response_bytes(Bytes::from_static(b"{\"error\":\"provider_normalize\"}"))
+                .unwrap();
+            assert_eq!(state.proxy_memory_budget.snapshot().0, admitted + 64 * 1024);
+            drop(failure);
         }
+        drop(failure_memory);
         assert!(owner.upgrade().is_some());
         assert_eq!(state.proxy_memory_budget.snapshot().0, admitted);
         let replacement = state.proxy_memory_budget.reservation();
@@ -325,6 +339,15 @@ async fn real_normalize_keeps_existing_memory_owner_until_guest_exit_after_calle
             .await
             .expect("normalize blocking invocation tears down its dispatch after work exits")
             .unwrap();
+        // Dispatch teardown can precede the blocking closure's remaining field
+        // destructors. Wait for both the owner and its semaphore permits.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.upgrade().is_some() || state.proxy_memory_budget.snapshot().0 != 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("normalize guest releases its memory owner and admission permits");
         assert!(owner.upgrade().is_none());
         assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
         assert!(replacement.try_grow(1024 * 1024, 1));

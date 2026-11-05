@@ -52,10 +52,10 @@ pub(super) struct GatewayPersistence {
 
 impl GatewayPersistence {
     pub(super) fn new(url: &str, backend: DatabaseBackend) -> Result<Self, sqlx::Error> {
-        // This is background metadata, not a request admission deadline.
-        // Allow the same cold-connection budget as the serving pool without
-        // increasing this independent pool's connection count.
-        let acquire_timeout = Duration::from_secs(10);
+        let acquire_timeout = match backend {
+            DatabaseBackend::PostgreSql => Duration::from_secs(30),
+            DatabaseBackend::Sqlite => Duration::from_millis(250),
+        };
         #[cfg(test)]
         let acquire_timeout = TEST_SOURCE_POOL_TIMEOUT
             .try_with(|timeout| *timeout)
@@ -228,21 +228,35 @@ impl Database {
             self.publish_request_source(identity, locator, length, digest)
                 .await;
         }
-        self.complete_request_source_metadata(identity, locator, length, digest, success)
+        self.complete_request_source_state(identity, locator, length, digest, success, false)
             .await;
     }
 
-    async fn complete_request_source_metadata(
+    /// A successful object-store Put is independent of the staging write lease.
+    /// Recover its metadata without granting a fenced writer a new write lease.
+    pub(crate) async fn complete_uploaded_request_source(
+        &self,
+        identity: ArchiveSpoolIdentity,
+        locator: &str,
+        length: usize,
+        digest: [u8; 32],
+    ) {
+        self.complete_request_source_state(identity, locator, length, digest, true, true)
+            .await;
+    }
+
+    async fn complete_request_source_state(
         &self,
         identity: ArchiveSpoolIdentity,
         locator: &str,
         length: usize,
         digest: [u8; 32],
         success: bool,
+        recovery: bool,
     ) {
         loop {
             if self
-                .persist_request_source(identity, locator, length, digest, Some(success))
+                .persist_request_source(identity, locator, length, digest, Some(success), recovery)
                 .await
                 .is_some()
             {
@@ -317,10 +331,19 @@ impl Database {
             if let Some(success) = *outcome.borrow_and_update() {
                 return Some(success);
             }
-            let delay = match self
-                .persist_request_source(identity, locator, length, digest, None)
-                .await
-            {
+            // Upload completion must interrupt a metadata write waiting for the
+            // archive pool; otherwise a durable object can retain raw memory
+            // behind an unrelated database wait.
+            let persisted = tokio::select! {
+                biased;
+                changed = outcome.changed() => {
+                    if changed.is_err() { return None; }
+                    if let Some(success) = *outcome.borrow_and_update() { return Some(success); }
+                    continue;
+                }
+                result = self.persist_request_source(identity, locator, length, digest, None, false) => result,
+            };
+            let delay = match persisted {
                 Some(false) => return None,
                 Some(true) => Duration::from_millis(
                     crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
@@ -348,6 +371,7 @@ impl Database {
         length: usize,
         digest: [u8; 32],
         success: Option<bool>,
+        recovery: bool,
     ) -> Option<bool> {
         let mut database = self.clone();
         database.pool = self.gateway_persistence.pool.clone();
@@ -365,8 +389,9 @@ impl Database {
         let result = ARCHIVE_DEADLINE
             .scope(
                 (self.gateway_persistence.clone(), deadline),
-                database
-                    .record_request_source_state(identity, locator, length, digest, success, false),
+                database.record_request_source_state(
+                    identity, locator, length, digest, success, recovery,
+                ),
             )
             .await;
         match result {
@@ -426,12 +451,15 @@ impl Database {
                 // Raw roots are independently discoverable by the body worker.
                 return;
             };
-            // The outcome is already known and the immutable root was
-            // published above, even when metadata admission was unavailable.
-            // Do not fetch and verify that same object a second time.
-            database
-                .complete_request_source_metadata(identity, &locator, length, digest, success)
-                .await;
+            if success {
+                database
+                    .complete_uploaded_request_source(identity, &locator, length, digest)
+                    .await;
+            } else {
+                database
+                    .complete_request_source(identity, &locator, length, digest, false)
+                    .await;
+            }
         });
     }
 
@@ -529,7 +557,12 @@ impl Database {
                     .try_get::<Option<String>, _>("lease_token")?
                     .is_none_or(|token| token != identity.request_id.to_string())
             {
-                return Ok(false);
+                // Request ownership was checked above, including tenant,
+                // reservation and exact locator. A reaper fencing staging is
+                // not permission to cancel the only remaining original body.
+                // Do not renew or mutate the fenced stage. Once the Put is
+                // durable, its explicit recovery path can bind the metadata.
+                return Ok(!writing && success.is_none());
             }
         }
         if success.is_some() {
@@ -730,11 +763,17 @@ impl Database {
                     .capture_deferred_request_archive(identity, &body, &pepper, compression_enabled)
                     .await
             };
-            let result = tokio::time::timeout_at(
-                deadline,
-                ARCHIVE_DEADLINE.scope((database.gateway_persistence.clone(), deadline), capture),
-            )
-            .await;
+            let result = match database.backend {
+                DatabaseBackend::PostgreSql => Ok(capture.await),
+                DatabaseBackend::Sqlite => {
+                    tokio::time::timeout_at(
+                        deadline,
+                        ARCHIVE_DEADLINE
+                            .scope((database.gateway_persistence.clone(), deadline), capture),
+                    )
+                    .await
+                }
+            };
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {

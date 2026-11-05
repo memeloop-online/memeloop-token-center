@@ -167,11 +167,15 @@ mod tests {
             ),
             (
                 serde_json::json!({"usage": {"prompt_tokens": i64::MIN, "cache_read_input_tokens": 1}}),
+                UsageRejection::OutOfRange("reported_input_tokens"),
+            ),
+            (
+                serde_json::json!({"usage": {"prompt_tokens": 1, "cache_read_input_tokens": i64::MIN}}),
                 UsageRejection::InputArithmeticOverflow,
             ),
             (
                 serde_json::json!({"usage": {"output_tokens": -1}}),
-                UsageRejection::OutOfRange("normalized_output_tokens"),
+                UsageRejection::OutOfRange("reported_output_tokens"),
             ),
             (
                 serde_json::json!({"usage": {"prompt_tokens": 1}, "service_tier": false}),

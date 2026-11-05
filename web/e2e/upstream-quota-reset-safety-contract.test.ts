@@ -27,6 +27,8 @@ test('reset confirmation remains memory-only, scope-bound and non-retrying', () 
   assert.match(source, /setError\('dispatch-unknown'\)/);
   assert.match(source, /setError\('status-unavailable'\)/);
   assert.match(source, /operation\.state === 'prepared' && secret\.current/);
-  assert.doesNotMatch(source, /attempted|setAttempted/);
-  assert.match(source, /disabled=\{busy \|\| !capability\.prepare_available\}/);
+  assert.doesNotMatch(source, /\battempted\b|\bsetAttempted\b/);
+  assert.match(source, /disabled=\{busy \|\| !capability\.prepare_available \|\| error === 'status-unavailable'\}/);
+  assert.match(source, /confirm\(t\('quota\.recoverConfirm'\)\)/);
+  assert.match(source, /confirmation: 'release_unknown_reset_without_consuming'/);
 });

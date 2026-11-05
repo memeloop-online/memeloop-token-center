@@ -232,6 +232,12 @@ pub(in crate::api) struct ResetConfirmation {
     confirmation: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::api) struct ResetRecovery {
+    confirmation: String,
+}
+
 fn quota_reset_idempotency_key(headers: &HeaderMap) -> Result<&str, AppError> {
     let mut values = headers.get_all("idempotency-key").iter();
     let value = values.next().ok_or_else(|| {
@@ -337,17 +343,25 @@ pub(in crate::api) async fn confirm_quota_reset(
         ));
     }
     let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
-    let result = crate::upstream_quota::reset::confirm(
-        &state,
-        &account,
-        &credential,
-        query.tenant_external_id.trim(),
-        &actor,
-        &operation_id.to_string(),
-        &body.confirmation_token,
-        idempotency_key,
-    )
-    .await?;
+    let idempotency_key = idempotency_key.to_owned();
+    // A browser disconnect must not cancel an already authorized consumption
+    // or its durable result. Dropping the JoinHandle detaches this single task;
+    // the database claim still permits exactly one supplier dispatch.
+    let result = tokio::spawn(async move {
+        crate::upstream_quota::reset::confirm(
+            &state,
+            &account,
+            &credential,
+            query.tenant_external_id.trim(),
+            &actor,
+            &operation_id.to_string(),
+            &body.confirmation_token,
+            &idempotency_key,
+        )
+        .await
+    })
+    .await
+    .map_err(|_| AppError::internal("quota_reset_dispatch_task"))??;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 
@@ -392,6 +406,31 @@ pub(in crate::api) async fn get_quota_reset(
             &operation_id.to_string(),
         )
         .await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
+}
+
+pub(in crate::api) async fn recover_quota_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((account_id, operation_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<QuotaQuery>,
+    Json(body): Json<ResetRecovery>,
+) -> Result<impl IntoResponse, AppError> {
+    if body.confirmation != "release_unknown_reset_without_consuming" {
+        return Err(AppError::BadRequest(
+            "confirmation must acknowledge release of an unknown reset without consuming".into(),
+        ));
+    }
+    let (account, credential, actor) = reset_account(&state, &headers, account_id, &query).await?;
+    let result = crate::upstream_quota::reset::recover(
+        &state,
+        &account,
+        &credential,
+        query.tenant_external_id.trim(),
+        &actor,
+        &operation_id.to_string(),
+    )
+    .await?;
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
 }
 

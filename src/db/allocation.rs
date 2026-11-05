@@ -209,15 +209,10 @@ impl Database {
     ) -> Result<(), AppError> {
         let mut tx = self.begin_write_transaction().await?;
         if matches!(self.backend, DatabaseBackend::PostgreSql) {
-            sqlx::query("SET LOCAL lock_timeout='5ms'")
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("SET LOCAL statement_timeout='80ms'")
-                .execute(&mut *tx)
-                .await?;
-            // Compact reconciliation benefits from direct execution within its short budget.
-            sqlx::query("SET LOCAL jit=off").execute(&mut *tx).await?;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("SELECT set_config('lock_timeout','5ms',true),set_config('statement_timeout','80ms',true),set_config('jit','off',true)")
                 .execute(&mut *tx)
                 .await?;
         }

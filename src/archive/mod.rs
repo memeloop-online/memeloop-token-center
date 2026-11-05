@@ -39,6 +39,7 @@ mod rustfs_contract_tests;
 mod session_projection;
 mod staging;
 mod supplier_summary;
+mod terminal_receipts;
 mod text;
 
 pub use cas::CasArchiveObject;

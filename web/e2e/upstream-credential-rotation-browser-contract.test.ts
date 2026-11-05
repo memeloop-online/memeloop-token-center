@@ -60,7 +60,7 @@ test('rotation explains replacement, uses Fluent controls, restores its parent a
       });
       await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page`);
       await page.getByRole('button', { name: copy.details, exact: true }).click();
-      await page.getByRole('button', { name: copy.manage, exact: true }).click();
+      await page.getByRole('region', { name: copy.manage, exact: true }).waitFor();
       const trigger = page.getByRole('button', { name: copy.rotate, exact: true });
       await trigger.focus(); await page.keyboard.press('Enter');
       const form = page.locator('.upstream-credential-rotation');

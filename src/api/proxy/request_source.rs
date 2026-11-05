@@ -47,10 +47,13 @@ pub(super) async fn parse(
     source: Arc<RequestSpool>,
     memory: Arc<ProxyMemoryReservation>,
 ) -> Result<Value, AppError> {
-    let working = memory
-        .try_reserve_archive_output(64 * 1024)
-        .ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?;
-    if !memory.try_reserve_json_shape(source.len(), source.json_nodes()) {
+    let mut working = None;
+    source.reclaim_for(|| {
+        working = memory.try_reserve_archive_output(64 * 1024);
+        working.is_some()
+    });
+    let working = working.ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?;
+    if !source.reclaim_for(|| memory.try_reserve_json_shape(source.len(), source.json_nodes())) {
         return Err(AppError::capacity_error("proxy_memory_json"));
     }
     let download = source
@@ -95,6 +98,27 @@ mod tests {
         .unwrap();
         let admission =
             RequestSpoolAdmission::new(std::env::temp_dir()).with_archive(archive.clone());
+        let source = admission
+            .capture_with_memory(
+                axum::body::Body::from(body.clone()),
+                body.len(),
+                Some(body.len()),
+                None,
+                0,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(source.upload_outcome().await);
+        source.release_retained();
+        (archive, Arc::new(source))
+    }
+
+    #[tokio::test]
+    async fn local_spill_parses_without_an_archive_upload() {
+        let value = serde_json::json!({"model": "test", "input": "x".repeat(96 * 1024)});
+        let body = Bytes::from(serde_json::to_vec(&value).unwrap());
+        let admission = RequestSpoolAdmission::new(std::env::temp_dir());
         let exhausted = ProxyMemoryBudget::new(0);
         let source = admission
             .capture_with_memory(
@@ -107,7 +131,8 @@ mod tests {
             )
             .await
             .unwrap();
-        (archive, Arc::new(source))
+        let memory = ProxyMemoryBudget::new(1024 * 1024).reservation();
+        assert_eq!(parse(Arc::new(source), memory).await.unwrap(), value);
     }
 
     #[tokio::test]
