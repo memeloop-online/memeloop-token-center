@@ -987,16 +987,25 @@ async fn proxy_with_cancellation_guard(
     tracing::info!(%request_id, phase = "request_shape", bytes = body.len(), compaction_hint = conversation_hints.compaction, "proxy request metadata");
     let traffic_policy =
         proxy_diagnostics::Phase::new(diagnostic_context, "request_traffic_policy");
+    // Only pinned internal callers compare the post-policy envelope. The
+    // original downstream bytes remain available for source-backed archival;
+    // ordinary requests need one parsed tree, not an archival clone of it.
+    let pinned_envelope = pinned_route
+        .is_some()
+        .then(|| original_request_json.clone());
     let applied = super::traffic::apply_traffic_policy_with_memory(
         &state,
         &key,
         TrafficPolicyProtocols::same(protocol.name()),
-        original_request_json.clone(),
+        original_request_json,
         memory.clone(),
     )
     .await?;
     traffic_policy.finish("completed", None, None);
-    if pinned_route.is_some() && applied.changes_pinned_envelope(&original_request_json) {
+    if pinned_envelope
+        .as_ref()
+        .is_some_and(|original| applied.changes_pinned_envelope(original))
+    {
         // Pinned internal callers establish their own reviewed request
         // envelope. Traffic policy may still deny it or rank an already
         // authorized account, but must never add tools, replace instructions,
@@ -1009,6 +1018,7 @@ async fn proxy_with_cancellation_guard(
         );
         return Err(AppError::Forbidden);
     }
+    drop(pinned_envelope);
     let request_json = applied.request_json;
     let model = applied.model;
     super::early_request::observe_model(Some(&Value::String(model.clone())));
@@ -1211,13 +1221,8 @@ async fn proxy_with_cancellation_guard(
         .ok_or_else(|| AppError::internal("proxy_request_source_locator"))?
         .to_owned();
     let conversation_body = if source_backed {
-        ConversationBody::source_backed(
-            source.clone(),
-            original_request_json,
-            memory.request_json_reserved_bytes(),
-        )
+        ConversationBody::source_backed(source.clone(), memory.request_json_reserved_bytes())
     } else {
-        drop(original_request_json);
         ConversationBody::InMemory(body.clone())
     };
     let started_request = match state
@@ -2425,10 +2430,8 @@ enum ConversationBody {
 impl ConversationBody {
     fn source_backed(
         spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
-        request_json: Value,
         json_memory_bytes: usize,
     ) -> Self {
-        drop(request_json);
         Self::ProjectedSpool {
             spool,
             json_memory_bytes,
