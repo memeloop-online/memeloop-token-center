@@ -12,12 +12,12 @@ mod early_request;
 pub mod error;
 pub mod filter_ast;
 mod gateway_body;
-mod json_source;
 pub mod generation;
 mod group_routing;
 pub mod http_settings;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc_control;
+mod json_source;
 pub mod metrics;
 pub mod model;
 #[cfg(unix)]
