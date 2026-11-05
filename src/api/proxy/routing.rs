@@ -6,6 +6,7 @@ mod anthropic;
 mod candidates;
 mod clock;
 mod codex;
+mod compact_file;
 pub(super) mod diagnostics;
 mod http;
 #[cfg(test)]
@@ -36,6 +37,7 @@ pub(super) use codex::with_test_pre_delivery_connect_failures;
 #[cfg(test)]
 pub(super) use codex::with_test_send_failures;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
+pub(super) use compact_file::ValidatedCompact;
 pub(super) use outcome::{attempt_failure_stage, classify_attempt_failure, failover_disposition};
 pub(crate) use policy::RequestAttemptBudget;
 pub(super) use probe::{SharedProbePermit, join_shared_probe};

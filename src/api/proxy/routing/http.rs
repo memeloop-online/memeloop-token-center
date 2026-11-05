@@ -1,7 +1,6 @@
 use super::*;
 use bytes::Bytes;
-
-const MAX_COMPACT_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 #[derive(Clone, Copy)]
 struct RequestTimeout {
@@ -312,7 +311,12 @@ where
     match upstream_result {
         Ok(response) => {
             let response = if route.compact_v2_bridge {
-                translate_new_api_compact_v2(response, route.wrap_compact_as_sse).await?
+                translate_new_api_compact_v2(
+                    response,
+                    route.wrap_compact_as_sse,
+                    std::path::Path::new(&state.config.responses_request_spool_path),
+                )
+                .await?
             } else {
                 UpstreamResponse::Reqwest(response)
             };
@@ -320,16 +324,17 @@ where
                 (Some(deadline), Some(timeout)) => response.with_body_timeouts(deadline, timeout),
                 _ => response,
             };
-            let (response, preoutput_quota) = if route.inspect_stream_rejection {
-                super::classify_stream_quota(
-                    response,
-                    sse_framing_limits,
-                    &state.proxy_memory_budget,
-                )
-                .await
-            } else {
-                (response, None)
-            };
+            let (response, preoutput_quota) =
+                if route.inspect_stream_rejection && response.validated_compact().is_none() {
+                    super::classify_stream_quota(
+                        response,
+                        sse_framing_limits,
+                        &state.proxy_memory_budget,
+                    )
+                    .await
+                } else {
+                    (response, None)
+                };
             let response = if preoutput_quota.is_some() {
                 response
             } else if let Some(context) = route.responses_chat.clone() {
@@ -407,6 +412,7 @@ fn classify_reqwest_send_error(error: reqwest::Error) -> ProxySendError {
 async fn translate_new_api_compact_v2(
     response: reqwest::Response,
     wrap_as_sse: bool,
+    spool_path: &std::path::Path,
 ) -> Result<UpstreamResponse, ProxySendError> {
     let status = response.status();
     // Only successful compact payloads require translation. Preserve an
@@ -417,57 +423,170 @@ async fn translate_new_api_compact_v2(
     }
     let version = response.version();
     let mut headers = response.headers().clone();
-    let bytes = read_compact_body(response.bytes_stream(), MAX_COMPACT_RESPONSE_BYTES).await?;
-    let value = crate::api::sse::parse_unique_json(&bytes)
-        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-    let responses = crate::api::new_api_transport::compact_to_responses(&value)
-        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-    let (content_type, body) = if wrap_as_sse {
-        (
-            HeaderValue::from_static("text/event-stream"),
-            crate::api::new_api_transport::responses_to_sse(&responses)
-                .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?,
-        )
+    let file = capture_compact_body(response.bytes_stream(), spool_path).await?;
+    let output = new_compact_file(spool_path).await?;
+    let output = output.into_std().await;
+    let file = file.into_std().await;
+    let output = tokio::task::spawn_blocking(move || {
+        super::compact_file::translate(file, output, wrap_as_sse)
+    })
+    .await
+    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
+    .map_err(|error| {
+        ProxySendError::AmbiguousResponse(if error == "compact_file_io" {
+            "upstream_compact_spool_write_failed"
+        } else {
+            "upstream_invalid_response"
+        })
+    })?;
+    let evidence = output.evidence;
+    let pieces = output.pieces;
+    let output = output.file;
+    let content_type = if wrap_as_sse {
+        HeaderValue::from_static("text/event-stream")
     } else {
-        (
-            HeaderValue::from_static("application/json"),
-            Bytes::from(
-                serde_json::to_vec(&responses)
-                    .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?,
-            ),
-        )
+        HeaderValue::from_static("application/json")
     };
     headers.remove(header::CONTENT_LENGTH);
     headers.remove(header::CONTENT_ENCODING);
     headers.insert(header::CONTENT_TYPE, content_type);
-    let stream: crate::api::proxy::upstream_response::UpstreamByteStream =
-        Box::pin(futures_util::stream::once(async move { Ok(body) }));
-    Ok(UpstreamResponse::Prefetched {
+    let stream = compact_file_stream(output, pieces, evidence.expected_body_bytes());
+    Ok(UpstreamResponse::ValidatedCompact {
         status,
         headers,
         version,
         content_length: None,
         stream,
+        evidence,
     })
 }
 
-async fn read_compact_body<Error>(
+fn compact_file_stream(
+    output: std::fs::File,
+    pieces: Vec<super::compact_file::CompactPiece>,
+    expected_bytes: u64,
+) -> crate::api::proxy::upstream_response::UpstreamByteStream {
+    use super::compact_file::CompactPiece;
+    let physical_bytes = pieces
+        .iter()
+        .filter_map(|piece| match piece {
+            CompactPiece::Range(range) => Some(range.end),
+            CompactPiece::Bytes(_) => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let pieces: std::collections::VecDeque<_> = pieces.into();
+    let source: crate::api::proxy::upstream_response::UpstreamByteStream =
+        Box::pin(futures_util::stream::try_unfold(
+            (
+                tokio::fs::File::from_std(output),
+                pieces,
+                None::<std::ops::Range<u64>>,
+            ),
+            move |(mut file, mut pieces, mut active)| async move {
+                loop {
+                    if let Some(range) = active.as_mut() {
+                        let length = (range.end - range.start).min(64 * 1024) as usize;
+                        let mut bytes = vec![0; length];
+                        file.read_exact(&mut bytes)
+                            .await
+                            .map_err(|_| "upstream_compact_spool_read_failed")?;
+                        range.start += length as u64;
+                        if range.start == range.end {
+                            active = None;
+                        }
+                        return Ok(Some((Bytes::from(bytes), (file, pieces, active))));
+                    }
+                    match pieces.pop_front() {
+                        Some(CompactPiece::Range(range)) if range.start < range.end => {
+                            file.seek(std::io::SeekFrom::Start(range.start))
+                                .await
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            active = Some(range);
+                        }
+                        Some(CompactPiece::Range(_)) => {}
+                        Some(CompactPiece::Bytes(bytes)) if !bytes.is_empty() => {
+                            return Ok(Some((Bytes::from(bytes), (file, pieces, active))));
+                        }
+                        Some(CompactPiece::Bytes(_)) => {}
+                        None => {
+                            file.seek(std::io::SeekFrom::Start(physical_bytes))
+                                .await
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            if file
+                                .read(&mut [0; 1])
+                                .await
+                                .map_err(|_| "upstream_compact_spool_read_failed")?
+                                != 0
+                            {
+                                return Err("upstream_compact_spool_read_failed");
+                            }
+                            return Ok(None);
+                        }
+                    }
+                }
+            },
+        ));
+    // Retain one chunk until the next read confirms progress or exact EOF. In
+    // particular a completed SSE event cannot escape before its file tail has
+    // been verified. These are chunk buffers, not whole-event buffers.
+    Box::pin(futures_util::stream::try_unfold(
+        (source, None::<Bytes>, 0u64, false),
+        move |(mut source, mut pending, mut read_bytes, finished)| async move {
+            if finished {
+                return Ok(None);
+            }
+            loop {
+                let Some(next) = source.next().await else {
+                    if read_bytes != expected_bytes {
+                        return Err("upstream_compact_spool_read_failed");
+                    }
+                    return Ok(pending
+                        .take()
+                        .map(|chunk| (chunk, (source, None, read_bytes, true))));
+                };
+                let next = next?;
+                read_bytes = read_bytes
+                    .checked_add(next.len() as u64)
+                    .filter(|count| *count <= expected_bytes)
+                    .ok_or("upstream_compact_spool_read_failed")?;
+                if let Some(chunk) = pending.replace(next) {
+                    return Ok(Some((chunk, (source, pending, read_bytes, false))));
+                }
+            }
+        },
+    ))
+}
+
+async fn new_compact_file(spool_path: &std::path::Path) -> Result<tokio::fs::File, ProxySendError> {
+    tokio::fs::create_dir_all(spool_path)
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_compact_spool_unavailable"))?;
+    let directory = spool_path.to_owned();
+    let file = tokio::task::spawn_blocking(move || tempfile::tempfile_in(directory))
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_compact_spool_unavailable"))?
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_compact_spool_unavailable"))?;
+    Ok(tokio::fs::File::from_std(file))
+}
+
+async fn capture_compact_body<Error>(
     stream: impl futures_util::Stream<Item = Result<Bytes, Error>>,
-    limit: usize,
-) -> Result<Bytes, ProxySendError> {
+    spool_path: &std::path::Path,
+) -> Result<tokio::fs::File, ProxySendError> {
     tokio::pin!(stream);
-    let mut bytes = Vec::new();
+    let mut file = new_compact_file(spool_path).await?;
     while let Some(chunk) = stream.next().await {
         let chunk =
             chunk.map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?;
-        if chunk.len() > limit.saturating_sub(bytes.len()) {
-            return Err(ProxySendError::AmbiguousResponse(
-                "upstream_invalid_response",
-            ));
-        }
-        bytes.extend_from_slice(&chunk);
+        file.write_all(&chunk).await.map_err(|_| {
+            ProxySendError::AmbiguousResponse("upstream_compact_spool_write_failed")
+        })?;
     }
-    Ok(Bytes::from(bytes))
+    file.flush()
+        .await
+        .map_err(|_| ProxySendError::AmbiguousResponse("upstream_compact_spool_write_failed"))?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -520,9 +639,11 @@ mod tests {
 
     #[tokio::test]
     async fn compact_translation_preserves_upstream_error_status_headers_and_body() {
+        let directory = tempfile::tempdir().unwrap();
         let response = translate_new_api_compact_v2(
             compact_response(StatusCode::TOO_MANY_REQUESTS, "private-canary error"),
             true,
+            directory.path(),
         )
         .await
         .unwrap();
@@ -538,6 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_rejection_returns_before_body_is_polled() {
+        let directory = tempfile::tempdir().unwrap();
         for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::BAD_GATEWAY] {
             let body = futures_util::stream::poll_fn(
                 |_| -> std::task::Poll<Option<Result<Bytes, std::io::Error>>> {
@@ -551,7 +673,9 @@ mod tests {
                 .body(reqwest::Body::wrap_stream(body))
                 .unwrap()
                 .into();
-            let response = translate_new_api_compact_v2(response, true).await.unwrap();
+            let response = translate_new_api_compact_v2(response, true, directory.path())
+                .await
+                .unwrap();
             assert_eq!(response.status(), status);
             assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
             assert_eq!(response.headers()[header::RETRY_AFTER], "7");
@@ -561,6 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_translation_never_returns_completed_for_failed_or_incomplete_body() {
+        let directory = tempfile::tempdir().unwrap();
         for body in [
             r#"{"status":"failed","output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
             r#"{"status":"incomplete","output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
@@ -569,6 +694,7 @@ mod tests {
                 let result = translate_new_api_compact_v2(
                     compact_response(StatusCode::OK, body),
                     wrap_as_sse,
+                    directory.path(),
                 )
                 .await;
                 assert!(matches!(
@@ -582,51 +708,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_body_limit_accepts_exact_boundary_and_empty_chunks() {
+    async fn compact_file_validation_evidence_survives_body_timeout_wrapper() {
+        let directory = tempfile::tempdir().unwrap();
+        let response = translate_new_api_compact_v2(
+            compact_response(
+                StatusCode::OK,
+                r#"{"id":"response-compact","usage":{"input_tokens":11,"output_tokens":3},"output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
+            ),
+            true,
+            directory.path(),
+        )
+        .await
+        .unwrap();
+        let evidence = response.validated_compact().expect("host evidence");
+        let length = evidence.expected_body_bytes();
+        assert_eq!(evidence.summary().usage.unwrap().input_tokens, 11);
+        let response = response.with_body_timeouts(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(60),
+        );
+        let evidence = response.validated_compact().expect("preserved evidence");
+        assert_eq!(evidence.expected_body_bytes(), length);
+        assert_eq!(evidence.summary().usage.unwrap().output_tokens, 3);
+        let mut stream = response.bytes_stream();
+        let mut received = 0u64;
+        while let Some(chunk) = stream.next().await {
+            received += chunk.unwrap().len() as u64;
+        }
+        assert_eq!(received, length);
+    }
+
+    #[tokio::test]
+    async fn compact_body_capture_preserves_chunks_and_empty_chunks() {
+        let directory = tempfile::tempdir().unwrap();
         let stream = futures_util::stream::iter([
             Ok::<_, &'static str>(Bytes::from_static(b"ab")),
             Ok(Bytes::new()),
             Ok(Bytes::from_static(b"cd")),
         ]);
+        let mut file = capture_compact_body(stream, directory.path())
+            .await
+            .unwrap();
+        tokio::io::AsyncSeekExt::rewind(&mut file).await.unwrap();
+        let mut body = Vec::new();
+        file.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"abcd");
+    }
+
+    #[tokio::test]
+    async fn compact_body_capture_has_no_old_64_mib_cutoff() {
+        let directory = tempfile::tempdir().unwrap();
+        let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+        let count = 1025usize;
+        let stream =
+            futures_util::stream::iter((0..count).map(|_| Ok::<_, &'static str>(chunk.clone())));
+        let file = capture_compact_body(stream, directory.path())
+            .await
+            .unwrap();
         assert_eq!(
-            read_compact_body(stream, 4).await.unwrap(),
-            Bytes::from_static(b"abcd")
+            file.metadata().await.unwrap().len(),
+            (count * chunk.len()) as u64
         );
     }
 
     #[tokio::test]
-    async fn compact_body_limit_stops_on_first_overflow_chunk() {
-        for chunks in [
-            vec![b"abcde".as_slice()],
-            vec![b"ab".as_slice(), b"cde".as_slice()],
-        ] {
-            let stream = futures_util::stream::iter(
-                chunks
-                    .into_iter()
-                    .map(|chunk| Ok::<_, &'static str>(Bytes::from_static(chunk))),
-            )
-            .chain(futures_util::stream::poll_fn(|_| {
-                panic!("oversized compact body must stop before polling again")
-            }));
-            assert!(matches!(
-                read_compact_body(stream, 4).await,
-                Err(ProxySendError::AmbiguousResponse(
-                    "upstream_invalid_response"
-                ))
-            ));
-        }
-    }
-
-    #[tokio::test]
     async fn compact_body_read_failure_preserves_ambiguous_nonreplayable_error() {
+        let directory = tempfile::tempdir().unwrap();
         let stream =
             futures_util::stream::iter([Ok(Bytes::from_static(b"partial")), Err("private-canary")]);
         assert!(matches!(
-            read_compact_body(stream, 64).await,
+            capture_compact_body(stream, directory.path()).await,
             Err(ProxySendError::AmbiguousResponse(
                 "upstream_invalid_response"
             ))
         ));
+    }
+
+    #[tokio::test]
+    async fn compact_file_tail_requires_exact_eof_before_last_chunk() {
+        use std::io::{Seek as _, Write as _};
+        for (body, expected, expected_error) in [
+            (b"complete".as_slice(), 8, false),
+            (b"short".as_slice(), 8, true),
+            (b"unexpected-tail".as_slice(), 8, true),
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(body).unwrap();
+            file.rewind().unwrap();
+            let mut stream = compact_file_stream(
+                file,
+                vec![super::super::compact_file::CompactPiece::Range(0..expected)],
+                expected,
+            );
+            let first = stream.next().await.unwrap();
+            if expected_error {
+                assert_eq!(first.unwrap_err(), "upstream_compact_spool_read_failed");
+            } else {
+                assert_eq!(first.unwrap(), body);
+                assert!(stream.next().await.is_none());
+            }
+        }
     }
 
     #[test]

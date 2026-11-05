@@ -2006,14 +2006,15 @@ async fn proxy_with_cancellation_guard(
         return result;
     }
     let upstream = upstream.ok_or(AppError::internal("proxy_site_7"))?;
+    let validated_compact = upstream.validated_compact().is_some();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let is_sse = content_type
         .as_ref()
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"));
-    let will_buffer_response =
-        (is_codex_route && !codex_downstream_stream) || (!is_sse && !strict_openai_chat_usage);
+    let will_buffer_response = !validated_compact
+        && ((is_codex_route && !codex_downstream_stream) || (!is_sse && !strict_openai_chat_usage));
     if requested_native_stream
         && will_buffer_response
         && let Some(conversation) = buffered_request.conversation.as_ref()
@@ -2037,7 +2038,7 @@ async fn proxy_with_cancellation_guard(
         codex_retry.complete(CodexRetryTerminal::Failed);
         return result;
     }
-    if is_codex_route && !codex_downstream_stream {
+    if is_codex_route && !codex_downstream_stream && !validated_compact {
         let buffer_phase = proxy_diagnostics::Phase::account(
             diagnostic_context,
             "codex_buffered_response",
@@ -2183,8 +2184,9 @@ async fn proxy_with_cancellation_guard(
             .await;
         return result;
     }
-    let capture_json_usage = should_capture_buffered_usage(is_sse, content_type.as_ref());
-    if !is_sse {
+    let capture_json_usage =
+        !validated_compact && should_capture_buffered_usage(is_sse, content_type.as_ref());
+    if !is_sse && !validated_compact {
         return finish_non_sse_proxy_response(NonSseProxyResponseInput {
             buffered_request: &buffered_request,
             selected_driver: active_route.route.driver.as_str(),
