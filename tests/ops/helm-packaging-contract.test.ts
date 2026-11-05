@@ -220,7 +220,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 2Gi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
-    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: "\/var\/lib\/memeloop-token-center\/request-spool"/, 2);
+    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: \/var\/lib\/memeloop-token-center\/request-spool/, 2);
     assert.ok(!output.default!.includes('responses-request-spool'));
     const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
     const defaultMemory: Record<string, string[]> = { gateway: ['512Mi', '8Gi'], control: ['128Mi', '256Mi'], worker: ['192Mi', '384Mi'] };
