@@ -6,6 +6,7 @@ use super::super::*;
 pub(crate) mod prefix_storage;
 mod projection_retry;
 mod semantic_payload;
+mod identity_projection;
 
 #[cfg(test)]
 mod semantic_order_tests;
@@ -1176,11 +1177,10 @@ impl Database {
                 "conversation semantic snapshot changed during projection".into(),
             ).into());
         }
-        let rebuilding = task
-            .try_get::<Option<String>, _>("statistics_outcome")?
-            .as_deref()
-            == Some(SESSION_BODY_REBUILD_OUTCOME);
-        let rewrote_existing = if rebuilding && let Some(snapshot) = snapshot.as_ref() {
+        // A declared identity may already have been published without waiting
+        // for archive content. Enrich that same observation rather than
+        // counting the request again or replacing its client provenance.
+        let rewrote_existing = if let Some(snapshot) = snapshot.as_ref() {
             let tenant = tenant_id.to_string();
             let request = request_id.to_string();
             rewrite_session_body_observation_in_transaction(

@@ -1112,6 +1112,10 @@ pub(crate) async fn archive_session_body(
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
+    state
+        .db
+        .project_claimed_conversation_identity(lease_owner, request_id)
+        .await?;
     let Some(locators) = state.db.session_body_locators(request_id).await? else {
         return skip_session_body(
             state,

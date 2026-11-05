@@ -14,6 +14,99 @@ struct Fixture {
     source: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 }
 
+async fn declared_identity_before_body_contract(database_url: String) {
+    let fixture = Fixture::new(database_url, false).await;
+    let mut hints = ConversationHints {
+        session_id: Some("declared-client-thread".into()),
+        ..Default::default()
+    };
+    hints.labels.insert(
+        "mtc_session_identity_source".into(),
+        "header:thread-id".into(),
+    );
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(serde_json::to_string(&hints).unwrap())
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    let owner = fixture.claim().await;
+    fixture
+        .state
+        .db
+        .project_claimed_conversation_identity(Uuid::now_v7(), fixture.request_id)
+        .await
+        .unwrap();
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(before, 0, "stale worker cannot publish identity");
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let row = sqlx::query("SELECT o.id, o.cluster_id, o.explicit_session_id, o.leaf_node_hash, r.conversation_cluster_id FROM conversation_observations o JOIN request_records r ON r.id = o.request_id WHERE o.request_id = $1")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        row.get::<String, _>("explicit_session_id"),
+        "declared-client-thread"
+    );
+    assert_eq!(
+        row.get::<String, _>("cluster_id"),
+        row.get::<String, _>("conversation_cluster_id")
+    );
+    assert!(
+        row.get::<Option<String>, _>("leaf_node_hash").is_none(),
+        "identity publication must not invent body content"
+    );
+    let observation = row.get::<String, _>("id");
+    fixture.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    fixture.assert_completed(true).await;
+    let rows = sqlx::query(
+        "SELECT id, leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_all(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String, _>("id"), observation);
+    assert!(rows[0].get::<Option<String>, _>("leaf_node_hash").is_some());
+    let count: i64 = sqlx::query_scalar(
+        "SELECT request_count FROM conversation_key_clusters WHERE cluster_id = $1",
+    )
+    .bind(row.get::<String, _>("cluster_id"))
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "body completion must not count identity twice");
+}
+
+#[tokio::test]
+async fn sqlite_declared_identity_is_readable_while_body_is_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    declared_identity_before_body_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("identity.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_declared_identity_is_readable_while_body_is_pending() {
+    let url =
+        std::env::var("MTC_TEST_POSTGRES_URL").expect("identity regression requires CI PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    declared_identity_before_body_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ArchiveBeforeTerminal {
     Pending,
