@@ -47,8 +47,16 @@ export interface OperatorUiApiRequestV1 {
   signal?: AbortSignal;
 }
 
+export interface OperatorUiApiStreamV1 {
+  /** Native SSE response body. Read incrementally and cancel/release the reader on early exit. */
+  body: ReadableStream<Uint8Array>;
+  requestId?: string;
+}
+
 export interface OperatorUiHostApiV1 {
   requestApi<T = unknown>(request: OperatorUiApiRequestV1): Promise<T>;
+  /** Optional on older hosts. Same authentication/tenant rules as requestApi; signal aborts fetch. */
+  requestApiStream?(request: OperatorUiApiRequestV1): Promise<OperatorUiApiStreamV1>;
   discoverApi(signal?: AbortSignal): Promise<Record<string, unknown>>;
   loadServiceData(endpointId: string, signal?: AbortSignal): Promise<OperatorUiServiceDataResponseV1>;
   navigate(route: string, context?: Record<string, unknown>): void;
