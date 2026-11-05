@@ -51,6 +51,7 @@ use crate::{
 mod archive_spool;
 mod archive_staging;
 mod gateway_persistence;
+mod request_cancel;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
 pub(crate) mod allocation;
@@ -262,6 +263,7 @@ pub struct Database {
     pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
     pool_role: &'static str,
+    request_cancel_options: Option<sqlx::postgres::PgConnectOptions>,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
@@ -667,7 +669,17 @@ impl Database {
                 .fetch_one(&pool)
                 .await?;
         }
+        let request_cancel_options = if matches!(backend, DatabaseBackend::PostgreSql) {
+            Some(
+                database_url
+                    .as_ref()
+                    .parse::<sqlx::postgres::PgConnectOptions>()?,
+            )
+        } else {
+            None
+        };
         Ok(Self {
+            request_cancel_options,
             http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
                 database_url.as_ref(),
@@ -774,6 +786,7 @@ impl Database {
             http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
+            request_cancel_options: self.request_cancel_options.clone(),
             pool: self
                 .pool
                 .options()

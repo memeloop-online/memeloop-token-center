@@ -759,7 +759,10 @@ impl Database {
         if let Err(error) = &connection {
             self.observe_key_authentication("acquire", acquire_elapsed, None, Some(error));
         }
-        let mut connection = connection?;
+        let mut connection = super::super::request_cancel::RequestConnection::new(
+            connection?,
+            self.request_cancel_options.clone(),
+        );
         let started = tokio::time::Instant::now();
         let row = sqlx::query(
             "SELECT k.id AS key_id, k.tenant_id, k.principal_id, k.account_id, k.alias, k.currency, k.policy_json, k.status, c.generation, c.secret_hash FROM key_credentials c JOIN key_records k ON k.id = c.key_id AND k.credential_generation = c.generation JOIN tenants t ON t.id = k.tenant_id AND t.status = 'active' WHERE c.secret_hash = $1 AND c.revoked_at IS NULL",
@@ -768,7 +771,7 @@ impl Database {
         .fetch_optional(&mut *connection)
         .await;
         let elapsed = started.elapsed();
-        drop(connection);
+        connection.finish();
         self.observe_key_authentication(
             "query",
             acquire_elapsed,
