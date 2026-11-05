@@ -1063,7 +1063,7 @@ const SESSION_BODY_ARCHIVE_READ_LIMIT: usize = 128 * 1024 * 1024;
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
     if let Err(error) = state
         .db
-        .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT)
+        .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT / 4)
         .await
     {
         state
