@@ -550,8 +550,25 @@ async fn assert_inference_archive(
                 assert_eq!(row.get::<String, _>("parent_turn_id"), "turn-0");
                 // The source worker stores the whole request/response turn,
                 // including assistant text/tool output in the terminal leaf.
-                let (_, expected_prefix) =
-                    crate::conversation::session_body_from_documents(request, response).into_prefix();
+                let mut expected_body =
+                    crate::conversation::session_body_from_documents(request, response);
+                for (turn, part, bytes) in expected_body.take_media_bytes() {
+                    let digest = blake3::hash(&bytes).to_hex().to_string();
+                    let locator: String = sqlx::query_scalar(
+                        "SELECT object_locator FROM conversation_media_parts \
+                         WHERE tenant_id = (SELECT tenant_id FROM request_records WHERE id = $1) \
+                         AND content_blake3 = $2 AND byte_length = $3",
+                    )
+                    .bind(request_id.to_string())
+                    .bind(digest)
+                    .bind(bytes.len() as i64)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(state.archive.get(&locator).await.unwrap().as_ref(), bytes.as_slice());
+                    expected_body.set_media_locator(turn, part, locator);
+                }
+                let (_, expected_prefix) = expected_body.into_prefix();
                 assert_eq!(row.get::<Option<String>, _>("leaf_node_hash").as_deref(), expected_prefix.last().map(|node| node.node_hash.as_str()));
                 break;
             }
