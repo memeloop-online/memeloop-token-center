@@ -754,7 +754,7 @@ impl Database {
         }
         let (secret_hash, _) = crypto::hash_credential(value, pepper);
         let started = tokio::time::Instant::now();
-        let connection = self.pool.acquire().await;
+        let connection = self.acquire_request_connection("authenticate_key").await;
         let acquire_elapsed = started.elapsed();
         if let Err(error) = &connection {
             self.observe_key_authentication("acquire", acquire_elapsed, None, Some(error));
