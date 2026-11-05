@@ -12,7 +12,6 @@ mod tests;
 pub(crate) struct ProbeAccountContext {
     pub(crate) tenant_external_id: String,
     pub(crate) driver: String,
-    pub(crate) config: Value,
     pub(crate) credential_generation: i64,
     pub(crate) transport_revision: i64,
 }
@@ -89,6 +88,7 @@ impl Database {
             .bind(account_id.to_string()).fetch_optional(&self.pool).await?)
     }
 
+    #[cfg(test)]
     pub(crate) async fn upstream_service_probes_due(
         &self,
         healthy_before: i64,
@@ -234,7 +234,7 @@ impl Database {
         account_id: Uuid,
     ) -> Result<ProbeAccountContext, AppError> {
         let row = sqlx::query(
-            "SELECT t.external_id, a.driver, a.config_json, a.credential_generation,
+            "SELECT t.external_id, a.driver, a.credential_generation,
                     a.updated_at AS transport_revision
              FROM upstream_accounts a
              JOIN tenants t ON t.id = a.tenant_id
@@ -244,12 +244,9 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
-        let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
-            .map_err(|_| AppError::internal("upstream_service_probes_probe_account_context_1"))?;
         Ok(ProbeAccountContext {
             tenant_external_id: row.try_get("external_id")?,
             driver: row.try_get("driver")?,
-            config,
             credential_generation: row.try_get("credential_generation")?,
             transport_revision: row.try_get("transport_revision")?,
         })

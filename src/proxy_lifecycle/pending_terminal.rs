@@ -1769,25 +1769,24 @@ impl Journal {
             compact_published = self.publish_receipt(&compact).await;
         }
         if removed {
-            if let Some(archive) = &self.archive {
-                if archive
+            if let Some(archive) = &self.archive
+                && archive
                     .delete(&self.receipt_location(receipt_id))
                     .await
                     .is_err()
+            {
+                // Keep the already acknowledged receipt for safe idempotent retry.
+                if let Some(entry) = self
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&receipt_id)
                 {
-                    // Keep the already acknowledged receipt for safe idempotent retry.
-                    if let Some(entry) = self
-                        .pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .get_mut(&receipt_id)
-                    {
-                        entry.running = false;
-                        entry.applied = true;
-                        entry.retry_after = tokio::time::Instant::now() + RETRY_INTERVAL;
-                    }
-                    return;
+                    entry.running = false;
+                    entry.applied = true;
+                    entry.retry_after = tokio::time::Instant::now() + RETRY_INTERVAL;
                 }
+                return;
             }
             let _ = tokio::fs::remove_file(self.directory.join(format!("{receipt_id}.json"))).await;
         }
