@@ -48,10 +48,13 @@ pub(super) async fn proxy_openai_chat(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    axum::Extension(spool): axum::Extension<
+        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    >,
     headers: HeaderMap,
-    body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiChat, memory).await
+    let body = replay_request_source(&state, &spool).await?;
+    super::proxy::proxy_spooled(state, headers, body, memory, spool, Protocol::OpenAiChat).await
 }
 
 pub(super) async fn proxy_openai_responses(
@@ -64,8 +67,8 @@ pub(super) async fn proxy_openai_responses(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let body = replay_native_request_file(&state, &spool).await?;
-    super::proxy::proxy_spooled_responses(
+    let body = replay_request_source(&state, &spool).await?;
+    super::proxy::proxy_spooled(
         state,
         headers,
         body,
@@ -86,8 +89,8 @@ pub(super) async fn proxy_openai_responses_compact(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let body = replay_native_request_file(&state, &spool).await?;
-    super::proxy::proxy_spooled_responses(
+    let body = replay_request_source(&state, &spool).await?;
+    super::proxy::proxy_spooled(
         state,
         headers,
         body,
@@ -98,7 +101,7 @@ pub(super) async fn proxy_openai_responses_compact(
     .await
 }
 
-async fn replay_native_request_file(
+async fn replay_request_source(
     state: &AppState,
     spool: &std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
 ) -> Result<crate::gateway_body::request_spool::VerifiedJsonInput, AppError> {
@@ -116,10 +119,21 @@ pub(super) async fn proxy_openai_alpha_search(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    axum::Extension(spool): axum::Extension<
+        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    >,
     headers: HeaderMap,
-    body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiAlphaSearch, memory).await
+    let body = replay_request_source(&state, &spool).await?;
+    super::proxy::proxy_spooled(
+        state,
+        headers,
+        body,
+        memory,
+        spool,
+        Protocol::OpenAiAlphaSearch,
+    )
+    .await
 }
 
 /// Temporary transport negotiation for clients that probe the Responses
@@ -148,10 +162,21 @@ pub(super) async fn proxy_openai_embeddings(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    axum::Extension(spool): axum::Extension<
+        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    >,
     headers: HeaderMap,
-    body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::OpenAiEmbeddings, memory).await
+    let body = replay_request_source(&state, &spool).await?;
+    super::proxy::proxy_spooled(
+        state,
+        headers,
+        body,
+        memory,
+        spool,
+        Protocol::OpenAiEmbeddings,
+    )
+    .await
 }
 
 pub(super) async fn proxy_anthropic(
@@ -159,10 +184,21 @@ pub(super) async fn proxy_anthropic(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    axum::Extension(spool): axum::Extension<
+        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    >,
     headers: HeaderMap,
-    body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicMessages, memory).await
+    let body = replay_request_source(&state, &spool).await?;
+    super::proxy::proxy_spooled(
+        state,
+        headers,
+        body,
+        memory,
+        spool,
+        Protocol::AnthropicMessages,
+    )
+    .await
 }
 
 pub(super) async fn proxy_anthropic_count_tokens(

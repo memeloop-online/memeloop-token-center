@@ -711,6 +711,7 @@ impl RequestSpool {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_bytes(self: &Arc<Self>, bytes: Bytes) -> Bytes {
         struct BodySource {
             bytes: Bytes,

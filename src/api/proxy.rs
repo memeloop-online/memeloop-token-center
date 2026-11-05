@@ -840,7 +840,7 @@ pub(super) async fn proxy(
     .await
 }
 
-pub(super) async fn proxy_spooled_responses(
+pub(super) async fn proxy_spooled(
     state: AppState,
     headers: HeaderMap,
     body: crate::gateway_body::request_spool::VerifiedJsonInput,
