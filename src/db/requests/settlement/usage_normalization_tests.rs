@@ -27,7 +27,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
 }
 
 #[test]
-fn rejected_usage_diagnostics_keep_scalar_evidence_and_redact_unknown_tiers() {
+fn usage_diagnostics_distinguish_accepted_output_overrun_and_redact_unknown_tiers() {
     let capture = LogCapture::default();
     let subscriber = tracing_subscriber::fmt()
         .json()
@@ -46,8 +46,11 @@ fn rejected_usage_diagnostics_keep_scalar_evidence_and_redact_unknown_tiers() {
             normalize_proxy_usage_with_output_limit(&usage, 743, None, None).unwrap(),
             usage
         );
+        assert_eq!(
+            normalize_proxy_usage_with_output_limit(&usage, 743, Some(6), None).unwrap(),
+            usage
+        );
         for (reported, requested, limit) in [
-            (None, None, Some(6)),
             (Some("priority"), None, None),
             (Some("Bearer private-provider-secret"), None, None),
             (None, Some("private-requested-tier"), None),
@@ -107,11 +110,19 @@ fn rejected_usage_diagnostics_keep_scalar_evidence_and_redact_unknown_tiers() {
     }
     assert_eq!(events[0]["fields"]["admitted_output_token_limit"], 6);
     assert_eq!(events[0]["fields"]["has_output_token_limit"], true);
+    assert_eq!(events[0]["fields"]["rejected"], false);
+    assert_eq!(events[1]["fields"]["rejected"], true);
     assert_eq!(events[1]["fields"]["admitted_output_token_limit"], 0);
     assert_eq!(events[1]["fields"]["has_output_token_limit"], false);
 }
 
-async fn actual_input_above_estimate_settles_once(database: &Database) {
+async fn actual_usage_settles_once(
+    database: &Database,
+    input_ceiling: i64,
+    output_ceiling: i64,
+    usage: TokenUsage,
+    actual_cost: i64,
+) {
     for (mode, capped) in [
         (EnforcementMode::Prepaid, false),
         (EnforcementMode::Prepaid, true),
@@ -152,8 +163,8 @@ async fn actual_input_above_estimate_settles_once(database: &Database) {
                 request_id,
                 key: &key,
                 price: &price,
-                input_token_ceiling: 10,
-                output_token_ceiling: 20,
+                input_token_ceiling: input_ceiling,
+                output_token_ceiling: output_ceiling,
                 protocol: "openai",
                 model: "provider-context",
                 request_object: "gap://provider-context/request",
@@ -162,7 +173,8 @@ async fn actual_input_above_estimate_settles_once(database: &Database) {
             })
             .await
             .unwrap();
-        assert_eq!(reservation.reserved_tokens, 30);
+        let reserved_tokens = input_ceiling + output_ceiling;
+        assert_eq!(reservation.reserved_tokens, reserved_tokens);
         let owner = ProxyRequestOwner {
             request_id,
             tenant_id: key.tenant_id,
@@ -172,7 +184,7 @@ async fn actual_input_above_estimate_settles_once(database: &Database) {
         };
         assert!(database.acquire_proxy_request_owner(&owner).await.unwrap());
         let claim = database
-            .claim_pending_proxy_settlement(&owner, 10, 20, None)
+            .claim_pending_proxy_settlement(&owner, input_ceiling, output_ceiling, None)
             .await
             .unwrap();
         let receipt = Uuid::now_v7();
@@ -184,16 +196,12 @@ async fn actual_input_above_estimate_settles_once(database: &Database) {
             request_id,
             tenant_id: key.tenant_id,
             reservation: &reservation,
-            input_token_ceiling: 10,
-            output_token_ceiling: 20,
+            input_token_ceiling: input_ceiling,
+            output_token_ceiling: output_ceiling,
             requested_service_tier: None,
             status_code: 200,
             duration_ms: 10,
-            usage: TokenUsage {
-                input_tokens: 500,
-                output_tokens: 7,
-                ..TokenUsage::default()
-            },
+            usage: usage.clone(),
             error_code: None,
             response_object: "gap://provider-context/response",
             routing_session_id: None,
@@ -212,7 +220,7 @@ async fn actual_input_above_estimate_settles_once(database: &Database) {
         let (first, second) = tokio::join!(finish(), finish());
         let ack = first.unwrap();
         assert_eq!(second.unwrap(), ack);
-        let cost = if capped { 100 } else { 507 };
+        let cost = if capped { 100 } else { actual_cost };
         assert_eq!(ack.cost_micros, cost);
         let mut altered = terminal();
         altered.usage.input_tokens += 1;
@@ -263,7 +271,7 @@ async fn actual_input_above_estimate_settles_once(database: &Database) {
                 .await
                 .unwrap()
         );
-        let row = sqlx::query("SELECT p.state, p.contract_digest, r.status, r.reserved_tokens, r.actual_micros, q.status_code, q.input_tokens, q.output_tokens, q.usage_basis, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.id AND l.kind = 'usage') AS ledgers, (SELECT CAST(SUM(amount_micros) AS BIGINT) FROM ledger_entries l WHERE l.source = r.id AND l.kind = 'usage') AS charged, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS facts FROM pending_proxy_settlements p JOIN usage_reservations r ON r.id = p.reservation_id JOIN request_records q ON q.id = p.request_id WHERE p.request_id = $1")
+        let row = sqlx::query("SELECT p.state, p.contract_digest, r.status, r.reserved_tokens, r.actual_micros, q.status_code, q.input_tokens, q.cached_input_tokens, q.output_tokens, q.usage_basis, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.id AND l.kind = 'usage') AS ledgers, (SELECT CAST(SUM(amount_micros) AS BIGINT) FROM ledger_entries l WHERE l.source = r.id AND l.kind = 'usage') AS charged, (SELECT COUNT(*) FROM request_stats_facts f WHERE f.request_id = q.id) AS facts FROM pending_proxy_settlements p JOIN usage_reservations r ON r.id = p.reservation_id JOIN request_records q ON q.id = p.request_id WHERE p.request_id = $1")
             .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
         assert_eq!(row.get::<String, _>("state"), "applied");
         assert_eq!(
@@ -271,11 +279,18 @@ async fn actual_input_above_estimate_settles_once(database: &Database) {
             claim.contract_digest
         );
         assert_eq!(row.get::<String, _>("status"), "settled");
-        assert_eq!(row.get::<i64, _>("reserved_tokens"), 30);
+        assert_eq!(row.get::<i64, _>("reserved_tokens"), reserved_tokens);
         assert_eq!(row.get::<i64, _>("actual_micros"), cost);
         assert_eq!(row.get::<i64, _>("status_code"), 200);
-        assert_eq!(row.get::<i64, _>("input_tokens"), 500);
-        assert_eq!(row.get::<i64, _>("output_tokens"), 7);
+        assert_eq!(
+            row.get::<i64, _>("input_tokens"),
+            usage.input_tokens + usage.cached_input_tokens + usage.cache_write_tokens
+        );
+        assert_eq!(
+            row.get::<i64, _>("cached_input_tokens"),
+            usage.cached_input_tokens
+        );
+        assert_eq!(row.get::<i64, _>("output_tokens"), usage.output_tokens);
         assert_eq!(row.get::<String, _>("usage_basis"), "provider_reported");
         assert_eq!(row.get::<i64, _>("ledgers"), 1);
         assert_eq!(row.get::<i64, _>("charged"), -cost);
@@ -285,15 +300,45 @@ async fn actual_input_above_estimate_settles_once(database: &Database) {
         assert_eq!(snapshot.concurrency.active, 0);
         if mode == EnforcementMode::Prepaid {
             assert_eq!(
-                snapshot.available_balance,
-                if capped { "0.9999" } else { "0.999493" }
+                snapshot.available_balance.parse::<Decimal>().unwrap(),
+                Decimal::ONE - Decimal::new(cost, 6)
             );
         }
     }
 }
 
+async fn provider_usage_over_request_estimates(database: &Database) {
+    actual_usage_settles_once(
+        database,
+        10,
+        20,
+        TokenUsage {
+            input_tokens: 500,
+            output_tokens: 7,
+            ..TokenUsage::default()
+        },
+        507,
+    )
+    .await;
+    // Actual Kimi probe evidence: 102 cached input, 19 output, requested 16.
+    // TokenUsage stores uncached input separately; request rows stay inclusive.
+    actual_usage_settles_once(
+        database,
+        10,
+        16,
+        TokenUsage {
+            input_tokens: 0,
+            cached_input_tokens: 102,
+            output_tokens: 19,
+            ..TokenUsage::default()
+        },
+        121,
+    )
+    .await;
+}
+
 #[tokio::test]
-async fn sqlite_provider_context_above_input_estimate_preserves_receipt_and_actual_charge() {
+async fn sqlite_provider_usage_above_request_limits_preserves_receipt_and_actual_charge() {
     let directory = tempfile::tempdir().unwrap();
     let database = Database::connect(&format!(
         "sqlite://{}?mode=rwc",
@@ -302,12 +347,12 @@ async fn sqlite_provider_context_above_input_estimate_preserves_receipt_and_actu
     .await
     .unwrap();
     database.migrate().await.unwrap();
-    actual_input_above_estimate_settles_once(&database).await;
+    provider_usage_over_request_estimates(&database).await;
     database.close().await;
 }
 
 #[tokio::test]
-async fn postgres_provider_context_above_input_estimate_preserves_receipt_and_actual_charge() {
+async fn postgres_provider_usage_above_request_limits_preserves_receipt_and_actual_charge() {
     let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
         assert!(
             std::env::var_os("CI").is_none(),
@@ -318,7 +363,7 @@ async fn postgres_provider_context_above_input_estimate_preserves_receipt_and_ac
     let isolated = PostgresTestDatabase::create(&url).await;
     let database = Database::connect_with_max(isolated.url(), 6).await.unwrap();
     database.migrate().await.unwrap();
-    actual_input_above_estimate_settles_once(&database).await;
+    provider_usage_over_request_estimates(&database).await;
     database.close().await;
     isolated.cleanup().await;
 }
