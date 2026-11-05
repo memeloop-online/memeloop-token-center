@@ -118,16 +118,17 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
         .unwrap();
     let (endpoint, release_body, upstream) =
         gated_sse_upstream(completed_codex_sse("projected after EOF").into_bytes()).await;
+    let request_document = json!({
+        "model": fixture.model,
+        "input": "small semantic input",
+        "metadata": {"padding": "x".repeat(RETAINED_BYTES)},
+        "stream": true
+    });
     let response = send_codex_route_to_endpoint(
         &fixture,
         endpoint,
         "/v1/responses",
-        json!({
-            "model": fixture.model,
-            "input": "small semantic input",
-            "metadata": {"padding": "x".repeat(RETAINED_BYTES)},
-            "stream": true
-        }),
+        request_document.clone(),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -186,10 +187,14 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     .expect("large source-backed request must financially settle");
     drain_completed_response_archive(&fixture).await;
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+    let raw_source = pending_delivery::read_archived_request_source(&fixture, &pool, request_id)
+        .await
+        .expect("projected conversation retains its real raw request source");
+    pending_delivery::assert_raw_request_source(&raw_source, &request_document);
     assert_eq!(
         fixture.state.responses_request_spool.read_count_for_test(),
-        spool_reads + 2,
-        "terminal projection reads the durable source once after routing released its JSON working set"
+        spool_reads + 1,
+        "archive worker reads the durable locator directly without rereading the routing spool"
     );
     let mut found_receipt = false;
     for receipt in fixture.state.pending_terminals.receipt_jsons_for_test() {
@@ -201,10 +206,7 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
             bytes.len() < RETAINED_BYTES,
             "journal must not copy raw padding"
         );
-        assert_eq!(
-            receipt["conversation"]["request_json"],
-            json!({"input": "small semantic input"})
-        );
+        assert_eq!(receipt["conversation"]["request_json"], json!({}));
         found_receipt = true;
     }
     assert!(
@@ -263,8 +265,8 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     );
     assert_eq!(
         fixture.state.responses_request_spool.read_count_for_test(),
-        spool_reads + 2,
-        "settlement and archival reuse the terminal projection without a third source read"
+        spool_reads + 1,
+        "settlement and archival never reread the routing spool"
     );
     pool.close().await;
     drop(retirement);

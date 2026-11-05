@@ -1,6 +1,35 @@
 use super::*;
 mod receipt_durability;
 
+pub(super) async fn read_archived_request_source(
+    fixture: &CodexRouteFixture,
+    pool: &sqlx::AnyPool,
+    request_id: Uuid,
+) -> Option<bytes::Bytes> {
+    let locator: String = sqlx::query_scalar(
+        "SELECT request_object FROM request_records WHERE id = $1 AND key_id = $2",
+    )
+    .bind(request_id.to_string())
+    .bind(fixture.key_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    if locator.starts_with("gap://") {
+        return None;
+    }
+    assert_eq!(
+        Some(locator.as_str()),
+        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
+            .as_deref()
+    );
+    fixture.state.archive.get(&locator).await.ok()
+}
+
+pub(super) fn assert_raw_request_source(raw: &[u8], expected: &Value) {
+    assert_eq!(raw, serde_json::to_vec(expected).unwrap().as_slice());
+    assert_eq!(serde_json::from_slice::<Value>(raw).unwrap(), *expected);
+}
+
 async fn owned_enqueued_source(
     fixture: &CodexRouteFixture,
     pool: &sqlx::AnyPool,
@@ -1380,20 +1409,27 @@ async fn unknown_failure_retries_operational_projection() {
     .expect("unknown finance must retain its durable receipt");
     let request_id = Uuid::parse_str(original["request_id"].as_str().unwrap()).unwrap();
     assert!(original["conversation"].is_object());
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture
-            .state
-            .pending_terminals
-            .idle_conversation_retained_for_test(receipt_id)
-            .await
-            != Some(true)
-        {
+    let raw_source = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if fixture
+                .state
+                .pending_terminals
+                .idle_conversation_retained_for_test(receipt_id)
+                .await
+                == Some(true)
+                && let Some(raw) = read_archived_request_source(&fixture, &pool, request_id).await
+            {
+                break raw;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("unknown awaiting its operational receipt must survive idle reap");
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    assert_raw_request_source(
+        &raw_source,
+        &json!({"model": fixture.model, "input": "operational failure retry", "stream": true}),
+    );
     let financial: (String, String, Option<i64>, i64, i64) = sqlx::query_as(
         "SELECT p.unknown_reason, r.status, r.actual_micros, \
          (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
@@ -1442,14 +1478,18 @@ async fn unknown_failure_retries_operational_projection() {
             .pending_terminals
             .contains_receipt_for_test(receipt_id)
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture
-            .state
-            .pending_terminals
-            .idle_conversation_retained_for_test(receipt_id)
-            .await
-            != Some(true)
-        {
+    let raw_source = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if fixture
+                .state
+                .pending_terminals
+                .idle_conversation_retained_for_test(receipt_id)
+                .await
+                == Some(true)
+                && let Some(raw) = read_archived_request_source(&fixture, &pool, request_id).await
+            {
+                break raw;
+            }
             tokio::task::yield_now().await;
         }
     })
@@ -1463,7 +1503,10 @@ async fn unknown_failure_retries_operational_projection() {
     .await
     .unwrap();
     assert_eq!(enqueued, 0);
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    assert_raw_request_source(
+        &raw_source,
+        &json!({"model": fixture.model, "input": "operational failure retry", "stream": true}),
+    );
     sqlx::query("DROP TRIGGER fail_unknown_projection")
         .execute(&pool)
         .await
