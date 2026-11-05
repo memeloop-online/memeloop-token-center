@@ -215,6 +215,13 @@ pub struct Config {
     pub pricing_litellm_url: String,
     pub pricing_openrouter_url: String,
     pub plugin_dir: Option<String>,
+    /// Private, fixed-tenant Health Intelligence companion. Never guest config.
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_origin: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_tenant: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_read_token: Option<String>,
     /// Host-provisioned JSON inventory; never accepted from plugin/tenant input.
     #[serde(default)]
     pub plugin_inventory_file: Option<String>,
@@ -498,6 +505,9 @@ impl Config {
             pricing_litellm_url,
             pricing_openrouter_url,
             plugin_dir: env::var("MTC_PLUGIN_DIR").ok(),
+            plugin_advice_origin: env::var("MTC_PLUGIN_ADVICE_ORIGIN").ok(),
+            plugin_advice_tenant: env::var("MTC_PLUGIN_ADVICE_TENANT").ok(),
+            plugin_advice_read_token: env::var("MTC_PLUGIN_ADVICE_READ_TOKEN").ok(),
             plugin_inventory_file: env::var("MTC_PLUGIN_INVENTORY_FILE").ok(),
             plugin_install_policy_file: env::var("MTC_PLUGIN_INSTALL_POLICY_FILE").ok(),
             allow_oauth_loopback,
@@ -582,6 +592,9 @@ impl Config {
             pricing_litellm_url: String::new(),
             pricing_openrouter_url: String::new(),
             plugin_dir: None,
+            plugin_advice_origin: None,
+            plugin_advice_tenant: None,
+            plugin_advice_read_token: None,
             plugin_inventory_file: None,
             plugin_install_policy_file: None,
             allow_oauth_loopback: true,

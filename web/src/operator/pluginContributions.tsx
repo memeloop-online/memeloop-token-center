@@ -4,6 +4,7 @@ import { ApiError, api } from '../api.js';
 import { PluginUiSlot } from '../plugins/PluginUiSlot.js';
 import { operatorRouteKeys, pluginRouteKey, type OperatorRouteKey, type PluginRouteKey } from '../app/routes.js';
 import { OperatorPluginComponentHost } from '../plugins/OperatorPluginComponentHost.js';
+import { PluginConcurrencyAdvice } from './PluginConcurrencyAdvice.js';
 import type {
   PluginManifest,
   PluginOperatorUiContribution,
@@ -421,11 +422,13 @@ export function PluginContributionPage({ registered, token, tenant, locale, onNa
   if (registered.contribution.renderer === 'component_v1') {
     return <article className="plugin-contribution-page plugin-component-page" aria-label={registered.contribution.label}>
       <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} context={context} />
+      {registered.pluginId === 'mtc-health-intelligence' && <PluginConcurrencyAdvice token={token} tenant={tenant} locale={locale} />}
     </article>;
   }
   return <article className="panel plugin-contribution-page">
     <div className="panel-title"><div><h2>{registered.contribution.label}</h2><p className="muted">Data from the installed extension.</p></div></div>
     <PluginContributionData registered={registered} token={token} tenant={tenant} locale={locale} onNavigate={onNavigate} />
+    {registered.pluginId === 'mtc-health-intelligence' && <PluginConcurrencyAdvice token={token} tenant={tenant} locale={locale} />}
   </article>;
 }
 
