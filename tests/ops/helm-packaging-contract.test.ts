@@ -73,7 +73,7 @@ interface RuntimeDeployment {
   metadata: { annotations: Record<string, string> };
   spec: { template: { metadata: { labels: Record<string, string> }; spec: {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
-    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
+    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; mountPath?: string; readOnly?: boolean; subPath?: string }> }>;
     initContainers: Array<{ name: string; image: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
     volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
@@ -180,6 +180,18 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
       const writer = role === 'control';
       const pod = deployment.spec.template.spec;
+      const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'request-spool');
+      const spoolVolume = pod.volumes?.find(item => item.name === 'request-spool');
+      if (role === 'gateway' || role === 'control' || role === 'all') {
+        assert.equal(spoolMount?.mountPath, '/var/lib/memeloop-token-center/request-spool');
+        assert.deepEqual(spoolVolume?.emptyDir, {});
+        assert.equal(resources.requests['ephemeral-storage'], '2Gi');
+        assert.equal(resources.limits['ephemeral-storage'], undefined);
+        assert.equal(pod.containers[0]!.env.find(item => item.name === 'MTC_RESPONSES_REQUEST_SPOOL_PATH')?.value, spoolMount?.mountPath);
+      } else {
+        assert.equal(spoolMount, undefined);
+        assert.equal(spoolVolume, undefined);
+      }
       const container = pod.containers[0]!;
       assert.equal(pod.securityContext.runAsUser, 10001);
       assert.equal(pod.securityContext.runAsGroup, 10001);
@@ -203,8 +215,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     count('dev', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 1);
     const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
-    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 8Gi/);
-    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 512Mi/);
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+memory: 8Gi/);
+    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 2Gi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_PATH'));
