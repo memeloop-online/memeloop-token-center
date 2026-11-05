@@ -1130,15 +1130,14 @@ async fn first_billable_delta_arrives_while_upstream_terminal_and_journal_ack_ar
 
 #[tokio::test]
 async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_responsibility() {
-    let mut fixture = codex_route_fixture("pending-filesystem-fault").await;
-    let unavailable = fixture._directory.path().join("journal-is-a-file");
+    let fixture = codex_route_fixture("pending-filesystem-fault").await;
+    // The filesystem backend maps receipt object keys below this directory.
+    // Block only their namespace so the production journal cannot publish its
+    // ACK, while the independent raw request/response sources remain writable.
+    let unavailable = fixture.archive_path.join("terminal-receipts");
     tokio::fs::write(&unavailable, b"not a directory")
         .await
         .unwrap();
-    fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        unavailable.clone(),
-        fixture.state.db.independent_persistence_pool(),
-    );
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
