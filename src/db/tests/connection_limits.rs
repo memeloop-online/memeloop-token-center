@@ -377,3 +377,45 @@ async fn two_connection_pool_keeps_all_control_pages_bounded_under_concurrent_re
             .all(|page| page.expect("control page read succeeds") == 100)
     );
 }
+
+#[tokio::test]
+async fn request_pool_wait_survives_timeout_and_cancels_cleanly() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("request-pool-wait.db").display()
+    );
+    let mut database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    database.pool = database
+        .pool
+        .options()
+        .clone()
+        .acquire_timeout(Duration::from_millis(20))
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+    // Exercise the PostgreSQL retry policy with a local held connection;
+    // the helper only acquires a slot and does not execute backend SQL.
+    database.backend = super::super::DatabaseBackend::PostgreSql;
+    let held = database.pool.acquire().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(70),
+            database.acquire_request_connection("test"),
+        )
+        .await
+        .is_err()
+    );
+    drop(held);
+    let connection = tokio::time::timeout(
+        Duration::from_secs(1),
+        database.acquire_request_connection("test"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(connection);
+    database.pool.close().await;
+    assert!(matches!(
+        database.acquire_request_connection("test").await,
+        Err(sqlx::Error::PoolClosed)
+    ));
+}
