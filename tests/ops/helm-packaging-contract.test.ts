@@ -73,7 +73,7 @@ interface RuntimeDeployment {
   metadata: { annotations: Record<string, string> };
   spec: { template: { metadata: { labels: Record<string, string> }; spec: {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
-    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
+    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; mountPath?: string; readOnly?: boolean; subPath?: string }> }>;
     initContainers: Array<{ name: string; image: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
     volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
@@ -203,12 +203,10 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     count('dev', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 1);
     const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
-    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 8Gi/);
-    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 512Mi/);
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+memory: 8Gi/);
+    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 2Gi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
-    assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_PATH'));
-    assert.ok(!output.default!.includes('responses-request-spool'));
     const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
     const defaultMemory: Record<string, string[]> = { gateway: ['512Mi', '8Gi'], control: ['128Mi', '256Mi'], worker: ['192Mi', '384Mi'] };
     for (const deployment of deployments) {
@@ -219,8 +217,17 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.deepEqual([resources.requests.memory, resources.limits.memory], expectedMemory, `${role}: default memory request and limit`);
       assert.equal(deployment.metadata.annotations['argocd.argoproj.io/sync-wave'], role === 'gateway' || role === 'control' ? '1' : '0');
       const pod = deployment.spec.template.spec;
-      assert.equal(pod.containers[0]!.volumeMounts?.find(item => item.name === 'responses-request-spool'), undefined, `${role}: request bodies do not get a temp directory`);
-      assert.equal(pod.volumes?.find(item => item.name === 'responses-request-spool'), undefined, `${role}: request bodies do not get a temp directory`);
+      const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'request-spool');
+      const spoolVolume = pod.volumes?.find(item => item.name === 'request-spool');
+      if (role === 'gateway') {
+        assert.equal(spoolMount?.mountPath, '/var/lib/memeloop-token-center/request-spool');
+        assert.deepEqual(spoolVolume?.emptyDir, {}, 'response conversion uses disk storage without a per-volume cap');
+        assert.equal(resources.limits['ephemeral-storage'], undefined);
+        assert.equal(pod.containers[0]!.env.find(item => item.name === 'MTC_RESPONSES_REQUEST_SPOOL_PATH')?.value, spoolMount?.mountPath);
+      } else {
+        assert.equal(spoolMount, undefined, `${role}: no response-conversion directory`);
+        assert.equal(spoolVolume, undefined, `${role}: no response-conversion volume`);
+      }
     }
     for (const deployment of output.default!.split(/^---$/m).filter((document) => document.includes('kind: Deployment'))) {
       for (const [name, value] of [['CONNECT_TIMEOUT', '5000'], ['REQUEST_TIMEOUT', '30000'], ['READINESS_DEADLINE', '5000']]) {
