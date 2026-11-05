@@ -74,13 +74,9 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
-                            for statement in [
-                                super::POSTGRES_SERVE_STATEMENT_TIMEOUT,
-                                super::POSTGRES_SERVE_LOCK_TIMEOUT,
-                                super::POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
-                            ] {
-                                sqlx::query(statement).execute(&mut *connection).await?;
-                            }
+                            sqlx::raw_sql(super::POSTGRES_SERVE_SETTINGS)
+                                .execute(&mut *connection)
+                                .await?;
                         }
                     }
                     Ok(())
