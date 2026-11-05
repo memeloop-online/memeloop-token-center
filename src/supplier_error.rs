@@ -203,18 +203,37 @@ pub(crate) fn upstream_error_value(value: &serde_json::Value) -> serde_json::Val
     if let Some(param) = error.get("param") {
         projected["param"] = param.clone();
     }
-    if let Some(fields) = error.as_object() {
-        let details: serde_json::Map<String, Value> = fields
+    let mut details: serde_json::Map<String, Value> =
+        error
+            .as_object()
+            .map_or_else(serde_json::Map::new, |fields| {
+                fields
+                    .iter()
+                    .filter(|(key, _)| {
+                        !matches!(key.as_str(), "code" | "message")
+                            && (key.as_str() != "msg" || error.get("message").is_some())
+                    })
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            });
+    if let Some(envelope) = value
+        .as_object()
+        .filter(|envelope| envelope.contains_key("error"))
+    {
+        let extra = envelope
             .iter()
-            .filter(|(key, _)| {
-                !matches!(key.as_str(), "code" | "message")
-                    && (key.as_str() != "msg" || error.get("message").is_some())
-            })
+            .filter(|(key, _)| key.as_str() != "error")
             .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        if !details.is_empty() {
-            projected["mtc_provider_details"] = Value::Object(details);
+            .collect::<serde_json::Map<_, _>>();
+        if !extra.is_empty() {
+            details = serde_json::Map::from_iter([
+                ("error".to_owned(), Value::Object(details)),
+                ("envelope".to_owned(), Value::Object(extra)),
+            ]);
         }
+    }
+    if !details.is_empty() {
+        projected["mtc_provider_details"] = Value::Object(details);
     }
     projected
 }
