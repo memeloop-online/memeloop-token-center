@@ -456,12 +456,10 @@ impl ResponsesSseCapture {
         // Explicit failure names remain authoritative, while unrelated event
         // metadata is redacted and the typed Chat payload is still validated.
         // This prevents provider metadata from changing settlement semantics.
-        if self.chat_usage.is_some() && event_kind.is_some() {
+        if self.chat_usage.is_some() && matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
             self.usage_invalid = true;
-            if matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
-                self.invalid = true;
-                self.terminal_failure = true;
-            }
+            self.invalid = true;
+            self.terminal_failure = true;
         }
         let Some(data) = data else {
             if self.chat_usage.is_some() && event_kind.is_some() {
@@ -507,6 +505,9 @@ impl ResponsesSseCapture {
         // on a Chat usage contract. Never feed it to the Chat chunk schema or
         // accept a later DONE as success. Parsing rejects duplicate JSON keys.
         if let Some((reason, _)) = Self::safe_supplier_failure(&data) {
+            if self.chat_usage.is_some() && event_kind.is_some() {
+                self.usage_invalid = true;
+            }
             self.terminal_failure = true;
             self.supplier_failure = true;
             self.supplier_rate_limited =

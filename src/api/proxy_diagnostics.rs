@@ -69,6 +69,7 @@ pub(super) fn route_class(path: &str) -> Option<&'static str> {
         "/v1/messages" => Some("messages"),
         "/v1/messages/count_tokens" => Some("count_tokens"),
         "/v1/embeddings" => Some("embeddings"),
+        "/v1/audio/transcriptions" => Some("audio"),
         _ => None,
     }
 }

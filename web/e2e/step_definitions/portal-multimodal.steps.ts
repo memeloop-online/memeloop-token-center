@@ -172,7 +172,7 @@ When('下游用户筛选失败请求并打开详情', async function (this: Dogf
   await assertValue(filters.getByLabel('错误码'), 'http_429');
   await assertCount(page.locator('.self-history tbody tr'), 1);
   await assertContains(page.locator('.self-history tbody'), '429');
-  await assertContains(page.locator('.self-history tbody'), '已记录原因: 上游服务在响应开始时返回了错误状态');
+  await assertContains(page.locator('.self-history tbody'), '已记录原因: 上游返回了未归类的错误');
   assert.doesNotMatch(await page.locator('.self-history tbody').innerText(), /http_429/);
   await page.locator('.self-history').getByRole('button', { name: /请求详情$/ }).click();
 });
@@ -181,7 +181,8 @@ Then('只能看到自己的错误正文且清除筛选后可加载完整历史',
   const page = this.requirePage();
   const drawer = page.getByRole('dialog');
   await assertContains(drawer, '429');
-  await assertContains(drawer, 'upstream rejected the request');
+  await assertContains(drawer, 'mock observable rate limit');
+  await assertContains(drawer, 'rate_limit_error');
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 
   const filters = page.locator('.self-request-filter-panel');

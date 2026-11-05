@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http::{HeaderMap, StatusCode, header};
+use http::{HeaderMap, header};
 use serde_json::{Value, json};
 
 use super::upstream_response::UpstreamResponse;
@@ -129,7 +129,7 @@ impl Rejection {
 mod tests {
     use super::*;
     use futures_util::stream;
-    use http::Version;
+    use http::{StatusCode, Version};
 
     fn response(
         status: StatusCode,

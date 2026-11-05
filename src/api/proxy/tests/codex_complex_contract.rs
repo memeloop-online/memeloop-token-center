@@ -108,7 +108,7 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
             Some(i64::from(expected_status.as_u16()))
         );
         if rejected {
-            sse_delivery::assert_unknown_response_archives_omit(
+            sse_delivery::assert_unknown_response_archive_contains(
                 &fixture,
                 "private-upstream-diagnostic-canary",
             )

@@ -1079,7 +1079,7 @@ fn upstream_image_idempotency_is_secret_and_scoped_to_stable_identity() {
 }
 
 #[tokio::test]
-async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() {
+async fn synchronous_image_budget_queues_before_body_poll_and_cancellation_releases_capacity() {
     let fixture = generation_api_fixture(
         "image-lifecycle",
         "comfyui",
@@ -1113,32 +1113,56 @@ async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() 
         "a third synchronous image lifecycle must not have a permit"
     );
 
-    let response = tokio::time::timeout(
-        Duration::from_millis(100),
+    let body_polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted_polls = body_polls.clone();
+    let body = Body::from_stream(futures_util::stream::poll_fn(move |_| {
+        counted_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        std::task::Poll::<Option<Result<Bytes, Infallible>>>::Pending
+    }));
+    let mut queued = Box::pin(
         router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(
             Request::post("/v1/images/generations")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
-                .body(Body::from_stream(futures_util::stream::pending::<
-                    Result<Bytes, Infallible>,
-                >()))
+                .body(body)
                 .unwrap(),
         ),
-    )
-    .await
-    .expect("an exhausted image budget must reject without reading the body")
-    .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut queued)
+            .await
+            .is_err(),
+        "an exhausted image budget queues the caller before reading its body"
+    );
+    assert_eq!(body_polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(fixture.state.image_response_permits.available_permits(), 0);
+    drop(queued);
 
     drop(both);
-    let _released = tokio::time::timeout(
+    let released = tokio::time::timeout(
         Duration::from_millis(100),
         fixture.state.image_response_permits.acquire(),
     )
     .await
     .expect("permit becomes available")
     .expect("semaphore remains open");
+    drop(released);
+    assert_eq!(fixture.state.image_response_permits.available_permits(), 2);
+    assert_eq!(body_polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let effects: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM usage_reservations), \
+         (SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'), \
+         (SELECT COUNT(*) FROM request_events WHERE event_kind = 'started'), \
+         (SELECT COUNT(*) FROM request_records WHERE upstream_account_id IS NOT NULL)",
+    )
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        effects,
+        (0, 0, 0, 0),
+        "cancelled queued media never dispatches or bills"
+    );
 }
 
 #[tokio::test]

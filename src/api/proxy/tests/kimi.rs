@@ -239,12 +239,16 @@ async fn native_kimi_rejections_preserve_classification_and_original_explanation
             assert!(
                 serde_json::to_string(&record.supplier_error)
                     .unwrap()
-                    .contains(canary)
+                    .contains(canary),
+                "supplier list projection lost details for {label} ({})",
+                protocol.name()
             );
             assert!(
                 serde_json::to_string(&detail.view.supplier_error)
                     .unwrap()
-                    .contains(canary)
+                    .contains(canary),
+                "supplier detail projection lost details for {label} ({})",
+                protocol.name()
             );
             assert_eq!(record.supplier_error, detail.view.supplier_error);
             assert!(record.supplier_error.is_some());

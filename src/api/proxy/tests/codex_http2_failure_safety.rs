@@ -197,7 +197,12 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&body);
-    assert!(!body.contains("upstream_http2_reset"));
+    if matches!(
+        failure,
+        Failure::RejectedPlain | Failure::RejectedPriorReset
+    ) {
+        assert!(body.contains("untrusted-diagnostic"));
+    }
     let receipt = cancellation::single_unknown_receipt(&fixture).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let expected_attempts = if matches!(

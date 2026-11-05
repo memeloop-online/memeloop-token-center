@@ -105,8 +105,9 @@ pub(super) async fn create_audio_transcription(
     let metadata: RewrittenAudioMetadata = serde_json::from_value(applied.request_json)
         .map_err(|_| AppError::BadRequest("plugin-rewritten audio request is invalid".into()))?;
     validate_audio_metadata(&metadata)?;
+    early_request::observe_model(Some(&json!(metadata.model)));
 
-    let request_id = Uuid::now_v7();
+    let request_id = proxy_diagnostics::Context::current().request_id;
     let route = crate::generation::group_routing::prepare_route_for_protocol(
         &mut state,
         &key,
@@ -179,6 +180,7 @@ pub(super) async fn create_audio_transcription(
             model_route_id: Some(route.route_id),
         })
         .await?;
+    early_request::mark_admitted();
     let worker = tokio::spawn(async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
         let result = async move {

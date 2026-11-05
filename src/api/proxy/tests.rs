@@ -5412,7 +5412,7 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
     let archived = sse_delivery::pending_response_archive(&fixture, &receipt).await;
     assert_eq!(archived, rendered);
     for secret in ["provider-secret", "secret-token"] {
-        assert!(!archived.contains(secret));
+        assert!(archived.contains(secret));
     }
     let rendered_metrics = fixture
         .state

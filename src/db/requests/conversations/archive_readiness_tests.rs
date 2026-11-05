@@ -828,6 +828,24 @@ async fn expired_live_source_writer_contract(database_url: String) {
         .await;
     sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
         .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
+    let original_stage: (i64, String, String) = sqlx::query_as(
+        "SELECT updated_at, lease_owner, lease_token FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    let (heartbeat_outcome, heartbeat_receiver) = tokio::sync::watch::channel(None);
+    // Drive the same production metadata waiter as the paused source Put;
+    // its next heartbeat must wait for the occupied archive pool.
+    let heartbeat = fixture.state.db.wait_request_source_upload(
+        fixture.identity,
+        &locator,
+        length,
+        digest,
+        heartbeat_receiver,
+    );
+    tokio::pin!(heartbeat);
     drop(source);
     let charged = fixture.state.proxy_memory_budget.snapshot().0;
     assert!(
@@ -836,7 +854,12 @@ async fn expired_live_source_writer_contract(database_url: String) {
     );
     // The occupied archive pool may keep the heartbeat waiting. It must not
     // cancel the still-pending upload or release its resident-memory charge.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut heartbeat)
+            .await
+            .is_err(),
+        "the source heartbeat must remain queued during the metadata outage"
+    );
     assert!(
         !release.is_closed(),
         "metadata failure must retain the paused Put"
@@ -845,12 +868,18 @@ async fn expired_live_source_writer_contract(database_url: String) {
     drop(held);
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let expiry: i64 = sqlx::query_scalar("SELECT lease_expires_at FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
+            // Keep polling the real waiter after the pool becomes available.
+            tokio::select! {
+                result = &mut heartbeat => panic!("pending source Put ended before renewal: {result:?}"),
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {}
+            }
+            let stage: (i64, i64, String, String) = sqlx::query_as("SELECT updated_at, lease_expires_at, lease_owner, lease_token FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
                 .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
-            if expiry > unix_millis() {
+            assert_eq!(stage.2, original_stage.1);
+            assert_eq!(stage.3, original_stage.2);
+            if stage.0 > original_stage.0 && stage.1 > unix_millis() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }).await.expect("the original writer must renew its expired lease before takeover");
     assert!(
@@ -890,6 +919,8 @@ async fn expired_live_source_writer_contract(database_url: String) {
     })
     .await
     .expect("the original Put must bind and release its raw budget");
+    heartbeat_outcome.send(Some(true)).unwrap();
+    assert_eq!(heartbeat.await, Some(true));
     let original = fixture.state.archive.get(&locator).await.unwrap();
     assert_eq!(original.len(), length);
     assert_eq!(*blake3::hash(&original).as_bytes(), digest);
