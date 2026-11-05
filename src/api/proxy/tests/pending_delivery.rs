@@ -1354,7 +1354,8 @@ async fn unknown_failure_retries_operational_projection() {
     let delivered = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert!(!delivered.contains("response.completed"));
-    assert!(!delivered.contains("PRIVATE_CANARY"));
+    assert!(delivered.contains("PROVIDER_PRIVATE_CANARY"));
+    assert!(!delivered.contains("UNKNOWN_OPERATIONAL_PRIVATE_CANARY"));
     let original = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let (_, receipt) = wait_for_receipt(&fixture).await;
@@ -1393,7 +1394,14 @@ async fn unknown_failure_retries_operational_projection() {
     })
     .await
     .expect("unknown awaiting its operational receipt must survive idle reap");
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    let source_location =
+        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
+            .unwrap();
+    let durable_source = fixture.state.archive.get(&source_location).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&durable_source).unwrap(),
+        json!({"model": fixture.model, "input": "operational failure retry", "stream": true})
+    );
     let financial: (String, String, Option<i64>, i64, i64) = sqlx::query_as(
         "SELECT p.unknown_reason, r.status, r.actual_micros, \
          (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
@@ -1463,7 +1471,10 @@ async fn unknown_failure_retries_operational_projection() {
     .await
     .unwrap();
     assert_eq!(enqueued, 0);
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    assert_eq!(
+        fixture.state.archive.get(&source_location).await.unwrap(),
+        durable_source
+    );
     sqlx::query("DROP TRIGGER fail_unknown_projection")
         .execute(&pool)
         .await

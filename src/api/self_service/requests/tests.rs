@@ -288,67 +288,51 @@ async fn request_archive_content_does_not_expose_policy_metadata_as_body() {
 }
 
 #[tokio::test]
-async fn invalid_native_supplier_envelopes_cannot_escape_detail_or_archive_content() {
+async fn unfamiliar_supplier_details_remain_visible_and_downloadable() {
     let (state, _directory) = test_state().await;
-    let valid = json!({"error": {
-        "type": "upstream_error", "code": "model_unavailable",
-        "message": "The requested upstream model is unavailable",
-        "mtc_safe_reason": "model_unavailable",
-        "mtc_provider_code": "model_not_found",
-        "mtc_provider_message": "Model not found"
+    let value = json!({"error": {
+        "type": "upstream_error", "code": "new_provider_error",
+        "message": "Schema validation failed: tools[3].parameters",
+        "mtc_provider_code": "new_provider_error",
+        "mtc_provider_message": "Schema validation failed: tools[3].parameters",
+        "future_diagnostic": "additional upstream field"
     }});
-    let mut invalid = Vec::new();
-    for field in ["mtc_provider_code", "mtc_provider_message", "unknown_field"] {
-        let mut tampered = valid.clone();
-        tampered["error"][field] = json!("Authorization: Bearer token=private-canary");
-        invalid.push(tampered.to_string());
-    }
-    invalid.extend([
-        r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}} trailing"#,
-        r#"{"error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"},"error":{"message":"legacy"}}"#,
-        r#"{"\u0065rror":{"\u006dtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}} trailing"#,
-        r#"{"error":{"mtc_provider_message":"Authorization: Bearer private-canary","mtc_provider_message":"Model not found","type":"upstream_error","code":"model_unavailable","message":"The requested upstream model is unavailable","mtc_safe_reason":"model_unavailable"}}"#,
-        r#"{"error":"legacy","error":{"mtc_safe_reason":"model_unavailable","mtc_provider_message":"Authorization: Bearer private-canary"}}"#,
-    ].into_iter().map(str::to_owned));
-    for raw in invalid {
-        let mut refs = request_detail_refs(Uuid::now_v7());
-        refs.response_object = Some(format!("inline-json:{raw}"));
-        refs.view.status_code = Some(400);
-        refs.view.error_code = Some("http_400".to_owned());
-        refs.view.supplier_error =
-            crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
-        assert!(refs.view.supplier_error.is_none());
-        let download = request_archive_content_response(
-            &state,
-            &HeaderMap::new(),
-            &refs,
-            RequestArchiveSide::Response,
-        )
+    let raw = value.to_string();
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.response_object = Some(format!("inline-json:{raw}"));
+    refs.view.status_code = Some(400);
+    refs.view.error_code = Some("http_400".to_owned());
+    refs.view.supplier_error =
+        crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
+    assert_eq!(
+        refs.view
+            .supplier_error
+            .as_ref()
+            .unwrap()
+            .provider_code
+            .as_deref(),
+        Some("new_provider_error")
+    );
+    let download = request_archive_content_response(
+        &state,
+        &HeaderMap::new(),
+        &refs,
+        RequestArchiveSide::Response,
+    )
+    .await
+    .unwrap();
+    assert_eq!(download.status(), StatusCode::OK);
+    let downloaded = axum::body::to_bytes(download.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
         .await
         .unwrap();
-        assert_eq!(download.status(), StatusCode::CONFLICT);
-        let download = axum::body::to_bytes(download.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
-            .await
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&download).contains("private-canary"));
-        let download: Value = serde_json::from_slice(&download).unwrap();
-        assert_eq!(download["error"]["reason"], "archive_payload_invalid");
-        let response = request_detail_response(&state, refs).await.unwrap();
-        let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
-            .await
-            .unwrap();
-        assert!(!String::from_utf8_lossy(&body).contains("private-canary"));
-        let detail: Value = serde_json::from_slice(&body).unwrap();
-        assert!(detail["response_body"].is_null());
-        assert!(detail["supplier_error"].is_null());
-        assert_eq!(detail["archive"]["response"]["complete"], false);
-        assert_eq!(
-            detail["archive"]["response"]["reason"],
-            "archive_payload_invalid"
-        );
-        assert_eq!(detail["status_code"], 400);
-        assert_eq!(detail["error_code"], "http_400");
-    }
+    assert_eq!(downloaded.as_ref(), raw.as_bytes());
+    let response = request_detail_response(&state, refs).await.unwrap();
+    let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
+        .await
+        .unwrap();
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(detail["response_body"], value);
+    assert_eq!(detail["archive"]["response"]["complete"], true);
 }
 
 #[tokio::test]
@@ -401,6 +385,12 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
     refs.view.supplier_error = Some(crate::supplier_error::SupplierError {
         code: "no_active_plan".to_owned(),
         message: "当前账号没有可用套餐".to_owned(),
+        category: "quota".to_owned(),
+        retryable: Some(false),
+        provider_details: None,
+        action: "check_plan".to_owned(),
+        provider_code: None,
+        provider_message: None,
     });
     let response = request_detail_response(&state, refs).await.unwrap();
     let body = axum::body::to_bytes(response.into_body(), MAX_ARCHIVE_DETAIL_RESPONSE)
@@ -409,7 +399,8 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
     let detail: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
         detail["supplier_error"],
-        json!({"code": "no_active_plan", "message": "当前账号没有可用套餐"})
+        json!({"code": "no_active_plan", "message": "当前账号没有可用套餐",
+            "category": "quota", "retryable": false, "action": "check_plan"})
     );
     assert_eq!(detail["status_code"], 402);
     assert_eq!(detail["error_code"], "http_402");

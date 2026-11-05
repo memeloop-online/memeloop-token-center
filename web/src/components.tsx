@@ -259,7 +259,8 @@ export function RequestDiagnostics({
   const costCopy = requestCostCopy(request, locale);
   const settlement = <DetailTooltip content={costCopy.hint}><span tabIndex={0}>{costCopy.label}</span></DetailTooltip>;
   const failureCause = pending || requestStatusCopy(request, locale).cause ? null : requestFailureCause(request, locale) ?? (request.error_code ? requestErrorCopy(request.error_code, locale) : null);
-  const supplierDetail = requestStatusCopy(request, locale).supplierDetail;
+  const statusCopy = requestStatusCopy(request, locale);
+  const failureDetails = requestFailed(request) ? statusCopy.details : [];
 
   return <div className="request-diagnostics request-detail-surface request-detail-summary">
     {sessionParent && <p className="request-session-parent"><b>{t('request.parentSession')}</b>
@@ -278,7 +279,9 @@ export function RequestDiagnostics({
       <div><b>{t('request.status')}</b><RequestStatus request={request} /></div>
       <div><b>{t('request.request')}</b><RequestMetadata label={zh ? '记录标识' : 'Record identifiers'} fields={[[zh ? '请求 ID' : 'Request ID', request.request_id]]} /></div>
       {failureCause && <div className="request-detail-wide"><b>{t('request.error')}</b><span>{failureCause}</span></div>}
-      {supplierDetail && <div className="request-detail-wide request-supplier-detail"><b>{zh ? '供应商错误详情' : 'Provider error details'}</b><span>{supplierDetail}</span></div>}
+      {statusCopy.upstreamNote && <div className="request-detail-wide"><b>{zh ? '上游说明' : 'Upstream message'}</b><span>{statusCopy.upstreamNote.replace(/^(上游说明|Upstream message): /, '')}</span></div>}
+      {statusCopy.nextAction && <div className="request-detail-wide"><b>{statusCopy.labels.nextStep}</b><span>{statusCopy.nextAction}</span></div>}
+      {failureDetails.length > 0 && <div className="request-detail-wide request-supplier-detail"><b>{statusCopy.labels.technicalDetails}</b><span>{failureDetails.map((entry) => `${entry.label}: ${entry.value}`).join(' · ')}</span></div>}
       <div><b>{t('request.duration')}</b><DetailTooltip content={timingDetails}><span className="request-detail-timing" tabIndex={0}>{duration.text === '—' ? missing : duration.text}</span></DetailTooltip></div>
       <div><RequestOutputRate request={request} /></div>
     </section>

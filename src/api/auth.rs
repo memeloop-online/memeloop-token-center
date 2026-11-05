@@ -188,6 +188,7 @@ pub(super) async fn authenticate_gateway_before_body(
         .flatten()
         .map(|route| match route {
             "messages" | "count_tokens" => "anthropic",
+            "audio" => "audio-transcription",
             _ => "openai",
         });
     let operation = Box::pin(async {

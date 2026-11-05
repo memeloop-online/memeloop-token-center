@@ -101,7 +101,10 @@ async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_unobserve
             .await
             .unwrap();
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-        assert!(!String::from_utf8_lossy(&body).contains("PRIVATE_PROVIDER_ERROR"));
+        assert_eq!(
+            String::from_utf8_lossy(&body).contains("PRIVATE_PROVIDER_ERROR"),
+            defect == "error"
+        );
         let receipt = cancellation::single_unknown_receipt(&fixture).await;
         assert_eq!(receipt["status_code"], 502, "{defect}");
         assert!(

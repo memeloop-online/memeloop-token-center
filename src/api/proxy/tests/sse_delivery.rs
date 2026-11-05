@@ -746,6 +746,20 @@ pub(super) async fn assert_unknown_response_archives_omit(
     pool.close().await;
 }
 
+pub(super) async fn assert_unknown_response_archive_contains(
+    fixture: &CodexRouteFixture,
+    detail: &str,
+) {
+    let receipt = cancellation::single_unknown_receipt(fixture).await;
+    let locator = receipt["response_object"].as_str().unwrap();
+    assert!(
+        locator
+            .strip_prefix("inline-json:")
+            .unwrap()
+            .contains(detail)
+    );
+}
+
 #[tokio::test]
 async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive() {
     let fixture = codex_route_fixture("failed-bare-secret-event").await;
@@ -778,9 +792,8 @@ async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive()
         .await
         .unwrap();
     let delivered = String::from_utf8(body.to_vec()).unwrap();
-    assert!(delivered.contains("upstream request failed"));
+    assert!(delivered.contains("provider-payload-secret"));
     assert!(delivered.contains("data: [DONE]"));
-    assert!(!delivered.contains("provider-payload-secret"));
     assert!(!delivered.contains("bare-event-secret"));
 
     let receipt = cancellation::assert_unknown_receipt(
@@ -792,8 +805,7 @@ async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive()
     )
     .await;
     let archived = pending_response_archive(&fixture, &receipt).await;
-    assert!(archived.contains("upstream request failed"));
-    assert!(!archived.contains("provider-payload-secret"));
+    assert!(archived.contains("provider-payload-secret"));
     assert!(!archived.contains("bare-event-secret"));
     upstream.verify().await;
 }

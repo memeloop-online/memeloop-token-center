@@ -50,6 +50,8 @@ pub(super) struct ResponsesSseCapture {
     terminal_success: bool,
     terminal_failure: bool,
     supplier_rate_limited: bool,
+    supplier_failure: bool,
+    supplier_reason: Option<crate::supplier_error::UpstreamReason>,
     terminal_incomplete: bool,
     usage: Option<TokenUsage>,
     usage_invalid: bool,
@@ -91,6 +93,7 @@ pub(super) enum ResponsesSseOutcome {
 pub(super) struct ResponsesSseSummary {
     pub(super) outcome: ResponsesSseOutcome,
     pub(super) supplier_rate_limited: bool,
+    pub(super) supplier_reason: Option<crate::supplier_error::UpstreamReason>,
     pub(super) usage: Option<TokenUsage>,
     pub(super) usage_invalid: bool,
     pub(super) observed_protocol_invalid: bool,
@@ -202,7 +205,7 @@ impl ResponsesSseCapture {
                 }
                 continue;
             }
-            if self.supplier_rate_limited {
+            if self.supplier_failure {
                 // A supplier failure cannot be followed by a success/DONE.
                 continue;
             }
@@ -266,7 +269,7 @@ impl ResponsesSseCapture {
         local_boundary: bool,
     ) -> ResponsesSseSummary {
         if let Some(chat_usage) = self.chat_usage.as_ref()
-            && !self.supplier_rate_limited
+            && !self.supplier_failure
         {
             self.usage = chat_usage.usage();
             let usage_invalid = chat_usage.usage_invalid();
@@ -302,6 +305,7 @@ impl ResponsesSseCapture {
         ResponsesSseSummary {
             outcome,
             supplier_rate_limited: self.supplier_rate_limited,
+            supplier_reason: self.supplier_reason,
             usage: self.usage,
             usage_invalid: self.usage_invalid,
             observed_protocol_invalid: self.observed_protocol_invalid,
@@ -334,7 +338,6 @@ impl ResponsesSseCapture {
     }
 
     #[cfg(test)]
-    #[cfg(test)]
     pub(super) fn has_pending_crlf_continuation(&self) -> bool {
         self.framer.has_pending_crlf_continuation()
     }
@@ -360,7 +363,7 @@ impl ResponsesSseCapture {
 
     fn delivery_event_bytes(&self, event: &crate::api::sse::BoundedSseEvent) -> Bytes {
         if let Ok((_, Some(data))) = crate::api::sse::parse_sse_event(event)
-            && let Some(body) = Self::safe_supplier_tpm_body(&data)
+            && let Some((_, body)) = Self::safe_supplier_failure(&data)
         {
             return Bytes::from(format!("data: {}\n\n", String::from_utf8_lossy(&body)));
         }
@@ -374,24 +377,19 @@ impl ResponsesSseCapture {
         crate::api::sse::redacted_sse_event_bytes(event, metadata_policy)
     }
 
-    fn safe_supplier_tpm_body(data: &[u8]) -> Option<Bytes> {
-        const CODE: &[u8] = b"ModelAccountTpmRateLimitExceeded";
-        if data.len() > upstream_error::MAX_ERROR_BYTES
-            || !data.windows(CODE.len()).any(|part| part == CODE)
-        {
+    fn safe_supplier_failure(
+        data: &[u8],
+    ) -> Option<(Option<crate::supplier_error::UpstreamReason>, Bytes)> {
+        if data.len() > upstream_error::MAX_ERROR_BYTES {
             return None;
         }
         let value = crate::api::sse::parse_unique_json(data).ok()?;
-        if value.pointer("/error/code").and_then(Value::as_str)
-            != Some("ModelAccountTpmRateLimitExceeded")
-        {
+        if !value.get("error").is_some_and(Value::is_object) {
             return None;
         }
-        let body = upstream_error::safe_error_body(data);
-        let inline = format!("inline-json:{}", String::from_utf8_lossy(&body));
-        crate::supplier_error::supplier_error_from_inline_json(Some(&inline))
-            .filter(|error| error.code == "rate_limited")
-            .map(|_| body)
+        let reason = crate::supplier_error::reason_from_value(&value);
+        let body = upstream_error::normalized_error_body(data);
+        Some((reason, body))
     }
 
     fn strict_chat_named_control_bytes(event: &crate::api::sse::BoundedSseEvent) -> Bytes {
@@ -459,6 +457,7 @@ impl ResponsesSseCapture {
         // metadata is redacted and the typed Chat payload is still validated.
         // This prevents provider metadata from changing settlement semantics.
         if self.chat_usage.is_some() && matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
+            self.usage_invalid = true;
             self.invalid = true;
             self.terminal_failure = true;
         }
@@ -502,12 +501,18 @@ impl ResponsesSseCapture {
             }
             return ChatSseDeliveryClass::Control;
         }
-        // A standard supplier TPM business error is a failed terminal even
+        // A supplier business error is a failed terminal even
         // on a Chat usage contract. Never feed it to the Chat chunk schema or
         // accept a later DONE as success. Parsing rejects duplicate JSON keys.
-        if Self::safe_supplier_tpm_body(&data).is_some() {
+        if let Some((reason, _)) = Self::safe_supplier_failure(&data) {
+            if self.chat_usage.is_some() && event_kind.is_some() {
+                self.usage_invalid = true;
+            }
             self.terminal_failure = true;
-            self.supplier_rate_limited = true;
+            self.supplier_failure = true;
+            self.supplier_rate_limited =
+                reason == Some(crate::supplier_error::UpstreamReason::RateLimited);
+            self.supplier_reason = reason;
             // Preserve the compatible failure frame's delivery attribution.
             return ChatSseDeliveryClass::Billable;
         }
@@ -566,10 +571,14 @@ impl ResponsesSseCapture {
                 }
             }
         }
-        let reports_error = value.get("error").is_some_and(|error| !error.is_null())
+        let reports_error = matches!(payload_kind, Some(ResponsesSseEventKind::Failed))
+            || value.get("error").is_some_and(|error| !error.is_null())
             || value
                 .pointer("/response/error")
                 .is_some_and(|error| !error.is_null());
+        if reports_error && self.supplier_reason.is_none() {
+            self.supplier_reason = crate::supplier_error::reason_from_value(&value);
+        }
         if reports_error
             && !matches!(
                 payload_kind.or(event_kind),

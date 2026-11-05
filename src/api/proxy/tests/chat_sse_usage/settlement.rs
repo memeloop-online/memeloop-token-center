@@ -242,7 +242,7 @@ async fn strict_chat_logprobs_and_named_failure_keep_usage_unobserved() {
         .unwrap();
     let body = String::from_utf8_lossy(&body);
     assert!(body.contains("logprobs"));
-    assert!(body.contains("response.failed"));
+    assert!(body.contains("must-fail"));
     cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_failed_response"))
         .await;
     upstream.verify().await;

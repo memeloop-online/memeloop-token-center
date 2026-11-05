@@ -19,12 +19,25 @@ pub(crate) async fn classify_media_rate_limit(
     kind
 }
 
-pub(in crate::api) async fn classify_codex_media_rate_limit(
+pub(in crate::api) async fn read_media_rejection(
     response: reqwest::Response,
-) -> crate::db::UpstreamFailureKind {
-    let (response, kind) = routing::classify_rate_limit(UpstreamResponse::Codex(response)).await;
-    drop(response);
-    kind
+    codex: bool,
+) -> (
+    upstream_error::Rejection,
+    Option<crate::db::UpstreamFailureKind>,
+) {
+    let response = if codex {
+        UpstreamResponse::Codex(response)
+    } else {
+        UpstreamResponse::Reqwest(response)
+    };
+    let (response, kind) = if response.status() == StatusCode::TOO_MANY_REQUESTS {
+        let (response, kind) = routing::classify_rate_limit(response).await;
+        (response, Some(kind))
+    } else {
+        (response, None)
+    };
+    (upstream_error::read_rejection(response).await, kind)
 }
 
 #[path = "codex_transport.rs"]
@@ -46,7 +59,7 @@ pub(crate) mod session_preferences;
 mod sse_capture;
 mod streaming;
 mod transport_protocol;
-mod upstream_error;
+pub(super) mod upstream_error;
 mod upstream_response;
 
 #[cfg(test)]
@@ -103,7 +116,9 @@ async fn read_safe_proxy_rejection(
     if !upstream.status().is_success()
         && !protocol.is_anthropic()
         && !responses_anthropic_route
-        && (crate::provider::is_openai_compatible_http_driver(driver) || native_kimi)
+        && (crate::provider::is_openai_compatible_http_driver(driver)
+            || native_kimi
+            || codex_transport::is_driver(driver))
     {
         (None, Some(upstream_error::read_rejection(upstream).await))
     } else {
@@ -1814,24 +1829,57 @@ async fn proxy_with_cancellation_guard(
                 return finish_unavailable(&buffered_request, "upstream_rejected", last_dispatch)
                     .await;
             }
-            Err(ProxySendError::CodexBadRequest) => {
+            Err(
+                error @ (ProxySendError::CodexBadRequest
+                | ProxySendError::CodexRejection(_)
+                | ProxySendError::CodexTransientRejection(_)),
+            ) => {
+                let (status, body) = match error {
+                    ProxySendError::CodexRejection(body) => (StatusCode::BAD_REQUEST, body),
+                    ProxySendError::CodexTransientRejection(body) => {
+                        (StatusCode::SERVICE_UNAVAILABLE, body)
+                    }
+                    _ => (StatusCode::BAD_REQUEST, upstream_error::fallback_body()),
+                };
+                let reason = serde_json::from_slice(&body)
+                    .ok()
+                    .as_ref()
+                    .and_then(crate::supplier_error::reason_from_value);
+                let stored_response = format!("inline-json:{}", String::from_utf8_lossy(&body));
                 upstream_attempt
                     .complete(UpstreamAttemptTerminal::Inconclusive)
                     .await;
-                return finish_local_buffered_error(
-                    &buffered_request,
-                    StatusCode::BAD_REQUEST,
-                    Bytes::from_static(
-                        b"{\"error\":{\"message\":\"upstream rejected the request\",\"type\":\"upstream_error\"}}",
-                    ),
-                    "application/json",
-                    (
-                        TokenUsage::default(),
-                        crate::model::RequestUsageBasis::NotObserved,
-                    ),
-                    Some("http_400".to_owned()),
-                )
-                .await;
+                let mut response =
+                    finish_buffered_request_with_upstream_attribution_and_response_object(
+                        &buffered_request,
+                        status,
+                        body,
+                        "application/json",
+                        (
+                            TokenUsage::default(),
+                            crate::model::RequestUsageBasis::NotObserved,
+                        ),
+                        Some(reason.map_or_else(
+                            || format!("http_{}", status.as_u16()),
+                            |reason| reason.code().to_owned(),
+                        )),
+                        BufferedFinishPolicy {
+                            upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                            response_storage: BufferedResponseStorage::InlineLocalJson(
+                                stored_response,
+                            ),
+                            terminal_cause: Some(
+                                crate::model::RequestTerminalCause::UpstreamHttpStatus,
+                            ),
+                        },
+                    )
+                    .await?;
+                if status == StatusCode::SERVICE_UNAVAILABLE {
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                }
+                return Ok(response);
             }
             Err(ProxySendError::AmbiguousResponse(error_code)) => {
                 upstream_attempt
@@ -1985,15 +2033,8 @@ async fn proxy_with_cancellation_guard(
             (rejection.body, rejection.terminal_cause)
         } else {
             let upstream = upstream.ok_or(AppError::internal("proxy_site_6"))?;
-            let terminal_cause = if status == StatusCode::BAD_GATEWAY {
-                upstream_response::rejected_response_terminal_cause(upstream)
-                    .await
-                    .or(Some(crate::model::RequestTerminalCause::UpstreamHttpStatus))
-            } else {
-                drop(upstream);
-                Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
-            };
-            (upstream_error::fallback_body(), terminal_cause)
+            let rejection = upstream_error::read_rejection(upstream).await;
+            (rejection.body, rejection.terminal_cause)
         };
         let stored_response = format!(
             "inline-json:{}",
@@ -2068,12 +2109,14 @@ async fn proxy_with_cancellation_guard(
             Some(active_route.route.account_id),
             Some(active_route.route.credential_generation),
         );
-        let buffered = match codex_transport::buffer_response(
+        let mut error_details = None;
+        let buffered = match codex_transport::buffer_response_with_details(
             upstream,
             &buffered_request.memory,
             buffered_request.memory_admission_wait,
             buffered_request.conversation.as_ref(),
             sse_framing_limits,
+            &mut error_details,
         )
         .await
         {
@@ -2081,6 +2124,32 @@ async fn proxy_with_cancellation_guard(
             Err(error_code) => {
                 buffer_phase.finish(error_code, None, None);
                 tracing::warn!(%request_id, stage = error_code, "Codex upstream response failed");
+                if let Some(body) = error_details {
+                    let stored = format!("inline-json:{}", String::from_utf8_lossy(&body));
+                    let result =
+                        finish_buffered_request_with_upstream_attribution_and_response_object(
+                            &buffered_request,
+                            StatusCode::BAD_GATEWAY,
+                            body,
+                            "application/json",
+                            (
+                                TokenUsage::default(),
+                                crate::model::RequestUsageBasis::NotObserved,
+                            ),
+                            Some(error_code.to_owned()),
+                            BufferedFinishPolicy {
+                                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                                response_storage: BufferedResponseStorage::InlineLocalJson(stored),
+                                terminal_cause: None,
+                            },
+                        )
+                        .await;
+                    upstream_attempt
+                        .complete(UpstreamAttemptTerminal::Inconclusive)
+                        .await;
+                    codex_retry.complete(CodexRetryTerminal::Failed);
+                    return result;
+                }
                 let result = finish_proxy_failure_with_cause(
                     &buffered_request,
                     error_code,
@@ -2854,6 +2923,7 @@ async fn execute_component_provider(
     let upstream_status = upstream.status();
     IndependentProbeTarget::response(upstream_status);
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
+        let mut rejected_response = UpstreamResponse::from(upstream);
         if let Some(attempt) = upstream_attempt.as_mut() {
             let terminal = if matches!(
                 upstream_status,
@@ -2861,7 +2931,7 @@ async fn execute_component_provider(
             ) {
                 let observed_at = unix_millis();
                 let (response, kind, evidence) =
-                    routing::classify_supplier_quota(upstream.into()).await;
+                    routing::classify_supplier_quota(rejected_response).await;
                 if upstream_status == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
                     publish_supplier_quota(
                         request.state,
@@ -2871,7 +2941,7 @@ async fn execute_component_provider(
                         evidence,
                     );
                 }
-                drop(response);
+                rejected_response = response;
                 UpstreamAttemptTerminal::Failed {
                     kind,
                     reason: if kind == crate::db::UpstreamFailureKind::Authentication {
@@ -2882,7 +2952,6 @@ async fn execute_component_provider(
                     failure_stage: "upstream_response",
                 }
             } else {
-                drop(upstream);
                 if matches!(
                     upstream_status,
                     StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
@@ -2903,15 +2972,13 @@ async fn execute_component_provider(
                 }
             };
             attempt.complete(terminal).await;
-        } else {
-            drop(upstream);
         }
+        let rejection = upstream_error::read_rejection(rejected_response).await;
+        let stored_response = format!("inline-json:{}", String::from_utf8_lossy(&rejection.body));
         return finish_buffered_request_with_upstream_attribution_and_response_object(
             &request,
             upstream_status,
-            Bytes::from_static(
-                b"{\"error\":{\"message\":\"component provider rejected the request\"}}",
-            ),
+            rejection.body,
             "application/json",
             (
                 TokenUsage::default(),
@@ -2920,8 +2987,8 @@ async fn execute_component_provider(
             Some(format!("http_{}", upstream_status.as_u16())),
             BufferedFinishPolicy {
                 upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
-                response_storage: BufferedResponseStorage::DurableArchive,
-                terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
+                response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
+                terminal_cause: rejection.terminal_cause,
             },
         )
         .await;
@@ -3062,24 +3129,29 @@ async fn execute_component_provider(
         }
     };
     if !status.is_success() {
+        let body = upstream_error::normalized_error_body(&normalized.body);
         drop(normalized);
         if let Some(attempt) = upstream_attempt.as_mut() {
             attempt
                 .complete(UpstreamAttemptTerminal::invalid_response())
                 .await;
         }
-        return finish_buffered_request(
+        let stored_response = format!("inline-json:{}", String::from_utf8_lossy(&body));
+        return finish_buffered_request_with_upstream_attribution_and_response_object(
             &request,
             status,
-            Bytes::from_static(
-                b"{\"error\":{\"message\":\"component provider rejected the request\"}}",
-            ),
+            body,
             "application/json",
             (
                 TokenUsage::default(),
                 crate::model::RequestUsageBasis::NotObserved,
             ),
             Some(format!("http_{}", status.as_u16())),
+            BufferedFinishPolicy {
+                upstream_attribution: ProxyRequestUpstreamAttribution::KeepSelected,
+                response_storage: BufferedResponseStorage::InlineLocalJson(stored_response),
+                terminal_cause: Some(crate::model::RequestTerminalCause::UpstreamHttpStatus),
+            },
         )
         .await;
     }

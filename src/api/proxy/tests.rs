@@ -1621,7 +1621,7 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
         .unwrap();
     let body = String::from_utf8_lossy(&body);
     assert!(!body.contains("standby after transient rejection"));
-    assert!(!body.contains("transient upstream detail must stay private"));
+    assert!(body.contains("transient upstream detail must stay private"));
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
@@ -1642,7 +1642,7 @@ async fn codex_transient_400_is_not_replayed_across_accounts() {
     .unwrap();
     assert_eq!(actual, fixture.upstream_account_id.to_string());
     pool.close().await;
-    sse_delivery::assert_unknown_response_archives_omit(
+    sse_delivery::assert_unknown_response_archive_contains(
         &fixture,
         "transient upstream detail must stay private",
     )
@@ -1720,8 +1720,9 @@ async fn codex_retry_then_definite_429_fails_over_but_5xx_does_not() {
             should_failover,
             "{label}"
         );
-        assert!(
-            !String::from_utf8_lossy(&body).contains("must not trigger account replay"),
+        assert_eq!(
+            String::from_utf8_lossy(&body).contains("must not trigger account replay"),
+            !should_failover,
             "{label}"
         );
         if should_failover {
@@ -1874,8 +1875,7 @@ async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("upstream rejected the request"));
-    assert!(!body.contains("private ordinary rejection"));
+    assert!(body.contains("private ordinary rejection"));
     cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     let rows = fixture
         .state
@@ -1885,7 +1885,7 @@ async fn codex_definite_ordinary_400_is_not_replayed_with_a_large_body() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].status_code, Some(400));
-    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private ordinary rejection")
+    sse_delivery::assert_unknown_response_archive_contains(&fixture, "private ordinary rejection")
         .await;
     let requests = upstream.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -2123,9 +2123,8 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("upstream rejected the request"));
+    assert!(body.contains("private ordinary rejection"));
     assert!(!body.contains("private transient rejection"));
-    assert!(!body.contains("private ordinary rejection"));
     cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
     let rows = fixture
         .state
@@ -2138,7 +2137,7 @@ async fn codex_retryable_then_ordinary_400_returns_fixed_400_without_cooldown_or
     assert_eq!(rows[0].error_code.as_deref(), Some("http_400"));
     sse_delivery::assert_unknown_response_archives_omit(&fixture, "private transient rejection")
         .await;
-    sse_delivery::assert_unknown_response_archives_omit(&fixture, "private ordinary rejection")
+    sse_delivery::assert_unknown_response_archive_contains(&fixture, "private ordinary rejection")
         .await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar(
@@ -2302,11 +2301,10 @@ async fn codex_ordinary_json_400_is_returned_once_without_failover_or_cooldown()
             .await
             .unwrap();
         let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("upstream rejected the request"), "{label}");
         cancellation::assert_single_unknown_receipt(&fixture, 400, Some("http_400")).await;
         if let Some(sensitive) = sensitive {
-            assert!(!body.contains(sensitive), "{label}");
-            sse_delivery::assert_unknown_response_archives_omit(&fixture, sensitive).await;
+            assert!(body.contains(sensitive), "{label}");
+            sse_delivery::assert_unknown_response_archive_contains(&fixture, sensitive).await;
         }
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let health_rows: i64 = sqlx::query_scalar(
@@ -2407,8 +2405,8 @@ async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
             .await
             .unwrap();
         assert!(
-            !String::from_utf8_lossy(&response_body).contains(sensitive),
-            "{label} response leaked upstream detail"
+            String::from_utf8_lossy(&response_body).contains(sensitive),
+            "{label} response lost upstream detail"
         );
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let health_rows: i64 = sqlx::query_scalar(
@@ -2421,7 +2419,7 @@ async fn codex_unclassifiable_400_bodies_fail_closed_without_leaking() {
         .unwrap();
         assert_eq!(health_rows, 0, "{label}");
         pool.close().await;
-        sse_delivery::assert_unknown_response_archives_omit(&fixture, sensitive).await;
+        sse_delivery::assert_unknown_response_archive_contains(&fixture, sensitive).await;
         upstream.verify().await;
     }
 }
@@ -4857,8 +4855,7 @@ async fn codex_streaming_natural_failure_then_truncation_emits_one_error_termina
         .expect("a post-terminal upstream error must still close the body cleanly");
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(rendered.matches("event: response.failed").count(), 1);
-    assert_eq!(rendered.matches("upstream request failed").count(), 1);
-    assert!(!rendered.contains("provider-secret"));
+    assert!(rendered.contains("provider-secret"));
 
     accepted.await.unwrap();
     let receipt = cancellation::single_unknown_receipt(&fixture).await;
@@ -5375,9 +5372,9 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
     .expect("redacted stream must complete with real database work")
     .unwrap();
     let rendered = String::from_utf8(body.to_vec()).unwrap();
-    assert!(rendered.contains("upstream request failed"));
+    assert!(rendered.contains("provider-secret"));
     for secret in ["provider-secret", "secret-token"] {
-        assert!(!rendered.contains(secret));
+        assert!(rendered.contains(secret));
     }
     let receipt = cancellation::assert_single_unknown_receipt(
         &fixture,
@@ -5415,7 +5412,7 @@ async fn codex_retry_streaming_failure_is_redacted_and_records_failed_terminal()
     let archived = sse_delivery::pending_response_archive(&fixture, &receipt).await;
     assert_eq!(archived, rendered);
     for secret in ["provider-secret", "secret-token"] {
-        assert!(!archived.contains(secret));
+        assert!(archived.contains(secret));
     }
     let rendered_metrics = fixture
         .state
@@ -5468,7 +5465,7 @@ async fn codex_streaming_output_then_failure_keeps_unobserved_usage_out_of_actua
         .unwrap();
     let rendered = String::from_utf8(body.to_vec()).unwrap();
     assert!(rendered.contains("billable output"));
-    assert!(!rendered.contains("provider-secret"));
+    assert!(rendered.contains("provider-secret"));
     cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_failed_response"))
         .await;
     let rows = fixture
@@ -6130,8 +6127,7 @@ async fn streaming_response_error_null_completes_and_non_null_error_fails() {
             assert!(rendered.contains("response.completed"));
             assert!(rendered.contains("\"error\":null"));
         } else {
-            assert!(rendered.contains("upstream request failed"));
-            assert!(!rendered.contains("provider-secret"));
+            assert!(rendered.contains("provider-secret"));
         }
         if expected_status == 200 {
             wait_for_request_settlement(&fixture, 1).await;

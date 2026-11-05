@@ -5,6 +5,63 @@ use crate::api::limits::{
     MAX_SSE_FRAMED_BYTES_PER_NETWORK_CHUNK, MAX_SSE_FRAMES_PER_NETWORK_CHUNK,
 };
 
+#[test]
+fn known_policy_and_unknown_upstream_errors_keep_original_explanations() {
+    for code in ["misalignment_policy_violation", "future_provider_error"] {
+        let original = json!({
+            "type": "error",
+            "code": code,
+            "message": "Specific provider explanation, including the affected field",
+        });
+        let frame = format!("data: {original}\n\n");
+        let mut sanitizer = ResponsesStreamingSanitizer::default();
+        let mut output = Vec::new();
+        for byte in frame.bytes() {
+            output.extend_from_slice(&sanitizer.push(&[byte]).unwrap());
+        }
+        output.extend_from_slice(&sanitizer.finish().unwrap());
+        let output = String::from_utf8(output).unwrap();
+        let payload = output
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let payload: Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(payload["response"]["error"]["code"], code);
+        assert_eq!(payload["response"]["error"]["message"], original["message"]);
+        assert_eq!(payload["type"], "response.failed");
+    }
+}
+
+#[test]
+fn observed_policy_rejection_after_progress_reaches_client_with_original_reason() {
+    let explanation =
+        "This request was blocked by our safety systems. Reason: Potentially unintended activity.";
+    let input = format!(
+        "data: {{\"type\":\"response.created\",\"response\":{{\"id\":\"resp-policy\"}}}}\n\n\
+         data: {{\"type\":\"response.in_progress\",\"response\":{{\"id\":\"resp-policy\"}}}}\n\n\
+         data: {{\"type\":\"response.metadata\",\"response_id\":\"resp-policy\"}}\n\n\
+         event: error\ndata: {}\n\n\
+         data: {{\"type\":\"response.output_text.delta\",\"delta\":\"after-failure\"}}\n\n",
+        json!({"type":"error","error":{
+            "code":"misalignment_policy_violation",
+            "type":"invalid_request_error",
+            "message":explanation,
+        }}),
+    );
+    let mut sanitizer = ResponsesStreamingSanitizer::default();
+    let mut output = Vec::new();
+    for chunk in input.as_bytes().chunks(7) {
+        output.extend_from_slice(&sanitizer.push(chunk).unwrap());
+    }
+    output.extend_from_slice(&sanitizer.finish().unwrap());
+    let text = String::from_utf8(output).unwrap();
+    assert_eq!(text.matches("\"type\":\"response.failed\"").count(), 1);
+    assert!(text.contains("\"code\":\"misalignment_policy_violation\""));
+    assert!(text.contains(explanation));
+    assert!(!text.contains("\"code\":\"upstream_rejected\""));
+    assert!(!text.contains("after-failure"));
+}
+
 fn event_with_field_count(fields: usize) -> Vec<u8> {
     let mut event = b"x\n".repeat(fields);
     event.push(b'\n');
@@ -12,7 +69,7 @@ fn event_with_field_count(fields: usize) -> Vec<u8> {
 }
 
 #[test]
-fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
+fn sanitizer_preserves_failure_explanation_and_rejects_terminal_conflicts() {
     let failed = concat!(
         "event: response.failed\n",
         "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"provider-secret\",\"token\":\"secret-token\"}}}\n\n",
@@ -26,13 +83,9 @@ fn sanitizer_redacts_failures_and_rejects_terminal_conflicts() {
         output.extend_from_slice(&sanitizer.push(&[*byte]).unwrap());
     }
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("upstream request failed"));
-    for secret in [
-        "provider-secret",
-        "secret-token",
-        "failure-comment-secret",
-        "post-terminal-secret",
-    ] {
+    assert!(output.contains("provider-secret"));
+    assert!(output.contains("secret-token"));
+    for secret in ["failure-comment-secret", "post-terminal-secret"] {
         assert!(!output.contains(secret));
     }
 
@@ -199,9 +252,8 @@ fn failed_terminal_drops_a_bare_secret_event_before_done() {
     }
     output.extend_from_slice(&sanitizer.finish().unwrap());
     let output = String::from_utf8(output).unwrap();
-    assert!(output.contains("upstream request failed"));
+    assert!(output.contains("provider-secret"));
     assert!(output.contains("data: [DONE]"));
-    assert!(!output.contains("provider-secret"));
     assert!(!output.contains("bare-event-secret"));
 }
 

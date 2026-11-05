@@ -12,6 +12,24 @@
 .request-outcome small { font: inherit; opacity: .8; }
 .request-status-cause { display: none; }
 .request-diagnostics .request-status-cause { display: block; margin-top: 4px; overflow-wrap: anywhere; }
+/* Structured failure tooltip: reason first, then the next step, then labeled
+   technical identifiers. Bounded width with wrapping at narrow viewports. */
+.request-status-tooltip { max-width: min(22rem, calc(100vw - 48px)); font-size: 12px; line-height: 1.55; }
+.request-status-tooltip p { margin: 0; overflow-wrap: anywhere; }
+.request-status-tooltip p + p { margin-top: 6px; }
+.request-status-tooltip p b { font-weight: 600; }
+.request-status-tooltip-note { overflow-wrap: anywhere; white-space: pre-wrap; }
+.request-status-tooltip-action { color: var(--mtc-data-primary, #72c7ba); }
+:root[data-theme='light'] .request-status-tooltip-action { color: var(--mtc-data-primary, #087d70); }
+.request-status-tooltip-details { margin: 8px 0 0; padding-top: 6px; border-top: 1px solid #33484e; }
+:root[data-theme='light'] .request-status-tooltip-details { border-top-color: #d0dfe2; }
+.request-status-tooltip-details-heading { display: block; margin-bottom: 2px; font-weight: 600; color: #a7bbc3; }
+:root[data-theme='light'] .request-status-tooltip-details-heading { color: #526d78; }
+.request-status-tooltip-details dl { display: grid; gap: 2px 8px; margin: 0; }
+.request-status-tooltip-details dl > div { display: flex; gap: 8px; min-width: 0; }
+.request-status-tooltip-details dt { flex: none; color: #a7bbc3; }
+.request-status-tooltip-details dd { margin: 0; min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; font-family: var(--mtc-mono, ui-monospace, monospace); font-size: 11px; }
+:root[data-theme='light'] .request-status-tooltip-details dt { color: #526d78; }
 .request-egress-line { display: block; margin-top: 4px; color: var(--muted, #82979e); font-weight: 400; overflow-wrap: anywhere; }
 :root[data-theme='light'] .request-egress-line { color: var(--muted, #526d78); }
 .request-diagnostics .request-egress-line { display: none; }

@@ -199,7 +199,15 @@ test('operational completion preserves bilingual outcomes and unknown costs acro
         assert.equal(await row.locator(`[data-outcome="${outcome}"]`).count(), 1);
         assert.equal(await cost.innerText(), recordedCost);
         if (reason) assert.ok((await drawer.innerText()).includes(reason));
-        assert.doesNotMatch(await drawer.innerText(), /http_499|http_502|upstream_transport_connection_reset/);
+        assert.doesNotMatch(await drawer.innerText(), /http_499|http_502/, 'duplicate HTTP wrappers stay out of details');
+        if (reason) {
+          assert.equal(await drawer.locator('.request-status-cause').count(), 1, 'the drawer shows one localized terminal cause');
+          assert.ok((await drawer.locator('.request-status-cause').innerText()).includes(reason), 'the visible cause uses localized copy');
+          const detailText = await drawer.locator('.request-supplier-detail span').innerText();
+          const terminalCode = mode === '499' ? 'client_disconnected' : 'upstream_transport_connection_reset';
+          assert.ok(detailText.includes(`${locale === 'en' ? 'Terminal cause code' : '终态原因码'}: ${terminalCode}`), 'the recorded terminal code is labeled');
+          assert.ok(detailText.includes(`${locale === 'en' ? 'Recorded status' : '记录状态码'}: ${mode}`), 'the recorded status is labeled');
+        }
       }
       await page.close();
     }
@@ -252,11 +260,21 @@ test('request error details distinguish active delivery from recorded terminal f
       } else {
         const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'This record has no stored cause';
         assert.equal(text.split(cause).length - 1, 1);
-        assert.doesNotMatch(text, /upstream_transport_connection_reset|upstream_stream/);
+        assert.equal(await drawer.locator('.request-status-cause').count(), 1, 'detail shows one recorded cause');
+        assert.equal(await drawer.locator('.request-status-cause').innerText(), `Recorded cause: ${cause}`);
+        const detailText = await drawer.locator('.request-supplier-detail span').innerText();
+        assert.ok(detailText.includes('Recorded status: 502'), 'technical details include the recorded status');
+        if (mode === 'terminal') {
+          assert.ok(detailText.includes('Error code: upstream_stream'), 'technical details preserve the raw error code');
+          assert.ok(detailText.includes('Terminal cause code: upstream_transport_connection_reset'), 'technical details preserve the terminal cause code');
+        } else {
+          assert.doesNotMatch(detailText, /upstream_transport_connection_reset|upstream_stream/, 'unknown outcomes do not invent technical causes');
+        }
         await drawer.locator('.request-outcome').focus();
         const tooltip = page.getByRole('tooltip').filter({ hasText: cause });
         await tooltip.waitFor();
-        assert.equal(await tooltip.innerText(), `Recorded cause: ${cause}`);
+        assert.equal(await tooltip.locator('.request-status-tooltip-reason').innerText(), `Recorded cause: ${cause}`);
+        assert.ok((await tooltip.locator('.request-status-tooltip-details dd').allInnerTexts()).includes('502'), 'tooltip technical details include the recorded status');
       }
       await drawer.getByRole('button', { name: 'Close', exact: true }).click();
     }
@@ -425,19 +443,23 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
   const browser = await chromium.launch({ headless: true });
   try {
     for (const [locale, reason, prefix, close, label] of [
-      ['zh-CN', '当前上游账号没有可用套餐，需在提供商处开通或更换账号。', '已记录原因', '关闭', '失败'],
-      ['en', 'The upstream account has no active plan. Activate a plan with the provider or use another account.', 'Recorded cause', 'Close', 'Failed'],
+      ['zh-CN', '当前上游账号没有可用套餐', '已记录原因', '关闭', '失败'],
+      ['en', 'The upstream account has no active plan', 'Recorded cause', 'Close', 'Failed'],
     ] as const) {
+      const action = locale === 'zh-CN' ? '在提供商处开通套餐或更换上游账号' : 'Activate a plan with the provider or switch the upstream account';
       const page = await browser.newPage();
       await page.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : route.abort());
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       await page.goto(`${origin}/e2e/fixtures/request-lifecycle.html?supplier-error`);
       await page.setViewportSize({ width: 390, height: 844 });
-      const detail = locale === 'zh-CN' ? '供应商错误码: 402 · 供应商说明: 当前账号没有可用套餐' : 'Provider error code: 402 · Provider message: 当前账号没有可用套餐';
-      const hint = `${prefix}: ${reason} · ${detail}`;
+      // Raw legacy fields stay viewable as one deduplicated technical block.
+      const detail = locale === 'zh-CN'
+        ? '供应商错误码: no_active_plan · 供应商说明: 当前账号没有可用套餐; provider code: 402; provider message: 当前账号没有可用套餐'
+        : 'Provider error code: no_active_plan · Provider message: 当前账号没有可用套餐; provider code: 402; provider message: 当前账号没有可用套餐';
+      const hint = `${prefix}: ${reason} · ${action} · ${detail}`;
       const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
       await row.locator('[data-outcome="failed"]').waitFor();
-      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`);
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label} 402`, 'the trigger stays concise; the full explanation arrives through the tooltip description');
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
       await row.locator('.request-outcome').scrollIntoViewIfNeeded();
       await row.locator('.table-action').hover();
@@ -467,7 +489,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       let observed: unknown;
       try {
         const handle = await page.waitForFunction(`(() => {
-          const expected = ${JSON.stringify(hint)};
+          const expectedParts = ${JSON.stringify([`${prefix}: ${reason}`, action, '402'])};
           const active = document.activeElement;
           if (!(active instanceof HTMLElement)) return false;
           const described = (active.getAttribute('aria-describedby') || '').split(/\\s+/);
@@ -476,14 +498,13 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
             const style = getComputedStyle(node);
             const rect = node.getBoundingClientRect();
             if (style.display === 'none' || style.visibility === 'hidden' || rect.width === 0 || rect.height === 0) continue;
-            if (node.innerText === expected) return node.innerText;
+            if (expectedParts.every((part) => node.innerText.includes(part))) return node.innerText;
           }
           return false;
         })()`);
         observed = await handle.jsonValue();
       } catch (error) {
         const diagnostics = await page.evaluate(`(() => {
-          const expected = ${JSON.stringify(hint)};
           const active = document.activeElement;
           return {
             focus: active instanceof HTMLElement ? active.className : String(active),
@@ -512,8 +533,11 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
         await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-tooltip-failure.png`, fullPage: true });
         throw new Error(`keyboard tooltip diagnostics: ${JSON.stringify(diagnostics)}`, { cause: error });
       }
-      assert.equal(typeof observed, 'string', 'the atomic keyboard tooltip observation is its visible text');
-      assert.equal(observed, hint);
+      assert.ok(typeof observed === 'string', 'the atomic keyboard tooltip observation is its visible text');
+      for (const part of [`${prefix}: ${reason}`, action, locale === 'zh-CN' ? '技术细节' : 'Technical details', '402']) {
+        assert.ok(observed.includes(part), `keyboard tooltip includes ${part}`);
+      }
+      assert.match(observed, new RegExp(`^${prefix}: ${reason}`), 'the tooltip leads with the reason');
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 0, 'list reason and keyboard tooltip need no detail fetch');
       await row.locator('.table-action').click();
       const drawer = page.getByRole('dialog', { name: 'model-a' });
@@ -523,19 +547,23 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await visibleCause.waitFor();
       assert.equal(await visibleCause.count(), 1);
       assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
-      assert.equal(await drawer.locator('.request-supplier-detail span').innerText(), detail);
+      const supplierDetailText = await drawer.locator('.request-supplier-detail span').innerText();
+      for (const part of locale === 'zh-CN' ? ['供应商错误码: no_active_plan', '供应商说明: 当前账号没有可用套餐; provider code: 402'] : ['Provider error code: no_active_plan', 'Provider message: 当前账号没有可用套餐; provider code: 402']) {
+        assert.ok(supplierDetailText.includes(part), `technical block includes ${part}`);
+      }
       assert.equal(await drawer.locator('.request-supplier-detail').evaluate(element => element.scrollWidth <= element.clientWidth + 1), true, 'provider details wrap on narrow screens');
       assert.equal(await drawer.locator('.request-outcome small').count(), 1, 'status appears once');
       const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
       await mkdir(artifactRoot, { recursive: true });
       await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-narrow.png`, fullPage: true });
-      assert.doesNotMatch(await drawer.innerText(), /http_402|no_active_plan|请求失败|The request failed/);
+      assert.doesNotMatch(await drawer.innerText(), /http_402|请求失败|The request failed/);
       await drawer.locator('.request-outcome').scrollIntoViewIfNeeded();
       await drawer.locator('.request-outcome').press('Shift+Tab');
       await page.keyboard.press('Tab');
       assert.equal(await drawer.locator('.request-outcome').evaluate(element => element === document.activeElement), true, 'keyboard navigation focuses the detail status');
       await tooltip.waitFor();
-      assert.equal(await tooltip.innerText(), hint);
+      const drawerTooltipText = await tooltip.innerText();
+      for (const part of [`${prefix}: ${reason}`, action, '402']) assert.ok(drawerTooltipText.includes(part), `detail tooltip includes ${part}`);
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 1);
       await page.evaluate(() => window.requestLifecycleFixture.finish());
       await page.waitForFunction(() => window.requestLifecycleFixture.detailCalls === 2);
@@ -543,7 +571,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await tooltip.waitFor({ state: 'hidden' });
       await visibleCause.waitFor();
       assert.equal(await visibleCause.count(), 1);
-      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`, 'enriched event preserves the list cause after detail refresh');
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label} 402`, 'enriched event preserves the list cause after detail refresh');
       assert.equal((await row.innerText()).split(reason).length - 1, 0);
       assert.equal((await drawer.innerText()).split(reason).length - 1, 1);
       await drawer.locator('.close').focus();
@@ -552,7 +580,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
       await page.keyboard.press('Tab');
       assert.equal(await drawer.locator('.request-outcome').evaluate(element => element === document.activeElement), true);
       await tooltip.waitFor();
-      assert.equal(await tooltip.innerText(), hint);
+      for (const part of [`${prefix}: ${reason}`, action]) assert.ok((await tooltip.innerText()).includes(part));
       assert.equal(await page.evaluate(() => window.requestLifecycleFixture.detailCalls), 2, 'status interaction adds no fetch beyond existing terminal refresh');
       await drawer.getByRole('button', { name: close, exact: true }).click();
       await page.close();
@@ -585,14 +613,19 @@ test('typed failure diagnostic replaces the repeated unknown cause in list and d
       const hint = `${prefix}: ${reason}`;
       const row = page.locator('tbody tr').filter({ has: page.getByText('model-a', { exact: true }) });
       await row.locator('[data-outcome="failed"]').waitFor();
-      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label}. ${hint}`);
-      assert.doesNotMatch(await row.innerText(), /http_499|client_disconnected|upstream_http_status|未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
+      assert.equal(await row.locator('.request-outcome').getAttribute('aria-label'), `${label} 499`, 'the trigger stays concise; the typed explanation arrives through the tooltip description');
+      assert.doesNotMatch(await row.innerText(), /client_disconnected|upstream_http_status|未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
       await row.locator('.table-action').click();
       const drawer = page.getByRole('dialog', { name: 'model-a' });
       const visibleCause = drawer.locator('.request-status-cause').and(drawer.getByText(hint, { exact: true }));
       await visibleCause.waitFor();
       assert.equal(await visibleCause.count(), 1, 'list and detail reuse the same typed explanation');
-      assert.doesNotMatch(await drawer.innerText(), /http_499|client_disconnected|upstream_http_status|未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
+      const drawerText = await drawer.innerText();
+      assert.doesNotMatch(drawerText, /未知（未记录具体原因）|Unknown \(no specific cause recorded\)/);
+      for (const [term, value] of [[locale === 'zh-CN' ? '失败阶段' : 'Failure stage', 'client_disconnected'], [locale === 'zh-CN' ? '失败阶段' : 'Failure stage', 'upstream_http_status']] as const) {
+        if (drawerText.includes(value)) assert.ok(drawerText.includes(term), `${value} only appears under its ${term} label`);
+      }
+      assert.doesNotMatch(drawerText, /http_499/, 'an http_NNN wrapper duplicating the recorded status is omitted');
       const artifactRoot = fileURLToPath(new URL('../e2e-artifacts/request-diagnostics/', import.meta.url));
       await mkdir(artifactRoot, { recursive: true });
       await page.screenshot({ path: `${artifactRoot}/failure-diagnostic-${param}-${locale}-detail.png`, fullPage: true });

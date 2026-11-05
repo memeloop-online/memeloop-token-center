@@ -221,7 +221,8 @@ pub(super) async fn send_proxy_route(
             }
         };
         if response.status() == StatusCode::BAD_REQUEST {
-            let disposition = codex_transport::classify_bad_request(response, request_id).await;
+            let (disposition, details) =
+                codex_transport::classify_bad_request_with_details(response, request_id).await;
             observe_bad_request_disposition(&state.metrics, disposition);
             match retry.after_bad_request(disposition) {
                 AttemptControl::RetrySameAccount => {
@@ -237,7 +238,13 @@ pub(super) async fn send_proxy_route(
                     retry
                         .outcome()
                         .observe_terminal(&state.metrics, CodexRetryTerminal::Failed);
-                    return Err(error);
+                    return Err(match (error, details) {
+                        (ProxySendError::RetryableCodexBadRequest, Some(body)) => {
+                            ProxySendError::CodexTransientRejection(body)
+                        }
+                        (_, Some(body)) => ProxySendError::CodexRejection(body),
+                        (error, None) => error,
+                    });
                 }
             }
         }

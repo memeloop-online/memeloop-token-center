@@ -315,9 +315,8 @@ fn strict_chat_rejects_named_events_before_they_can_complete() {
         wire.extend_from_slice(b"\ndata: {\"error\":{\"message\":\"failure\"}}\n\n");
         wire.extend_from_slice(done().as_bytes());
         let frames = capture.push_delivery_frames(&wire).unwrap();
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 1);
         assert!(frames[0].billable);
-        assert!(!frames[1].billable);
         let summary = capture.finish_summary();
         assert!(summary.usage_invalid);
         assert!(matches!(

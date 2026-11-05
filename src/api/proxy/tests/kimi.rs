@@ -3,7 +3,7 @@ use super::*;
 mod buffered_usage;
 
 #[tokio::test]
-async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks() {
+async fn native_kimi_rejections_preserve_classification_and_original_explanation() {
     let canary = "kimi-upstream-token-prompt-canary";
     let cases = [
         (
@@ -101,19 +101,24 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
             assert!(retained.is_none());
             let rejection = rejection.expect("native Kimi non-success uses the safe reader");
             let delivered: Value = serde_json::from_slice(&rejection.body).unwrap();
-            assert!(!String::from_utf8_lossy(&rejection.body).contains(canary));
+            assert!(
+                delivered["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty())
+            );
             assert_eq!(
                 rejection.terminal_cause,
                 Some(crate::model::RequestTerminalCause::UpstreamHttpStatus)
             );
-            if let Some(reason) = expected_reason {
-                assert_eq!(delivered["error"]["code"].as_str(), Some(*reason));
-                assert_eq!(
-                    delivered["error"]["mtc_safe_reason"].as_str(),
-                    Some(*reason)
-                );
+            if let Some(reason) = expected_reason.or(if *slow_body {
+                Some("insufficient_quota")
             } else {
-                assert_eq!(rejection.body, upstream_error::fallback_body());
+                None
+            }) {
+                assert_eq!(delivered["error"]["code"].as_str(), Some(reason));
+                assert_eq!(delivered["error"]["mtc_safe_reason"].as_str(), Some(reason));
+            } else {
+                assert!(delivered["error"].get("mtc_safe_reason").is_none());
             }
             let key = fixture
                 .state
@@ -232,17 +237,21 @@ async fn native_kimi_rejections_keep_safe_reasons_and_bounded_private_fallbacks(
             let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
             assert_eq!(detail.response_body, delivered);
             assert!(
-                !serde_json::to_string(&record.supplier_error)
+                serde_json::to_string(&record.supplier_error)
                     .unwrap()
-                    .contains(canary)
+                    .contains(canary),
+                "supplier list projection lost details for {label} ({})",
+                protocol.name()
             );
             assert!(
-                !serde_json::to_string(&detail.view.supplier_error)
+                serde_json::to_string(&detail.view.supplier_error)
                     .unwrap()
-                    .contains(canary)
+                    .contains(canary),
+                "supplier detail projection lost details for {label} ({})",
+                protocol.name()
             );
             assert_eq!(record.supplier_error, detail.view.supplier_error);
-            assert_eq!(record.supplier_error.is_some(), expected_reason.is_some());
+            assert!(record.supplier_error.is_some());
             upstream.verify().await;
         }
     }
@@ -272,12 +281,6 @@ async fn native_kimi_safe_rejection_keeps_other_response_paths_untouched() {
         (
             crate::oauth::managed::kimi::PROVIDER_DRIVER,
             Protocol::OpenAiResponsesCompact,
-            false,
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            "openai-codex",
-            Protocol::OpenAiResponses,
             false,
             StatusCode::FORBIDDEN,
         ),
@@ -1553,7 +1556,7 @@ async fn dispatched_compaction_400_is_not_replayed_to_a_standby() {
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert!(!String::from_utf8_lossy(&body).contains("provider-rejection-canary"));
+    assert!(String::from_utf8_lossy(&body).contains("provider-rejection-canary"));
     assert_eq!(preferred.received_requests().await.unwrap().len(), 1);
     assert!(standby.received_requests().await.unwrap().is_empty());
     preferred.verify().await;

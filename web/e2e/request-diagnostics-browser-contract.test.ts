@@ -100,13 +100,14 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     assert.match(await stage('read recorded cache split', () => recordedRow.locator('.request-token-cell .request-value-info').getAttribute('aria-label'), history, current) ?? '', /Cache read 40.*Cache write 20/);
     const recordedText = await stage('read recorded diagnostics', () => recorded.textContent(), history, current) ?? '';
     assert.match(recordedText, /The upstream connection was reset/, 'the recorded terminal cause takes precedence over a legacy error code');
-    assert.doesNotMatch(recordedText, /http_429|upstream_transport_connection_reset/, 'raw recorded codes are never permanent detail copy');
+    assert.doesNotMatch(recordedText, /http_429/, 'an http_NNN wrapper duplicating the recorded status is omitted');
+    assert.match(recordedText, /Terminal cause code: upstream_transport_connection_reset/, 'the recorded terminal cause stays a labeled technical detail');
     assert.match(recordedText, /Production Codex/);
     assert.match(recordedText, /Research key/);
     assert.doesNotMatch(recordedText, new RegExp(`${upstreamId}|${routeId}|${requestId}|${sessionId}`), 'technical identifiers are supplemental, not permanent detail rows');
-    for (const [surface, cause] of [
-      [recordedDiagnostics, 'The upstream connection was reset'],
-      [historicalGapDiagnostics, 'Reading the upstream response timed out'],
+    for (const [surface, cause, terminalCode] of [
+      [recordedDiagnostics, 'The upstream connection was reset', 'upstream_transport_connection_reset'],
+      [historicalGapDiagnostics, 'Reading the upstream response timed out', 'upstream_read_timeout'],
     ] as const) {
       const detailText = await surface.innerText();
       assert.equal(detailText.split(cause).length - 1, 1, 'the main detail shows its recorded cause once');
@@ -115,19 +116,27 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
       assert.equal(await statusBadge.count(), 1, 'the detail has exactly one recorded status badge');
       assert.equal(await statusBadge.innerText(), '429');
       assert.equal(await statusBadge.textContent(), '429');
-      const detailWithoutStatusBadge = await surface.evaluate(element => {
+      const detailTextWithoutBadge = await surface.evaluate(element => {
         const detail = element.cloneNode(true) as HTMLElement;
         detail.querySelector('.request-outcome > small')?.remove();
         return detail.textContent ?? '';
       });
-      assert.doesNotMatch(detailWithoutStatusBadge, /429/, 'the recorded status code appears only in its status badge');
+      assert.equal(detailTextWithoutBadge.split('Recorded status: 429').length - 1, 1, 'the recorded status appears once as a labeled technical detail');
       assert.doesNotMatch(detailText, /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
       assert.equal(await surface.getByText('Error', { exact: true }).count(), 0);
       await surface.locator('.request-outcome').focus();
       const causeTooltip = page.getByRole('tooltip').filter({ hasText: cause });
       await causeTooltip.waitFor();
-      assert.equal(await causeTooltip.innerText(), `Recorded cause: ${cause}`);
-      assert.doesNotMatch(await causeTooltip.innerText(), /429|Recorded status|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
+      const tooltipText = await causeTooltip.innerText();
+      assert.match(tooltipText, new RegExp(`^Recorded cause: ${cause}`), 'the tooltip leads with the recorded reason');
+      const tooltipTerms = causeTooltip.locator('dt');
+      const tooltipValues = causeTooltip.locator('dd');
+      assert.ok((await tooltipTerms.allInnerTexts()).includes('Recorded status'), 'the status code is a labeled technical detail, not primary copy');
+      assert.ok((await tooltipValues.allInnerTexts()).includes('429'));
+      assert.ok((await tooltipTerms.allInnerTexts()).includes('Terminal cause code'), 'the terminal cause code is labeled, never primary copy');
+      assert.ok((await tooltipValues.allInnerTexts()).includes(terminalCode));
+      assert.match(tooltipText, /Technical details/, 'technical identifiers sit under an explicit localized label');
+      assert.doesNotMatch(tooltipText, /[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}/i);
       await page.keyboard.press('Escape');
     }
     assert.match(await recordedRow.locator('.request-status-cause').textContent() ?? '', /The upstream connection was reset/);
@@ -148,7 +157,7 @@ test('Request diagnostics remain copyable, session-linked, and contained on narr
     const historicalGapText = await stage('read historical diagnostics', () => historicalGap.textContent(), history, current) ?? '';
     assert.doesNotMatch(historicalGapText, /Completed at/, 'completion is supplemental timing information, not another permanent row');
     assert.match(historicalGapText, /Reading the upstream response timed out/, 'a terminal-only failure presents its recorded cause without any error code');
-    assert.doesNotMatch(historicalGapText, /upstream_read_timeout/, 'raw recorded codes are never permanent detail copy');
+    assert.match(historicalGapText, /Terminal cause code: upstream_read_timeout/, 'the recorded code remains in labeled technical details');
     assert.match(historicalGapText, /Final upstreamNot recorded/);
     assert.doesNotMatch(historicalGapText, /Final upstream ID|Final route ID/, 'missing technical values do not occupy empty rows');
     assert.doesNotMatch(historicalGapText, /Cache read|Cache write/, 'missing historical cache fields must remain absent rather than becoming zero-valued rows');

@@ -50,7 +50,8 @@ impl BoundedUpstreamError {
 }
 
 pub(super) fn upstream_error_health_terminal(error_code: &str) -> UpstreamAttemptTerminal {
-    if is_local_response_boundary(error_code)
+    if crate::supplier_error::UpstreamReason::from_code(error_code).is_some()
+        || is_local_response_boundary(error_code)
         || matches!(
             error_code,
             "upstream_timeout"

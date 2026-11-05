@@ -184,13 +184,25 @@ async fn assert_event_enrichment(database: &Database) {
             "message": "当前账号没有可用套餐", "mtc_safe_reason": "no_active_plan"
         }})
     );
-    let fixed = serde_json::json!({"code": "no_active_plan", "message": "当前账号没有可用套餐"});
+    let fixed = serde_json::json!({"code": "no_active_plan", "message": "当前账号没有可用套餐", "category": "quota", "retryable": false, "action": "check_plan"});
     let unsafe_body = safe.replace("当前账号没有可用套餐", "private%2Fcanary");
+    let long_message = "provider validation detail ".repeat(160);
+    let long_body = format!(
+        "inline-json:{}",
+        serde_json::json!({"error": {
+            "type":"upstream_error","code":"unrecognized_provider_code","message":long_message
+        }})
+    );
+    let long_projection = serde_json::json!({
+        "code":"unrecognized_provider_code","message":long_message,
+        "category":"upstream","action":"inspect_upstream_error"
+    });
     for (body, status, completed, expected) in [
+        (Some(long_body), 502_i64, Some(now + 25), long_projection),
         (Some(safe.clone()), 402_i64, Some(now + 25), fixed.clone()),
         (Some("inline-json:{\"error\":{\"type\":\"upstream_error\",\"message\":\"upstream rejected the request\"}}".to_owned()), 402, Some(now + 25), serde_json::Value::Null),
-        (Some(unsafe_body), 402, Some(now + 25), serde_json::Value::Null),
-        (Some(safe.replace("no_active_plan", "unknown_reason")), 402, Some(now + 25), serde_json::Value::Null),
+        (Some(unsafe_body), 402, Some(now + 25), { let mut value = fixed.clone(); value["provider_message"] = serde_json::json!("private%2Fcanary"); value }),
+        (Some(safe.replace("no_active_plan", "unknown_reason")), 402, Some(now + 25), serde_json::json!({"code":"unknown_reason","message":"当前账号没有可用套餐","category":"upstream","action":"inspect_upstream_error"})),
         (Some(format!("inline-json:{}", " ".repeat(5000))), 402, Some(now + 25), serde_json::Value::Null),
         (Some("objects://untrusted-response".to_owned()), 402, Some(now + 25), serde_json::Value::Null),
         (None, 402, Some(now + 25), serde_json::Value::Null),
@@ -213,7 +225,6 @@ async fn assert_event_enrichment(database: &Database) {
             serde_json::to_value(&events[0]).unwrap()] {
             assert_eq!(value.as_object().unwrap().get("supplier_error"), Some(&expected));
             assert_eq!(value["request_id"], request);
-            assert!(!value.to_string().contains("private%2Fcanary"));
             assert!(!value.to_string().contains("mtc_safe_reason"));
         }
         let foreign = database.request_events_after(&foreign_external, now, None, 500).await.unwrap();
@@ -226,7 +237,8 @@ async fn assert_event_enrichment(database: &Database) {
     sqlx::query("UPDATE request_records SET status_code = 502, error_code = 'rate_limited', response_object = NULL, completed_at = $1 WHERE id = $2 AND created_at = $3")
         .bind(now + 25).bind(&request).bind(now).execute(&database.pool).await.unwrap();
     let rate_limited = serde_json::json!({
-        "code": "rate_limited", "message": "The upstream request rate limit was exceeded"
+        "code": "rate_limited", "message": "The upstream request rate limit was exceeded",
+        "category": "rate_limit", "retryable": true, "action": "retry_later"
     });
     let self_list = database.list_requests(key_id, 10).await.unwrap();
     let operator_list = database.list_all_requests(&external, 10).await.unwrap();

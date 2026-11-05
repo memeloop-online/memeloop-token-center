@@ -571,6 +571,9 @@ pub(crate) fn render_bilingual(code: &str, facts: ErrorFacts) -> (String, String
 }
 
 pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'static str)> {
+    if let Some(reason) = crate::supplier_error::UpstreamReason::from_marker(code) {
+        return Some((reason.message_zh(), reason.message()));
+    }
     Some(match code {
         "proxy_memory_ingress" => (
             "网关内存装不下这次请求体，也没有写入对象存储",
