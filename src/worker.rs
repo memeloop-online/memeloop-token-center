@@ -1112,10 +1112,6 @@ pub(crate) async fn archive_session_body(
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
-    state
-        .db
-        .project_claimed_conversation_identity(lease_owner, request_id)
-        .await?;
     let Some(locators) = state.db.session_body_locators(request_id).await? else {
         return skip_session_body(
             state,
@@ -1126,6 +1122,10 @@ pub(crate) async fn archive_session_body(
         .await;
     };
     if locators.pending {
+        state
+            .db
+            .project_claimed_conversation_identity(lease_owner, request_id)
+            .await?;
         state
             .db
             .defer_pending_session_body_archive(lease_owner, request_id)
@@ -1298,6 +1298,10 @@ async fn skip_session_body(
     request_id: Uuid,
     reason: &'static str,
 ) -> Result<bool, AppError> {
+    state
+        .db
+        .project_claimed_conversation_identity(lease_owner, request_id)
+        .await?;
     tracing::warn!(%request_id, reason, "会话正文归档跳过这条请求");
     state
         .db

@@ -3,10 +3,10 @@ use std::fmt::Write as _;
 
 use super::super::*;
 
+mod identity_projection;
 pub(crate) mod prefix_storage;
 mod projection_retry;
 mod semantic_payload;
-mod identity_projection;
 
 #[cfg(test)]
 mod semantic_order_tests;
