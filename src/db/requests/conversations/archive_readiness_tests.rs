@@ -63,6 +63,31 @@ async fn declared_identity_before_body_contract(database_url: String) {
         row.get::<Option<String>, _>("leaf_node_hash").is_none(),
         "identity publication must not invent body content"
     );
+    let filtered = fixture
+        .state
+        .db
+        .source_history_list(&RequestListFilter {
+            limit: 10,
+            typed_ast: Some(crate::filter_ast::TypedFilterAst {
+                conditions: vec![crate::filter_ast::TypedFilterCondition {
+                    field: crate::filter_ast::TypedFilterField::ClientSessionId,
+                    operator: crate::filter_ast::TypedFilterOperator::Equals,
+                    value: crate::filter_ast::TypedFilterValue::Text(
+                        "declared-client-thread".into(),
+                    ),
+                    upper: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        filtered
+            .iter()
+            .any(|request| request.request_id == fixture.request_id)
+    );
     let observation = row.get::<String, _>("id");
     fixture.capture().await;
     assert!(response_archive_spool::process_one_for_test(&fixture.state).await);

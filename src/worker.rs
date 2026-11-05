@@ -1167,6 +1167,10 @@ pub(crate) async fn archive_session_body(
             if retry {
                 state
                     .db
+                    .project_claimed_conversation_identity(lease_owner, request_id)
+                    .await?;
+                state
+                    .db
                     .defer_session_body_archive(lease_owner, request_id)
                     .await?;
                 return Ok(false);
