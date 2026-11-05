@@ -109,7 +109,8 @@ async fn postgres_archive_pool_cold_reconnect_and_wait_preserve_session_policy()
 
 #[tokio::test]
 async fn source_metadata_waits_past_two_seconds_without_cancellation_or_replay() {
-    let fixture = Fixture::new().await;
+    let fixture =
+        Database::with_source_pool_timeout_for_test(Duration::from_secs(10), Fixture::new()).await;
     let request_id = Uuid::new_v4();
     let locator =
         crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
@@ -145,10 +146,14 @@ async fn source_metadata_waits_past_two_seconds_without_cancellation_or_replay()
         .database
         .hold_gateway_archive_connection_for_test()
         .await;
-    let pending =
-        fixture
-            .database
-            .persist_request_source(identity, &locator, body.len(), digest, Some(true));
+    let pending = fixture.database.persist_request_source(
+        identity,
+        &locator,
+        body.len(),
+        digest,
+        Some(true),
+        false,
+    );
     let (result, ()) = tokio::join!(pending, async {
         tokio::time::sleep(Duration::from_millis(2200)).await;
         drop(held);
@@ -158,7 +163,7 @@ async fn source_metadata_waits_past_two_seconds_without_cancellation_or_replay()
     assert_eq!(
         fixture
             .database
-            .persist_request_source(identity, &locator, body.len(), digest, Some(true),)
+            .persist_request_source(identity, &locator, body.len(), digest, Some(true), false)
             .await,
         Some(false),
         "a completed staging attempt must not be replayed"
