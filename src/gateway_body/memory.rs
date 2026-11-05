@@ -96,6 +96,20 @@ impl ProxyMemoryBudget {
         )
     }
 
+    pub(crate) async fn streaming_working_set(
+        &self,
+        bytes: usize,
+    ) -> Result<Arc<ProxyMemoryReservation>, tokio::sync::AcquireError> {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_many_owned(bytes.div_ceil(UNIT_BYTES) as u32)
+            .await?;
+        let reservation = self.reservation();
+        *reservation.held.lock().expect("fresh memory reservation") = (bytes, Some(permit));
+        Ok(reservation)
+    }
+
     pub(crate) fn temporary(
         &self,
         bytes: usize,
