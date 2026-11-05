@@ -2401,7 +2401,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { description: Dispatch has not ended, outcome is not unknown, or the account revision changed. }
+        '409': { description: "Dispatch has not ended, outcome is not unknown, or the account revision changed." }
         '503': { description: Fresh supplier evidence or database is temporarily unavailable; no consumption occurs. }
 
   /internal/v1/upstreams/{account_id}/health:
