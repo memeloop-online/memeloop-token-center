@@ -87,7 +87,7 @@ window.fetch = async (_input, init) => {
     }
     if (path.includes('/recover')) {
       const body = JSON.parse(String(init?.body));
-      if (Object.keys(body).sort().join(',') !== 'expected_updated_at,reason' || body.expected_updated_at !== operation.updated_at || !['operator_authorized_retry', 'supplier_confirmed_not_applied'].includes(body.reason)) throw new Error('Invalid recovery contract');
+      if (Object.keys(body).join(',') !== 'confirmation' || body.confirmation !== 'release_unknown_reset_without_consuming') throw new Error('Invalid recovery contract');
       if (mode === 'recover-stale') return new Response('{}', { status: 409 });
       if (mode === 'recover-forbidden') return new Response('{}', { status: 403 });
       if (mode === 'recover-failed') return new Response('{}', { status: 503 });
