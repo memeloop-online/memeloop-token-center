@@ -14,6 +14,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 
+pub(crate) mod audio_file;
 pub(crate) mod memory;
 pub(crate) mod request_spool;
 
