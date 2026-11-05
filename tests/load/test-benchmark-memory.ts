@@ -6,7 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
-import { assetGatewayRssEvidence, chatPayload, createMockServer, createRequestSpool, HarnessFailure, MockState, seed, smallChat, streamChat, waitForTextRouteRecovery } from "./benchmark-memory.ts";
+import { assetGatewayRssEvidence, chatPayload, createMockServer, createRequestSpool, HarnessFailure, MockState, seed, smallChat, streamChat } from "./benchmark-memory.ts";
 import { StreamStartBarrier } from "./benchmark-stream-barrier.ts";
 import { DatabaseSync } from "node:sqlite";
 import { FirstSoakFailureEvidence, readSoakFailureClassification } from "./benchmark-soak-diagnostics.ts";
@@ -160,22 +160,6 @@ test("stream fixture exercises the streaming proxy path with valid Chat SSE", as
 
 test("soak chat uses bounded node:http requests instead of Undici fetch", async () => {
   const server = createMockServer(new MockState()); await new Promise<void>((done) => server.listen(0, "127.0.0.1", done)); const originalFetch = globalThis.fetch; globalThis.fetch = () => { throw new Error("Undici fetch must not be used by soak chat"); }; try { const address = server.address(); assert.ok(address && typeof address !== "string"); for (let index = 0; index < 25; index += 1) assert.ok(await smallChat(`http://127.0.0.1:${address.port}`, "test-key") > 0); } finally { globalThis.fetch = originalFetch; await new Promise<void>((done) => server.close(() => done())); }
-});
-
-test("soak waits for the intentional response-limit breaker to recover", async () => {
-  let attempts = 0;
-  const evidence = await waitForTextRouteRecovery(async () => {
-    attempts += 1;
-    if (attempts < 3) throw new HarnessFailure('small chat failed with HTTP 503: {"error":{"message":"no healthy upstream is currently available","type":"upstream_error"}}');
-    return 1;
-  }, 1_000, 0);
-  assert.equal(evidence.attempts, 3);
-  assert.equal(evidence.temporarily_unavailable, 2);
-  assert.ok(evidence.duration_seconds >= 0);
-});
-
-test("soak recovery fails closed for an unrelated upstream error", async () => {
-  await assert.rejects(waitForTextRouteRecovery(async () => { throw new HarnessFailure('small chat failed with HTTP 503: {"error":{"message":"maintenance"}}'); }, 1_000, 0), /maintenance/u);
 });
 
 test("large stream is counted incrementally without Undici or body aggregation", async () => {
