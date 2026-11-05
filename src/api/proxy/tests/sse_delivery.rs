@@ -188,8 +188,8 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     assert_eq!(
         fixture.state.responses_request_spool.read_count_for_test(),
-        spool_reads + 1,
-        "terminal journal preparation must reuse the semantic projection without rereading raw input"
+        spool_reads + 2,
+        "terminal projection reads the durable source once after routing released its JSON working set"
     );
     let mut found_receipt = false;
     for receipt in fixture.state.pending_terminals.receipt_jsons_for_test() {
@@ -260,6 +260,11 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     assert_eq!(
         leaf.as_deref(),
         nodes.last().map(|node| node.node_hash.as_str())
+    );
+    assert_eq!(
+        fixture.state.responses_request_spool.read_count_for_test(),
+        spool_reads + 2,
+        "settlement and archival reuse the terminal projection without a third source read"
     );
     pool.close().await;
     drop(retirement);

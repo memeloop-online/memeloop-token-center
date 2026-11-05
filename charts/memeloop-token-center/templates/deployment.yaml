@@ -47,6 +47,11 @@ spec:
   revisionHistoryLimit: {{ $.Values.revisionHistoryLimit }}
   strategy:
     type: {{ $.Values.deploymentStrategy }}
+    {{- if and $runtimeWriter (eq $.Values.deploymentStrategy "RollingUpdate") }}
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+    {{- end }}
   {{- if not $roleConfig.autoscaling.enabled }}
   replicas: {{ $roleConfig.replicaCount }}
   {{- end }}
@@ -96,6 +101,7 @@ spec:
           imagePullPolicy: {{ $.Values.image.pullPolicy }}
           args:
             - prepare-plugin-inventory
+            - --allow-unavailable
             - --directory
             - /var/lib/memeloop-token-center/plugin-runtime
             {{- if not $runtimeWriter }}

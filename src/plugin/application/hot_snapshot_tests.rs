@@ -319,7 +319,77 @@ async fn background_refresh_timeout_keeps_serving_verified_snapshot() {
 }
 
 #[tokio::test]
-async fn cold_snapshot_keeps_liveness_healthy_and_readiness_unavailable_until_background_warm() {
+async fn cold_provider_only_inventory_does_not_block_core_or_cache_a_later_policy_head() {
+    let directory = tempfile::tempdir().unwrap();
+    let initial = authority(directory.path()).await;
+    let root = directory.path().join("a");
+    let path = root.join("example-policy-rewrite/plugin.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["contributions"]["traffic_policy"] = json!(false);
+    manifest["contributions"]["request_rewrite"] = json!(false);
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let roots = [("a", root.clone()), ("b", directory.path().join("b"))];
+    let inventory = super::tests::inventory(&initial.db, &roots);
+    let baseline = PluginRuntime::load(None, initial.db.clone()).unwrap();
+    let authority =
+        Arc::new(ApplicationPlugins::new(initial.db.clone(), inventory, &baseline).unwrap());
+    publish(&authority, "a", 0).await;
+    // Compilation is not needed to classify a verified provider-only contract.
+    let before = work_counts(&authority);
+    assert!(authority.request_snapshot().await.unwrap().is_none());
+    assert_eq!(work_counts(&authority), before);
+    assert!(!ProviderCatalog::builtins().is_public("example-oauth-http"));
+    std::fs::remove_file(root.join("example-policy-rewrite/plugin.wasm")).unwrap();
+    assert!(authority.request_snapshot().await.unwrap().is_none());
+    publish(&authority, "b", 1).await;
+    let pinned = authority.request_snapshot().await.unwrap().unwrap();
+    assert_eq!(pinned.receipt.revision, 2);
+    assert!(
+        pinned.runtime.runtime().manifests()[0]
+            .contributions
+            .traffic_policy
+    );
+}
+
+#[tokio::test]
+async fn missing_inventory_is_visible_without_discarding_published_policy_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let installed = authority(directory.path()).await;
+    publish(&installed, "a", 0).await;
+    let baseline = PluginRuntime::load(None, installed.db.clone()).unwrap();
+    let unavailable = Arc::new(
+        ApplicationPlugins::from_inventory_file(
+            installed.db.clone(),
+            directory.path().join("missing-inventory.json"),
+            &baseline,
+        )
+        .await
+        .unwrap(),
+    );
+    let status = unavailable.status().await.unwrap();
+    assert_eq!(status.current.unwrap().revision, 1);
+    assert_eq!(status.runtime["error"], "inventory_unavailable");
+    assert!(unavailable.request_snapshot().await.is_err());
+    assert!(unavailable.stage("a").await.is_err());
+}
+
+#[tokio::test]
+async fn unpublished_application_inventory_does_not_require_background_warmup() {
+    let directory = tempfile::tempdir().unwrap();
+    let authority = authority(directory.path()).await;
+    let before = work_counts(&authority);
+    assert_eq!(authority.refresh_status()["ready"], false);
+    assert!(authority.request_snapshot().await.unwrap().is_none());
+    assert_eq!(work_counts(&authority), before);
+    authority.refresh_current().await.unwrap();
+    assert_eq!(authority.refresh_status()["ready"], true);
+    authority.db.close().await;
+    assert!(authority.request_snapshot().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn cold_snapshot_keeps_core_ready_and_resolves_required_policy_on_first_request() {
     use axum::{
         body::Body,
         http::{Request, StatusCode},
@@ -335,10 +405,7 @@ async fn cold_snapshot_keeps_liveness_healthy_and_readiness_unavailable_until_ba
     let mut state = crate::AppState::initialize(config).await.unwrap();
     state.application_plugins = Some(authority.clone());
     let app = crate::api::router_for_role(state.clone(), crate::config::RuntimeRole::Gateway);
-    for (path, expected) in [
-        ("/livez", StatusCode::OK),
-        ("/readyz", StatusCode::SERVICE_UNAVAILABLE),
-    ] {
+    for (path, expected) in [("/livez", StatusCode::OK), ("/readyz", StatusCode::OK)] {
         let response = app
             .clone()
             .oneshot(Request::get(path).body(Body::empty()).unwrap())
@@ -346,8 +413,9 @@ async fn cold_snapshot_keeps_liveness_healthy_and_readiness_unavailable_until_ba
             .unwrap();
         assert_eq!(response.status(), expected);
     }
-    assert!(state.clone().pin_application_plugins().await.is_err());
-    state.refresh_application_plugins().await.unwrap();
+    let pinned = state.clone().pin_application_plugins().await.unwrap();
+    assert_eq!(pinned.application_plugin_revision(), Some(1));
+    assert!(pinned.plugins.manifests()[0].contributions.traffic_policy);
     assert!(state.pin_application_plugins().await.is_ok());
     let response = app
         .oneshot(Request::get("/readyz").body(Body::empty()).unwrap())

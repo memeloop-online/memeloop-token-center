@@ -190,6 +190,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(volume.persistentVolumeClaim?.claimName, 'shared-plugin-inventories');
       assert.equal(volume.persistentVolumeClaim?.readOnly, !writer);
       const prepare = pod.initContainers.find(item => item.name === 'prepare-plugin-inventory')!;
+      assert.equal(prepare.args.includes('--allow-unavailable'), true, `${role}: optional inventory must not block startup`);
       assert.equal(prepare.args.includes('--read-only'), !writer, `${role}: readers never initialize`);
       assert.equal(prepare.volumeMounts[0]!.readOnly, !writer);
       assert.equal(pod.volumes.some(item => item.secret?.secretName === 'publisher-trust'), writer);
@@ -257,6 +258,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(deployment.spec.template.spec.initContainers.find(item => item.name === 'prepare-plugin-inventory')!.image, expected, `${role}: init/runtime image compatibility`);
     }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
+    count('default', 'maxUnavailable: 0', 1);
+    count('default', 'maxSurge: 1', 1);
     count('default', /readinessProbe:\s+httpGet: \{ path: "?\/readyz"?, port: http \}/g, 3);
     const services = parseAllDocuments(output.default!).map(document => document.toJSON()).filter(document => document?.kind === 'Service');
     for (const role of ['gateway', 'control']) {

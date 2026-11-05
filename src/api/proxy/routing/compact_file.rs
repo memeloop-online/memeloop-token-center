@@ -140,11 +140,20 @@ impl Scanner {
         let start = index.end();
         let mut digest = Sha256::new();
         let mut small = Vec::new();
+        let mut pending = Vec::new();
         let mut oversized = false;
         let result = self
             .string(|bytes| {
                 digest.update(bytes);
-                index.append(bytes)?;
+                if pending.len() + bytes.len() > CHUNK && !pending.is_empty() {
+                    index.append(&pending)?;
+                    pending.clear();
+                }
+                if bytes.len() == CHUNK {
+                    index.append(bytes)?;
+                } else {
+                    pending.extend_from_slice(bytes);
+                }
                 if !oversized && small.len() + bytes.len() <= 64 {
                     small.extend_from_slice(bytes);
                 } else {
@@ -154,6 +163,9 @@ impl Scanner {
                 Ok(())
             })
             .and_then(|_| {
+                if !pending.is_empty() {
+                    index.append(&pending)?;
+                }
                 let key = Span {
                     start,
                     end: index.end(),

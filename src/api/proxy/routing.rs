@@ -53,6 +53,28 @@ pub(super) use route_types::{
     ProxyRouteResponse, ProxySendError, TransportFailureKind,
 };
 
+fn route_temporary_memory(
+    state: &AppState,
+    bytes: usize,
+) -> Result<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>, AppError> {
+    let mut reservation = None;
+    state.responses_request_spool.reclaim_for(|| {
+        reservation = state.proxy_memory_budget.temporary(bytes).ok();
+        reservation.is_some()
+    });
+    reservation.ok_or_else(|| {
+        state.metrics.observe_proxy_memory_error(
+            crate::metrics::ProxyMemoryRejectionStage::Route,
+            AppError::capacity(
+                "proxy_memory_temporary",
+                crate::error::ErrorFacts::new()
+                    .stage("proxy_memory_route")
+                    .bytes(bytes as u64),
+            ),
+        )
+    })
+}
+
 pub(super) fn plan_proxy_route(
     input: ProxyRoutePlanInput<'_>,
 ) -> Result<PlannedProxyRoute, AppError> {
@@ -74,17 +96,10 @@ pub(super) fn plan_proxy_route(
         return Err(AppError::upstream("provider_driver_is_not_loaded"));
     }
     route.credential.validate(preparation_now)?;
-    let _planning_memory = state
-        .proxy_memory_budget
-        .temporary(
-            crate::gateway_body::memory::json_encoded_length(request_json)?.saturating_mul(3),
-        )
-        .map_err(|error| {
-            state
-                .metrics
-                .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
-                .name_if_overloaded("proxy_memory_route")
-        })?;
+    let _planning_memory = route_temporary_memory(
+        state,
+        crate::gateway_body::memory::json_encoded_length(request_json)?.saturating_mul(3),
+    )?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
         codex::validate_route(&route, protocol)?;
@@ -382,18 +397,14 @@ pub(super) async fn materialize_proxy_route(
     // Allocate temporary serialization/adapter work before cloning any payload.
     let temporary_bytes = if planned.component_context.is_some() {
         encoded_length.saturating_mul(6)
-    } else {
+    } else if planned.wire_shim_context.is_some() {
         encoded_length.saturating_mul(2)
+    } else {
+        // Serialization creates one Vec; Bytes::from takes ownership without
+        // copying. A plain HTTP route does not allocate a second encoded body.
+        encoded_length
     };
-    let _temporary_memory = state
-        .proxy_memory_budget
-        .temporary(temporary_bytes)
-        .map_err(|error| {
-            state
-                .metrics
-                .observe_proxy_memory_error(crate::metrics::ProxyMemoryRejectionStage::Route, error)
-                .name_if_overloaded("proxy_memory_route")
-        })?;
+    let _temporary_memory = route_temporary_memory(state, temporary_bytes)?;
     let component_request = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,
@@ -504,6 +515,40 @@ pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {
 #[cfg(test)]
 mod compact_bridge_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn route_workspace_reclaims_only_durably_uploaded_source_cache() {
+        use crate::gateway_body::{
+            memory::ProxyMemoryBudget,
+            request_spool::{MemoryObjectStore, RequestSpoolAdmission},
+        };
+        let (mut state, directory) = crate::api::tests::test_state().await;
+        state.proxy_memory_budget = std::sync::Arc::new(ProxyMemoryBudget::new(256 * 1024));
+        state.responses_request_spool = RequestSpoolAdmission::new(directory.path().to_owned())
+            .with_memory_store(MemoryObjectStore::new());
+        let memory = state.proxy_memory_budget.reservation();
+        let original = Bytes::from(vec![b'x'; 128 * 1024]);
+        let source = state
+            .responses_request_spool
+            .capture_with_memory(
+                Body::from(original.clone()),
+                original.len(),
+                Some(original.len()),
+                Some(&memory),
+                0,
+                Some("route-workspace-reclaim"),
+            )
+            .await
+            .unwrap();
+        assert!(source.upload_outcome().await);
+        assert!(state.proxy_memory_budget.temporary(192 * 1024).is_err());
+        let workspace = route_temporary_memory(&state, 192 * 1024).unwrap();
+        assert_eq!(source.read_all().await.unwrap(), original);
+        drop(workspace);
+        drop(source);
+        drop(memory);
+        assert_eq!(state.proxy_memory_budget.snapshot().0, 0);
+    }
     use serde_json::json;
 
     fn route(driver: &str, config: Value) -> ResolvedUpstream {

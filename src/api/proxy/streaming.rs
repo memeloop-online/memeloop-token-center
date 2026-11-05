@@ -32,27 +32,6 @@ enum StreamPoll<T> {
 const CODEX_RESPONSES_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const SESSION_ROUTING_TERMINAL_PUBLISH_TIMEOUT: Duration = Duration::from_millis(250);
 
-#[cfg(test)]
-tokio::task_local! {
-    static TEST_MAX_PROXY_RESPONSE_BODY: usize;
-}
-
-fn streaming_response_body_limit() -> usize {
-    #[cfg(test)]
-    if let Ok(limit) = TEST_MAX_PROXY_RESPONSE_BODY.try_with(|limit| *limit) {
-        return limit;
-    }
-    MAX_PROXY_RESPONSE_BODY
-}
-
-#[cfg(test)]
-pub(super) async fn with_test_response_body_limit<T>(
-    limit: usize,
-    future: impl std::future::Future<Output = T>,
-) -> T {
-    TEST_MAX_PROXY_RESPONSE_BODY.scope(limit, future).await
-}
-
 async fn poll_upstream_or_downstream_closed<T>(
     body_sender: &tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>,
     upstream: impl std::future::Future<Output = T>,
@@ -156,7 +135,6 @@ pub(super) struct StreamingResponse<'a> {
 
 pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Response, AppError> {
     let diagnostic_context = proxy_diagnostics::Context::for_request(input.request_id);
-    let response_body_limit = streaming_response_body_limit();
     let StreamingResponse {
         state,
         upstream,
@@ -348,14 +326,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 progress_heartbeat_deadline = None;
                                 continue;
                             };
-                            match waits
-                                .downstream(tokio::time::timeout(
-                                    MAX_DOWNSTREAM_SEND_WAIT,
-                                    body_sender.send(Ok(heartbeat)),
-                                ))
-                                .await
-                            {
-                                Ok(Ok(())) => {
+                            match waits.downstream(body_sender.send(Ok(heartbeat))).await {
+                                Ok(()) => {
                                     waits.heartbeat();
                                     progress_heartbeat_deadline = Some(
                                         tokio::time::Instant::now()
@@ -363,8 +335,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     );
                                     continue;
                                 }
-                                Ok(Err(_)) => transport_error = Some("downstream_disconnected"),
-                                Err(_) => transport_error = Some("downstream_backpressure"),
+                                Err(_) => transport_error = Some("downstream_disconnected"),
                             }
                             drop(archive_sender.take());
                             break;
@@ -494,24 +465,9 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     .await;
                                 break;
                             }
-                            if validated_compact.is_none() && response_bytes > response_body_limit {
-                                transport_error = Some(transport_error_with_downstream_precedence(
-                                    downstream_closed_observed || body_sender.is_closed(),
-                                    "upstream_response_too_large",
-                                ));
-                                drop(archive_sender.take());
-                                let _ = tokio::time::timeout(
-                                    MAX_DOWNSTREAM_SEND_WAIT,
-                                    body_sender.send(downstream_stream_failure(
-                                        protocol,
-                                        is_sse,
-                                        responses_streaming_sanitizer.as_ref(),
-                                        "upstream response exceeded the size limit",
-                                    )),
-                                )
-                                .await;
-                                break;
-                            }
+                            // Cumulative traffic does not occupy cumulative
+                            // memory. Frame decoding, terminal retention and
+                            // channel backpressure own the live working set.
                             if let Some(sanitizer) = responses_streaming_sanitizer.as_mut() {
                                 match sanitizer.push(&raw_chunk) {
                                     Ok(chunk) => chunk,
