@@ -1442,7 +1442,7 @@ async fn proxy_with_cancellation_guard(
                     let code = error.diagnostic_category().to_owned();
                     let response = error.into_response();
                     let (parts, body) = response.into_parts();
-                    let body = to_bytes(body, 64 * 1024)
+                    let body = axum::body::to_bytes(body, 64 * 1024)
                         .await
                         .map_err(|_| AppError::internal("local_admission_error_body"))?;
                     let mut response = finish_buffered_request(
