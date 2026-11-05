@@ -342,14 +342,13 @@ async fn exercise_coverage(url: &str) {
             .await
             .unwrap();
     }
-    db.prune_allocation_history(sweep_at)
-        .await
-        .unwrap();
-    let session_tenants: Vec<String> =
-        sqlx::query_scalar("SELECT tenant_id FROM group_allocation_sessions WHERE session_key='shared-session'")
-            .fetch_all(&db.pool)
-            .await
-            .unwrap();
+    db.prune_allocation_history(sweep_at).await.unwrap();
+    let session_tenants: Vec<String> = sqlx::query_scalar(
+        "SELECT tenant_id FROM group_allocation_sessions WHERE session_key='shared-session'",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
     assert_eq!(
         session_tenants,
         vec![fresh.to_string()],
