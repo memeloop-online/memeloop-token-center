@@ -1235,7 +1235,46 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
     let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     wait_for_request_settlement(&fixture, 1).await;
     let request_id = Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap();
-    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+    // A fenced conversation enqueue needs the operational receipt's timestamp.
+    // While that write is blocked, verify finance and the original source,
+    // then retain the full exactly-once projection check after recovery below.
+    let financial: (String, i64, i64, i64) = sqlx::query_as(
+        "SELECT r.status, \
+         (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id), \
+         (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id), \
+         (SELECT COUNT(*) FROM pending_proxy_settlements p WHERE p.request_id = q.id AND p.state = 'applied') \
+         FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id \
+         WHERE q.id = $1 AND q.key_id = $2",
+    )
+    .bind(request_id.to_string())
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(financial, ("settled".to_owned(), 1, 1, 1));
+    let projections: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1), \
+         (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1)",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projections, (0, 0));
+    let raw_source = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(raw) = read_archived_request_source(&fixture, &pool, request_id).await {
+                break raw;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocked operational receipt must retain the complete original source");
+    assert_raw_request_source(
+        &raw_source,
+        &json!({"model": fixture.model, "input": "operational retry", "stream": false}),
+    );
     assert!(
         fixture
             .state
