@@ -12,6 +12,7 @@ mod early_request;
 pub mod error;
 pub mod filter_ast;
 mod gateway_body;
+mod json_source;
 pub mod generation;
 mod group_routing;
 pub mod http_settings;
