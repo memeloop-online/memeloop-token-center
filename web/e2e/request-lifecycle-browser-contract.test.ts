@@ -515,7 +515,7 @@ test('supplier cause stays shared through list, keyboard tooltip, detail and ter
         await page.screenshot({ path: `${artifactRoot}/supplier-error-${locale}-tooltip-failure.png`, fullPage: true });
         throw new Error(`keyboard tooltip diagnostics: ${JSON.stringify(diagnostics)}`, { cause: error });
       }
-      assert.equal(typeof observed, 'string', 'the atomic keyboard tooltip observation is its visible text');
+      assert.ok(typeof observed === 'string', 'the atomic keyboard tooltip observation is its visible text');
       for (const part of [`${prefix}: ${reason}`, action, locale === 'zh-CN' ? '技术细节' : 'Technical details', '402']) {
         assert.ok(observed.includes(part), `keyboard tooltip includes ${part}`);
       }
