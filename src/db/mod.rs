@@ -708,6 +708,33 @@ impl Database {
         })
     }
 
+    // Waiting for a pool slot is safe to resume: no application SQL has been
+    // sent yet. Once a connection is returned, callers must not replay work.
+    async fn acquire_request_connection(
+        &self,
+        operation: &'static str,
+    ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
+        let started = tokio::time::Instant::now();
+        let mut timeouts = 0_u64;
+        loop {
+            match self.pool.acquire().await {
+                Ok(connection) => return Ok(connection),
+                Err(sqlx::Error::PoolTimedOut)
+                    if matches!(self.backend, DatabaseBackend::PostgreSql) =>
+                {
+                    timeouts += 1;
+                    if timeouts == 1 || timeouts.is_multiple_of(6) {
+                        self.observe_pool_timeout(operation, started, &sqlx::Error::PoolTimedOut);
+                    }
+                }
+                Err(error) => {
+                    self.observe_pool_timeout(operation, started, &error);
+                    return Err(error);
+                }
+            }
+        }
+    }
+
     pub(crate) async fn begin_write_transaction(
         &self,
     ) -> Result<Transaction<'static, Any>, sqlx::Error> {
@@ -728,14 +755,16 @@ impl Database {
         // Keep SQLx's acquisition state out of every enclosing write future.
         // Gateway completion awaits several layers of these futures on the
         // request task; retaining acquisition inline compounds stack pressure.
-        Box::pin(self.pool.begin_with(match self.backend {
+        let connection = Box::pin(self.acquire_request_connection("write_transaction")).await?;
+        let statement = match self.backend {
             DatabaseBackend::PostgreSql => "BEGIN",
             DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
-        }))
+        };
+        Box::pin(Transaction::begin(
+            connection,
+            Some(sqlx::SqlStr::from_static(statement)),
+        ))
         .await
-        .inspect_err(|error| {
-            self.observe_pool_timeout("write_transaction", started, error);
-        })
     }
 
     fn observe_pool_timeout(
