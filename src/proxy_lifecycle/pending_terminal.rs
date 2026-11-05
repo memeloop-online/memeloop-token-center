@@ -538,6 +538,9 @@ impl Journal {
                 .values()
                 .all(|entry| {
                     entry.reconcile
+                        && entry.durable
+                        && entry.published_revision == Some(entry.snapshot_revision)
+                        && !entry.publication_running
                         && !entry.running
                         && !entry.operational_running
                         && !entry.conversation_pending
