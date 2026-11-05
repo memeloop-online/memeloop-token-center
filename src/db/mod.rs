@@ -696,9 +696,11 @@ impl Database {
         loop {
             match self.pool.acquire().await {
                 Ok(connection) => return Ok(connection),
-                Err(sqlx::Error::PoolTimedOut) if matches!(self.backend, DatabaseBackend::PostgreSql) => {
+                Err(sqlx::Error::PoolTimedOut)
+                    if matches!(self.backend, DatabaseBackend::PostgreSql) =>
+                {
                     timeouts += 1;
-                    if timeouts == 1 || timeouts % 6 == 0 {
+                    if timeouts == 1 || timeouts.is_multiple_of(6) {
                         self.observe_pool_timeout(operation, started, &sqlx::Error::PoolTimedOut);
                     }
                 }
@@ -735,7 +737,11 @@ impl Database {
             DatabaseBackend::PostgreSql => "BEGIN",
             DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
         };
-        Box::pin(Transaction::begin(connection, Some(sqlx::SqlStr::from_static(statement)))).await
+        Box::pin(Transaction::begin(
+            connection,
+            Some(sqlx::SqlStr::from_static(statement)),
+        ))
+        .await
     }
 
     fn observe_pool_timeout(
