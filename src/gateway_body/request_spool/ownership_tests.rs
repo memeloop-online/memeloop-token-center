@@ -70,11 +70,11 @@ async fn metadata_charge(path: &str, declared: Option<usize>) -> usize {
 }
 
 #[tokio::test]
-async fn responses_metadata_one_unit_short_rejects_before_directory_or_body_poll() {
+async fn responses_metadata_one_unit_short_spills_without_claiming_durability() {
     for path in ROUTES {
         let metadata = metadata_charge(path, Some(1)).await;
         let directory = tempfile::tempdir().unwrap();
-        let spool_path = directory.path().join("not-opened");
+        let spool_path = directory.path().join("local-spill");
         let spool = RequestSpoolAdmission::new(spool_path.clone());
         let budget = ProxyMemoryBudget::new(BUDGET_BYTES);
         let held = budget.reservation();
@@ -86,13 +86,20 @@ async fn responses_metadata_one_unit_short_rejects_before_directory_or_body_poll
             observed.fetch_add(1, Ordering::AcqRel);
             Ok::<_, Infallible>(Bytes::from_static(b"x"))
         }));
-        assert!(matches!(
-            admit(path, body, Some(1), &budget, &spool).await,
-            Err(GatewayBodyAdmissionError::CapacityExhausted)
-        ));
-        assert_eq!(polls.load(Ordering::Acquire), 0);
-        assert!(!spool_path.exists());
+        let admitted = admit(path, body, Some(1), &budget, &spool).await.unwrap();
+        assert_eq!(polls.load(Ordering::Acquire), 1);
+        assert!(spool_path.is_dir());
+        assert_eq!(spool.snapshot().active_files, 1);
+        let owner = admitted
+            .extensions()
+            .get::<Arc<super::RequestSpool>>()
+            .unwrap();
+        assert_eq!(owner.read_all().await.unwrap(), "x");
+        assert!(!owner.upload_outcome().await);
+        assert_eq!(budget.snapshot().0, held_bytes);
+        drop(admitted);
         assert_eq!(spool.snapshot().active_files, 0);
+        assert_eq!(std::fs::read_dir(&spool_path).unwrap().count(), 0);
         assert_eq!(spool.snapshot().used_bytes, 0);
         assert_eq!(budget.snapshot().0, held_bytes);
         drop(held);
@@ -134,10 +141,19 @@ async fn responses_transport_sized_first_frame_and_false_length_at_byte_boundary
                                     && rejection.reason == GatewayBodyRejectionReason::BodyLimitExceeded
                         ));
                     } else if frame_allowance == 0 {
-                        assert!(matches!(
-                            capture.await.unwrap(),
-                            Err(GatewayBodyAdmissionError::CapacityExhausted)
-                        ));
+                        let admitted = capture.await.unwrap().unwrap();
+                        let owner = admitted
+                            .extensions()
+                            .get::<Arc<super::RequestSpool>>()
+                            .unwrap();
+                        assert_eq!(
+                            owner.read_all().await.unwrap(),
+                            Bytes::from(vec![b'x'; frame_bytes])
+                        );
+                        assert!(!owner.upload_outcome().await);
+                        assert_eq!(budget.snapshot().0, held_bytes);
+                        assert_eq!(spool.snapshot().active_files, 1);
+                        drop(admitted);
                     } else {
                         let admitted = capture.await.unwrap().unwrap();
                         assert!(budget.snapshot().0 >= held_bytes + metadata + frame_bytes);
