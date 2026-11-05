@@ -64,6 +64,7 @@ mod plugin_background_actions;
 pub(crate) mod plugin_execution;
 #[cfg(feature = "experimental-plugin-revisions")]
 mod plugin_installer_network;
+mod plugin_private_data;
 mod plugins;
 pub(crate) mod proxy;
 pub(crate) use proxy::MediaAttemptBudget;
