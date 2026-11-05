@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 
 use super::super::*;
 
+mod identity_projection;
 pub(crate) mod prefix_storage;
 mod projection_retry;
 mod semantic_payload;
@@ -1176,11 +1177,16 @@ impl Database {
                 "conversation semantic snapshot changed during projection".into(),
             ).into());
         }
-        let rebuilding = task
-            .try_get::<Option<String>, _>("statistics_outcome")?
-            .as_deref()
-            == Some(SESSION_BODY_REBUILD_OUTCOME);
-        let rewrote_existing = if rebuilding && let Some(snapshot) = snapshot.as_ref() {
+        // A declared identity may already have been published without waiting
+        // for archive content. Enrich that same observation rather than
+        // counting the request again or replacing its client provenance.
+        let identity_pending = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1 AND leaf_node_hash IS NULL",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await? != 0;
+        let rewrote_existing = if !identity_pending && let Some(snapshot) = snapshot.as_ref() {
             let tenant = tenant_id.to_string();
             let request = request_id.to_string();
             rewrite_session_body_observation_in_transaction(
@@ -1360,8 +1366,24 @@ impl Database {
             .map(|snapshot| snapshot.leaf.clone())
             .unwrap_or_else(|| nodes.last().map(|node| node.node_hash.clone()));
         let now = observed_at;
-        let observation_id = Uuid::now_v7();
         let request_id = request_id.to_string();
+        let existing_identity = sqlx::query(
+            "SELECT id, cluster_id FROM conversation_observations WHERE request_id = $1 AND key_id = $2 AND leaf_node_hash IS NULL",
+        )
+        .bind(&request_id)
+        .bind(key.key_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let enriching_identity = existing_identity.is_some();
+        let observation_id = existing_identity
+            .as_ref()
+            .map(|row| {
+                row.try_get::<String, _>("id")
+                    .map_err(AppError::from)
+                    .and_then(parse_uuid)
+            })
+            .transpose()?
+            .unwrap_or_else(Uuid::now_v7);
         let request_created_at = if attach_request_record {
             let locator = sqlx::query(
                 "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1 UNION ALL SELECT created_at, tenant_id, key_id FROM terminal_projection_outbox WHERE request_id = $1 AND NOT EXISTS (SELECT 1 FROM request_record_locators WHERE id = $1)",
@@ -1460,6 +1482,7 @@ impl Database {
             &key_id,
             hints,
             now,
+            &request_id,
         )
         .await?;
         let candidates = if let Some(candidate) = structured_candidate {
@@ -1471,12 +1494,13 @@ impl Database {
             Vec::new()
         } else {
             sqlx::query(
-                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
+                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 50",
             )
             .bind(&tenant_id)
             .bind(&principal_id)
             .bind(&key_id)
             .bind(now)
+            .bind(&request_id)
             .fetch_all(&mut **transaction)
             .await?
         };
@@ -1678,7 +1702,9 @@ impl Database {
                 .as_ref()
                 .is_some_and(|selection| selection.direct_parent)
         });
-        let cluster_id = if let Some(selection) = &selected {
+        let cluster_id = if let Some(existing) = &existing_identity {
+            parse_uuid(existing.try_get("cluster_id")?)?
+        } else if let Some(selection) = &selected {
             lock_selected_conversation_cluster_in_transaction(
                 transaction,
                 self.backend,
@@ -1705,7 +1731,17 @@ impl Database {
         let labels_json = serde_json::to_string(&hints.labels)
             .map_err(|_| AppError::internal("conversations_site_12"))?;
 
-        sqlx::query(
+        if enriching_identity {
+            sqlx::query(
+                "UPDATE conversation_observations SET leaf_node_hash = $1, atom_hashes_json = $2 WHERE id = $3",
+            )
+            .bind(&leaf)
+            .bind(&atom_hashes_json)
+            .bind(observation_id.to_string())
+            .execute(&mut **transaction)
+            .await?;
+        } else {
+            sqlx::query(
             "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version, turn_id, parent_turn_id, branch_id, compaction, session_name, trace_id, span_id, parent_span_id, agent_id, parent_agent_id, task_kind, labels_json, metadata_source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 2, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
         )
         .bind(observation_id.to_string())
@@ -1732,6 +1768,7 @@ impl Database {
         .bind(execution_metadata.as_ref().map(|metadata| metadata.source.as_str()))
         .execute(&mut **transaction)
         .await?;
+        }
 
         if let Some(parent_reference) = unresolved_parent_reference {
             sqlx::query(
@@ -1751,7 +1788,7 @@ impl Database {
         let edge_selection = selected
             .filter(|selection| selection.write_edge)
             .or(candidate_selection);
-        let candidate_edge_increment = i64::from(
+        let mut candidate_edge_increment = i64::from(
             edge_selection
                 .as_ref()
                 .is_some_and(|selection| selection.relation == RelationKind::Candidate),
@@ -1762,8 +1799,8 @@ impl Database {
             } else {
                 (selection.observation_id, observation_id.to_string())
             };
-            sqlx::query(
-                "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 2, $8)",
+            let inserted = sqlx::query(
+                "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) SELECT $1, $2, $3, $4, $5, $6, $7, 0, 2, $8 WHERE NOT EXISTS (SELECT 1 FROM conversation_edges WHERE from_observation_id = $3 AND to_observation_id = $4 AND relation_kind = $5)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(cluster_id.to_string())
@@ -1786,6 +1823,7 @@ impl Database {
             .bind(now)
             .execute(&mut **transaction)
             .await?;
+            candidate_edge_increment *= inserted.rows_affected() as i64;
         }
         sqlx::query("UPDATE conversation_clusters SET created_at = CASE WHEN created_at > $1 THEN $1 ELSE created_at END, updated_at = CASE WHEN updated_at < $1 THEN $1 ELSE updated_at END, explicit_session_id = COALESCE(explicit_session_id, $2) WHERE id = $3")
             .bind(now)
@@ -1794,16 +1832,18 @@ impl Database {
             .execute(&mut **transaction)
             .await?;
         sqlx::query(
-            "INSERT INTO conversation_key_clusters (key_id, cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, $3, $4, 1, $5) ON CONFLICT(key_id, cluster_id) DO UPDATE SET explicit_session_id = COALESCE(conversation_key_clusters.explicit_session_id, excluded.explicit_session_id), updated_at = CASE WHEN conversation_key_clusters.updated_at < excluded.updated_at THEN excluded.updated_at ELSE conversation_key_clusters.updated_at END, request_count = conversation_key_clusters.request_count + 1, candidate_edge_count = conversation_key_clusters.candidate_edge_count + excluded.candidate_edge_count",
+            "INSERT INTO conversation_key_clusters (key_id, cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, $3, $4, $6, $5) ON CONFLICT(key_id, cluster_id) DO UPDATE SET explicit_session_id = COALESCE(conversation_key_clusters.explicit_session_id, excluded.explicit_session_id), updated_at = CASE WHEN conversation_key_clusters.updated_at < excluded.updated_at THEN excluded.updated_at ELSE conversation_key_clusters.updated_at END, request_count = conversation_key_clusters.request_count + excluded.request_count, candidate_edge_count = conversation_key_clusters.candidate_edge_count + excluded.candidate_edge_count",
         )
         .bind(key.key_id.to_string())
         .bind(cluster_id.to_string())
         .bind(hints.session_id.as_deref())
         .bind(now)
         .bind(candidate_edge_increment)
+        .bind(i64::from(!enriching_identity))
         .execute(&mut **transaction)
         .await?;
-        if client_name != Some("session-title")
+        if !enriching_identity
+            && client_name != Some("session-title")
             && hints
                 .session_name
                 .as_deref()
@@ -2045,24 +2085,27 @@ async fn fetch_structured_conversation_candidate(
     key_id: &str,
     hints: &ConversationHints,
     observed_at: i64,
+    excluded_request_id: &str,
 ) -> Result<Option<AnyRow>, AppError> {
     if let Some(parent_turn_id) = hints.parent_turn_id.as_deref() {
         let by_turn = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(parent_turn_id)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         let by_response = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(parent_turn_id)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         return newest_conversation_candidate(by_turn, by_response);
@@ -2070,13 +2113,14 @@ async fn fetch_structured_conversation_candidate(
 
     if let Some(turn_id) = hints.turn_id.as_deref() {
         let candidate = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 AND o.request_id <> $6 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(turn_id)
         .bind(observed_at)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         if candidate.is_some() {
@@ -2086,13 +2130,14 @@ async fn fetch_structured_conversation_candidate(
 
     if let Some(session_id) = hints.session_id.as_deref() {
         let causal = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 AND o.request_id <> $6 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(session_id)
         .bind(observed_at)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         if causal.is_some() {
@@ -2101,13 +2146,14 @@ async fn fetch_structured_conversation_candidate(
 
         // Archive projection can commit a later source-time observation first.
         let future = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 AND o.request_id <> $6 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(session_id)
         .bind(observed_at)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         return Ok(future);
