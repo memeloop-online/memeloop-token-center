@@ -1517,6 +1517,9 @@ async fn unknown_failure_retries_operational_projection() {
     .expect(
         "unknown with durable semantic enqueue must release memory and the parsed conversation",
     );
+    // This gateway-only fixture must run the raw archive worker before the
+    // source-backed conversation can consume its response locator.
+    drain_completed_response_archive(&fixture).await;
     let terminal_owner = Uuid::now_v7();
     for pending_id in fixture
         .state
