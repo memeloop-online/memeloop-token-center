@@ -199,7 +199,15 @@ test('operational completion preserves bilingual outcomes and unknown costs acro
         assert.equal(await row.locator(`[data-outcome="${outcome}"]`).count(), 1);
         assert.equal(await cost.innerText(), recordedCost);
         if (reason) assert.ok((await drawer.innerText()).includes(reason));
-        assert.doesNotMatch(await drawer.innerText(), /http_499|http_502|upstream_transport_connection_reset/);
+        assert.doesNotMatch(await drawer.innerText(), /http_499|http_502/, 'duplicate HTTP wrappers stay out of details');
+        if (reason) {
+          assert.equal(await drawer.locator('.request-status-cause').count(), 1, 'the drawer shows one localized terminal cause');
+          assert.ok((await drawer.locator('.request-status-cause').innerText()).includes(reason), 'the visible cause uses localized copy');
+          const detailText = await drawer.locator('.request-supplier-detail span').innerText();
+          const terminalCode = mode === '499' ? 'client_disconnected' : 'upstream_transport_connection_reset';
+          assert.ok(detailText.includes(`${locale === 'en' ? 'Terminal cause code' : '终态原因码'}: ${terminalCode}`), 'the recorded terminal code is labeled');
+          assert.ok(detailText.includes(`${locale === 'en' ? 'Recorded status' : '记录状态码'}: ${mode}`), 'the recorded status is labeled');
+        }
       }
       await page.close();
     }
@@ -252,11 +260,21 @@ test('request error details distinguish active delivery from recorded terminal f
       } else {
         const cause = mode === 'terminal' ? 'The upstream connection was reset' : 'This record has no stored cause';
         assert.equal(text.split(cause).length - 1, 1);
-        assert.doesNotMatch(text, /upstream_transport_connection_reset|upstream_stream/);
+        assert.equal(await drawer.locator('.request-status-cause').count(), 1, 'detail shows one recorded cause');
+        assert.equal(await drawer.locator('.request-status-cause').innerText(), `Recorded cause: ${cause}`);
+        const detailText = await drawer.locator('.request-supplier-detail span').innerText();
+        assert.ok(detailText.includes('Recorded status: 502'), 'technical details include the recorded status');
+        if (mode === 'terminal') {
+          assert.ok(detailText.includes('Error code: upstream_stream'), 'technical details preserve the raw error code');
+          assert.ok(detailText.includes('Terminal cause code: upstream_transport_connection_reset'), 'technical details preserve the terminal cause code');
+        } else {
+          assert.doesNotMatch(detailText, /upstream_transport_connection_reset|upstream_stream/, 'unknown outcomes do not invent technical causes');
+        }
         await drawer.locator('.request-outcome').focus();
         const tooltip = page.getByRole('tooltip').filter({ hasText: cause });
         await tooltip.waitFor();
-        assert.equal(await tooltip.innerText(), `Recorded cause: ${cause}`);
+        assert.equal(await tooltip.locator('.request-status-tooltip-reason').innerText(), `Recorded cause: ${cause}`);
+        assert.ok((await tooltip.locator('.request-status-tooltip-details dd').allInnerTexts()).includes('502'), 'tooltip technical details include the recorded status');
       }
       await drawer.getByRole('button', { name: 'Close', exact: true }).click();
     }
