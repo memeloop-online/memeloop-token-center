@@ -292,13 +292,10 @@ async fn admit_authenticated_gateway_body(
     }
     if matches!(
         request.uri().path(),
-        "/v1/audio/transcriptions"
-            | "/v1/images/generations"
-            | "/v1/videos/generations"
-            | "/v1/generations"
+        "/v1/videos/generations" | "/v1/generations"
     ) {
-        // Media handlers own their execution and financial terminal records.
-        // This observer records upload failures only, before that handoff.
+        // Asynchronous job handlers own their job/financial terminal records.
+        // Synchronous image/audio mark admission when their record is created.
         super::early_request::mark_admitted();
     }
     let response = next.run(request).await;

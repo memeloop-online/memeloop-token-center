@@ -180,6 +180,7 @@ pub(super) async fn create_audio_transcription(
             model_route_id: Some(route.route_id),
         })
         .await?;
+    super::early_request::mark_admitted();
     let operation = async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
         let result = async move {
