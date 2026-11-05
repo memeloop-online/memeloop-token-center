@@ -109,16 +109,27 @@ pub(super) async fn temperature(
         .await
         .map_err(|_| AppError::internal("audio_metadata_seek"))?;
     let file = file.into_std().await;
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel_on_drop = CancelNumericRead(cancelled.clone());
     let value = tokio::task::spawn_blocking(move || {
         // serde_json's reader parses numeric digits incrementally, without
         // retaining a complete numeric string (arbitrary_precision is disabled).
-        serde_json::from_reader::<_, f64>(FloatReader::new(std::io::BufReader::new(file)))
+        serde_json::from_reader::<_, f64>(
+            FloatReader::new(std::io::BufReader::new(file)).with_cancellation(cancelled),
+        )
     })
     .await
     .map_err(|_| AppError::internal("audio_metadata_parse_owner"))?
     .map_err(|_| invalid())?;
     validate_temperature(Some(value))?;
     Ok(value)
+}
+
+struct CancelNumericRead(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for CancelNumericRead {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 // Rust's f64 syntax also permits a leading plus/zeros and an omitted integer
@@ -129,6 +140,7 @@ struct FloatReader<R: std::io::Read> {
     initialized: bool,
     after_dot: bool,
     seen_digit: bool,
+    cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl<R: std::io::Read> FloatReader<R> {
@@ -139,10 +151,26 @@ impl<R: std::io::Read> FloatReader<R> {
             initialized: false,
             after_dot: false,
             seen_digit: false,
+            cancelled: None,
         }
     }
 
+    fn with_cancellation(
+        mut self,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.cancelled = Some(cancelled);
+        self
+    }
+
     fn raw_byte(&mut self) -> std::io::Result<Option<u8>> {
+        if self
+            .cancelled
+            .as_ref()
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(std::io::Error::other("numeric upload owner cancelled"));
+        }
         let Some(byte) = self.bytes.next().transpose()? else {
             return Ok(None);
         };
@@ -199,7 +227,9 @@ impl<R: std::io::Read> FloatReader<R> {
                     self.pending.push_back(b'-');
                 }
                 first = self.raw_byte()?;
-                if matches!(first, Some(b'+' | b'-')) {
+                if matches!(first, Some(b'+' | b'-'))
+                    || first.is_some_and(|byte| byte.is_ascii_whitespace())
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "duplicate number sign",
@@ -316,12 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_numeric_owner_stops_before_reading_unbounded_source() {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let owner = CancelNumericRead(flag.clone());
+        let reader = FloatReader::new(std::io::repeat(b'0')).with_cancellation(flag);
+        drop(owner);
+        assert!(serde_json::from_reader::<_, f64>(reader).is_err());
+    }
+
+    #[test]
     fn streaming_float_normalization_matches_supported_spellings() {
         for input in ["+000.5", ".5", "1.", "0.e4", "000", " -000.0 ", "1e-10000"] {
             let result: f64 = serde_json::from_reader(FloatReader::new(input.as_bytes())).unwrap();
             assert_eq!(result, input.trim().parse::<f64>().unwrap(), "{input}");
         }
-        for input in [".", "-.", "1..", "+", ".e2", "+-0"] {
+        for input in [".", "-.", "1..", "+", ".e2", "+-0", "+ 0", "- 0"] {
             assert!(
                 serde_json::from_reader::<_, f64>(FloatReader::new(input.as_bytes())).is_err(),
                 "{input}"
