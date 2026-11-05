@@ -114,3 +114,7 @@ strip = "debuginfo"
 # feature can reach it. This source-identical, manifest-only fork removes that
 # dormant surface; see vendor/rust_decimal/MEMELOOP-FORK.md.
 rust_decimal = { path = "vendor/rust_decimal" }
+
+# Local SQLx 0.9 extension for connection-scoped PostgreSQL cancellation.
+sqlx-core = { path = "vendor/sqlx-core" }
+sqlx-postgres = { path = "vendor/sqlx-postgres" }
