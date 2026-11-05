@@ -144,7 +144,7 @@ async fn assert_inference_permissions(path: &str, stream: bool) {
     // Invalid requests are rejected before a nonexistent key is copied.
     let mut request = inference(&writer.token, Uuid::now_v7());
     *request.body_mut() =
-        Body::from(json!({"key_id":Uuid::now_v7(),"request":{"stream":true}}).to_string());
+        Body::from(json!({"key_id":Uuid::now_v7(),"request":{"stream":"true"}}).to_string());
     let response = router_for_role(state.clone(), RuntimeRole::Control)
         .oneshot(request)
         .await
@@ -350,7 +350,8 @@ async fn successful_inference(protocol: Protocol, stream: bool, cancel: bool) {
         })
     };
     let fixture_sse = format!(
-        "event: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+        "event: response.created\ndata: {}\n\nevent: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"type":"response.created","response":{"id":"resp_operator_fixture","object":"response","status":"in_progress","output":[]}}),
         json!({"type":"response.output_item.done","output_index":0,"item":completion["output"][0]}),
         json!({"type":"response.completed","response":completion})
     );
