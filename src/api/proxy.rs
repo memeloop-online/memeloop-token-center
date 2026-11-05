@@ -2081,7 +2081,7 @@ async fn proxy_with_cancellation_guard(
         && !buffered_request
             .memory
             .reserve_unexpected_buffered_request(
-                conversation.request_body_length,
+                conversation.request_body.len(),
                 conversation.request_body.projection_weight(),
             )
             .await
@@ -2132,7 +2132,7 @@ async fn proxy_with_cancellation_guard(
             }
         };
         if matches!(protocol, Protocol::OpenAiResponses) && buffered.terminal.is_incomplete() {
-            let buffered_body_length = buffered.body_length;
+            let buffered_body_length = buffered.body.len();
             let valid_output = buffered_responses_incomplete_output_is_valid(&buffered.body);
             let terminal_error = if valid_output {
                 "upstream_incomplete_response"
@@ -2204,7 +2204,7 @@ async fn proxy_with_cancellation_guard(
         } else {
             buffered
         };
-        buffer_phase.finish("completed", Some(200), Some(buffered.body_length));
+        buffer_phase.finish("completed", Some(200), Some(buffered.body.len()));
         let result = finish_buffered_request(
             &buffered_request,
             StatusCode::OK,
@@ -2472,7 +2472,7 @@ impl ConversationBody {
 
     fn len(&self) -> usize {
         match self {
-            Self::InMemory(body) => body_length,
+            Self::InMemory(body) => body.len(),
             #[cfg(test)]
             Self::Spool(spool) => spool.len(),
             Self::ProjectedSpool { spool, .. } => spool.len(),
@@ -2507,7 +2507,7 @@ impl ConversationBody {
 
     fn release_working_copies(&self, memory: &crate::gateway_body::memory::ProxyMemoryReservation) {
         match self {
-            Self::InMemory(body) => memory.release_conversation_working_copies(body_length),
+            Self::InMemory(body) => memory.release_conversation_working_copies(body.len()),
             #[cfg(test)]
             Self::Spool(spool) => {
                 // The test double still has to reread the retained bytes. Dropping
@@ -2602,7 +2602,7 @@ impl ProxyConversation {
             ConversationBody::ProjectedSpool {
                 json_memory_bytes, ..
             } => (*json_memory_bytes, 1),
-            body => (body_length, body.projection_weight()),
+            body => (body.len(), body.projection_weight()),
         };
         let admission = memory
             .reserve_buffered_response_with_projection(
@@ -2638,7 +2638,7 @@ impl ProxyConversation {
             ConversationBody::ProjectedSpool {
                 json_memory_bytes, ..
             } => (*json_memory_bytes, 1),
-            body => (body_length, body.projection_weight()),
+            body => (body.len(), body.projection_weight()),
         };
         let projection_memory = match admission {
             ConversationProjectionAdmission::Deferred => memory
