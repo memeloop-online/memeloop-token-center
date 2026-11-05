@@ -17,18 +17,36 @@ pub(in crate::api) struct CreateGenerationRequest {
 
 pub(in crate::api) async fn create_image_generation(
     State(state): State<AppState>,
+    axum::extract::Extension(resources): axum::extract::Extension<
+        super::super::auth::ImageRequestResources,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let value: Value = serde_json::from_slice(&body)
-        .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
-    if value.get("input").is_some() {
-        let request = serde_json::from_value(value)
-            .map_err(|_| AppError::BadRequest("model and generation input are required".into()))?;
-        return super::jobs::create_generation_for_modality(state, headers, request, Some("image"))
-            .await;
-    }
-    proxy_openai_image_generation(state, headers, body, value).await
+    tokio::spawn(async move {
+        let _resource_owners = (&resources.lifecycle, &resources.memory);
+        let result = async move {
+            let value: Value = serde_json::from_slice(&body)
+                .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+            if value.get("input").is_some() {
+                let request = serde_json::from_value(value).map_err(|_| {
+                    AppError::BadRequest("model and generation input are required".into())
+                })?;
+                return super::jobs::create_generation_for_modality(
+                    state,
+                    headers,
+                    request,
+                    Some("image"),
+                )
+                .await;
+            }
+            proxy_openai_image_generation(state, headers, body, value).await
+        }
+        .await;
+        result.map(|response| super::super::auth::hold_response_body_permit(response, resources))
+    })
+    .await
+    .map_err(|_| AppError::internal("synchronous_image_owner_failed"))?
 }
 
 async fn proxy_openai_image_generation(
@@ -296,27 +314,23 @@ async fn proxy_openai_image_generation(
         invalid_response: std::sync::atomic::AtomicBool::new(false),
         confirmed_rejection: std::sync::atomic::AtomicBool::new(false),
     };
-    match tokio::time::timeout(
-        SYNCHRONOUS_IMAGE_DEADLINE,
-        execute_synchronous_image_request(
-            &context,
-            body,
-            &staged_request_object,
-            &route,
-            request,
-            response_format,
-        ),
+    match execute_synchronous_image_request(
+        &context,
+        body,
+        &staged_request_object,
+        &route,
+        request,
+        response_format,
     )
     .await
     {
-        Ok(Err(_))
+        Err(_)
             if context.arm_state.load(std::sync::atomic::Ordering::Acquire)
                 != super::synchronous_image::ARM_NOT_STARTED =>
         {
             fail_image_request(&context, "image_submission_failed").await
         }
-        Ok(result) => result,
-        Err(_) => fail_image_request(&context, "image_deadline_exceeded").await,
+        result => result,
     }
 }
 

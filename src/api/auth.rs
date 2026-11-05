@@ -210,6 +210,8 @@ async fn admit_authenticated_gateway_body(
 ) -> Result<Response, AppError> {
     let audio_request = request.method() == axum::http::Method::POST
         && request.uri().path() == "/v1/audio/transcriptions";
+    let image_request = request.method() == axum::http::Method::POST
+        && request.uri().path() == "/v1/images/generations";
     let mut media_lifecycle_permit = if matches!(
         request.uri().path(),
         "/v1/images/generations" | "/v1/audio/transcriptions"
@@ -276,6 +278,16 @@ async fn admit_authenticated_gateway_body(
             memory: memory.clone().ok_or(AppError::internal(
                 "auth_admit_authenticated_gateway_body_2",
             ))?,
+        });
+    }
+    if image_request {
+        request.extensions_mut().insert(ImageRequestResources {
+            lifecycle: std::sync::Arc::new(
+                media_lifecycle_permit
+                    .take()
+                    .ok_or(AppError::internal("image_request_lifecycle_missing"))?,
+            ),
+            memory: memory.clone(),
         });
     }
     let response = next.run(request).await;
@@ -407,6 +419,12 @@ where
 pub(super) struct AudioRequestResources {
     pub(super) lifecycle: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
     pub(super) memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+}
+
+#[derive(Clone)]
+pub(super) struct ImageRequestResources {
+    pub(super) lifecycle: std::sync::Arc<tokio::sync::OwnedSemaphorePermit>,
+    pub(super) memory: Option<std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
 }
 
 pub(super) async fn admit_cloud_webhook_before_body(
