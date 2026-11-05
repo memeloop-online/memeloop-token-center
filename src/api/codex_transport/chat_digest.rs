@@ -8,10 +8,12 @@ pub(super) struct EmittedText {
 
 impl EmittedText {
     pub(super) fn from_text(text: &str) -> Self {
-        let mut value = Self::default();
-        value.bytes = text.len() as u64;
-        value.digest.update(text.as_bytes());
-        value
+        let mut digest = blake3::Hasher::new();
+        digest.update(text.as_bytes());
+        Self {
+            bytes: text.len() as u64,
+            digest,
+        }
     }
 
     pub(super) fn observe(&mut self, text: &str) -> Result<(), &'static str> {
@@ -36,7 +38,7 @@ impl EmittedText {
         // str::get rejects a prefix ending inside a UTF-8 scalar as well as a
         // terminal shorter than the already-emitted prefix.
         let prefix = completed.get(..length)?;
-        self.matches(prefix).then(|| &completed[length..])
+        self.matches(prefix).then_some(&completed[length..])
     }
 }
 
