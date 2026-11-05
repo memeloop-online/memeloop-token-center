@@ -159,8 +159,31 @@ async fn native_codex_image_uses_oauth_transport_and_non_streaming_responses_too
     )
     .await
     .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let response = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+    let safe_code = serde_json::from_slice::<Value>(&response)
+        .ok()
+        .and_then(
+            |document| match document.pointer("/error/code").and_then(Value::as_str) {
+                Some("upstream_image_invalid_json") => Some("upstream_image_invalid_json"),
+                Some("upstream_image_invalid_payload") => Some("upstream_image_invalid_payload"),
+                Some("upstream_image_response_too_large") => {
+                    Some("upstream_image_response_too_large")
+                }
+                Some("upstream_image_too_large") => Some("upstream_image_too_large"),
+                Some("image_submission_uncertain") => Some("image_submission_uncertain"),
+                Some("image_submission_state_unavailable") => {
+                    Some("image_submission_state_unavailable")
+                }
+                Some("upstream_http_404") => Some("upstream_http_404"),
+                Some("upstream_http_401") => Some("upstream_http_401"),
+                Some("image_submission_failed") => Some("image_submission_failed"),
+                Some("upstream_unavailable") => Some("upstream_unavailable"),
+                _ => None,
+            },
+        )
+        .unwrap_or("unclassified_image_error");
+    assert_eq!(status, StatusCode::OK, "safe error category: {safe_code}");
     assert_eq!(
         serde_json::from_slice::<Value>(&response).unwrap()["data"][0]["b64_json"],
         "bW9jay1wbmc="

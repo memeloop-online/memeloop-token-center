@@ -243,6 +243,7 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
     assert_eq!(charges, 1);
     budget_holder.commit().await.unwrap();
     upstream.verify().await;
+    drain_completed_response_archive_state(&state).await;
     let terminal_owner = Uuid::now_v7();
     assert!(
         state

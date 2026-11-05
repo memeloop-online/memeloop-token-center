@@ -1598,6 +1598,7 @@ async fn unknown_failure_retries_operational_projection() {
                 .unwrap()
         );
     }
+    drain_completed_response_archive(&fixture).await;
     let owner = Uuid::now_v7();
     let tasks = fixture
         .state
