@@ -180,6 +180,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
       const writer = role === 'control';
       const pod = deployment.spec.template.spec;
+      const resources = pod.containers[0]!.resources;
       const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'request-spool');
       const spoolVolume = pod.volumes?.find(item => item.name === 'request-spool');
       if (role === 'gateway' || role === 'control' || role === 'all') {
