@@ -1438,6 +1438,30 @@ async fn proxy_with_cancellation_guard(
                     stage = "upstream_candidate_selection",
                     "proxy candidate selection failed"
                 );
+                if matches!(error, AppError::Capacity { .. } | AppError::Overloaded) {
+                    let code = error.diagnostic_category().to_owned();
+                    let response = error.into_response();
+                    let (parts, body) = response.into_parts();
+                    let body = axum::body::to_bytes(body, 64 * 1024)
+                        .await
+                        .map_err(|_| AppError::internal("local_admission_error_body"))?;
+                    let mut response = finish_buffered_request(
+                        &buffered_request,
+                        parts.status,
+                        body,
+                        "application/json",
+                        (
+                            TokenUsage::default(),
+                            crate::model::RequestUsageBasis::NotObserved,
+                        ),
+                        Some(code),
+                    )
+                    .await?;
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    return Ok(response);
+                }
                 return finish_proxy_failure(&buffered_request, "upstream_candidate_invalid").await;
             }
         };
@@ -2476,6 +2500,21 @@ struct ProxyConversationProjection<'a> {
 }
 
 impl ProxyConversation {
+    fn terminal_receipt_seed(
+        &self,
+        upstream_response_id: Option<&str>,
+    ) -> crate::proxy_lifecycle::pending_terminal::OwnedConversation {
+        crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
+            ProxyConversationInput {
+                key: &self.key,
+                request_json: &serde_json::json!({}),
+                hints: &self.hints,
+                client_name: self.client_name.as_deref(),
+                upstream_response_id,
+            },
+        )
+    }
+
     fn take_for_terminal(&self) -> Option<Self> {
         let admission = std::mem::replace(
             &mut *self.projection_admission.lock().ok()?,
@@ -3504,6 +3543,9 @@ async fn finish_buffered_request_before_deadline(
     request.state.pending_terminals.submit_with_preparation(
         snapshot,
         (body.clone(), request.memory.clone(), _response_buffer),
+        conversation
+            .as_ref()
+            .map(|conversation| conversation.terminal_receipt_seed(response_id.as_deref())),
         prepare_terminal_conversation(
             conversation,
             request.memory.clone(),
