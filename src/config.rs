@@ -513,7 +513,6 @@ impl Config {
             || !crate::gateway_body::memory::ProxyMemoryBudget::supports(
                 self.proxy_memory_budget_bytes,
             )
-            || self.proxy_memory_budget_bytes < u64::from(self.audio_body_max_bytes) * 3
         {
             return Err(ConfigError::InvalidProxyMemoryBudget);
         }
@@ -733,7 +732,7 @@ fn responses_body_read_concurrency(value: u32) -> u32 {
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error(
-        "MTC_PROXY_MEMORY_BUDGET_BYTES must be at least 256 MiB, fit the process memory counter, and be at least three times MTC_AUDIO_BODY_MAX_BYTES; pod memory must cover this budget plus 256 MiB"
+        "MTC_PROXY_MEMORY_BUDGET_BYTES must be at least 256 MiB and fit the process memory counter; pod memory must cover this budget plus 256 MiB"
     )]
     InvalidProxyMemoryBudget,
     #[error(
@@ -820,8 +819,9 @@ mod tests {
         config.proxy_memory_budget_bytes = u64::MAX;
         assert!(config.validate_proxy_memory_budget().is_err());
         config.proxy_memory_budget_bytes = DEFAULT_PROXY_MEMORY_BUDGET_BYTES;
-        config.audio_body_max_bytes = (config.proxy_memory_budget_bytes / 3 + 1) as u32;
-        assert!(config.validate_proxy_memory_budget().is_err());
+        // Audio file streaming uses a fixed working set, independent of this legacy setting.
+        config.audio_body_max_bytes = u32::MAX;
+        assert!(config.validate_proxy_memory_budget().is_ok());
     }
 
     #[test]
