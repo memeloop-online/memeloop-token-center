@@ -26,6 +26,7 @@ mod objects;
 mod path;
 mod readiness;
 mod staging;
+mod terminal_receipts;
 
 pub use cas::CasArchiveObject;
 pub use download::ArchiveDownload;
