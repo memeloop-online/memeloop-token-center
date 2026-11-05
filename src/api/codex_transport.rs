@@ -331,6 +331,20 @@ where
     TEST_ENDPOINT.scope(endpoint, future).await
 }
 
+/// Capture before spawning: Tokio task locals are not inherited by owned work.
+#[cfg(test)]
+pub(in crate::api) fn preserve_test_endpoint<F: Future>(
+    future: F,
+) -> impl Future<Output = F::Output> {
+    let endpoint = TEST_ENDPOINT.try_with(Clone::clone).ok();
+    async move {
+        match endpoint {
+            Some(endpoint) => TEST_ENDPOINT.scope(endpoint, future).await,
+            None => future.await,
+        }
+    }
+}
+
 /// Rewrite only the upstream wire document. The original downstream body is
 /// archived by `proxy()` before this document is sent.
 #[cfg(test)]

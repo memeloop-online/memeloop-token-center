@@ -290,6 +290,14 @@ async fn admit_authenticated_gateway_body(
             memory: memory.clone(),
         });
     }
+    if matches!(
+        request.uri().path(),
+        "/v1/videos/generations" | "/v1/generations"
+    ) {
+        // Asynchronous job handlers own their job/financial terminal records.
+        // Synchronous image/audio mark admission when their record is created.
+        super::early_request::mark_admitted();
+    }
     let response = next.run(request).await;
     if super::early_request::is_pre_admission_failure(response.status()) {
         drop(memory);
