@@ -199,6 +199,12 @@ impl<R: std::io::Read> FloatReader<R> {
                     self.pending.push_back(b'-');
                 }
                 first = self.raw_byte()?;
+                if matches!(first, Some(b'+' | b'-')) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "duplicate number sign",
+                    ));
+                }
             }
             let mut zeros = false;
             while first == Some(b'0') {
@@ -312,7 +318,7 @@ mod tests {
             let result: f64 = serde_json::from_reader(FloatReader::new(input.as_bytes())).unwrap();
             assert_eq!(result, input.trim().parse::<f64>().unwrap(), "{input}");
         }
-        for input in [".", "-.", "1..", "+", ".e2"] {
+        for input in [".", "-.", "1..", "+", ".e2", "+-0"] {
             assert!(
                 serde_json::from_reader::<_, f64>(FloatReader::new(input.as_bytes())).is_err(),
                 "{input}"
