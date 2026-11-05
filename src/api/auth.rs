@@ -242,17 +242,26 @@ async fn admit_authenticated_gateway_body(
             .map(|context| proxy_diagnostics::Phase::new(context, "gateway_request_body"));
         let _body_read_activity =
             crate::gateway_body::GatewayBodyReadActivity::start(state.gateway_body_reads.clone());
-        request = match crate::gateway_body::admit_gateway_request_body_with_memory(
-            request,
-            state.gateway_body_read_permits.clone(),
-            state.responses_body_read_permits.clone(),
-            state.config.responses_body_max_bytes as usize,
-            state.config.audio_body_max_bytes as usize,
-            Some(&state.proxy_memory_budget),
-            &state.responses_request_spool,
-        )
-        .await
-        {
+        let admission = if audio_request {
+            crate::gateway_body::audio_file::capture(
+                request,
+                std::path::Path::new(&state.config.responses_request_spool_path),
+                &state.proxy_memory_budget,
+            )
+            .await
+        } else {
+            crate::gateway_body::admit_gateway_request_body_with_memory(
+                request,
+                state.gateway_body_read_permits.clone(),
+                state.responses_body_read_permits.clone(),
+                state.config.responses_body_max_bytes as usize,
+                state.config.audio_body_max_bytes as usize,
+                Some(&state.proxy_memory_budget),
+                &state.responses_request_spool,
+            )
+            .await
+        };
+        request = match admission {
             Ok(request) => request,
             Err(error) => {
                 let response = gateway_body_admission_rejection(state, &request_id, error);

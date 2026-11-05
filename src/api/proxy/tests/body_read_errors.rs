@@ -3,8 +3,7 @@ use std::sync::atomic::Ordering;
 
 #[tokio::test]
 async fn failed_uploads_keep_typed_status_without_dispatch_billing_or_resource_leaks() {
-    let mut fixture = codex_route_fixture("body-read-errors").await;
-    std::sync::Arc::make_mut(&mut fixture.state.config).audio_body_max_bytes = 4 * 1024 * 1024;
+    let fixture = codex_route_fixture("body-read-errors").await;
     let upstream = MockServer::start().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let initial_account: (i64, i64) = sqlx::query_as(
@@ -27,10 +26,11 @@ async fn failed_uploads_keep_typed_status_without_dispatch_billing_or_resource_l
         ),
         ("/v1/chat/completions", 4 * 1024 * 1024),
         ("/v1/audio/transcriptions", 4 * 1024 * 1024),
+        ("/v1/generations", 4 * 1024 * 1024),
     ] {
-        // Durable inference has no hot-body size cap; audio retains a real
-        // admission limit. Exercise transport failures on both kinds of route.
-        let failures: &[&str] = if path == "/v1/audio/transcriptions" {
+        // Streaming inference/audio has no hot-body size cap. The structured
+        // generation-job route still has a real JSON admission limit.
+        let failures: &[&str] = if path == "/v1/generations" {
             &["read", "declared_limit", "stream_limit"]
         } else {
             &["read"]

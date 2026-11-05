@@ -39,8 +39,7 @@ impl Server {
     }
 
     async fn start_with_response_gate(gate: Option<(Arc<Notify>, Arc<Notify>)>) -> Self {
-        let (mut state, directory) = crate::api::tests::test_state().await;
-        Arc::make_mut(&mut state.config).audio_body_max_bytes = LIMIT as u32;
+        let (state, directory) = crate::api::tests::test_state().await;
         let issued = state
             .db
             .create_key(
@@ -63,7 +62,7 @@ impl Server {
         // middleware, with a counted upstream substitute after admission.
         let app = Router::new()
             .route(
-                "/v1/audio/transcriptions",
+                "/v1/generations",
                 post(move || {
                     let calls = calls.clone();
                     async move {
@@ -138,7 +137,7 @@ impl Server {
 
     fn headers(&self, framing: &str) -> Vec<u8> {
         format!(
-            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\n{framing}\r\n",
+            "POST /v1/generations HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\n{framing}\r\n",
             self.key
         )
         .into_bytes()
@@ -383,7 +382,7 @@ async fn http1_durable_chat_exceeds_hot_body_limit_without_truncation_or_resourc
         body.len()
     )))
     .unwrap()
-    .replace("/v1/audio/transcriptions", "/v1/chat/completions");
+    .replace("/v1/generations", "/v1/chat/completions");
     socket.write_all(headers.as_bytes()).await.unwrap();
     socket.write_all(&body).await.unwrap();
     let response = read_response(&mut socket).await;
