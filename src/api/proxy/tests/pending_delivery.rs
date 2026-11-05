@@ -1,6 +1,35 @@
 use super::*;
 mod receipt_durability;
 
+pub(super) async fn read_archived_request_source(
+    fixture: &CodexRouteFixture,
+    pool: &sqlx::AnyPool,
+    request_id: Uuid,
+) -> Option<bytes::Bytes> {
+    let locator: String = sqlx::query_scalar(
+        "SELECT request_object FROM request_records WHERE id = $1 AND key_id = $2",
+    )
+    .bind(request_id.to_string())
+    .bind(fixture.key_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    if locator.starts_with("gap://") {
+        return None;
+    }
+    assert_eq!(
+        Some(locator.as_str()),
+        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
+            .as_deref()
+    );
+    fixture.state.archive.get(&locator).await.ok()
+}
+
+pub(super) fn assert_raw_request_source(raw: &[u8], expected: &Value) {
+    assert_eq!(raw, serde_json::to_vec(expected).unwrap().as_slice());
+    assert_eq!(serde_json::from_slice::<Value>(raw).unwrap(), *expected);
+}
+
 async fn owned_enqueued_source(
     fixture: &CodexRouteFixture,
     pool: &sqlx::AnyPool,
@@ -1101,15 +1130,14 @@ async fn first_billable_delta_arrives_while_upstream_terminal_and_journal_ack_ar
 
 #[tokio::test]
 async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_responsibility() {
-    let mut fixture = codex_route_fixture("pending-filesystem-fault").await;
-    let unavailable = fixture._directory.path().join("journal-is-a-file");
+    let fixture = codex_route_fixture("pending-filesystem-fault").await;
+    // The filesystem backend maps receipt object keys below this directory.
+    // Block only their namespace so the production journal cannot publish its
+    // ACK, while the independent raw request/response sources remain writable.
+    let unavailable = fixture.archive_path.join("terminal-receipts");
     tokio::fs::write(&unavailable, b"not a directory")
         .await
         .unwrap();
-    fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        unavailable.clone(),
-        fixture.state.db.independent_persistence_pool(),
-    );
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -1206,7 +1234,46 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
     let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     wait_for_request_settlement(&fixture, 1).await;
     let request_id = Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap();
-    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+    // A fenced conversation enqueue needs the operational receipt's timestamp.
+    // While that write is blocked, verify finance and the original source,
+    // then retain the full exactly-once projection check after recovery below.
+    let financial: (String, i64, i64, i64) = sqlx::query_as(
+        "SELECT r.status, \
+         (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id), \
+         (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id), \
+         (SELECT COUNT(*) FROM pending_proxy_settlements p WHERE p.request_id = q.id AND p.state = 'applied') \
+         FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id \
+         WHERE q.id = $1 AND q.key_id = $2",
+    )
+    .bind(request_id.to_string())
+    .bind(fixture.key_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(financial, ("settled".to_owned(), 1, 1, 1));
+    let projections: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1), \
+         (SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1)",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projections, (0, 0));
+    let raw_source = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(raw) = read_archived_request_source(&fixture, &pool, request_id).await {
+                break raw;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("blocked operational receipt must retain the complete original source");
+    assert_raw_request_source(
+        &raw_source,
+        &json!({"model": fixture.model, "input": "operational retry", "stream": false}),
+    );
     assert!(
         fixture
             .state
@@ -1380,20 +1447,27 @@ async fn unknown_failure_retries_operational_projection() {
     .expect("unknown finance must retain its durable receipt");
     let request_id = Uuid::parse_str(original["request_id"].as_str().unwrap()).unwrap();
     assert!(original["conversation"].is_object());
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture
-            .state
-            .pending_terminals
-            .idle_conversation_retained_for_test(receipt_id)
-            .await
-            != Some(true)
-        {
+    let raw_source = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if fixture
+                .state
+                .pending_terminals
+                .idle_conversation_retained_for_test(receipt_id)
+                .await
+                == Some(true)
+                && let Some(raw) = read_archived_request_source(&fixture, &pool, request_id).await
+            {
+                break raw;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("unknown awaiting its operational receipt must survive idle reap");
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    assert_raw_request_source(
+        &raw_source,
+        &json!({"model": fixture.model, "input": "operational failure retry", "stream": true}),
+    );
     let financial: (String, String, Option<i64>, i64, i64) = sqlx::query_as(
         "SELECT p.unknown_reason, r.status, r.actual_micros, \
          (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
@@ -1442,14 +1516,18 @@ async fn unknown_failure_retries_operational_projection() {
             .pending_terminals
             .contains_receipt_for_test(receipt_id)
     );
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture
-            .state
-            .pending_terminals
-            .idle_conversation_retained_for_test(receipt_id)
-            .await
-            != Some(true)
-        {
+    let raw_source = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if fixture
+                .state
+                .pending_terminals
+                .idle_conversation_retained_for_test(receipt_id)
+                .await
+                == Some(true)
+                && let Some(raw) = read_archived_request_source(&fixture, &pool, request_id).await
+            {
+                break raw;
+            }
             tokio::task::yield_now().await;
         }
     })
@@ -1463,7 +1541,10 @@ async fn unknown_failure_retries_operational_projection() {
     .await
     .unwrap();
     assert_eq!(enqueued, 0);
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
+    assert_raw_request_source(
+        &raw_source,
+        &json!({"model": fixture.model, "input": "operational failure retry", "stream": true}),
+    );
     sqlx::query("DROP TRIGGER fail_unknown_projection")
         .execute(&pool)
         .await
@@ -1517,6 +1598,7 @@ async fn unknown_failure_retries_operational_projection() {
                 .unwrap()
         );
     }
+    drain_completed_response_archive(&fixture).await;
     let owner = Uuid::now_v7();
     let tasks = fixture
         .state

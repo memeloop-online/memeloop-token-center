@@ -275,6 +275,7 @@ jobs:
         run: |
           cargo test --locked --all-features --lib request_history -- --nocapture
           cargo test --locked --all-features --lib request_history_real_services_acceptance -- --ignored --nocapture
+          cargo test --locked --all-features --lib allocation_history_real_services_acceptance -- --ignored --nocapture
           curl --fail --silent --show-error "$MTC_TEST_CLICKHOUSE_URL" --data-binary 'CREATE DATABASE IF NOT EXISTS session_tasks'
           MTC_REQUEST_HISTORY_DATABASE=session_tasks cargo test --locked --all-features --lib session_tasks_history_real_services_acceptance -- --ignored --nocapture
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings

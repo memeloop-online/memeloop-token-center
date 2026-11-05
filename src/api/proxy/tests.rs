@@ -2907,12 +2907,15 @@ async fn assert_only_early_request_failures(fixture: &CodexRouteFixture) {
 }
 
 async fn drain_archive_capture(fixture: &CodexRouteFixture) {
-    fixture.state.db.drain_gateway_persistence_for_test().await;
-    fixture.state.persistence.drain_for_test().await;
+    drain_archive_capture_state(&fixture.state).await;
+}
+
+async fn drain_archive_capture_state(state: &AppState) {
+    state.db.drain_gateway_persistence_for_test().await;
+    state.persistence.drain_for_test().await;
     let _writers = tokio::time::timeout(
         Duration::from_secs(5),
-        fixture
-            .state
+        state
             .proxy_archive_stream_permits
             .acquire_many(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32),
     )
@@ -2922,12 +2925,16 @@ async fn drain_archive_capture(fixture: &CodexRouteFixture) {
 }
 
 async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
-    drain_archive_capture(fixture).await;
+    drain_completed_response_archive_state(&fixture.state).await;
+}
+
+async fn drain_completed_response_archive_state(state: &AppState) {
+    drain_archive_capture_state(state).await;
     // Gateway-only fixtures do not run background workers. Settlement and
     // upload are now independent: exercise the real fenced spool worker before
     // asserting object bytes, without making production delivery await S3.
     tokio::time::timeout(Duration::from_secs(5), async {
-        let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+        let pool = sqlx::AnyPool::connect(&state.config.database_url).await.unwrap();
         loop {
             let outstanding: i64 = sqlx::query_scalar(
                 "SELECT (SELECT COUNT(*) FROM request_archive_spools WHERE state IN ('capturing', 'pending', 'uploading')) + (SELECT COUNT(*) FROM response_archive_spools WHERE state IN ('capturing', 'pending', 'uploading'))",
@@ -2935,7 +2942,7 @@ async fn drain_completed_response_archive(fixture: &CodexRouteFixture) {
             if outstanding == 0 {
                 break;
             }
-            crate::response_archive_spool::process_one_for_test(&fixture.state).await;
+            crate::response_archive_spool::process_one_for_test(state).await;
             tokio::task::yield_now().await;
         }
         pool.close().await;
