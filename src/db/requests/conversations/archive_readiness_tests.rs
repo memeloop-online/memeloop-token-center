@@ -77,6 +77,17 @@ async fn fair_projection_queue_contract(database_url: String) {
             expected
         );
     }
+    let terminal_claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_projection_outbox WHERE terminal_lease_owner = $1",
+    )
+    .bind(owner.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal_claims, 12,
+        "terminal sentinels must sort by their terminal deadline, not their permanent primary lease"
+    );
     let second = db
         .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
         .await

@@ -580,7 +580,8 @@ impl Database {
                       AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $3)
                       AND ({primary} OR semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL)
                     ORDER BY CASE WHEN lease_owner = 'session-body-rebuild' THEN observed_at
-                        ELSE COALESCE(terminal_lease_expires_at, lease_expires_at, observed_at) END,
+                        WHEN {primary} THEN COALESCE(terminal_lease_expires_at, lease_expires_at, observed_at)
+                        ELSE COALESCE(terminal_lease_expires_at, observed_at) END,
                         observed_at, request_id LIMIT $4{lock}
                  ) RETURNING request_id, observed_at"
             );
