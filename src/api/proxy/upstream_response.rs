@@ -179,6 +179,7 @@ pub(super) struct UpstreamResponseParts {
     pub(super) version: Version,
     pub(super) content_length: Option<u64>,
     pub(super) stream: UpstreamByteStream,
+    pub(super) validated_compact: Option<super::routing::ValidatedCompact>,
 }
 
 /// A small response surface. Native Codex and every other upstream use reqwest.
@@ -191,6 +192,14 @@ pub(super) enum UpstreamResponse {
         version: Version,
         content_length: Option<u64>,
         stream: UpstreamByteStream,
+    },
+    ValidatedCompact {
+        status: StatusCode,
+        headers: HeaderMap,
+        version: Version,
+        content_length: Option<u64>,
+        stream: UpstreamByteStream,
+        evidence: super::routing::ValidatedCompact,
     },
 }
 
@@ -218,7 +227,7 @@ impl UpstreamResponse {
         match self {
             Self::Reqwest(response) => response.status(),
             Self::Codex(response) => response.status(),
-            Self::Prefetched { status, .. } => *status,
+            Self::Prefetched { status, .. } | Self::ValidatedCompact { status, .. } => *status,
         }
     }
 
@@ -226,7 +235,7 @@ impl UpstreamResponse {
         match self {
             Self::Reqwest(response) => response.headers(),
             Self::Codex(response) => response.headers(),
-            Self::Prefetched { headers, .. } => headers,
+            Self::Prefetched { headers, .. } | Self::ValidatedCompact { headers, .. } => headers,
         }
     }
 
@@ -234,7 +243,7 @@ impl UpstreamResponse {
         match self {
             Self::Reqwest(response) => response.version(),
             Self::Codex(response) => response.version(),
-            Self::Prefetched { version, .. } => *version,
+            Self::Prefetched { version, .. } | Self::ValidatedCompact { version, .. } => *version,
         }
     }
 
@@ -242,7 +251,15 @@ impl UpstreamResponse {
         match self {
             Self::Reqwest(response) => response.content_length(),
             Self::Codex(response) => response.content_length(),
-            Self::Prefetched { content_length, .. } => *content_length,
+            Self::Prefetched { content_length, .. }
+            | Self::ValidatedCompact { content_length, .. } => *content_length,
+        }
+    }
+
+    pub(super) fn validated_compact(&self) -> Option<&super::routing::ValidatedCompact> {
+        match self {
+            Self::ValidatedCompact { evidence, .. } => Some(evidence),
+            _ => None,
         }
     }
 
@@ -251,6 +268,7 @@ impl UpstreamResponse {
         let headers = self.headers().clone();
         let version = self.version();
         let content_length = self.content_length();
+        let validated_compact = self.validated_compact().cloned();
         let stream = self.bytes_stream();
         UpstreamResponseParts {
             status,
@@ -258,6 +276,7 @@ impl UpstreamResponse {
             version,
             content_length,
             stream,
+            validated_compact,
         }
     }
 
@@ -270,12 +289,40 @@ impl UpstreamResponse {
             .headers
             .insert(http::header::CONTENT_TYPE, content_type);
         let prefixed = stream::iter(prefetched.into_iter().map(Ok)).chain(parts.stream);
+        Self::from_parts_stream(
+            parts.status,
+            parts.headers,
+            parts.version,
+            parts.content_length,
+            Box::pin(prefixed),
+            parts.validated_compact,
+        )
+    }
+
+    fn from_parts_stream(
+        status: StatusCode,
+        headers: HeaderMap,
+        version: Version,
+        content_length: Option<u64>,
+        stream: UpstreamByteStream,
+        evidence: Option<super::routing::ValidatedCompact>,
+    ) -> Self {
+        if let Some(evidence) = evidence {
+            return Self::ValidatedCompact {
+                status,
+                headers,
+                version,
+                content_length,
+                stream,
+                evidence,
+            };
+        }
         Self::Prefetched {
-            status: parts.status,
-            headers: parts.headers,
-            version: parts.version,
-            content_length: parts.content_length,
-            stream: Box::pin(prefixed),
+            status,
+            headers,
+            version,
+            content_length,
+            stream,
         }
     }
 
@@ -337,13 +384,14 @@ impl UpstreamResponse {
                 }
             },
         );
-        Self::Prefetched {
-            status: parts.status,
-            headers: parts.headers,
-            version: parts.version,
-            content_length: parts.content_length,
-            stream: Box::pin(timed),
-        }
+        Self::from_parts_stream(
+            parts.status,
+            parts.headers,
+            parts.version,
+            parts.content_length,
+            Box::pin(timed),
+            parts.validated_compact,
+        )
     }
 
     pub(super) fn bytes_stream(self) -> UpstreamByteStream {
@@ -360,7 +408,7 @@ impl UpstreamResponse {
                         .map_or(UPSTREAM_STREAM_ERROR, CodexHttp2Failure::error_code)
                 })
             })),
-            Self::Prefetched { stream, .. } => stream,
+            Self::Prefetched { stream, .. } | Self::ValidatedCompact { stream, .. } => stream,
         }
     }
 }
@@ -374,6 +422,26 @@ impl From<reqwest::Response> for UpstreamResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upstream_headers_cannot_assert_validated_compact_provenance() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-mtc-validated-compact",
+            http::HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            http::header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let response = UpstreamResponse::for_test(
+            headers,
+            Version::HTTP_11,
+            vec![Ok(Bytes::from_static(b"data: unvalidated\n\n"))],
+        );
+        assert!(response.validated_compact().is_none());
+        assert!(response.into_parts().validated_compact.is_none());
+    }
 
     #[tokio::test(start_paused = true)]
     async fn diagnostic_observation_limits_do_not_invent_terminal_causes() {

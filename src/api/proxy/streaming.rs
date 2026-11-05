@@ -213,6 +213,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Some(upstream_account_id),
                 Some(credential_generation),
             ));
+            // Only the host compact codec can construct this evidence. A
+            // provider header cannot opt out of ordinary SSE validation.
+            let validated_compact = upstream.validated_compact().cloned();
+            let mut compact_file_eof = false;
             let mut upstream_stream = upstream.bytes_stream();
             let spool_identity = crate::db::ArchiveSpoolIdentity {
                 request_id,
@@ -235,7 +239,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     codex_chat_include_usage,
                 )
             });
-            let mut sse_capture = is_sse.then(|| match protocol {
+            let mut sse_capture = (is_sse && validated_compact.is_none()).then(|| match protocol {
                 Protocol::OpenAiChat if is_codex_route => {
                     ResponsesSseCapture::for_codex_responses_with_limits(sse_framing_limits)
                 }
@@ -250,7 +254,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
                 _ => ResponsesSseCapture::for_delivery_with_limits(sse_framing_limits),
             });
-            let mut responses_streaming_sanitizer = (is_sse
+            let mut responses_streaming_sanitizer = (validated_compact.is_none()
+                && is_sse
                 && (is_codex_route
                     || matches!(
                         protocol,
@@ -338,6 +343,22 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     }
                 };
                 let Some(next) = next else {
+                    if let Some(evidence) = validated_compact.as_ref() {
+                        if response_bytes as u64 != evidence.expected_body_bytes() {
+                            transport_error = Some("compact_file_length_mismatch");
+                            drop(archive_sender.take());
+                            let _ = body_sender
+                                .send(downstream_stream_failure(
+                                    protocol,
+                                    is_sse,
+                                    None,
+                                    "validated compact file ended before its complete body",
+                                ))
+                                .await;
+                            break;
+                        }
+                        compact_file_eof = true;
+                    }
                     match terminal_delivery.finish_at_eof(responses_streaming_sanitizer.as_mut()) {
                         TerminalEof::Flush => continue,
                         TerminalEof::Complete => {
@@ -379,6 +400,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 match next {
                     Ok(raw_chunk) => {
                         if is_sse
+                            && validated_compact.is_none()
                             && !flushing_terminal
                             && !raw_chunk.is_empty()
                             && _sse_streaming_memory.is_none()
@@ -428,6 +450,21 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 raw_chunk.len(),
                             );
                             response_bytes = response_bytes.saturating_add(raw_chunk.len());
+                            if validated_compact.as_ref().is_some_and(|evidence| {
+                                response_bytes as u64 > evidence.expected_body_bytes()
+                            }) {
+                                transport_error = Some("compact_file_length_mismatch");
+                                drop(archive_sender.take());
+                                let _ = body_sender
+                                    .send(downstream_stream_failure(
+                                        protocol,
+                                        is_sse,
+                                        None,
+                                        "validated compact file exceeded its complete body",
+                                    ))
+                                    .await;
+                                break;
+                            }
                             // Cumulative traffic does not occupy cumulative
                             // memory. Frame decoding, terminal retention and
                             // channel backpressure own the live working set.
@@ -540,6 +577,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 break;
                             }
                         };
+                        if let Some(evidence) = validated_compact.as_ref() {
+                            // File fragments are not complete SSE events. The
+                            // codec records the first complete output boundary;
+                            // a created prefix alone is not delivered output.
+                            let complete_output =
+                                response_bytes as u64 >= evidence.first_billable_byte_end();
+                            for frame in &mut delivery_frames {
+                                frame.billable = complete_output;
+                            }
+                        }
                         if let Some(translator) = codex_chat_translator.as_mut() {
                             let mut translated = Vec::with_capacity(delivery_frames.len());
                             for mut frame in delivery_frames {
@@ -584,6 +631,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         if let Some(spool) = archive_sender.as_mut() {
                             let mut archive_failed = false;
                             for frame in &delivery_frames {
+                                if validated_compact.is_some() {
+                                    // The codec already validated unique JSON;
+                                    // these are bounded file fragments, not
+                                    // independently parseable SSE events.
+                                    if !spool.append(vec![frame.bytes.clone()]) {
+                                        archive_failed = true;
+                                        break;
+                                    }
+                                    continue;
+                                }
                                 let Some(_retention_memory) =
                                     request_memory.try_reserve_archive_json_transform(&frame.bytes)
                                 else {
@@ -741,15 +798,26 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             }
             let local_response_boundary =
                 transport_error.is_some_and(buffered_upstream::is_local_response_boundary);
-            let sse_summary = sse_capture.map(|capture| {
-                let mut summary =
-                    capture.finish_summary_after_local_boundary(local_response_boundary);
-                lifecycle::apply_chat_translation_usage_evidence(
-                    &mut summary,
-                    codex_chat_translation_error,
-                );
-                summary
-            });
+            let sse_summary = validated_compact
+                .as_ref()
+                .map(|evidence| {
+                    let mut summary = evidence.summary();
+                    if !compact_file_eof || transport_error.is_some() {
+                        summary.outcome = ResponsesSseOutcome::Incomplete;
+                    }
+                    summary
+                })
+                .or_else(|| {
+                    sse_capture.map(|capture| {
+                        let mut summary =
+                            capture.finish_summary_after_local_boundary(local_response_boundary);
+                        lifecycle::apply_chat_translation_usage_evidence(
+                            &mut summary,
+                            codex_chat_translation_error,
+                        );
+                        summary
+                    })
+                });
             let incomplete = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),
                 Some(ResponsesSseOutcome::Incomplete)
@@ -921,6 +989,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     transport_error,
                     delivered_billable,
                     sse_summary,
+                    validated_compact,
                     usage_capture,
                     stored_response,
                     routing_terminal_observed_at,
