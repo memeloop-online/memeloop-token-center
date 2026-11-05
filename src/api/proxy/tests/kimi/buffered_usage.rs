@@ -2,11 +2,20 @@ use super::*;
 
 #[tokio::test]
 async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_original_body_once() {
+    native_kimi_buffered_usage(2).await;
+}
+
+#[tokio::test]
+async fn native_kimi_output_above_requested_limit_preserves_success_and_actual_usage() {
+    native_kimi_buffered_usage(19).await;
+}
+
+async fn native_kimi_buffered_usage(output_tokens: i64) {
     let upstream = MockServer::start().await;
     let fixture = response_usage_fixture("kimi-buffered-cache", &upstream, 0).await;
     let body = json!({"id":"kimi-native-buffered","object":"chat.completion","model":"kimi-k3",
         "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],
-        "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12,"cached_tokens":6}});
+        "usage":{"prompt_tokens":10,"completion_tokens":output_tokens,"total_tokens":10 + output_tokens,"cached_tokens":6}});
     let raw_body = serde_json::to_vec(&body).unwrap();
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_raw(raw_body.clone(), "application/json"))
@@ -43,7 +52,7 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
             key: &key,
             price: &price,
             input_token_ceiling: 20,
-            output_token_ceiling: 8,
+            output_token_ceiling: 16,
             protocol: "openai",
             model: &fixture.model,
             request_object: &format!("gap://{request_id}/request"),
@@ -59,8 +68,8 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
         request_id,
         memory_admission_wait: Duration::from_secs(30),
         input_token_ceiling: 20,
-        output_token_ceiling: 8,
-        output_token_limit: Some(8),
+        output_token_ceiling: 16,
+        output_token_limit: Some(16),
         requested_service_tier: None,
         conversation: Some(ProxyConversation {
             key: key.clone(),
@@ -134,17 +143,17 @@ async fn native_kimi_buffered_chat_settles_discounted_cache_and_archives_origina
             rows[0].cached_input_tokens,
             rows[0].output_tokens
         ),
-        (10, 6, 2),
+        (10, 6, output_tokens),
         "request rows report inclusive input; cached input remains a subset"
     );
     assert_eq!(
         rows[0].usage_basis,
         Some(crate::model::RequestUsageBasis::ProviderReported)
     );
-    // 4 uncached * 2 + 6 cached * 1 + 2 output * 3 = 20 microdollars.
+    // Preserve the actual output alongside the discounted cache price.
     assert_eq!(
         rows[0].cost.parse::<Decimal>().unwrap(),
-        Decimal::new(20, 6)
+        Decimal::new(4 * 2 + 6 + output_tokens * 3, 6)
     );
     assert_exactly_once_side_effects(&fixture, request_id, None).await;
     drain_completed_response_archive(&fixture).await;
