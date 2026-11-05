@@ -9,13 +9,95 @@ use bytes::Bytes;
 
 struct Fixture {
     state: AppState,
+    key: AuthenticatedKey,
     request_id: Uuid,
     identity: ArchiveSpoolIdentity,
     source: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
 }
 
+async fn body_enrichment_preserves_relations(fixture: &Fixture) {
+    let short = serde_json::json!({"messages":[{"role":"user","content":"question"}]});
+    let long = serde_json::json!({"messages":[
+        {"role":"user","content":"question"},
+        {"role":"assistant","content":"answer"},
+        {"role":"user","content":"followup"}
+    ]});
+    for (name, first, second, reverse, compaction, expected) in [
+        ("prefix", &short, &long, false, false, "continues"),
+        ("reverse-prefix", &long, &short, true, false, "continues"),
+        ("compaction", &long, &short, false, true, "compacts"),
+    ] {
+        let mut results = Vec::new();
+        for pending in [false, true] {
+            let session = format!("{name}-{pending}");
+            let first_id = Uuid::now_v7();
+            let second_id = Uuid::now_v7();
+            let now = unix_millis();
+            let mut transaction = fixture.state.db.pool.begin().await.unwrap();
+            for (request_id, body, observed_at, compact) in [
+                (first_id, first, now + i64::from(reverse), false),
+                (second_id, second, now + i64::from(!reverse), compaction),
+            ] {
+                let hints = ConversationHints {
+                    session_id: Some(session.clone()),
+                    compaction: compact,
+                    ..Default::default()
+                };
+                let empty = serde_json::json!({});
+                let bodies = if pending && request_id == second_id {
+                    vec![&empty, body]
+                } else {
+                    vec![body]
+                };
+                for body in bodies {
+                    fixture
+                        .state
+                        .db
+                        .record_conversation_observation_with_snapshot_in_transaction(
+                            &mut transaction,
+                            ConversationObservationInput {
+                                key: &fixture.key,
+                                request_id,
+                                request_json: body,
+                                hints: &hints,
+                                client_name: Some("codex"),
+                                upstream_response_id: None,
+                                observed_at,
+                                attach_request_record: false,
+                                content_materialized: false,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            transaction.commit().await.unwrap();
+            let edges = sqlx::query(
+                "SELECT e.relation_kind, a.request_id AS source_request FROM conversation_edges e JOIN conversation_observations a ON a.id = e.from_observation_id JOIN conversation_observations b ON b.id = e.to_observation_id WHERE a.explicit_session_id = $1 AND b.explicit_session_id = $1",
+            )
+            .bind(&session).fetch_all(&fixture.state.db.pool).await.unwrap();
+            assert_eq!(edges.len(), 1, "{name} pending={pending}");
+            results.push((
+                edges[0].get::<String, _>("relation_kind"),
+                edges[0].get::<String, _>("source_request") == first_id.to_string(),
+            ));
+            let count: i64 = sqlx::query_scalar(
+                "SELECT request_count FROM conversation_key_clusters WHERE key_id = $1 AND explicit_session_id = $2",
+            )
+            .bind(fixture.key.key_id.to_string()).bind(&session)
+            .fetch_one(&fixture.state.db.pool).await.unwrap();
+            assert_eq!(count, 2, "{name} pending={pending}");
+        }
+        assert_eq!(results[0], results[1], "{name} must survive early identity");
+        assert_eq!(results[1].0, expected);
+        assert_eq!(results[1].1, !reverse);
+    }
+}
+
 async fn declared_identity_before_body_contract(database_url: String) {
     let fixture = Fixture::new(database_url, false).await;
+    body_enrichment_preserves_relations(&fixture).await;
     let mut hints = ConversationHints {
         session_id: Some("declared-client-thread".into()),
         ..Default::default()
@@ -351,6 +433,7 @@ impl Fixture {
         );
         Self {
             state,
+            key,
             request_id,
             identity,
             source,
