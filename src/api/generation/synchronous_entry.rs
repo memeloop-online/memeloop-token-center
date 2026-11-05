@@ -537,10 +537,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reservations, 0);
-        let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        // Invalid authenticated requests now have early diagnostic records;
+        // none may own a paid submission or a reservation.
+        let submissions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_records WHERE reservation_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(submissions, 0);
         pool.close().await;
         let first =
