@@ -1,29 +1,37 @@
 //! File-backed compact translation. Payload strings are never materialized in memory.
-use std::collections::HashSet;
+mod index;
+use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 const CHUNK: usize = 64 * 1024;
 type Result<T> = std::result::Result<T, &'static str>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct Span {
     start: u64,
     end: u64,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 enum Kind {
     Null,
     Bool(bool),
     Number,
     String(bool),
     Object(Vec<(String, Node)>),
-    Array(Vec<Node>),
+    Array(DiskNodes),
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Node {
     span: Span,
     kind: Kind,
+    raw_fields: Option<DiskNodes>,
 }
 
 impl Node {
@@ -56,20 +64,129 @@ enum Capture {
     Skip,
 }
 
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct DiskNodes {
+    head: u64,
+    count: usize,
+}
+
+fn recognized_key(capture: Capture, key: &str) -> bool {
+    match capture {
+        Capture::Root => matches!(
+            key,
+            "id" | "error"
+                | "status"
+                | "incomplete_details"
+                | "output"
+                | "usage"
+                | "message"
+                | "response"
+                | "service_tier"
+        ),
+        Capture::Item => matches!(
+            key,
+            "id" | "type" | "status" | "incomplete_details" | "encrypted_content" | "content"
+        ),
+        Capture::Part => matches!(key, "type" | "text"),
+        Capture::UsageEnvelope => matches!(key, "usage" | "service_tier"),
+        Capture::Usage | Capture::UsageDetails => matches!(
+            key,
+            "service_tier"
+                | "input_tokens"
+                | "prompt_tokens"
+                | "output_tokens"
+                | "completion_tokens"
+                | "prompt_cache_hit_tokens"
+                | "prompt_cache_miss_tokens"
+                | "input_tokens_details"
+                | "prompt_tokens_details"
+                | "cache_read_input_tokens"
+                | "cache_creation_input_tokens"
+                | "cache_creation"
+                | "cached_tokens"
+                | "ephemeral_5m_input_tokens"
+                | "ephemeral_1h_input_tokens"
+                | "cache_read_observed"
+                | "cache_usage_complete"
+        ),
+        _ => false,
+    }
+}
+
 struct Scanner {
     reader: BufReader<File>,
+    index: Option<index::Index>,
     position: u64,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl Scanner {
+    #[cfg(test)]
     fn new(file: File) -> Self {
-        Self {
+        Self::with_index(file, tempfile::tempfile().unwrap()).unwrap()
+    }
+
+    fn with_index(file: File, index_file: File) -> Result<Self> {
+        Ok(Self {
             reader: BufReader::with_capacity(CHUNK, file),
+            index: Some(index::Index::new(index_file)?),
             position: 0,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn key(&mut self, root: &mut u64) -> Result<String> {
+        let mut index = self.index.take().ok_or("compact_file_io")?;
+        let start = index.end();
+        let mut digest = Sha256::new();
+        let mut small = Vec::new();
+        let mut oversized = false;
+        let result = self
+            .string(|bytes| {
+                digest.update(bytes);
+                index.append(bytes)?;
+                if !oversized && small.len() + bytes.len() <= 64 {
+                    small.extend_from_slice(bytes);
+                } else {
+                    oversized = true;
+                    small.clear();
+                }
+                Ok(())
+            })
+            .and_then(|_| {
+                let key = Span {
+                    start,
+                    end: index.end(),
+                };
+                index.insert_key(root, digest.finalize().into(), key)
+            });
+        self.index = Some(index);
+        result?;
+        String::from_utf8(small).map_err(|_| "invalid_json")
+    }
+
+    fn disk_node(&mut self, at: &mut u64) -> Result<Option<Node>> {
+        self.check_cancelled()?;
+        if *at == 0 {
+            return Ok(None);
+        }
+        let (bytes, next) = self.index.as_mut().ok_or("compact_file_io")?.record(*at)?;
+        *at = next;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| "compact_file_io")
+    }
+
+    fn check_cancelled(&self) -> Result<()> {
+        if self.cancelled.load(Ordering::Relaxed) {
+            Err("compact_cancelled")
+        } else {
+            Ok(())
         }
     }
 
     fn seek(&mut self, position: u64) -> Result<()> {
+        self.check_cancelled()?;
         self.reader
             .seek(SeekFrom::Start(position))
             .map_err(|_| "compact_file_io")?;
@@ -78,6 +195,7 @@ impl Scanner {
     }
 
     fn peek(&mut self) -> Result<Option<u8>> {
+        self.check_cancelled()?;
         Ok(self
             .reader
             .fill_buf()
@@ -127,6 +245,7 @@ impl Scanner {
         self.expect(b'"')?;
         let mut nonempty = false;
         loop {
+            self.check_cancelled()?;
             // Most provider blobs and text are ASCII. Process a buffer slice at a time
             // rather than calling the base64 encoder once per character.
             let available = self.reader.fill_buf().map_err(|_| "compact_file_io")?;
@@ -207,24 +326,20 @@ impl Scanner {
         }
         self.whitespace()?;
         let start = self.position;
+        let mut raw_fields = None;
         let kind = match self.peek()?.ok_or("invalid_json")? {
             b'"' => Kind::String(self.string(|_| Ok(()))?),
             b'{' => {
                 self.byte()?;
                 self.whitespace()?;
                 let mut fields = Vec::new();
-                let mut keys = HashSet::new();
+                let mut keys = 0u64;
+                let mut raw = DiskNodes { head: 0, count: 0 };
+                let mut raw_tail = 0;
                 if self.peek()? != Some(b'}') {
                     loop {
-                        let mut key = Vec::new();
-                        self.string(|bytes| {
-                            key.extend_from_slice(bytes);
-                            Ok(())
-                        })?;
-                        let key = String::from_utf8(key).map_err(|_| "invalid_json")?;
-                        if !keys.insert(key.clone()) {
-                            return Err("duplicate_json_key");
-                        }
+                        let field_start = self.position;
+                        let key = self.key(&mut keys)?;
                         self.whitespace()?;
                         self.expect(b':')?;
                         let child_capture = match (capture, key.as_str()) {
@@ -239,15 +354,38 @@ impl Scanner {
                             _ => Capture::Skip,
                         };
                         let child = self.value(child_capture, depth + 1)?;
-                        if matches!(
-                            capture,
-                            Capture::Root
-                                | Capture::Item
-                                | Capture::Part
-                                | Capture::Usage
-                                | Capture::UsageDetails
-                                | Capture::UsageEnvelope
-                        ) {
+                        if matches!(capture, Capture::Root)
+                            && !matches!(
+                                key.as_str(),
+                                "id" | "object" | "status" | "error" | "output"
+                            )
+                        {
+                            let span = Span {
+                                start: field_start,
+                                end: child.span.end,
+                            };
+                            let at = self
+                                .index
+                                .as_mut()
+                                .ok_or("compact_file_io")?
+                                .append_span(&mut raw_tail, span)?;
+                            if raw.head == 0 {
+                                raw.head = at;
+                            }
+                            raw.count += 1;
+                        }
+
+                        if recognized_key(capture, &key)
+                            && matches!(
+                                capture,
+                                Capture::Root
+                                    | Capture::Item
+                                    | Capture::Part
+                                    | Capture::Usage
+                                    | Capture::UsageDetails
+                                    | Capture::UsageEnvelope
+                            )
+                        {
                             fields.push((key, child));
                         }
                         self.whitespace()?;
@@ -260,12 +398,16 @@ impl Scanner {
                 } else {
                     self.byte()?;
                 }
+                if matches!(capture, Capture::Root) {
+                    raw_fields = Some(raw);
+                }
                 Kind::Object(fields)
             }
             b'[' => {
                 self.byte()?;
                 self.whitespace()?;
-                let mut items = Vec::new();
+                let mut items = DiskNodes { head: 0, count: 0 };
+                let mut tail = 0;
                 if self.peek()? != Some(b']') {
                     loop {
                         let child_capture = match capture {
@@ -275,7 +417,17 @@ impl Scanner {
                         };
                         let child = self.value(child_capture, depth + 1)?;
                         if matches!(capture, Capture::Output | Capture::Content) {
-                            items.push(child);
+                            let bytes =
+                                serde_json::to_vec(&child).map_err(|_| "compact_file_io")?;
+                            let at = self
+                                .index
+                                .as_mut()
+                                .ok_or("compact_file_io")?
+                                .append_record(&mut tail, &bytes)?;
+                            if items.head == 0 {
+                                items.head = at;
+                            }
+                            items.count += 1;
                         }
                         self.whitespace()?;
                         match self.byte()? {
@@ -313,6 +465,7 @@ impl Scanner {
                 end: self.position,
             },
             kind,
+            raw_fields,
         })
     }
 
@@ -334,6 +487,7 @@ impl Scanner {
     }
 
     fn number(&mut self) -> Result<()> {
+        let start = self.position;
         if self.peek()? == Some(b'-') {
             self.byte()?;
         }
@@ -355,6 +509,30 @@ impl Scanner {
             }
             self.digits()?;
         }
+        let end = self.position;
+        self.seek(start)?;
+        struct NumberReader<'a> {
+            source: std::io::Take<&'a mut BufReader<File>>,
+            cancelled: Arc<AtomicBool>,
+        }
+        impl Read for NumberReader<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.cancelled.load(Ordering::Relaxed) {
+                    return Err(std::io::Error::other("compact cancelled"));
+                }
+                self.source.read(bytes)
+            }
+        }
+        let reader = NumberReader {
+            source: (&mut self.reader).take(end - start),
+            cancelled: self.cancelled.clone(),
+        };
+        // Match the existing unique-JSON parser's finite number semantics
+        // without storing an arbitrarily long number spelling.
+        let number = serde_json::from_reader::<_, serde_json::Number>(reader);
+        self.check_cancelled()?;
+        number.map_err(|_| "invalid_json")?;
+        self.seek(end)?;
         Ok(())
     }
 
@@ -403,6 +581,7 @@ impl Scanner {
         let mut escaped = false;
         let mut buffer = [0; CHUNK];
         while remaining > 0 {
+            self.check_cancelled()?;
             let length = remaining.min(CHUNK as u64) as usize;
             self.reader
                 .read_exact(&mut buffer[..length])
@@ -438,52 +617,47 @@ fn write(out: &mut impl Write, bytes: &[u8]) -> Result<()> {
     out.write_all(bytes).map_err(|_| "compact_file_io")
 }
 
-struct Item<'a> {
-    original: &'a Node,
-    text: Option<Vec<Span>>,
-}
-
-fn legacy_text(scanner: &mut Scanner, item: &Node) -> Result<Option<Vec<Span>>> {
+fn legacy_text(scanner: &mut Scanner, item: &Node) -> Result<bool> {
     let Some(content) = item.get("content") else {
-        return Ok(None);
+        return Ok(false);
     };
     if content.string() {
-        return Ok(content.nonempty_string().then(|| vec![content.span]));
+        return Ok(content.nonempty_string());
     }
     let Kind::Array(parts) = &content.kind else {
-        return Ok(None);
+        return Ok(false);
     };
-    let mut spans = Vec::new();
+    let mut at = parts.head;
     let mut nonempty = false;
-    for part in parts {
+    while let Some(part) = scanner.disk_node(&mut at)? {
         if let Some(kind) = part.get("type")
             && kind.string()
             && !scanner.equals(kind, "output_text")?
             && !scanner.equals(kind, "input_text")?
             && !scanner.equals(kind, "text")?
         {
-            return Ok(None);
+            return Ok(false);
         }
         let Some(text) = part.get("text").filter(|n| n.string()) else {
-            return Ok(None);
+            return Ok(false);
         };
         nonempty |= text.nonempty_string();
-        spans.push(text.span);
     }
-    Ok(nonempty.then_some(spans))
+    Ok(nonempty)
 }
 
 fn emit_item(
     scanner: &mut Scanner,
     out: &mut impl Write,
     root: &Node,
-    item: &Item<'_>,
+    item: &Node,
+    translate_text: bool,
     index: usize,
     count: usize,
 ) -> Result<()> {
-    let Some(text) = &item.text else {
-        return scanner.copy(item.original.span, out);
-    };
+    if !translate_text {
+        return scanner.copy(item.span, out);
+    }
     write(out, br#"{"id":"cmp_"#)?;
     if let Some(id) = root.get("id").filter(|n| n.string()) {
         // Copy the interior verbatim: JSON escapes remain escapes, even for very large IDs.
@@ -491,6 +665,7 @@ fn emit_item(
         let mut remaining = id.span.end - id.span.start - 2;
         let mut buffer = [0; CHUNK];
         while remaining > 0 {
+            scanner.check_cancelled()?;
             let length = remaining.min(CHUNK as u64) as usize;
             scanner
                 .reader
@@ -515,9 +690,17 @@ fn emit_item(
             &base64::engine::general_purpose::URL_SAFE_NO_PAD,
         );
         // Keep one encoder across all parts: base64 boundaries follow concatenated UTF-8.
-        for span in text {
-            scanner.seek(span.start)?;
+        let content = item.get("content").ok_or("output_item_malformed")?;
+        if content.string() {
+            scanner.seek(content.span.start)?;
             scanner.string(|bytes| write(&mut encoder, bytes))?;
+        } else if let Kind::Array(parts) = &content.kind {
+            let mut at = parts.head;
+            while let Some(part) = scanner.disk_node(&mut at)? {
+                let text = part.get("text").ok_or("output_item_malformed")?;
+                scanner.seek(text.span.start)?;
+                scanner.string(|bytes| write(&mut encoder, bytes))?;
+            }
         }
         encoder.finish().map_err(|_| "compact_file_io")?;
     }
@@ -527,7 +710,7 @@ fn emit_item(
 struct ResponseLayout {
     status: Span,
     output_start: u64,
-    items: Vec<Span>,
+    items: DiskNodes,
     end: u64,
 }
 
@@ -539,22 +722,21 @@ fn emit_response(
     scanner: &mut Scanner,
     out: &mut (impl Write + Seek),
     root: &Node,
-    items: &[Item<'_>],
+    items: DiskNodes,
+    native: bool,
 ) -> Result<ResponseLayout> {
     write(out, b"{")?;
-    if let Kind::Object(fields) = &root.kind {
-        for (key, value) in fields {
-            if matches!(
-                key.as_str(),
-                "id" | "object" | "status" | "error" | "output"
-            ) {
-                continue;
-            }
-            serde_json::to_writer(&mut *out, key).map_err(|_| "event_serialization")?;
-            write(out, b":")?;
-            scanner.copy(value.span, out)?;
-            write(out, b",")?;
-        }
+    let mut field = root.raw_fields.map(|fields| fields.head).unwrap_or(0);
+    while field != 0 {
+        scanner.check_cancelled()?;
+        let (span, next) = scanner
+            .index
+            .as_mut()
+            .ok_or("compact_file_io")?
+            .span(field)?;
+        scanner.copy(span, out)?;
+        write(out, b",")?;
+        field = next;
     }
     write(out, br#""id":"#)?;
     if let Some(id) = root.get("id").filter(|n| n.string()) {
@@ -571,17 +753,41 @@ fn emit_response(
     };
     write(out, br#","output":["#)?;
     let output_start = position(out)?;
-    let mut item_spans = Vec::with_capacity(items.len());
-    for (index, item) in items.iter().enumerate() {
+    let mut item_spans = DiskNodes { head: 0, count: 0 };
+    let mut span_tail = 0;
+    let mut at = items.head;
+    let mut index = 0;
+    while let Some(item) = scanner.disk_node(&mut at)? {
         if index != 0 {
             write(out, b",")?;
         }
         let start = position(out)?;
-        emit_item(scanner, out, root, item, index, items.len())?;
-        item_spans.push(Span {
+        let translate_text = !native
+            && scanner.equals(item.get("type").ok_or("output_item_malformed")?, "message")?
+            && legacy_text(scanner, &item)?;
+        emit_item(
+            scanner,
+            out,
+            root,
+            &item,
+            translate_text,
+            index,
+            items.count,
+        )?;
+        let span = Span {
             start,
             end: position(out)?,
-        });
+        };
+        let record = scanner
+            .index
+            .as_mut()
+            .ok_or("compact_file_io")?
+            .append_span(&mut span_tail, span)?;
+        if item_spans.head == 0 {
+            item_spans.head = record;
+        }
+        item_spans.count += 1;
+        index += 1;
     }
     write(out, b"]}")?;
     Ok(ResponseLayout {
@@ -632,7 +838,8 @@ impl ValidatedCompact {
 
 pub(super) struct TranslatedCompact {
     pub(super) file: File,
-    pub(super) pieces: Vec<CompactPiece>,
+    pub(super) pieces: File,
+    pub(super) physical_body_bytes: u64,
     pub(super) evidence: ValidatedCompact,
 }
 
@@ -641,44 +848,125 @@ pub(super) enum CompactPiece {
     Bytes(Vec<u8>),
 }
 
-impl CompactPiece {
-    fn len(&self) -> u64 {
-        match self {
-            Self::Range(range) => range.end - range.start,
-            Self::Bytes(bytes) => bytes.len() as u64,
+fn response_pieces(
+    layout: ResponseLayout,
+    sse: bool,
+    index: &mut index::Index,
+    mut plan: File,
+    cancelled: &AtomicBool,
+) -> Result<(File, u64, u64)> {
+    use CompactPiece::{Bytes, Range};
+    plan.set_len(0).map_err(|_| "compact_file_io")?;
+    plan.seek(SeekFrom::Start(0))
+        .map_err(|_| "compact_file_io")?;
+    let mut out = BufWriter::with_capacity(CHUNK, &mut plan);
+    let mut total = 0u64;
+    let mut emit = |piece: CompactPiece| -> Result<()> {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err("compact_cancelled");
         }
+        let length = match piece {
+            Range(range) => {
+                write(&mut out, &[0])?;
+                write(&mut out, &range.start.to_le_bytes())?;
+                write(&mut out, &range.end.to_le_bytes())?;
+                range.end - range.start
+            }
+            Bytes(bytes) => {
+                write(&mut out, &[1])?;
+                write(&mut out, &(bytes.len() as u64).to_le_bytes())?;
+                write(&mut out, &bytes)?;
+                bytes.len() as u64
+            }
+        };
+        total = total.checked_add(length).ok_or("compact_file_io")?;
+        Ok(())
+    };
+    let mut first_billable = 0;
+    if !sse {
+        emit(Range(0..layout.end))?;
+    } else {
+        emit(Bytes(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":".to_vec(),
+        ))?;
+        emit(Range(0..layout.status.start))?;
+        emit(Bytes(br#""in_progress""#.to_vec()))?;
+        emit(Range(layout.status.end..layout.output_start))?;
+        emit(Bytes(b"]}}\n\n".to_vec()))?;
+        let mut at = layout.items.head;
+        let mut item_index = 0usize;
+        // Track the boundary without borrowing the closure's running total.
+        let mut added_lengths = 0u64;
+        while at != 0 {
+            let (item, next) = index.span(at)?;
+            for event in ["response.output_item.added", "response.output_item.done"] {
+                let prefix = format!("event: {event}\ndata: {{\"type\":\"{event}\",\"output_index\":{item_index},\"item\":").into_bytes();
+                if item_index == 0 && event == "response.output_item.added" {
+                    added_lengths = prefix.len() as u64 + item.end - item.start + 3;
+                }
+                emit(Bytes(prefix))?;
+                emit(Range(item.start..item.end))?;
+                emit(Bytes(b"}\n\n".to_vec()))?;
+            }
+            at = next;
+            item_index += 1;
+        }
+        if layout.items.count != 0 {
+            first_billable =
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":".len()
+                    as u64
+                    + layout.status.start
+                    + br#""in_progress""#.len() as u64
+                    + layout.output_start
+                    - layout.status.end
+                    + b"]}}\n\n".len() as u64
+                    + added_lengths;
+        }
+        emit(Bytes(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":"
+                .to_vec(),
+        ))?;
+        emit(Range(0..layout.end))?;
+        emit(Bytes(b"}\n\n".to_vec()))?;
     }
+    out.flush().map_err(|_| "compact_file_io")?;
+    drop(out);
+    plan.seek(SeekFrom::Start(0))
+        .map_err(|_| "compact_file_io")?;
+    Ok((
+        plan,
+        total,
+        if first_billable == 0 {
+            total
+        } else {
+            first_billable
+        },
+    ))
 }
 
-fn response_pieces(layout: ResponseLayout, sse: bool) -> Vec<CompactPiece> {
-    use CompactPiece::{Bytes, Range};
-    if !sse {
-        return vec![Range(0..layout.end)];
+#[cfg(test)]
+fn read_piece(input: &mut impl Read) -> Result<Option<CompactPiece>> {
+    let mut tag = [0];
+    if input.read(&mut tag).map_err(|_| "compact_file_io")? == 0 {
+        return Ok(None);
     }
-    let mut pieces = vec![
-        Bytes(
-            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":".to_vec(),
-        ),
-        Range(0..layout.status.start),
-        Bytes(br#""in_progress""#.to_vec()),
-        Range(layout.status.end..layout.output_start),
-        Bytes(b"]}}\n\n".to_vec()),
-    ];
-    for (index, item) in layout.items.iter().enumerate() {
-        for event in ["response.output_item.added", "response.output_item.done"] {
-            pieces.push(Bytes(format!(
-                "event: {event}\ndata: {{\"type\":\"{event}\",\"output_index\":{index},\"item\":"
-            ).into_bytes()));
-            pieces.push(Range(item.start..item.end));
-            pieces.push(Bytes(b"}\n\n".to_vec()));
+    let mut word = [0; 8];
+    input.read_exact(&mut word).map_err(|_| "compact_file_io")?;
+    let first = u64::from_le_bytes(word);
+    match tag[0] {
+        0 => {
+            input.read_exact(&mut word).map_err(|_| "compact_file_io")?;
+            Ok(Some(CompactPiece::Range(first..u64::from_le_bytes(word))))
         }
+        1 => {
+            let mut buffer = [0; 256];
+            let length = usize::try_from(first).map_err(|_| "compact_file_io")?;
+            let bytes = buffer.get_mut(..length).ok_or("compact_file_io")?;
+            input.read_exact(bytes).map_err(|_| "compact_file_io")?;
+            Ok(Some(CompactPiece::Bytes(bytes.to_vec())))
+        }
+        _ => Err("compact_file_io"),
     }
-    pieces.push(Bytes(
-        b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":".to_vec(),
-    ));
-    pieces.push(Range(0..layout.end));
-    pieces.push(Bytes(b"}\n\n".to_vec()));
-    pieces
 }
 
 fn small_string(scanner: &mut Scanner, node: &Node, maximum: usize) -> Result<Option<String>> {
@@ -802,12 +1090,27 @@ fn usage_projection(scanner: &mut Scanner, node: &Node) -> Result<serde_json::Va
 }
 
 /// The caller owns temporary-file lifecycle and async I/O. Returns a rewound output file.
-pub(super) fn translate(
+#[cfg(test)]
+fn translate(input: File, output: File, wrap_as_sse: bool) -> Result<TranslatedCompact> {
+    translate_cancellable(
+        input,
+        output,
+        tempfile::tempfile().unwrap(),
+        wrap_as_sse,
+        Arc::new(AtomicBool::new(false)),
+    )
+}
+
+pub(super) fn translate_cancellable(
     input: File,
     mut output: File,
+    index_file: File,
     wrap_as_sse: bool,
+    cancelled: Arc<AtomicBool>,
 ) -> Result<TranslatedCompact> {
-    let mut scanner = Scanner::new(input);
+    let mut scanner = Scanner::with_index(input, index_file)?;
+    scanner.index.as_mut().ok_or("compact_file_io")?.cancelled = cancelled.clone();
+    scanner.cancelled = cancelled;
     scanner.seek(0)?;
     let root = scanner.value(Capture::Root, 0)?;
     scanner.whitespace()?;
@@ -822,16 +1125,17 @@ pub(super) fn translate(
     }
     scanner.completed(&root)?;
     let nodes = match root.get("output").map(|n| &n.kind) {
-        Some(Kind::Array(nodes)) if !nodes.is_empty() => nodes,
+        Some(Kind::Array(nodes)) if nodes.count != 0 => *nodes,
         _ => return Err("compaction_item_missing"),
     };
     let mut native = false;
-    for node in nodes {
+    let mut at = nodes.head;
+    while let Some(node) = scanner.disk_node(&mut at)? {
         let kind = node
             .get("type")
             .filter(|n| n.nonempty_string())
             .ok_or("output_item_malformed")?;
-        scanner.completed(node)?;
+        scanner.completed(&node)?;
         if scanner.equals(kind, "compaction")? {
             native = true;
             if !node
@@ -841,20 +1145,6 @@ pub(super) fn translate(
                 return Err("compaction_item_malformed");
             }
         }
-    }
-    let mut items = Vec::with_capacity(nodes.len());
-    for node in nodes {
-        let text = if !native
-            && scanner.equals(node.get("type").ok_or("output_item_malformed")?, "message")?
-        {
-            legacy_text(&mut scanner, node)?
-        } else {
-            None
-        };
-        items.push(Item {
-            original: node,
-            text,
-        });
     }
     let projected = usage_projection(&mut scanner, &root)?;
     let (usage, usage_invalid) =
@@ -875,34 +1165,25 @@ pub(super) fn translate(
         .map_err(|_| "compact_file_io")?;
     let layout = {
         let mut out = BufWriter::with_capacity(CHUNK, &mut output);
-        let layout = emit_response(&mut scanner, &mut out, &root, &items)?;
+        let layout = emit_response(&mut scanner, &mut out, &root, nodes, native)?;
         out.flush().map_err(|_| "compact_file_io")?;
         layout
     };
     output
         .seek(SeekFrom::Start(0))
         .map_err(|_| "compact_file_io")?;
-    // The first five pieces form response.created; the next three form
-    // the first complete output_item.added event. Prefix delivery alone is
-    // not evidence that a billable output event reached the client.
-    let first_billable_piece_count = if wrap_as_sse && !layout.items.is_empty() {
-        8
-    } else {
-        usize::MAX
-    };
-    let pieces = response_pieces(layout, wrap_as_sse);
-    let first_billable_byte_end = pieces
-        .iter()
-        .take(first_billable_piece_count)
-        .try_fold(0u64, |length, piece| {
-            length.checked_add(piece.len()).ok_or("compact_file_io")
-        })?;
-    let body_bytes = pieces.iter().try_fold(0u64, |length, piece| {
-        length.checked_add(piece.len()).ok_or("compact_file_io")
-    })?;
+    let physical_body_bytes = layout.end;
+    let mut index = scanner.index.take().ok_or("compact_file_io")?;
+    let cancelled = scanner.cancelled.clone();
+    // Parsing and translation are complete: reuse the consumed input file for
+    // the small delivery plan and release the entire validation index.
+    let plan = scanner.reader.into_inner();
+    let (pieces, body_bytes, first_billable_byte_end) =
+        response_pieces(layout, wrap_as_sse, &mut index, plan, &cancelled)?;
     Ok(TranslatedCompact {
         file: output,
         pieces,
+        physical_body_bytes,
         evidence: ValidatedCompact {
             usage,
             usage_invalid,
@@ -919,9 +1200,136 @@ mod tests {
     use crate::api::new_api_transport::{compact_to_responses, responses_to_sse};
     use serde_json::{Value, json};
 
+    #[test]
+    fn metadata_keys_and_many_output_items_use_disk_cursors() {
+        let long_key = "k".repeat(CHUNK * 2);
+        let mut value = json!({"output":[], "usage":{"input_tokens":5}});
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert(long_key.clone(), json!({"nested":"preserved"}));
+        for number in 0..1024 {
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert(format!("unknown_{number}"), json!(number));
+            value["output"].as_array_mut().unwrap().push(
+                json!({"type":"compaction","encrypted_content":format!("checkpoint_{number}")}),
+            );
+        }
+        let mut input = tempfile::tempfile().unwrap();
+        input
+            .write_all(&serde_json::to_vec(&value).unwrap())
+            .unwrap();
+        input.rewind().unwrap();
+        let mut scanner = Scanner::new(input);
+        let root = scanner.value(Capture::Root, 0).unwrap();
+        let Kind::Object(fields) = &root.kind else {
+            panic!("object");
+        };
+        assert_eq!(fields.len(), 2); // Only output and usage are retained in memory.
+        let Kind::Array(items) = &root.get("output").unwrap().kind else {
+            panic!("array");
+        };
+        assert_eq!(items.count, 1024);
+        assert_eq!(root.raw_fields.unwrap().count, 1026);
+        let mut input = scanner.reader.into_inner();
+        input.rewind().unwrap();
+        let translated = translate(input, tempfile::tempfile().unwrap(), false).unwrap();
+        let mut body = materialize(translated);
+        body.rewind().unwrap();
+        let actual: Value = serde_json::from_reader(body).unwrap();
+        assert_eq!(actual[&long_key], value[&long_key]);
+        assert_eq!(actual["output"], value["output"]);
+        assert_eq!(actual["unknown_1023"], 1023);
+    }
+
+    #[test]
+    fn escaped_duplicate_keys_and_large_duplicate_keys_remain_invalid() {
+        let long_key = "x".repeat(CHUNK * 2);
+        for body in [
+            r#"{"metadata":{"a":1,"\u0061":2},"output":[{"type":"compaction","encrypted_content":"x"}]}"#.to_owned(),
+            format!("{{\"{long_key}\":1,\"{long_key}\":2,\"output\":[{{\"type\":\"compaction\",\"encrypted_content\":\"x\"}}]}}"),
+        ] {
+            let mut input = tempfile::tempfile().unwrap();
+            input.write_all(body.as_bytes()).unwrap();
+            assert!(matches!(translate(input, tempfile::tempfile().unwrap(), true), Err("duplicate_json_key")));
+        }
+    }
+
+    #[test]
+    fn delivery_boundary_excludes_created_and_incomplete_item_prefixes() {
+        let body = br#"{"output":[{"type":"compaction","encrypted_content":"opaque"}]}"#;
+        for sse in [false, true] {
+            let mut input = tempfile::tempfile().unwrap();
+            input.write_all(body).unwrap();
+            let translated = translate(input, tempfile::tempfile().unwrap(), sse).unwrap();
+            let boundary = translated.evidence.first_billable_byte_end() as usize;
+            let mut bytes = Vec::new();
+            materialize(translated).read_to_end(&mut bytes).unwrap();
+            if sse {
+                let prefix = std::str::from_utf8(&bytes[..boundary]).unwrap();
+                assert!(prefix.ends_with("}\n\n"));
+                assert!(prefix.contains("event: response.output_item.added\n"));
+                assert!(!prefix.contains("event: response.output_item.done\n"));
+                assert!(
+                    std::str::from_utf8(&bytes[boundary..])
+                        .unwrap()
+                        .starts_with("event: response.output_item.done\n")
+                );
+            } else {
+                assert_eq!(boundary, bytes.len());
+            }
+        }
+    }
+
+    #[test]
+    fn finite_number_semantics_match_unique_json() {
+        for number in [
+            "1e999",
+            "-1e999",
+            "1.2e3",
+            "0e999",
+            "18446744073709551616",
+            "1e-999",
+        ] {
+            let body = format!(
+                "{{\"unknown\":{number},\"output\":[{{\"type\":\"compaction\",\"encrypted_content\":\"opaque\"}}]}}"
+            );
+            let expected = crate::api::sse::parse_unique_json(body.as_bytes()).is_ok();
+            let mut input = tempfile::tempfile().unwrap();
+            input.write_all(body.as_bytes()).unwrap();
+            assert_eq!(
+                translate(input, tempfile::tempfile().unwrap(), false).is_ok(),
+                expected,
+                "{number}"
+            );
+        }
+    }
+
+    #[test]
+    fn cancellation_interrupts_large_string_at_next_chunk() {
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"\"").unwrap();
+        input.write_all(&vec![b'x'; CHUNK * 3]).unwrap();
+        input.write_all(b"\"").unwrap();
+        input.rewind().unwrap();
+        let mut scanner = Scanner::new(input);
+        let cancelled = scanner.cancelled.clone();
+        let mut consumed = 0usize;
+        let result = scanner.string(|bytes| {
+            consumed += bytes.len();
+            cancelled.store(true, Ordering::Relaxed);
+            Ok(())
+        });
+        assert_eq!(result, Err("compact_cancelled"));
+        assert!(consumed <= CHUNK);
+        assert!(scanner.position < (CHUNK * 3) as u64);
+    }
+
     fn materialize(mut translated: TranslatedCompact) -> File {
         let mut output = tempfile::tempfile().unwrap();
-        for piece in translated.pieces {
+        while let Some(piece) = read_piece(&mut translated.pieces).unwrap() {
             match piece {
                 CompactPiece::Bytes(bytes) => output.write_all(&bytes).unwrap(),
                 CompactPiece::Range(range) => {
@@ -1127,9 +1535,10 @@ mod tests {
                     assert!(summary.usage.is_none());
                 }
             }
+            let expected_bytes = translated.evidence.expected_body_bytes();
             assert_eq!(
-                translated.evidence.expected_body_bytes(),
-                translated.pieces.iter().map(CompactPiece::len).sum::<u64>()
+                materialize(translated).metadata().unwrap().len(),
+                expected_bytes
             );
         }
     }
@@ -1190,17 +1599,19 @@ mod tests {
                 };
                 let node = scanner.value(capture, 0).unwrap();
                 let end = scanner.position;
-                let nodes: Vec<&Node> = if key == b"item" {
-                    vec![&node]
+                let mut nodes = Vec::new();
+                if key == b"item" {
+                    nodes.push(node);
                 } else if let Some(Node {
                     kind: Kind::Array(items),
                     ..
                 }) = node.get("output")
                 {
-                    items.iter().collect()
-                } else {
-                    Vec::new()
-                };
+                    let mut at = items.head;
+                    while let Some(item) = scanner.disk_node(&mut at).unwrap() {
+                        nodes.push(item);
+                    }
+                }
                 for item in nodes {
                     let encrypted = item.get("encrypted_content").unwrap();
                     if encrypted.span.end - encrypted.span.start == 1025 * CHUNK as u64 + 2 {

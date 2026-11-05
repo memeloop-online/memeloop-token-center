@@ -425,10 +425,21 @@ async fn translate_new_api_compact_v2(
     let mut headers = response.headers().clone();
     let file = capture_compact_body(response.bytes_stream(), spool_path).await?;
     let output = new_compact_file(spool_path).await?;
+    let index = new_compact_file(spool_path).await?.into_std().await;
     let output = output.into_std().await;
     let file = file.into_std().await;
+    struct CancelTranslation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelTranslation {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let cancellation = CancelTranslation(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        false,
+    )));
+    let cancelled = cancellation.0.clone();
     let output = tokio::task::spawn_blocking(move || {
-        super::compact_file::translate(file, output, wrap_as_sse)
+        super::compact_file::translate_cancellable(file, output, index, wrap_as_sse, cancelled)
     })
     .await
     .map_err(|_| ProxySendError::AmbiguousResponse("upstream_invalid_response"))?
@@ -441,6 +452,7 @@ async fn translate_new_api_compact_v2(
     })?;
     let evidence = output.evidence;
     let pieces = output.pieces;
+    let physical_body_bytes = output.physical_body_bytes;
     let output = output.file;
     let content_type = if wrap_as_sse {
         HeaderValue::from_static("text/event-stream")
@@ -450,7 +462,12 @@ async fn translate_new_api_compact_v2(
     headers.remove(header::CONTENT_LENGTH);
     headers.remove(header::CONTENT_ENCODING);
     headers.insert(header::CONTENT_TYPE, content_type);
-    let stream = compact_file_stream(output, pieces, evidence.expected_body_bytes());
+    let stream = compact_file_stream(
+        output,
+        pieces,
+        physical_body_bytes,
+        evidence.expected_body_bytes(),
+    );
     Ok(UpstreamResponse::ValidatedCompact {
         status,
         headers,
@@ -463,27 +480,18 @@ async fn translate_new_api_compact_v2(
 
 fn compact_file_stream(
     output: std::fs::File,
-    pieces: Vec<super::compact_file::CompactPiece>,
+    pieces: std::fs::File,
+    physical_bytes: u64,
     expected_bytes: u64,
 ) -> crate::api::proxy::upstream_response::UpstreamByteStream {
-    use super::compact_file::CompactPiece;
-    let physical_bytes = pieces
-        .iter()
-        .filter_map(|piece| match piece {
-            CompactPiece::Range(range) => Some(range.end),
-            CompactPiece::Bytes(_) => None,
-        })
-        .max()
-        .unwrap_or(0);
-    let pieces: std::collections::VecDeque<_> = pieces.into();
     let source: crate::api::proxy::upstream_response::UpstreamByteStream =
         Box::pin(futures_util::stream::try_unfold(
             (
                 tokio::fs::File::from_std(output),
-                pieces,
+                tokio::fs::File::from_std(pieces),
                 None::<std::ops::Range<u64>>,
             ),
-            move |(mut file, mut pieces, mut active)| async move {
+            move |(mut file, mut plan, mut active)| async move {
                 loop {
                     if let Some(range) = active.as_mut() {
                         let length = (range.end - range.start).min(64 * 1024) as usize;
@@ -495,34 +503,67 @@ fn compact_file_stream(
                         if range.start == range.end {
                             active = None;
                         }
-                        return Ok(Some((Bytes::from(bytes), (file, pieces, active))));
+                        return Ok(Some((Bytes::from(bytes), (file, plan, active))));
                     }
-                    match pieces.pop_front() {
-                        Some(CompactPiece::Range(range)) if range.start < range.end => {
-                            file.seek(std::io::SeekFrom::Start(range.start))
+                    let mut tag = [0];
+                    if plan
+                        .read(&mut tag)
+                        .await
+                        .map_err(|_| "upstream_compact_spool_read_failed")?
+                        == 0
+                    {
+                        file.seek(std::io::SeekFrom::Start(physical_bytes))
+                            .await
+                            .map_err(|_| "upstream_compact_spool_read_failed")?;
+                        if file
+                            .read(&mut [0; 1])
+                            .await
+                            .map_err(|_| "upstream_compact_spool_read_failed")?
+                            != 0
+                        {
+                            return Err("upstream_compact_spool_read_failed");
+                        }
+                        return Ok(None);
+                    }
+                    let first = plan
+                        .read_u64_le()
+                        .await
+                        .map_err(|_| "upstream_compact_spool_read_failed")?;
+                    match tag[0] {
+                        0 => {
+                            let end = plan
+                                .read_u64_le()
                                 .await
                                 .map_err(|_| "upstream_compact_spool_read_failed")?;
-                            active = Some(range);
-                        }
-                        Some(CompactPiece::Range(_)) => {}
-                        Some(CompactPiece::Bytes(bytes)) if !bytes.is_empty() => {
-                            return Ok(Some((Bytes::from(bytes), (file, pieces, active))));
-                        }
-                        Some(CompactPiece::Bytes(_)) => {}
-                        None => {
-                            file.seek(std::io::SeekFrom::Start(physical_bytes))
-                                .await
-                                .map_err(|_| "upstream_compact_spool_read_failed")?;
-                            if file
-                                .read(&mut [0; 1])
-                                .await
-                                .map_err(|_| "upstream_compact_spool_read_failed")?
-                                != 0
-                            {
+                            if first > end || end > physical_bytes {
                                 return Err("upstream_compact_spool_read_failed");
                             }
-                            return Ok(None);
+                            if first == end {
+                                continue;
+                            }
+                            file.seek(std::io::SeekFrom::Start(first))
+                                .await
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            active = Some(first..end);
                         }
+                        1 => {
+                            // Literals are generated protocol punctuation and event names,
+                            // never provider data. Their record has a fixed representation.
+                            let mut literal = [0; 256];
+                            let length = usize::try_from(first)
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            let bytes = literal
+                                .get_mut(..length)
+                                .ok_or("upstream_compact_spool_read_failed")?;
+                            plan.read_exact(bytes)
+                                .await
+                                .map_err(|_| "upstream_compact_spool_read_failed")?;
+                            if bytes.is_empty() {
+                                continue;
+                            }
+                            return Ok(Some((Bytes::copy_from_slice(bytes), (file, plan, active))));
+                        }
+                        _ => return Err("upstream_compact_spool_read_failed"),
                     }
                 }
             },
@@ -788,18 +829,19 @@ mod tests {
     async fn compact_file_tail_requires_exact_eof_before_last_chunk() {
         use std::io::{Seek as _, Write as _};
         for (body, expected, expected_error) in [
-            (b"complete".as_slice(), 8, false),
+            (b"complete".as_slice(), 8u64, false),
             (b"short".as_slice(), 8, true),
             (b"unexpected-tail".as_slice(), 8, true),
         ] {
             let mut file = tempfile::tempfile().unwrap();
             file.write_all(body).unwrap();
             file.rewind().unwrap();
-            let mut stream = compact_file_stream(
-                file,
-                vec![super::super::compact_file::CompactPiece::Range(0..expected)],
-                expected,
-            );
+            let mut plan = tempfile::tempfile().unwrap();
+            plan.write_all(&[0]).unwrap();
+            plan.write_all(&0u64.to_le_bytes()).unwrap();
+            plan.write_all(&expected.to_le_bytes()).unwrap();
+            plan.rewind().unwrap();
+            let mut stream = compact_file_stream(file, plan, expected, expected);
             let first = stream.next().await.unwrap();
             if expected_error {
                 assert_eq!(first.unwrap_err(), "upstream_compact_spool_read_failed");
