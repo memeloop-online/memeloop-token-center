@@ -3,6 +3,7 @@ use reqwest::multipart::{Form, Part};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use super::*;
+mod multipart_metadata;
 
 const AUDIO_PROTOCOL: &str = "openai-audio";
 const AUDIO_AUDIT_PROTOCOL: &str = "audio-transcription";
@@ -451,9 +452,7 @@ async fn parse_audio_transcription_form(
                         "hotwords must be supplied once".into(),
                     ));
                 }
-                let mut raw = None;
-                set_once_text(&mut raw, field, "hotwords").await?;
-                hotwords = Some(parse_hotwords(raw.as_deref().unwrap_or_default())?);
+                hotwords = Some(multipart_metadata::hotwords(field).await?);
             }
             "response_format" => {
                 set_once_text(&mut response_format, field, "response_format").await?
@@ -464,11 +463,7 @@ async fn parse_audio_transcription_form(
                         "temperature must be supplied once".into(),
                     ));
                 }
-                let raw = field
-                    .text()
-                    .await
-                    .map_err(|_| AppError::BadRequest("invalid temperature field".into()))?;
-                temperature = Some(parse_temperature(&raw)?);
+                temperature = Some(multipart_metadata::temperature(field, spool_path).await?);
             }
             _ => {
                 return Err(AppError::BadRequest(format!(
@@ -512,20 +507,14 @@ async fn set_once_text(
             "{name} must be supplied once"
         )));
     }
-    *target = Some(
-        field
-            .text()
-            .await
-            .map_err(|_| AppError::BadRequest(format!("invalid {name} field")))?,
-    );
+    let maximum = match name {
+        "model" => 200,
+        "prompt" => 32_000,
+        "response_format" => "verbose_json".len(),
+        _ => return Err(AppError::internal("audio_metadata_field")),
+    };
+    *target = Some(multipart_metadata::text(field, name, maximum).await?);
     Ok(())
-}
-
-fn parse_hotwords(value: &str) -> Result<Vec<String>, AppError> {
-    let values: Vec<String> = serde_json::from_str(value)
-        .map_err(|_| AppError::BadRequest("hotwords must be a JSON string array".into()))?;
-    validate_hotwords(Some(&values))?;
-    Ok(values)
 }
 
 fn validate_audio_metadata(metadata: &RewrittenAudioMetadata) -> Result<(), AppError> {

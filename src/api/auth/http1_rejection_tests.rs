@@ -58,6 +58,7 @@ impl Server {
             .unwrap();
         let reached_handler = Arc::new(AtomicUsize::new(0));
         let calls = reached_handler.clone();
+        let audio_calls = reached_handler.clone();
         // Use the production authentication/body admission and request-ID
         // middleware, with a counted upstream substitute after admission.
         let app = Router::new()
@@ -65,6 +66,16 @@ impl Server {
                 "/v1/generations",
                 post(move || {
                     let calls = calls.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        "ok"
+                    }
+                }),
+            )
+            .route(
+                "/v1/audio/transcriptions",
+                post(move || {
+                    let calls = audio_calls.clone();
                     async move {
                         calls.fetch_add(1, Ordering::Relaxed);
                         "ok"
@@ -397,5 +408,29 @@ async fn http1_durable_chat_exceeds_hot_body_limit_without_truncation_or_resourc
         server.state.gateway_body_read_permits.available_permits(),
         initial_permits
     );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn http1_truncated_audio_upload_releases_file_and_reports_read_error() {
+    let server = Server::start().await;
+    let mut socket = TcpStream::connect(server.address).await.unwrap();
+    let headers =
+        String::from_utf8(server.headers("Transfer-Encoding: chunked\r\nConnection: close\r\n"))
+            .unwrap()
+            .replace("/v1/generations", "/v1/audio/transcriptions");
+    socket.write_all(headers.as_bytes()).await.unwrap();
+    socket.write_all(b"8\r\nabc").await.unwrap();
+    socket.shutdown().await.unwrap();
+    let response = read_response(&mut socket).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400"),
+        "{}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(String::from_utf8_lossy(&response).contains("request_body_read_failed"));
+    assert_eq!(server.reached_handler.load(Ordering::Relaxed), 0);
+    assert_eq!(server.state.proxy_memory_budget.snapshot().0, 0);
+    server.normal_request().await;
     server.stop().await;
 }
