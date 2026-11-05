@@ -143,7 +143,7 @@ pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
 use validation::*;
 
-const POSTGRES_SERVE_SETTINGS: &str = "SET statement_timeout = 30000; SET lock_timeout = 10000; SET idle_in_transaction_session_timeout = 30000";
+const POSTGRES_SERVE_SETTINGS: &str = "SET statement_timeout = 0; SET lock_timeout = 0; SET idle_in_transaction_session_timeout = 30000";
 const POSTGRES_MIGRATION_SETTINGS: &str = "SET statement_timeout = 900000; SET lock_timeout = 60000; SET idle_in_transaction_session_timeout = 300000";
 
 async fn wait_for_initial_postgres_connection(pool: &AnyPool) -> Result<(), sqlx::Error> {
