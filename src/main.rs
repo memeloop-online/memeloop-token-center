@@ -107,6 +107,9 @@ enum Command {
         /// Reader roles validate the file without creating it.
         #[arg(long)]
         read_only: bool,
+        /// Leave optional inventory recovery to the running application.
+        #[arg(long)]
+        allow_unavailable: bool,
     },
     /// Internal release-package check for the installer, runtime library path,
     /// and Cosign companion. It performs no registry or database access.
@@ -151,9 +154,10 @@ async fn run() -> Result<(), &'static str> {
     if let Command::PreparePluginInventory {
         directory,
         read_only,
+        allow_unavailable,
     } = &cli.command
     {
-        return if *read_only {
+        let prepared = if *read_only {
             memeloop_token_center::plugin::application::prepare::check_inventory_directory(
                 directory,
             )
@@ -161,8 +165,12 @@ async fn run() -> Result<(), &'static str> {
             memeloop_token_center::plugin::application::prepare::prepare_inventory_directory(
                 directory,
             )
+        };
+        if prepared.is_err() && *allow_unavailable {
+            eprintln!("plugin inventory unavailable; application will report status and retry");
+            return Ok(());
         }
-        .map_err(|_| "plugin_inventory_preparation_failed");
+        return prepared.map_err(|_| "plugin_inventory_preparation_failed");
     }
     #[cfg(all(
         feature = "experimental-plugin-revisions",
