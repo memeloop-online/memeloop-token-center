@@ -7,7 +7,7 @@ type Settings = { enabled: boolean; billing_key_id: string | null; interval_seco
 type Key = { key_id: string; alias: string; status: string };
 
 export function HealthProbeSettings({ token, tenant, accountId, disabled }: { token: string; tenant: string; accountId: string; disabled: boolean }) {
-  const { locale } = useI18n();
+  const { locale, t } = useI18n();
   const zh = locale.startsWith('zh');
   const [value, setValue] = useState<Settings>();
   const [keys, setKeys] = useState<Key[]>([]);
@@ -22,17 +22,16 @@ export function HealthProbeSettings({ token, tenant, accountId, disabled }: { to
       api<Settings>(path, token, { signal: controller.signal }),
       api<Key[]>(`/internal/v1/keys?tenant_external_id=${encodeURIComponent(tenant)}&limit=500`, token, { signal: controller.signal }),
     ]).then(([settings, credentials]) => {
-      if (!settings || typeof settings.enabled !== 'boolean' || typeof settings.interval_seconds !== 'number' || typeof settings.prompt !== 'string' || !Array.isArray(credentials)) throw new Error(zh ? '探测设置格式无效' : 'Invalid probe settings');
       setValue(settings); setKeys(credentials.filter(key => key.status === 'active'));
     })
-      .catch(reason => { if (!controller.signal.aborted) setError(String(reason)); });
+      .catch(() => { if (!controller.signal.aborted) setError(t('providers.healthProbeSettingsLoadFailed')); });
     return () => controller.abort();
-  }, [path, tenant, token, zh]);
+  }, [path, tenant, token, t]);
   async function save() {
     if (!value) return;
     setSaving(true); setError(''); setSaved(false);
     try { setValue(await api<Settings>(path, token, { method: 'PUT', body: JSON.stringify(value) })); setSaved(true); }
-    catch (reason) { setError(String(reason)); } finally { setSaving(false); }
+    catch { setError(t('providers.healthProbeSettingsSaveFailed')); } finally { setSaving(false); }
   }
   return <section className="settings-card" aria-label={zh ? '上游健康探测' : 'Upstream health probe'}>
     <h3>{zh ? '上游健康探测' : 'Upstream health probe'}</h3>

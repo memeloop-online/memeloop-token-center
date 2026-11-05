@@ -843,7 +843,12 @@ async fn expired_live_source_writer_contract(database_url: String) {
     );
     assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, charged);
     drop(held);
-    tokio::time::timeout(Duration::from_secs(5), async {
+    // The writer sleeps for the production heartbeat interval after its first
+    // successful registration, even when this fixture expires its lease in SQL.
+    let renewal_timeout = Duration::from_millis(
+        crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
+    ) + Duration::from_secs(5);
+    tokio::time::timeout(renewal_timeout, async {
         loop {
             let expiry: i64 = sqlx::query_scalar("SELECT lease_expires_at FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
                 .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
