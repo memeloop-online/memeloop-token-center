@@ -1150,13 +1150,14 @@ async fn synchronous_image_budget_queues_before_body_poll_and_cancellation_relea
     drop(released);
     assert_eq!(fixture.state.image_response_permits.available_permits(), 2);
     assert_eq!(body_polls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let effects: (i64, i64, i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM usage_reservations), \
          (SELECT COUNT(*) FROM ledger_entries WHERE kind = 'usage'), \
          (SELECT COUNT(*) FROM request_events WHERE event_kind = 'started'), \
          (SELECT COUNT(*) FROM request_records WHERE upstream_account_id IS NOT NULL)",
     )
-    .fetch_one(&fixture.state.db.pool)
+    .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(
@@ -1164,6 +1165,7 @@ async fn synchronous_image_budget_queues_before_body_poll_and_cancellation_relea
         (0, 0, 0, 0),
         "cancelled queued media never dispatches or bills"
     );
+    pool.close().await;
 }
 
 #[tokio::test]
