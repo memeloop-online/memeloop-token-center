@@ -50,7 +50,7 @@ test('account recovery uses the production shell and workspace with contained Fl
       }
       if (request.method() === 'POST' && url.pathname === '/internal/v1/upstreams/codex-recovery/quota-reset/reviewed-operation/recover') {
         assert.equal(url.searchParams.get('tenant_external_id'), 'fixture-a');
-        assert.deepEqual(request.postDataJSON(), { expected_updated_at: now, reason: 'supplier_confirmed_not_applied' });
+        assert.deepEqual(request.postDataJSON(), { confirmation: 'release_unknown_reset_without_consuming' });
         recoveries.push(request.postDataJSON());
         operation = { ...operation, settled_at: now + 1, updated_at: now + 1, manual_unlock_available: false, last_reconciled_at: now + 1, reconciled_available_credits: 1, reconciled_applicable_credits: 1 };
         return route.fulfill({ json: operation });
@@ -95,26 +95,24 @@ test('account recovery uses the production shell and workspace with contained Fl
         await page.screenshot({ path: join(artifacts, `kimi-workspace-${accountId}-${theme}-${width}.png`), fullPage: true });
       }
       const workspace = await manageProviderAccount(page, 'codex-recovery');
-      const recovery = workspace.getByRole('button', { name: '核对并恢复', exact: true });
+      const recovery = workspace.getByRole('button', { name: '解除锁定', exact: true });
       await recovery.waitFor();
-      const reason = workspace.getByRole('combobox', { name: '恢复依据', exact: true });
-      assert.equal(await reason.inputValue(), 'operator_authorized_retry');
-      assert.equal(await reason.locator('option').allTextContents().then(labels => labels.join('|')), '人工恢复|上游已确认未执行');
-      const select = await reason.boundingBox();
-      const icon = await workspace.locator('.fui-Select__icon').boundingBox();
       const button = await recovery.boundingBox();
-      assert.ok(select && icon && button);
-      assert.ok(icon.y >= select.y && icon.y + icon.height <= select.y + select.height, 'caret stays inside the select row');
-      assert.ok(icon.x >= select.x && icon.x + icon.width <= select.x + select.width, 'caret stays inside the select width');
-      assert.ok(button.y >= select.y + select.height, 'action stays in its own row');
+      assert.ok(button && button.width > 0 && button.x >= 0 && button.x + button.width <= width, 'unlock action remains visible within the viewport');
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth));
       assert.equal(await workspace.getByRole('checkbox').count(), 0);
       assert.equal(recoveries.length, 0);
       await page.screenshot({ path: join(artifacts, `kimi-workspace-recovery-${theme}-${width}.png`), fullPage: true });
     }
     const workspace = page.locator('.provider-detail-workspace');
-    await workspace.getByRole('combobox', { name: '恢复依据', exact: true }).selectOption('supplier_confirmed_not_applied');
-    await workspace.getByRole('button', { name: '核对并恢复', exact: true }).click();
+    await workspace.getByRole('button', { name: '解除锁定', exact: true }).click();
+    const confirmation = page.getByRole('dialog');
+    await confirmation.getByText(/解除锁定本身不会重置额度，也不会消耗次数/).waitFor();
+    assert.equal(recoveries.length, 0);
+    await confirmation.getByRole('button', { name: '取消', exact: true }).click();
+    assert.equal(recoveries.length, 0);
+    await workspace.getByRole('button', { name: '解除锁定', exact: true }).click();
+    await confirmation.getByRole('button', { name: '确认继续', exact: true }).click();
     await workspace.getByText('已恢复操作，上次重置结果仍待核对。', { exact: true }).waitFor();
     assert.equal(recoveries.length, 1);
     await workspace.getByRole('button', { name: '上次操作详情', exact: true }).click();

@@ -269,10 +269,10 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
             .iter()
             .any(|task| task.request_id == request_id)
     );
+    // The production worker reconstructs the durable metadata seed from the
+    // original request/response archives before projecting semantic content.
     assert!(
-        state
-            .db
-            .project_claimed_conversation_projection_task(owner, request_id)
+        crate::worker::archive_session_body(&state, owner, request_id)
             .await
             .unwrap()
     );

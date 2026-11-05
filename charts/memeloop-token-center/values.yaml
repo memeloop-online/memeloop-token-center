@@ -96,7 +96,7 @@ roles:
       type: ClusterIP
       port: 8080
     resources:
-      requests: { cpu: 50m, memory: 128Mi }
+      requests: { cpu: 50m, memory: 128Mi, ephemeral-storage: 2Gi }
       limits: { cpu: 500m, memory: 256Mi }
     autoscaling:
       enabled: false

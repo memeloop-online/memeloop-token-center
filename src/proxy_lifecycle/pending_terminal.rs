@@ -1686,6 +1686,13 @@ impl Journal {
                             client_name: conversation.client_name.as_deref(),
                             upstream_response_id: conversation.upstream_response_id.as_deref(),
                         };
+                        // Identity is bounded receipt metadata, not archive
+                        // content. Publish it even while the durable source is
+                        // pending, without acknowledging conversation completion
+                        // or releasing receipt/body ownership below.
+                        let identity_enqueued = database
+                            .enqueue_operational_conversation_projection(claim, receipt_id, &input)
+                            .await;
                         let source = crate::gateway_body::request_spool::request_body_object_key(
                             &request_id.to_string(),
                         );
@@ -1698,12 +1705,10 @@ impl Journal {
                                 false
                             };
                         source_durable = source_ready;
-                        if source_ready {
-                            database
-                                .enqueue_operational_conversation_projection(
-                                    claim, receipt_id, &input,
-                                )
-                                .await
+                        if let Err(error) = identity_enqueued {
+                            Err(error)
+                        } else if source_ready {
+                            Ok(())
                         } else {
                             Err(crate::error::AppError::storage(
                                 "terminal_conversation_source_pending",
