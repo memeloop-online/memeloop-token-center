@@ -353,6 +353,28 @@ async fn cold_provider_only_inventory_does_not_block_core_or_cache_a_later_polic
 }
 
 #[tokio::test]
+async fn missing_inventory_is_visible_without_discarding_published_policy_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let installed = authority(directory.path()).await;
+    publish(&installed, "a", 0).await;
+    let baseline = PluginRuntime::load(None, installed.db.clone()).unwrap();
+    let unavailable = Arc::new(
+        ApplicationPlugins::from_inventory_file(
+            installed.db.clone(),
+            directory.path().join("missing-inventory.json"),
+            &baseline,
+        )
+        .await
+        .unwrap(),
+    );
+    let status = unavailable.status().await.unwrap();
+    assert_eq!(status.current.unwrap().revision, 1);
+    assert_eq!(status.runtime["error"], "inventory_unavailable");
+    assert!(unavailable.request_snapshot().await.is_err());
+    assert!(unavailable.stage("a").await.is_err());
+}
+
+#[tokio::test]
 async fn unpublished_application_inventory_does_not_require_background_warmup() {
     let directory = tempfile::tempdir().unwrap();
     let authority = authority(directory.path()).await;
