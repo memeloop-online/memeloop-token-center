@@ -658,7 +658,7 @@ impl Database {
                             POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT,
                         ),
                     };
-                    sqlx::query("SELECT set_config('application_name', $1, false)")
+                    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
                         .bind(application_name)
                         .execute(&mut *connection)
                         .await?;
@@ -805,7 +805,7 @@ impl Database {
                                                 POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT,
                                             ),
                                         };
-                                    sqlx::query("SELECT set_config('application_name', $1, false)")
+                                    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
                                         .bind(application_name)
                                         .execute(&mut *connection)
                                         .await?;

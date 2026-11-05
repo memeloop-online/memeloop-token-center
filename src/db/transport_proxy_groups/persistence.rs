@@ -191,7 +191,7 @@ fn labeled_pool_options(database_url: &str, name: &'static str) -> AnyPoolOption
         let application_name = application_name.clone();
         Box::pin(async move {
             if postgres {
-                sqlx::query("SELECT set_config('application_name', $1, false)")
+                sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
                     .bind(application_name)
                     .execute(connection)
                     .await?;

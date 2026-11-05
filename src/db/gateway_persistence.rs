@@ -76,7 +76,7 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
-                            sqlx::query("SELECT set_config('application_name', $1, false)")
+                            sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
                                 .bind(application_name)
                                 .execute(&mut *connection)
                                 .await?;
