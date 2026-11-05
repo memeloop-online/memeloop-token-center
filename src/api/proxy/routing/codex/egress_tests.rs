@@ -18,7 +18,7 @@ async fn generic_http_egress_records_selected_endpoint_and_cancelled_body_withou
     let (response, selection) = observe_response(
         UpstreamResponse::for_test(
             HeaderMap::new(),
-            http::Version::HTTP_11,
+            ::http::Version::HTTP_11,
             vec![
                 Ok(bytes::Bytes::from_static(b"first")),
                 Ok(bytes::Bytes::from_static(b"remaining")),
@@ -60,7 +60,7 @@ async fn generic_http_egress_finishes_only_at_actual_eof() {
     let (response, _) = observe_response(
         UpstreamResponse::for_test(
             HeaderMap::new(),
-            http::Version::HTTP_11,
+            ::http::Version::HTTP_11,
             vec![Ok(bytes::Bytes::from_static(b"body"))],
         ),
         recorder,
