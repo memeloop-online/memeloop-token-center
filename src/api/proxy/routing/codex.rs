@@ -7,7 +7,7 @@ pub(super) mod quota;
 #[path = "codex/retry.rs"]
 mod retry;
 #[path = "codex/send_diagnostics.rs"]
-mod send_diagnostics;
+pub(in crate::api::proxy) mod send_diagnostics;
 #[cfg(test)]
 #[path = "codex/wire_contract_tests.rs"]
 mod wire_contract_tests;
