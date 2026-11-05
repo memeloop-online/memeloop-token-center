@@ -114,9 +114,7 @@ pub(super) async fn temperature(
     let value = tokio::task::spawn_blocking(move || {
         // serde_json's reader parses numeric digits incrementally, without
         // retaining a complete numeric string (arbitrary_precision is disabled).
-        serde_json::from_reader::<_, f64>(
-            FloatReader::new(std::io::BufReader::new(file)).with_cancellation(cancelled),
-        )
+        serde_json::from_reader::<_, f64>(FloatReader::new(file).with_cancellation(cancelled))
     })
     .await
     .map_err(|_| AppError::internal("audio_metadata_parse_owner"))?
@@ -135,7 +133,7 @@ impl Drop for CancelNumericRead {
 // Rust's f64 syntax also permits a leading plus/zeros and an omitted integer
 // or fractional zero. Normalize those spellings without retaining the digits.
 struct FloatReader<R: std::io::Read> {
-    bytes: std::io::Bytes<R>,
+    bytes: std::io::Bytes<std::io::BufReader<R>>,
     pending: std::collections::VecDeque<u8>,
     initialized: bool,
     after_dot: bool,
@@ -146,7 +144,7 @@ struct FloatReader<R: std::io::Read> {
 impl<R: std::io::Read> FloatReader<R> {
     fn new(reader: R) -> Self {
         Self {
-            bytes: reader.bytes(),
+            bytes: std::io::Read::bytes(std::io::BufReader::new(reader)),
             pending: Default::default(),
             initialized: false,
             after_dot: false,
