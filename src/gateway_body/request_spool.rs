@@ -10,6 +10,9 @@ use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
 
+mod json_file;
+pub(crate) use json_file::VerifiedJsonInput;
+
 pub(crate) const REQUEST_SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
 /// The background upload has not decided whether the object should stay.
@@ -261,12 +264,15 @@ struct BodyResidency {
     metadata: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
     memory_released: AtomicBool,
     durable_settled: AtomicBool,
+    replay_readers: AtomicUsize,
+    replay_lock: tokio::sync::Mutex<()>,
 }
 
 impl BodyResidency {
     fn release_if_idle(&self) {
         if self.memory_released.load(Ordering::Acquire)
             && self.durable_settled.load(Ordering::Acquire)
+            && self.replay_readers.load(Ordering::Acquire) == 0
         {
             if let Ok(mut frames) = self.frames.lock() {
                 frames.clear();
@@ -520,6 +526,8 @@ impl RequestSpoolAdmission {
                     metadata: Mutex::new(captured.metadata),
                     memory_released: AtomicBool::new(false),
                     durable_settled: AtomicBool::new(captured.durable_settled),
+                    replay_readers: AtomicUsize::new(0),
+                    replay_lock: tokio::sync::Mutex::new(()),
                 }),
                 lease: captured.lease,
                 durable: captured.durable,
