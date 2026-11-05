@@ -124,7 +124,7 @@ pub(super) async fn temperature(
 // Rust's f64 syntax also permits a leading plus/zeros and an omitted integer
 // or fractional zero. Normalize those spellings without retaining the digits.
 struct FloatReader<R: std::io::Read> {
-    bytes: std::iter::Peekable<std::io::Bytes<R>>,
+    bytes: std::io::Bytes<R>,
     pending: std::collections::VecDeque<u8>,
     initialized: bool,
     after_dot: bool,
@@ -134,11 +134,53 @@ struct FloatReader<R: std::io::Read> {
 impl<R: std::io::Read> FloatReader<R> {
     fn new(reader: R) -> Self {
         Self {
-            bytes: reader.bytes().peekable(),
+            bytes: reader.bytes(),
             pending: Default::default(),
             initialized: false,
             after_dot: false,
             seen_digit: false,
+        }
+    }
+
+    fn raw_byte(&mut self) -> std::io::Result<Option<u8>> {
+        let Some(byte) = self.bytes.next().transpose()? else {
+            return Ok(None);
+        };
+        if byte.is_ascii_whitespace() {
+            return Ok(Some(b' '));
+        }
+        if byte.is_ascii() {
+            return Ok(Some(byte));
+        }
+        let width = match byte {
+            0xc2..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf4 => 4,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid number text",
+                ));
+            }
+        };
+        let mut utf8 = [0_u8; 4];
+        utf8[0] = byte;
+        for slot in &mut utf8[1..width] {
+            *slot = self.bytes.next().transpose()?.ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid number text")
+            })?;
+        }
+        if std::str::from_utf8(&utf8[..width])
+            .ok()
+            .and_then(|s| s.chars().next())
+            .is_some_and(char::is_whitespace)
+        {
+            Ok(Some(b' '))
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid number text",
+            ))
         }
     }
 
@@ -148,20 +190,20 @@ impl<R: std::io::Read> FloatReader<R> {
         }
         if !self.initialized {
             self.initialized = true;
-            let mut first = self.bytes.next().transpose()?;
+            let mut first = self.raw_byte()?;
             while first.is_some_and(|b| b.is_ascii_whitespace()) {
-                first = self.bytes.next().transpose()?;
+                first = self.raw_byte()?;
             }
             if matches!(first, Some(b'+' | b'-')) {
                 if first == Some(b'-') {
                     self.pending.push_back(b'-');
                 }
-                first = self.bytes.next().transpose()?;
+                first = self.raw_byte()?;
             }
             let mut zeros = false;
             while first == Some(b'0') {
                 zeros = true;
-                first = self.bytes.next().transpose()?;
+                first = self.raw_byte()?;
             }
             self.seen_digit = zeros || first.is_some_and(|b| b.is_ascii_digit());
             if first == Some(b'.') || (zeros && !first.is_some_and(|b| b.is_ascii_digit())) {
@@ -173,7 +215,7 @@ impl<R: std::io::Read> FloatReader<R> {
             }
             return Ok(self.pending.pop_front());
         }
-        let next = self.bytes.next().transpose()?;
+        let next = self.raw_byte()?;
         if self.after_dot && !next.is_some_and(|b| b.is_ascii_digit()) {
             if !self.seen_digit {
                 return Err(std::io::Error::new(
