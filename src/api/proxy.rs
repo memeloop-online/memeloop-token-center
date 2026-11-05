@@ -818,28 +818,6 @@ enum RequestInput {
     File(crate::gateway_body::request_spool::VerifiedJsonInput),
 }
 
-pub(super) async fn proxy(
-    state: AppState,
-    headers: HeaderMap,
-    body: Bytes,
-    protocol: Protocol,
-    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
-) -> Result<Response, AppError> {
-    let key = authenticate_downstream(&headers, &state).await?;
-    proxy_with_identity_and_conversation_spool(
-        state,
-        headers,
-        RequestInput::Bytes(body),
-        protocol,
-        key,
-        None,
-        None,
-        memory,
-        None,
-    )
-    .await
-}
-
 pub(super) async fn proxy_spooled(
     state: AppState,
     headers: HeaderMap,

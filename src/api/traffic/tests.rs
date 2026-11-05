@@ -7,6 +7,7 @@ use crate::{
     plugin::PluginRuntime,
     provider::UpstreamCredential,
 };
+use axum::body::Bytes;
 use rust_decimal::Decimal;
 use serde_json::json;
 use std::sync::Arc;

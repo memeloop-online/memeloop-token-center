@@ -280,7 +280,11 @@ async fn admit_request_body_for_route(
 ) -> Result<Request, GatewayBodyAdmissionError> {
     let source_backed = matches!(
         request.uri().path(),
-        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
+        "/v1/chat/completions"
+            | "/v1/messages"
+            | "/v1/messages/count_tokens"
+            | "/v1/alpha/search"
+            | "/v1/embeddings"
     );
     // Request transport needs a correct replay, not a healthy archive service.
     // Missing shared admission falls back to an owned local carrier.

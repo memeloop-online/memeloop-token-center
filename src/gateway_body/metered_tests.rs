@@ -199,25 +199,17 @@ async fn metered_text_capture_uses_local_source_when_memory_is_occupied() {
         let read_count = spool.read_count_for_test();
         let result = admit(request, Some(&budget), &spool).await;
         assert_eq!(spool.read_count_for_test(), read_count);
-        if path == "/v1/messages/count_tokens" {
-            assert!(matches!(
-                result,
-                Err(GatewayBodyAdmissionError::CapacityExhausted)
-            ));
-            assert!(!polled.load(Ordering::Acquire));
-        } else {
-            let admitted = result.unwrap();
-            assert!(polled.load(Ordering::Acquire));
-            assert!(
-                !admitted
-                    .extensions()
-                    .get::<Arc<request_spool::RequestSpool>>()
-                    .unwrap()
-                    .upload_outcome()
-                    .await
-            );
-            assert_eq!(admitted_source_bytes(admitted).await, "{}");
-        }
+        let admitted = result.unwrap();
+        assert!(polled.load(Ordering::Acquire));
+        assert!(
+            !admitted
+                .extensions()
+                .get::<Arc<request_spool::RequestSpool>>()
+                .unwrap()
+                .upload_outcome()
+                .await
+        );
+        assert_eq!(admitted_source_bytes(admitted).await, "{}");
         assert_eq!(spool.snapshot().active_files, 0);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(budget.snapshot().0, 16 * 1024 * 1024);
@@ -281,15 +273,8 @@ async fn metered_text_inference_crosses_old_limit_and_releases_owners() {
                 &spool,
             )
             .await;
-            if path == "/v1/messages/count_tokens" {
-                assert!(matches!(
-                    result,
-                    Err(GatewayBodyAdmissionError::Rejected(_))
-                ));
-            } else {
-                let admitted = result.unwrap();
-                assert_eq!(admitted_source_bytes(admitted).await, payload);
-            }
+            let admitted = result.unwrap();
+            assert_eq!(admitted_source_bytes(admitted).await, payload);
             assert_eq!(budget.snapshot().0, 0);
             assert_eq!(spool.snapshot().active_files, 0);
         }

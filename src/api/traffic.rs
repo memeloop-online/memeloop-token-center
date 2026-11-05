@@ -2,7 +2,6 @@ use std::{collections::BTreeMap, time::Duration};
 
 use axum::{
     Json,
-    body::Bytes,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -206,10 +205,21 @@ pub(super) async fn proxy_anthropic_count_tokens(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    axum::Extension(spool): axum::Extension<
+        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    >,
     headers: HeaderMap,
-    body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicCountTokens, memory).await
+    let body = replay_request_source(&state, &spool).await?;
+    super::proxy::proxy_spooled(
+        state,
+        headers,
+        body,
+        memory,
+        spool,
+        Protocol::AnthropicCountTokens,
+    )
+    .await
 }
 
 #[derive(Clone, Copy)]
