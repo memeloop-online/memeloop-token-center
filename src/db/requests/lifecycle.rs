@@ -312,7 +312,6 @@ async fn enqueue_conversation_task(
         ConversationProjectionEnqueueInput {
             request_id,
             key: conversation.key,
-            request_json: conversation.request_json,
             hints: conversation.hints,
             client_name: conversation.client_name,
             upstream_response_id: conversation.upstream_response_id,
@@ -2626,7 +2625,7 @@ async fn record_request_finished_with_basis_and_metering_in_transaction(
     // Preserve the response locator bound by this request's archive owner
     // when the terminal receipt still carries its pending/gap marker.
     let updated = sqlx::query(
-        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = CASE WHEN $10 LIKE 'gap://%' AND EXISTS (SELECT 1 FROM response_archive_spools archive_spool WHERE archive_spool.request_id = request_records.id AND archive_spool.tenant_id = request_records.tenant_id AND archive_spool.reservation_id = request_records.reservation_id AND archive_spool.state = 'bound' AND archive_spool.bound_locator = request_records.response_object) THEN request_records.response_object ELSE $10 END, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19, cache_known_read_tokens = $20, cache_known_input_tokens = $21 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
+        "UPDATE request_records SET status_code = $1, duration_ms = $2, input_tokens = $3, cached_input_tokens = $4, cache_write_tokens = $5, output_tokens = $6, service_tier = $7, cost_micros = $8, error_code = $9, response_object = CASE WHEN $10 LIKE 'gap://%' AND (response_object LIKE 'tenants/' || tenant_id || '/cas/v1/blake3/%' OR EXISTS (SELECT 1 FROM response_archive_spools archive_spool WHERE archive_spool.request_id = request_records.id AND archive_spool.tenant_id = request_records.tenant_id AND archive_spool.reservation_id = request_records.reservation_id AND archive_spool.state = 'bound' AND archive_spool.bound_locator = request_records.response_object)) THEN response_object ELSE $10 END, completed_at = $11, first_output_ms = $14, generation_duration_ms = $15, usage_basis = $16, billed_units = $17, billing_unit = $18, terminal_cause_code = $19, cache_known_read_tokens = $20, cache_known_input_tokens = $21 WHERE id = $12 AND created_at = $13 AND completed_at IS NULL",
     )
     .bind(request.status_code)
     .bind(request.duration_ms)

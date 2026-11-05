@@ -70,21 +70,45 @@ export function assertUnknownFinancialEvidence(row: Record<string, unknown>, rec
   for (const [field, column] of Object.entries({ status_code: "operational_status", error_code: "operational_error", completed_at: "operational_completed", stage: "operational_stage", response_object: "operational_response_object" })) {
     assert(operational[field] === row[column], `operational ACK must match owned receipt: ${field}`);
   }
-  assert(receipt.response_object === `inline-json:${SAFE_UPSTREAM_ERROR}` && operational.response_object === receipt.response_object, "failed response archive must contain only the safe local error");
+  assert(receipt.response_object === `gap://${row.request_id}/response`
+    && operational.response_object === receipt.response_object,
+    "unknown receipt must retain its raw response handoff without fabricating a local error body");
   return 0;
 }
 
 export function assertUnknownArchiveEvidence(row: Record<string, unknown>, archive: string): Record<string, unknown> {
-  assert(typeof row.request_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(row.request_id), "request source must have a canonical request identity");
-  const locator = `staging/proxy/${row.request_id}/request/${row.request_id}/body.json`;
-  assert(row.spool_state === "bound" && row.request_object === locator && row.bound_locator === locator, "unknown request archive must remain durable at its exact request-bound source locator");
+  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+  assert(typeof row.request_id === "string" && uuid.test(row.request_id), "request source must have a canonical request identity");
+  assert(typeof row.tenant_id === "string" && uuid.test(row.tenant_id), "request source must have a canonical tenant identity");
+  const staged = `staging/proxy/${row.request_id}/request/${row.request_id}/body.json`;
+  assert(row.spool_state === "bound" && row.bound_locator === staged,
+    "unknown request source must remain durable with its exact request-bound source locator");
   assert(row.body_byte_count === 512, "durable request source must retain its exact 512 byte length");
-  assert(typeof row.body_blake3 === "string" && /^[0-9a-f]{64}$/u.test(row.body_blake3) && row.body_blake3 !== "0".repeat(64) && row.body_blake3 === row.source_intent_digest, "durable request source must retain its staging digest");
-  assert(row.spool_cipher_bytes === 0 && row.spool_plain_bytes === 0 && row.chunk_count === 0, "bound request source must have zero encrypted spool accounting");
-  const body = readFileSync(join(archive, locator));
-  const sha256 = createHash("sha256").update(body).digest("hex");
-  assert(body.length === 512 && sha256 === planHash(inputPlan(512)), "durable source object must contain the exact original request bytes/hash");
-  return { locator, bytes: body.length, blake3: row.body_blake3, sha256 };
+  assert(typeof row.body_blake3 === "string" && /^[0-9a-f]{64}$/u.test(row.body_blake3)
+    && row.body_blake3 !== "0".repeat(64) && row.body_blake3 === row.source_intent_digest,
+    "durable request source must retain its staging digest");
+  assert(row.spool_cipher_bytes === 0 && row.spool_plain_bytes === 0 && row.chunk_count === 0,
+    "bound request source must have zero encrypted spool accounting");
+  const original = (side: "request" | "response", expected: Buffer) => {
+    const root = JSON.parse(readFileSync(join(archive, `tenants/${row.tenant_id}/raw/v1/${row.request_id}/${side}.json`), "utf8"));
+    assert(typeof root.blake3_digest === "string" && /^[0-9a-f]{64}$/u.test(root.blake3_digest), "raw root requires a valid digest");
+    const locator = `tenants/${row.tenant_id}/cas/v1/blake3/${root.blake3_digest.slice(0, 2)}/${root.blake3_digest}`;
+    assert(root.object_locator === locator, "raw root must reference exact tenant CAS");
+    const body = readFileSync(join(archive, locator));
+    const sha256 = createHash("sha256").update(body).digest("hex");
+    assert(root.size_bytes === body.length && body.equals(expected), `raw ${side} CAS must contain exact original ${side} bytes/hash`);
+    return { locator, bytes: body.length, blake3: root.blake3_digest, sha256 };
+  };
+  const request = inputPlan(512);
+  const body = Buffer.concat([...pieces(request)]);
+  const captured = original("request", body);
+  assert(row.request_object === captured.locator && captured.blake3 === row.body_blake3,
+    "unknown request must retain its exact CAS locator and source digest");
+  // This fixture deliberately declares 16 bytes for a larger supplier JSON.
+  // Preserve only the bytes HTTP actually exposed. Keep this incomplete
+  // supplier document distinct from the safe local delivery error.
+  const response = original("response", Buffer.concat([...pieces(outputPlan(512))]).subarray(0, 16));
+  return { ...captured, response, complete_training_fidelity_certified: false };
 }
 
 export function assertUnknownSemanticEvidence(row: Record<string, unknown>, previous?: Record<string, unknown>): Record<string, unknown> {
