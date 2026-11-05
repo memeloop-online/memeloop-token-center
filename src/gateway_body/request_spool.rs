@@ -10,6 +10,9 @@ use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
 
+mod json_file;
+pub(crate) use json_file::VerifiedJsonFile;
+
 pub(crate) const REQUEST_SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
 /// The background upload has not decided whether the object should stay.

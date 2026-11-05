@@ -64,25 +64,12 @@ pub(super) async fn proxy_openai_responses(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !state.responses_request_spool.reclaim_for(|| {
-        memory.try_grow(
-            spool.len(),
-            crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
-        )
-    }) {
-        state
-            .metrics
-            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
-        return Err(AppError::capacity_error("proxy_memory_ingress"));
-    }
-    let body = spool.read_all().await.map_err(|_| {
-        tracing::error!(
-            stage = "request_spool_read",
-            bytes = spool.len(),
-            "authenticated Responses request spool could not be replayed"
-        );
-        AppError::capacity_error("request_spool_read_failed")
-    })?;
+    let body = spool
+        .verified_json_file(std::path::Path::new(
+            &state.config.responses_request_spool_path,
+        ))
+        .await
+        .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?;
     super::proxy::proxy_spooled_responses(
         state,
         headers,
@@ -104,25 +91,12 @@ pub(super) async fn proxy_openai_responses_compact(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    if !state.responses_request_spool.reclaim_for(|| {
-        memory.try_grow(
-            spool.len(),
-            crate::gateway_body::memory::REQUEST_MEMORY_WEIGHT,
-        )
-    }) {
-        state
-            .metrics
-            .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Ingress);
-        return Err(AppError::capacity_error("proxy_memory_ingress"));
-    }
-    let body = spool.read_all().await.map_err(|_| {
-        tracing::error!(
-            stage = "request_spool_read",
-            bytes = spool.len(),
-            "authenticated Responses compact request spool could not be replayed"
-        );
-        AppError::capacity_error("request_spool_read_failed")
-    })?;
+    let body = spool
+        .verified_json_file(std::path::Path::new(
+            &state.config.responses_request_spool_path,
+        ))
+        .await
+        .map_err(|_| AppError::capacity_error("request_spool_read_failed"))?;
     super::proxy::proxy_spooled_responses(
         state,
         headers,
