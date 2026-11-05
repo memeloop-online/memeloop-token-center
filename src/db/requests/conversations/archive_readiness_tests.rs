@@ -834,25 +834,45 @@ async fn expired_live_source_writer_contract(database_url: String) {
         charged > 0,
         "the pending Put still owns the raw bytes after request drop"
     );
-    // The occupied archive pool may keep the heartbeat waiting. It must not
-    // cancel the still-pending upload or release its resident-memory charge.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !release.is_closed(),
-        "metadata failure must retain the paused Put"
-    );
-    assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, charged);
-    drop(held);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let expiry: i64 = sqlx::query_scalar("SELECT lease_expires_at FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
-                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
-            if expiry > unix_millis() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    {
+        // Explicitly poll this writer's real heartbeat while its pool is held.
+        // The background writer may be between its normal 20-second ticks;
+        // a five-second assertion must not depend on that timer firing.
+        let (_outcome, receiver) = tokio::sync::watch::channel(None);
+        let heartbeat = fixture.state.db.wait_request_source_upload(
+            fixture.identity,
+            &locator,
+            length,
+            digest,
+            receiver,
+        );
+        tokio::pin!(heartbeat);
+        tokio::select! {
+            result = &mut heartbeat => panic!("pending source heartbeat unexpectedly ended: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
         }
-    }).await.expect("the original writer must renew its expired lease before takeover");
+        assert!(
+            !release.is_closed(),
+            "metadata failure must retain the paused Put"
+        );
+        assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, charged);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut heartbeat => panic!("pending source heartbeat unexpectedly ended: {result:?}"),
+                _ = async {
+                    loop {
+                        let expiry: i64 = sqlx::query_scalar("SELECT lease_expires_at FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
+                            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+                        if expiry > unix_millis() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        }).await.expect("the original writer must renew its expired lease before takeover");
+    }
     assert!(
         !release.is_closed(),
         "renewal must keep the original Put alive"
