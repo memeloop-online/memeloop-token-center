@@ -25,14 +25,23 @@ async fn inference_requires_explicit_key_copy_permission_and_tenant() {
         "/internal/v1/inference/messages",
         "/internal/v1/inference/responses",
     ] {
-        assert_inference_permissions(path).await;
+        assert_inference_permissions(path, false).await;
+        if path.ends_with("/responses") {
+            assert_inference_permissions(path, true).await;
+        }
     }
 }
 
-async fn assert_inference_permissions(path: &str) {
+async fn assert_inference_permissions(path: &str, stream: bool) {
     let inference = |token: &str, key_id: Uuid| {
         let mut request = inference(token, key_id);
         *request.uri_mut() = path.parse().unwrap();
+        if stream {
+            *request.body_mut() = Body::from(
+                json!({"key_id":key_id,"request":{"model":"fixture","input":"hello","stream":true}})
+                    .to_string(),
+            );
+        }
         request
     };
     let (state, _directory) = crate::api::tests::test_state().await;
@@ -170,12 +179,21 @@ async fn assert_inference_permissions(path: &str) {
 }
 
 #[test]
-fn operator_bridge_requires_nonstreaming_json() {
-    assert!(validate_request(&json!({"stream":true})).is_err());
-    assert!(validate_request(&json!({"stream":"false"})).is_err());
-    assert!(validate_request(&json!([])).is_err());
-    assert!(validate_request(&json!({"stream":false})).is_ok());
-    assert!(validate_request(&json!({})).is_ok());
+fn operator_bridge_accepts_streaming_only_for_responses() {
+    for protocol in [
+        Protocol::OpenAiChat,
+        Protocol::AnthropicMessages,
+        Protocol::OpenAiResponses,
+    ] {
+        assert_eq!(
+            validate_request(&json!({"stream":true}), protocol).is_ok(),
+            matches!(protocol, Protocol::OpenAiResponses)
+        );
+        assert!(validate_request(&json!({"stream":"false"}), protocol).is_err());
+        assert!(validate_request(&json!([]), protocol).is_err());
+        assert!(validate_request(&json!({"stream":false}), protocol).is_ok());
+        assert!(validate_request(&json!({}), protocol).is_ok());
+    }
 }
 
 #[test]
@@ -232,20 +250,30 @@ fn conversation_wrapper_accepts_only_bounded_identifiers_and_known_fields() {
 
 #[tokio::test]
 async fn control_inference_returns_tool_calls_and_settles_selected_billing_key() {
-    successful_inference(Protocol::OpenAiChat).await;
+    successful_inference(Protocol::OpenAiChat, false, false).await;
 }
 
 #[tokio::test]
 async fn control_messages_returns_tool_use_and_settles_selected_billing_key() {
-    successful_inference(Protocol::AnthropicMessages).await;
+    successful_inference(Protocol::AnthropicMessages, false, false).await;
 }
 
 #[tokio::test]
 async fn control_responses_preserves_image_generation_and_archives_the_conversation() {
-    successful_inference(Protocol::OpenAiResponses).await;
+    successful_inference(Protocol::OpenAiResponses, false, false).await;
 }
 
-async fn successful_inference(protocol: Protocol) {
+#[tokio::test]
+async fn control_responses_streams_image_events_and_archives_usage_and_conversation() {
+    successful_inference(Protocol::OpenAiResponses, true, false).await;
+}
+
+#[tokio::test]
+async fn dropping_operator_responses_body_uses_normal_cancelled_lifecycle() {
+    successful_inference(Protocol::OpenAiResponses, true, true).await;
+}
+
+async fn successful_inference(protocol: Protocol, stream: bool, cancel: bool) {
     use crate::{
         db::{CreateModelRouteInput, CreateUpstreamAccountInput},
         provider::UpstreamCredential,
@@ -255,6 +283,48 @@ async fn successful_inference(protocol: Protocol) {
         matchers::{header as header_matcher, method, path},
     };
     let upstream = MockServer::start().await;
+    // A real stalled HTTP body makes downstream cancellation observable before
+    // any terminal usage is reported; a buffered mock could finish before drop.
+    let mut stalled_task = None;
+    let upstream_uri = if cancel {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        stalled_task = Some(tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0; 1024];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert!(
+                    count > 0,
+                    "operator request must arrive before the SSE response"
+                );
+                request.extend_from_slice(&chunk[..count]);
+                assert!(request.len() <= 8192, "bounded test fixture request");
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse().unwrap())
+                        })
+                        .expect("the JSON request carries Content-Length");
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let prefix = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-cancelled\"}}\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n", prefix.len(), prefix).as_bytes()).await.unwrap();
+            std::future::pending::<()>().await;
+        }));
+        endpoint
+    } else {
+        upstream.uri()
+    };
     let anthropic = matches!(protocol, Protocol::AnthropicMessages);
     let responses = matches!(protocol, Protocol::OpenAiResponses);
     let reported_input = if responses { 2048 } else { 3 };
@@ -279,11 +349,21 @@ async fn successful_inference(protocol: Protocol) {
             "usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}
         })
     };
+    let fixture_sse = format!(
+        "event: response.output_item.done\ndata: {}\n\nevent: response.completed\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"type":"response.output_item.done","output_index":0,"item":completion["output"][0]}),
+        json!({"type":"response.completed","response":completion})
+    );
+    let response_template = if stream {
+        ResponseTemplate::new(200).set_body_raw(fixture_sse.clone(), "text/event-stream")
+    } else {
+        ResponseTemplate::new(200).set_body_json(&completion)
+    };
     Mock::given(method("POST"))
         .and(path(protocol.path()))
         .and(header_matcher("authorization", "Bearer provider-fixture"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&completion))
-        .expect(1)
+        .respond_with(response_template)
+        .expect(if cancel { 0 } else { 1 })
         .mount(&upstream)
         .await;
     let (state, _directory) = crate::api::tests::test_state().await;
@@ -294,7 +374,7 @@ async fn successful_inference(protocol: Protocol) {
                 tenant_external_id: "inference-success".into(),
                 name: "inference-upstream".into(),
                 driver: "http-json".into(),
-                config: json!({"base_url":upstream.uri(),"network_scope":"public"}),
+                config: json!({"base_url":upstream_uri,"network_scope":"public"}),
                 credential: UpstreamCredential::ApiKey {
                     value: "provider-fixture".into(),
                     header: "authorization".into(),
@@ -371,7 +451,7 @@ async fn successful_inference(protocol: Protocol) {
         json!({
             "model":"fixture","input":"Draw a tiny fixture",
             "tools":[{"type":"image_generation","model":"gpt-image-2"}],
-            "tool_choice":{"type":"image_generation"},"store":false,"stream":false
+            "tool_choice":{"type":"image_generation"},"store":false,"stream":stream
         })
     } else {
         json!({"model":"fixture","messages":[{"role":"user","content":"hello"}],"stream":false})
@@ -410,10 +490,50 @@ async fn successful_inference(protocol: Protocol) {
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     let core_request_id =
         Uuid::parse_str(response.headers()[REQUEST_ID_HEADER].to_str().unwrap()).unwrap();
+    if cancel {
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let rows = state.db.list_requests(key.key_id, 10).await.unwrap();
+                if rows.len() == 1 && rows[0].operational_terminal.is_some() {
+                    assert_eq!(rows[0].request_id, core_request_id);
+                    assert_eq!(rows[0].status_code, Some(499));
+                    assert_eq!(rows[0].error_code.as_deref(), Some("client_cancelled"));
+                    assert_eq!(rows[0].completed_at, None);
+                    assert!(rows[0].usage.tokens.is_none());
+                    assert_eq!(rows[0].billing.cost, None);
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operator body drop settles through the gateway lifecycle");
+        let task = stalled_task.take().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        return;
+    }
     let bytes = axum::body::to_bytes(response.into_body(), 65_536)
         .await
         .unwrap();
-    let actual: Value = serde_json::from_slice(&bytes).unwrap();
+    let actual: Value = if stream {
+        assert_eq!(
+            bytes.as_ref(),
+            fixture_sse.as_bytes(),
+            "the operator preserves every fixture SSE frame"
+        );
+        assert!(String::from_utf8_lossy(&bytes).contains("response.output_item.done"));
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .find(|event| event["type"] == "response.completed")
+            .expect("the stream includes its completed response")["response"]
+            .clone()
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
     if anthropic {
         assert_eq!(actual["content"], completion["content"]);
         assert_eq!(actual["stop_reason"], "tool_use");
@@ -484,6 +604,7 @@ async fn successful_inference(protocol: Protocol) {
         rows[0].request_id,
         &provider_request,
         &completion,
+        stream.then_some(bytes.as_ref()),
     )
     .await;
 }
@@ -494,6 +615,7 @@ async fn assert_inference_archive(
     request_id: Uuid,
     request: &Value,
     response: &Value,
+    expected_sse: Option<&[u8]>,
 ) {
     state.db.drain_gateway_persistence_for_test().await;
     state.persistence.drain_for_test().await;
@@ -514,10 +636,33 @@ async fn assert_inference_archive(
                 .request_archive_refs(key_id, request_id)
                 .await
                 .unwrap();
+            let response_location = refs.response_object.clone();
             let detail = crate::api::request_detail::request_detail(state, refs).await;
             if detail.archive_complete {
+                if let Some(expected) = expected_sse {
+                    let archived = state
+                        .archive
+                        .get(response_location.as_deref().expect("canonical SSE object"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        archived.as_ref(),
+                        expected,
+                        "archive retains every delivered SSE frame, not only the completed JSON"
+                    );
+                }
                 assert_eq!(&detail.request_body, request);
-                assert_eq!(&detail.response_body, response);
+                let archived_response = if let Some(sse) = detail.response_body.as_str() {
+                    sse.lines()
+                        .filter_map(|line| line.strip_prefix("data: "))
+                        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                        .find(|event| event["type"] == "response.completed")
+                        .expect("archived SSE retains the terminal response")["response"]
+                        .clone()
+                } else {
+                    detail.response_body
+                };
+                assert_eq!(&archived_response, response);
                 break;
             }
             crate::response_archive_spool::process_one_for_test(state).await;
