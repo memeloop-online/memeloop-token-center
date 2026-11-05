@@ -294,9 +294,7 @@ mod tests {
             .body(axum::body::Body::from(format!(
                 "--metadata-test\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\n{value}\r\n--metadata-test--\r\n"
             ))).unwrap();
-        request
-            .extensions_mut()
-            .insert(axum::extract::DefaultBodyLimit::disable());
+        axum::extract::DefaultBodyLimit::disable().apply(&mut request);
         Multipart::from_request(request, &()).await.unwrap()
     }
 
