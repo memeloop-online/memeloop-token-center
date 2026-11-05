@@ -1114,25 +1114,36 @@ async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() 
         "a third synchronous image lifecycle must not have a permit"
     );
 
-    let response = tokio::time::timeout(
-        Duration::from_millis(100),
-        router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(
-            Request::post("/v1/images/generations")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
-                .body(Body::from_stream(futures_util::stream::pending::<
-                    Result<Bytes, Infallible>,
-                >()))
-                .unwrap(),
-        ),
-    )
-    .await
-    .expect("an exhausted image budget must reject without reading the body")
-    .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
-
+    let polled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let body_polled = polled.clone();
+    let body = futures_util::stream::once(async move {
+        body_polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok::<_, Infallible>(Bytes::from_static(b"invalid json"))
+    });
+    let response = router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(
+        Request::post("/v1/images/generations")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+            .body(Body::from_stream(body))
+            .unwrap(),
+    );
+    tokio::pin!(response);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut response)
+            .await
+            .is_err(),
+        "an exhausted image budget must queue before reading the body"
+    );
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 0);
     drop(both);
+    let response = tokio::time::timeout(Duration::from_secs(5), response)
+        .await
+        .expect("queued upload continues when the permit is released")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(polled.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(response);
+
     let _released = tokio::time::timeout(
         Duration::from_millis(100),
         fixture.state.image_response_permits.acquire(),

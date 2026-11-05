@@ -69,6 +69,10 @@ pub(super) fn route_class(path: &str) -> Option<&'static str> {
         "/v1/messages" => Some("messages"),
         "/v1/messages/count_tokens" => Some("count_tokens"),
         "/v1/embeddings" => Some("embeddings"),
+        "/v1/audio/transcriptions" => Some("audio_transcription"),
+        "/v1/images/generations" => Some("image_generation"),
+        "/v1/videos/generations" => Some("video_generation"),
+        "/v1/generations" => Some("generation"),
         _ => None,
     }
 }
@@ -287,6 +291,16 @@ mod tests {
             Some("responses_compact")
         );
         assert_eq!(route_class("/v1/alpha/search"), Some("alpha_search"));
+        assert_eq!(
+            route_class("/v1/audio/transcriptions"),
+            Some("audio_transcription")
+        );
+        assert_eq!(
+            route_class("/v1/images/generations"),
+            Some("image_generation")
+        );
+        assert_eq!(route_class("/v1/generations"), Some("generation"));
+        assert_eq!(route_class("/v1/generations/private-job"), None);
         assert_eq!(route_class("/v1/responses/SECRET_CANARY"), None);
         assert_eq!(route_class("/v1/responses?api_key=SECRET_CANARY"), None);
         assert_eq!(ingress_request_id(Some("SECRET_CANARY")), None);

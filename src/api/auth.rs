@@ -290,6 +290,17 @@ async fn admit_authenticated_gateway_body(
             memory: memory.clone(),
         });
     }
+    if matches!(
+        request.uri().path(),
+        "/v1/audio/transcriptions"
+            | "/v1/images/generations"
+            | "/v1/videos/generations"
+            | "/v1/generations"
+    ) {
+        // Media handlers own their execution and financial terminal records.
+        // This observer records upload failures only, before that handoff.
+        super::early_request::mark_admitted();
+    }
     let response = next.run(request).await;
     if super::early_request::is_pre_admission_failure(response.status()) {
         drop(memory);

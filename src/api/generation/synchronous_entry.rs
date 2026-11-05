@@ -23,7 +23,8 @@ pub(in crate::api) async fn create_image_generation(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    tokio::spawn(async move {
+    let context = super::super::proxy_diagnostics::Context::current();
+    let operation = async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
         let result = async move {
             let value: Value = serde_json::from_slice(&body)
@@ -44,9 +45,12 @@ pub(in crate::api) async fn create_image_generation(
         }
         .await;
         result.map(|response| super::super::auth::hold_response_body_permit(response, resources))
-    })
-    .await
-    .map_err(|_| AppError::internal("synchronous_image_owner_failed"))?
+    };
+    #[cfg(test)]
+    let operation = crate::api::proxy::codex_transport::preserve_test_endpoint(operation);
+    tokio::spawn(super::super::proxy_diagnostics::CONTEXT.scope(context, operation))
+        .await
+        .map_err(|_| AppError::internal("synchronous_image_owner_failed"))?
 }
 
 async fn proxy_openai_image_generation(
@@ -108,7 +112,7 @@ async fn proxy_openai_image_generation(
         upstream_account_hint,
         ..
     } = applied;
-    let request_id = Uuid::now_v7();
+    let request_id = super::super::proxy_diagnostics::Context::current().request_id;
     if let Some(idempotency) = image_idempotency.as_ref() {
         match state
             .db

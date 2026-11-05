@@ -160,12 +160,25 @@ async fn native_codex_image_uses_oauth_transport_and_non_streaming_responses_too
     .await
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    let request_id = response
+        .headers()
+        .get("x-mtc-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(Uuid::parse_str(&request_id).is_ok());
     let response = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
     assert_eq!(
         serde_json::from_slice::<Value>(&response).unwrap()["data"][0]["b64_json"],
         "bW9jay1wbmc="
     );
     let requests = upstream.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the owned worker must retain its test endpoint"
+    );
     let forwarded: Value = requests[0].body_json().unwrap();
     assert_eq!(forwarded["model"], "gpt-5.6-sol");
     assert_eq!(forwarded["stream"], false);
