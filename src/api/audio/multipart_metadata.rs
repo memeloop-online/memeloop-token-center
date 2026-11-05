@@ -261,11 +261,14 @@ mod tests {
     use axum::extract::FromRequest;
 
     async fn multipart(value: String) -> Multipart {
-        let request = axum::http::Request::builder()
+        let mut request = axum::http::Request::builder()
             .header("content-type", "multipart/form-data; boundary=metadata-test")
             .body(axum::body::Body::from(format!(
                 "--metadata-test\r\nContent-Disposition: form-data; name=\"value\"\r\n\r\n{value}\r\n--metadata-test--\r\n"
             ))).unwrap();
+        request
+            .extensions_mut()
+            .insert(axum::extract::DefaultBodyLimit::disable());
         Multipart::from_request(request, &()).await.unwrap()
     }
 
