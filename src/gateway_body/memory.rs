@@ -50,7 +50,20 @@ pub(crate) struct ProxyMemoryBudget {
 }
 
 impl ProxyMemoryBudget {
-    pub(crate) fn new(bytes: u32) -> Self {
+    pub(crate) fn supports(bytes: u64) -> bool {
+        usize::try_from(bytes).is_ok_and(|bytes| {
+            let units = bytes / UNIT_BYTES;
+            units <= u32::MAX as usize && units <= Semaphore::MAX_PERMITS
+        })
+    }
+
+    pub(crate) fn new(bytes: u64) -> Self {
+        // Production configuration is validated before constructing the budget.
+        // The bound is the semaphore's representation, not a fixed pod size.
+        assert!(
+            Self::supports(bytes),
+            "memory budget exceeds counter representation"
+        );
         Self {
             capacity: bytes as usize,
             permits: Arc::new(Semaphore::new(bytes as usize / UNIT_BYTES)),
@@ -676,6 +689,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn four_gib_budget_keeps_full_capacity_and_releases_large_reservations() {
+        let capacity = 4_u64 * 1024 * 1024 * 1024;
+        let budget = ProxyMemoryBudget::new(capacity);
+        assert_eq!(budget.snapshot().1 as u64, capacity);
+        let request = budget.reservation();
+        assert!(request.try_grow(3 * 1024 * 1024 * 1024, 1));
+        assert_eq!(budget.snapshot().0, 3 * 1024 * 1024 * 1024);
+        assert!(!request.try_grow(2 * 1024 * 1024 * 1024, 1));
+        drop(request);
+        assert_eq!(budget.snapshot().0, 0);
+        assert!(!ProxyMemoryBudget::supports(u64::MAX));
+    }
+
+    #[test]
     fn dispatched_durable_source_releases_json_nodes_with_working_copies() {
         let budget = ProxyMemoryBudget::new(8 * 1024 * 1024);
         let memory = budget.reservation();
@@ -691,7 +718,7 @@ mod tests {
 
     #[test]
     fn json_admission_is_atomic_when_bytes_fit_but_nodes_do_not() {
-        let budget = ProxyMemoryBudget::new(4 * UNIT_BYTES as u32);
+        let budget = ProxyMemoryBudget::new(4 * UNIT_BYTES as u64);
         let blocker = budget.reservation();
         assert!(blocker.try_grow(2 * UNIT_BYTES, 1));
         let memory = budget.reservation();
@@ -756,7 +783,7 @@ mod tests {
 
     #[test]
     fn failed_response_growth_and_payload_transfer_preserve_existing_permits() {
-        let budget = ProxyMemoryBudget::new(2 * UNIT_BYTES as u32);
+        let budget = ProxyMemoryBudget::new(2 * UNIT_BYTES as u64);
         let memory = budget.reservation();
         assert!(memory.try_grow(1234, 1));
         assert!(memory.reserve_buffered_response(1, tokio::time::Instant::now()));
@@ -862,7 +889,7 @@ mod tests {
     #[test]
     fn sse_streaming_envelope_limits_concurrency_and_releases_capacity() {
         let framed_bytes = 8 * UNIT_BYTES;
-        let budget = ProxyMemoryBudget::new((framed_bytes * SSE_STREAMING_MEMORY_WEIGHT) as u32);
+        let budget = ProxyMemoryBudget::new((framed_bytes * SSE_STREAMING_MEMORY_WEIGHT) as u64);
         let first = budget.reservation();
         let first_permit = first
             .try_reserve_sse_streaming(framed_bytes)
