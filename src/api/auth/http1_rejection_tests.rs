@@ -16,6 +16,7 @@ use tokio::{
     sync::{Notify, oneshot},
     task::JoinHandle,
 };
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 
 use super::*;
 use crate::{db::CreateKeyInput, model::KeyPolicy};
@@ -110,6 +111,13 @@ impl Server {
                         response
                     }
                 },
+            ))
+            .layer(PropagateRequestIdLayer::new(
+                axum::http::HeaderName::from_static(REQUEST_ID_HEADER),
+            ))
+            .layer(SetRequestIdLayer::new(
+                axum::http::HeaderName::from_static(REQUEST_ID_HEADER),
+                MakeRequestUuid,
             ))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
