@@ -337,12 +337,12 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
           <Field label={copy.probeInterval} required><Input type="number" required min={10_000} max={3_600_000} step={1000} value={probeInterval} onChange={(_, data) => setProbeInterval(data.value)} /></Field>
           <Field label={copy.probeAttempts} required><Input type="number" required min={1} max={8} value={probeAttempts} onChange={(_, data) => setProbeAttempts(data.value)} /></Field>
           <p>{copy.probeHint}</p>
-          <div className="button-row">
-            <Button type="submit" appearance="primary">{copy.save}</Button>
-            <Button type="button" onClick={async () => { if (await confirm(copy.discardEdit)) clearForm(); }}>{copy.cancelEdit}</Button>
-          </div>
         </FormSection>
         </fieldset>
+        <div className="button-row">
+          <Button type="submit" appearance="primary" disabled={busy || !ready}>{copy.save}</Button>
+          <Button type="button" disabled={busy} onClick={async () => { if (await confirm(copy.discardEdit)) clearForm(); }}>{copy.cancelEdit}</Button>
+        </div>
       </form></DrawerFrame>}
   </div>;
 }
