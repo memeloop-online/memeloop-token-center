@@ -1442,7 +1442,7 @@ async fn proxy_with_cancellation_guard(
                     let code = error.diagnostic_category().to_owned();
                     let response = error.into_response();
                     let (parts, body) = response.into_parts();
-                    let body = to_bytes(body, 64 * 1024)
+                    let body = axum::body::to_bytes(body, 64 * 1024)
                         .await
                         .map_err(|_| AppError::internal("local_admission_error_body"))?;
                     let mut response = finish_buffered_request(
@@ -2500,6 +2500,21 @@ struct ProxyConversationProjection<'a> {
 }
 
 impl ProxyConversation {
+    fn terminal_receipt_seed(
+        &self,
+        upstream_response_id: Option<&str>,
+    ) -> crate::proxy_lifecycle::pending_terminal::OwnedConversation {
+        crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
+            ProxyConversationInput {
+                key: &self.key,
+                request_json: &serde_json::json!({}),
+                hints: &self.hints,
+                client_name: self.client_name.as_deref(),
+                upstream_response_id,
+            },
+        )
+    }
+
     fn take_for_terminal(&self) -> Option<Self> {
         let admission = std::mem::replace(
             &mut *self.projection_admission.lock().ok()?,
@@ -3575,6 +3590,9 @@ async fn finish_buffered_request_before_deadline(
     request.state.pending_terminals.submit_with_preparation(
         snapshot,
         (body.clone(), request.memory.clone(), _response_buffer),
+        conversation
+            .as_ref()
+            .map(|conversation| conversation.terminal_receipt_seed(response_id.as_deref())),
         prepare_terminal_conversation(
             conversation,
             request.memory.clone(),
