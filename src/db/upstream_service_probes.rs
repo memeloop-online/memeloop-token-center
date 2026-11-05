@@ -90,6 +90,32 @@ impl Database {
             .bind(account_id.to_string()).fetch_optional(&self.pool).await?)
     }
 
+    /// Reserve the next scheduled attempt before dispatch. A failed result
+    /// write or another worker must not cause a second paid probe this interval.
+    pub(crate) async fn claim_upstream_service_probe(
+        &self,
+        account_id: Uuid,
+        now: i64,
+        interval_millis: i64,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "INSERT INTO upstream_service_probes
+             (upstream_account_id, status, checked_at, last_attempt_at)
+             SELECT id, 'skipped', $2, $2 FROM upstream_accounts
+             WHERE id = $1 AND status = 'active'
+             ON CONFLICT (upstream_account_id) DO UPDATE SET
+               last_attempt_at = excluded.last_attempt_at
+             WHERE COALESCE(upstream_service_probes.last_attempt_at,
+                            upstream_service_probes.checked_at) <= $3",
+        )
+        .bind(account_id.to_string())
+        .bind(now)
+        .bind(now.saturating_sub(interval_millis))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     #[cfg(test)]
     pub(crate) async fn upstream_service_probes_due(
         &self,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Button } from '@fluentui/react-components';
 import { api } from '../api';
 import { useI18n } from '../i18n';
@@ -14,24 +14,42 @@ export function HealthProbeSettings({ token, tenant, accountId, disabled }: { to
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const contextVersion = useRef(0);
   const path = `/internal/v1/upstreams/${encodeURIComponent(accountId)}/health-probe-settings?tenant_external_id=${encodeURIComponent(tenant)}`;
   useEffect(() => {
     const controller = new AbortController();
-    setValue(undefined); setError(''); setSaved(false);
+    const version = ++contextVersion.current;
+    setValue(undefined); setError(''); setSaved(false); setSaving(false);
     Promise.all([
       api<Settings>(path, token, { signal: controller.signal }),
       api<Key[]>(`/internal/v1/keys?tenant_external_id=${encodeURIComponent(tenant)}&limit=500`, token, { signal: controller.signal }),
     ]).then(([settings, credentials]) => {
+      if (controller.signal.aborted || contextVersion.current !== version) return;
       setValue(settings); setKeys(credentials.filter(key => key.status === 'active'));
     })
-      .catch(() => { if (!controller.signal.aborted) setError(t('providers.healthProbeSettingsLoadFailed')); });
-    return () => controller.abort();
+      .catch(() => {
+        if (!controller.signal.aborted && contextVersion.current === version) {
+          setError(t('providers.healthProbeSettingsLoadFailed'));
+        }
+      });
+    return () => {
+      controller.abort();
+      contextVersion.current += 1;
+    };
   }, [path, tenant, token, t]);
   async function save() {
     if (!value) return;
+    const version = contextVersion.current;
     setSaving(true); setError(''); setSaved(false);
-    try { setValue(await api<Settings>(path, token, { method: 'PUT', body: JSON.stringify(value) })); setSaved(true); }
-    catch { setError(t('providers.healthProbeSettingsSaveFailed')); } finally { setSaving(false); }
+    try {
+      const next = await api<Settings>(path, token, { method: 'PUT', body: JSON.stringify(value) });
+      if (contextVersion.current !== version) return;
+      setValue(next); setSaved(true);
+    } catch {
+      if (contextVersion.current === version) setError(t('providers.healthProbeSettingsSaveFailed'));
+    } finally {
+      if (contextVersion.current === version) setSaving(false);
+    }
   }
   return <section className="settings-card" aria-label={zh ? '上游健康探测' : 'Upstream health probe'}>
     <h3>{zh ? '上游健康探测' : 'Upstream health probe'}</h3>

@@ -292,6 +292,26 @@ pub(crate) async fn run_upstream_service_probes(
             if inflight.len() >= 32 {
                 break;
             }
+            match state
+                .db
+                .claim_upstream_service_probe(
+                    account_id,
+                    unix_millis(),
+                    settings.interval_seconds.saturating_mul(1000),
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        %account_id,
+                        error_category = error.diagnostic_category(),
+                        "upstream service probe claim failed"
+                    );
+                    continue;
+                }
+            }
             let state = state.clone();
             inflight.spawn(async move {
                 // At most one request per account per interval. Rotate scoped
