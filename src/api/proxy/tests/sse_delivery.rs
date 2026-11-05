@@ -201,10 +201,7 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
             bytes.len() < RETAINED_BYTES,
             "journal must not copy raw padding"
         );
-        assert_eq!(
-            receipt["conversation"]["request_json"],
-            json!({})
-        );
+        assert_eq!(receipt["conversation"]["request_json"], json!({}));
         found_receipt = true;
     }
     assert!(
