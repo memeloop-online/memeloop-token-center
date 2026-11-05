@@ -322,6 +322,11 @@
           "properties": {
             "enabled": { "type": "boolean" },
             "existingClaim": { "type": "string" },
+            "gatewayCachePath": {
+              "type": "string",
+              "pattern": "^$|^/var/lib/memeloop-token-center/[A-Za-z0-9_-]+(/[A-Za-z0-9_-]+)*$",
+              "description": "Explicit Gateway node-local replica of verified published plugin inventories and packages. Not an installation authority."
+            },
             "persistence": {
               "type": "object", "additionalProperties": false,
               "required": ["create", "storageClass", "size"],

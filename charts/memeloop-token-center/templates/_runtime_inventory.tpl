@@ -73,9 +73,15 @@
 {{- $runtime := .root.Values.plugins.runtimeInventory -}}
 {{- if $runtime.enabled }}
 - name: plugin-runtime-inventory
+  {{- if .gatewayCache }}
+  hostPath:
+    path: {{ $runtime.gatewayCachePath | quote }}
+    type: DirectoryOrCreate
+  {{- else }}
   persistentVolumeClaim:
     claimName: {{ include "memeloop-token-center.runtimeInventory.claimName" .root | quote }}
     readOnly: {{ not .writer }}
+  {{- end }}
 {{- if and .writer $runtime.installationEnabled }}
 - name: plugin-runtime-policy
   configMap:

@@ -239,6 +239,12 @@ plugins:
     # browser installation, never an automatic emptyDir/ConfigMap fallback.
     enabled: false
     existingClaim: ""
+    # Optional Gateway-only replica of verified inventory + packages. Provision
+    # complete published bundles at this node-local path on eligible nodes.
+    # Keep the inventory's absolute package paths identical to the mounted
+    # runtime path. Control/worker retain the durable shared claim.
+    # Empty means the existing shared-PVC reader behavior.
+    gatewayCachePath: ""
     persistence:
       create: false
       storageClass: ""

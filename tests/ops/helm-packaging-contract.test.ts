@@ -75,7 +75,7 @@ interface RuntimeDeployment {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
     containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
     initContainers: Array<{ name: string; image: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
-    volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
+    volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; hostPath?: { path: string; type: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
 }
 
@@ -91,6 +91,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       terminalProjectionEnabled: render('default', ['--set', 'config.terminalProjectionEnabled=true']),
       terminalProjectionAll: render('terminal-projection-all', ['--set', 'config.terminalProjectionEnabled=true', '--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
       runtime: render('runtime', runtimeFlags),
+      runtimeGatewayCache: render('runtime-gateway-cache', [...runtimeFlags, '--set-string', 'plugins.runtimeInventory.gatewayCachePath=/var/lib/memeloop-token-center/gateway-plugin-cache']),
       runtimeReaders: render('runtime-readers', runtimeFlags.slice(0, 4)),
       runtimeCreated: render('runtime-created', ['--set', 'plugins.runtimeInventory.enabled=true', '--set', 'plugins.runtimeInventory.persistence.create=true', '--set', 'plugins.runtimeInventory.persistence.storageClass=reviewed-rwx']),
       runtimeAll: render('runtime-all', [...runtimeFlags, '--set', 'config.proxyMemoryBudgetBytes=536870912', '--set', 'roles.all.enabled=true', '--set', 'roles.gateway.enabled=false', '--set', 'roles.control.enabled=false', '--set', 'roles.worker.enabled=false']),
@@ -154,6 +155,22 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('runtime', 'name: MTC_PLUGIN_INVENTORY_FILE', 3);
     count('runtime', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 1);
     count('runtimeReaders', 'name: MTC_PLUGIN_INSTALL_POLICY_FILE', 0);
+    for (const deployment of parseAllDocuments(output.runtimeGatewayCache!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment')) {
+      const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
+      const pod = deployment.spec.template.spec;
+      const volume = pod.volumes.find(item => item.name === 'plugin-runtime-inventory')!;
+      if (role === 'gateway') {
+        assert.deepEqual(volume.hostPath, { path: '/var/lib/memeloop-token-center/gateway-plugin-cache', type: 'DirectoryOrCreate' });
+        assert.equal(volume.persistentVolumeClaim, undefined);
+        assert.equal(pod.initContainers?.some(item => item.name === 'prepare-plugin-inventory') ?? false, false);
+        assert.equal(pod.containers[0]!.volumeMounts.find(item => item.name === 'plugin-runtime-inventory')!.readOnly, true);
+        assert.equal(deployment.metadata.annotations['argocd.argoproj.io/sync-wave'], '0');
+        assert.equal(pod.containers[0]!.env.some(item => item.name === 'MTC_PLUGIN_INSTALL_POLICY_FILE'), false);
+      } else {
+        assert.equal(volume.hostPath, undefined);
+        assert.equal(volume.persistentVolumeClaim?.claimName, 'shared-plugin-inventories');
+      }
+    }
     lacks('runtimeReaders', 'secretName:');
     lacks('runtime', 'subPath:');
     lacks('runtime', 'MTC_PLUGIN_DIR');
