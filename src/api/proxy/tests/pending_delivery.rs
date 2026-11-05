@@ -1354,7 +1354,8 @@ async fn unknown_failure_retries_operational_projection() {
     let delivered = String::from_utf8(body.to_vec()).unwrap();
     assert_eq!(delivered.matches("event: response.failed").count(), 1);
     assert!(!delivered.contains("response.completed"));
-    assert!(!delivered.contains("PRIVATE_CANARY"));
+    assert!(delivered.contains("PROVIDER_PRIVATE_CANARY"));
+    assert!(!delivered.contains("UNKNOWN_OPERATIONAL_PRIVATE_CANARY"));
     let original = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let (_, receipt) = wait_for_receipt(&fixture).await;

@@ -109,7 +109,21 @@ pub(super) async fn image_idempotency_replay_response(
         SynchronousImageIdempotencyClaim::Failed {
             request_id,
             error_code,
-        } => Ok(replayed_image_failure(request_id, &error_code)),
+            response_object,
+        } => {
+            if let Some(body) = response_object
+                .as_deref()
+                .and_then(|object| object.strip_prefix("inline-json:"))
+            {
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(REQUEST_ID_HEADER, request_id.to_string())
+                    .body(Body::from(body.to_owned()))
+                    .map_err(|_| AppError::internal("image_failure_replay_response"));
+            }
+            Ok(replayed_image_failure(request_id, &error_code))
+        }
         SynchronousImageIdempotencyClaim::Pending { request_id } => Err(AppError::Conflict(
             format!("image request {request_id} with this Idempotency-Key is still in progress"),
         )),

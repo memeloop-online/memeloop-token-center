@@ -456,9 +456,12 @@ impl ResponsesSseCapture {
         // Explicit failure names remain authoritative, while unrelated event
         // metadata is redacted and the typed Chat payload is still validated.
         // This prevents provider metadata from changing settlement semantics.
-        if self.chat_usage.is_some() && matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
-            self.invalid = true;
-            self.terminal_failure = true;
+        if self.chat_usage.is_some() && event_kind.is_some() {
+            self.usage_invalid = true;
+            if matches!(event_kind, Some(ResponsesSseEventKind::Failed)) {
+                self.invalid = true;
+                self.terminal_failure = true;
+            }
         }
         let Some(data) = data else {
             if self.chat_usage.is_some() && event_kind.is_some() {

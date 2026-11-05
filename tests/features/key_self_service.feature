@@ -391,13 +391,13 @@ Feature: Stable key identity and read-only self-service statistics
     Then the response status is 409
     And the oversized image is quarantined and reconciled with no partial response archive
 
-  Scenario: OpenAI image provider errors never expose or archive the upstream body
+  Scenario: OpenAI image provider errors retain their details across replay
     Given a token center backed by SQLite and memory object storage
     And the mock OpenAI Images upstream rejects with a sensitive error body
     When the service creates a metered OpenAI Images route and key
     And the client creates an OpenAI-compatible image
     Then the response status is 502
-    And the upstream image rejection is sanitized archived as a gap and replayed safely
+    And the upstream image rejection is retained and replayed safely
 
   Scenario: Codex Responses image tools are exposed as the OpenAI Images API
     Given a token center backed by SQLite and memory object storage

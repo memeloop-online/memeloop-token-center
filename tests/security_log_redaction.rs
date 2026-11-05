@@ -419,8 +419,16 @@ async fn proxy_oauth_database_and_object_store_never_log_or_return_canaries() {
         logs.contains("http_request"),
         "URI redaction probe did not reach the request tracing collector"
     );
+    assert!(
+        response_bodies[0].contains(PROXY_CANARY),
+        "provider response details should reach the requesting client"
+    );
+    assert!(
+        response_bodies[1..]
+            .iter()
+            .all(|body| !body.contains(PROXY_CANARY))
+    );
     for canary in [
-        PROXY_CANARY,
         OAUTH_CANARY,
         QUERY_CANARY,
         PATH_CANARY,
@@ -434,4 +442,8 @@ async fn proxy_oauth_database_and_object_store_never_log_or_return_canaries() {
         );
         assert!(!logs.contains(canary), "tracing exposed a secret canary");
     }
+    assert!(
+        !logs.contains(PROXY_CANARY),
+        "tracing exposed the provider response body"
+    );
 }

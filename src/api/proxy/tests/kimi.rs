@@ -237,17 +237,17 @@ async fn native_kimi_rejections_preserve_classification_and_original_explanation
             let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
             assert_eq!(detail.response_body, delivered);
             assert!(
-                !serde_json::to_string(&record.supplier_error)
+                serde_json::to_string(&record.supplier_error)
                     .unwrap()
                     .contains(canary)
             );
             assert!(
-                !serde_json::to_string(&detail.view.supplier_error)
+                serde_json::to_string(&detail.view.supplier_error)
                     .unwrap()
                     .contains(canary)
             );
             assert_eq!(record.supplier_error, detail.view.supplier_error);
-            assert_eq!(record.supplier_error.is_some(), expected_reason.is_some());
+            assert!(record.supplier_error.is_some());
             upstream.verify().await;
         }
     }
@@ -277,12 +277,6 @@ async fn native_kimi_safe_rejection_keeps_other_response_paths_untouched() {
         (
             crate::oauth::managed::kimi::PROVIDER_DRIVER,
             Protocol::OpenAiResponsesCompact,
-            false,
-            StatusCode::FORBIDDEN,
-        ),
-        (
-            "openai-codex",
-            Protocol::OpenAiResponses,
             false,
             StatusCode::FORBIDDEN,
         ),
@@ -1558,7 +1552,7 @@ async fn dispatched_compaction_400_is_not_replayed_to_a_standby() {
     let body = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
         .await
         .unwrap();
-    assert!(!String::from_utf8_lossy(&body).contains("provider-rejection-canary"));
+    assert!(String::from_utf8_lossy(&body).contains("provider-rejection-canary"));
     assert_eq!(preferred.received_requests().await.unwrap().len(), 1);
     assert!(standby.received_requests().await.unwrap().is_empty());
     preferred.verify().await;

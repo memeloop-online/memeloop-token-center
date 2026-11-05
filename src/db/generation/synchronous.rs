@@ -51,6 +51,7 @@ pub enum SynchronousImageIdempotencyClaim {
     Failed {
         request_id: Uuid,
         error_code: String,
+        response_object: Option<String>,
     },
 }
 
@@ -777,9 +778,10 @@ impl Database {
         if let Some(idempotency_key) = input.idempotency_key {
             let terminal = if let Some(error_code) = input.error_code {
                 sqlx::query(
-                    "UPDATE synchronous_image_idempotency SET status = 'failed', response_status = $1, response_object = NULL, error_code = $2, completed_at = $3 WHERE key_id = $4 AND idempotency_key = $5 AND request_id = $6 AND reservation_id = $7 AND status = 'pending'",
+                    "UPDATE synchronous_image_idempotency SET status = 'failed', response_status = $1, response_object = $2, error_code = $3, completed_at = $4 WHERE key_id = $5 AND idempotency_key = $6 AND request_id = $7 AND reservation_id = $8 AND status = 'pending'",
                 )
                 .bind(input.status_code)
+                .bind(input.response_object)
                 .bind(error_code)
                 .bind(now)
                 .bind(&key_id)
@@ -1153,6 +1155,7 @@ fn synchronous_image_claim_from_row(
         }),
         "failed" => Ok(SynchronousImageIdempotencyClaim::Failed {
             request_id,
+            response_object: row.try_get("response_object")?,
             error_code: row
                 .try_get::<Option<String>, _>("error_code")?
                 .unwrap_or_else(|| "image_generation_failed".to_owned()),
@@ -1302,9 +1305,10 @@ async fn recover_expired_synchronous_image_owner(
         }
         let error_code = error_code.unwrap_or_else(|| "idempotency_claim_expired".to_owned());
         let updated = sqlx::query(
-            "UPDATE synchronous_image_idempotency SET status = 'failed', response_status = $1, response_object = NULL, error_code = $2, completed_at = $3 WHERE key_id = $4 AND idempotency_key = $5 AND request_id = $6 AND status = 'pending'",
+            "UPDATE synchronous_image_idempotency SET status = 'failed', response_status = $1, response_object = $2, error_code = $3, completed_at = $4 WHERE key_id = $5 AND idempotency_key = $6 AND request_id = $7 AND status = 'pending'",
         )
         .bind(status_code.unwrap_or(502))
+        .bind(&response_object)
         .bind(&error_code)
         .bind(now)
         .bind(key_id.to_string())
@@ -1320,6 +1324,7 @@ async fn recover_expired_synchronous_image_owner(
         return Ok(Some(SynchronousImageIdempotencyClaim::Failed {
             request_id,
             error_code,
+            response_object,
         }));
     }
 
@@ -1365,6 +1370,7 @@ async fn recover_expired_synchronous_image_owner(
         return Ok(Some(SynchronousImageIdempotencyClaim::Failed {
             request_id,
             error_code: error_code.to_owned(),
+            response_object: None,
         }));
     }
     if reservation_status != "reserved" {
@@ -1475,6 +1481,7 @@ async fn recover_non_idempotent_synchronous_image_terminal(
         Ok(SynchronousImageIdempotencyClaim::Failed {
             request_id: input.request_id,
             error_code,
+            response_object: stored_response,
         })
     } else {
         Ok(SynchronousImageIdempotencyClaim::Completed {

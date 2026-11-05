@@ -66,7 +66,7 @@ pub(in crate::api) fn normalized_error_body(raw: &[u8]) -> Bytes {
         .unwrap_or_else(|_| fallback_body())
 }
 
-pub(in crate::api) async fn read_rejection(response: UpstreamResponse) -> Rejection {
+pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
     let status = response.status();
     if status.is_success() {
         drop(response);

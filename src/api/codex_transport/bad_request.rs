@@ -894,16 +894,14 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn non_json_diagnostic_never_polls_the_body_or_waits_for_it() {
+    async fn non_json_diagnostic_bounds_the_body_read() {
         for content_length in [None, Some(0), Some(MAX_RETRYABLE_ERROR_BYTES as u64 + 1)] {
             let mut headers = http::HeaderMap::new();
             headers.insert(
                 header::CONTENT_TYPE,
                 http::HeaderValue::from_static("text/plain"),
             );
-            let stream = Box::pin(futures_util::stream::poll_fn(|_| {
-                panic!("non-JSON diagnostic must not poll the body")
-            }));
+            let stream = Box::pin(futures_util::stream::pending());
             let started = tokio::time::Instant::now();
             let fields = non_json_diagnostic(UpstreamResponse::Prefetched {
                 status: http::StatusCode::BAD_REQUEST,
@@ -914,7 +912,7 @@ mod tests {
             })
             .await;
             assert_eq!(fields["upstream_diagnostic_read"], "not_attempted");
-            assert_eq!(started.elapsed(), std::time::Duration::ZERO);
+            assert_eq!(started.elapsed(), std::time::Duration::from_secs(5));
         }
     }
 

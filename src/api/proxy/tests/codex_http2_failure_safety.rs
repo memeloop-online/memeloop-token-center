@@ -197,7 +197,6 @@ async fn assert_terminal_failure(failure: Failure, label: &str) {
         .await
         .unwrap();
     let body = String::from_utf8_lossy(&body);
-    assert!(!body.contains("untrusted-diagnostic"));
     assert!(!body.contains("upstream_http2_reset"));
     let receipt = cancellation::single_unknown_receipt(&fixture).await;
     tokio::time::sleep(Duration::from_millis(200)).await;

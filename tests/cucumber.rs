@@ -4624,22 +4624,19 @@ async fn oversized_openai_image_is_unbilled(world: &mut TokenCenterWorld) {
     assert_eq!(key["available_balance"], "0.3");
 }
 
-#[then("the upstream image rejection is sanitized archived as a gap and replayed safely")]
-async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWorld) {
+#[then("the upstream image rejection is retained and replayed safely")]
+async fn openai_image_rejection_is_retained(world: &mut TokenCenterWorld) {
     assert_eq!(world.status, Some(StatusCode::BAD_GATEWAY));
     let rendered = world.response.to_string();
-    assert!(!rendered.contains("must-not-leak"));
-    assert_eq!(world.response["error"]["code"], "upstream_http_400");
+    assert!(rendered.contains("provider detail must-not-leak"));
+    assert!(rendered.contains("https://images.example.invalid/result.png?token=must-not-leak"));
     let request_id = world
         .synchronous_request_id
         .expect("rejected synchronous image request id");
     let replay = replay_openai_compatible_image(world).await;
     assert_eq!(replay.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
-        replay
-            .json::<Value>()
-            .await
-            .expect("sanitized rejection replay"),
+        replay.json::<Value>().await.expect("rejection replay"),
         world.response
     );
     let state = world.state.clone().expect("test application state");
@@ -4651,8 +4648,12 @@ async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWo
         )
         .await
         .expect("rejected image archive references");
-    let expected_gap = format!("gap://{request_id}/response");
-    assert_eq!(refs.response_object.as_deref(), Some(expected_gap.as_str()));
+    assert!(
+        refs.response_object
+            .as_deref()
+            .unwrap()
+            .starts_with("inline-json:")
+    );
     let detail = world
         .client
         .get(format!(
@@ -4669,9 +4670,7 @@ async fn sensitive_openai_image_rejection_is_sanitized(world: &mut TokenCenterWo
     assert_eq!(detail["status_code"], 502);
     assert_eq!(detail["error_code"], "upstream_http_400");
     assert_eq!(detail["cost"], "0");
-    assert!(detail["response_body"].is_null());
-    assert_eq!(detail["archive_complete"], false);
-    assert!(!detail.to_string().contains("must-not-leak"));
+    assert_eq!(detail["response_body"], world.response);
 }
 
 #[given("the mock Codex Responses upstream returns a generated icon")]

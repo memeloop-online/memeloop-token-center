@@ -82,7 +82,10 @@ async fn native_codex_complex_contract_preserves_wire_and_does_not_replay_ordina
         let returned = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        assert!(!String::from_utf8_lossy(&returned).contains("private-upstream-diagnostic-canary"));
+        assert_eq!(
+            String::from_utf8_lossy(&returned).contains("private-upstream-diagnostic-canary"),
+            rejected
+        );
         if rejected {
             cancellation::assert_single_unknown_receipt(
                 &fixture,
