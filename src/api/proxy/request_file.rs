@@ -42,5 +42,11 @@ pub(super) async fn parse(
     })
     .await
     .map_err(|_| AppError::internal("request_json_parse_worker"))?;
-    result.map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))
+    result.map_err(|error| {
+        if error.is_io() {
+            AppError::capacity_error("request_spool_read_failed")
+        } else {
+            AppError::BadRequest("request body must be valid JSON".into())
+        }
+    })
 }
