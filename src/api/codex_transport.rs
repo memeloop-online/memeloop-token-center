@@ -331,6 +331,21 @@ where
     TEST_ENDPOINT.scope(endpoint, future).await
 }
 
+/// Carry the test endpoint into a spawned owner without adding a production override.
+#[cfg(test)]
+pub(in crate::api) fn inherit_test_endpoint<F>(future: F) -> impl Future<Output = F::Output>
+where
+    F: Future,
+{
+    let endpoint = TEST_ENDPOINT.try_with(Clone::clone).ok();
+    async move {
+        match endpoint {
+            Some(endpoint) => TEST_ENDPOINT.scope(endpoint, future).await,
+            None => future.await,
+        }
+    }
+}
+
 /// Rewrite only the upstream wire document. The original downstream body is
 /// archived by `proxy()` before this document is sent.
 #[cfg(test)]

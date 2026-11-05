@@ -395,7 +395,7 @@ async function largeChat(url: string, key: string, bytes: number): Promise<Obj> 
       resolveResponse({ status, bytes_received: received, sha256: hash.digest("hex"), request_id: requestId, client_error: error === undefined ? null : error instanceof Error ? error.name : String(error) });
     };
     const request = requestForURL(target, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json", "content-length": body.length, connection: "close" } }, (response) => {
-      status = response.statusCode ?? 0; requestId = responseHeaders(response)["x-request-id"] ?? "";
+      status = response.statusCode ?? 0; requestId = responseHeaders(response)["x-mtc-request-id"] ?? "";
       void (async () => { try { for await (const raw of response) { const chunk = Buffer.from(raw); received += chunk.length; hash.update(chunk); } finish(); } catch (error) { finish(error); } })();
     });
     request.setTimeout(180_000, () => request.destroy(new HarnessFailure("large chat timed out after 180000 ms")));
@@ -407,7 +407,7 @@ async function verifyLargeResponseArchive(url: string, key: string, token: strin
   const expected = createHash("sha256");
   for (const frame of chatSseFrames(bytes, 256 * 1024)) expected.update(frame);
   const expectedHash = expected.digest("hex");
-  if (client.status !== 200 || client.bytes_received !== bytes || client.sha256 !== expectedHash || client.client_error !== null || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(client.request_id)) throw new HarnessFailure("large response client status, identity, complete bytes or hash mismatch");
+  if (client.status !== 200 || client.bytes_received !== bytes || client.sha256 !== expectedHash || client.client_error !== null || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(client.request_id)) throw new HarnessFailure(`large response client status, identity, complete bytes or hash mismatch: ${JSON.stringify({ ...client, expected_bytes: bytes, expected_sha256: expectedHash })}`);
   const deadline = performance.now() + 20_000;
   const reader = new DatabaseSync(databasePath, { readOnly: true, timeout: 1000 });
   let evidence: Obj = {};
