@@ -979,7 +979,15 @@ async fn proxy_with_cancellation_guard(
     let mut state = state.pin_application_plugins().await?;
     plugin_snapshot.finish("completed", None, None);
     let proxy_lifecycle_permit = state.proxy_lifecycles.start();
-    if !memory.try_reserve_json(&body) {
+    if !state
+        .responses_request_spool
+        .reclaim_for(|| memory.try_reserve_json(&body))
+    {
+        let (used_bytes, capacity_bytes, _, _) = state.proxy_memory_budget.snapshot();
+        tracing::warn!(%request_id, stage = "request_json_admission",
+            actual_body_bytes = body.len(), used_bytes, capacity_bytes,
+            has_durable_source = conversation_spool.is_some(),
+            "request JSON working allocation unavailable after durable cache reclamation");
         state
             .metrics
             .record_proxy_memory_rejection(crate::metrics::ProxyMemoryRejectionStage::Json);
@@ -1218,7 +1226,11 @@ async fn proxy_with_cancellation_guard(
         .ok_or_else(|| AppError::internal("proxy_request_source_locator"))?
         .to_owned();
     let conversation_body = if source_backed {
-        ConversationBody::source_backed(source.clone(), original_request_json)?
+        ConversationBody::source_backed(
+            source.clone(),
+            original_request_json,
+            memory.request_json_reserved_bytes(),
+        )
     } else {
         drop(original_request_json);
         ConversationBody::InMemory(body.clone())
@@ -1441,6 +1453,30 @@ async fn proxy_with_cancellation_guard(
                     stage = "upstream_candidate_selection",
                     "proxy candidate selection failed"
                 );
+                if matches!(error, AppError::Capacity { .. } | AppError::Overloaded) {
+                    let code = error.diagnostic_category().to_owned();
+                    let response = error.into_response();
+                    let (parts, body) = response.into_parts();
+                    let body = axum::body::to_bytes(body, 64 * 1024)
+                        .await
+                        .map_err(|_| AppError::internal("local_admission_error_body"))?;
+                    let mut response = finish_buffered_request(
+                        &buffered_request,
+                        parts.status,
+                        body,
+                        "application/json",
+                        (
+                            TokenUsage::default(),
+                            crate::model::RequestUsageBasis::NotObserved,
+                        ),
+                        Some(code),
+                    )
+                    .await?;
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                    return Ok(response);
+                }
                 return finish_proxy_failure(&buffered_request, "upstream_candidate_invalid").await;
             }
         };
@@ -1910,6 +1946,8 @@ async fn proxy_with_cancellation_guard(
     active_route.release_request_buffers();
     if let Some(conversation) = buffered_request.conversation.as_ref() {
         conversation.release_working_copies(&buffered_request.memory);
+    } else {
+        buffered_request.memory.release_unretained_json();
     }
     let is_codex_route = active_route.is_codex();
     let codex_downstream_stream = active_route.codex_downstream_stream;
@@ -2449,8 +2487,7 @@ enum ConversationBody {
     Spool(std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>),
     ProjectedSpool {
         spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
-        request_json: std::sync::Arc<Value>,
-        retained_bytes: usize,
+        json_memory_bytes: usize,
     },
 }
 
@@ -2458,22 +2495,13 @@ impl ConversationBody {
     fn source_backed(
         spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
         request_json: Value,
-    ) -> Result<Self, AppError> {
-        let mut semantic = serde_json::Map::new();
-        if let Value::Object(mut request) = request_json {
-            for field in ["messages", "input"] {
-                if let Some(value) = request.remove(field) {
-                    semantic.insert(field.to_owned(), value);
-                }
-            }
-        }
-        let request_json = Value::Object(semantic);
-        let retained_bytes = crate::gateway_body::memory::json_encoded_length(&request_json)?;
-        Ok(Self::ProjectedSpool {
+        json_memory_bytes: usize,
+    ) -> Self {
+        drop(request_json);
+        Self::ProjectedSpool {
             spool,
-            request_json: std::sync::Arc::new(request_json),
-            retained_bytes,
-        })
+            json_memory_bytes,
+        }
     }
 
     fn len(&self) -> usize {
@@ -2504,7 +2532,10 @@ impl ConversationBody {
                 .read_all()
                 .await
                 .map_err(|_| AppError::capacity_error("request_spool_read_failed")),
-            Self::ProjectedSpool { .. } => Err(AppError::internal("proxy_read_1")),
+            Self::ProjectedSpool { spool, .. } => spool
+                .read_all()
+                .await
+                .map_err(|_| AppError::capacity_error("request_spool_read_failed")),
         }
     }
 
@@ -2517,15 +2548,9 @@ impl ConversationBody {
                 // them here made projection fail after the budget charge was released.
                 memory.release_source_backed_conversation_working_copies(spool.len())
             }
-            Self::ProjectedSpool {
-                spool,
-                retained_bytes,
-                ..
-            } => {
-                spool.release_retained();
-                memory.release_source_backed_conversation_working_copies(
-                    spool.len().saturating_sub(*retained_bytes),
-                )
+            Self::ProjectedSpool { spool, .. } => {
+                spool.release_durable_retained();
+                memory.release_source_backed_conversation_working_copies(spool.len())
             }
         }
     }
@@ -2544,6 +2569,21 @@ struct ProxyConversationProjection<'a> {
 }
 
 impl ProxyConversation {
+    fn terminal_receipt_seed(
+        &self,
+        upstream_response_id: Option<&str>,
+    ) -> crate::proxy_lifecycle::pending_terminal::OwnedConversation {
+        crate::proxy_lifecycle::pending_terminal::OwnedConversation::capture(
+            ProxyConversationInput {
+                key: &self.key,
+                request_json: &serde_json::json!({}),
+                hints: &self.hints,
+                client_name: self.client_name.as_deref(),
+                upstream_response_id,
+            },
+        )
+    }
+
     fn take_for_terminal(&self) -> Option<Self> {
         let admission = std::mem::replace(
             &mut *self.projection_admission.lock().ok()?,
@@ -2576,7 +2616,7 @@ impl ProxyConversation {
             ConversationBody::InMemory(_) => {}
             #[cfg(test)]
             ConversationBody::Spool(spool) => spool.release_retained(),
-            ConversationBody::ProjectedSpool { spool, .. } => spool.release_retained(),
+            ConversationBody::ProjectedSpool { spool, .. } => spool.release_durable_retained(),
         }
     }
 
@@ -2593,7 +2633,9 @@ impl ProxyConversation {
         deadline: tokio::time::Instant,
     ) -> bool {
         let (projection_bytes, projection_weight) = match &self.request_body {
-            ConversationBody::ProjectedSpool { .. } => (0, 0),
+            ConversationBody::ProjectedSpool {
+                json_memory_bytes, ..
+            } => (*json_memory_bytes, 1),
             body => (body.len(), body.projection_weight()),
         };
         let admission = memory
@@ -2626,27 +2668,15 @@ impl ProxyConversation {
                 .map_err(|_| AppError::internal("proxy_project_1"))?;
             std::mem::replace(&mut *current, ConversationProjectionAdmission::Rejected)
         };
-        if let ConversationBody::ProjectedSpool { request_json, .. } = &self.request_body {
-            let projection_memory = match admission {
-                ConversationProjectionAdmission::Deferred => None,
-                ConversationProjectionAdmission::Reserved(permit) => Some(permit),
-                ConversationProjectionAdmission::Rejected => {
-                    return Err(AppError::capacity_error("proxy_memory_projection"));
-                }
-            };
-            return Ok(ProxyConversationProjection {
-                conversation: self,
-                request_json: request_json.clone(),
-                _memory: projection_memory,
-            });
-        }
+        let (projection_bytes, projection_weight) = match &self.request_body {
+            ConversationBody::ProjectedSpool {
+                json_memory_bytes, ..
+            } => (*json_memory_bytes, 1),
+            body => (body.len(), body.projection_weight()),
+        };
         let projection_memory = match admission {
             ConversationProjectionAdmission::Deferred => memory
-                .reserve_conversation_projection(
-                    self.request_body.len(),
-                    self.request_body.projection_weight(),
-                    deadline,
-                )
+                .reserve_conversation_projection(projection_bytes, projection_weight, deadline)
                 .ok_or(AppError::capacity_error("proxy_memory_projection"))?,
             ConversationProjectionAdmission::Reserved(permit) => permit,
             ConversationProjectionAdmission::Rejected => {
@@ -2848,6 +2878,8 @@ async fn execute_component_provider(
     .await;
     if let Some(conversation) = request.conversation.as_ref() {
         conversation.release_working_copies(&request.memory);
+    } else {
+        request.memory.release_unretained_json();
     }
     request.state.metrics.observe_upstream(
         driver,
@@ -3583,6 +3615,9 @@ async fn finish_buffered_request_before_deadline(
     request.state.pending_terminals.submit_with_preparation(
         snapshot,
         (body.clone(), request.memory.clone(), _response_buffer),
+        conversation
+            .as_ref()
+            .map(|conversation| conversation.terminal_receipt_seed(response_id.as_deref())),
         prepare_terminal_conversation(
             conversation,
             request.memory.clone(),

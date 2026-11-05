@@ -28,7 +28,9 @@ mod empty;
 pub mod uninstall;
 pub use empty::RegisterEmptyInventory;
 pub mod installation;
+mod inventory_lock;
 pub mod prepare;
+mod request_dependencies;
 mod retained_installation;
 const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 const COMPILATION_DEADLINE: Duration = Duration::from_secs(35);
@@ -62,6 +64,7 @@ pub struct ApplicationRevision {
 pub struct ApplicationPluginStatus {
     pub current: Option<ApplicationRevision>,
     pub candidates: Vec<ApplicationPluginCandidate>,
+    pub runtime: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -96,6 +99,8 @@ pub struct RollbackApplicationPlugin {
 pub struct ApplicationPlugins {
     db: Database,
     current: std::sync::RwLock<CurrentSnapshot>,
+    baseline_provider_ids: std::collections::BTreeSet<String>,
+    request_dependencies: tokio::sync::Mutex<Option<(ApplicationRevision, bool)>>,
     refresh: tokio::sync::Mutex<()>,
     inventory: tokio::sync::RwLock<BTreeMap<String, PreinstalledInventory>>,
     inventory_file: Option<PathBuf>,
@@ -122,6 +127,7 @@ struct CurrentSnapshot {
     snapshot: Option<Arc<ApplicationPluginSnapshot>>,
     initialized: bool,
     error: Option<&'static str>,
+    inventory_error: Option<&'static str>,
 }
 
 struct RefreshAttempt<'a> {
@@ -238,11 +244,14 @@ impl LoadFailure {
 
 impl ApplicationPlugins {
     pub async fn status(&self) -> Result<ApplicationPluginStatus, AppError> {
-        self.refresh_inventory().await?;
+        // The installation page must remain available to explain and recover
+        // an unavailable inventory. Keep its last validated candidate list.
+        let _ = self.refresh_inventory().await;
         let current = self.db.optional_application_plugin_head().await?;
         let staged = self.db.staged_application_plugin_ids().await?;
         Ok(ApplicationPluginStatus {
             current,
+            runtime: self.refresh_status(),
             candidates: self
                 .inventory
                 .read()
@@ -269,7 +278,7 @@ impl ApplicationPlugins {
     pub fn new(
         db: Database,
         inventory: BTreeMap<String, PreinstalledInventory>,
-        _baseline: &PluginRuntime,
+        baseline: &PluginRuntime,
     ) -> Result<Self, AppError> {
         for (id, entry) in &inventory {
             validate_inventory_id(id)?;
@@ -280,6 +289,12 @@ impl ApplicationPlugins {
         Ok(Self {
             db,
             current: std::sync::RwLock::new(CurrentSnapshot::default()),
+            baseline_provider_ids: baseline
+                .provider_types()
+                .into_iter()
+                .map(|provider| provider.id)
+                .collect(),
+            request_dependencies: tokio::sync::Mutex::new(None),
             refresh: tokio::sync::Mutex::new(()),
             inventory: tokio::sync::RwLock::new(inventory),
             inventory_file: None,
@@ -314,11 +329,23 @@ impl ApplicationPlugins {
         }
         let mut authority = Self::new(db, BTreeMap::new(), baseline)?;
         authority.inventory_file = Some(path);
-        authority.refresh_inventory().await?;
+        // Keep the authority even when optional distribution files are absent
+        // or invalid. Request dependency classification still consults the
+        // published receipt; required policies cannot fall back to baseline.
+        let _ = authority.refresh_inventory().await;
         Ok(authority)
     }
 
     async fn refresh_inventory(&self) -> Result<(), AppError> {
+        let result = self.refresh_inventory_inner().await;
+        self.current
+            .write()
+            .map_err(|_| AppError::internal("application_inventory_status"))?
+            .inventory_error = result.as_ref().err().map(|_| "inventory_unavailable");
+        result
+    }
+
+    async fn refresh_inventory_inner(&self) -> Result<(), AppError> {
         #[cfg(test)]
         self.inventory_refreshes
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -631,6 +658,29 @@ impl ApplicationPlugins {
         Ok(current.snapshot.clone())
     }
 
+    /// A cold background refresh is not request admission. Resolve the actual
+    /// published dependency instead: an empty head uses the startup runtime,
+    /// while a published policy must still be loaded and validated. Warm
+    /// requests retain the last verified atomic runtime/catalog without I/O.
+    pub async fn request_snapshot(
+        self: &Arc<Self>,
+    ) -> Result<Option<Arc<ApplicationPluginSnapshot>>, AppError> {
+        {
+            let current = self
+                .current
+                .read()
+                .map_err(|_| AppError::internal("application_current_snapshot_1"))?;
+            if current.initialized {
+                return Ok(current.snapshot.clone());
+            }
+        }
+        if self.baseline_is_independent().await? {
+            return Ok(None);
+        }
+        self.refresh_current_inner(true).await?;
+        self.current_snapshot()
+    }
+
     pub fn refresh_status(&self) -> serde_json::Value {
         let Ok(current) = self.current.read() else {
             return json!({"ready": false, "error": "snapshot_lock_failed"});
@@ -638,12 +688,25 @@ impl ApplicationPlugins {
         json!({
             "ready": current.initialized,
             "revision": current.snapshot.as_ref().map(|snapshot| &snapshot.receipt),
-            "error": current.error,
+            "error": current.error.or(current.inventory_error),
         })
     }
 
     pub async fn refresh_current(self: &Arc<Self>) -> Result<(), AppError> {
+        self.refresh_current_inner(false).await
+    }
+
+    async fn refresh_current_inner(self: &Arc<Self>, only_if_cold: bool) -> Result<(), AppError> {
         let _refresh = self.refresh.lock().await;
+        if only_if_cold
+            && self
+                .current
+                .read()
+                .map_err(|_| AppError::internal("application_current_snapshot_1"))?
+                .initialized
+        {
+            return Ok(());
+        }
         let mut attempt = RefreshAttempt {
             current: &self.current,
             completed: false,

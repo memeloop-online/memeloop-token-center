@@ -155,6 +155,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         )
         .route("/internal/v1/plugins", get(plugin_manifests))
         .route(
+            "/internal/v1/plugins/mtc-health-intelligence/private-data/concurrency-advice",
+            get(super::super::plugin_private_data::concurrency_advice),
+        )
+        .route(
             "/internal/v1/plugins/runtime-access",
             get(super::super::plugins::application_plugin_access),
         )
@@ -247,6 +251,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/reconcile",
             post(reconcile_quota_reset),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/recover",
+            post(recover_quota_reset),
         )
         .route(
             "/internal/v1/native-oauth-imports/capabilities",
