@@ -6,7 +6,7 @@ use std::sync::{
 };
 
 pub(super) async fn parse(
-    file: std::fs::File,
+    file: Box<dyn Read + Send + Sync>,
     memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 ) -> Result<Value, AppError> {
     struct Cancel(Arc<AtomicBool>);
@@ -16,7 +16,7 @@ pub(super) async fn parse(
         }
     }
     struct Reader {
-        file: std::fs::File,
+        file: Box<dyn Read + Send + Sync>,
         cancel: Arc<AtomicBool>,
     }
     impl Read for Reader {

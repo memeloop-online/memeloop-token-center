@@ -815,7 +815,7 @@ mod request_file;
 
 enum RequestInput {
     Bytes(Bytes),
-    File(crate::gateway_body::request_spool::VerifiedJsonFile),
+    File(crate::gateway_body::request_spool::VerifiedJsonInput),
 }
 
 pub(super) async fn proxy(
@@ -843,7 +843,7 @@ pub(super) async fn proxy(
 pub(super) async fn proxy_spooled_responses(
     state: AppState,
     headers: HeaderMap,
-    body: crate::gateway_body::request_spool::VerifiedJsonFile,
+    body: crate::gateway_body::request_spool::VerifiedJsonInput,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
     protocol: Protocol,
@@ -1009,7 +1009,7 @@ async fn proxy_with_cancellation_guard(
             (value, body)
         }
         RequestInput::File(file) => (
-            request_file::parse(file.into_file(), memory.clone()).await?,
+            request_file::parse(file.into_reader(), memory.clone()).await?,
             Bytes::new(),
         ),
     };

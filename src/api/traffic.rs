@@ -101,22 +101,12 @@ pub(super) async fn proxy_openai_responses_compact(
 async fn replay_native_request_file(
     state: &AppState,
     spool: &std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
-) -> Result<crate::gateway_body::request_spool::VerifiedJsonFile, AppError> {
-    const WORKING_BYTES: usize = 4 * crate::gateway_body::request_spool::REQUEST_SPOOL_CHUNK_BYTES;
-    // Reclaim only completed durable cache entries; contention then queues
-    // before reading the source, without a new rejection or deadline.
-    state
-        .responses_request_spool
-        .reclaim_for(|| state.proxy_memory_budget.temporary(WORKING_BYTES).is_ok());
-    let _working = state
-        .proxy_memory_budget
-        .streaming_working_set(WORKING_BYTES)
-        .await
-        .map_err(|_| AppError::capacity_error("request_spool_memory_closed"))?;
+) -> Result<crate::gateway_body::request_spool::VerifiedJsonInput, AppError> {
     spool
-        .verified_json_file(std::path::Path::new(
-            &state.config.responses_request_spool_path,
-        ))
+        .verified_json_file(
+            std::path::Path::new(&state.config.responses_request_spool_path),
+            &state.proxy_memory_budget,
+        )
         .await
         .map_err(|_| AppError::capacity_error("request_spool_read_failed"))
 }
