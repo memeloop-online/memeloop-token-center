@@ -97,3 +97,33 @@ pub(in crate::api) fn parse_unique_json(data: &[u8]) -> Result<Value, &'static s
         .map_err(|_| "upstream_invalid_response")?;
     Ok(value)
 }
+
+/// Preserve duplicate-key and trailing-data rejection when replaying a file.
+pub(in crate::api) fn parse_unique_json_reader(
+    reader: impl std::io::Read,
+) -> Result<Value, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let value = UniqueJsonSeed.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}
+
+#[cfg(test)]
+mod reader_tests {
+    use super::*;
+    #[test]
+    fn file_reader_keeps_duplicate_and_trailing_data_contract() {
+        for source in [
+            r#"{"input":["你好",{"value":1}],"model":"m"}"#,
+            r#"{"model":"first","model":"second"}"#,
+            r#"{} true"#,
+            r#"{"input":[1,}"#,
+        ] {
+            let bytes = source.as_bytes();
+            assert_eq!(
+                parse_unique_json(bytes).map_err(|_| ()),
+                parse_unique_json_reader(std::io::Cursor::new(bytes)).map_err(|_| ())
+            );
+        }
+    }
+}

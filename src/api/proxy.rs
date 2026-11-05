@@ -811,24 +811,17 @@ async fn execute_component_primary(
     .await
 }
 
-pub(super) async fn proxy(
-    state: AppState,
-    headers: HeaderMap,
-    body: Bytes,
-    protocol: Protocol,
-    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
-) -> Result<Response, AppError> {
-    let key = authenticate_downstream(&headers, &state).await?;
-    proxy_with_identity_and_conversation_spool(
-        state, headers, body, protocol, key, None, None, memory, None,
-    )
-    .await
+mod request_file;
+
+enum RequestInput {
+    Bytes(Bytes),
+    File(crate::gateway_body::request_spool::VerifiedJsonInput),
 }
 
-pub(super) async fn proxy_spooled_responses(
+pub(super) async fn proxy_spooled(
     state: AppState,
     headers: HeaderMap,
-    body: Bytes,
+    body: crate::gateway_body::request_spool::VerifiedJsonInput,
     memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
     protocol: Protocol,
@@ -837,7 +830,7 @@ pub(super) async fn proxy_spooled_responses(
     proxy_with_identity_and_conversation_spool(
         state,
         headers,
-        body,
+        RequestInput::File(body),
         protocol,
         key,
         None,
@@ -864,7 +857,7 @@ pub(in crate::api) async fn proxy_with_identity(
     proxy_with_identity_and_conversation_spool(
         state,
         headers,
-        body,
+        RequestInput::Bytes(body),
         protocol,
         key,
         pinned_route,
@@ -910,7 +903,7 @@ pub(in crate::api) async fn proxy_with_pinned_account(
 async fn proxy_with_identity_and_conversation_spool(
     state: AppState,
     headers: HeaderMap,
-    body: Bytes,
+    body: RequestInput,
     protocol: Protocol,
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
@@ -940,7 +933,7 @@ async fn proxy_with_identity_and_conversation_spool(
 async fn proxy_with_cancellation_guard(
     state: AppState,
     headers: HeaderMap,
-    body: Bytes,
+    body: RequestInput,
     protocol: Protocol,
     key: AuthenticatedKey,
     pinned_route: Option<Uuid>,
@@ -949,6 +942,14 @@ async fn proxy_with_cancellation_guard(
     conversation_spool: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     cancellation: &mut lifecycle::CancellationGuard,
 ) -> Result<Response, AppError> {
+    let body_length = match &body {
+        RequestInput::Bytes(body) => body.len(),
+        RequestInput::File(file) => file.length(),
+    };
+    let raw_reserved = match &body {
+        RequestInput::Bytes(body) => body.len(),
+        RequestInput::File(_) => 0,
+    };
     let official_codex_client =
         crate::api::request_normalization::is_official_codex_user_agent(&headers);
     let diagnostic_context = proxy_diagnostics::Context::current();
@@ -958,19 +959,19 @@ async fn proxy_with_cancellation_guard(
     let preparation = proxy_diagnostics::Phase::new(diagnostic_context, "request_preparation");
     let _request_buffer = state
         .metrics
-        .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, body.len());
+        .memory_usage(crate::metrics::MemoryComponent::RequestBuffer, raw_reserved);
     let plugin_snapshot =
         proxy_diagnostics::Phase::new(diagnostic_context, "application_plugin_snapshot");
     let mut state = state.pin_application_plugins().await?;
     plugin_snapshot.finish("completed", None, None);
     let proxy_lifecycle_permit = state.proxy_lifecycles.start();
-    if !state
-        .responses_request_spool
-        .reclaim_for(|| memory.try_reserve_json(&body))
-    {
+    if !state.responses_request_spool.reclaim_for(|| match &body {
+        RequestInput::Bytes(body) => memory.try_reserve_json(body),
+        RequestInput::File(file) => memory.try_reserve_json_shape(file.length(), file.nodes()),
+    }) {
         let (used_bytes, capacity_bytes, _, _) = state.proxy_memory_budget.snapshot();
         tracing::warn!(%request_id, stage = "request_json_admission",
-            actual_body_bytes = body.len(), used_bytes, capacity_bytes,
+            actual_body_bytes = body_length, used_bytes, capacity_bytes,
             has_durable_source = conversation_spool.is_some(),
             "request JSON working allocation unavailable after durable cache reclamation");
         state
@@ -979,24 +980,42 @@ async fn proxy_with_cancellation_guard(
         return Err(AppError::capacity_error("proxy_memory_json"));
     }
     let json_parse = proxy_diagnostics::Phase::new(diagnostic_context, "request_json_parse");
-    let original_request_json: Value = crate::api::sse::parse_unique_json(&body)
-        .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+    let (original_request_json, body) = match body {
+        RequestInput::Bytes(body) => {
+            let value = crate::api::sse::parse_unique_json(&body)
+                .map_err(|_| AppError::BadRequest("request body must be valid JSON".into()))?;
+            (value, body)
+        }
+        RequestInput::File(file) => (
+            request_file::parse(file.into_reader(), memory.clone()).await?,
+            Bytes::new(),
+        ),
+    };
     super::early_request::observe_model(original_request_json.get("model"));
-    json_parse.finish("completed", None, Some(body.len()));
+    json_parse.finish("completed", None, Some(body_length));
     let conversation_hints = conversation_hints(&headers, &original_request_json);
-    tracing::info!(%request_id, phase = "request_shape", bytes = body.len(), compaction_hint = conversation_hints.compaction, "proxy request metadata");
+    tracing::info!(%request_id, phase = "request_shape", bytes = body_length, compaction_hint = conversation_hints.compaction, "proxy request metadata");
     let traffic_policy =
         proxy_diagnostics::Phase::new(diagnostic_context, "request_traffic_policy");
+    // Only pinned internal callers compare the post-policy envelope. The
+    // original downstream bytes remain available for source-backed archival;
+    // ordinary requests need one parsed tree, not an archival clone of it.
+    let pinned_envelope = pinned_route
+        .is_some()
+        .then(|| original_request_json.clone());
     let applied = super::traffic::apply_traffic_policy_with_memory(
         &state,
         &key,
         TrafficPolicyProtocols::same(protocol.name()),
-        original_request_json.clone(),
+        original_request_json,
         memory.clone(),
     )
     .await?;
     traffic_policy.finish("completed", None, None);
-    if pinned_route.is_some() && applied.changes_pinned_envelope(&original_request_json) {
+    if pinned_envelope
+        .as_ref()
+        .is_some_and(|original| applied.changes_pinned_envelope(original))
+    {
         // Pinned internal callers establish their own reviewed request
         // envelope. Traffic policy may still deny it or rank an already
         // authorized account, but must never add tools, replace instructions,
@@ -1009,13 +1028,14 @@ async fn proxy_with_cancellation_guard(
         );
         return Err(AppError::Forbidden);
     }
+    drop(pinned_envelope);
     let request_json = applied.request_json;
     let model = applied.model;
     super::early_request::observe_model(Some(&Value::String(model.clone())));
     let codex_multi_agent_v2_request = matches!(protocol, Protocol::OpenAiResponses)
         && official_codex_client
         && crate::api::request_normalization::has_codex_multi_agent_v2_shape(&request_json);
-    preparation.finish("completed", None, Some(body.len()));
+    preparation.finish("completed", None, Some(body_length));
     let route_preparation = proxy_diagnostics::Phase::new(diagnostic_context, "route_preparation");
     let selection_seed = routing_selection_seed(&key, request_id, &conversation_hints);
     let avoid_route_account = session_route_account_to_avoid(
@@ -1077,7 +1097,7 @@ async fn proxy_with_cancellation_guard(
     };
     let mut route_plan = prepare_authorized_proxy_routes(AuthorizedProxyRoutesInput {
         request: request_context,
-        original_body_length: body.len(),
+        original_body_length: body_length,
         candidates,
     })
     .await?;
@@ -1119,7 +1139,7 @@ async fn proxy_with_cancellation_guard(
                     request_json: &request_json,
                     codex_multi_agent_v2_request,
                 },
-                original_body_length: body.len(),
+                original_body_length: body_length,
                 candidates,
             })
             .await?;
@@ -1196,8 +1216,8 @@ async fn proxy_with_cancellation_guard(
                 .responses_request_spool
                 .capture_with_memory(
                     Body::from(body.clone()),
-                    body.len(),
-                    Some(body.len()),
+                    body_length,
+                    Some(body_length),
                     Some(&memory),
                     0,
                     Some(&request_id.to_string()),
@@ -1211,13 +1231,8 @@ async fn proxy_with_cancellation_guard(
         .ok_or_else(|| AppError::internal("proxy_request_source_locator"))?
         .to_owned();
     let conversation_body = if source_backed {
-        ConversationBody::source_backed(
-            source.clone(),
-            original_request_json,
-            memory.request_json_reserved_bytes(),
-        )
+        ConversationBody::source_backed(source.clone(), memory.request_json_reserved_bytes())
     } else {
-        drop(original_request_json);
         ConversationBody::InMemory(body.clone())
     };
     let started_request = match state
@@ -1243,7 +1258,7 @@ async fn proxy_with_cancellation_guard(
     {
         Ok(started) => started,
         Err(error) => {
-            admission.finish(error.diagnostic_category(), None, Some(body.len()));
+            admission.finish(error.diagnostic_category(), None, Some(body_length));
             tracing::error!(%request_id, stage = "request_transaction_admission", failure_domain = "local_admission", error_category = error.diagnostic_category(), "proxy request admission failed");
             return Err(error);
         }
@@ -1263,7 +1278,7 @@ async fn proxy_with_cancellation_guard(
         | crate::db::RequestArchiveAdmission::Queued => {}
     }
     let reservation = started_request.reservation;
-    admission.finish("completed", None, Some(body.len()));
+    admission.finish("completed", None, Some(body_length));
     let recovery_wait_deadline =
         attempt_budget.recovery_wait_deadline(state.config.upstream_health);
     let client_name = client_name(&headers);
@@ -1282,10 +1297,10 @@ async fn proxy_with_cancellation_guard(
         projection_admission: std::sync::Mutex::new(ConversationProjectionAdmission::Deferred),
     });
     memory.release(
-        body.len(),
+        raw_reserved,
         crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
     );
-    let request_body_length = body.len();
+    let request_body_length = body_length;
     drop(body);
     let mut buffered_request = BufferedRequest {
         session_preference: conversation.as_ref().and_then(|conversation| {
@@ -2425,10 +2440,8 @@ enum ConversationBody {
 impl ConversationBody {
     fn source_backed(
         spool: std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
-        request_json: Value,
         json_memory_bytes: usize,
     ) -> Self {
-        drop(request_json);
         Self::ProjectedSpool {
             spool,
             json_memory_bytes,

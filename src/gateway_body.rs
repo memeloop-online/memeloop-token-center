@@ -280,7 +280,11 @@ async fn admit_request_body_for_route(
 ) -> Result<Request, GatewayBodyAdmissionError> {
     let source_backed = matches!(
         request.uri().path(),
-        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
+        "/v1/chat/completions"
+            | "/v1/messages"
+            | "/v1/messages/count_tokens"
+            | "/v1/alpha/search"
+            | "/v1/embeddings"
     );
     // Request transport needs a correct replay, not a healthy archive service.
     // Missing shared admission falls back to an owned local carrier.
@@ -380,27 +384,11 @@ async fn admit_request_body_for_route(
         {
             request_spool.register_source(request_id, &spool);
         }
-        let body = if route_class == GatewayBodyRouteClass::Responses {
-            Body::empty()
-        } else {
-            if let Some(reservation) = reservation.as_ref()
-                && !request_spool.reclaim_for(|| {
-                    reservation.try_grow(spool.len(), memory::REQUEST_MEMORY_WEIGHT)
-                })
-            {
-                return Err(GatewayBodyAdmissionError::CapacityExhausted);
-            }
-            let bytes = spool
-                .read_all()
-                .await
-                .map_err(|_| GatewayBodyAdmissionError::RequestSpoolUnavailable)?;
-            Body::from(spool.shared_bytes(bytes))
-        };
         if let Some(reservation) = reservation {
             parts.extensions.insert(reservation);
         }
         parts.extensions.insert(spool);
-        return Ok(Request::from_parts(parts, body));
+        return Ok(Request::from_parts(parts, Body::empty()));
     }
     if let Some(reservation) = reservation {
         let read_maximum = declared_content_length
@@ -599,15 +587,11 @@ mod tests {
             )
             .await
             .unwrap();
-            if path.starts_with("/v1/responses") {
-                let captured = admitted
-                    .extensions()
-                    .get::<Arc<request_spool::RequestSpool>>()
-                    .unwrap();
-                assert_eq!(captured.len(), 2);
-            } else {
-                assert_eq!(to_bytes(admitted.into_body(), 1024).await.unwrap(), "{}");
-            }
+            let captured = admitted
+                .extensions()
+                .get::<Arc<request_spool::RequestSpool>>()
+                .unwrap();
+            assert_eq!(captured.read_all().await.unwrap(), "{}");
         }
     }
 
