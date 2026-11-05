@@ -82,7 +82,7 @@ test('Kimi renewal evidence and quota lock recovery preserve uncertainty and sep
     await page.getByText(/重置已被接受，但最新额度暂未读取成功/).waitFor();
     assert.equal(await page.evaluate(() => window.quotaConfirms), 1);
     for (const [mode, message] of [
-      ['recover-stale', /操作记录已变化/],
+      ['recover-stale', /操作尚未结束或记录已变化/],
       ['recover-forbidden', /当前凭据不能解除锁定/],
       ['recover-failed', /核对或解除锁定未能确认/],
     ] as const) {
