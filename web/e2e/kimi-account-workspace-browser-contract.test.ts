@@ -112,7 +112,7 @@ test('account recovery uses the production shell and workspace with contained Fl
     await confirmation.getByRole('button', { name: '取消', exact: true }).click();
     assert.equal(recoveries.length, 0);
     await workspace.getByRole('button', { name: '解除锁定', exact: true }).click();
-    await confirmation.getByRole('button', { name: '确认', exact: true }).click();
+    await confirmation.getByRole('button', { name: '确认继续', exact: true }).click();
     await workspace.getByText('已恢复操作，上次重置结果仍待核对。', { exact: true }).waitFor();
     assert.equal(recoveries.length, 1);
     await workspace.getByRole('button', { name: '上次操作详情', exact: true }).click();
