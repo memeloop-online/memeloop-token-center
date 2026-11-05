@@ -103,7 +103,6 @@ test('real route forms submit explicit model intent, preserve edit policies and 
       await page.locator('.catalog-status').getByRole('button', { name: 'Retry', exact: true }).waitFor();
       await page.getByLabel(/Public model/).fill('renamed-route');
       await page.getByRole('button', { name: 'Routing priority', exact: true }).click();
-      const editor = page.getByRole('region', { name: 'Edit saved-route', exact: true });
       const priority = editor.getByRole('spinbutton', { name: 'Priority', exact: true });
       await priority.fill('7.5');
       assert.equal(await editor.getByRole('button', { name: 'Save', exact: true }).isDisabled(), true);
