@@ -338,8 +338,8 @@ paths:
         JSON (stream=false or omitted) and server-sent events (stream=true).
         Streaming uses the normal gateway backpressure, cancellation, request/session
         archive and usage settlement lifecycle. Consume response.completed before
-        declaring a completed turn. Cancellation may leave usage unknown; it does
-        not imply that no upstream work or billable usage occurred.
+        declaring a completed turn. Cancellation leaves usage unknown until the
+        upstream reports its normal settlement.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters:
