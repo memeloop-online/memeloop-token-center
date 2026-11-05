@@ -9,7 +9,7 @@ import { pluginManagementCopy as copy } from './pluginManagementCopy';
 
 interface Revision { revision: number; inventory_id: string; reason: string; created_at?: number }
 interface Candidate { inventory_id: string; staged: boolean; plugins: Record<string, string[]> }
-interface RuntimeStatus { current: Revision | null; candidates: Candidate[] }
+interface RuntimeStatus { current: Revision | null; candidates: Candidate[]; runtime?: { ready: boolean; error?: string | null } }
 interface Installation {
   id: string; inventory_id: string; actor: string; status: string; packages: string[]; base_revision?: number | null;
   review_digest: string | null; review: { plugins: PluginManifest[] } | null;
@@ -101,13 +101,14 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
   }, [token]);
   useEffect(() => { void load(); }, [load]);
   const installing = history?.installations.some((job) => job.status === 'installing') ?? false;
+  const runtimePending = status?.runtime?.ready === false || Boolean(status?.runtime?.error);
   useEffect(() => {
-    if (!installing) return;
+    if (!installing && !runtimePending) return;
     // Background ticks must not supersede a slow read or a manual refresh.
     // Explicit refreshes still advance generation to reject older results.
-    const timer = window.setInterval(() => { if (activeLoads.current === 0) void load(); }, 3000);
+    const timer = window.setInterval(() => { if (activeLoads.current === 0 && document.visibilityState === 'visible') void load(); }, installing ? 3000 : 10000);
     return () => window.clearInterval(timer);
-  }, [installing, load]);
+  }, [installing, runtimePending, load]);
 
   useEffect(() => {
     if (!canManage) return;
@@ -275,6 +276,7 @@ function PluginRuntimeManagerSession({ token, canManage, onPublished, tenant }: 
     {message && <p className="notice" role="status">{message}</p>}
     {unavailable ? <p className="muted">{text.unavailable}</p> : <>
       {statusError && <p className="notice error" role="alert">{statusError}</p>}
+      {runtimePending && <p className="notice" role="status">{text.runtimePending}</p>}
       {!status && !statusError && <p role="status">{text.loading}</p>}
       {status && <section aria-label={text.active}>
         <h3>{text.active}</h3>

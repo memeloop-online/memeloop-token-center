@@ -146,13 +146,13 @@ fn transformed_body(
 }
 
 pub(in crate::api::proxy) fn translate(
-    response: reqwest::Response,
+    response: impl Into<UpstreamResponse>,
     context: responses_via_anthropic::Context,
     streaming: bool,
     sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<UpstreamResponse, ProxySendError> {
     let diagnostic = crate::api::proxy_diagnostics::Context::current();
-    let mut parts = UpstreamResponse::from(response).into_parts();
+    let mut parts = response.into().into_parts();
     if parts
         .headers
         .get_all(header::CONTENT_ENCODING)

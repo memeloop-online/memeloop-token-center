@@ -50,7 +50,20 @@ pub(crate) struct ProxyMemoryBudget {
 }
 
 impl ProxyMemoryBudget {
-    pub(crate) fn new(bytes: u32) -> Self {
+    pub(crate) fn supports(bytes: u64) -> bool {
+        usize::try_from(bytes).is_ok_and(|bytes| {
+            let units = bytes / UNIT_BYTES;
+            units <= u32::MAX as usize && units <= Semaphore::MAX_PERMITS
+        })
+    }
+
+    pub(crate) fn new(bytes: u64) -> Self {
+        // Production configuration is validated before constructing the budget.
+        // The bound is the semaphore's representation, not a fixed pod size.
+        assert!(
+            Self::supports(bytes),
+            "memory budget exceeds counter representation"
+        );
         Self {
             capacity: bytes as usize,
             permits: Arc::new(Semaphore::new(bytes as usize / UNIT_BYTES)),
@@ -68,6 +81,7 @@ impl ProxyMemoryBudget {
             retained: Mutex::new(None),
             json_body_ceiling: AtomicUsize::new(0),
             json_node_ceiling: AtomicUsize::new(0),
+            json_reserved_bytes: AtomicUsize::new(0),
         })
     }
 
@@ -106,6 +120,7 @@ pub(crate) struct ProxyMemoryReservation {
     retained: Mutex<Option<OwnedSemaphorePermit>>,
     json_body_ceiling: AtomicUsize,
     json_node_ceiling: AtomicUsize,
+    json_reserved_bytes: AtomicUsize,
 }
 
 pub(crate) struct ConversationProjectionPermit {
@@ -534,12 +549,15 @@ impl ProxyMemoryReservation {
         self.response_bytes.store(0, Ordering::Release);
         self.json_body_ceiling.store(0, Ordering::Release);
         self.json_node_ceiling.store(0, Ordering::Release);
+        self.json_reserved_bytes.store(0, Ordering::Release);
     }
 
     /// Keep one raw request-body copy charged after the routed request JSON and
     /// provider working buffers have both been dropped. Terminal projection
     /// reacquires the two transient copies before reparsing the retained body.
     pub(crate) fn release_conversation_working_copies(&self, bytes: usize) {
+        // Unlike a durable source, this path reparses with only a byte-copy
+        // permit at terminal projection. Keep its existing node allowance.
         self.release(bytes, REQUEST_MEMORY_WEIGHT.saturating_sub(1));
     }
 
@@ -547,7 +565,16 @@ impl ProxyMemoryReservation {
     /// after routing. Unlike the in-memory path, no byte-sized reservation
     /// remains live while the upstream response is in flight.
     pub(crate) fn release_source_backed_conversation_working_copies(&self, bytes: usize) {
-        self.release(bytes, REQUEST_MEMORY_WEIGHT);
+        let reserved = self.json_reserved_bytes.swap(0, Ordering::AcqRel);
+        self.release(reserved.max(bytes.saturating_mul(REQUEST_MEMORY_WEIGHT)), 1);
+    }
+
+    pub(crate) fn release_unretained_json(&self) {
+        self.release(self.json_reserved_bytes.swap(0, Ordering::AcqRel), 1);
+    }
+
+    pub(crate) fn request_json_reserved_bytes(&self) -> usize {
+        self.json_reserved_bytes.load(Ordering::Acquire)
     }
 
     /// Reserve the transient JSON-tree copies required to project a retained
@@ -583,6 +610,8 @@ impl ProxyMemoryReservation {
         }
         self.json_body_ceiling.store(body.len(), Ordering::Release);
         self.json_node_ceiling.store(nodes, Ordering::Release);
+        self.json_reserved_bytes
+            .fetch_add(required, Ordering::AcqRel);
         true
     }
 
@@ -660,8 +689,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn four_gib_budget_keeps_full_capacity_and_releases_large_reservations() {
+        let capacity = 4_u64 * 1024 * 1024 * 1024;
+        let budget = ProxyMemoryBudget::new(capacity);
+        assert_eq!(budget.snapshot().1 as u64, capacity);
+        let request = budget.reservation();
+        assert!(request.try_grow(3 * 1024 * 1024 * 1024, 1));
+        assert_eq!(budget.snapshot().0, 3 * 1024 * 1024 * 1024);
+        assert!(!request.try_grow(2 * 1024 * 1024 * 1024, 1));
+        drop(request);
+        assert_eq!(budget.snapshot().0, 0);
+        assert!(!ProxyMemoryBudget::supports(u64::MAX));
+    }
+
+    #[test]
+    fn dispatched_durable_source_releases_json_nodes_with_working_copies() {
+        let budget = ProxyMemoryBudget::new(8 * 1024 * 1024);
+        let memory = budget.reservation();
+        let body = format!("[{}0]", "0,".repeat(2000));
+        assert!(memory.try_grow(body.len(), REQUEST_MEMORY_WEIGHT));
+        assert!(memory.try_reserve_json(body.as_bytes()));
+        memory.release(body.len(), REQUEST_MEMORY_WEIGHT);
+        assert!(budget.snapshot().0 > body.len() * REQUEST_MEMORY_WEIGHT);
+        memory.release_source_backed_conversation_working_copies(body.len());
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(memory.request_json_reserved_bytes(), 0);
+    }
+
+    #[test]
     fn json_admission_is_atomic_when_bytes_fit_but_nodes_do_not() {
-        let budget = ProxyMemoryBudget::new(4 * UNIT_BYTES as u32);
+        let budget = ProxyMemoryBudget::new(4 * UNIT_BYTES as u64);
         let blocker = budget.reservation();
         assert!(blocker.try_grow(2 * UNIT_BYTES, 1));
         let memory = budget.reservation();
@@ -726,7 +783,7 @@ mod tests {
 
     #[test]
     fn failed_response_growth_and_payload_transfer_preserve_existing_permits() {
-        let budget = ProxyMemoryBudget::new(2 * UNIT_BYTES as u32);
+        let budget = ProxyMemoryBudget::new(2 * UNIT_BYTES as u64);
         let memory = budget.reservation();
         assert!(memory.try_grow(1234, 1));
         assert!(memory.reserve_buffered_response(1, tokio::time::Instant::now()));
@@ -832,7 +889,7 @@ mod tests {
     #[test]
     fn sse_streaming_envelope_limits_concurrency_and_releases_capacity() {
         let framed_bytes = 8 * UNIT_BYTES;
-        let budget = ProxyMemoryBudget::new((framed_bytes * SSE_STREAMING_MEMORY_WEIGHT) as u32);
+        let budget = ProxyMemoryBudget::new((framed_bytes * SSE_STREAMING_MEMORY_WEIGHT) as u64);
         let first = budget.reservation();
         let first_permit = first
             .try_reserve_sse_streaming(framed_bytes)
