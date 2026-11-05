@@ -2893,8 +2893,7 @@ async fn execute_component_provider(
                 StatusCode::TOO_MANY_REQUESTS | StatusCode::FORBIDDEN
             ) {
                 let observed_at = unix_millis();
-                let (response, kind, evidence) =
-                    routing::classify_supplier_quota(upstream.into()).await;
+                let (response, kind, evidence) = routing::classify_supplier_quota(upstream).await;
                 if upstream_status == StatusCode::TOO_MANY_REQUESTS || evidence.exhausted {
                     publish_supplier_quota(
                         request.state,
@@ -2990,7 +2989,7 @@ async fn execute_component_provider(
     };
     let has_content_length = upstream.content_length().is_some();
     let upstream_body = match read_bounded_upstream(
-        upstream.into(),
+        upstream,
         maximum.min(MAX_PROXY_RESPONSE_BODY),
         &request.memory,
         request.memory_admission_wait,
