@@ -27,7 +27,7 @@ test('old probe saves cannot change settings or unlock a save in a new account, 
         const save = page.getByRole('button', { name: 'Save probe settings', exact: true });
         await prompt.fill('old account prompt');
         await save.click();
-        await page.waitForFunction(() => (window as FixtureWindow).healthProbeFixture.writes.length === 1);
+        await page.waitForFunction(() => (window as unknown as FixtureWindow).healthProbeFixture.writes.length === 1);
         await page.getByRole('button', { name: `Switch ${scope}`, exact: true }).click();
         await page.waitForFunction(() => {
           const textarea = document.querySelector('textarea');
@@ -35,16 +35,16 @@ test('old probe saves cannot change settings or unlock a save in a new account, 
         });
         await prompt.fill('new account prompt');
         await save.click();
-        await page.waitForFunction(() => (window as FixtureWindow).healthProbeFixture.writes.length === 2);
-        await page.evaluate(failed => (window as FixtureWindow).healthProbeFixture.writes[0].release(failed), fail);
+        await page.waitForFunction(() => (window as unknown as FixtureWindow).healthProbeFixture.writes.length === 2);
+        await page.evaluate(failed => (window as unknown as FixtureWindow).healthProbeFixture.writes[0].release(failed), fail);
         // Let the resolved fetch and React commit finish before asserting.
         await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
         assert.equal(await prompt.inputValue(), 'new account prompt');
         assert.equal(await save.isDisabled(), true, 'old finally must not unlock the current save');
         assert.equal(await page.getByRole('alert').count(), 0);
         assert.equal(await page.getByRole('status').count(), 0, 'old success must not mark new settings saved');
-        assert.equal(await page.evaluate(() => (window as FixtureWindow).healthProbeFixture.writes[1].body.prompt), 'new account prompt');
-        await page.evaluate(() => (window as FixtureWindow).healthProbeFixture.writes[1].release());
+        assert.equal(await page.evaluate(() => (window as unknown as FixtureWindow).healthProbeFixture.writes[1].body.prompt), 'new account prompt');
+        await page.evaluate(() => (window as unknown as FixtureWindow).healthProbeFixture.writes[1].release());
         await page.getByRole('status').waitFor();
         assert.equal(await page.getByRole('status').textContent(), 'Saved');
         assert.equal(await save.isEnabled(), true);
