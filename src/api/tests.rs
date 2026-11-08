@@ -1114,25 +1114,32 @@ async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() 
         "a third synchronous image lifecycle must not have a permit"
     );
 
-    let response = tokio::time::timeout(
-        Duration::from_millis(100),
-        router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(
-            Request::post("/v1/images/generations")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
-                .body(Body::from_stream(futures_util::stream::pending::<
-                    Result<Bytes, Infallible>,
-                >()))
-                .unwrap(),
-        ),
-    )
-    .await
-    .expect("an exhausted image budget must reject without reading the body")
-    .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
+    let polls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = polls.clone();
+    let request = router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(
+        Request::post("/v1/images/generations")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
+            .body(Body::from_stream(futures_util::stream::once(async move {
+                observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok::<Bytes, Infallible>(Bytes::from_static(b"invalid JSON"))
+            })))
+            .unwrap(),
+    );
+    tokio::pin!(request);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut request)
+            .await
+            .is_err(),
+        "an exhausted image budget waits for a permit"
+    );
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 0);
 
     drop(both);
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    drop(response);
     let _released = tokio::time::timeout(
         Duration::from_millis(100),
         fixture.state.image_response_permits.acquire(),
