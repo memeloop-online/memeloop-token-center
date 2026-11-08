@@ -2055,6 +2055,14 @@ mod tests {
             "buffered_response_ready",
         );
         tokio::time::pause();
+        // SQLite runs on a real worker thread. Keep virtual time from advancing
+        // automatically while awaiting it, so only the explicit advance below
+        // can expire a retry deadline.
+        let clock_guard = tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        });
         journal.submit_with_preparation(snapshot.clone(), (), None, async { None });
         journal.start_pending(&database);
         finish_attempts(&journal).await;
@@ -2091,6 +2099,7 @@ mod tests {
                 serde_json::to_value(snapshot).unwrap()
             });
         }
+        clock_guard.abort();
         tokio::time::resume();
         journal.stop_for_test().await;
         database.close().await;
