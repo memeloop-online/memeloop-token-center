@@ -57,7 +57,7 @@ async fn persist_output_token_limit(
     Ok(())
 }
 
-fn output_token_limit_from_snapshot(
+pub(super) fn output_token_limit_from_snapshot(
     snapshot: Option<&str>,
     legacy_ceiling: i64,
 ) -> Result<Option<i64>, AppError> {

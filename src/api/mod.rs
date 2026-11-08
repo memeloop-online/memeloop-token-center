@@ -67,6 +67,7 @@ mod plugin_installer_network;
 mod plugin_private_data;
 mod plugins;
 pub(crate) mod proxy;
+pub(crate) mod settlement_recovery_usage;
 pub(crate) use proxy::MediaAttemptBudget;
 pub(crate) use proxy::{MediaAttemptGuard, MediaAttemptTerminal, classify_media_rate_limit};
 mod proxy_diagnostics;

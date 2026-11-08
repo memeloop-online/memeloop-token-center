@@ -53,6 +53,11 @@ enum Command {
         role: RuntimeRole,
     },
     Migrate,
+    /// Read-only evidence plan for an exact manifest. Never settles or starts workers.
+    PlanPendingSettlementRecovery {
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+    },
     RequestHistory {
         #[command(subcommand)]
         command: memeloop_token_center::request_history::migration::HistoryCommand,
@@ -184,6 +189,13 @@ async fn run() -> Result<(), &'static str> {
     let config = Config::from_env().map_err(|_| "configuration_invalid")?;
 
     match cli.command {
+        Command::PlanPendingSettlementRecovery { manifest } => {
+            let result =
+                memeloop_token_center::db::plan_pending_settlement_recovery(&config, &manifest)
+                    .await
+                    .map_err(|_| "pending_settlement_recovery_plan_failed")?;
+            println!("{result}");
+        }
         Command::RequestHistory { command } => {
             let result =
                 memeloop_token_center::request_history::migration::command(&config, command)

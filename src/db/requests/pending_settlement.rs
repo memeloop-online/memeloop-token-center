@@ -5,6 +5,8 @@ use super::super::*;
 
 const RESERVATION_CONTRACT_SQL: &str = "SELECT r.account_id,r.enforcement_mode,r.reserved_micros,r.reserved_tokens,r.reserved_units,r.price_snapshot_json,q.upstream_account_id,q.model_route_id,q.upstream_model FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id WHERE r.id = $1 AND r.key_id = $2 AND q.id = $3 AND r.status = 'reserved'";
 
+pub mod recovery;
+
 #[cfg(test)]
 mod tests;
 

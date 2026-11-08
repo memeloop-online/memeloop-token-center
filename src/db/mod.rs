@@ -84,6 +84,7 @@ mod providers;
 mod request_history;
 mod requests;
 pub(crate) use requests::EarlyRequestTerminal;
+pub use requests::pending_settlement::recovery::plan_pending_settlement_recovery;
 #[allow(unused_imports)] // Consumed by the separately owned API receipt integration.
 pub(crate) use requests::pending_settlement::{
     PendingProxySettlementAck, PendingProxySettlementClaim, PendingProxySettlementEvidence,
