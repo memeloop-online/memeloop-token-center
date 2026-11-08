@@ -9,9 +9,209 @@ use bytes::Bytes;
 
 struct Fixture {
     state: AppState,
+    key: AuthenticatedKey,
     request_id: Uuid,
     identity: ArchiveSpoolIdentity,
     source: Option<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+}
+
+async fn body_enrichment_preserves_relations(fixture: &Fixture) {
+    let short = serde_json::json!({"messages":[{"role":"user","content":"question"}]});
+    let long = serde_json::json!({"messages":[
+        {"role":"user","content":"question"},
+        {"role":"assistant","content":"answer"},
+        {"role":"user","content":"followup"}
+    ]});
+    for (name, first, second, reverse, compaction, expected) in [
+        ("prefix", &short, &long, false, false, "continues"),
+        ("reverse-prefix", &long, &short, true, false, "continues"),
+        ("compaction", &long, &short, false, true, "compacts"),
+    ] {
+        let mut results = Vec::new();
+        for pending in [false, true] {
+            let session = format!("{name}-{pending}");
+            let first_id = Uuid::now_v7();
+            let second_id = Uuid::now_v7();
+            let now = unix_millis();
+            let mut transaction = fixture.state.db.pool.begin().await.unwrap();
+            for (request_id, body, observed_at, compact) in [
+                (first_id, first, now + i64::from(reverse), false),
+                (second_id, second, now + i64::from(!reverse), compaction),
+            ] {
+                let hints = ConversationHints {
+                    session_id: Some(session.clone()),
+                    compaction: compact,
+                    ..Default::default()
+                };
+                let empty = serde_json::json!({});
+                let bodies = if pending && request_id == second_id {
+                    vec![&empty, body]
+                } else {
+                    vec![body]
+                };
+                for body in bodies {
+                    fixture
+                        .state
+                        .db
+                        .record_conversation_observation_with_snapshot_in_transaction(
+                            &mut transaction,
+                            ConversationObservationInput {
+                                key: &fixture.key,
+                                request_id,
+                                request_json: body,
+                                hints: &hints,
+                                client_name: Some("codex"),
+                                upstream_response_id: None,
+                                observed_at,
+                                attach_request_record: false,
+                                content_materialized: false,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            transaction.commit().await.unwrap();
+            let edges = sqlx::query(
+                "SELECT e.relation_kind, a.request_id AS source_request FROM conversation_edges e JOIN conversation_observations a ON a.id = e.from_observation_id JOIN conversation_observations b ON b.id = e.to_observation_id WHERE a.explicit_session_id = $1 AND b.explicit_session_id = $1",
+            )
+            .bind(&session).fetch_all(&fixture.state.db.pool).await.unwrap();
+            assert_eq!(edges.len(), 1, "{name} pending={pending}");
+            results.push((
+                edges[0].get::<String, _>("relation_kind"),
+                edges[0].get::<String, _>("source_request") == first_id.to_string(),
+            ));
+            let count: i64 = sqlx::query_scalar(
+                "SELECT request_count FROM conversation_key_clusters WHERE key_id = $1 AND explicit_session_id = $2",
+            )
+            .bind(fixture.key.key_id.to_string()).bind(&session)
+            .fetch_one(&fixture.state.db.pool).await.unwrap();
+            assert_eq!(count, 2, "{name} pending={pending}");
+        }
+        assert_eq!(results[0], results[1], "{name} must survive early identity");
+        assert_eq!(results[1].0, expected);
+        assert_eq!(results[1].1, !reverse);
+    }
+}
+
+async fn declared_identity_before_body_contract(database_url: String) {
+    let fixture = Fixture::new(database_url, false).await;
+    body_enrichment_preserves_relations(&fixture).await;
+    let mut hints = ConversationHints {
+        session_id: Some("declared-client-thread".into()),
+        ..Default::default()
+    };
+    hints.labels.insert(
+        "mtc_session_identity_source".into(),
+        "header:thread-id".into(),
+    );
+    sqlx::query("UPDATE conversation_projection_outbox SET hints_json = $1 WHERE request_id = $2")
+        .bind(serde_json::to_string(&hints).unwrap())
+        .bind(fixture.request_id.to_string())
+        .execute(&fixture.state.db.pool)
+        .await
+        .unwrap();
+    let owner = fixture.claim().await;
+    fixture
+        .state
+        .db
+        .project_claimed_conversation_identity(Uuid::now_v7(), fixture.request_id)
+        .await
+        .unwrap();
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(before, 0, "stale worker cannot publish identity");
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let row = sqlx::query("SELECT o.id, o.cluster_id, o.explicit_session_id, o.leaf_node_hash, r.conversation_cluster_id FROM conversation_observations o JOIN request_records r ON r.id = o.request_id WHERE o.request_id = $1")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        row.get::<String, _>("explicit_session_id"),
+        "declared-client-thread"
+    );
+    assert_eq!(
+        row.get::<String, _>("cluster_id"),
+        row.get::<String, _>("conversation_cluster_id")
+    );
+    assert!(
+        row.get::<Option<String>, _>("leaf_node_hash").is_none(),
+        "identity publication must not invent body content"
+    );
+    let filtered = fixture
+        .state
+        .db
+        .source_history_list(&RequestListFilter {
+            limit: 10,
+            typed_ast: Some(crate::filter_ast::TypedFilterAst {
+                conditions: vec![crate::filter_ast::TypedFilterCondition {
+                    field: crate::filter_ast::TypedFilterField::ClientSessionId,
+                    operator: crate::filter_ast::TypedFilterOperator::Equals,
+                    value: crate::filter_ast::TypedFilterValue::Text(
+                        "declared-client-thread".into(),
+                    ),
+                    upper: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        filtered
+            .iter()
+            .any(|request| request.request_id == fixture.request_id)
+    );
+    let observation = row.get::<String, _>("id");
+    fixture.capture().await;
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    assert!(response_archive_spool::process_one_for_test(&fixture.state).await);
+    fixture.assert_completed(true).await;
+    let rows = sqlx::query(
+        "SELECT id, leaf_node_hash FROM conversation_observations WHERE request_id = $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .fetch_all(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<String, _>("id"), observation);
+    assert!(rows[0].get::<Option<String>, _>("leaf_node_hash").is_some());
+    let count: i64 = sqlx::query_scalar(
+        "SELECT request_count FROM conversation_key_clusters WHERE cluster_id = $1",
+    )
+    .bind(row.get::<String, _>("cluster_id"))
+    .fetch_one(&fixture.state.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 1, "body completion must not count identity twice");
+}
+
+#[tokio::test]
+async fn sqlite_declared_identity_is_readable_while_body_is_pending() {
+    let directory = tempfile::tempdir().unwrap();
+    declared_identity_before_body_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("identity.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_declared_identity_is_readable_while_body_is_pending() {
+    let url =
+        std::env::var("MTC_TEST_POSTGRES_URL").expect("identity regression requires CI PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&url).await;
+    declared_identity_before_body_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -242,6 +442,7 @@ impl Fixture {
         );
         Self {
             state,
+            key,
             request_id,
             identity,
             source,
