@@ -563,7 +563,7 @@ async fn send_official_codex_responses_to_endpoint(
 }
 
 #[tokio::test]
-async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the_wire() {
+async fn native_codex_responses_keeps_collaboration_messages_readable_and_preserves_opaque_input() {
     let upstream = MockServer::start().await;
     let fixture = codex_route_fixture("native-collaboration-wire").await;
     Mock::given(method("POST"))
@@ -618,7 +618,7 @@ async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the
     assert!(!v1_namespace.to_string().contains("encrypted"));
 
     let forwarded: Value = requests[1].body_json().unwrap();
-    let expected_v2: Value = serde_json::from_str(include_str!(
+    let mut expected_v2: Value = serde_json::from_str(include_str!(
         "../../kimi_transport/fixtures/codex-multi-agent-v2.json"
     ))
     .unwrap();
@@ -630,6 +630,17 @@ async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the
         requests[1].headers[header::USER_AGENT].to_str().unwrap(),
         "codex_exec/0.154.0"
     );
+    // Native parents advertise readable delegation while unrelated schemas remain intact.
+    for index in [0, 1] {
+        expected_v2["tools"][0]["tools"][index]["parameters"]["properties"]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("encrypted");
+    }
+    expected_v2["input"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("encrypted");
     assert_eq!(forwarded["tools"][0], expected_v2["tools"][0]);
     for tool in [
         &forwarded["tools"][0]["tools"][0],
@@ -639,7 +650,7 @@ async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the
         assert!(
             tool["parameters"]["properties"]["message"]
                 .get("encrypted")
-                .is_some()
+                .is_none()
         );
     }
     let mut expected_input = expected_v2["input"].clone();
