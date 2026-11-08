@@ -33,17 +33,21 @@ async fn read_failures_and_limits_are_distinct_across_spool_metered_and_fallback
                 Some(MAXIMUM),
                 GatewayBodyRejectionReason::BodyReadRejected,
             ),
-            (
-                Body::from(vec![b'x'; MAXIMUM + 1]),
-                None,
-                GatewayBodyRejectionReason::BodyLimitExceeded,
-            ),
-            (
-                Body::empty(),
-                Some(MAXIMUM + 1),
-                GatewayBodyRejectionReason::DeclaredContentLengthExceedsLimit,
-            ),
         ];
+        if route_class != GatewayBodyRouteClass::Responses {
+            cases.extend([
+                (
+                    Body::from(vec![b'x'; MAXIMUM + 1]),
+                    None,
+                    GatewayBodyRejectionReason::BodyLimitExceeded,
+                ),
+                (
+                    Body::empty(),
+                    Some(MAXIMUM + 1),
+                    GatewayBodyRejectionReason::DeclaredContentLengthExceedsLimit,
+                ),
+            ]);
+        }
         if route_class != GatewayBodyRouteClass::Other {
             cases.push((
                 Body::from("{}"),
@@ -70,10 +74,14 @@ async fn read_failures_and_limits_are_distinct_across_spool_metered_and_fallback
             .unwrap_err();
             assert!(
                 matches!(error, GatewayBodyAdmissionError::Rejected(rejection)
-                    if rejection.route_class == route_class
-                        && rejection.reason == reason
-                        && rejection.declared_content_length == declared.map(|length| length as u64)
-                        && rejection.limit_bytes == MAXIMUM),
+                if rejection.route_class == route_class
+                    && rejection.reason == reason
+                    && rejection.declared_content_length == declared.map(|length| length as u64)
+                    && rejection.limit_bytes == if route_class == GatewayBodyRouteClass::Responses {
+                        usize::MAX
+                    } else {
+                        MAXIMUM
+                    }),
                 "{route_class:?}: {error:?}"
             );
             assert_eq!(budget.snapshot().0, 0);
@@ -81,10 +89,17 @@ async fn read_failures_and_limits_are_distinct_across_spool_metered_and_fallback
             assert_eq!(spool.snapshot().active_files, 0);
             assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         }
+        // Source-backed Responses has no configured body-size gate. Other
+        // readers retain the explicit maximum and its distinct size errors.
+        let accepted_length = if route_class == GatewayBodyRouteClass::Responses {
+            MAXIMUM + 1
+        } else {
+            MAXIMUM
+        };
         let admitted = admit_request_body_for_route(
             Request::post("/")
-                .header(header::CONTENT_LENGTH, MAXIMUM)
-                .body(Body::from(vec![b'x'; MAXIMUM]))
+                .header(header::CONTENT_LENGTH, accepted_length)
+                .body(Body::from(vec![b'x'; accepted_length]))
                 .unwrap(),
             None,
             MAXIMUM,
