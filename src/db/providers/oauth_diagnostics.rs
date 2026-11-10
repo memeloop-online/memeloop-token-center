@@ -673,7 +673,17 @@ mod tests {
                 1,
                 created,
                 "old-kimi-operation",
-                OAuthRefreshFailure::new(OAuthRefreshFailureKind::Timeout, None),
+                OAuthRefreshFailure {
+                    kind: OAuthRefreshFailureKind::Timeout,
+                    http_status: Some(200),
+                    observation: Some(crate::oauth::OAuthRefreshObservation {
+                        phase: crate::oauth::OAuthRefreshPhase::ResponseBody,
+                        elapsed_ms: 100,
+                        budget_ms: 0,
+                        connector_failure: false,
+                        timeout_source: Some(crate::oauth::OAuthRefreshTimeoutSource::HttpClient),
+                    }),
+                },
             )
             .await
             .unwrap();

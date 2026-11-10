@@ -62,6 +62,9 @@ impl OAuthRefreshFailure {
     /// Kimi's official OAuth client retries these failures using the same token.
     /// This policy does not apply to quota resets or other OAuth providers.
     pub(crate) fn kimi_retryable(self) -> bool {
+        if matches!(self.http_status, Some(401 | 403)) {
+            return false;
+        }
         matches!(
             self.kind,
             OAuthRefreshFailureKind::Network | OAuthRefreshFailureKind::Timeout
@@ -459,6 +462,30 @@ mod tests {
         assert_eq!(completed.refresh_state, OAuthRefreshState::OutcomeUnknown);
         assert!(completed.automatic_refresh_paused);
         assert!(!completed.reauthorization_required);
+        failure.failure = OAuthRefreshFailure {
+            kind: OAuthRefreshFailureKind::Network,
+            http_status: Some(200),
+            observation: Some(OAuthRefreshObservation {
+                phase: OAuthRefreshPhase::ResponseBody,
+                elapsed_ms: 100,
+                budget_ms: 0,
+                connector_failure: false,
+                timeout_source: None,
+            }),
+        };
+        let mut body_source = metadata();
+        body_source.kimi = true;
+        body_source.diagnostic_json = Some(serde_json::to_string(&failure).unwrap());
+        let body_status = body_source.status(30);
+        assert_eq!(body_status.allowed_actions, ["refresh", "reauthorize"]);
+        assert_eq!(body_status.http_status, Some(200));
+        assert_eq!(
+            body_status.failure_observation.unwrap().phase,
+            OAuthRefreshPhase::ResponseBody
+        );
+        failure.failure.http_status = Some(401);
+        assert!(!failure.allows_kimi_retry(5, 6));
+        failure.failure.http_status = Some(200);
         assert!(!failure.allows_kimi_retry(4, 6));
         assert!(!failure.allows_kimi_retry(5, 10));
         failure.failure =

@@ -293,15 +293,16 @@ async fn refresh_with_client(
         let attempt_request = request
             .try_clone()
             .ok_or_else(|| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
-        let result = super::super::refresh_exchange::execute_started(client, attempt_request, None)
-            .await
-            .and_then(|(status, bytes)| {
-                if status == 200 {
-                    Ok(bytes)
-                } else {
-                    Err(super::super::refresh_exchange::rejected(status, &bytes))
-                }
-            });
+        let result =
+            super::super::refresh_exchange::execute_started(client, attempt_request, None, true)
+                .await
+                .and_then(|(status, bytes)| {
+                    if status == 200 {
+                        Ok(bytes)
+                    } else {
+                        Err(super::super::refresh_exchange::rejected(status, &bytes))
+                    }
+                });
         match result {
             Ok(bytes) => break bytes,
             Err(AppError::OAuthRefresh(failure)) if failure.kimi_retryable() && attempt < 2 => {
@@ -539,8 +540,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn refresh_retries_transient_disconnects_with_one_fenced_operation() {
+    async fn assert_disconnected_refresh_retries(status: Option<u16>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -567,6 +567,9 @@ mod tests {
                             .into_bytes()
                         );
                         server_attempts.fetch_add(1, Ordering::SeqCst);
+                        if let Some(status) = status {
+                            stream.write_all(format!("HTTP/1.1 {status} OK\r\nContent-Length: 128\r\n\r\n{{").as_bytes()).await.unwrap();
+                        }
                         drop(stream);
                     }
                 }
@@ -585,7 +588,19 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(error, AppError::OAuthRefresh(_)));
+        let AppError::OAuthRefresh(failure) = error else {
+            panic!("expected typed network failure")
+        };
+        assert_eq!(failure.kind, OAuthRefreshFailureKind::Network);
+        assert_eq!(failure.http_status, status);
+        assert_eq!(
+            failure.observation.unwrap().phase,
+            if status.is_some() {
+                OAuthRefreshPhase::ResponseBody
+            } else {
+                OAuthRefreshPhase::BeforeHeaders
+            }
+        );
         assert!(guard.started.load(Ordering::SeqCst));
         assert!(!guard.not_sent.load(Ordering::SeqCst));
         shutdown.send(()).unwrap();
@@ -595,6 +610,13 @@ mod tests {
             3,
             "Kimi retries a transient failure three times within its single fenced operation"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_retries_transient_disconnects_before_and_after_headers() {
+        assert_disconnected_refresh_retries(None).await;
+        assert_disconnected_refresh_retries(Some(200)).await;
+        assert_disconnected_refresh_retries(Some(503)).await;
     }
 
     async fn assert_stalled_refresh_preserves_observed_status(status: Option<u16>) {
@@ -663,14 +685,18 @@ mod tests {
         assert!(!observation.connector_failure);
         assert!(matches!(
             failure.kind,
-            OAuthRefreshFailureKind::Timeout | OAuthRefreshFailureKind::ResponseBody
+            OAuthRefreshFailureKind::Timeout | OAuthRefreshFailureKind::Network
         ));
         assert!(!failure.requires_reauthorization());
         assert!(guard.started.load(Ordering::SeqCst));
         assert!(!guard.not_sent.load(Ordering::SeqCst));
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            if status.is_none() { 3 } else { 1 }
+            if matches!(status, Some(401 | 403)) {
+                1
+            } else {
+                3
+            }
         );
     }
 
@@ -731,8 +757,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_timeout_after_headers_preserves_status_without_replay() {
+    async fn refresh_timeout_after_headers_preserves_status_with_bounded_retries() {
         assert_stalled_refresh_preserves_observed_status(Some(200)).await;
+        assert_stalled_refresh_preserves_observed_status(Some(503)).await;
+        assert_stalled_refresh_preserves_observed_status(Some(401)).await;
     }
 
     #[tokio::test]
@@ -1158,7 +1186,7 @@ mod tests {
 
     #[tokio::test]
     async fn authorization_rejection_is_terminal_and_transient_retries_are_bounded() {
-        for (status, attempts) in [(401, 1), (403, 1), (400, 1), (429, 3), (503, 3)] {
+        for (status, attempts) in [(401, 1), (403, 1), (400, 1), (200, 1), (429, 3), (503, 3)] {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
                 .respond_with(
