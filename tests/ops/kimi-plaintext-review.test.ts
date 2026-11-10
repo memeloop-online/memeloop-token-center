@@ -61,3 +61,10 @@ test('provider failure is returned without a retry or exposing a credential in i
   assert.equal(result.review, undefined);
   assert.equal(result.error?.message, 'rejected [redacted]');
 });
+
+ test('a non-JSON gateway failure preserves status and request ID without retry', async () => {
+  const result = await review({ baseUrl: 'https://gateway.invalid/v1', apiKey: 'test-key', model: 'k3.1-pro', task: 'Review.' }, async () => new Response('upstream reset test-key', { status: 503, headers: { 'x-request-id': 'reset-request' } }));
+  assert.equal(result.status, 503);
+  assert.equal(result.request_id, 'reset-request');
+  assert.deepEqual(result.error, { type: 'non_json_response', message: 'upstream reset [redacted]', code: undefined });
+});

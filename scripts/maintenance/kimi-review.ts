@@ -78,7 +78,12 @@ export async function review(options: ReviewOptions, send: typeof fetch = fetch)
   });
   const streaming = response.headers.get('content-type')?.split(';')[0]?.trim() === 'text/event-stream';
   const collected = streaming ? await collectStream(response) : undefined;
-  const data = collected?.data ?? await response.json() as ReviewData;
+  let data: ReviewData = collected?.data ?? {};
+  if (!collected) {
+    const raw = await response.text();
+    try { data = JSON.parse(raw) as ReviewData; }
+    catch { data = { error: { type: 'non_json_response', message: raw } }; }
+  }
   // Return the actual review and finish reason, including an empty or truncated
   // result. Do not substitute reasoning, opaque content or a success summary.
   return {
