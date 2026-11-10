@@ -785,6 +785,18 @@ pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'stat
             "the upstream response reported invalid usage",
         ),
         "upstream_invalid_response" => ("上游响应无效", "the upstream response was invalid"),
+        "upstream_compact_spool_unavailable" => (
+            "压缩响应的临时存储暂不可用",
+            "temporary storage for the compact response is unavailable",
+        ),
+        "upstream_compact_spool_write_failed" => (
+            "压缩响应写入临时存储失败",
+            "writing the compact response to temporary storage failed",
+        ),
+        "upstream_compact_spool_read_failed" => (
+            "压缩响应的临时文件读取不完整",
+            "the compact response temporary file could not be read completely",
+        ),
         "upstream_failed_response" => ("上游响应失败", "the upstream response failed"),
         "upstream_credential_invalid" => ("上游凭据无效", "the upstream credential is invalid"),
         "upstream_credential_unavailable" => {

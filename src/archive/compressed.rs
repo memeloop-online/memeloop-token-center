@@ -7,7 +7,7 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
 use object_store::{GetOptions, GetRange};
 
-use super::{ArchiveDownload, ArchiveStore, path::archive_path};
+use super::{ArchiveDownload, ArchiveStore};
 use crate::error::AppError;
 
 pub(super) const SUFFIX: &str = ".mtcz1";
@@ -59,10 +59,10 @@ struct Metadata {
 
 impl ArchiveStore {
     async fn compressed_metadata(&self, location: &str) -> Result<Metadata, AppError> {
-        let result = self
-            .inner
+        let (store, key) = self.resolve(location)?;
+        let result = store
             .get_opts(
-                &archive_path(location)?,
+                &key,
                 GetOptions {
                     range: Some(GetRange::Suffix(FOOTER)),
                     ..GetOptions::default()
@@ -101,10 +101,10 @@ impl ArchiveStore {
         let metadata = self.compressed_metadata(location).await?;
         let requested = range.unwrap_or(0..metadata.logical);
         super::download::validate_download_range(metadata.logical, Some(&requested), &requested)?;
-        let result = self
-            .inner
+        let (store, key) = self.resolve(location)?;
+        let result = store
             .get_opts(
-                &archive_path(location)?,
+                &key,
                 GetOptions {
                     if_match: metadata.etag.clone(),
                     version: metadata.version.clone(),

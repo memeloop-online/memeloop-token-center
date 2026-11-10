@@ -4,6 +4,39 @@ use super::{
     OAuthRefreshRequestGuard, OAuthRefreshTimeoutSource,
 };
 use crate::error::AppError;
+use std::error::Error as _;
+
+fn body_network_failure(error: &reqwest::Error) -> bool {
+    // Response::bytes wraps both transport and decoding failures as Decode in
+    // reqwest 0.13. Inspect typed causes rather than retrying every decode error.
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(error) = cause.downcast_ref::<hyper::Error>() {
+            if error.is_incomplete_message()
+                || error.is_closed()
+                || error.is_canceled()
+                || error.is_timeout()
+            {
+                return true;
+            }
+        }
+        if let Some(error) = cause.downcast_ref::<std::io::Error>() {
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+            ) {
+                return true;
+            }
+        }
+        source = cause.source();
+    }
+    false
+}
 
 pub(super) async fn execute(
     client: &reqwest::Client,
@@ -11,6 +44,17 @@ pub(super) async fn execute(
     guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<(u16, Vec<u8>), AppError> {
     guard.mark_request_started().await?;
+    execute_started(client, request, Some(guard), false).await
+}
+
+// A provider-owned retry operation keeps its single durable dispatch fence.
+// It must not clear that fence between attempts, including connector failures.
+pub(super) async fn execute_started(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    connector_guard: Option<&dyn OAuthRefreshRequestGuard>,
+    preserve_body_transport_error: bool,
+) -> Result<(u16, Vec<u8>), AppError> {
     let started = tokio::time::Instant::now();
     let observed = |kind, status, phase, connector_failure, timeout_source| {
         AppError::OAuthRefresh(OAuthRefreshFailure {
@@ -31,7 +75,9 @@ pub(super) async fn execute(
             // Only connector evidence proves that no request reached the
             // authorization server. Every ambiguous dispatch retains its fence.
             if error.is_connect() {
-                guard.mark_request_not_sent(&error).await?;
+                if let Some(guard) = connector_guard {
+                    guard.mark_request_not_sent(&error).await?;
+                }
             }
             return Err(observed(
                 if error.is_timeout() {
@@ -49,15 +95,27 @@ pub(super) async fn execute(
         }
     };
     let status = response.status().as_u16();
-    let bytes = super::bounded_body(response).await.map_err(|_| {
-        observed(
-            OAuthRefreshFailureKind::ResponseBody,
-            Some(status),
-            OAuthRefreshPhase::ResponseBody,
-            false,
-            None,
-        )
-    })?;
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| {
+            let kind = if preserve_body_transport_error && error.is_timeout() {
+                OAuthRefreshFailureKind::Timeout
+            } else if preserve_body_transport_error && body_network_failure(&error) {
+                OAuthRefreshFailureKind::Network
+            } else {
+                OAuthRefreshFailureKind::ResponseBody
+            };
+            observed(
+                kind,
+                Some(status),
+                OAuthRefreshPhase::ResponseBody,
+                false,
+                (preserve_body_transport_error && error.is_timeout())
+                    .then_some(OAuthRefreshTimeoutSource::HttpClient),
+            )
+        })?
+        .to_vec();
     Ok((status, bytes))
 }
 

@@ -495,6 +495,8 @@ struct LocalCapture {
     progress: tokio::sync::watch::Sender<(u64, bool)>,
     file: Option<std::fs::File>,
     length: u64,
+    #[cfg(test)]
+    owner: std::sync::Weak<crate::gateway_body::local_body_file::LocalBodyFile>,
 }
 
 impl LocalCapture {
@@ -517,6 +519,10 @@ impl LocalCapture {
             })
             .await
             .map_err(std::io::Error::other)??;
+            #[cfg(test)]
+            {
+                self.owner = Arc::downgrade(&local);
+            }
             self.source
                 .take()
                 .ok_or_else(|| std::io::Error::other("capture closed"))?
@@ -557,17 +563,20 @@ impl LocalCapture {
 }
 
 struct CaptureQueueMemory {
-    // Blocking IO cannot be aborted. Keep admission until the actual IO exits.
-    _archive_permit: tokio::sync::OwnedSemaphorePermit,
-    reservation: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    // Blocking IO cannot be aborted. Its local charge follows the actual IO.
+    _local_metrics: Option<crate::metrics::MemoryUsageGuard>,
+    _archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    reservation: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
 }
 
 impl Drop for CaptureQueueMemory {
     fn drop(&mut self) {
-        self.reservation.release(
-            super::CAPTURE_MEMORY_BYTES,
-            crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-        );
+        if let Some(reservation) = &self.reservation {
+            reservation.release(
+                super::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            );
+        }
     }
 }
 
@@ -707,24 +716,9 @@ impl ResponseArchiveProducer {
             target,
         };
         async move {
-            // Keep the supplier stream unpolled while a bounded writer is busy.
-            // Accepted originals must not disappear merely because another
-            // response still owns the upload envelope.
-            let archive_permit = state
-                .proxy_archive_stream_permits
-                .clone()
-                .acquire_owned()
-                .await
-                .ok()?;
-            let memory = state
-                .persistence
-                .stream_memory
-                .temporary_wait(
-                    super::CAPTURE_MEMORY_BYTES,
-                    crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-                )
-                .await?;
-            let producer = Self::begin_admitted(&state, identity, memory, archive_permit, target);
+            // Capture locally before competing for object-storage upload resources.
+            // The owned writer retains the source until its eventual CAS/root ACK.
+            let producer = Self::begin_admitted(&state, identity, None, None, target);
             admission.disarm();
             Some(producer)
         }
@@ -757,8 +751,8 @@ impl ResponseArchiveProducer {
         Some(Self::begin_admitted(
             state,
             identity,
-            memory,
-            archive_permit,
+            Some(memory),
+            Some(archive_permit),
             CaptureTarget::Response,
         ))
     }
@@ -766,11 +760,15 @@ impl ResponseArchiveProducer {
     fn begin_admitted(
         state: &AppState,
         identity: ArchiveSpoolIdentity,
-        memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
-        archive_permit: tokio::sync::OwnedSemaphorePermit,
+        memory: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
+        archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
         target: CaptureTarget,
     ) -> Self {
         let queue_memory = Arc::new(CaptureQueueMemory {
+            _local_metrics: Some(state.metrics.memory_usage(
+                crate::metrics::MemoryComponent::StreamCapture,
+                super::CHUNK_BYTES,
+            )),
             reservation: memory,
             _archive_permit: archive_permit,
         });
@@ -786,10 +784,6 @@ impl ResponseArchiveProducer {
         let writer = super::OwnedTask::spawn(
             async move {
                 let _queue_memory = writer_memory.clone();
-                let _capture_metrics = writer_state.metrics.memory_usage(
-                    crate::metrics::MemoryComponent::StreamCapture,
-                    super::CAPTURE_MEMORY_BYTES,
-                );
                 match run_response_archive_writer(
                     writer_state.clone(),
                     identity,
@@ -830,6 +824,8 @@ impl ResponseArchiveProducer {
                 progress,
                 file: None,
                 length: 0,
+                #[cfg(test)]
+                owner: std::sync::Weak::new(),
             },
             writer,
             active,
@@ -875,6 +871,13 @@ impl ResponseArchiveProducer {
         self.local.source.take();
         self.local.file.take();
         self.local.progress.send_replace((self.local.length, true));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn local_source_owner_for_test(
+        &self,
+    ) -> std::sync::Weak<crate::gateway_body::local_body_file::LocalBodyFile> {
+        self.local.owner.clone()
     }
 
     #[cfg(test)]
@@ -1156,6 +1159,25 @@ async fn drain_local_capture(
     Ok(WriterOutcome::Sealed)
 }
 
+// Closing an unsealed producer or explicitly abandoning it wakes resource
+// waits. A sealed source remains owned even after every observer disappears.
+async fn capture_abandoned(
+    mut progress: tokio::sync::watch::Receiver<(u64, bool)>,
+    active: Arc<AtomicBool>,
+) {
+    loop {
+        if !active.load(Ordering::Acquire) {
+            return;
+        }
+        if progress.changed().await.is_err() {
+            if !progress.borrow().1 || !active.load(Ordering::Acquire) {
+                return;
+            }
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 async fn run_response_archive_writer(
     mut state: AppState,
     identity: ArchiveSpoolIdentity,
@@ -1167,6 +1189,37 @@ async fn run_response_archive_writer(
     active: Arc<AtomicBool>,
     target: CaptureTarget,
 ) -> Result<WriterOutcome, AppError> {
+    // Upload concurrency and multipart memory belong to this background task,
+    // never to admission of the supplier/client stream. The queued source is a
+    // file and a watch watermark, not a response-sized in-memory channel.
+    let _upload_memory = if memory._archive_permit.is_none() {
+        let permits = state.proxy_archive_stream_permits.clone();
+        let permit = tokio::select! {
+            permit = permits.acquire_owned() => permit
+                .map_err(|_| AppError::internal("capture_upload_admission_closed"))?,
+            () = capture_abandoned(progress.clone(), active.clone()) =>
+                return Ok(writer_interrupted(identity, "abandoned_before_upload")),
+        };
+        let reservation = tokio::select! {
+            reservation = state.persistence.stream_memory.temporary_wait(
+                super::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            ) => reservation.ok_or_else(|| AppError::internal("capture_upload_memory_closed"))?,
+            () = capture_abandoned(progress.clone(), active.clone()) =>
+                return Ok(writer_interrupted(identity, "abandoned_before_upload_memory")),
+        };
+        Some(CaptureQueueMemory {
+            _local_metrics: None,
+            _archive_permit: Some(permit),
+            reservation: Some(reservation),
+        })
+    } else {
+        None
+    };
+    let _upload_metrics = state.metrics.memory_usage(
+        crate::metrics::MemoryComponent::StreamCapture,
+        super::CAPTURE_MEMORY_BYTES,
+    );
     #[cfg(test)]
     pause_begin_for_test(&state).await;
     let staging = format!(

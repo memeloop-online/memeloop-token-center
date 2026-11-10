@@ -28,6 +28,11 @@ pub(super) fn tenant_cas_location(
 }
 
 pub(crate) fn is_tenant_cas_location(tenant_id: Uuid, location: &str) -> bool {
+    let location = match super::routing::split(location) {
+        Ok(Some((_, key))) => key,
+        Ok(None) => location,
+        Err(_) => return false,
+    };
     let prefix = format!("tenants/{tenant_id}/cas/v1/blake3/");
     let Some(rest) = location.strip_prefix(&prefix) else {
         return false;
@@ -52,6 +57,14 @@ fn is_lower_hex_digest(digest: &str) -> bool {
 }
 
 pub(super) fn is_any_v1_cas_location(location: &str) -> bool {
+    let location = if let Some(rest) = location.strip_prefix(super::routing::PREFIX) {
+        let Some((_, key)) = rest.split_once('/') else {
+            return true;
+        };
+        key
+    } else {
+        location
+    };
     let mut segments = location.split('/');
     matches!(
         (
@@ -96,6 +109,14 @@ pub(super) fn is_conversation_root_location(location: &str) -> bool {
 }
 
 pub(super) fn may_include_v1_cas_location(location: &str) -> bool {
+    let location = if let Some(rest) = location.strip_prefix(super::routing::PREFIX) {
+        let Some((_, key)) = rest.split_once('/') else {
+            return false;
+        };
+        key
+    } else {
+        location
+    };
     let mut segments = location.split('/');
     if segments.next() != Some("tenants") {
         return false;

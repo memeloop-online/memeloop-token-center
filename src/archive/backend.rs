@@ -78,9 +78,58 @@ impl ArchiveStore {
             }
         };
 
+        let training = config
+            .training_s3
+            .as_ref()
+            .map(|settings| {
+                let identity_document = serde_json::to_vec(&(
+                    "mtc-training-s3-v1",
+                    &settings.endpoint,
+                    &settings.bucket,
+                    &settings.region,
+                ))
+                .map_err(|_| AppError::storage("archive_training_configuration_invalid"))?;
+                let identity = blake3::hash(&identity_document).to_hex().to_string();
+                let store = AmazonS3Builder::new()
+                    .with_endpoint(&settings.endpoint)
+                    .with_bucket_name(&settings.bucket)
+                    .with_region(&settings.region)
+                    .with_access_key_id(&settings.access_key)
+                    .with_secret_access_key(&settings.secret_key)
+                    .with_allow_http(settings.allow_http)
+                    .with_copy_if_not_exists(S3CopyIfNotExists::Multipart)
+                    .with_client_options(
+                        ClientOptions::new()
+                            .with_allow_http(settings.allow_http)
+                            .with_connect_timeout(Duration::from_millis(
+                                config.s3_timeouts.connect_millis.into(),
+                            ))
+                            .with_timeout(Duration::from_millis(
+                                config.s3_timeouts.request_millis.into(),
+                            )),
+                    )
+                    .with_retry(RetryConfig {
+                        max_retries: 3,
+                        retry_timeout: Duration::from_secs(10),
+                        ..RetryConfig::default()
+                    })
+                    .build()
+                    .map_err(|_| AppError::storage("archive_training_configuration_invalid"))?;
+                Ok::<_, AppError>(super::routing::TrainingStore {
+                    store: Arc::new(store),
+                    identity,
+                })
+            })
+            .transpose()?;
+        if config.training_cas_writes && training.is_none() {
+            return Err(AppError::storage("archive_training_backend_missing"));
+        }
+
         let readiness_path = archive_path(&format!("readiness/{}.bin", uuid::Uuid::now_v7()))?;
         Ok(Self {
             inner,
+            training,
+            training_cas_writes: config.training_cas_writes,
             readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
             readiness_path,
             readiness_deadline: Duration::from_millis(config.s3_timeouts.readiness_millis.into()),
