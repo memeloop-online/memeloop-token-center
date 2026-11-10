@@ -3,6 +3,7 @@ use std::fmt::Write as _;
 
 use super::super::*;
 
+mod identity_projection;
 pub(crate) mod prefix_storage;
 mod projection_retry;
 mod semantic_payload;
@@ -26,8 +27,8 @@ const MAX_CONVERSATION_FINGERPRINT_JSON_BYTES: usize = 70_000;
 // PostgreSQL's much larger protocol limit.
 const CONVERSATION_INSERT_BATCH_BIND_LIMIT: usize = 900;
 const SEMANTIC_ATOM_INSERT_BIND_COUNT: usize = 7;
-// The worker cgroup limit is 384Mi. A full session's raw JSON is at most
-// 128MiB; keep each insert batch far below the rest of that budget.
+// The worker streams body objects; SQL insert batches contain references and
+// stay below the worker's memory budget.
 const CONVERSATION_INSERT_BATCH_BYTES: usize = 256 * 1024;
 const CONTEXT_NODE_INSERT_BIND_COUNT: usize = 6;
 const EXPLICIT_SESSION_LOCK_SEED: i64 = 734_627_102_948_338;
@@ -101,8 +102,6 @@ pub(crate) struct SessionBodyLocators {
 pub(crate) struct ConversationProjectionEnqueueInput<'a> {
     pub(crate) request_id: Uuid,
     pub(crate) key: &'a AuthenticatedKey,
-    /// 结算时已经收好的对话字段。不是带填充的原始请求 JSON。
-    pub(crate) request_json: &'a serde_json::Value,
     pub(crate) hints: &'a ConversationHints,
     pub(crate) client_name: Option<&'a str>,
     pub(crate) upstream_response_id: Option<&'a str>,
@@ -125,22 +124,9 @@ const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
 const SESSION_BODY_REBUILD_OUTCOME: &str = "session_body";
-const SESSION_BODY_INLINE_REQUEST_LIMIT: usize = 1024 * 1024;
-
-fn inline_session_request(value: &serde_json::Value) -> String {
-    let Ok(encoded) = serde_json::to_string(value) else {
-        return "{}".to_owned();
-    };
-    if encoded.len() > SESSION_BODY_INLINE_REQUEST_LIMIT {
-        "{}".to_owned()
-    } else {
-        encoded
-    }
-}
-
 /// 网关结算只把请求身份放进队列。
 /// 不在这里解析原始请求 JSON 或原始返回 JSON。
-/// 会话正文归档由 worker 读取这两个 locator 之后写入 CNPG。
+/// 会话正文由 worker 读取 locator 后存入对象归档。
 pub(crate) async fn enqueue_conversation_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     input: ConversationProjectionEnqueueInput<'_>,
@@ -148,22 +134,13 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let ConversationProjectionEnqueueInput {
         request_id,
         key,
-        request_json,
         hints,
         client_name,
         upstream_response_id,
         observed_at,
     } = input;
-    // 这里不解析对象存储里的原始请求 JSON。只留下结算时已经收好的对话字段，
-    // 供 locator 仍是 gap:// 时归档。超过上限的内容仍留给对象存储。
-    //
-    // The raw request body never lands in PostgreSQL: object storage owns it, and
-    // this row only carries the bounded conversation fields the projection needs
-    // while the locator is still `gap://`. An earlier revision persisted the full
-    // body into `conversation_semantic_payloads` for every request, which grew the
-    // database by roughly a gigabyte per hour of Codex traffic.
     let payload: Option<(String, String)> = None;
-    let request_json = inline_session_request(request_json);
+    let request_json = "{}";
     let semantic_snapshot = {
         let snapshot = ConversationSemanticSnapshot {
             leaf: None,
@@ -192,7 +169,7 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     .bind(key.tenant_id.to_string())
     .bind(key.key_id.to_string())
     .bind(key.principal_id.to_string())
-    .bind(&request_json)
+    .bind(request_json)
     .bind(&hints_json)
     .bind(client_name)
     .bind(upstream_response_id)
@@ -440,7 +417,6 @@ impl Database {
             ConversationProjectionEnqueueInput {
                 request_id: claim.request_id,
                 key: conversation.key,
-                request_json: conversation.request_json,
                 hints: conversation.hints,
                 client_name: conversation.client_name,
                 upstream_response_id: conversation.upstream_response_id,
@@ -463,6 +439,9 @@ impl Database {
     ) -> Result<(), AppError> {
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
+        let atoms = self
+            .archive_atom_bodies(parse_uuid(tenant_id.to_owned())?, &atoms)
+            .await?;
         let mut transaction = self.begin_write_transaction().await?;
         let result = materialize_conversation_content_with_statement_error(
             &mut transaction,
@@ -701,31 +680,63 @@ impl Database {
         Ok(())
     }
 
-    /// locator 是 gap:// 时，用结算时已经收好的对话字段。不读对象存储。
-    pub async fn session_body_inline_request(
+    /// Long object streams retain their claim while an independent worker
+    /// continues to own the unfinished relational projection.
+    pub(crate) async fn renew_session_body_archive(
         &self,
         lease_owner: Uuid,
         request_id: Uuid,
-    ) -> Result<Option<String>, AppError> {
+    ) -> Result<bool, AppError> {
         let now = unix_millis();
-        let row = sqlx::query(
-            "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+        let updated = sqlx::query(
+            "UPDATE conversation_projection_outbox SET terminal_lease_expires_at = CASE WHEN terminal_lease_owner IS NOT NULL THEN $1 ELSE terminal_lease_expires_at END, lease_expires_at = CASE WHEN terminal_lease_owner IS NULL THEN $1 ELSE lease_expires_at END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3 AND COALESCE(terminal_lease_expires_at, lease_expires_at) > $4",
         )
+        .bind(now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS))
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
         .bind(now)
-        .fetch_optional(&self.pool)
+        .execute(&self.pool)
         .await?;
-        Ok(row.and_then(|row| row.try_get("request_json").ok()))
+        Ok(updated.rows_affected() == 1)
     }
 
-    /// 把已经整理好的会话正文写入 CNPG。媒体 locator 记在 `conversation_media_parts`。
-    /// 不读取对象存储，也不碰 `generation_assets`。
+    /// 先持久化对象，再把正文引用及媒体 locator 写入投影元数据。
     pub async fn prepare_session_body_archive(
         &self,
         lease_owner: Uuid,
         request_id: Uuid,
         atoms: Vec<SemanticAtom>,
+        nodes: &[PrefixNode],
+        media: &[crate::conversation::SessionMediaLocator],
+    ) -> Result<bool, AppError> {
+        let tenant_id: Option<String> = sqlx::query_scalar(
+            "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(tenant_id) = tenant_id else {
+            return Ok(false);
+        };
+        let archived_atoms = self
+            .archive_atom_bodies(parse_uuid(tenant_id)?, atoms)
+            .await?;
+        self.prepare_archived_session_body_archive(
+            lease_owner,
+            request_id,
+            archived_atoms,
+            nodes,
+            media,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_archived_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        archived_atoms: Vec<SemanticAtom>,
         nodes: &[PrefixNode],
         media: &[crate::conversation::SessionMediaLocator],
     ) -> Result<bool, AppError> {
@@ -735,7 +746,7 @@ impl Database {
                 &mut transaction,
                 lease_owner,
                 request_id,
-                atoms,
+                archived_atoms,
                 nodes,
                 media,
             )
@@ -847,34 +858,58 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
-    /// 训练导出只读 CNPG 里的会话正文。不打开、不列出对象存储。
+    /// Walk relational prefix metadata and restore each tenant CAS body.
     pub async fn export_training_dialogue(
         &self,
         tenant_id: Uuid,
         leaf_node_hash: &str,
     ) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS ( \
-                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2 \
-                UNION ALL \
-                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n \
-                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash \
-                WHERE c.depth > 0 AND c.depth < 4096 \
-            ) \
-            SELECT a.content_json FROM chain c \
-            JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash \
-            ORDER BY c.depth ASC LIMIT 4096",
+        use futures_util::TryStreamExt as _;
+
+        let mut rows = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2
+                UNION
+                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n
+                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash
+                WHERE c.depth > 1 AND n.depth = c.depth - 1
+            )
+            SELECT c.node_hash, c.parent_hash, c.depth, a.content_json FROM chain c
+            LEFT JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash
+            ORDER BY c.depth ASC",
         )
         .bind(tenant_id.to_string())
         .bind(leaf_node_hash)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut turns = Vec::with_capacity(rows.len());
-        for row in rows {
-            let content: String = row.try_get("content_json")?;
+        .fetch(&self.pool);
+        let mut turns = Vec::new();
+        let mut previous = None;
+        while let Some(row) = rows.try_next().await? {
+            let parent: Option<String> = row.try_get("parent_hash")?;
+            let depth: i64 = row.try_get("depth")?;
+            if depth
+                != i64::try_from(turns.len())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1)
+                || parent != previous
+            {
+                return Err(AppError::storage("conversation_prefix_incomplete"));
+            }
+            let reference: Option<String> = row.try_get("content_json")?;
+            let content = self
+                .read_body_reference(
+                    tenant_id,
+                    reference
+                        .as_deref()
+                        .ok_or_else(|| AppError::storage("conversation_body_missing"))?,
+                )
+                .await?;
             let value = serde_json::from_str(&content)
                 .map_err(|_| AppError::internal("conversations_export_training_dialogue_1"))?;
             turns.push(value);
+            previous = Some(row.try_get::<String, _>("node_hash")?);
+        }
+        if previous.as_deref() != Some(leaf_node_hash) {
+            return Err(AppError::storage("conversation_prefix_incomplete"));
         }
         Ok(crate::conversation::training_dialogue(&turns))
     }
@@ -1176,11 +1211,16 @@ impl Database {
                 "conversation semantic snapshot changed during projection".into(),
             ).into());
         }
-        let rebuilding = task
-            .try_get::<Option<String>, _>("statistics_outcome")?
-            .as_deref()
-            == Some(SESSION_BODY_REBUILD_OUTCOME);
-        let rewrote_existing = if rebuilding && let Some(snapshot) = snapshot.as_ref() {
+        // A declared identity may already have been published without waiting
+        // for archive content. Enrich that same observation rather than
+        // counting the request again or replacing its client provenance.
+        let identity_pending = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1 AND leaf_node_hash IS NULL",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await? != 0;
+        let rewrote_existing = if !identity_pending && let Some(snapshot) = snapshot.as_ref() {
             let tenant = tenant_id.to_string();
             let request = request_id.to_string();
             rewrite_session_body_observation_in_transaction(
@@ -1360,8 +1400,24 @@ impl Database {
             .map(|snapshot| snapshot.leaf.clone())
             .unwrap_or_else(|| nodes.last().map(|node| node.node_hash.clone()));
         let now = observed_at;
-        let observation_id = Uuid::now_v7();
         let request_id = request_id.to_string();
+        let existing_identity = sqlx::query(
+            "SELECT id, cluster_id FROM conversation_observations WHERE request_id = $1 AND key_id = $2 AND leaf_node_hash IS NULL",
+        )
+        .bind(&request_id)
+        .bind(key.key_id.to_string())
+        .fetch_optional(&mut **transaction)
+        .await?;
+        let enriching_identity = existing_identity.is_some();
+        let observation_id = existing_identity
+            .as_ref()
+            .map(|row| {
+                row.try_get::<String, _>("id")
+                    .map_err(AppError::from)
+                    .and_then(parse_uuid)
+            })
+            .transpose()?
+            .unwrap_or_else(Uuid::now_v7);
         let request_created_at = if attach_request_record {
             let locator = sqlx::query(
                 "SELECT created_at, tenant_id, key_id FROM request_record_locators WHERE id = $1 UNION ALL SELECT created_at, tenant_id, key_id FROM terminal_projection_outbox WHERE request_id = $1 AND NOT EXISTS (SELECT 1 FROM request_record_locators WHERE id = $1)",
@@ -1424,10 +1480,11 @@ impl Database {
 
         let tenant_id = key.tenant_id.to_string();
         if !content_materialized {
+            let archived_atoms = self.archive_atom_bodies(key.tenant_id, &atoms).await?;
             materialize_conversation_content_in_transaction(
                 transaction,
                 &tenant_id,
-                &atoms,
+                &archived_atoms,
                 &nodes,
                 now,
             )
@@ -1460,6 +1517,7 @@ impl Database {
             &key_id,
             hints,
             now,
+            &request_id,
         )
         .await?;
         let candidates = if let Some(candidate) = structured_candidate {
@@ -1471,12 +1529,13 @@ impl Database {
             Vec::new()
         } else {
             sqlx::query(
-                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 ORDER BY o.created_at DESC LIMIT 50",
+                "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.created_at <= $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 50",
             )
             .bind(&tenant_id)
             .bind(&principal_id)
             .bind(&key_id)
             .bind(now)
+            .bind(&request_id)
             .fetch_all(&mut **transaction)
             .await?
         };
@@ -1678,7 +1737,9 @@ impl Database {
                 .as_ref()
                 .is_some_and(|selection| selection.direct_parent)
         });
-        let cluster_id = if let Some(selection) = &selected {
+        let cluster_id = if let Some(existing) = &existing_identity {
+            parse_uuid(existing.try_get("cluster_id")?)?
+        } else if let Some(selection) = &selected {
             lock_selected_conversation_cluster_in_transaction(
                 transaction,
                 self.backend,
@@ -1705,7 +1766,17 @@ impl Database {
         let labels_json = serde_json::to_string(&hints.labels)
             .map_err(|_| AppError::internal("conversations_site_12"))?;
 
-        sqlx::query(
+        if enriching_identity {
+            sqlx::query(
+                "UPDATE conversation_observations SET leaf_node_hash = $1, atom_hashes_json = $2 WHERE id = $3",
+            )
+            .bind(&leaf)
+            .bind(&atom_hashes_json)
+            .bind(observation_id.to_string())
+            .execute(&mut **transaction)
+            .await?;
+        } else {
+            sqlx::query(
             "INSERT INTO conversation_observations (id, cluster_id, request_id, key_id, leaf_node_hash, atom_hashes_json, explicit_session_id, client_name, created_at, inference_version, turn_id, parent_turn_id, branch_id, compaction, session_name, trace_id, span_id, parent_span_id, agent_id, parent_agent_id, task_kind, labels_json, metadata_source) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 2, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)",
         )
         .bind(observation_id.to_string())
@@ -1732,6 +1803,7 @@ impl Database {
         .bind(execution_metadata.as_ref().map(|metadata| metadata.source.as_str()))
         .execute(&mut **transaction)
         .await?;
+        }
 
         if let Some(parent_reference) = unresolved_parent_reference {
             sqlx::query(
@@ -1751,7 +1823,7 @@ impl Database {
         let edge_selection = selected
             .filter(|selection| selection.write_edge)
             .or(candidate_selection);
-        let candidate_edge_increment = i64::from(
+        let mut candidate_edge_increment = i64::from(
             edge_selection
                 .as_ref()
                 .is_some_and(|selection| selection.relation == RelationKind::Candidate),
@@ -1762,8 +1834,8 @@ impl Database {
             } else {
                 (selection.observation_id, observation_id.to_string())
             };
-            sqlx::query(
-                "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, 0, 2, $8)",
+            let inserted = sqlx::query(
+                "INSERT INTO conversation_edges (id, cluster_id, from_observation_id, to_observation_id, relation_kind, confidence_millis, evidence_json, pinned, inference_version, created_at) SELECT $1, $2, $3, $4, $5, $6, $7, 0, 2, $8 WHERE NOT EXISTS (SELECT 1 FROM conversation_edges WHERE from_observation_id = $3 AND to_observation_id = $4 AND relation_kind = $5)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(cluster_id.to_string())
@@ -1786,6 +1858,7 @@ impl Database {
             .bind(now)
             .execute(&mut **transaction)
             .await?;
+            candidate_edge_increment *= inserted.rows_affected() as i64;
         }
         sqlx::query("UPDATE conversation_clusters SET created_at = CASE WHEN created_at > $1 THEN $1 ELSE created_at END, updated_at = CASE WHEN updated_at < $1 THEN $1 ELSE updated_at END, explicit_session_id = COALESCE(explicit_session_id, $2) WHERE id = $3")
             .bind(now)
@@ -1794,16 +1867,18 @@ impl Database {
             .execute(&mut **transaction)
             .await?;
         sqlx::query(
-            "INSERT INTO conversation_key_clusters (key_id, cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, $3, $4, 1, $5) ON CONFLICT(key_id, cluster_id) DO UPDATE SET explicit_session_id = COALESCE(conversation_key_clusters.explicit_session_id, excluded.explicit_session_id), updated_at = CASE WHEN conversation_key_clusters.updated_at < excluded.updated_at THEN excluded.updated_at ELSE conversation_key_clusters.updated_at END, request_count = conversation_key_clusters.request_count + 1, candidate_edge_count = conversation_key_clusters.candidate_edge_count + excluded.candidate_edge_count",
+            "INSERT INTO conversation_key_clusters (key_id, cluster_id, explicit_session_id, updated_at, request_count, candidate_edge_count) VALUES ($1, $2, $3, $4, $6, $5) ON CONFLICT(key_id, cluster_id) DO UPDATE SET explicit_session_id = COALESCE(conversation_key_clusters.explicit_session_id, excluded.explicit_session_id), updated_at = CASE WHEN conversation_key_clusters.updated_at < excluded.updated_at THEN excluded.updated_at ELSE conversation_key_clusters.updated_at END, request_count = conversation_key_clusters.request_count + excluded.request_count, candidate_edge_count = conversation_key_clusters.candidate_edge_count + excluded.candidate_edge_count",
         )
         .bind(key.key_id.to_string())
         .bind(cluster_id.to_string())
         .bind(hints.session_id.as_deref())
         .bind(now)
         .bind(candidate_edge_increment)
+        .bind(i64::from(!enriching_identity))
         .execute(&mut **transaction)
         .await?;
-        if client_name != Some("session-title")
+        if !enriching_identity
+            && client_name != Some("session-title")
             && hints
                 .session_name
                 .as_deref()
@@ -2045,24 +2120,27 @@ async fn fetch_structured_conversation_candidate(
     key_id: &str,
     hints: &ConversationHints,
     observed_at: i64,
+    excluded_request_id: &str,
 ) -> Result<Option<AnyRow>, AppError> {
     if let Some(parent_turn_id) = hints.parent_turn_id.as_deref() {
         let by_turn = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(parent_turn_id)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         let by_response = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.upstream_response_id = $4 AND o.request_id <> $5 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(parent_turn_id)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         return newest_conversation_candidate(by_turn, by_response);
@@ -2070,13 +2148,14 @@ async fn fetch_structured_conversation_candidate(
 
     if let Some(turn_id) = hints.turn_id.as_deref() {
         let candidate = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.turn_id = $4 AND o.created_at <= $5 AND o.request_id <> $6 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(turn_id)
         .bind(observed_at)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         if candidate.is_some() {
@@ -2086,13 +2165,14 @@ async fn fetch_structured_conversation_candidate(
 
     if let Some(session_id) = hints.session_id.as_deref() {
         let causal = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at <= $5 AND o.request_id <> $6 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(session_id)
         .bind(observed_at)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         if causal.is_some() {
@@ -2101,13 +2181,14 @@ async fn fetch_structured_conversation_candidate(
 
         // Archive projection can commit a later source-time observation first.
         let future = sqlx::query(
-            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 ORDER BY o.created_at DESC LIMIT 1",
+            "SELECT o.id, o.cluster_id, o.atom_hashes_json, o.leaf_node_hash, o.explicit_session_id, o.turn_id, o.parent_turn_id, o.compaction, o.upstream_response_id, o.branch_id, o.client_name, o.created_at FROM conversation_observations o JOIN conversation_clusters c ON c.id = o.cluster_id WHERE c.tenant_id = $1 AND c.principal_id = $2 AND o.key_id = $3 AND o.explicit_session_id = $4 AND o.created_at > $5 AND o.request_id <> $6 ORDER BY o.created_at DESC LIMIT 1",
         )
         .bind(tenant_id)
         .bind(principal_id)
         .bind(key_id)
         .bind(session_id)
         .bind(observed_at)
+        .bind(excluded_request_id)
         .fetch_optional(&mut **transaction)
         .await?;
         return Ok(future);
@@ -2933,6 +3014,7 @@ impl Database {
         }
         let mut transaction = self.begin_write_transaction().await?;
         let result = insert_streamed_conversation_content(
+            self,
             &mut transaction,
             tenant_id,
             request_json,
@@ -2960,6 +3042,7 @@ impl Database {
 }
 
 async fn insert_streamed_conversation_content(
+    database: &Database,
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
     request_json: String,
@@ -2992,6 +3075,9 @@ async fn insert_streamed_conversation_content(
             );
             break;
         };
+        let content_json = database
+            .store_body_reference(parse_uuid(tenant_id.to_owned())?, content_json)
+            .await?;
         drop(content);
         depth += 1;
         let node_hash = crate::conversation::digest_parts(parent.as_deref(), &content_hash);
@@ -3355,7 +3441,15 @@ mod tests {
             assert_eq!(role, atom.role);
             assert_eq!(kind, atom.kind);
             assert_eq!(instance_hash, atom.instance_hash);
-            assert_eq!(content_json, serde_json::to_string(&atom.content).unwrap());
+            let restored = db
+                .read_body_reference(Uuid::parse_str(&tenant).unwrap(), &content_json)
+                .await
+                .unwrap();
+            assert_eq!(restored, serde_json::to_string(&atom.content).unwrap());
+            assert!(
+                serde_json::from_str::<crate::archive::ConversationBodyReference>(&content_json)
+                    .is_ok()
+            );
         }
         assert_eq!(
             leaf.as_deref(),
@@ -3382,7 +3476,7 @@ mod tests {
         .unwrap();
         transaction.commit().await.unwrap();
         let atom_sql = "SELECT content_hash, instance_hash, role, kind, content_json FROM semantic_atoms WHERE tenant_id = $1 ORDER BY content_hash";
-        let expected_atoms: Vec<(String, String, String, String, String)> =
+        let mut expected_atoms: Vec<(String, String, String, String, String)> =
             sqlx::query_as(atom_sql)
                 .bind(&tenant)
                 .fetch_all(&db.pool)
@@ -3393,6 +3487,12 @@ mod tests {
             .fetch_all(&db.pool)
             .await
             .unwrap();
+        for atom in &mut expected_atoms {
+            atom.4 = db
+                .read_body_reference(Uuid::parse_str(&tenant).unwrap(), &atom.4)
+                .await
+                .unwrap();
+        }
         assert_eq!(owned_atoms, expected_atoms);
         let node_sql = "SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 ORDER BY depth";
         let expected_nodes: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(node_sql)
