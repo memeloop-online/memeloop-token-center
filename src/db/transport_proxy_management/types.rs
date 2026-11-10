@@ -239,7 +239,7 @@ pub(super) fn view(
 ) -> Result<Value, AppError> {
     let members = members.into_iter().map(|member| {
         let parsed = url::Url::parse(&member.proxy_url).map_err(|_| AppError::internal("types_view_1"))?;
-        Ok(serde_json::json!({"id":member.id,"label":member.label,"proxy_url":member.proxy_url,"scheme":parsed.scheme(),"host":parsed.host_str(),"port":parsed.port().unwrap_or(1080),"remote_dns":true,"has_auth":!parsed.username().is_empty() || parsed.password().is_some()}))
+        Ok(serde_json::json!({"id":member.id,"label":member.label,"proxy_url":member.proxy_url,"scheme":parsed.scheme(),"host":parsed.host_str(),"port":parsed.port_or_known_default().unwrap_or(1080),"remote_dns":true,"has_auth":!parsed.username().is_empty() || parsed.password().is_some()}))
     }).collect::<Result<Vec<_>, AppError>>()?;
     Ok(serde_json::json!({
         "id":row.try_get::<String,_>("id")?, "tenant_external_id":tenant_external_id,

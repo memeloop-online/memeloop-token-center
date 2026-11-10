@@ -303,7 +303,7 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
               <Label htmlFor={`${inputPrefix}-${member.key}`}>{member.id ? copy.address : copy.requiredAddress}</Label>
               <ProxyAddressInput id={`${inputPrefix}-${member.key}`} value={member.proxyUrl} disabled={busy || !ready} required={!member.id}
                 onChange={value => updateMember(member.key, { proxyUrl: value })}
-                placeholder={savedMember ? egressAddress(savedMember, locale) : 'socks5h://mihomo.egress.svc:1080'} />
+                placeholder="socks5h://mihomo.egress.svc:1080" />
             </div>
             <div className="button-row">
               <Button type="button" disabled={index === 0} onClick={() => setMembers(current => { const next = [...current]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; return next; })}>{t('common.moveUp')}</Button>
