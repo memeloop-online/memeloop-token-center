@@ -124,6 +124,9 @@ const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
 const SESSION_BODY_REBUILD_OUTCOME: &str = "session_body";
+// Archive bind events clear this deadline. Persistent unavailable sources back off.
+const SESSION_BODY_RETRY_DELAY_SQL: &str = "CASE WHEN attempts <= 1 THEN 5000 WHEN attempts = 2 THEN 10000 WHEN attempts = 3 THEN 20000 WHEN attempts = 4 THEN 40000 WHEN attempts = 5 THEN 80000 WHEN attempts = 6 THEN 160000 ELSE 300000 END";
+
 /// 网关结算只把请求身份放进队列。
 /// 不在这里解析原始请求 JSON 或原始返回 JSON。
 /// 会话正文由 worker 读取 locator 后存入对象归档。
@@ -480,6 +483,18 @@ impl Database {
     pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
         let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
         let mut transaction = self.begin_write_transaction().await?;
+        // Serialize the count and replenishment across worker transactions.
+        // This background operation never waits for a busy replenisher.
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            let acquired: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(82420261105)")
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            if !acquired {
+                transaction.rollback().await?;
+                return Ok(0);
+            }
+        }
         let (outcome_predicate, lock) = match self.backend {
             DatabaseBackend::PostgreSql => (
                 "o.statistics_outcome IS DISTINCT FROM 'session_body'",
@@ -488,7 +503,7 @@ impl Database {
             DatabaseBackend::Sqlite => ("o.statistics_outcome IS NOT 'session_body'", ""),
         };
         let statement = format!(
-            "UPDATE conversation_projection_outbox SET projected_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL, lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}', lease_expires_at = 9223372036854775807, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, statistics_outcome = '{SESSION_BODY_REBUILD_OUTCOME}' WHERE request_id IN (SELECT o.request_id FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id WHERE o.projected_at IS NOT NULL AND {outcome_predicate} AND r.request_object <> '' AND r.response_object IS NOT NULL AND r.response_object <> '' ORDER BY o.observed_at ASC, o.request_id ASC LIMIT $1{lock})"
+            "UPDATE conversation_projection_outbox SET projected_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL, lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}', lease_expires_at = 9223372036854775807, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, statistics_outcome = '{SESSION_BODY_REBUILD_OUTCOME}' WHERE request_id IN (SELECT o.request_id FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id WHERE o.projected_at IS NOT NULL AND {outcome_predicate} AND r.request_object <> '' AND r.response_object IS NOT NULL AND r.response_object <> '' ORDER BY o.observed_at ASC, o.request_id ASC LIMIT (SELECT CASE WHEN COUNT(*) >= $1 THEN 0 ELSE $1 - COUNT(*) END FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}'){lock})"
         );
         let updated = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(limit)
@@ -510,61 +525,61 @@ impl Database {
         let expires_at = now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS);
         let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
         let mut transaction = self.begin_write_transaction().await?;
-        let claimable = match self.backend {
-            DatabaseBackend::PostgreSql => {
-                "SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY observed_at ASC, request_id ASC LIMIT $4 FOR UPDATE SKIP LOCKED"
-            }
-            // SQLite's BEGIN IMMEDIATE writer transaction serializes claimers,
-            // so the same bounded selector is race-free without row locks.
-            DatabaseBackend::Sqlite => {
-                "SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY observed_at ASC, request_id ASC LIMIT $4"
-            }
-        };
-        let statement = format!(
-            "UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN ({claimable}) RETURNING request_id, observed_at"
-        );
-        let sentinel_lock = match self.backend {
+        let lock = match self.backend {
             DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
             DatabaseBackend::Sqlite => "",
         };
-        // 只领取租约主人仍是 session-body-rebuild 的行。主租约未过期，两份快照又是空的，
-        // 所以旧 worker 的两条领取都匹配不到。
-        let sentinel_statement = format!(
-            "UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}' ORDER BY observed_at ASC, request_id ASC LIMIT $3{sentinel_lock}) RETURNING request_id, observed_at"
-        );
-        let mut rows = sqlx::query(sqlx::AssertSqlSafe(sentinel_statement))
-            .bind(lease_owner.to_string())
-            .bind(expires_at)
-            .bind(limit)
-            .fetch_all(&mut *transaction)
-            .await?;
-        let mut budget = limit.saturating_sub(rows.len() as i64);
-        if budget > 0 {
-            let primary = sqlx::query(sqlx::AssertSqlSafe(statement))
-                .bind(lease_owner.to_string())
-                .bind(expires_at)
-                .bind(now)
-                .bind(budget)
-                .fetch_all(&mut *transaction)
-                .await?;
-            budget = budget.saturating_sub(primary.len() as i64);
-            rows.extend(primary);
-        }
-        if budget > 0 {
-            let remaining = budget;
-            let suffix = match self.backend {
-                DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
-                DatabaseBackend::Sqlite => "",
-            };
+        // Reserve half for first attempts, a quarter for retries and a quarter
+        // for historical body rebuilds. An idle lane lends its slots to the
+        // others. Both primary and terminal-snapshot claims share these budgets.
+        // Retry order uses the previous deadline so one old failing row cannot
+        // repeatedly jump ahead of other eligible work.
+        let rebuild_budget = limit / 4;
+        let retry_budget = limit / 4;
+        let fresh_budget = limit - rebuild_budget - retry_budget;
+        let primary = "(lease_owner = 'session-body-rebuild' OR lease_expires_at IS NULL OR lease_expires_at <= $3)";
+        let ordinary = "COALESCE(statistics_outcome, '') <> 'session_body' AND COALESCE(lease_owner, '') <> 'session-body-rebuild'";
+        let lanes = [
+            (format!("{ordinary} AND attempts = 0"), fresh_budget),
+            (format!("{ordinary} AND attempts > 0"), retry_budget),
+            (
+                "(statistics_outcome = 'session_body' OR lease_owner = 'session-body-rebuild')"
+                    .to_owned(),
+                rebuild_budget,
+            ),
+            ("1 = 1".to_owned(), limit),
+        ];
+        let mut rows = Vec::new();
+        for (lane, lane_budget) in lanes {
+            let budget = lane_budget.min(limit - rows.len() as i64);
+            if budget == 0 {
+                continue;
+            }
             let statement = format!(
-                "UPDATE conversation_projection_outbox SET terminal_lease_owner = $1, terminal_lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL) AND (terminal_lease_owner IS NULL OR terminal_lease_owner <> $1) AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $3) ORDER BY observed_at, request_id LIMIT $4{suffix}) RETURNING request_id, observed_at"
+                "UPDATE conversation_projection_outbox SET
+                    lease_owner = CASE WHEN {primary} THEN $1 ELSE lease_owner END,
+                    lease_expires_at = CASE WHEN {primary} THEN $2 ELSE lease_expires_at END,
+                    terminal_lease_owner = CASE WHEN {primary} THEN NULL ELSE $1 END,
+                    terminal_lease_expires_at = CASE WHEN {primary} THEN NULL ELSE $2 END,
+                    attempts = attempts + 1
+                 WHERE request_id IN (
+                    SELECT request_id FROM conversation_projection_outbox
+                    WHERE projected_at IS NULL AND ({lane})
+                      AND (lease_owner IS NULL OR lease_owner <> $1 OR lease_expires_at <= $3)
+                      AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $3)
+                      AND ({primary} OR semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL)
+                    ORDER BY CASE WHEN lease_owner = 'session-body-rebuild' THEN observed_at
+                        WHEN {primary} THEN COALESCE(terminal_lease_expires_at, lease_expires_at, observed_at)
+                        ELSE COALESCE(terminal_lease_expires_at, observed_at) END,
+                        observed_at, request_id LIMIT $4{lock}
+                 ) RETURNING request_id, observed_at"
             );
             rows.extend(
                 sqlx::query(sqlx::AssertSqlSafe(statement))
                     .bind(lease_owner.to_string())
                     .bind(expires_at)
                     .bind(now)
-                    .bind(remaining)
+                    .bind(budget)
                     .fetch_all(&mut *transaction)
                     .await?,
             );
@@ -645,10 +660,10 @@ impl Database {
         request_id: Uuid,
     ) -> Result<(), AppError> {
         let mut transaction = self.begin_write_transaction().await?;
-        let updated = sqlx::query(
-            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
-        )
-        .bind(unix_millis().saturating_add(5000))
+        let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 + {SESSION_BODY_RETRY_DELAY_SQL} END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 + {SESSION_BODY_RETRY_DELAY_SQL} WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+        )))
+        .bind(unix_millis())
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
         .execute(&mut *transaction)
@@ -669,10 +684,10 @@ impl Database {
         lease_owner: Uuid,
         request_id: Uuid,
     ) -> Result<(), AppError> {
-        sqlx::query(
-            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
-        )
-        .bind(unix_millis().saturating_add(5000))
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 + {SESSION_BODY_RETRY_DELAY_SQL} END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 + {SESSION_BODY_RETRY_DELAY_SQL} WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+        )))
+        .bind(unix_millis())
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
         .execute(&self.pool)

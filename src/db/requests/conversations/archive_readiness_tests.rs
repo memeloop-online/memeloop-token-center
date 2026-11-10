@@ -7,6 +7,229 @@ use crate::{
 };
 use bytes::Bytes;
 
+async fn fair_projection_queue_contract(database_url: String) {
+    let fixture = Fixture::new(database_url, true).await;
+    let db = &fixture.state.db;
+    sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 1, statistics_outcome = NULL WHERE request_id = $1")
+        .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+    let mut fresh = Vec::new();
+    let mut retries = Vec::new();
+    let mut rebuilds = Vec::new();
+    for lane in 0..3 {
+        for index in 0..32 {
+            let id = Uuid::now_v7();
+            let terminal = lane != 2 && index % 2 == 0;
+            sqlx::query(
+                "INSERT INTO conversation_projection_outbox
+                 (request_id, tenant_id, key_id, principal_id, request_json, hints_json,
+                  observed_at, attempts, lease_owner, lease_expires_at,
+                  semantic_snapshot_json, statistics_outcome)
+                 SELECT $1, tenant_id, key_id, principal_id, request_json, hints_json,
+                    $2, $3, $4, $5, $6, $7
+                 FROM conversation_projection_outbox WHERE request_id = $8",
+            )
+            .bind(id.to_string())
+            // Historical work predates all new requests.
+            .bind(if lane == 0 { 1000_i64 + index } else { index })
+            .bind(if lane == 1 { 106950_i64 } else { 0 })
+            .bind(if lane == 2 {
+                Some(SESSION_BODY_REBUILD_LEASE_OWNER)
+            } else if terminal {
+                Some("terminal-v118")
+            } else {
+                None
+            })
+            .bind(if lane == 2 || terminal {
+                Some(i64::MAX)
+            } else {
+                None
+            })
+            .bind(if terminal { Some("{}") } else { None })
+            .bind(if lane == 2 {
+                Some(SESSION_BODY_REBUILD_OUTCOME)
+            } else {
+                None
+            })
+            .bind(fixture.request_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            match lane {
+                0 => fresh.push(id),
+                1 => retries.push(id),
+                _ => rebuilds.push(id),
+            }
+        }
+    }
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 0);
+    let owner = Uuid::now_v7();
+    let first = db
+        .claim_conversation_projection_tasks(owner, 32)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 32);
+    for (ids, expected) in [(&fresh, 16), (&retries, 8), (&rebuilds, 8)] {
+        assert_eq!(
+            first
+                .iter()
+                .filter(|task| ids.contains(&task.request_id))
+                .count(),
+            expected
+        );
+    }
+    let terminal_claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_projection_outbox WHERE terminal_lease_owner = $1",
+    )
+    .bind(owner.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal_claims, 12,
+        "terminal sentinels must sort by their terminal deadline, not their permanent primary lease"
+    );
+    let second = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 32);
+    assert!(second.iter().all(|task| {
+        first
+            .iter()
+            .all(|prior| prior.request_id != task.request_id)
+    }));
+    for (ids, expected) in [(&fresh, 16), (&retries, 8), (&rebuilds, 8)] {
+        assert_eq!(
+            second
+                .iter()
+                .filter(|task| ids.contains(&task.request_id))
+                .count(),
+            expected
+        );
+    }
+    // With the first-attempt lane drained, its slots are borrowed.
+    let third = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(third.len(), 32);
+    assert!(third.iter().all(|task| {
+        first
+            .iter()
+            .chain(&second)
+            .all(|prior| prior.request_id != task.request_id)
+    }));
+    assert!(
+        third
+            .iter()
+            .filter(|task| retries.contains(&task.request_id))
+            .count()
+            >= 8
+    );
+    assert!(
+        third
+            .iter()
+            .filter(|task| rebuilds.contains(&task.request_id))
+            .count()
+            >= 8
+    );
+
+    let retry = first
+        .iter()
+        .find(|task| retries.contains(&task.request_id))
+        .unwrap()
+        .request_id;
+    let before = unix_millis();
+    db.defer_session_body_archive(owner, retry).await.unwrap();
+    let deadline: i64 = sqlx::query_scalar("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(retry.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert!(deadline >= before + 300000 && deadline <= unix_millis() + 300000);
+    // A stale worker cannot shorten the retry deadline or change its owner.
+    db.defer_session_body_archive(Uuid::now_v7(), retry)
+        .await
+        .unwrap();
+    assert_eq!(deadline, sqlx::query_scalar::<_, i64>("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(retry.to_string()).fetch_one(&db.pool).await.unwrap());
+    assert!(
+        db.claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut transaction = db.begin_write_transaction().await.unwrap();
+    wake_session_body_archive_in_transaction(&mut transaction, retry)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let woken = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(woken.len(), 1);
+    assert_eq!(woken[0].request_id, retry);
+
+    // Repeated reopen scans do not accumulate unclaimed historical tasks.
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET projected_at = 1 WHERE request_id <> $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 1);
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn sqlite_projection_queue_fairness_and_source_retry_wake() {
+    let directory = tempfile::tempdir().unwrap();
+    fair_projection_queue_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("fairness.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_projection_queue_fairness_and_source_retry_wake() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("projection fairness PostgreSQL regression must not silently skip");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    fair_projection_queue_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_rebuild_replenishment_does_not_wait_for_another_worker() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("rebuild serialization regression requires PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    let fixture = Fixture::new(isolated.url().to_owned(), true).await;
+    let mut owner = fixture.state.db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(82420261105)")
+        .execute(&mut *owner)
+        .await
+        .unwrap();
+    let replenished = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fixture.state.db.reopen_session_body_rebuilds(8),
+    )
+    .await
+    .expect("another replenisher must not block the worker")
+    .unwrap();
+    assert_eq!(replenished, 0);
+    owner.rollback().await.unwrap();
+    // The transaction-scoped lock is released and normal replenishment resumes.
+    fixture
+        .state
+        .db
+        .reopen_session_body_rebuilds(8)
+        .await
+        .unwrap();
+    drop(fixture);
+    isolated.cleanup().await;
+}
+
 struct Fixture {
     state: AppState,
     key: AuthenticatedKey,
