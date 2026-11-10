@@ -33,7 +33,7 @@ test('only complete new alias calls gain the client plaintext marker', () => {
 });
 
 test('captured SSE restores item identities consistently without touching parameter frames', () => {
-  const call = { type: 'function_call', id: 'new', call_id: 'new-call', namespace: alias, name: 'spawn_agent', arguments: '{"message":"alpha beta"}' };
+  const call = { type: 'function_call', status: 'completed', id: 'new', call_id: 'new-call', namespace: alias, name: 'spawn_agent', arguments: '{"message":"alpha beta"}' };
   const events = [
     { type: 'response.output_item.added', item: { ...call, arguments: '' } },
     { type: 'response.function_call_arguments.delta', item_id: call.id, delta: call.arguments },
@@ -54,6 +54,22 @@ test('captured SSE restores item identities consistently without touching parame
   }
   assert.deepEqual(decoded[4].response.output[1], opaque);
   assert.deepEqual(decoded[4].response.usage, { output_tokens: 12 });
+  const emptyTerminalEvents = events.map(event => event.type === 'response.completed'
+    ? { ...event, response: { ...event.response, output: [] } }
+    : event);
+  const emptyCapture = emptyTerminalEvents.map(event => `data: ${JSON.stringify(event)}\n\n`).join('');
+  const restoredEmpty = restoreCapturedSse(emptyCapture, { version: 1, alias, tools: ['spawn_agent'] });
+  const emptyDecoded = restoredEmpty.trim().split('\n\n').map(frame => JSON.parse(frame.slice(6)));
+  assert.equal(emptyDecoded[0].item.namespace, 'collaboration');
+  assert.equal(emptyDecoded[3].item.namespace, 'collaboration');
+  assert.deepEqual(emptyDecoded[3].item.encrypted_function_args, []);
+  assert.deepEqual(emptyDecoded[4].response.output, []);
+  assert.equal(emptyDecoded[3].item.arguments, call.arguments);
+  assert.deepEqual(emptyDecoded[4].response.usage, { output_tokens: 12 });
+  const incompleteDone = emptyTerminalEvents.map(event => event.type === 'response.output_item.done'
+    ? { ...event, item: { ...event.item, status: 'incomplete' } }
+    : event).map(event => `data: ${JSON.stringify(event)}\n\n`).join('');
+  assert.equal(restoreCapturedSse(incompleteDone, { version: 1, alias, tools: ['spawn_agent'] }), incompleteDone);
   assert.equal(restoreCapturedSse(frames.slice(0, 4).join(''), { version: 1, alias, tools: ['spawn_agent'] }), frames.slice(0, 4).join(''));
   const encode = (value: unknown[]) => value.map(event => `data: ${JSON.stringify(event)}\n\n`).join('');
   const invalidCaptures = [

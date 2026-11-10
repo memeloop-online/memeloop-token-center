@@ -41,6 +41,15 @@ added/delta/arguments-done/item-done events, then changes item metadata consiste
 Argument delta/done frames remain byte-for-byte identical. Failed, truncated or
 inconsistent captures remain unchanged. No live streaming support is claimed.
 
+The controlled real-provider alias request on 2026-11-10 completed with HTTP
+200 and archived the complete plaintext task in an alias `spawn_agent` done
+item. Its actual native terminal had `output: []`. The offline converter also
+supports this captured grammar: completed done items supply the call identities
+and complete arguments, while a successful terminal confirms completion. An
+empty terminal stays empty. If terminal output is nonempty, it must match the
+streamed calls. Incomplete done items remain unchanged. This experiment did not
+execute the tool or deliver a task to the current host.
+
 Before any host integration, independently review this experiment, verify that
 the actual provider accepts the added alias, and verify a complete plaintext
 parameter value. Then test the current host receiving the restored call and

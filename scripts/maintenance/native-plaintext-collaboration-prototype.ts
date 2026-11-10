@@ -84,10 +84,18 @@ export function restoreCapturedSse(source: string, context: PrototypeContext) {
     ['error', 'response.failed', 'response.incomplete', 'response.cancelled'].includes(event?.type))) return source;
   const terminal = terminals[0]!;
   if (terminal.event.response?.status !== 'completed') return source;
+  const terminalOutput = terminal.event.response.output;
+  if (!Array.isArray(terminalOutput)) return source;
+  const indexed = parsed.flatMap((event, index) => event ? [{ event, index }] : []);
+  // Actual native streams may finish with output:[] after delivering complete
+  // output_item.done items. Keep that empty terminal unchanged; do not fill it.
+  const completedItems = terminalOutput.length ? terminalOutput : indexed
+    .filter(({ event }) => event.type === 'response.output_item.done')
+    .map(({ event }) => event.item);
   const calls = new Map<string, Wire>();
   const itemIds = new Set<string>();
   const callIds = new Set<string>();
-  for (const item of terminal.event.response.output ?? []) {
+  for (const item of completedItems) {
     if (typeof item.id === 'string') {
       if (itemIds.has(item.id)) return source;
       itemIds.add(item.id);
@@ -98,10 +106,10 @@ export function restoreCapturedSse(source: string, context: PrototypeContext) {
     }
     if (item.namespace !== alias) continue;
     if (!plaintextAlias(item) || !context.tools.includes(item.name) ||
-        typeof item.id !== 'string' || typeof item.call_id !== 'string') return source;
+        typeof item.id !== 'string' || typeof item.call_id !== 'string' ||
+        (!terminalOutput.length && item.status !== 'completed')) return source;
     calls.set(item.id, item);
   }
-  const indexed = parsed.flatMap((event, index) => event ? [{ event, index }] : []);
   // Every alias item event must belong to exactly one completed output call.
   // Ordinary calls may not reuse the same call ID as an alias event either.
   for (const { event, index } of indexed) {
