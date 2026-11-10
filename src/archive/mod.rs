@@ -18,6 +18,7 @@ use futures_util::{Stream, TryStreamExt, stream};
 use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 
 mod backend;
+pub mod cache_command;
 mod cas;
 mod compressed;
 mod conversation;
@@ -30,6 +31,7 @@ mod durable_roots;
 mod multipart;
 mod objects;
 mod path;
+mod raw_cache;
 mod raw_capture;
 #[cfg(test)]
 mod raw_capture_tests;
@@ -57,6 +59,7 @@ pub use multipart::{ArchiveWriter, StagedArchiveObject};
 #[cfg(test)]
 use path::content_location;
 pub(crate) use path::is_tenant_cas_location;
+pub use raw_cache::CacheFifoPass;
 pub use raw_capture::{RawResponseAttempt, RawResponseAttemptCapture};
 pub(crate) use session_projection::PreparedSessionBody;
 pub use staging::ArchiveStagingObjectStore;
