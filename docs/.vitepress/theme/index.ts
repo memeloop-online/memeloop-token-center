@@ -1,16 +1,21 @@
 import DefaultTheme from 'vitepress/theme'
+import { withBase } from 'vitepress'
 import type { Theme } from 'vitepress'
 import ProductGallery from './components/ProductGallery.vue'
+import RequestExample from './components/RequestExample.vue'
 import './custom.css'
 
 export default {
   extends: DefaultTheme,
   enhanceApp({ app, router }) {
     app.component('ProductGallery', ProductGallery)
+    app.component('RequestExample', RequestExample)
 
     if (typeof window !== 'undefined') {
       const syncLocale = (path: string) => {
-        const locale = path.match(/^\/(zh|en)(?:\/|$)/)?.[1]
+        const base = withBase('/')
+        const relativePath = path.startsWith(base) ? path.slice(base.length) : path.replace(/^\//, '')
+        const locale = relativePath.match(/^(zh|en)(?:\/|$)/)?.[1]
         if (!locale) return
         try {
           window.localStorage.setItem('mtc-docs-locale', locale)

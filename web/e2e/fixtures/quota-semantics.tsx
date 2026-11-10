@@ -37,8 +37,14 @@ function Preview() {
     { ...retained.windows[0], id: 'code:secondary_window', period_seconds: 604_800, used_percent: 20, reset_at: Date.UTC(2030, 0, 3, 11), reset_is_estimated: true },
     { ...retained.windows[0], id: 'code_review:primary_window', used_percent: null, reset_at: null },
   ] };
+  const kimi: UpstreamQuotaSnapshot = { ...summarySnapshot, upstream_account_id: 'kimi-7021', provider: 'kimi-oauth', windows: [
+    { ...summarySnapshot.windows[0], id: 'limit-0', label: 'limit-0', source: 'kimi_usage', used_percent: 80, period_seconds: 18_000 },
+    { ...summarySnapshot.windows[0], id: 'summary', label: 'summary', source: 'kimi_usage', used_percent: 10, period_seconds: 604_800 },
+  ] };
   return <main className="main"><article className="panel">
     <h1>Quota semantics · no network</h1>
+    <section data-case="kimi-choice"><QuotaSummary snapshot={kimi} /><UpstreamQuotaDetails snapshot={kimi} /></section>
+    <section data-case="kimi-other-account"><QuotaSummary snapshot={{ ...kimi, upstream_account_id: 'another-kimi' }} /></section>
     <section data-case="summary"><QuotaSummary snapshot={summarySnapshot} showResetCreditExpiryInTooltip /></section>
     <section data-case="summary-credit-unknown"><QuotaSummary snapshot={{ ...summarySnapshot, reset_credits: [{ status: 'available', granted_at: now - 60_000, expires_at: null, source: 'codex_reset_credits' }] }} showResetCreditExpiryInTooltip /></section>
     <section data-case="summary-credit-none"><QuotaSummary snapshot={{ ...summarySnapshot, reset_capability: { ...summarySnapshot.reset_capability, available_credits: 0 }, reset_credits: [] }} showResetCreditExpiryInTooltip /></section>

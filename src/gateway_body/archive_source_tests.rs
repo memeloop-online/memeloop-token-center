@@ -30,7 +30,9 @@ async fn chat_messages_and_responses_share_the_captured_source() {
             request,
             Arc::new(tokio::sync::Semaphore::new(0)),
             Arc::new(tokio::sync::Semaphore::new(0)),
-            1024 * 1024,
+            // A hot-body setting must not truncate or reject an authenticated
+            // Responses upload that has a durable source.
+            1,
             1024 * 1024,
             Some(&budget),
             &admission,
@@ -46,17 +48,7 @@ async fn chat_messages_and_responses_share_the_captured_source() {
         assert_eq!(source.read_all().await.unwrap(), body);
         let (parts, delivered) = admitted.into_parts();
         drop(parts);
-        if path.starts_with("/v1/responses") {
-            assert!(to_bytes(delivered, usize::MAX).await.unwrap().is_empty());
-        } else {
-            let delivered = to_bytes(delivered, usize::MAX).await.unwrap();
-            assert_eq!(delivered, body);
-            drop(source);
-            assert!(admission.source(request_id).is_some());
-            drop(delivered);
-            assert!(admission.source(request_id).is_none());
-            continue;
-        }
+        assert!(to_bytes(delivered, usize::MAX).await.unwrap().is_empty());
         drop(source);
     }
 }

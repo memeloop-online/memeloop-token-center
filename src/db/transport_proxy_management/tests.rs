@@ -102,7 +102,7 @@ async fn contract(database: &Database) {
     assert_eq!(group["members"][0]["port"], 1080);
     assert!(group["probe_url"].is_null());
     assert_eq!(group["probe_attempts"], 2);
-    assert!(group["members"][0].get("proxy_url").is_none());
+    assert_eq!(group["members"][0]["proxy_url"], PRIMARY);
     let unrelated = database
         .create_transport_group(
             CreateGroup {

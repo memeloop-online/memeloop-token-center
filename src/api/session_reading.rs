@@ -279,6 +279,51 @@ pub(super) async fn self_session_dialogue(
     session_dialogue(&state, scope).await.map(Json)
 }
 
+pub(super) async fn internal_session_training(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, request_id)): Path<(Uuid, Uuid)>,
+    Query(query): Query<ContextQuery>,
+) -> Result<axum::response::Response, AppError> {
+    let scope = operator_scope(&state, &headers, &query, session_id, request_id).await?;
+    let reference = state
+        .archive
+        .request_conversation_reference(scope.tenant_id, scope.request_id)
+        .await?;
+    let stream = state
+        .archive
+        .stream_conversation_export(scope.tenant_id, &reference)
+        .await?;
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/x-ndjson")
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|_| AppError::internal("conversation_export_response"))
+}
+
+pub(super) async fn internal_session_training_raw(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((session_id, request_id, side)): Path<(Uuid, Uuid, String)>,
+    Query(query): Query<ContextQuery>,
+) -> Result<axum::response::Response, AppError> {
+    let scope = operator_scope(&state, &headers, &query, session_id, request_id).await?;
+    let object = state
+        .archive
+        .raw_capture_reference(scope.tenant_id, request_id, &side)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let download = state
+        .archive
+        .open_tenant_content(scope.tenant_id, &object)
+        .await?;
+    axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .header("x-content-blake3", object.blake3_digest)
+        .header("x-content-bytes", object.size_bytes.to_string())
+        .body(axum::body::Body::from_stream(download.stream))
+        .map_err(|_| AppError::internal("conversation_raw_export_response"))
+}
+
 async fn session_dialogue(
     state: &AppState,
     scope: SessionContextScope,

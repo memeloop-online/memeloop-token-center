@@ -450,7 +450,12 @@ async fn exhausted_memory_rejects_chunked_request_before_upstream_and_recovers()
             .get(refs.response_object.as_deref().unwrap())
             .await
             .unwrap(),
-        delivered
+        Bytes::from(completed_codex_sse("capacity recovered"))
+    );
+    let delivered: Value = serde_json::from_slice(&delivered).unwrap();
+    assert_eq!(
+        delivered["output"][0]["content"][0]["text"],
+        "capacity recovered"
     );
     assert_exactly_once_side_effects(&fixture, rows[0].request_id, Some("resp-codex")).await;
     upstream.verify().await;

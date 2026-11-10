@@ -384,6 +384,29 @@ impl Database {
         idempotency_hash: &str,
         guard: Option<&crate::upstream_quota::reset::BackgroundResetGuard>,
     ) -> Result<QuotaResetClaim, AppError> {
+        self.claim_quota_reset_owned(
+            account,
+            id,
+            actor,
+            confirmation_hash,
+            idempotency_hash,
+            guard,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn claim_quota_reset_owned(
+        &self,
+        account: &UpstreamAccountView,
+        id: &str,
+        actor: &str,
+        confirmation_hash: &str,
+        idempotency_hash: &str,
+        guard: Option<&crate::upstream_quota::reset::BackgroundResetGuard>,
+        owner: Option<Uuid>,
+    ) -> Result<QuotaResetClaim, AppError> {
         let tenant = account.tenant_id.to_string();
         let account_id = account.id.to_string();
         let mut tx = self.begin_write_transaction().await?;
@@ -502,24 +525,41 @@ impl Database {
         .bind(id)
         .fetch_one(&mut *tx)
         .await?;
-        insert_audit(
-            &mut tx,
-            id,
-            &tenant,
-            &account_id,
-            "confirmation_claimed",
-            Some(actor),
-            None,
-            now,
+        // The existing confirmation audit ID is also the dispatch owner nonce.
+        // It commits with the claim and never changes on a confirmation replay.
+        sqlx::query(
+            "INSERT INTO upstream_quota_reset_audit
+                 (id, operation_id, tenant_id, upstream_account_id, event,
+                  actor_service_id, created_at)
+                 VALUES ($1, $2, $3, $4, 'confirmation_claimed', $5, $6)",
         )
+        .bind(owner.unwrap_or_else(Uuid::now_v7).to_string())
+        .bind(id)
+        .bind(&tenant)
+        .bind(&account_id)
+        .bind(actor)
+        .bind(now)
+        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(QuotaResetClaim::Claimed { redeem_request_id })
     }
 
+    #[cfg(test)]
     pub(crate) async fn finish_quota_reset(
         &self,
         id: &str,
+        accepted: bool,
+        error: Option<&str>,
+    ) -> Result<(), AppError> {
+        self.finish_quota_reset_owned(id, None, accepted, error)
+            .await
+    }
+
+    pub(crate) async fn finish_quota_reset_owned(
+        &self,
+        id: &str,
+        owner: Option<Uuid>,
         accepted: bool,
         error: Option<&str>,
     ) -> Result<(), AppError> {
@@ -531,15 +571,30 @@ impl Database {
             "dispatch_unknown"
         };
         let mut tx = self.pool.begin().await?;
+        if owner.is_some() && matches!(self.backend, DatabaseBackend::PostgreSql) {
+            // Wait for any in-flight claim COMMIT, including a lost client ACK.
+            // A predicate-only UPDATE could otherwise see the old prepared row,
+            // affect zero rows, and finish recovery before that claim commits.
+            sqlx::query("SELECT id FROM upstream_quota_reset_operations WHERE id = $1 FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        }
         let changed = sqlx::query(
             "UPDATE upstream_quota_reset_operations
              SET state = $1, error_code = $2, updated_at = $3
-             WHERE id = $4 AND state = 'submitted'",
+             WHERE id = $4 AND state = 'submitted'
+               AND ($5 IS NULL OR EXISTS (
+                   SELECT 1 FROM upstream_quota_reset_audit owner
+                   WHERE owner.operation_id = upstream_quota_reset_operations.id
+                     AND owner.id = $5 AND owner.event = 'confirmation_claimed'
+               ))",
         )
         .bind(state)
         .bind(error)
         .bind(now)
         .bind(id)
+        .bind(owner.map(|owner| owner.to_string()))
         .execute(&mut *tx)
         .await?;
         if changed.rows_affected() == 1 {
@@ -564,6 +619,90 @@ impl Database {
                 now,
             )
             .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn release_unknown_quota_reset(
+        &self,
+        account: &UpstreamAccountView,
+        id: &str,
+        actor: &str,
+        available: i64,
+        applicable: i64,
+        observed_at: i64,
+    ) -> Result<(), AppError> {
+        let tenant = account.tenant_id.to_string();
+        let account_id = account.id.to_string();
+        let mut tx = self.begin_write_transaction().await?;
+        // Only a completed dispatch may be released. An old submitted row or
+        // an expired lease is not evidence that its HTTP owner has ended.
+        let changed = sqlx::query(
+            "UPDATE upstream_quota_reset_operations
+             SET settled_at = $1, updated_at = $1, last_reconciled_at = $1,
+                 reconciled_available_credits = $2, reconciled_applicable_credits = $3
+             WHERE id = $4 AND tenant_id = $5 AND upstream_account_id = $6
+               AND state = 'unknown' AND settled_at IS NULL
+               AND $1 > observed_at
+               AND EXISTS (
+                   SELECT 1 FROM upstream_quota_reset_audit ended
+                   WHERE ended.operation_id = upstream_quota_reset_operations.id
+                     AND ended.tenant_id = $5 AND ended.upstream_account_id = $6
+                     AND ended.event = 'dispatch_unknown'
+               )
+               AND EXISTS (
+                   SELECT 1 FROM upstream_accounts account
+                   WHERE account.id = $6 AND account.tenant_id = $5
+                     AND account.credential_generation = $7 AND account.updated_at = $8
+               )",
+        )
+        .bind(observed_at)
+        .bind(available)
+        .bind(applicable)
+        .bind(id)
+        .bind(&tenant)
+        .bind(&account_id)
+        .bind(account.credential_generation)
+        .bind(account.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        if changed.rows_affected() == 1 {
+            insert_audit(
+                &mut tx,
+                id,
+                &tenant,
+                &account_id,
+                "reconciled",
+                Some(actor),
+                Some("unknown_reset_released_by_operator"),
+                observed_at,
+            )
+            .await?;
+        } else {
+            let released = sqlx::query_scalar::<_, String>(
+                "SELECT id FROM upstream_quota_reset_operations
+                 WHERE id = $1 AND tenant_id = $2 AND upstream_account_id = $3
+                   AND state = 'unknown' AND settled_at IS NOT NULL
+                   AND EXISTS (
+                       SELECT 1 FROM upstream_quota_reset_audit audit
+                       WHERE audit.operation_id = upstream_quota_reset_operations.id
+                         AND audit.event = 'reconciled'
+                         AND audit.error_code = 'unknown_reset_released_by_operator'
+                   )",
+            )
+            .bind(id)
+            .bind(&tenant)
+            .bind(&account_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if released.is_none() {
+                return Err(AppError::Conflict(
+                    "reset recovery requires an unknown result and recorded dispatch completion"
+                        .into(),
+                ));
+            }
         }
         tx.commit().await?;
         Ok(())
@@ -920,6 +1059,12 @@ mod tests {
                 .is_err(),
             "submitted remains the unique active operation after observation"
         );
+        assert!(
+            db.release_unknown_quota_reset(&account, &operation.id, "operator", 1, 0, now + 1)
+                .await
+                .is_err(),
+            "neither elapsed time nor a fresh lower balance proves a submitted owner ended"
+        );
 
         db.finish_quota_reset(&operation.id, false, Some("reset_dispatch_unknown"))
             .await
@@ -1005,6 +1150,56 @@ mod tests {
             .await
             .unwrap(),
             "credential changes cannot settle an unknown dispatch"
+        );
+        assert!(
+            db.release_unknown_quota_reset(&account, &operation.id, "operator", 1, 0, now + 5)
+                .await
+                .is_err(),
+            "recovery must use the current account revision for its fresh read"
+        );
+        db.release_unknown_quota_reset(
+            &changed_unknown_account,
+            &operation.id,
+            "operator",
+            1,
+            0,
+            now + 5,
+        )
+        .await
+        .unwrap();
+        db.release_unknown_quota_reset(
+            &changed_unknown_account,
+            &operation.id,
+            "operator",
+            1,
+            0,
+            now + 6,
+        )
+        .await
+        .unwrap();
+        let released = db
+            .quota_reset_operation(&tenant.to_string(), &account.id.to_string(), &operation.id)
+            .await
+            .unwrap();
+        assert_eq!(released.state, "unknown");
+        assert_eq!(released.settled_at, Some(now + 5));
+        assert_eq!(released.available_credits, 2);
+        assert_eq!(released.reconciled_available_credits, Some(1));
+        assert_eq!(
+            released
+                .audit
+                .iter()
+                .filter(|event| event.error_code.as_deref()
+                    == Some("unknown_reset_released_by_operator"))
+                .count(),
+            1,
+            "recovery replay keeps one audit record and the original unknown outcome"
+        );
+        assert!(
+            db.current_quota_reset_operation(&tenant.to_string(), &account.id.to_string())
+                .await
+                .unwrap()
+                .is_none()
         );
 
         let mut accepted_account = account.clone();
@@ -1187,21 +1382,85 @@ mod tests {
             .await
             .unwrap()
             .operation;
+        let dispatch_owner = Uuid::now_v7();
         assert!(matches!(
-            db.claim_quota_reset(
+            db.claim_quota_reset_owned(
                 &observed_account,
                 &observed.id,
                 "actor",
                 "observed-confirmation-hash",
-                "observed-confirm"
+                "observed-confirm",
+                None,
+                Some(dispatch_owner),
             )
             .await
             .unwrap(),
             QuotaResetClaim::Claimed { .. }
         ));
-        db.finish_quota_reset(&observed.id, true, None)
+        let replay_owner = Uuid::now_v7();
+        assert!(matches!(
+            db.claim_quota_reset_owned(
+                &observed_account,
+                &observed.id,
+                "actor",
+                "observed-confirmation-hash",
+                "observed-confirm",
+                None,
+                Some(replay_owner),
+            )
+            .await
+            .unwrap(),
+            QuotaResetClaim::Replayed(_)
+        ));
+        db.finish_quota_reset_owned(
+            &observed.id,
+            Some(replay_owner),
+            false,
+            Some("reset_dispatch_owner_ended"),
+        )
+        .await
+        .unwrap();
+        let still_owned = db
+            .quota_reset_operation(
+                &tenant.to_string(),
+                &observed_account.id.to_string(),
+                &observed.id,
+            )
             .await
             .unwrap();
+        assert_eq!(still_owned.state, "submitted");
+        assert_eq!(
+            still_owned
+                .audit
+                .iter()
+                .filter(|event| event.event == "confirmation_claimed")
+                .count(),
+            1,
+            "a replay cannot acquire or finish another dispatch owner's claim"
+        );
+        db.finish_quota_reset_owned(&observed.id, Some(dispatch_owner), true, None)
+            .await
+            .unwrap();
+        db.finish_quota_reset_owned(
+            &observed.id,
+            Some(dispatch_owner),
+            false,
+            Some("reset_dispatch_owner_ended"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.quota_reset_operation(
+                &tenant.to_string(),
+                &observed_account.id.to_string(),
+                &observed.id,
+            )
+            .await
+            .unwrap()
+            .state,
+            "accepted",
+            "completion retry cannot replace accepted supplier evidence"
+        );
         observed_account.credential_generation += 1;
         observed_account.updated_at = now + 1;
         sqlx::query(

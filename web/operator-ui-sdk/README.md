@@ -4,6 +4,8 @@ This package defines the versioned React contract for MTC Operator extensions. T
 
 Hosts also provide optional `ReactDOM` and `ReactJSXRuntime` bindings containing the complete `react-dom` and `react/jsx-runtime` namespaces. Packages that use portals or automatic JSX should check these bindings during activation and map their bundled externals to the host bindings before evaluating component libraries. This keeps hooks, contexts and portals on the host's React instance. Existing packages that only read `React` and `Fluent` keep the same activation contract.
 
+`host.EChart` is an optional shared ECharts component for line, bar and heatmap visualizations. It loads when rendered and follows the host theme, resizing and disposal lifecycle. Pass `option`, `ariaLabel`, `locale`, `timeZone`, and a chart height through `style` or a plugin CSS class. A package running on an earlier host can show its data as cards while offering charts on hosts that provide this binding.
+
 ```tsx
 export function activateOperatorUi({ React, Fluent, defineOperatorUiPackage }) {
   function Workspace({ contribution }) {

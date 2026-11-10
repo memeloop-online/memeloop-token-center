@@ -567,6 +567,7 @@ async fn streaming_codex_rejects_output_items_before_response_identity() {
         Some("upstream_invalid_response")
     );
     assert_eq!(rows[0].billing.cost, None);
+    cancellation::assert_original_response(&fixture, rows[0].request_id, body.as_bytes()).await;
     let refs = fixture
         .state
         .db
@@ -574,9 +575,11 @@ async fn streaming_codex_rejects_output_items_before_response_identity() {
         .await
         .unwrap();
     assert!(
-        refs.response_object
+        !refs
+            .response_object
             .as_deref()
-            .is_some_and(|locator| locator.starts_with("gap://"))
+            .unwrap()
+            .starts_with("gap://")
     );
     upstream.verify().await;
 }

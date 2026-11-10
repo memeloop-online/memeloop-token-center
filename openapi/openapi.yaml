@@ -1620,6 +1620,39 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /internal/v1/plugins/mtc-health-intelligence/private-data/concurrency-advice:
+    get:
+      tags: [System]
+      operationId: getPrivatePluginConcurrencyAdvice
+      summary: Read tenant-bound private concurrency observations
+      description: |
+        Requires an installed Health Intelligence plugin and plugins:read.
+        Private data additionally requires providers:read and requests:read.
+        The authorized tenant must match the host-provisioned companion tenant.
+        Reads never trigger collection or modify routing. Responses are private, no-store.
+      parameters:
+        - name: tenant_external_id
+          in: query
+          schema: { type: string }
+      responses:
+        '200':
+          description: Observations or an explicit unavailable/configuration/permission state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state:
+                    type: string
+                    enum: [ready, select_tenant, not_configured, permission_required, unavailable]
+                  data:
+                    type: object
+                    additionalProperties: true
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /internal/v1/plugins/{plugin_id}/data/{endpoint_id}:
     parameters:
       - name: plugin_id
@@ -2356,6 +2389,97 @@ paths:
           headers:
             Retry-After: { schema: { type: integer, minimum: 1 } }
 
+  /internal/v1/upstreams/{account_id}/health-probe-settings:
+    get:
+      tags: [Upstream providers]
+      operationId: getUpstreamHealthProbeSettings
+      summary: Read per-upstream scheduled probe settings
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:read
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+      responses:
+        '200':
+          description: Scheduled probing is disabled by default.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthProbeSettings' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    put:
+      tags: [Upstream providers]
+      operationId: putUpstreamHealthProbeSettings
+      summary: Configure per-upstream scheduled probes
+      description: Requires providers:write and keys:write. The probe credential must differ from the system AI credential. Disabling scheduling leaves manual probes available.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - $ref: '#/components/parameters/TenantFilter'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HealthProbeSettings' }
+      responses:
+        '200':
+          description: Saved settings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthProbeSettings' }
+        '400': { $ref: '#/components/responses/InvalidRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /internal/v1/upstreams/{account_id}/quota-reset/{operation_id}/recover:
+    post:
+      tags: [Upstream providers]
+      operationId: recoverUpstreamQuotaReset
+      summary: Release a completed unknown reset without consuming another credit
+      security: [{ serviceBearer: [] }]
+      x-required-scope: providers:write
+      description: |
+        Requires explicit operator acknowledgement and a fresh read of supplier
+        credits. Only unknown operations with a durable dispatch_unknown audit
+        may be released. Submitted operations cannot be released based on age or
+        balance. Keeps the unknown outcome and original baseline, records the
+        actor and fresh counts, and sets settled_at to release the local account
+        lock. Does not send a consume request or prove supplier success/failure.
+        Repeating recovery cannot consume or release a different operation.
+      parameters:
+        - $ref: '#/components/parameters/AccountId'
+        - name: operation_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: tenant_external_id
+          in: query
+          required: true
+          schema: { type: string, minLength: 1, maxLength: 200 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirmation]
+              properties:
+                confirmation: { const: release_unknown_reset_without_consuming }
+      responses:
+        '200':
+          description: Unknown outcome retained; local lock released with audited fresh counts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpstreamQuotaResetOperation' }
+        '400': { description: Explicit recovery confirmation is required. }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: "Dispatch has not ended, outcome is not unknown, or the account revision changed." }
+        '503': { description: Fresh supplier evidence or database is temporarily unavailable; no consumption occurs. }
+
   /internal/v1/upstreams/{account_id}/health:
     get:
       tags: [Upstream providers]
@@ -2750,7 +2874,7 @@ paths:
       description: |
         Requires the same global operator authority as editing private transport
         proxies and verifies the explicitly selected tenant owns the account.
-        Returns only credential-backed proxy settings and account CAS revisions,
+        Returns effective policy-backed proxy settings and account CAS revisions,
         including proxy username and password where configured. Never returns
         API keys, OAuth access/refresh tokens, adapter state or configuration.
         Works for supported OAuth and API-key proxy credentials. An unconfigured
@@ -2770,7 +2894,7 @@ paths:
               schema:
                 type: object
                 additionalProperties: false
-                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported]
+                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported, source, proxy_id, group_id, selected_member_id, configuration_state]
                 properties:
                   account_id: { type: string, format: uuid }
                   proxy_url: { type: [string, 'null'] }
@@ -2778,6 +2902,11 @@ paths:
                   updated_at: { type: integer, format: int64 }
                   credential_generation: { type: integer, format: int64 }
                   supported: { type: boolean, description: Whether this credential has an OAuth or proxied API-key container supported by the transport editor. }
+                  source: {"type":"string","enum":["credential","manual","auto","plugin"]}
+                  proxy_id: {"type":["string","null"],"format":"uuid"}
+                  group_id: {"type":["string","null"],"format":"uuid"}
+                  selected_member_id: {"type":["string","null"],"format":"uuid"}
+                  configuration_state: {"type":"string","enum":["credential","applied","pending"]}
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -3076,6 +3205,8 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/upstreams/{account_id}/oauth/recover: {"post":{"tags":["Upstream providers"],"operationId":"recoverUpstreamOAuthCredential","summary":"Finalize an already saved OAuth refresh result without contacting the authorization server","security":[{"serviceBearer":[]}],"x-required-scope":"oauth:write","parameters":[{"$ref":"#/components/parameters/AccountId"}],"responses":{"200":{"description":"Recovered stable upstream identity.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/UpstreamProvider"}}}},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"No saved result exists, or its generation/attempt no longer matches."}}}}
 
   /internal/v1/upstreams/{account_id}/oauth/disconnect:
     post:
@@ -5729,12 +5860,72 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { description: Retained prefix path is incomplete or inconsistent. }
 
+  /internal/v1/sessions/{session_id}/requests/{request_id}/training:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionTrainingArchive
+      summary: Export verified conversation events and durable raw and media references
+      description: Reads immutable tenant archive objects. Incomplete captures or missing media fail rather than being labelled complete training data. Raw JSON and SSE can be streamed separately without a document size limit.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+      responses:
+        '200':
+          description: NDJSON manifest and event references with descending ordinals. Require the verified end record and EOF; a truncated stream is not a complete export.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {description: 'Archive is incomplete, inconsistent or unavailable.'}
+
+  /internal/v1/sessions/{session_id}/requests/{request_id}/training/raw/{side}:
+    get:
+      tags: [Operator traffic]
+      operationId: getOperatorSessionTrainingRaw
+      summary: Stream the exact retained raw request or response
+      description: Rechecks session ownership and streams the durable object with byte and BLAKE3 verification. Consumers must read to EOF and verify x-content-blake3 and x-content-bytes. This endpoint does not certify that a partial upstream response is a complete dialogue.
+      security: [{ serviceBearer: [] }]
+      x-required-scope: requests:read
+      parameters:
+        - $ref: '#/components/parameters/ContextSessionId'
+        - $ref: '#/components/parameters/RequestIdPath'
+        - $ref: '#/components/parameters/TenantFilter'
+        - $ref: '#/components/parameters/ContextKeyId'
+        - name: side
+          in: path
+          required: true
+          schema: {type: string, enum: [request, response]}
+      responses:
+        '200':
+          description: Exact JSON or SSE bytes, never an evictable cache reference.
+          headers:
+            x-content-blake3:
+              schema: {type: string}
+            x-content-bytes:
+              schema: {type: string}
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        '400': {$ref: '#/components/responses/InvalidRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {description: Archive is inconsistent or unavailable.}
+
   /internal/v1/sessions/{session_id}/requests/{request_id}/dialogue:
     get:
       tags: [Operator traffic]
       operationId: getOperatorSessionDialogue
       summary: Read the cleaned session dialogue stored for this request
-      description: Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.
+      description: Returns cleaned dialogue from immutable archive bodies through tenant-scoped context metadata. This presentation is not the byte-exact raw training archive and does not return object locators.
       security: [{ serviceBearer: [] }]
       x-required-scope: requests:read
       parameters:
@@ -9235,6 +9426,16 @@ components:
       additionalProperties: false
       required: [current, candidates]
       properties:
+        runtime:
+          type: object
+          description: Local plugin availability; does not determine core gateway readiness.
+          properties:
+            ready: { type: boolean }
+            error: { type: [string, 'null'] }
+            revision:
+              oneOf:
+                - { $ref: '#/components/schemas/ApplicationPluginRevision' }
+                - { type: 'null' }
         current:
           oneOf:
             - { $ref: '#/components/schemas/ApplicationPluginRevision' }
@@ -9402,7 +9603,7 @@ components:
         last_reconciled_at: { type: [integer, 'null'], format: int64 }
         reconciled_available_credits: { type: [integer, 'null'], format: int64 }
         reconciled_applicable_credits: { type: [integer, 'null'], format: int64 }
-        settled_at: { type: [integer, 'null'], format: int64, description: Fresh observation time when an accepted operation's exact old available-credit balance no longer applied; not proof that this operation caused the change or reset a quota window. }
+        settled_at: { type: [integer, 'null'], format: int64, description: Fresh observation time when an accepted balance changed or an operator explicitly released a completed unknown dispatch; not proof of supplier reset completion. }
         error_code: { type: [string, 'null'] }
         audit:
           type: array
@@ -10192,6 +10393,7 @@ components:
       additionalProperties: false
       required: [id, tenant_id, tenant_external_id, name, notes, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, has_proxy, proxy_scheme, proxy_remote_dns, proxy_label, proxy_fingerprint, can_update_transport_proxy, import_source_identity_hash, import_source_document_sha256, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
       properties:
+        oauth_refresh: {"type":"object","properties":{"allowed_actions":{"type":"array","items":{"type":"string","enum":["refresh","resume_local","reauthorize"]}},"lease_expires_at":{"type":["integer","null"],"format":"int64"},"access_state":{"type":"string","enum":["valid","expired","revoked","unknown"]},"refresh_state":{"type":"string","enum":["not_observed","in_progress","pending_local","outcome_unknown","failed","reauthorization_required"]},"reauthorization_required":{"type":"boolean"},"automatic_refresh_paused":{"type":"boolean"}}}
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
         tenant_external_id: { type: [string, 'null'] }
@@ -11517,7 +11719,7 @@ components:
       type: object
       required: [billing_unit, price_per_unit]
       properties:
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         price_per_unit: { $ref: '#/components/schemas/NonNegativeMoney' }
     GenerationPrice:
       type: object
@@ -11526,7 +11728,7 @@ components:
         id: { type: string, format: uuid }
         model: { type: string }
         currency: { $ref: '#/components/schemas/Currency' }
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         price_per_unit: { $ref: '#/components/schemas/NonNegativeMoney' }
     GrantRequest:
       type: object
@@ -12365,6 +12567,16 @@ components:
           description: Stable enabled MTC model-route reference; no credential material is returned.
         updated_at: { type: integer, format: int64 }
         billing_key_id: { type: [string, 'null'], format: uuid }
+    HealthProbeSettings:
+      type: object
+      additionalProperties: false
+      required: [enabled, billing_key_id, interval_seconds, model, prompt]
+      properties:
+        enabled: { type: boolean, default: false }
+        billing_key_id: { type: [string, 'null'], format: uuid }
+        interval_seconds: { type: integer, minimum: 3600, maximum: 2592000, default: 3600 }
+        model: { type: [string, 'null'], maxLength: 200 }
+        prompt: { type: string, minLength: 1, maxLength: 1024 }
     PutFilterAssistantSettingsRequest:
       type: object
       additionalProperties: false
@@ -13142,7 +13354,7 @@ components:
         completed_at: { type: [integer, 'null'], format: int64 }
         model: { type: string }
         driver: { type: string }
-        billing_unit: { type: string, enum: [job, second, image, megapixel] }
+        billing_unit: { type: string, enum: [job, second, image, megapixel, million_tokens] }
         status: { type: string, enum: [queued, running, cancelling, succeeded, failed, cancelled] }
         upstream_job_id: { type: [string, 'null'] }
         estimated_units: { type: integer, format: int64 }

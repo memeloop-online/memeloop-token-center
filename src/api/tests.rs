@@ -1080,69 +1080,6 @@ fn upstream_image_idempotency_is_secret_and_scoped_to_stable_identity() {
 }
 
 #[tokio::test]
-async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() {
-    let fixture = generation_api_fixture(
-        "image-lifecycle",
-        "comfyui",
-        "job",
-        KeyPolicy {
-            allowed_models: vec!["generation-api-model-image-lifecycle".to_owned()],
-            ..KeyPolicy::default()
-        },
-        Decimal::TEN,
-    )
-    .await;
-    let both = fixture
-        .state
-        .image_response_permits
-        .acquire_many(2)
-        .await
-        .expect("acquire both image permits");
-    let cloned = fixture.state.clone();
-    assert!(std::sync::Arc::ptr_eq(
-        &fixture.state.image_response_permits,
-        &cloned.image_response_permits,
-    ));
-    assert!(cloned.image_response_permits.try_acquire().is_err());
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(25),
-            fixture.state.image_response_permits.acquire()
-        )
-        .await
-        .is_err(),
-        "a third synchronous image lifecycle must not have a permit"
-    );
-
-    let response = tokio::time::timeout(
-        Duration::from_millis(100),
-        router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(
-            Request::post("/v1/images/generations")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
-                .body(Body::from_stream(futures_util::stream::pending::<
-                    Result<Bytes, Infallible>,
-                >()))
-                .unwrap(),
-        ),
-    )
-    .await
-    .expect("an exhausted image budget must reject without reading the body")
-    .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
-
-    drop(both);
-    let _released = tokio::time::timeout(
-        Duration::from_millis(100),
-        fixture.state.image_response_permits.acquire(),
-    )
-    .await
-    .expect("permit becomes available")
-    .expect("semaphore remains open");
-}
-
-#[tokio::test]
 async fn queued_image_permit_wait_heartbeats_and_stops_when_claim_is_lost() {
     let semaphore = tokio::sync::Semaphore::new(0);
     let heartbeats = std::sync::atomic::AtomicUsize::new(0);

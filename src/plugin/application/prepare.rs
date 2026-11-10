@@ -32,6 +32,7 @@ pub fn check_inventory_directory(directory: &Path) -> Result<(), AppError> {
 pub fn prepare_inventory_directory(directory: &Path) -> Result<(), AppError> {
     validate_directory(directory)?;
     let inventory = directory.join("inventory.json");
+    let _lock = super::inventory_lock::try_write_lock(&inventory)?;
     if inventory
         .try_exists()
         .map_err(|_| AppError::internal("prepare_prepare_inventory_directory_1"))?
@@ -127,14 +128,34 @@ mod tests {
     fn concurrent_initializers_converge_and_crashed_temporary_file_is_ignored() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join(".mtc-inventory-init-crashed"), b"").unwrap();
-        std::thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| prepare_inventory_directory(root.path()).unwrap());
+        let successful = std::thread::scope(|scope| {
+            let attempts: Vec<_> = (0..4)
+                .map(|_| scope.spawn(|| prepare_inventory_directory(root.path())))
+                .collect();
+            let mut successful = 0;
+            for attempt in attempts {
+                match attempt.join().unwrap() {
+                    Ok(()) => successful += 1,
+                    Err(AppError::Capacity {
+                        code: "plugin_installation_lock",
+                        ..
+                    }) => {}
+                    Err(error) => panic!("unexpected initialization failure: {error:?}"),
+                }
             }
+            successful
         });
+        // One initializer owns publication; contenders report the explicit busy
+        // outcome consumed by --allow-unavailable, rather than wait in Pod init.
+        assert!(successful >= 1);
         assert_eq!(
             std::fs::read(root.path().join("inventory.json")).unwrap(),
             b"{}"
+        );
+        prepare_inventory_directory(root.path()).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join(".mtc-inventory-init-crashed")).unwrap(),
+            b""
         );
     }
 

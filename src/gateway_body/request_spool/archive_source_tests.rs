@@ -87,8 +87,8 @@ async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queu
     let admission =
         RequestSpoolAdmission::new(directory.path().to_owned()).with_memory_store(store.clone());
     // Leave room for the first body plus its 64 KiB capture metadata
-    // and structs. At 192 KiB the first capture itself spills and waits on
-    // the paused write before this fixture can ever send its release.
+    // and structs. At 192 KiB the first capture would also spill, so this
+    // fixture could not exercise the shared resident byte owner.
     let budget = ProxyMemoryBudget::new(256 * 1024);
     let first_memory = budget.reservation();
     let second_memory = budget.reservation();
@@ -121,6 +121,7 @@ async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queu
     assert_eq!(raw.as_ptr(), shared.as_ptr());
     let pending_bytes = budget.snapshot().0;
     assert!(pending_bytes > raw.len());
+    let release_second = store.pause_next_write();
     let second = tokio::time::timeout(
         Duration::from_secs(1),
         admission.capture_with_memory(
@@ -135,7 +136,7 @@ async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queu
     .await
     .expect("a later upload must spill without waiting for the pending upload")
     .unwrap();
-    assert!(second.durable_settled_for_test());
+    assert!(!second.durable_settled_for_test());
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), second.read_all())
             .await
@@ -143,10 +144,17 @@ async fn pending_sources_share_one_budget_and_later_upload_spills_without_a_queu
             .unwrap(),
         Bytes::from(vec![b'b'; 256 * 1024])
     );
-    assert_eq!(store.reads.load(Ordering::Acquire), 1, "read the spill");
+    assert_eq!(
+        store.reads.load(Ordering::Acquire),
+        0,
+        "read the local spill"
+    );
+    release_second.send(()).unwrap();
+    assert!(second.upload_outcome().await);
+    assert!(second.durable_settled_for_test());
     assert!(!first.durable_settled_for_test());
     assert_eq!(first.read_all().await.unwrap().as_ptr(), shared.as_ptr());
-    assert_eq!(store.reads.load(Ordering::Acquire), 1);
+    assert_eq!(store.reads.load(Ordering::Acquire), 0);
     assert_eq!(budget.snapshot().0, pending_bytes);
     assert!(pending_bytes <= budget.snapshot().1);
     assert_eq!(admission.snapshot().used_bytes, 128 * 1024);

@@ -63,7 +63,8 @@ async fn acquisition_timeout_is_distinct_from_query_failure_and_keeps_overload()
         .options()
         .clone()
         .acquire_timeout(Duration::from_millis(20))
-        .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone())
+        .into();
     let held = database.pool.acquire().await.unwrap();
     let credential = "private-auth-credential-canary";
     let pepper = b"private-auth-pepper-canary";
