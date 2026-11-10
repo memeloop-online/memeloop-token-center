@@ -116,6 +116,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
         const parsed = body.proxy_url ? new URL(body.proxy_url) : undefined;
         const saved: NetworkProxy = {
           id: id!, tenant_external_id: 'fixture', name: body.name, version: (old?.version ?? 0) + 1,
+          proxy_url: body.proxy_url ?? old?.proxy_url,
           address: {
             scheme: parsed?.protocol.slice(0, -1) ?? old?.address.scheme ?? 'socks5h',
             host: parsed?.hostname ?? old?.address.host ?? '10.20.30.40', port: parsed ? Number(parsed.port) : old?.address.port ?? 1080,
@@ -201,6 +202,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
             const address = member.proxy_url ? new URL(member.proxy_url) : undefined;
             return {
               id: member.id ?? (old ? `raw-member-id-${old.version + 1}-${index}` : `raw-member-id-${index}`),
+              proxy_url: member.proxy_url ?? saved?.proxy_url,
               label: member.label, scheme: 'socks5h', host: address?.hostname ?? saved?.host ?? '10.20.30.40',
               port: address ? Number(address.port) : saved?.port ?? 1080, remote_dns: true,
               has_auth: address ? Boolean(address.username || address.password) : saved?.has_auth ?? false,
@@ -694,7 +696,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       let writes = await page.evaluate(() => window.proxyGroupFixture.writes);
       assert.equal(writes.length, 1);
       assert.equal(writes[0].method, 'PUT');
-      assert.equal(Object.hasOwn(writes[0].body, 'proxy_url'), false, 'unchanged redacted address preserves stored authentication');
+      assert.equal(Object.hasOwn(writes[0].body, 'proxy_url'), false, 'unchanged address is omitted instead of replacing stored authentication');
       assert.equal(writes[0].body.expected_version, 1);
 
       await workspace.getByRole('button', { name: copy.create, exact: true }).click();
@@ -704,7 +706,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       await workspace.getByRole('button', { name: copy.edit('研发备用'), exact: true }).waitFor();
       await workspace.getByRole('button', { name: copy.edit('研发备用'), exact: true }).click();
       const replacement = workspace.locator('.proxy-address-input');
-      assert.equal(await replacement.inputValue(), 'socks5h://10.20.30.40:1080');
+      assert.equal(await replacement.inputValue(), privateProxySecret, 'saved authenticated address remains directly editable');
       await replacement.fill('socks5h://10.20.30.41:1080');
       await workspace.getByRole('button', { name: copy.save, exact: true }).click();
       await workspace.getByText(copy.saved, { exact: true }).waitFor();

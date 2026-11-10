@@ -317,7 +317,10 @@ async fn managed_binding_stamp_reaches_send_stage_without_bad_request() {
     assert_eq!(stamp["binding_version"], binding["binding_version"]);
     assert!(stamp["selection_version"].as_i64().unwrap() > 0);
 
-    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let pool = sqlx::AnyPool::connect(&fixture.database_url)
+        .await
+        .unwrap()
+        .into();
     fixture
         .state
         .transport_proxy_groups

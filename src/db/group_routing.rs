@@ -25,7 +25,7 @@ impl Database {
     #[cfg(test)]
     pub(crate) async fn hold_group_snapshot_pool_for_tests(
         &self,
-    ) -> Vec<sqlx::pool::PoolConnection<sqlx::Any>> {
+    ) -> Vec<super::request_connection::RequestConnection> {
         let mut held = Vec::new();
         for _ in 0..self.pool.options().get_max_connections() {
             held.push(self.pool.acquire().await.expect("test pool connection"));

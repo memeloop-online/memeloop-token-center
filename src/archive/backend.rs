@@ -18,6 +18,17 @@ impl ArchiveStore {
         super::tests::memory_store()
     }
 
+    #[cfg(test)]
+    pub(crate) fn training_memory_for_test() -> Self {
+        let mut archive = super::tests::memory_store();
+        archive.training = Some(super::routing::TrainingStore {
+            store: Arc::new(InMemory::new()),
+            identity: "a".repeat(64),
+        });
+        archive.training_cas_writes = true;
+        archive
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self, AppError> {
         config
             .s3_timeouts

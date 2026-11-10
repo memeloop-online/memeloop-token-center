@@ -46,7 +46,7 @@ async fn readiness_reuses_one_checkout_while_pool_return_is_delayed() {
             })
         })
         .connect_lazy_with(database.pool.connect_options().as_ref().clone());
-    let previous_pool = std::mem::replace(&mut database.pool, pool);
+    let previous_pool = std::mem::replace(&mut database.pool, pool.into());
     previous_pool.close().await;
     let held = database.pool.acquire().await.unwrap();
     let mut warmed = database.pool.acquire().await.unwrap();

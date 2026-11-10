@@ -164,7 +164,7 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
   function editProxy(proxy: NetworkProxy | null) {
     setEditing(proxy); setError(''); setMessage('');
     setName(proxy?.name ?? '');
-    const displayAddress = proxy ? egressAddress(proxy.address, locale) : '';
+    const displayAddress = proxy ? proxy.proxy_url ?? egressAddress(proxy.address, locale) : '';
     setAddress(displayAddress); setOriginalAddress(displayAddress);
     setProbeEnabled(proxy?.probe.enabled ?? true);
     setProbeTarget(proxy?.probe.target_url ?? 'https://openai.com/');
@@ -332,7 +332,6 @@ export function NetworkProxyWorkspace({ token, tenant, onChanged, closeRequest }
               onChange={setAddress} placeholder="socks5h://100.64.0.16:1080" />
           </div>
           <p>{copy.addressHint}</p>
-          {editing?.address.has_auth && <p>{copy.authHint}</p>}
           <Checkbox label={copy.probeEnabled} checked={probeEnabled} onChange={(_, data) => setProbeEnabled(data.checked === true)} />
           <Field label={copy.probeTarget} required><Input required maxLength={2048} value={probeTarget} onChange={(_, data) => setProbeTarget(data.value)} placeholder="https://openai.com/" /></Field>
           <Field label={copy.probeInterval} required><Input type="number" required min={10_000} max={3_600_000} step={1000} value={probeInterval} onChange={(_, data) => setProbeInterval(data.value)} /></Field>
