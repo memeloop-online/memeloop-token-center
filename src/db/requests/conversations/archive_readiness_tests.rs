@@ -694,12 +694,13 @@ impl Fixture {
 
     async fn assert_deferred(&self) -> Uuid {
         let owner = self.claim().await;
+        let started_at = unix_millis();
         assert!(
             !crate::worker::archive_session_body(&self.state, owner, self.request_id)
                 .await
                 .unwrap()
         );
-        let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at, projected_at, statistics_outcome FROM conversation_projection_outbox WHERE request_id = $1")
+        let row = sqlx::query("SELECT lease_owner, lease_expires_at, terminal_lease_owner, terminal_lease_expires_at, projected_at, statistics_outcome, attempts FROM conversation_projection_outbox WHERE request_id = $1")
             .bind(self.request_id.to_string()).fetch_one(&self.state.db.pool).await.unwrap();
         assert_eq!(row.get::<String, _>("lease_owner"), "terminal-v118");
         assert_eq!(row.get::<i64, _>("lease_expires_at"), i64::MAX);
@@ -707,7 +708,20 @@ impl Fixture {
             row.get::<Option<String>, _>("terminal_lease_owner")
                 .is_none()
         );
-        assert!(row.get::<i64, _>("terminal_lease_expires_at") <= unix_millis() + 5000);
+        // Repeated readiness deferrals follow the bounded retry contract from
+        // PR824; they do not reset every retry to the first-attempt delay.
+        let retry_delay = match row.get::<i64, _>("attempts") {
+            0 | 1 => 5_000,
+            2 => 10_000,
+            3 => 20_000,
+            4 => 40_000,
+            5 => 80_000,
+            6 => 160_000,
+            _ => 300_000,
+        };
+        let deadline = row.get::<i64, _>("terminal_lease_expires_at");
+        assert!(deadline >= started_at + retry_delay);
+        assert!(deadline <= unix_millis() + retry_delay);
         assert!(row.get::<Option<i64>, _>("projected_at").is_none());
         assert_ne!(
             row.get::<Option<String>, _>("statistics_outcome")
