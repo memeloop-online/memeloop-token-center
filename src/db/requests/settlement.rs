@@ -294,7 +294,7 @@ pub(crate) fn normalize_proxy_usage_with_output_limit(
     output_token_limit: Option<i64>,
     requested_service_tier: Option<&str>,
 ) -> Result<TokenUsage, AppError> {
-    let observe_rejection = |reason: &'static str| {
+    let observe_usage = |reason: &'static str, rejected: bool| {
         let safe_tier = |tier: Option<&str>| match tier {
             None => "absent",
             Some("default") => "default",
@@ -321,9 +321,15 @@ pub(crate) fn normalize_proxy_usage_with_output_limit(
             has_output_token_limit = output_token_limit.is_some(),
             requested_service_tier = safe_tier(requested_service_tier),
             reported_service_tier = safe_tier(usage.service_tier.as_deref()),
-            "provider usage normalization rejected"
+            rejected,
+            message = if rejected {
+                "provider usage normalization rejected"
+            } else {
+                "provider reported output above the requested token limit"
+            }
         );
     };
+    let observe_rejection = |reason| observe_usage(reason, true);
     validate_token_usage(usage).map_err(|_| {
         observe_rejection(
             if [
@@ -358,13 +364,12 @@ pub(crate) fn normalize_proxy_usage_with_output_limit(
         })?;
     // Admission estimates input from the wire body. Provider-added tool and
     // image context can exceed that estimate; settlement prices actual usage.
+    // A requested generation limit is not proof that the provider's reported
+    // usage is invalid. Providers can overshoot a small limit (the Kimi probe
+    // reports 19 for a requested 16). Keep the actual billable usage and the
+    // diagnostic; do not turn a successful response into a health failure.
     if output_token_limit.is_some_and(|limit| usage.output_tokens > limit) {
-        observe_rejection("explicit_output_limit_exceeded");
-        return Err(AppError::upstream_with(
-            "upstream_unavailable",
-            crate::error::ErrorFacts::new()
-                .stage("settlement_normalize_proxy_usage_with_output_limit"),
-        ));
+        observe_usage("explicit_output_limit_exceeded", false);
     }
 
     if let Some(requested) = requested_service_tier {
