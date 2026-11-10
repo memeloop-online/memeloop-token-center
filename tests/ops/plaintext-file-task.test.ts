@@ -70,3 +70,21 @@ test('duplicate tool identity is incomplete and non-JSON upstream error remains 
   assert.equal(error.status, 503);
   assert.equal(error.stream_complete, false);
 });
+
+test('receipt final symlink cannot create or truncate a file in the model workspace', async () => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'mtc-file-task-'));
+  const privateDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'mtc-file-receipt-'));
+  const destination = path.join(directory, 'receipt.json');
+  const archive = path.join(privateDirectory, 'receipt.json');
+  let requests = 0;
+  try {
+    await fs.symlink(destination, archive);
+    const invoke = () => runTask({ directory, archive, task: 'Task', model: 'test', apiKey: 'key', baseUrl: 'https://example.invalid' }, async () => { requests++; throw new Error('must not send'); });
+    await assert.rejects(invoke());
+    await assert.rejects(fs.stat(destination));
+    await fs.writeFile(destination, 'preserved');
+    await assert.rejects(invoke());
+    assert.equal(await fs.readFile(destination, 'utf8'), 'preserved');
+    assert.equal(requests, 0);
+  } finally { await fs.rm(directory, { recursive: true, force: true }); await fs.rm(privateDirectory, { recursive: true, force: true }); }
+});

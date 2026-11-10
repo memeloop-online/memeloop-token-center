@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { constants } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -117,7 +118,8 @@ export async function runTask(options: Options, send: typeof fetch = fetch) {
   const record: any = { model: options.model, directory, task: options.task, turns: [], completed: false };
   const redact = (value: unknown) => JSON.parse(JSON.stringify(value).replaceAll(options.apiKey, '[redacted]'));
   const save = async () => {
-    const file = await fs.open(archive, 'w', 0o600);
+    // Do not follow a final-component symlink back into the model workspace.
+    const file = await fs.open(archive, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
     try { await file.chmod(0o600); await file.writeFile(JSON.stringify(redact(record), null, 2) + '\n'); }
     finally { await file.close(); }
   };
