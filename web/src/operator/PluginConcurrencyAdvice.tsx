@@ -4,35 +4,25 @@ import { api } from '../api.js';
 const copy = {
   en: {
     title: 'Concurrency observations',
-    intro: 'Compare observed account and proxy load with completed requests. Suggested ranges are for manual review; they do not change routing or concurrency.',
-    loading: 'Loading observations…',
-    select_tenant: 'Choose a tenant to see its observations.',
-    not_configured: 'Concurrency observations are not enabled for this tenant. Ask an administrator to connect its private observation service.',
-    permission_required: 'Viewing these observations requires access to providers and request history.',
+    intro: 'View account and proxy request load, completed requests, and suggested concurrency ranges.',
     unavailable: 'Observations are temporarily unavailable. Try refreshing shortly.',
-    empty: 'Waiting for observed account or proxy activity.',
-    stale: 'These observations are out of date. Wait for fresh samples before changing settings.',
+    stale: 'Showing the previous observations. Refresh to check for new samples.',
     refresh: 'Refresh', resource: 'Resource', current: 'Current / sampled peak', samples: 'Matched / target samples per bucket',
-    progress: 'Sample / observation window progress', range: 'Observed range for manual review', none: 'More comparable evidence is needed',
+    progress: 'Sample / observation window progress', range: 'Suggested concurrency range', none: 'Waiting for enough samples',
     account: 'Account', proxy: 'Proxy', detail: 'Evidence details',
-    caution: 'Observations describe traffic seen so far, not a proven optimum or the causal effect of increasing concurrency. Different models and request sizes may not be comparable. Confidence intervals rely on independent, comparable samples; repeated inspection and correlated traffic can weaken them.',
-    limits: 'Statistical assumptions and limitations', unknown: 'Unknown',
+    caution: 'Ranges describe the current sample. Compare model, request length, and sampling coverage together. Confidence intervals assume independent, comparable samples; repeated observations and correlated traffic affect confidence.',
+    limits: 'How ranges are calculated', unknown: 'Unknown',
   },
   zh: {
     title: '并发观测',
-    intro: '对照账号及代理的实测负载与已完成请求。建议区间仅供人工审阅，不会更改路由或并发配置。',
-    loading: '正在读取观测…',
-    select_tenant: '选择租户以查看其观测。',
-    not_configured: '此租户尚未启用并发观测。请联系管理员连接该租户的私有观测服务。',
-    permission_required: '查看这些观测需要供应商与请求历史的读取权限。',
+    intro: '查看账号与代理的请求负载、完成量和建议并发区间。',
     unavailable: '暂时无法读取观测，请稍后刷新。',
-    empty: '正在等待账号或代理的实际请求活动。',
-    stale: '观测已过期。请等待新鲜样本后再调整配置。',
+    stale: '当前显示上次观测结果，可刷新查看新样本。',
     refresh: '刷新', resource: '资源', current: '当前 / 已采样峰值', samples: '已匹配 / 每桶目标样本',
-    progress: '样本 / 观察窗进度', range: '供人工审阅的实测区间', none: '仍需更多可比较证据',
+    progress: '样本 / 观察窗进度', range: '建议并发区间', none: '等待足够样本',
     account: '账号', proxy: '代理', detail: '证据详情',
-    caution: '观测仅描述已发生的流量，不证明最优并发，也不证明提高并发的因果效果。不同模型和请求长度可能无法比较。置信区间依赖独立、可比较样本；反复查看及相关流量可能削弱其有效性。',
-    limits: '统计假设与局限', unknown: '未知',
+    caution: '建议区间基于当前样本，请结合模型、请求长度与采样覆盖比较。置信区间以独立、可比较样本为前提；重复观测与相关流量会影响可信度。',
+    limits: '区间计算依据', unknown: '未知',
   },
 };
 
@@ -74,18 +64,17 @@ export function PluginConcurrencyAdvice({ token, tenant, locale }: { token: stri
     && data.application_mode === 'manual_only' && typeof data.stale === 'boolean' && Array.isArray(data.series)
     && (!tenant || data.tenant_external_id === tenant);
   const state = response?.state;
-  const message = !response ? text.loading : state === 'select_tenant' ? text.select_tenant
-    : state === 'not_configured' ? text.not_configured : state === 'permission_required' ? text.permission_required
-      : !valid ? text.unavailable : '';
+  if (!response || state === 'select_tenant' || state === 'not_configured' || state === 'permission_required'
+    || (valid && Array.isArray(data?.series) && data.series.length === 0)) return null;
+  const message = valid ? '' : text.unavailable;
   const series = valid && Array.isArray(data?.series) ? data.series.map(object).filter((s): s is RecordValue => s !== null) : [];
   const uncertainty = object(data?.uncertainty);
   return <section className="panel" aria-label={text.title}>
-    <div className="panel-title"><div><h2>{text.title}</h2><p className="muted">{text.intro}</p></div>
+    <div className="panel-title"><div><h2>{text.title}</h2>{valid && <p className="muted">{text.intro}</p>}</div>
       <button type="button" disabled={!response} onClick={() => setRefresh((v) => v + 1)}>{text.refresh}</button>
     </div>
     {message ? <p role="status">{message}</p> : <>
       {data?.stale === true && <p className="notice" role="status">{text.stale}</p>}
-      {series.length === 0 && <p>{text.empty}</p>}
       {series.map((item, index) => {
         const sampling = object(item.sampling);
         const recommendation = data?.stale === false && item.status === 'manual_review' ? object(item.recommendation) : null;
