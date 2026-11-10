@@ -433,7 +433,6 @@ async fn contract(url: &str) {
     let input = ConversationProjectionEnqueueInput {
         request_id: projected,
         key: &first,
-        request_json: &base_body,
         hints: &default_hints,
         client_name: Some("Codex"),
         upstream_response_id: None,
@@ -466,6 +465,14 @@ async fn contract(url: &str) {
     assert!(
         !database
             .project_claimed_conversation_projection_task(crashed, projected)
+            .await
+            .unwrap()
+    );
+    let atoms = extract_atoms(&base_body);
+    let nodes = build_prefix(&atoms);
+    assert!(
+        database
+            .prepare_session_body_archive(owner, projected, atoms, &nodes, &[])
             .await
             .unwrap()
     );

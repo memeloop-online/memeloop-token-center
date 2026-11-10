@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use axum::{
     Json,
+    body::Bytes,
     extract::State,
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -47,13 +48,32 @@ pub(super) async fn proxy_openai_chat(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
-    axum::Extension(spool): axum::Extension<
-        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     >,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
-    let body = replay_request_source(&state, &spool).await?;
-    super::proxy::proxy_spooled(state, headers, body, memory, spool, Protocol::OpenAiChat).await
+    proxy_source_or_body(state, headers, body, Protocol::OpenAiChat, memory, spool).await
+}
+
+async fn proxy_source_or_body(
+    state: AppState,
+    headers: HeaderMap,
+    body: Bytes,
+    protocol: Protocol,
+    memory: std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    >,
+) -> Result<Response, AppError> {
+    match spool {
+        Some(axum::Extension(spool)) => {
+            super::proxy::proxy_spooled_responses(state, headers, body, memory, spool, protocol)
+                .await
+        }
+        None => super::proxy::proxy(state, headers, body, protocol, memory).await,
+    }
 }
 
 pub(super) async fn proxy_openai_responses(
@@ -66,11 +86,10 @@ pub(super) async fn proxy_openai_responses(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let body = replay_request_source(&state, &spool).await?;
-    super::proxy::proxy_spooled(
+    super::proxy::proxy_spooled_responses(
         state,
         headers,
-        body,
+        Bytes::new(),
         memory,
         spool,
         Protocol::OpenAiResponses,
@@ -88,11 +107,10 @@ pub(super) async fn proxy_openai_responses_compact(
     >,
     headers: HeaderMap,
 ) -> Result<Response, AppError> {
-    let body = replay_request_source(&state, &spool).await?;
-    super::proxy::proxy_spooled(
+    super::proxy::proxy_spooled_responses(
         state,
         headers,
-        body,
+        Bytes::new(),
         memory,
         spool,
         Protocol::OpenAiResponsesCompact,
@@ -100,37 +118,24 @@ pub(super) async fn proxy_openai_responses_compact(
     .await
 }
 
-async fn replay_request_source(
-    state: &AppState,
-    spool: &std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
-) -> Result<crate::gateway_body::request_spool::VerifiedJsonInput, AppError> {
-    spool
-        .verified_json_file(
-            std::path::Path::new(&state.config.responses_request_spool_path),
-            &state.proxy_memory_budget,
-        )
-        .await
-        .map_err(|_| AppError::capacity_error("request_spool_read_failed"))
-}
-
 pub(super) async fn proxy_openai_alpha_search(
     State(state): State<AppState>,
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
-    axum::Extension(spool): axum::Extension<
-        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     >,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
-    let body = replay_request_source(&state, &spool).await?;
-    super::proxy::proxy_spooled(
+    proxy_source_or_body(
         state,
         headers,
         body,
+        Protocol::OpenAiAlphaSearch,
         memory,
         spool,
-        Protocol::OpenAiAlphaSearch,
     )
     .await
 }
@@ -161,19 +166,19 @@ pub(super) async fn proxy_openai_embeddings(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
-    axum::Extension(spool): axum::Extension<
-        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     >,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
-    let body = replay_request_source(&state, &spool).await?;
-    super::proxy::proxy_spooled(
+    proxy_source_or_body(
         state,
         headers,
         body,
+        Protocol::OpenAiEmbeddings,
         memory,
         spool,
-        Protocol::OpenAiEmbeddings,
     )
     .await
 }
@@ -183,19 +188,19 @@ pub(super) async fn proxy_anthropic(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
-    axum::Extension(spool): axum::Extension<
-        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     >,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
-    let body = replay_request_source(&state, &spool).await?;
-    super::proxy::proxy_spooled(
+    proxy_source_or_body(
         state,
         headers,
         body,
+        Protocol::AnthropicMessages,
         memory,
         spool,
-        Protocol::AnthropicMessages,
     )
     .await
 }
@@ -205,19 +210,19 @@ pub(super) async fn proxy_anthropic_count_tokens(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
-    axum::Extension(spool): axum::Extension<
-        std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
     >,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, AppError> {
-    let body = replay_request_source(&state, &spool).await?;
-    super::proxy::proxy_spooled(
+    proxy_source_or_body(
         state,
         headers,
         body,
+        Protocol::AnthropicCountTokens,
         memory,
         spool,
-        Protocol::AnthropicCountTokens,
     )
     .await
 }

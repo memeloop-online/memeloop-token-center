@@ -12,6 +12,7 @@ mod tests;
 pub(crate) struct ProbeAccountContext {
     pub(crate) tenant_external_id: String,
     pub(crate) driver: String,
+    #[cfg(test)]
     pub(crate) config: Value,
     pub(crate) credential_generation: i64,
     pub(crate) transport_revision: i64,
@@ -30,6 +31,92 @@ pub(crate) struct ProbeBillingRoute {
 }
 
 impl Database {
+    pub(crate) async fn health_probe_credential_in_use(
+        &self,
+        tenant: &str,
+        key_id: Uuid,
+    ) -> Result<bool, AppError> {
+        let values: Vec<Vec<u8>> = sqlx::query_scalar(
+            "SELECT k.value FROM plugin_kv k
+             JOIN upstream_accounts a ON a.id = k.key
+             JOIN tenants t ON t.id = a.tenant_id
+             WHERE k.plugin_id = 'upstream-health-probe' AND t.external_id = $1",
+        )
+        .bind(tenant)
+        .fetch_all(&self.pool)
+        .await?;
+        for value in values {
+            let settings: Value = serde_json::from_slice(&value)
+                .map_err(|_| AppError::internal("health_probe_settings"))?;
+            if settings["billing_key_id"].as_str() == Some(key_id.to_string().as_str()) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(crate) async fn configured_upstream_service_probes_due(
+        &self,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<Uuid>, AppError> {
+        let rows = sqlx::query(
+            "SELECT a.id FROM upstream_accounts a
+             JOIN plugin_kv k ON k.plugin_id = 'upstream-health-probe' AND k.key = a.id
+             LEFT JOIN upstream_service_probes p ON p.upstream_account_id = a.id
+             WHERE a.status = 'active'
+               AND (COALESCE(p.last_attempt_at, p.checked_at) IS NULL
+                    OR COALESCE(p.last_attempt_at, p.checked_at) <= $1)
+             ORDER BY COALESCE(p.last_attempt_at, p.checked_at, 0), a.id LIMIT $2",
+        )
+        .bind(before)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|row| {
+                let id: String = row.try_get("id")?;
+                Uuid::parse_str(&id)
+                    .map_err(|_| AppError::internal("configured_upstream_service_probes_due"))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn upstream_service_probe_last_attempt(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<i64>, AppError> {
+        Ok(sqlx::query_scalar("SELECT COALESCE(last_attempt_at, checked_at) FROM upstream_service_probes WHERE upstream_account_id = $1")
+            .bind(account_id.to_string()).fetch_optional(&self.pool).await?)
+    }
+
+    /// Reserve the next scheduled attempt before dispatch. A failed result
+    /// write or another worker must not cause a second paid probe this interval.
+    pub(crate) async fn claim_upstream_service_probe(
+        &self,
+        account_id: Uuid,
+        now: i64,
+        interval_millis: i64,
+    ) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "INSERT INTO upstream_service_probes
+             (upstream_account_id, status, checked_at, last_attempt_at)
+             SELECT id, 'skipped', $2, $2 FROM upstream_accounts
+             WHERE id = $1 AND status = 'active'
+             ON CONFLICT (upstream_account_id) DO UPDATE SET
+               last_attempt_at = excluded.last_attempt_at
+             WHERE COALESCE(upstream_service_probes.last_attempt_at,
+                            upstream_service_probes.checked_at) <= $3",
+        )
+        .bind(account_id.to_string())
+        .bind(now)
+        .bind(now.saturating_sub(interval_millis))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn upstream_service_probes_due(
         &self,
         healthy_before: i64,
@@ -185,11 +272,13 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?
         .ok_or(AppError::NotFound)?;
+        #[cfg(test)]
         let config: Value = serde_json::from_str(&row.try_get::<String, _>("config_json")?)
             .map_err(|_| AppError::internal("upstream_service_probes_probe_account_context_1"))?;
         Ok(ProbeAccountContext {
             tenant_external_id: row.try_get("external_id")?,
             driver: row.try_get("driver")?,
+            #[cfg(test)]
             config,
             credential_generation: row.try_get("credential_generation")?,
             transport_revision: row.try_get("transport_revision")?,

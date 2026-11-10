@@ -4,6 +4,10 @@
 .upstream-quota-heading h3 { margin: 0; font-size: 15px; }
 .upstream-quota-heading button { font-size: 13px; padding: 7px 10px; }
 .upstream-quota-meta { display: flex; flex-wrap: wrap; gap: 8px 14px; margin: 12px 0; }
+.upstream-quota-credit-summary { margin: 10px 0 14px; font-variant-numeric: tabular-nums; }
+.upstream-quota-credit-summary > span { cursor: help; }
+.upstream-quota-credit-summary > span:focus-visible { outline: 2px solid var(--colorStrokeFocus2, #40a59a); outline-offset: 3px; border-radius: 3px; }
+.upstream-quota-credit-summary .quota-credit-info { margin-inline-start: 6px; color: var(--picker-muted); }
 .upstream-quota-windows { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 12px; }
 .upstream-quota-window { background: var(--picker-inset); border-radius: 10px; min-width: 0; padding: 16px; border: 1px solid var(--picker-border); }
 .upstream-quota-window-heading strong { font-size: 20px; white-space: nowrap; font-variant-numeric: tabular-nums; }
@@ -13,6 +17,8 @@
 .upstream-quota small { display: block; margin-top: 8px; overflow-wrap: anywhere; }
 .upstream-quota-reset { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; margin-top: 20px; padding: 0; }
 .upstream-quota-reset h3, .upstream-quota-reset p { margin: 0; }
+.upstream-quota-reset-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 16px; }
+.upstream-quota-window-reset { display: flex; flex-wrap: wrap; gap: 4px 14px; }
 .upstream-quota .upstream-danger-zone { background: var(--form-danger-surface); border: 1px solid var(--form-danger); border-radius: 8px; margin-top: 14px; padding: 0 14px 12px; }
 .upstream-quota .upstream-danger-zone > summary { color: var(--form-danger); min-height: 44px; padding: 12px 0; }
 .upstream-quota .upstream-danger-zone > p { color: var(--picker-text); }

@@ -207,7 +207,11 @@ impl TransportProxyGroups {
             })
             .transpose()?;
         let entry = match (stamp.as_ref(), managed.get(&account_id)) {
-            (Some(stamp), None) if stamp.group_id.is_none() && stamp.group_version.is_none() => {
+            (Some(stamp), None)
+                if stamp.group_id.is_none()
+                    && stamp.group_version.is_none()
+                    && stamp.mode.is_none() =>
+            {
                 None
             }
             (Some(stamp), Some(current))
@@ -235,16 +239,24 @@ impl TransportProxyGroups {
         {
             return Err(unavailable());
         }
-        let base = credential
-            .proxy()
-            .and_then(|(proxy, _)| {
+        // Managed policy is authoritative, including accounts left with an
+        // old credential projection by the retired URL-only editor. Legacy
+        // environment groups still use their credential's configured base.
+        let base = if let Some(current) = managed.get(&account_id) {
+            current
+                .members
+                .iter()
+                .position(|member| member.id == current.initial_member_id)
+        } else {
+            credential.proxy().and_then(|(proxy, _)| {
                 entry
                     .group
                     .proxies
                     .iter()
                     .position(|candidate| candidate == proxy)
             })
-            .ok_or_else(unavailable)?;
+        }
+        .ok_or_else(unavailable)?;
         let mut state = entry.state.load(Ordering::Acquire);
         let previous = Snapshot::decode(state);
         if generation < previous.credential_generation {

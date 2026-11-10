@@ -175,14 +175,19 @@ async fn metered_text_reads_bypass_count_and_refund_unused_bytes() {
         let used = budget.snapshot().0;
         assert!(used >= 2 * memory::REQUEST_MEMORY_WEIGHT);
         assert!(used < MAX_DEFAULT_BODY * memory::REQUEST_MEMORY_WEIGHT);
-        assert_eq!(admitted_source_bytes(admitted).await, "{}");
+        assert_eq!(
+            to_bytes(admitted.into_body(), MAX_DEFAULT_BODY)
+                .await
+                .unwrap(),
+            "{}"
+        );
         assert_eq!(budget.snapshot().0, 0);
     }
     assert_eq!(spool.snapshot().active_files, 0);
 }
 
 #[tokio::test]
-async fn metered_text_capture_uses_local_source_when_memory_is_occupied() {
+async fn metered_text_full_byte_budget_distinguishes_capture_and_materialization() {
     let directory = tempfile::tempdir().unwrap();
     let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
     let budget = memory::ProxyMemoryBudget::new(16 * 1024 * 1024);
@@ -196,20 +201,14 @@ async fn metered_text_capture_uses_local_source_when_memory_is_occupied() {
             Ok::<_, Infallible>(bytes::Bytes::from_static(b"{}"))
         }));
         let request = Request::post(path).body(body).unwrap();
-        let read_count = spool.read_count_for_test();
-        let result = admit(request, Some(&budget), &spool).await;
-        assert_eq!(spool.read_count_for_test(), read_count);
-        let admitted = result.unwrap();
-        assert!(polled.load(Ordering::Acquire));
-        assert!(
-            !admitted
-                .extensions()
-                .get::<Arc<request_spool::RequestSpool>>()
-                .unwrap()
-                .upload_outcome()
-                .await
+        assert!(matches!(
+            admit(request, Some(&budget), &spool).await,
+            Err(GatewayBodyAdmissionError::CapacityExhausted)
+        ));
+        assert_eq!(
+            polled.load(Ordering::Acquire),
+            path != "/v1/messages/count_tokens",
         );
-        assert_eq!(admitted_source_bytes(admitted).await, "{}");
         assert_eq!(spool.snapshot().active_files, 0);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(budget.snapshot().0, 16 * 1024 * 1024);
@@ -273,8 +272,18 @@ async fn metered_text_inference_crosses_old_limit_and_releases_owners() {
                 &spool,
             )
             .await;
-            let admitted = result.unwrap();
-            assert_eq!(admitted_source_bytes(admitted).await, payload);
+            if path == "/v1/messages/count_tokens" {
+                assert!(matches!(
+                    result,
+                    Err(GatewayBodyAdmissionError::Rejected(_))
+                ));
+            } else {
+                let admitted = result.unwrap();
+                assert_eq!(
+                    to_bytes(admitted.into_body(), usize::MAX).await.unwrap(),
+                    payload
+                );
+            }
             assert_eq!(budget.snapshot().0, 0);
             assert_eq!(spool.snapshot().active_files, 0);
         }
@@ -287,16 +296,5 @@ async fn metered_text_inference_crosses_old_limit_and_releases_owners() {
                 if rejection.reason == GatewayBodyRejectionReason::BodyLimitExceeded));
         assert_eq!(budget.snapshot().0, 0);
         assert_eq!(spool.snapshot().active_files, 0);
-    }
-}
-
-async fn admitted_source_bytes(admitted: Request) -> bytes::Bytes {
-    if let Some(source) = admitted
-        .extensions()
-        .get::<Arc<request_spool::RequestSpool>>()
-    {
-        source.read_all().await.unwrap()
-    } else {
-        to_bytes(admitted.into_body(), usize::MAX).await.unwrap()
     }
 }

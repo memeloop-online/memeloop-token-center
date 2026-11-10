@@ -10,9 +10,6 @@ use axum::body::Body;
 use bytes::Bytes;
 use futures_util::StreamExt;
 
-mod json_file;
-pub(crate) use json_file::VerifiedJsonInput;
-
 pub(crate) const REQUEST_SPOOL_CHUNK_BYTES: usize = 64 * 1024;
 
 /// The background upload has not decided whether the object should stay.
@@ -250,6 +247,7 @@ struct CapturedBody {
     body: Option<Bytes>,
     local: Option<Arc<LocalBodyFile>>,
     length: usize,
+    json_nodes: usize,
     digest: [u8; 32],
     metadata: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     frames: Vec<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -264,15 +262,12 @@ struct BodyResidency {
     metadata: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
     memory_released: AtomicBool,
     durable_settled: AtomicBool,
-    replay_readers: AtomicUsize,
-    replay_lock: tokio::sync::Mutex<()>,
 }
 
 impl BodyResidency {
     fn release_if_idle(&self) {
         if self.memory_released.load(Ordering::Acquire)
             && self.durable_settled.load(Ordering::Acquire)
-            && self.replay_readers.load(Ordering::Acquire) == 0
         {
             if let Ok(mut frames) = self.frames.lock() {
                 frames.clear();
@@ -406,6 +401,7 @@ impl RequestSpoolAdmission {
         let mut retained_frames = Vec::new();
         let mut length = 0_usize;
         let mut hasher = blake3::Hasher::new();
+        let mut json_scanner = super::memory::JsonMemoryScanner::default();
         let mut spilling = memory.is_some() && metadata.is_none();
         let mut sink = if spilling {
             Some(open_spill(&self.usage.directory).await?)
@@ -471,6 +467,7 @@ impl RequestSpoolAdmission {
                 write_spill(sink, chunk.clone()).await?;
             }
             hasher.update(&chunk);
+            json_scanner.observe(&chunk);
             length = next;
         }
         let digest = *hasher.finalize().as_bytes();
@@ -485,6 +482,7 @@ impl RequestSpoolAdmission {
                     body: None,
                     local: Some(local),
                     length,
+                    json_nodes: json_scanner.observe(&[]),
                     digest,
                     metadata: None,
                     frames: Vec::new(),
@@ -502,6 +500,7 @@ impl RequestSpoolAdmission {
                 body: Some(retained),
                 local: None,
                 length,
+                json_nodes: json_scanner.observe(&[]),
                 digest,
                 metadata,
                 frames: retained_frames,
@@ -520,14 +519,13 @@ impl RequestSpoolAdmission {
                 body: Mutex::new(captured.body),
                 local: captured.local,
                 length: captured.length,
+                json_nodes: captured.json_nodes,
                 digest: captured.digest,
                 residency: Arc::new(BodyResidency {
                     frames: Mutex::new(captured.frames),
                     metadata: Mutex::new(captured.metadata),
                     memory_released: AtomicBool::new(false),
                     durable_settled: AtomicBool::new(captured.durable_settled),
-                    replay_readers: AtomicUsize::new(0),
-                    replay_lock: tokio::sync::Mutex::new(()),
                 }),
                 lease: captured.lease,
                 durable: captured.durable,
@@ -641,6 +639,7 @@ struct SharedBody {
     body: Mutex<Option<Bytes>>,
     local: Option<Arc<LocalBodyFile>>,
     length: usize,
+    json_nodes: usize,
     digest: [u8; 32],
     residency: Arc<BodyResidency>,
     lease: Arc<Mutex<RequestSpoolLease>>,
@@ -729,6 +728,122 @@ impl RequestSpool {
     }
     pub(crate) fn len(&self) -> usize {
         self.shared.length
+    }
+
+    pub(crate) fn json_nodes(&self) -> usize {
+        self.shared.json_nodes
+    }
+
+    pub(crate) fn reclaim_for(&self, mut reserve: impl FnMut() -> bool) -> bool {
+        let usage = self
+            .shared
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .usage
+            .clone();
+        loop {
+            if reserve() {
+                return true;
+            }
+            if !evict_oldest_settled(&usage) {
+                return false;
+            }
+        }
+    }
+
+    pub(crate) async fn open_stream(
+        &self,
+    ) -> Result<crate::archive::ArchiveDownload, RequestSpoolReadError> {
+        #[cfg(test)]
+        self.read_count.fetch_add(1, Ordering::AcqRel);
+        let resident = self
+            .shared
+            .body
+            .lock()
+            .map_err(|_| RequestSpoolReadError)?
+            .clone();
+        let download = if let Some(body) = resident {
+            crate::archive::ArchiveDownload {
+                object_size: self.len() as u64,
+                range: 0..self.len() as u64,
+                stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+            }
+        } else if let Some(local) = &self.shared.local {
+            let file =
+                tokio::fs::File::from_std(local.reopen().map_err(|_| RequestSpoolReadError)?);
+            crate::archive::ArchiveDownload {
+                object_size: self.len() as u64,
+                range: 0..self.len() as u64,
+                stream: Box::pin(futures_util::stream::try_unfold(
+                    file,
+                    |mut file| async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut chunk = vec![0; 64 * 1024];
+                        let count = file.read(&mut chunk).await?;
+                        if count == 0 {
+                            return Ok::<_, std::io::Error>(None);
+                        }
+                        chunk.truncate(count);
+                        Ok(Some((Bytes::from(chunk), file)))
+                    },
+                )),
+            }
+        } else {
+            if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
+                return Err(RequestSpoolReadError);
+            }
+            let key = self.object_locator().ok_or(RequestSpoolReadError)?;
+            match self.shared.durable.as_ref().ok_or(RequestSpoolReadError)? {
+                DurableRequestBodies::Archive(archive) => archive
+                    .open_stream(key, None)
+                    .await
+                    .map_err(|_| RequestSpoolReadError)?,
+                #[cfg(test)]
+                store @ DurableRequestBodies::Memory(_) => {
+                    let body = store
+                        .get(key, self.len())
+                        .await
+                        .map_err(|_| RequestSpoolReadError)?;
+                    crate::archive::ArchiveDownload {
+                        object_size: self.len() as u64,
+                        range: 0..self.len() as u64,
+                        stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+                    }
+                }
+            }
+        };
+        if download.object_size != self.len() as u64 {
+            return Err(RequestSpoolReadError);
+        }
+        let expected = self.shared.digest;
+        let length = self.len();
+        let stream = futures_util::stream::unfold(
+            (download.stream, blake3::Hasher::new(), 0usize, false),
+            move |(mut stream, mut hasher, mut bytes, done)| async move {
+                if done {
+                    return None;
+                }
+                let invalid = || std::io::Error::other("request source integrity failed");
+                let chunk = match stream.next().await {
+                    Some(Ok(chunk)) if chunk.len() <= length.saturating_sub(bytes) => {
+                        bytes += chunk.len();
+                        hasher.update(&chunk);
+                        Ok(chunk)
+                    }
+                    None if bytes == length && hasher.finalize().as_bytes() == &expected => {
+                        return None;
+                    }
+                    _ => return Some((Err(invalid()), (stream, hasher, bytes, true))),
+                };
+                Some((chunk, (stream, hasher, bytes, false)))
+            },
+        );
+        Ok(crate::archive::ArchiveDownload {
+            object_size: length as u64,
+            range: 0..length as u64,
+            stream: Box::pin(stream.fuse()),
+        })
     }
 
     #[cfg(test)]
@@ -1034,6 +1149,16 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                 break false;
                             }
                         };
+                        if success {
+                            database
+                                .publish_request_source(
+                                    identity,
+                                    &key,
+                                    source.length,
+                                    source.digest,
+                                )
+                                .await;
+                        }
                         let permit = if success {
                             database.try_request_source_completion()
                         } else {

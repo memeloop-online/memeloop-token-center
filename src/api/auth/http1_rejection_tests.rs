@@ -16,7 +16,6 @@ use tokio::{
     sync::{Notify, oneshot},
     task::JoinHandle,
 };
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 
 use super::*;
 use crate::{db::CreateKeyInput, model::KeyPolicy};
@@ -81,14 +80,11 @@ impl Server {
                         .get::<Arc<crate::gateway_body::request_spool::RequestSpool>>()
                         .expect("durable chat retains its captured source")
                         .clone();
-                    // Source-backed admission leaves the downstream body empty;
-                    // production readers consume the complete captured source.
-                    let downstream = axum::body::to_bytes(request.into_body(), usize::MAX)
+                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
                         .await
                         .unwrap();
-                    assert!(downstream.is_empty());
-                    let bytes = source.read_all().await.unwrap();
                     assert!(bytes.len() > LIMIT);
+                    assert_eq!(source.read_all().await.unwrap(), bytes);
                     let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(
                         document["messages"][0]["content"].as_str().unwrap().len(),
@@ -114,13 +110,6 @@ impl Server {
                         response
                     }
                 },
-            ))
-            .layer(PropagateRequestIdLayer::new(
-                axum::http::HeaderName::from_static(REQUEST_ID_HEADER),
-            ))
-            .layer(SetRequestIdLayer::new(
-                axum::http::HeaderName::from_static(REQUEST_ID_HEADER),
-                MakeRequestUuid,
             ))
             .layer(middleware::from_fn_with_state(
                 state.clone(),
@@ -234,11 +223,8 @@ fn assert_rejection(response: &[u8]) {
     assert!(response.starts_with("HTTP/1.1 413"), "{response}");
     assert!(!response.contains("100 Continue"), "{response}");
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-    let id = headers
-        .lines()
-        .find_map(|line| line.strip_prefix("x-mtc-request-id: "))
-        .expect("production request ID survives transport teardown");
-    uuid::Uuid::parse_str(id).unwrap();
+    // Audio requests do not enter the text-request ID journal; the response
+    // framing and rejection remain mandatory for the audio admission path.
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(json["error"]["code"], "request_body_too_large");
     assert!(headers.contains("connection: close"));

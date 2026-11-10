@@ -17,6 +17,9 @@ use futures_util::StreamExt;
 pub(crate) mod memory;
 pub(crate) mod request_spool;
 
+#[derive(Clone)]
+pub(crate) struct RawAudioRequestBody(pub(crate) bytes::Bytes);
+
 #[cfg(test)]
 mod body_read_classification_tests;
 #[cfg(test)]
@@ -431,6 +434,9 @@ async fn admit_request_body_for_route(
             memory::REQUEST_MEMORY_WEIGHT,
         );
         parts.extensions.insert(reservation);
+        if parts.uri.path() == "/v1/audio/transcriptions" {
+            parts.extensions.insert(RawAudioRequestBody(bytes.clone()));
+        }
         return Ok(Request::from_parts(parts, Body::from(bytes)));
     }
     let bytes = read_with_deadline(deadline, to_bytes(body, maximum))
@@ -446,6 +452,9 @@ async fn admit_request_body_for_route(
             };
             rejected_body(route_class, declared_content_length, maximum, reason)
         })?;
+    if parts.uri.path() == "/v1/audio/transcriptions" {
+        parts.extensions.insert(RawAudioRequestBody(bytes.clone()));
+    }
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 
@@ -587,11 +596,15 @@ mod tests {
             )
             .await
             .unwrap();
-            let captured = admitted
-                .extensions()
-                .get::<Arc<request_spool::RequestSpool>>()
-                .unwrap();
-            assert_eq!(captured.read_all().await.unwrap(), "{}");
+            if path.starts_with("/v1/responses") {
+                let captured = admitted
+                    .extensions()
+                    .get::<Arc<request_spool::RequestSpool>>()
+                    .unwrap();
+                assert_eq!(captured.len(), 2);
+            } else {
+                assert_eq!(to_bytes(admitted.into_body(), 1024).await.unwrap(), "{}");
+            }
         }
     }
 

@@ -27,8 +27,8 @@ const MAX_CONVERSATION_FINGERPRINT_JSON_BYTES: usize = 70_000;
 // PostgreSQL's much larger protocol limit.
 const CONVERSATION_INSERT_BATCH_BIND_LIMIT: usize = 900;
 const SEMANTIC_ATOM_INSERT_BIND_COUNT: usize = 7;
-// The worker cgroup limit is 384Mi. A full session's raw JSON is at most
-// 128MiB; keep each insert batch far below the rest of that budget.
+// The worker streams body objects; SQL insert batches contain references and
+// stay below the worker's memory budget.
 const CONVERSATION_INSERT_BATCH_BYTES: usize = 256 * 1024;
 const CONTEXT_NODE_INSERT_BIND_COUNT: usize = 6;
 const EXPLICIT_SESSION_LOCK_SEED: i64 = 734_627_102_948_338;
@@ -102,8 +102,6 @@ pub(crate) struct SessionBodyLocators {
 pub(crate) struct ConversationProjectionEnqueueInput<'a> {
     pub(crate) request_id: Uuid,
     pub(crate) key: &'a AuthenticatedKey,
-    /// 结算时已经收好的对话字段。不是带填充的原始请求 JSON。
-    pub(crate) request_json: &'a serde_json::Value,
     pub(crate) hints: &'a ConversationHints,
     pub(crate) client_name: Option<&'a str>,
     pub(crate) upstream_response_id: Option<&'a str>,
@@ -126,22 +124,12 @@ const CONVERSATION_PROJECTION_BATCH_LIMIT: i64 = 32;
 const CONVERSATION_PROJECTION_LEASE_MILLIS: i64 = 5 * 60 * 1_000;
 const SESSION_BODY_REBUILD_LEASE_OWNER: &str = "session-body-rebuild";
 const SESSION_BODY_REBUILD_OUTCOME: &str = "session_body";
-const SESSION_BODY_INLINE_REQUEST_LIMIT: usize = 1024 * 1024;
-
-fn inline_session_request(value: &serde_json::Value) -> String {
-    let Ok(encoded) = serde_json::to_string(value) else {
-        return "{}".to_owned();
-    };
-    if encoded.len() > SESSION_BODY_INLINE_REQUEST_LIMIT {
-        "{}".to_owned()
-    } else {
-        encoded
-    }
-}
+// Archive bind events clear this deadline. Persistent unavailable sources back off.
+const SESSION_BODY_RETRY_DELAY_SQL: &str = "CASE WHEN attempts <= 1 THEN 5000 WHEN attempts = 2 THEN 10000 WHEN attempts = 3 THEN 20000 WHEN attempts = 4 THEN 40000 WHEN attempts = 5 THEN 80000 WHEN attempts = 6 THEN 160000 ELSE 300000 END";
 
 /// 网关结算只把请求身份放进队列。
 /// 不在这里解析原始请求 JSON 或原始返回 JSON。
-/// 会话正文归档由 worker 读取这两个 locator 之后写入 CNPG。
+/// 会话正文由 worker 读取 locator 后存入对象归档。
 pub(crate) async fn enqueue_conversation_projection_in_transaction(
     transaction: &mut Transaction<'_, Any>,
     input: ConversationProjectionEnqueueInput<'_>,
@@ -149,22 +137,13 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     let ConversationProjectionEnqueueInput {
         request_id,
         key,
-        request_json,
         hints,
         client_name,
         upstream_response_id,
         observed_at,
     } = input;
-    // 这里不解析对象存储里的原始请求 JSON。只留下结算时已经收好的对话字段，
-    // 供 locator 仍是 gap:// 时归档。超过上限的内容仍留给对象存储。
-    //
-    // The raw request body never lands in PostgreSQL: object storage owns it, and
-    // this row only carries the bounded conversation fields the projection needs
-    // while the locator is still `gap://`. An earlier revision persisted the full
-    // body into `conversation_semantic_payloads` for every request, which grew the
-    // database by roughly a gigabyte per hour of Codex traffic.
     let payload: Option<(String, String)> = None;
-    let request_json = inline_session_request(request_json);
+    let request_json = "{}";
     let semantic_snapshot = {
         let snapshot = ConversationSemanticSnapshot {
             leaf: None,
@@ -193,7 +172,7 @@ pub(crate) async fn enqueue_conversation_projection_in_transaction(
     .bind(key.tenant_id.to_string())
     .bind(key.key_id.to_string())
     .bind(key.principal_id.to_string())
-    .bind(&request_json)
+    .bind(request_json)
     .bind(&hints_json)
     .bind(client_name)
     .bind(upstream_response_id)
@@ -441,7 +420,6 @@ impl Database {
             ConversationProjectionEnqueueInput {
                 request_id: claim.request_id,
                 key: conversation.key,
-                request_json: conversation.request_json,
                 hints: conversation.hints,
                 client_name: conversation.client_name,
                 upstream_response_id: conversation.upstream_response_id,
@@ -464,6 +442,9 @@ impl Database {
     ) -> Result<(), AppError> {
         let atoms = extract_atoms(request_json);
         let nodes = build_prefix(&atoms);
+        let atoms = self
+            .archive_atom_bodies(parse_uuid(tenant_id.to_owned())?, &atoms)
+            .await?;
         let mut transaction = self.begin_write_transaction().await?;
         let result = materialize_conversation_content_with_statement_error(
             &mut transaction,
@@ -502,6 +483,18 @@ impl Database {
     pub async fn reopen_session_body_rebuilds(&self, limit: i64) -> Result<u64, AppError> {
         let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
         let mut transaction = self.begin_write_transaction().await?;
+        // Serialize the count and replenishment across worker transactions.
+        // This background operation never waits for a busy replenisher.
+        if matches!(self.backend, DatabaseBackend::PostgreSql) {
+            let acquired: bool =
+                sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(82420261105)")
+                    .fetch_one(&mut *transaction)
+                    .await?;
+            if !acquired {
+                transaction.rollback().await?;
+                return Ok(0);
+            }
+        }
         let (outcome_predicate, lock) = match self.backend {
             DatabaseBackend::PostgreSql => (
                 "o.statistics_outcome IS DISTINCT FROM 'session_body'",
@@ -510,7 +503,7 @@ impl Database {
             DatabaseBackend::Sqlite => ("o.statistics_outcome IS NOT 'session_body'", ""),
         };
         let statement = format!(
-            "UPDATE conversation_projection_outbox SET projected_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL, lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}', lease_expires_at = 9223372036854775807, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, statistics_outcome = '{SESSION_BODY_REBUILD_OUTCOME}' WHERE request_id IN (SELECT o.request_id FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id WHERE o.projected_at IS NOT NULL AND {outcome_predicate} AND r.request_object <> '' AND r.response_object IS NOT NULL AND r.response_object <> '' ORDER BY o.observed_at ASC, o.request_id ASC LIMIT $1{lock})"
+            "UPDATE conversation_projection_outbox SET projected_at = NULL, semantic_snapshot_json = NULL, semantic_payload_snapshot_json = NULL, lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}', lease_expires_at = 9223372036854775807, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, statistics_outcome = '{SESSION_BODY_REBUILD_OUTCOME}' WHERE request_id IN (SELECT o.request_id FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id WHERE o.projected_at IS NOT NULL AND {outcome_predicate} AND r.request_object <> '' AND r.response_object IS NOT NULL AND r.response_object <> '' ORDER BY o.observed_at ASC, o.request_id ASC LIMIT (SELECT CASE WHEN COUNT(*) >= $1 THEN 0 ELSE $1 - COUNT(*) END FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}'){lock})"
         );
         let updated = sqlx::query(sqlx::AssertSqlSafe(statement))
             .bind(limit)
@@ -532,61 +525,61 @@ impl Database {
         let expires_at = now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS);
         let limit = limit.clamp(1, CONVERSATION_PROJECTION_BATCH_LIMIT);
         let mut transaction = self.begin_write_transaction().await?;
-        let claimable = match self.backend {
-            DatabaseBackend::PostgreSql => {
-                "SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY observed_at ASC, request_id ASC LIMIT $4 FOR UPDATE SKIP LOCKED"
-            }
-            // SQLite's BEGIN IMMEDIATE writer transaction serializes claimers,
-            // so the same bounded selector is race-free without row locks.
-            DatabaseBackend::Sqlite => {
-                "SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (lease_expires_at IS NULL OR lease_expires_at <= $3) ORDER BY observed_at ASC, request_id ASC LIMIT $4"
-            }
-        };
-        let statement = format!(
-            "UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN ({claimable}) RETURNING request_id, observed_at"
-        );
-        let sentinel_lock = match self.backend {
+        let lock = match self.backend {
             DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
             DatabaseBackend::Sqlite => "",
         };
-        // 只领取租约主人仍是 session-body-rebuild 的行。主租约未过期，两份快照又是空的，
-        // 所以旧 worker 的两条领取都匹配不到。
-        let sentinel_statement = format!(
-            "UPDATE conversation_projection_outbox SET lease_owner = $1, lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND lease_owner = '{SESSION_BODY_REBUILD_LEASE_OWNER}' ORDER BY observed_at ASC, request_id ASC LIMIT $3{sentinel_lock}) RETURNING request_id, observed_at"
-        );
-        let mut rows = sqlx::query(sqlx::AssertSqlSafe(sentinel_statement))
-            .bind(lease_owner.to_string())
-            .bind(expires_at)
-            .bind(limit)
-            .fetch_all(&mut *transaction)
-            .await?;
-        let mut budget = limit.saturating_sub(rows.len() as i64);
-        if budget > 0 {
-            let primary = sqlx::query(sqlx::AssertSqlSafe(statement))
-                .bind(lease_owner.to_string())
-                .bind(expires_at)
-                .bind(now)
-                .bind(budget)
-                .fetch_all(&mut *transaction)
-                .await?;
-            budget = budget.saturating_sub(primary.len() as i64);
-            rows.extend(primary);
-        }
-        if budget > 0 {
-            let remaining = budget;
-            let suffix = match self.backend {
-                DatabaseBackend::PostgreSql => " FOR UPDATE SKIP LOCKED",
-                DatabaseBackend::Sqlite => "",
-            };
+        // Reserve half for first attempts, a quarter for retries and a quarter
+        // for historical body rebuilds. An idle lane lends its slots to the
+        // others. Both primary and terminal-snapshot claims share these budgets.
+        // Retry order uses the previous deadline so one old failing row cannot
+        // repeatedly jump ahead of other eligible work.
+        let rebuild_budget = limit / 4;
+        let retry_budget = limit / 4;
+        let fresh_budget = limit - rebuild_budget - retry_budget;
+        let primary = "(lease_owner = 'session-body-rebuild' OR lease_expires_at IS NULL OR lease_expires_at <= $3)";
+        let ordinary = "COALESCE(statistics_outcome, '') <> 'session_body' AND COALESCE(lease_owner, '') <> 'session-body-rebuild'";
+        let lanes = [
+            (format!("{ordinary} AND attempts = 0"), fresh_budget),
+            (format!("{ordinary} AND attempts > 0"), retry_budget),
+            (
+                "(statistics_outcome = 'session_body' OR lease_owner = 'session-body-rebuild')"
+                    .to_owned(),
+                rebuild_budget,
+            ),
+            ("1 = 1".to_owned(), limit),
+        ];
+        let mut rows = Vec::new();
+        for (lane, lane_budget) in lanes {
+            let budget = lane_budget.min(limit - rows.len() as i64);
+            if budget == 0 {
+                continue;
+            }
             let statement = format!(
-                "UPDATE conversation_projection_outbox SET terminal_lease_owner = $1, terminal_lease_expires_at = $2, attempts = attempts + 1 WHERE request_id IN (SELECT request_id FROM conversation_projection_outbox WHERE projected_at IS NULL AND (semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL) AND (terminal_lease_owner IS NULL OR terminal_lease_owner <> $1) AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $3) ORDER BY observed_at, request_id LIMIT $4{suffix}) RETURNING request_id, observed_at"
+                "UPDATE conversation_projection_outbox SET
+                    lease_owner = CASE WHEN {primary} THEN $1 ELSE lease_owner END,
+                    lease_expires_at = CASE WHEN {primary} THEN $2 ELSE lease_expires_at END,
+                    terminal_lease_owner = CASE WHEN {primary} THEN NULL ELSE $1 END,
+                    terminal_lease_expires_at = CASE WHEN {primary} THEN NULL ELSE $2 END,
+                    attempts = attempts + 1
+                 WHERE request_id IN (
+                    SELECT request_id FROM conversation_projection_outbox
+                    WHERE projected_at IS NULL AND ({lane})
+                      AND (lease_owner IS NULL OR lease_owner <> $1 OR lease_expires_at <= $3)
+                      AND (terminal_lease_expires_at IS NULL OR terminal_lease_expires_at <= $3)
+                      AND ({primary} OR semantic_snapshot_json IS NOT NULL OR semantic_payload_snapshot_json IS NOT NULL)
+                    ORDER BY CASE WHEN lease_owner = 'session-body-rebuild' THEN observed_at
+                        WHEN {primary} THEN COALESCE(terminal_lease_expires_at, lease_expires_at, observed_at)
+                        ELSE COALESCE(terminal_lease_expires_at, observed_at) END,
+                        observed_at, request_id LIMIT $4{lock}
+                 ) RETURNING request_id, observed_at"
             );
             rows.extend(
                 sqlx::query(sqlx::AssertSqlSafe(statement))
                     .bind(lease_owner.to_string())
                     .bind(expires_at)
                     .bind(now)
-                    .bind(remaining)
+                    .bind(budget)
                     .fetch_all(&mut *transaction)
                     .await?,
             );
@@ -667,10 +660,10 @@ impl Database {
         request_id: Uuid,
     ) -> Result<(), AppError> {
         let mut transaction = self.begin_write_transaction().await?;
-        let updated = sqlx::query(
-            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
-        )
-        .bind(unix_millis().saturating_add(5000))
+        let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 + {SESSION_BODY_RETRY_DELAY_SQL} END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 + {SESSION_BODY_RETRY_DELAY_SQL} WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+        )))
+        .bind(unix_millis())
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
         .execute(&mut *transaction)
@@ -691,10 +684,10 @@ impl Database {
         lease_owner: Uuid,
         request_id: Uuid,
     ) -> Result<(), AppError> {
-        sqlx::query(
-            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
-        )
-        .bind(unix_millis().saturating_add(5000))
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE conversation_projection_outbox SET lease_owner = CASE WHEN lease_owner = 'terminal-v118' THEN lease_owner ELSE NULL END, lease_expires_at = CASE WHEN lease_owner = 'terminal-v118' THEN lease_expires_at ELSE $1 + {SESSION_BODY_RETRY_DELAY_SQL} END, terminal_lease_owner = NULL, terminal_lease_expires_at = $1 + {SESSION_BODY_RETRY_DELAY_SQL} WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
+        )))
+        .bind(unix_millis())
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
         .execute(&self.pool)
@@ -702,31 +695,63 @@ impl Database {
         Ok(())
     }
 
-    /// locator 是 gap:// 时，用结算时已经收好的对话字段。不读对象存储。
-    pub async fn session_body_inline_request(
+    /// Long object streams retain their claim while an independent worker
+    /// continues to own the unfinished relational projection.
+    pub(crate) async fn renew_session_body_archive(
         &self,
         lease_owner: Uuid,
         request_id: Uuid,
-    ) -> Result<Option<String>, AppError> {
+    ) -> Result<bool, AppError> {
         let now = unix_millis();
-        let row = sqlx::query(
-            "SELECT request_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2 AND COALESCE(terminal_lease_expires_at, lease_expires_at) >= $3",
+        let updated = sqlx::query(
+            "UPDATE conversation_projection_outbox SET terminal_lease_expires_at = CASE WHEN terminal_lease_owner IS NOT NULL THEN $1 ELSE terminal_lease_expires_at END, lease_expires_at = CASE WHEN terminal_lease_owner IS NULL THEN $1 ELSE lease_expires_at END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3 AND COALESCE(terminal_lease_expires_at, lease_expires_at) > $4",
         )
+        .bind(now.saturating_add(CONVERSATION_PROJECTION_LEASE_MILLIS))
         .bind(request_id.to_string())
         .bind(lease_owner.to_string())
         .bind(now)
-        .fetch_optional(&self.pool)
+        .execute(&self.pool)
         .await?;
-        Ok(row.and_then(|row| row.try_get("request_json").ok()))
+        Ok(updated.rows_affected() == 1)
     }
 
-    /// 把已经整理好的会话正文写入 CNPG。媒体 locator 记在 `conversation_media_parts`。
-    /// 不读取对象存储，也不碰 `generation_assets`。
+    /// 先持久化对象，再把正文引用及媒体 locator 写入投影元数据。
     pub async fn prepare_session_body_archive(
         &self,
         lease_owner: Uuid,
         request_id: Uuid,
         atoms: Vec<SemanticAtom>,
+        nodes: &[PrefixNode],
+        media: &[crate::conversation::SessionMediaLocator],
+    ) -> Result<bool, AppError> {
+        let tenant_id: Option<String> = sqlx::query_scalar(
+            "SELECT tenant_id FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $2",
+        )
+        .bind(request_id.to_string())
+        .bind(lease_owner.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(tenant_id) = tenant_id else {
+            return Ok(false);
+        };
+        let archived_atoms = self
+            .archive_atom_bodies(parse_uuid(tenant_id)?, atoms)
+            .await?;
+        self.prepare_archived_session_body_archive(
+            lease_owner,
+            request_id,
+            archived_atoms,
+            nodes,
+            media,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_archived_session_body_archive(
+        &self,
+        lease_owner: Uuid,
+        request_id: Uuid,
+        archived_atoms: Vec<SemanticAtom>,
         nodes: &[PrefixNode],
         media: &[crate::conversation::SessionMediaLocator],
     ) -> Result<bool, AppError> {
@@ -736,7 +761,7 @@ impl Database {
                 &mut transaction,
                 lease_owner,
                 request_id,
-                atoms,
+                archived_atoms,
                 nodes,
                 media,
             )
@@ -848,34 +873,58 @@ impl Database {
         Ok(updated.rows_affected() == 1)
     }
 
-    /// 训练导出只读 CNPG 里的会话正文。不打开、不列出对象存储。
+    /// Walk relational prefix metadata and restore each tenant CAS body.
     pub async fn export_training_dialogue(
         &self,
         tenant_id: Uuid,
         leaf_node_hash: &str,
     ) -> Result<Vec<crate::conversation::TrainingUtterance>, AppError> {
-        let rows = sqlx::query(
-            "WITH RECURSIVE chain AS ( \
-                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2 \
-                UNION ALL \
-                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n \
-                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash \
-                WHERE c.depth > 0 AND c.depth < 4096 \
-            ) \
-            SELECT a.content_json FROM chain c \
-            JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash \
-            ORDER BY c.depth ASC LIMIT 4096",
+        use futures_util::TryStreamExt as _;
+
+        let mut rows = sqlx::query(
+            "WITH RECURSIVE chain AS (
+                SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 AND node_hash = $2
+                UNION
+                SELECT n.node_hash, n.parent_hash, n.atom_hash, n.depth FROM context_nodes n
+                JOIN chain c ON n.tenant_id = $1 AND n.node_hash = c.parent_hash
+                WHERE c.depth > 1 AND n.depth = c.depth - 1
+            )
+            SELECT c.node_hash, c.parent_hash, c.depth, a.content_json FROM chain c
+            LEFT JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = c.atom_hash
+            ORDER BY c.depth ASC",
         )
         .bind(tenant_id.to_string())
         .bind(leaf_node_hash)
-        .fetch_all(&self.pool)
-        .await?;
-        let mut turns = Vec::with_capacity(rows.len());
-        for row in rows {
-            let content: String = row.try_get("content_json")?;
+        .fetch(&self.pool);
+        let mut turns = Vec::new();
+        let mut previous = None;
+        while let Some(row) = rows.try_next().await? {
+            let parent: Option<String> = row.try_get("parent_hash")?;
+            let depth: i64 = row.try_get("depth")?;
+            if depth
+                != i64::try_from(turns.len())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1)
+                || parent != previous
+            {
+                return Err(AppError::storage("conversation_prefix_incomplete"));
+            }
+            let reference: Option<String> = row.try_get("content_json")?;
+            let content = self
+                .read_body_reference(
+                    tenant_id,
+                    reference
+                        .as_deref()
+                        .ok_or_else(|| AppError::storage("conversation_body_missing"))?,
+                )
+                .await?;
             let value = serde_json::from_str(&content)
                 .map_err(|_| AppError::internal("conversations_export_training_dialogue_1"))?;
             turns.push(value);
+            previous = Some(row.try_get::<String, _>("node_hash")?);
+        }
+        if previous.as_deref() != Some(leaf_node_hash) {
+            return Err(AppError::storage("conversation_prefix_incomplete"));
         }
         Ok(crate::conversation::training_dialogue(&turns))
     }
@@ -1446,10 +1495,11 @@ impl Database {
 
         let tenant_id = key.tenant_id.to_string();
         if !content_materialized {
+            let archived_atoms = self.archive_atom_bodies(key.tenant_id, &atoms).await?;
             materialize_conversation_content_in_transaction(
                 transaction,
                 &tenant_id,
-                &atoms,
+                &archived_atoms,
                 &nodes,
                 now,
             )
@@ -2979,6 +3029,7 @@ impl Database {
         }
         let mut transaction = self.begin_write_transaction().await?;
         let result = insert_streamed_conversation_content(
+            self,
             &mut transaction,
             tenant_id,
             request_json,
@@ -3006,6 +3057,7 @@ impl Database {
 }
 
 async fn insert_streamed_conversation_content(
+    database: &Database,
     transaction: &mut Transaction<'_, Any>,
     tenant_id: &str,
     request_json: String,
@@ -3038,6 +3090,9 @@ async fn insert_streamed_conversation_content(
             );
             break;
         };
+        let content_json = database
+            .store_body_reference(parse_uuid(tenant_id.to_owned())?, content_json)
+            .await?;
         drop(content);
         depth += 1;
         let node_hash = crate::conversation::digest_parts(parent.as_deref(), &content_hash);
@@ -3401,7 +3456,15 @@ mod tests {
             assert_eq!(role, atom.role);
             assert_eq!(kind, atom.kind);
             assert_eq!(instance_hash, atom.instance_hash);
-            assert_eq!(content_json, serde_json::to_string(&atom.content).unwrap());
+            let restored = db
+                .read_body_reference(Uuid::parse_str(&tenant).unwrap(), &content_json)
+                .await
+                .unwrap();
+            assert_eq!(restored, serde_json::to_string(&atom.content).unwrap());
+            assert!(
+                serde_json::from_str::<crate::archive::ConversationBodyReference>(&content_json)
+                    .is_ok()
+            );
         }
         assert_eq!(
             leaf.as_deref(),
@@ -3428,7 +3491,7 @@ mod tests {
         .unwrap();
         transaction.commit().await.unwrap();
         let atom_sql = "SELECT content_hash, instance_hash, role, kind, content_json FROM semantic_atoms WHERE tenant_id = $1 ORDER BY content_hash";
-        let expected_atoms: Vec<(String, String, String, String, String)> =
+        let mut expected_atoms: Vec<(String, String, String, String, String)> =
             sqlx::query_as(atom_sql)
                 .bind(&tenant)
                 .fetch_all(&db.pool)
@@ -3439,6 +3502,12 @@ mod tests {
             .fetch_all(&db.pool)
             .await
             .unwrap();
+        for atom in &mut expected_atoms {
+            atom.4 = db
+                .read_body_reference(Uuid::parse_str(&tenant).unwrap(), &atom.4)
+                .await
+                .unwrap();
+        }
         assert_eq!(owned_atoms, expected_atoms);
         let node_sql = "SELECT node_hash, parent_hash, atom_hash, depth FROM context_nodes WHERE tenant_id = $1 ORDER BY depth";
         let expected_nodes: Vec<(String, Option<String>, String, i64)> = sqlx::query_as(node_sql)
