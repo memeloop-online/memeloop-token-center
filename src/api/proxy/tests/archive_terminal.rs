@@ -396,6 +396,56 @@ async fn cancelled_unsealed_capture_releases_source_while_upload_resources_remai
     }
 }
 
+async fn assert_unknown_archive_terminal(
+    fixture: &ResilientRouteFixture,
+    status_code: i64,
+    error_code: Option<&str>,
+) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            if rows.len() == 1
+                && rows[0].operational_terminal.as_ref().is_some_and(|terminal| {
+                    terminal.financial_state == crate::model::RequestFinancialState::Unknown
+                })
+            {
+                let record = &rows[0];
+                assert_eq!(record.status_code, Some(status_code));
+                assert_eq!(record.error_code.as_deref(), error_code);
+                assert_eq!(record.completed_at, None);
+                assert_eq!(record.billing.cost, None);
+                assert!(record.usage.tokens.is_none());
+                let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+                let financial = sqlx::query(
+                    "SELECT q.completed_at, r.status, r.actual_micros, p.state, p.receipt_id, p.receipt_digest, p.cost_micros, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger_count FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id JOIN pending_proxy_settlements p ON p.request_id = q.id WHERE q.id = $1",
+                )
+                .bind(record.request_id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                assert_eq!(financial.get::<Option<i64>, _>("completed_at"), None);
+                assert_eq!(financial.get::<String, _>("status"), "reserved");
+                assert_eq!(financial.get::<Option<i64>, _>("actual_micros"), None);
+                assert_eq!(financial.get::<String, _>("state"), "pending");
+                assert_eq!(financial.get::<Option<String>, _>("receipt_id"), None);
+                assert_eq!(financial.get::<Option<String>, _>("receipt_digest"), None);
+                assert_eq!(financial.get::<Option<i64>, _>("cost_micros"), None);
+                assert_eq!(financial.get::<i64, _>("ledger_count"), 0);
+                pool.close().await;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("operational completion must preserve unknown finance and its uncharged hold");
+}
+
 #[tokio::test]
 async fn encoded_buffered_upstream_is_rejected_once_without_replay() {
     let upstream = MockServer::start().await;
