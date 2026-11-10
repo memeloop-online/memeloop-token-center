@@ -29,7 +29,9 @@ test('SQLx SQLite fork preserves authenticated release sources and licenses', ()
   assert.equal(upstream.archive_sha256, '488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c');
   assert.equal(Object.keys(upstream.files).length, 57);
   assert.deepEqual(Object.keys(upstream.omitted), ['Cargo.lock']);
-  assert.match(upstream.files['Cargo.lock'], /^[0-9a-f]{64}$/);
+  const omittedLockHash = upstream.files['Cargo.lock'];
+  assert.ok(omittedLockHash, 'omitted lockfile retains its upstream hash');
+  assert.match(omittedLockHash, /^[0-9a-f]{64}$/);
   assert.equal(existsSync(resolve(vendor, 'Cargo.lock')), false);
   const auditFiles = ['MEMELOOP-FORK.md', 'MEMELOOP-MANIFEST.patch', 'MEMELOOP-UPSTREAM.json'];
   assert.deepEqual(files(vendor), [...Object.keys(upstream.files).filter(path => path !== 'Cargo.lock'), ...auditFiles].sort());
@@ -53,7 +55,9 @@ test('workspace locks the patched SQLite bundle and retains its existing build c
   const record = (name: string) => {
     const matches = packages.filter(p => p.includes(`\nname = "${name}"\n`));
     assert.equal(matches.length, 1, `one ${name} package`);
-    return matches[0];
+    const found = matches[0];
+    assert.ok(found, `missing ${name} package record`);
+    return found;
   };
   const sqlite = record('libsqlite3-sys');
   assert.match(sqlite, /\nversion = "0\.39\.1"\n/);
