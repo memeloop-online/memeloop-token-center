@@ -630,7 +630,33 @@ async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the
         requests[1].headers[header::USER_AGENT].to_str().unwrap(),
         "codex_exec/0.154.0"
     );
-    assert_eq!(forwarded["tools"][0], expected_v2["tools"][0]);
+    let mut expected_wire = expected_v2.clone();
+    for pointer in [
+        "/tools/0/tools/0/parameters/properties/message",
+        "/tools/0/tools/1/parameters/properties/message",
+        "/input/0/tools/0/tools/0/parameters/properties/message",
+    ] {
+        assert!(
+            expected_wire
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .remove("encrypted")
+                .is_some(),
+            "fixture retains the internal marker at {pointer}"
+        );
+    }
+    assert_eq!(forwarded["tools"], expected_wire["tools"]);
+    assert_eq!(
+        forwarded["tools"][0]["tools"][2],
+        expected_v2["tools"][0]["tools"][2]
+    );
+    assert!(
+        forwarded["tools"][0]["tools"][2]["parameters"]["properties"]["message"]
+            .get("encrypted")
+            .is_some()
+    );
     for tool in [
         &forwarded["tools"][0]["tools"][0],
         &forwarded["tools"][0]["tools"][1],
@@ -639,10 +665,10 @@ async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the
         assert!(
             tool["parameters"]["properties"]["message"]
                 .get("encrypted")
-                .is_some()
+                .is_none()
         );
     }
-    let mut expected_input = expected_v2["input"].clone();
+    let mut expected_input = expected_wire["input"].clone();
     expected_input[1]["role"] = json!("developer");
     assert_eq!(forwarded["input"], expected_input);
     upstream.verify().await;
