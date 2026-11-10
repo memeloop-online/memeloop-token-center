@@ -30,9 +30,50 @@ pub(crate) struct QuotaResetOperation {
     pub settled_at: Option<i64>,
     pub error_code: Option<String>,
     pub audit: Vec<QuotaResetAuditEvent>,
+    pub dispatch_diagnostic: Option<QuotaResetDispatchDiagnostic>,
+    pub quota_refresh_status: &'static str,
     /// The supplier decides which Codex rate limits a credit resets.
     pub effect: &'static str,
     pub consumes_credits: i64,
+}
+
+/// Closed diagnostic vocabulary; never serialize raw HTTP errors or bodies.
+#[derive(Clone, Serialize)]
+pub(crate) struct QuotaResetDispatchDiagnostic {
+    pub stage: &'static str,
+    pub reason: &'static str,
+    pub supplier_http_status: Option<u16>,
+}
+
+impl QuotaResetDispatchDiagnostic {
+    fn from_code(code: Option<&str>) -> Option<Self> {
+        let code = code?;
+        let (stage, reason, status) = match code {
+            "reset_prepare_credential_invalid" => ("prepare", "credential_invalid", None),
+            "reset_send_connect_timeout" => ("send", "connect_timeout", None),
+            "reset_send_connect_failed" => ("send", "connect_failed", None),
+            "reset_send_timeout" => ("send", "timeout", None),
+            "reset_send_request_invalid" => ("send", "request_invalid", None),
+            "reset_send_transport_failed" => ("send", "transport_failed", None),
+            "reset_dispatch_unknown" => ("send", "unavailable", None),
+            "reset_supplier_response_unknown" => ("response", "unavailable", None),
+            _ => {
+                let status = code
+                    .strip_prefix("reset_response_http_")?
+                    .parse::<u16>()
+                    .ok()?;
+                if !(100..=599).contains(&status) {
+                    return None;
+                }
+                ("response", "supplier_http_status", Some(status))
+            }
+        };
+        Some(Self {
+            stage,
+            reason,
+            supplier_http_status: status,
+        })
+    }
 }
 
 pub(crate) struct PrepareQuotaReset {
@@ -295,7 +336,14 @@ impl Database {
                     actor_service_id, confirmed_by_service_id, confirmed_at,
                     created_at, updated_at, last_reconciled_at,
                     reconciled_available_credits, reconciled_applicable_credits,
-                    settled_at, error_code
+                    settled_at, error_code,
+                    (SELECT a.error_code FROM upstream_quota_reset_audit a
+                     WHERE a.operation_id = upstream_quota_reset_operations.id
+                       AND a.tenant_id = upstream_quota_reset_operations.tenant_id
+                       AND a.upstream_account_id = upstream_quota_reset_operations.upstream_account_id
+                       AND a.event = 'reconciled'
+                       AND (a.error_code = 'reset_readback_succeeded' OR substr(a.error_code, 1, 23) = 'reset_readback_pending_')
+                     ORDER BY a.created_at DESC, a.id DESC LIMIT 1) AS readback_code
              FROM upstream_quota_reset_operations
              WHERE tenant_id = $1 AND upstream_account_id = $2 AND id = $3",
         )
@@ -309,7 +357,7 @@ impl Database {
             "SELECT id, event, actor_service_id, error_code, created_at
              FROM upstream_quota_reset_audit
              WHERE operation_id = $1 AND tenant_id = $2 AND upstream_account_id = $3
-             ORDER BY created_at, id
+             ORDER BY created_at DESC, id DESC
              LIMIT 32",
         )
         .bind(id)
@@ -318,6 +366,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await?
         .into_iter()
+        .rev()
         .map(|row| -> Result<QuotaResetAuditEvent, sqlx::Error> {
             Ok(QuotaResetAuditEvent {
                 id: row.try_get("id")?,
@@ -328,10 +377,20 @@ impl Database {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+        let state: String = row.try_get("state")?;
+        let error_code: Option<String> = row.try_get("error_code")?;
+        let latest_readback: Option<String> = row.try_get("readback_code")?;
+        let quota_refresh_status = match latest_readback.as_deref() {
+            Some("reset_readback_succeeded") => "succeeded",
+            Some(_) => "pending",
+            None if state == "accepted" => "pending",
+            None => "not_attempted",
+        };
+        let dispatch_diagnostic = QuotaResetDispatchDiagnostic::from_code(error_code.as_deref());
         Ok(QuotaResetOperation {
             id: row.try_get("id")?,
             upstream_account_id: row.try_get("upstream_account_id")?,
-            state: row.try_get("state")?,
+            state,
             credential_generation: row.try_get("credential_generation")?,
             available_credits: row.try_get("available_credits")?,
             applicable_credits: row.try_get("applicable_credits")?,
@@ -346,11 +405,39 @@ impl Database {
             reconciled_available_credits: row.try_get("reconciled_available_credits")?,
             reconciled_applicable_credits: row.try_get("reconciled_applicable_credits")?,
             settled_at: row.try_get("settled_at")?,
-            error_code: row.try_get("error_code")?,
+            error_code,
             audit,
+            dispatch_diagnostic,
+            quota_refresh_status,
             effect: "supplier_defined_codex_rate_limits",
             consumes_credits: 1,
         })
+    }
+
+    /// Record only the ordinary post-acceptance quota read, never consumption.
+    /// The source is a closed quota error code, not supplier text or a URL.
+    pub(crate) async fn record_quota_reset_readback(
+        &self,
+        account: &UpstreamAccountView,
+        operation: &str,
+        actor: &str,
+        error: Option<&'static str>,
+    ) -> Result<(), AppError> {
+        let code = error
+            .map(|code| format!("reset_readback_pending_{code}"))
+            .unwrap_or_else(|| "reset_readback_succeeded".into());
+        let changed = sqlx::query(
+            "INSERT INTO upstream_quota_reset_audit (id, operation_id, tenant_id, upstream_account_id, event, actor_service_id, error_code, created_at)
+             SELECT $1, id, tenant_id, upstream_account_id, 'reconciled', $5, $6, $7
+             FROM upstream_quota_reset_operations
+             WHERE id = $2 AND tenant_id = $3 AND upstream_account_id = $4 AND state = 'accepted'",
+        ).bind(Uuid::now_v7().to_string()).bind(operation)
+            .bind(account.tenant_id.to_string()).bind(account.id.to_string())
+            .bind(actor).bind(code).bind(unix_millis()).execute(&self.pool).await?;
+        if changed.rows_affected() != 1 {
+            return Err(AppError::NotFound);
+        }
+        Ok(())
     }
 
     /// CAS is committed before dispatch. An exact confirmation replay returns
@@ -870,6 +957,27 @@ impl Database {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dispatch_diagnostics_only_expose_closed_codes() {
+        let timeout =
+            QuotaResetDispatchDiagnostic::from_code(Some("reset_send_connect_timeout")).unwrap();
+        assert_eq!(timeout.stage, "send");
+        assert_eq!(timeout.reason, "connect_timeout");
+        assert_eq!(timeout.supplier_http_status, None);
+        let status =
+            QuotaResetDispatchDiagnostic::from_code(Some("reset_response_http_503")).unwrap();
+        assert_eq!(status.stage, "response");
+        assert_eq!(status.supplier_http_status, Some(503));
+        for code in [
+            "https://user:secret@example.test/",
+            "reset_response_http_600",
+            "reset_response_http_secret",
+            "arbitrary supplier body",
+        ] {
+            assert!(QuotaResetDispatchDiagnostic::from_code(Some(code)).is_none());
+        }
+    }
+
     #[tokio::test]
     async fn sqlite_reset_is_idempotent_audited_and_unknown_blocks_new_operations() {
         let dir = tempfile::tempdir().unwrap();
@@ -1238,6 +1346,36 @@ mod tests {
             .await
             .unwrap();
         assert!(
+            db.record_quota_reset_readback(&account, &accepted.id, "actor", None)
+                .await
+                .is_err(),
+            "an unrelated account cannot add readback evidence"
+        );
+        for (error, expected) in [
+            (Some("quota_timeout"), "pending"),
+            (None, "succeeded"),
+            (Some("quota_unavailable"), "pending"),
+            (None, "succeeded"),
+        ] {
+            db.record_quota_reset_readback(&accepted_account, &accepted.id, "actor", error)
+                .await
+                .unwrap();
+            let observed = db
+                .quota_reset_operation(
+                    &tenant.to_string(),
+                    &accepted_account.id.to_string(),
+                    &accepted.id,
+                )
+                .await
+                .unwrap();
+            assert_eq!(observed.state, "accepted");
+            assert_eq!(observed.quota_refresh_status, expected);
+            assert_eq!(
+                observed.available_credits, 2,
+                "readback audit does not consume or rewrite the preparation balance"
+            );
+        }
+        assert!(
             db.current_quota_reset_operation_for_tenant(
                 accepted_account.tenant_external_id.as_ref().unwrap(),
                 &accepted_account.id.to_string()
@@ -1334,6 +1472,46 @@ mod tests {
                 .and_then(|event| event.error_code.as_deref()),
             Some("accepted_credit_decrease_observed")
         );
+        // The display is bounded, but evidence must survive outside its last 32 rows.
+        let mut audit_tx = db.pool.begin().await.unwrap();
+        for _ in 0..40 {
+            insert_audit(
+                &mut audit_tx,
+                &accepted.id,
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                "reconciled",
+                Some("actor"),
+                Some("fixture_later_event"),
+                unix_millis(),
+            )
+            .await
+            .unwrap();
+        }
+        audit_tx.commit().await.unwrap();
+        let paged = db
+            .quota_reset_operation(
+                &tenant.to_string(),
+                &accepted_account.id.to_string(),
+                &accepted.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(paged.audit.len(), 32);
+        assert!(
+            paged
+                .audit
+                .iter()
+                .all(|event| event.error_code.as_deref() == Some("fixture_later_event"))
+        );
+        assert!(
+            paged
+                .audit
+                .windows(2)
+                .all(|events| (events[0].created_at, &events[0].id)
+                    <= (events[1].created_at, &events[1].id))
+        );
+        assert_eq!(paged.quota_refresh_status, "succeeded");
         assert!(
             db.current_quota_reset_operation_for_tenant(
                 accepted_account.tenant_external_id.as_ref().unwrap(),

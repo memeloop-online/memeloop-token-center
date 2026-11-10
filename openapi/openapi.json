@@ -20081,6 +20081,8 @@
           "settled_at",
           "error_code",
           "audit",
+          "dispatch_diagnostic",
+          "quota_refresh_status",
           "effect",
           "consumes_credits"
         ],
@@ -20185,6 +20187,58 @@
               "null"
             ]
           },
+          "dispatch_diagnostic": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "stage",
+              "reason",
+              "supplier_http_status"
+            ],
+            "properties": {
+              "stage": {
+                "type": "string",
+                "enum": [
+                  "prepare",
+                  "send",
+                  "response"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "credential_invalid",
+                  "connect_timeout",
+                  "connect_failed",
+                  "timeout",
+                  "request_invalid",
+                  "transport_failed",
+                  "unavailable",
+                  "supplier_http_status"
+                ]
+              },
+              "supplier_http_status": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 100,
+                "maximum": 599
+              }
+            }
+          },
+          "quota_refresh_status": {
+            "type": "string",
+            "enum": [
+              "not_attempted",
+              "pending",
+              "succeeded"
+            ],
+            "description": "Ordinary fresh quota read after acceptance, not proof of supplier reset completion. Accepted legacy operations without readback evidence remain pending."
+          },
           "audit": {
             "type": "array",
             "maxItems": 32,
@@ -20230,7 +20284,8 @@
                   "format": "int64"
                 }
               }
-            }
+            },
+            "description": "Latest 32 durable audit events in chronological order. Readback evidence is derived from the full audit history."
           },
           "effect": {
             "const": "supplier_defined_codex_rate_limits"

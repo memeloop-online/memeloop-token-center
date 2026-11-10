@@ -9592,7 +9592,7 @@ components:
         reason: { type: string, enum: [initial, reload, rollback] }
     UpstreamQuotaResetOperation:
       type: object
-      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, settled_at, error_code, audit, effect, consumes_credits]
+      required: [id, upstream_account_id, state, credential_generation, available_credits, applicable_credits, observed_at, expires_at, prepared_by_service_id, confirmed_by_service_id, confirmed_at, created_at, updated_at, last_reconciled_at, reconciled_available_credits, reconciled_applicable_credits, settled_at, error_code, audit, dispatch_diagnostic, quota_refresh_status, effect, consumes_credits]
       properties:
         id: { type: string, format: uuid }
         upstream_account_id: { type: string, format: uuid }
@@ -9612,9 +9612,22 @@ components:
         reconciled_applicable_credits: { type: [integer, 'null'], format: int64 }
         settled_at: { type: [integer, 'null'], format: int64, description: Fresh observation time when an accepted balance changed or an operator explicitly released a completed unknown dispatch; not proof of supplier reset completion. }
         error_code: { type: [string, 'null'] }
+        dispatch_diagnostic:
+          type: [object, 'null']
+          additionalProperties: false
+          required: [stage, reason, supplier_http_status]
+          properties:
+            stage: { type: string, enum: [prepare, send, response] }
+            reason: { type: string, enum: [credential_invalid, connect_timeout, connect_failed, timeout, request_invalid, transport_failed, unavailable, supplier_http_status] }
+            supplier_http_status: { type: [integer, 'null'], minimum: 100, maximum: 599 }
+        quota_refresh_status:
+          type: string
+          enum: [not_attempted, pending, succeeded]
+          description: Ordinary fresh quota read after acceptance, not proof of supplier reset completion. Accepted legacy operations without readback evidence remain pending.
         audit:
           type: array
           maxItems: 32
+          description: Latest 32 durable audit events in chronological order. Readback evidence is derived from the full audit history.
           items:
             type: object
             additionalProperties: false
