@@ -151,6 +151,16 @@ impl RuntimeRole {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct TrainingS3Config {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub allow_http: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing)]
     pub transport_proxy_groups: String,
@@ -209,6 +219,11 @@ pub struct Config {
     pub s3_allow_http: bool,
     #[serde(default)]
     pub s3_timeouts: S3Timeouts,
+    /// Independent immutable training CAS. Legacy S3 settings retain their meaning.
+    #[serde(default)]
+    pub training_s3: Option<TrainingS3Config>,
+    #[serde(default)]
+    pub training_cas_writes: bool,
     pub upstream_openai_url: Option<String>,
     pub upstream_openai_key: Option<String>,
     pub upstream_anthropic_url: Option<String>,
@@ -505,6 +520,18 @@ impl Config {
             s3_secret_key: env::var("MTC_S3_SECRET_KEY").ok(),
             s3_allow_http: env_bool("MTC_S3_ALLOW_HTTP", false),
             s3_timeouts: S3Timeouts::from_env()?,
+            training_s3: match env::var("MTC_TRAINING_S3_ENDPOINT").ok() {
+                Some(endpoint) => Some(TrainingS3Config {
+                    endpoint,
+                    bucket: required("MTC_TRAINING_S3_BUCKET")?,
+                    region: env_string("MTC_TRAINING_S3_REGION", "us-east-1"),
+                    access_key: required("MTC_TRAINING_S3_ACCESS_KEY")?,
+                    secret_key: required("MTC_TRAINING_S3_SECRET_KEY")?,
+                    allow_http: env_bool("MTC_TRAINING_S3_ALLOW_HTTP", false),
+                }),
+                None => None,
+            },
+            training_cas_writes: env_bool("MTC_TRAINING_CAS_WRITES", false),
             upstream_openai_url: env::var("MTC_UPSTREAM_OPENAI_URL").ok(),
             upstream_openai_key: env::var("MTC_UPSTREAM_OPENAI_KEY").ok(),
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
@@ -591,6 +618,8 @@ impl Config {
             s3_secret_key: None,
             s3_allow_http: true,
             s3_timeouts: S3Timeouts::default(),
+            training_s3: None,
+            training_cas_writes: false,
             upstream_openai_url: None,
             upstream_openai_key: None,
             upstream_anthropic_url: None,

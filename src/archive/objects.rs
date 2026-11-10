@@ -20,6 +20,9 @@ impl ArchiveStore {
     }
 
     pub async fn put(&self, location: &str, data: Bytes) -> Result<(), AppError> {
+        if location.starts_with(super::routing::PREFIX) {
+            return Err(AppError::storage("archive_training_requires_immutable_cas"));
+        }
         if is_any_v1_cas_location(location) || is_conversation_root_location(location) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
@@ -39,6 +42,9 @@ impl ArchiveStore {
     }
 
     pub async fn delete(&self, location: &str) -> Result<(), AppError> {
+        if location.starts_with(super::routing::PREFIX) {
+            return Err(AppError::storage("archive_cas_objects_are_immutable"));
+        }
         if is_any_v1_cas_location(location) || is_conversation_root_location(location) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
@@ -66,8 +72,8 @@ impl ArchiveStore {
             }
             return Ok(body.freeze());
         }
-        let path = archive_path(location)?;
-        let metadata = self.inner.head(&path).await?;
+        let (store, path) = self.resolve(location)?;
+        let metadata = store.head(&path).await?;
         if metadata.size > maximum as u64 {
             return Err(AppError::storage("archive_object_exceeds_byte_read_limit"));
         }
@@ -75,7 +81,7 @@ impl ArchiveStore {
         let initial_capacity = usize::try_from(metadata.size)
             .map_err(|_| AppError::storage("archive_object_size_exceeds_this_platform"))?;
         let mut body = BytesMut::with_capacity(initial_capacity);
-        let mut stream = self.inner.get(&path).await?.into_stream();
+        let mut stream = store.get(&path).await?.into_stream();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
             if body.len().saturating_add(chunk.len()) > maximum {
@@ -94,6 +100,7 @@ impl ArchiveStore {
         if location.ends_with(super::compressed::SUFFIX) {
             return self.compressed_size(location).await;
         }
-        Ok(self.inner.head(&archive_path(location)?).await?.size)
+        let (store, path) = self.resolve(location)?;
+        Ok(store.head(&path).await?.size)
     }
 }

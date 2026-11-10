@@ -36,6 +36,9 @@ mod raw_capture;
 #[cfg(test)]
 mod raw_capture_tests;
 mod readiness;
+mod routing;
+#[cfg(test)]
+mod routing_tests;
 #[cfg(test)]
 mod rustfs_contract_tests;
 mod session_projection;
@@ -67,6 +70,8 @@ pub use staging::ArchiveStagingObjectStore;
 #[derive(Clone)]
 pub struct ArchiveStore {
     inner: Arc<dyn ObjectStore>,
+    training: Option<routing::TrainingStore>,
+    training_cas_writes: bool,
     readiness: Arc<tokio::sync::Mutex<ReadinessCache>>,
     readiness_path: object_store::path::Path,
     readiness_deadline: Duration,

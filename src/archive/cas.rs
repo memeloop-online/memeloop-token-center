@@ -18,7 +18,9 @@ impl CasArchiveObject {
     pub(super) fn validate_tenant(&self, tenant_id: Uuid) -> Result<(), AppError> {
         let compressed = self.object_locator.ends_with(super::compressed::SUFFIX);
         if path::tenant_cas_location(tenant_id, &self.blake3_digest, compressed)?
-            != self.object_locator
+            != super::routing::split(&self.object_locator)?
+                .map(|(_, key)| key)
+                .unwrap_or(&self.object_locator)
         {
             return Err(AppError::storage("archive_cas_reference_invalid"));
         }
@@ -34,11 +36,12 @@ impl ArchiveStore {
     ) -> Result<CasArchiveObject, AppError> {
         let blake3_digest = blake3::hash(&data).to_hex().to_string();
         let size_bytes = data.len() as u64;
-        let object_locator = path::tenant_cas_location(tenant_id, &blake3_digest, false)?;
-        match self
-            .inner
+        let object_locator =
+            self.new_cas_locator(path::tenant_cas_location(tenant_id, &blake3_digest, false)?)?;
+        let (store, key) = self.resolve(&object_locator)?;
+        match store
             .put_opts(
-                &path::archive_path(&object_locator)?,
+                &key,
                 PutPayload::from_bytes(data),
                 PutOptions {
                     mode: PutMode::Create,
@@ -100,6 +103,9 @@ impl ArchiveStore {
         tenant_id: Uuid,
         staged: &StagedArchiveObject,
     ) -> Result<CasArchiveObject, AppError> {
+        if super::routing::split(&staged.object_locator)?.is_some() {
+            return Err(AppError::storage("archive_staging_backend_mismatch"));
+        }
         let compressed = staged.object_locator.ends_with(super::compressed::SUFFIX);
         let locator = path::tenant_cas_location(tenant_id, &staged.blake3_digest, compressed)?;
         let source = path::archive_path(&staged.object_locator)?;
