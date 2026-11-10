@@ -90,6 +90,7 @@ jobs:
       - run: cargo test --locked --lib archive::conversation
       - run: cargo test --locked --lib archive::session_projection -- --test-threads=1
       - run: cargo test --locked --lib conversation::return_stream_tests
+      - run: cargo test --locked --lib archive::routing_tests
       - run: cargo test --locked --lib archive::compressed_tests
       - run: cargo test --locked --lib archive::text
       - run: cargo test --locked --lib archive::supplier_summary
@@ -109,6 +110,7 @@ jobs:
           MTC_RUSTFS_TEST_ACCESS_KEY: rustfs-test-fixture
           MTC_RUSTFS_TEST_SECRET_KEY: synthetic-test-only-secret-707
         run: |
+          cargo test --locked --lib training_cas_real_s3_configuration_and_reader -- --ignored
           cargo test --locked --lib rustfs_multipart_cas_promotion_and_restart_reconstruction -- --ignored
           docker restart rustfs-contract
           ready=false
