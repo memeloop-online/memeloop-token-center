@@ -39,3 +39,18 @@ test('local pending, active renewal and safe unsent failure remain different', (
     assert.equal(status.paused, false);
   }
 });
+
+
+test('a valid snapshot expires with the same generation while renewal uncertainty stays separate', () => {
+  const current: AccountStatusInput = { ...account, credential_expires_at: 2000, oauth_refresh: { ...diagnostic, access_state: 'valid' } };
+  const before = providerAccountStatus(current, 1999);
+  const after = providerAccountStatus(current, 2000);
+  assert.equal(before.expired, false);
+  assert.equal(before.accountLabel, 'providers.accountEnabled');
+  assert.equal(after.expired, true);
+  assert.equal(after.accountLabel, 'providers.accessTokenExpired');
+  assert.equal(after.renewalLabel, before.renewalLabel);
+  assert.equal(after.needsReauthorization, false);
+  assert.deepEqual(after.allowedActions, ['reauthorize']);
+  assert.equal(providerAccountStatus({ ...current, oauth_refresh: { ...diagnostic, access_state: 'revoked' } }, 2000).accountLabel, 'providers.authorizationRevoked');
+});

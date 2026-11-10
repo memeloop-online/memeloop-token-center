@@ -28,6 +28,7 @@ interface ProxyGroupFixture {
   policies: boolean[];
   proxies: NetworkProxy[];
   selection: NetworkProxySelection;
+  effective?: Record<string, unknown>;
 }
 
 declare global {
@@ -134,6 +135,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
           proxy_id: selection.desired.proxy_id, group_id: selection.desired.group_id, selected_member_id: null,
           configuration_state: selection.desired.mode === 'credential' ? 'credential' : 'pending',
           proxy_url: 'socks5h://10.20.30.40:1080',
+          ...state.effective,
         }));
       }
       if (!url.pathname.includes('transport-proxy-group')) return previousFetch(input, init);
@@ -643,6 +645,28 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         await captureNavigationIdentity(page, 'proxy-groups', 'network-exit-edit-address', locale);
         await page.close();
       }
+    });
+
+    await context.test('current exit follows the actual selected member and pending never claims direct or desired egress', async () => {
+      const page = await prepare(true, 'zh-CN', 'policies');
+      const copy = networkProxyCopy('zh-CN');
+      await page.evaluate(() => {
+        const state = window.proxyGroupFixture;
+        state.proxies.push({ ...state.proxies[0], id: 'selected-backup', name: '实际备用出口' });
+        state.selection.desired = { ...state.selection.desired, mode: 'manual', proxy_id: state.proxies[0].id };
+        state.effective = { source: 'manual', configuration_state: 'applied', proxy_id: state.proxies[0].id, selected_member_id: 'selected-backup', proxy_url: 'socks5h://10.20.30.41:1080' };
+      });
+      const policies = page.locator('.network-proxy-policy-workspace');
+      await policies.getByRole('button', { name: '研发订阅', exact: true }).click();
+      const exit = policies.getByText(copy.effectiveExit, { exact: true }).locator('..').locator('dd');
+      await exit.getByText('实际备用出口', { exact: true }).waitFor();
+      assert.equal(await exit.textContent(), '实际备用出口');
+      await page.evaluate(() => { window.proxyGroupFixture.effective = { source: 'manual', configuration_state: 'pending', proxy_id: window.proxyGroupFixture.proxies[0].id, selected_member_id: null, proxy_url: null }; });
+      await policies.getByRole('button', { name: copy.refresh, exact: true }).click();
+      await exit.getByText(copy.appliedPending, { exact: true }).waitFor();
+      assert.equal(await exit.textContent(), copy.appliedPending);
+      assert.notEqual(await exit.textContent(), copy.directExit);
+      await page.close();
     });
 
     await context.test('entity address edits and manual, automatic and plugin policies save and reload through existing APIs', async () => {

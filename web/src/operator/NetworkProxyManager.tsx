@@ -441,7 +441,9 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   const feedback = useRef<HTMLDivElement>(null);
   const query = `?${new URLSearchParams({ tenant_external_id: tenant })}`;
   const effectiveAddress = (() => {
-    if (!effective?.proxy_url) return copy.directExit;
+    if (!effective) return copy.unknownSource;
+    if (effective.configuration_state === 'pending') return copy.appliedPending;
+    if (!effective.proxy_url) return copy.directExit;
     try {
       const url = new URL(effective.proxy_url);
       return egressAddress({ scheme: url.protocol.slice(0, -1), host: url.hostname, port: Number(url.port) }, locale);
@@ -651,7 +653,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
           {selection && <>
             <dl className="network-proxy-policy-summary">
               <div><dt>{copy.currentPolicy}</dt><dd><DetailTooltip content={`${copy.effectiveSource}: ${effective?.source === 'credential' ? copy.credentialSource : effective?.source ? copy.modes[effective.source] ?? copy.unknownSource : copy.unknownSource}`}><span tabIndex={0}>{copy.modes[selection.desired.mode] ?? copy.policyLegacy}</span></DetailTooltip></dd></div>
-              <div><dt>{copy.effectiveExit}</dt><dd>{effective ? proxies.find(proxy => proxy.id === effective.proxy_id)?.name ?? groups.flatMap(group => group.members).find(member => member.id === effective.selected_member_id)?.label ?? effectiveAddress : copy.unknownSource}</dd></div>
+              <div><dt>{copy.effectiveExit}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective ? proxies.find(proxy => proxy.id === effective.selected_member_id)?.name ?? groups.flatMap(group => group.members).find(member => member.id === effective.selected_member_id)?.label ?? effectiveAddress : copy.unknownSource}</dd></div>
               <div><dt>{copy.appliedStatus}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective?.configuration_state === 'applied' ? copy.appliedReady : effective?.configuration_state === 'credential' ? copy.credentialSource : copy.appliedUnknown}</dd></div>
             </dl>
             <Field label={copy.mode} required><Select value={draft.mode} disabled={disabled || busy || !ready} onChange={event => changeStrategy(event.target.value)}>

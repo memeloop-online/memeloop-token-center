@@ -20,7 +20,7 @@ export function providerAccountStatus(account: AccountStatusInput, now: number) 
   const expiry = account.credential_expires_at;
   const known = typeof expiry === 'number' && Number.isFinite(expiry);
   const diagnostic = account.auth_kind === 'oauth' && account.oauth_refresh?.credential_generation === account.credential_generation ? account.oauth_refresh : undefined;
-  const expired = diagnostic?.access_state === 'expired' || (diagnostic?.access_state !== 'valid' && known && expiry <= now);
+  const expired = diagnostic?.access_state === 'expired' || (known && expiry <= now);
   const revoked = diagnostic?.access_state === 'revoked';
   const renewalLabel = diagnostic?.refresh_state === 'outcome_unknown'
     ? diagnostic.failure_class === 'network' ? 'providers.renewalNetworkUnknown' : diagnostic.failure_class === 'local_persistence' ? 'providers.renewalLocalUnknown' : 'providers.renewalUnknown'

@@ -59,12 +59,12 @@ pub(in crate::api) async fn get_upstream_proxy_settings(
         &credential,
         &account.config,
     );
-    let configuration_state = if source == "credential" {
-        "credential"
-    } else if selected.is_ok() {
-        "applied"
-    } else {
+    let configuration_state = if selected.is_err() {
         "pending"
+    } else if source == "credential" {
+        "credential"
+    } else {
+        "applied"
     };
     let effective = selected
         .as_ref()
@@ -83,7 +83,11 @@ pub(in crate::api) async fn get_upstream_proxy_settings(
         source,
         proxy_id: identity(&policy["desired"]["proxy_id"]),
         group_id: identity(&policy["desired"]["group_id"]),
-        selected_member_id: identity(&policy["applied"]["selected_proxy_id"]),
+        selected_member_id: selected
+            .as_ref()
+            .ok()
+            .and_then(|selection| selection.egress_snapshot())
+            .and_then(|egress| egress.member_id),
         configuration_state,
     };
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(body)))
