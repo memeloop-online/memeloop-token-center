@@ -941,6 +941,8 @@ impl Database {
         // before taking the explicit-session lock below. A stale lease is
         // rechecked in the final transaction; its durable outbox row makes a
         // committed content-only prefix retryable rather than user-visible.
+        let mut prepared_payload = None;
+        let mut rebuilt_snapshot = None;
         let prepared_snapshot = {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
@@ -964,7 +966,6 @@ impl Database {
                     })
                 })
                 .transpose()?;
-            let mut snapshot = snapshot;
             if snapshot.as_ref().is_some_and(empty_semantic_snapshot) {
                 // Keep the primary terminal-v118 sentinel pinned so legacy
                 // workers cannot claim the deferred body. Release only this
@@ -1005,6 +1006,10 @@ impl Database {
                         &prepare.try_get::<String, _>("principal_id")?,
                     )
                     .await?
+                    .map(|loaded| {
+                        prepared_payload = Some(loaded.verified);
+                        loaded.body
+                    })
                     .filter(|body| body != "{}" && !body.is_empty())
                     .unwrap_or_default()
                 };
@@ -1038,18 +1043,10 @@ impl Database {
                     Some(&rebuilt),
                 )
                 .await?;
-                let encoded = serde_json::to_string(&rebuilt).map_err(|_| {
-                    AppError::internal(
-                        "conversations_project_claimed_conversation_projection_task_3",
-                    )
-                })?;
-                sqlx::query("UPDATE conversation_projection_outbox SET semantic_snapshot_json = $1, semantic_payload_snapshot_json = NULL WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3")
-                    .bind(&encoded)
-                    .bind(request_id.to_string())
-                    .bind(lease_owner.to_string())
-                    .execute(&self.pool)
-                    .await?;
-                snapshot = Some(rebuilt);
+                // Keep the persisted sentinel until the final transaction has
+                // rechecked the source token. A crash or changed source must
+                // retry the read rather than bypass it with a derived snapshot.
+                rebuilt_snapshot = Some(rebuilt);
             }
             let payload_required = prepare.try_get::<i64, _>("payload_required")? != 0;
             if payload_required
@@ -1070,7 +1067,7 @@ impl Database {
                 let prepare_request_json = if let Some(expected) =
                     snapshot.as_ref().and_then(|s| s.payload_digest.as_deref())
                 {
-                    semantic_payload::load(
+                    let loaded = semantic_payload::load(
                         self,
                         request_id,
                         &prepare_tenant_id,
@@ -1078,7 +1075,9 @@ impl Database {
                         &prepare.try_get::<String, _>("principal_id")?,
                         expected,
                     )
-                    .await?
+                    .await?;
+                    prepared_payload = Some(loaded.verified);
+                    loaded.body
                 } else {
                     prepare.try_get::<String, _>("request_json")?
                 };
@@ -1226,6 +1225,12 @@ impl Database {
                 "conversation semantic snapshot changed during projection".into(),
             ).into());
         }
+        if let Some(verified) = prepared_payload.as_ref() {
+            semantic_payload::verify_in_transaction(
+                &mut transaction, self.backend, request_id, &projection_key, verified,
+            ).await?;
+        }
+        let snapshot = rebuilt_snapshot.clone().or(snapshot);
         // A declared identity may already have been published without waiting
         // for archive content. Enrich that same observation rather than
         // counting the request again or replacing its client provenance.
@@ -1249,19 +1254,6 @@ impl Database {
             false
         };
         if !rewrote_existing {
-            if let Some(expected) = snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.payload_digest.as_deref())
-            {
-                semantic_payload::verify_in_transaction(
-                    &mut transaction,
-                    self.backend,
-                    request_id,
-                    &projection_key,
-                    expected,
-                )
-                .await?;
-            }
             self.record_conversation_observation_with_snapshot_in_transaction(
                 &mut transaction,
                 ConversationObservationInput {
@@ -1288,7 +1280,12 @@ impl Database {
             )
             .await?;
         }
-        let receipt = task.try_get::<Option<String>, _>("semantic_snapshot_json")?.as_deref().map(semantic_payload::completed_receipt);
+        let completed_snapshot = if let Some(rebuilt) = rebuilt_snapshot.as_ref() {
+            Some(serde_json::to_string(rebuilt).map_err(|_| AppError::internal("conversations_completed_snapshot"))?)
+        } else {
+            task.try_get::<Option<String>, _>("semantic_snapshot_json")?
+        };
+        let receipt = completed_snapshot.as_deref().map(semantic_payload::completed_receipt);
         let acknowledged = sqlx::query(
             "UPDATE conversation_projection_outbox SET projected_at = $1, statistics_outcome = 'session_body', lease_owner = NULL, lease_expires_at = NULL, terminal_lease_owner = NULL, terminal_lease_expires_at = NULL, semantic_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NULL THEN $4 ELSE NULL END, semantic_payload_snapshot_json = CASE WHEN semantic_payload_snapshot_json IS NOT NULL THEN $4 ELSE NULL END WHERE request_id = $2 AND projected_at IS NULL AND COALESCE(terminal_lease_owner, lease_owner) = $3",
         )
