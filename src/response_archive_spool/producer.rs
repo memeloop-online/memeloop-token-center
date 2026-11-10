@@ -508,6 +508,7 @@ impl LocalCapture {
             let directory = self.directory.clone();
             let (local, file) = tokio::task::spawn_blocking(move || {
                 let _charge = charge;
+                std::fs::create_dir_all(&directory)?;
                 let local = Arc::new(crate::gateway_body::local_body_file::LocalBodyFile::new(
                     &directory,
                 )?);
@@ -822,7 +823,7 @@ impl ResponseArchiveProducer {
             #[cfg(test)]
             state: state.clone(),
             local: LocalCapture {
-                directory: std::env::temp_dir(),
+                directory: state.config.responses_request_spool_path.clone().into(),
                 #[cfg(test)]
                 write_pause: None,
                 source: Some(source),
@@ -874,11 +875,6 @@ impl ResponseArchiveProducer {
         self.local.source.take();
         self.local.file.take();
         self.local.progress.send_replace((self.local.length, true));
-    }
-
-    #[cfg(test)]
-    pub(super) fn local_directory_for_test(&mut self, directory: std::path::PathBuf) {
-        self.local.directory = directory;
     }
 
     #[cfg(test)]

@@ -25,6 +25,10 @@ async fn object_capture_recovers_a_completed_request_without_a_response_locator(
     )
     .unwrap();
     assert!(archive.append_with_backpressure(body.clone()).await);
+    assert!(
+        configured.is_dir(),
+        "capture uses the production Config spool path"
+    );
     archive.seal().unwrap().wait().await;
     let reference = state
         .archive
@@ -576,6 +580,18 @@ async fn fixture_with_compression(
     sqlx::AnyPool,
     ArchiveSpoolIdentity,
 ) {
+    fixture_with_capture_directory(compression_enabled, None).await
+}
+
+async fn fixture_with_capture_directory(
+    compression_enabled: bool,
+    directory: Option<std::path::PathBuf>,
+) -> (
+    tempfile::TempDir,
+    AppState,
+    sqlx::AnyPool,
+    ArchiveSpoolIdentity,
+) {
     let dir = tempfile::tempdir().unwrap();
     let url = format!(
         "sqlite://{}?mode=rwc",
@@ -583,6 +599,9 @@ async fn fixture_with_compression(
     );
     let mut config = Config::for_test(url.clone());
     config.archive_spool_compression_enabled = compression_enabled;
+    if let Some(directory) = directory {
+        config.responses_request_spool_path = directory.to_string_lossy().into_owned();
+    }
     let state = AppState::initialize(config).await.unwrap();
     let pool = sqlx::AnyPool::connect(&url).await.unwrap();
     let identity = ArchiveSpoolIdentity {
@@ -1046,14 +1065,15 @@ async fn empty_local_carrier_publishes_the_exact_empty_original() {
 
 #[tokio::test]
 async fn local_open_failure_fences_without_acknowledging_a_partial_original() {
-    let (directory, state, _pool, identity) = fixture().await;
+    let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("not-a-directory");
     std::fs::write(&path, b"blocked").unwrap();
+    let (_fixture, state, _pool, identity) =
+        fixture_with_capture_directory(false, Some(path)).await;
     let baseline = state.proxy_memory_budget.snapshot().0;
     let mut producer =
         ResponseArchiveProducer::begin(&state, identity, state.proxy_memory_budget.reservation())
             .unwrap();
-    producer.local_directory_for_test(path);
     assert!(
         !producer
             .append_with_backpressure(Bytes::from_static(b"complete supplier bytes"))
