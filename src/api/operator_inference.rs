@@ -55,7 +55,7 @@ async fn execute(
 ) -> Result<Response, AppError> {
     let service = require_service(&headers, &state, "keys:write").await?;
     let tenant = management_tenant(&service, query.tenant_external_id)?;
-    validate_request(&body.request)?;
+    validate_request(&body.request, protocol)?;
     let inference_headers = inference_headers(body.conversation.as_ref())?;
     // The database atomically fences tenant, active status and credential
     // generation using the same authorization as the explicit copy operation.
@@ -108,18 +108,19 @@ async fn execute(
     Ok(response)
 }
 
-fn validate_request(request: &Value) -> Result<(), AppError> {
+fn validate_request(request: &Value, protocol: Protocol) -> Result<(), AppError> {
     if !request.is_object() {
         return Err(AppError::BadRequest(
             "request must be an inference object".into(),
         ));
     }
-    if request
-        .get("stream")
-        .is_some_and(|value| value != &Value::Bool(false))
-    {
+    if request.get("stream").is_some_and(|value| {
+        !value.is_boolean()
+            || (value == &Value::Bool(true) && !matches!(protocol, Protocol::OpenAiResponses))
+    }) {
         return Err(AppError::BadRequest(
-            "operator inference requires stream=false".into(),
+            "stream must be a boolean; streaming is supported by operator Responses inference"
+                .into(),
         ));
     }
     Ok(())

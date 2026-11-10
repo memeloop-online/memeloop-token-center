@@ -334,8 +334,12 @@ paths:
         Optional conversation identifiers connect requests to the core session and
         usage records; the wrapper is consumed by the gateway. Request and response
         bodies use the normal core archive pipeline.
-        Requires an active key with a stored copyable credential. Only JSON
-        Responses are supported; stream=true is rejected.
+        Requires an active key with a stored copyable credential. Responses support
+        JSON (stream=false or omitted) and server-sent events (stream=true).
+        Streaming uses the normal gateway backpressure, cancellation, request/session
+        archive and usage settlement lifecycle. Consume response.completed before
+        declaring a completed turn. Cancellation leaves usage unknown until the
+        upstream reports its normal settlement.
       security: [{ serviceBearer: [] }]
       x-required-scope: keys:write
       parameters:
@@ -355,13 +359,16 @@ paths:
                   type: object
                   additionalProperties: true
                   properties:
-                    stream: { type: boolean, const: false }
+                    stream: { type: boolean }
       responses:
         '200':
           description: OpenAI Responses result including image generation output, billed to the selected key
           content:
             application/json:
               schema: { type: object, additionalProperties: true }
+            text/event-stream:
+              schema: { type: string }
+              example: "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
         '400':
           description: Invalid JSON Responses request
           content:
