@@ -1246,19 +1246,20 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
         .pending_terminals
         .directory_for_test()
         .to_path_buf();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !directory.join(format!("{receipt_id}.json")).is_file() {
+    let compact: Value = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(bytes) = tokio::fs::read(directory.join(format!("{receipt_id}.json"))).await
+                && let Ok(compact) = serde_json::from_slice::<Value>(&bytes)
+                && compact["financial_ack"]["receipt_id"] == receipt["receipt_id"]
+                && compact["financial_ack"]["request_id"] == receipt["request_id"]
+            {
+                break compact;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("unprojected financial ACK must retain a compact recovery receipt");
-    let compact: Value = serde_json::from_slice(
-        &tokio::fs::read(directory.join(format!("{receipt_id}.json")))
-            .await
-            .unwrap(),
-    )
-    .unwrap();
     assert_eq!(compact["conversation"]["request_json"], json!({}));
     assert_eq!(compact["usage"], receipt["usage"]);
     assert_eq!(
