@@ -33,6 +33,33 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`${origin}/e2e/fixtures/quota-semantics.html`);
 
+    const kimi = page.locator('[data-case="kimi-choice"]');
+    const kimiSummary = kimi.locator('.quota-summary');
+    const choice = kimi.getByRole('combobox', { name: 'Allowance shown in summaries' });
+    assert.match(await kimiSummary.innerText(), /Weekly limit.*10% used/);
+    await choice.selectOption('limit-0');
+    await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('80% used'));
+    assert.match(await kimiSummary.innerText(), /5-hour limit.*80% used/);
+    assert.match(await page.locator('[data-case="kimi-other-account"] .quota-summary').innerText(), /Weekly limit.*10% used/);
+    await page.reload();
+    assert.equal(await choice.inputValue(), 'limit-0');
+    assert.match(await kimiSummary.innerText(), /5-hour limit.*80% used/);
+    await choice.selectOption('');
+    await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('10% used'));
+
+    await page.evaluate(() => {
+      Reflect.set(window, 'quotaOriginalSetItem', Storage.prototype.setItem);
+      Storage.prototype.setItem = () => { throw new DOMException('Storage unavailable', 'QuotaExceededError'); };
+    });
+    try {
+      await choice.selectOption('limit-0');
+      await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('80% used'));
+    } finally {
+      await page.evaluate(() => { Storage.prototype.setItem = Reflect.get(window, 'quotaOriginalSetItem'); });
+    }
+    await choice.selectOption('');
+    await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('10% used'));
+
     const summary = page.locator('[data-case="summary"]');
     assert.match(await summary.innerText(), /Codex usage · 5-hour limit · 51% used/);
     assert.equal(await summary.getByRole('meter').getAttribute('aria-valuenow'), '51');
@@ -73,12 +100,17 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     const retainedText = await retained.innerText();
     assert.match(retainedText, /Codex usage · 5-hour limit/);
     assert.match(retainedText, /Last observed balance 0/);
-    assert.match(retainedText, /Last observed: Upstream reports extra credits/);
-    assert.match(retainedText, /Extra credits are counted apart from plan windows/);
     assert.match(retainedText, /Last observed · may be outdated/);
     assert.match(retainedText, /This refresh failed/);
     assert.doesNotMatch(retainedText, /code:primary_window|codex_usage/);
     assert.equal(await retained.locator('meter').count(), 1);
+    const retainedCredits = retained.locator('[data-quota-extra-credits] [tabindex="0"]');
+    assert.match(await retainedCredits.innerText(), /^Last observed balance 0/);
+    await retainedCredits.focus();
+    const creditExplanation = page.getByRole('tooltip').filter({ hasText: 'Last observed: Upstream reports extra credits' });
+    await creditExplanation.waitFor();
+    assert.match(await creditExplanation.innerText(), /Extra credits are counted apart from plan windows/);
+    await page.keyboard.press('Escape');
     const unmapped = page.locator('[data-case="unmapped"]');
     assert.match(await unmapped.innerText(), /Codex additional usage · 5-hour limit/);
     assert.doesNotMatch(await unmapped.innerText(), /bengalfox|balance 0/i, 'an internal feature is not a model name; unsourced zero is not a balance');

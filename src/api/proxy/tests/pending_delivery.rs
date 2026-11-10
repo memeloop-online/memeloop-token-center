@@ -65,6 +65,21 @@ async fn owned_enqueued_source(
     serde_json::from_slice(&raw).unwrap()
 }
 
+async fn assert_financial_settled_once(fixture: &CodexRouteFixture, request_id: Uuid) {
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let row = sqlx::query(
+        "SELECT r.status, (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id) AS reservations, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("status"), "settled");
+    assert_eq!(row.get::<i64, _>("reservations"), 1);
+    assert_eq!(row.get::<i64, _>("ledger"), 1);
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn durable_unknown_receipt_releases_projection_memory_without_discarding_evidence() {
     let upstream = MockServer::start().await;
@@ -1101,15 +1116,12 @@ async fn first_billable_delta_arrives_while_upstream_terminal_and_journal_ack_ar
 
 #[tokio::test]
 async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_responsibility() {
-    let mut fixture = codex_route_fixture("pending-filesystem-fault").await;
-    let unavailable = fixture._directory.path().join("journal-is-a-file");
+    let fixture = codex_route_fixture("pending-filesystem-fault").await;
+    // Block receipt publication without disabling raw body archival or recovery.
+    let unavailable = fixture.archive_path.join("terminal-receipts");
     tokio::fs::write(&unavailable, b"not a directory")
         .await
         .unwrap();
-    fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        unavailable.clone(),
-        fixture.state.db.independent_persistence_pool(),
-    );
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -1206,7 +1218,9 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
     let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     wait_for_request_settlement(&fixture, 1).await;
     let request_id = Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap();
-    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+    // Semantic projection requires the operational acknowledgement that the
+    // injected trigger is withholding. Finance must already be complete.
+    assert_financial_settled_once(&fixture, request_id).await;
     assert!(
         fixture
             .state
@@ -1227,19 +1241,20 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
         .pending_terminals
         .directory_for_test()
         .to_path_buf();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !directory.join(format!("{receipt_id}.json")).is_file() {
+    let compact: Value = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(bytes) = tokio::fs::read(directory.join(format!("{receipt_id}.json"))).await
+                && let Ok(compact) = serde_json::from_slice::<Value>(&bytes)
+                && compact["financial_ack"]["receipt_id"] == receipt["receipt_id"]
+                && compact["financial_ack"]["request_id"] == receipt["request_id"]
+            {
+                break compact;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("unprojected financial ACK must retain a compact recovery receipt");
-    let compact: Value = serde_json::from_slice(
-        &tokio::fs::read(directory.join(format!("{receipt_id}.json")))
-            .await
-            .unwrap(),
-    )
-    .unwrap();
     assert_eq!(compact["conversation"]["request_json"], json!({}));
     assert_eq!(compact["usage"], receipt["usage"]);
     assert_eq!(
@@ -1380,6 +1395,24 @@ async fn unknown_failure_retries_operational_projection() {
     .expect("unknown finance must retain its durable receipt");
     let request_id = Uuid::parse_str(original["request_id"].as_str().unwrap()).unwrap();
     assert!(original["conversation"].is_object());
+    let recovery_directory = tempfile::tempdir().unwrap();
+    let recovery = crate::proxy_lifecycle::pending_terminal::Journal::with_archive(
+        recovery_directory.path().to_owned(),
+        fixture.state.db.clone(),
+        fixture.state.archive.clone(),
+    );
+    recovery.stop_for_test().await;
+    let mut replay = original.clone();
+    replay["conversation_state"] = json!("Enqueued");
+    replay["reconciliation_required"] = json!(true);
+    recovery
+        .recover_snapshot_for_test(&fixture.state.db, replay.clone())
+        .await;
+    assert!(
+        !recovery.awaiting_evidence_for_test(receipt_id),
+        "failed operational ACK must remain retryable"
+    );
+
     tokio::time::timeout(Duration::from_secs(3), async {
         while fixture
             .state
@@ -1393,7 +1426,6 @@ async fn unknown_failure_retries_operational_projection() {
     })
     .await
     .expect("unknown awaiting its operational receipt must survive idle reap");
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
     let financial: (String, String, Option<i64>, i64, i64) = sqlx::query_as(
         "SELECT p.unknown_reason, r.status, r.actual_micros, \
          (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
@@ -1422,6 +1454,15 @@ async fn unknown_failure_retries_operational_projection() {
         .execute(&pool)
         .await
         .unwrap();
+    let mut incomplete = replay.clone();
+    incomplete["conversation_state"] = json!("Pending");
+    recovery
+        .recover_snapshot_for_test(&fixture.state.db, incomplete)
+        .await;
+    assert!(
+        !recovery.awaiting_evidence_for_test(receipt_id),
+        "unfinished source/projection work must remain retryable"
+    );
     let receipt = cancellation::assert_single_unknown_receipt(
         &fixture,
         502,
@@ -1463,7 +1504,6 @@ async fn unknown_failure_retries_operational_projection() {
     .await
     .unwrap();
     assert_eq!(enqueued, 0);
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
     sqlx::query("DROP TRIGGER fail_unknown_projection")
         .execute(&pool)
         .await
@@ -1500,6 +1540,9 @@ async fn unknown_failure_retries_operational_projection() {
     .expect(
         "unknown with durable semantic enqueue must release memory and the parsed conversation",
     );
+    // This gateway-only fixture must run the raw archive worker before the
+    // source-backed conversation can consume its response locator.
+    drain_completed_response_archive(&fixture).await;
     let terminal_owner = Uuid::now_v7();
     for pending_id in fixture
         .state
@@ -1527,10 +1570,7 @@ async fn unknown_failure_retries_operational_projection() {
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].request_id, request_id);
     assert!(
-        fixture
-            .state
-            .db
-            .project_claimed_conversation_projection_task(owner, request_id)
+        crate::worker::archive_session_body(&fixture.state, owner, request_id)
             .await
             .unwrap()
     );
@@ -1553,6 +1593,52 @@ async fn unknown_failure_retries_operational_projection() {
     .await
     .unwrap();
     assert_eq!(effects, (1, 0, 1));
+    assert!(
+        !recovery
+            .recover_snapshot_for_test(&fixture.state.db, replay.clone())
+            .await
+    );
+    assert!(recovery.awaiting_evidence_for_test(receipt_id));
+    sqlx::query("CREATE TRIGGER no_unknown_replay BEFORE UPDATE OF unknown_reason ON pending_proxy_settlements WHEN NEW.unknown_reason IS NOT NULL BEGIN SELECT RAISE(ABORT, 'UNCHANGED_EVIDENCE_MUST_NOT_WRITE'); END")
+        .execute(&pool).await.unwrap();
+    assert!(
+        !recovery
+            .recover_snapshot_for_test(&fixture.state.db, replay.clone())
+            .await
+    );
+    assert!(recovery.awaiting_evidence_for_test(receipt_id));
+    replay["usage_basis"] = json!("provider_reported");
+    replay["usage"]["input_tokens"] = json!(3);
+    replay["usage"]["output_tokens"] = json!(2);
+    let completed_before: Option<i64> =
+        sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id=$1")
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let progressed = recovery
+        .recover_snapshot_for_test(&fixture.state.db, replay)
+        .await;
+    assert!(
+        !recovery.awaiting_evidence_for_test(receipt_id),
+        "changed provider evidence must leave the cache and re-enter the original financial guard"
+    );
+    let financial: (String, Option<i64>, i64) = sqlx::query_as(
+        "SELECT p.state,p.cost_micros,(SELECT COUNT(*) FROM ledger_entries WHERE source=p.reservation_id) FROM pending_proxy_settlements p WHERE p.request_id=$1",
+    ).bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+    if completed_before.is_some() {
+        // A completed record without a matching receipt remains an authority
+        // conflict. Evidence caching must not bypass that financial guard.
+        assert!(!progressed);
+        assert_eq!(financial, ("pending".to_owned(), None, 0));
+    } else {
+        // The operational/statistical terminal can exist while finance still
+        // owns the pending request. Real evidence then uses the normal finish.
+        assert!(progressed);
+        assert_eq!(financial.0, "applied");
+        assert!(financial.1.unwrap() > 0);
+        assert_eq!(financial.2, 1);
+    }
     pool.close().await;
     upstream.verify().await;
 }

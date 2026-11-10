@@ -127,6 +127,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await view.click();
     await page.getByRole('button', { name: 'Check operation status', exact: true }).click();
     await page.waitForFunction(() => window.quotaCurrents === 2);
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     assert.equal(await reset.isEnabled(), true);
     await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=reset-settled`);
     await view.click();

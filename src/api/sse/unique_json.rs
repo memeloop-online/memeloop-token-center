@@ -97,3 +97,12 @@ pub(in crate::api) fn parse_unique_json(data: &[u8]) -> Result<Value, &'static s
         .map_err(|_| "upstream_invalid_response")?;
     Ok(value)
 }
+
+pub(in crate::api) fn parse_unique_json_reader(
+    reader: impl std::io::Read,
+) -> Result<Value, serde_json::Error> {
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let value = UniqueJsonSeed.deserialize(&mut deserializer)?;
+    deserializer.end()?;
+    Ok(value)
+}

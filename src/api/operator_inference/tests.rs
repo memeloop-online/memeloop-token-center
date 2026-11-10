@@ -537,7 +537,9 @@ async fn assert_inference_archive(
                 state.db.project_claimed_terminal_projection_task(owner, pending_id).await.unwrap();
             }
             for task in state.db.claim_conversation_projection_tasks(owner, 32).await.unwrap() {
-                state.db.project_claimed_conversation_projection_task(owner, task.request_id).await.unwrap();
+                // Match the production worker: durable terminal receipts carry
+                // metadata seeds, so materialize their original source first.
+                crate::worker::archive_session_body(state, owner, task.request_id).await.unwrap();
             }
             use sqlx::Row;
             let observation = sqlx::query("SELECT explicit_session_id, turn_id, parent_turn_id, leaf_node_hash FROM conversation_observations WHERE request_id = $1")
@@ -546,7 +548,7 @@ async fn assert_inference_archive(
                 assert_eq!(row.get::<String, _>("explicit_session_id"), "playground-fixture");
                 assert_eq!(row.get::<String, _>("turn_id"), "turn-1");
                 assert_eq!(row.get::<String, _>("parent_turn_id"), "turn-0");
-                let expected_prefix = crate::conversation::build_prefix(&crate::conversation::extract_atoms(request));
+                let (_, expected_prefix) = crate::conversation::session_body_from_documents(request, response).into_prefix();
                 assert_eq!(row.get::<Option<String>, _>("leaf_node_hash").as_deref(), expected_prefix.last().map(|node| node.node_hash.as_str()));
                 break;
             }

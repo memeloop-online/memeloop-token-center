@@ -5,14 +5,14 @@ mod admission;
 mod anthropic;
 mod candidates;
 mod clock;
-mod codex;
+pub(super) mod codex;
 mod compact_file;
 pub(super) mod diagnostics;
 mod http;
 #[cfg(test)]
 pub(super) use http::with_stalled_probe_preparation;
 pub(super) mod kimi;
-mod outcome;
+pub(super) mod outcome;
 mod policy;
 mod probe;
 mod readiness;
@@ -502,7 +502,15 @@ pub(super) async fn send_proxy_route(
         )
         .await;
     }
-    http::send_reqwest_proxy_route(state, headers, protocol, request_id, route).await
+    http::send_reqwest_proxy_route(
+        state,
+        headers,
+        protocol,
+        request_id,
+        route,
+        outbound_attempt,
+    )
+    .await
 }
 
 pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {

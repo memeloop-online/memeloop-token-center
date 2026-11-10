@@ -32,7 +32,7 @@ impl Database {
                     {now} AS sampled_at
              FROM (
                SELECT r.tenant_id, r.id AS sample_id, 'request_owner' AS source,
-                      r.upstream_account_id, 'unknown' AS state,
+                      r.upstream_account_id, COALESCE(r.in_flight_stage, 'unknown') AS state,
                       r.proxy_owner_expires_at AS lease_expires_at,
                       e.snapshot_json, e.attempt_id AS egress_attempt_id,
                       e.completed AS egress_completed, e.upstream_account_id AS egress_upstream_account_id, r.created_at
@@ -85,7 +85,16 @@ impl Database {
                     sample_id: row.try_get("sample_id")?,
                     source: row.try_get("source")?,
                     upstream_account_id: row.try_get("upstream_account_id")?,
-                    state: row.try_get("state")?,
+                    state: {
+                        let state: String = row.try_get("state")?;
+                        let source: String = row.try_get("source")?;
+                        if source == "request_owner" {
+                            crate::model::recorded_in_flight_stage(Some(state))
+                                .unwrap_or_else(|| "unknown".into())
+                        } else {
+                            state
+                        }
+                    },
                     lease_expires_at: expires,
                     lease_state: match expires {
                         Some(expiry) if expiry > sampled_at => "live",
@@ -165,6 +174,16 @@ mod tests {
             token: Uuid::now_v7(),
         };
         assert!(database.acquire_proxy_request_owner(&owner).await.unwrap());
+        database
+            .record_proxy_in_flight_stage(
+                request_id,
+                key.tenant_id,
+                key.key_id,
+                reservation.id,
+                "upstream_response_body",
+            )
+            .await
+            .unwrap();
         let samples = database.upstream_concurrency_samples(4097).await.unwrap();
         let sample = samples
             .iter()
@@ -172,6 +191,7 @@ mod tests {
             .unwrap();
         assert_eq!(sample.tenant_external_id, marker);
         assert_eq!(sample.lease_state, "live");
+        assert_eq!(sample.state, "upstream_response_body");
         assert_eq!(sample.egress_state, "missing_metadata");
         assert!(sample.upstream_account_id.is_none());
         assert!(sample.selected_egress.is_none());

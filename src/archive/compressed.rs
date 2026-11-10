@@ -7,13 +7,12 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt, stream};
 use object_store::{GetOptions, GetRange};
 
-use super::{ArchiveDownload, ArchiveStore, path::archive_path};
+use super::{ArchiveDownload, ArchiveStore};
 use crate::error::AppError;
 
 pub(super) const SUFFIX: &str = ".mtcz1";
 pub(super) const BLOCK: usize = 64 * 1024;
 const MAX_ENCODED_BLOCK: usize = 128 * 1024;
-pub(super) const MAX_PLAIN: u64 = 64 * 1024 * 1024;
 pub(super) const MAGIC: &[u8; 8] = b"MTCZSTD1";
 const END: &[u8; 8] = b"MTCZEND1";
 const FOOTER: u64 = 48;
@@ -60,10 +59,10 @@ struct Metadata {
 
 impl ArchiveStore {
     async fn compressed_metadata(&self, location: &str) -> Result<Metadata, AppError> {
-        let result = self
-            .inner
+        let (store, key) = self.resolve(location)?;
+        let result = store
             .get_opts(
-                &archive_path(location)?,
+                &key,
                 GetOptions {
                     range: Some(GetRange::Suffix(FOOTER)),
                     ..GetOptions::default()
@@ -73,9 +72,7 @@ impl ArchiveStore {
         let physical = result.meta.size;
         let etag = result.meta.e_tag.clone();
         let version = result.meta.version.clone();
-        if !(8 + FOOTER..=MAX_PLAIN * 3).contains(&physical)
-            || result.range != (physical - FOOTER..physical)
-        {
+        if physical < 8 + FOOTER || result.range != (physical - FOOTER..physical) {
             return Err(storage(()));
         }
         let bytes = result.bytes().await?;
@@ -83,9 +80,6 @@ impl ArchiveStore {
             return Err(storage(()));
         }
         let logical = u64::from_le_bytes(bytes[8..16].try_into().map_err(storage)?);
-        if logical > MAX_PLAIN {
-            return Err(storage(()));
-        }
         Ok(Metadata {
             physical,
             logical,
@@ -107,10 +101,10 @@ impl ArchiveStore {
         let metadata = self.compressed_metadata(location).await?;
         let requested = range.unwrap_or(0..metadata.logical);
         super::download::validate_download_range(metadata.logical, Some(&requested), &requested)?;
-        let result = self
-            .inner
+        let (store, key) = self.resolve(location)?;
+        let result = store
             .get_opts(
-                &archive_path(location)?,
+                &key,
                 GetOptions {
                     if_match: metadata.etag.clone(),
                     version: metadata.version.clone(),
@@ -158,7 +152,9 @@ impl ArchiveStore {
                     state.done = true;
                     return Ok(state.pending.take().map(|bytes| (bytes, state)));
                 }
-                if state.physical + 40 > state.metadata.physical - FOOTER {
+                if state.physical.checked_add(40).ok_or_else(invalid)?
+                    > state.metadata.physical - FOOTER
+                {
                     return Err(invalid());
                 }
                 let header = state.read(40).await?;
@@ -166,10 +162,18 @@ impl ArchiveStore {
                     u32::from_le_bytes(header[..4].try_into().map_err(|_| invalid())?) as usize;
                 let encoded_len =
                     u32::from_le_bytes(header[4..8].try_into().map_err(|_| invalid())?) as usize;
+                let plain_end = state
+                    .position
+                    .checked_add(plain_len as u64)
+                    .ok_or_else(invalid)?;
                 if !(1..=BLOCK).contains(&plain_len)
                     || !(1..=MAX_ENCODED_BLOCK).contains(&encoded_len)
-                    || state.physical + encoded_len as u64 > state.metadata.physical - FOOTER
-                    || state.position + plain_len as u64 > state.metadata.logical
+                    || state
+                        .physical
+                        .checked_add(encoded_len as u64)
+                        .ok_or_else(invalid)?
+                        > state.metadata.physical - FOOTER
+                    || plain_end > state.metadata.logical
                 {
                     return Err(invalid());
                 }
@@ -180,9 +184,9 @@ impl ArchiveStore {
                 }
                 state.hash.update(&plain);
                 let start = state.range.start.max(state.position);
-                let end = state.range.end.min(state.position + plain_len as u64);
+                let end = state.range.end.min(plain_end);
                 let offset = state.position;
-                state.position += plain_len as u64;
+                state.position = plain_end;
                 if start < end {
                     let selected = Bytes::from(plain)
                         .slice((start - offset) as usize..(end - offset) as usize);
@@ -230,7 +234,7 @@ impl Decoder {
             let length = (size - output.len()).min(self.carry.len());
             output.extend_from_slice(&self.carry.split_to(length));
         }
-        self.physical += size as u64;
+        self.physical = self.physical.checked_add(size as u64).ok_or_else(invalid)?;
         Ok(output.freeze())
     }
 }

@@ -1,4 +1,4 @@
-import type { ComponentType } from 'react';
+import type { ComponentType, CSSProperties } from 'react';
 import type * as ReactRuntime from 'react';
 import type * as ReactDOMRuntime from 'react-dom';
 import type * as ReactJSXRuntime from 'react/jsx-runtime';
@@ -84,6 +84,18 @@ export interface OperatorUiPackageV1 {
   components: Readonly<Record<string, ComponentType<OperatorUiComponentPropsV1>>>;
 }
 
+export interface OperatorUiEChartPropsV1 {
+  ariaLabel: string;
+  className?: string;
+  locale: 'zh-CN' | 'en';
+  onClick?: (event: { dataIndex: number; seriesIndex?: number; value: unknown }) => void;
+  /** ECharts options passed to the host renderer; plugins share its runtime. */
+  option: Readonly<Record<string, unknown>>;
+  /** Give the chart a height within the plugin's responsive layout. */
+  style?: CSSProperties;
+  timeZone: string;
+}
+
 export interface OperatorUiModuleHostV1 {
   apiVersion: typeof OPERATOR_UI_PACKAGE_API_V1;
   React: typeof ReactRuntime;
@@ -92,6 +104,8 @@ export interface OperatorUiModuleHostV1 {
   /** The host's automatic JSX runtime, backed by the same React instance. */
   ReactJSXRuntime?: typeof ReactJSXRuntime;
   Fluent: typeof FluentRuntime;
+  /** Shared, lazily loaded ECharts renderer with host theme and lifecycle management. */
+  EChart?: ComponentType<OperatorUiEChartPropsV1>;
   defineOperatorUiPackage: typeof defineOperatorUiPackage;
 }
 

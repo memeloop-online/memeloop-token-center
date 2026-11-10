@@ -76,91 +76,52 @@ impl Database {
         normalize_legacy_members(&self.pool, key).await?;
         let mut tx = self.begin_write_transaction().await?;
         lock(&mut tx).await?;
-        let tenant_id = tenant(&mut tx, external).await?;
-        let current = sqlx::query(BINDING_SELECT)
-            .bind(id.to_string())
-            .bind(external)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(AppError::NotFound)?;
-        let version: i64 = current.try_get("binding_version")?;
-        if version != expected_binding {
-            return Err(conflict("proxy_group_binding_conflict"));
-        }
+        let current = sqlx::query("SELECT COALESCE(p.version, 0) AS policy_version, b.group_id, b.initial_member_id FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id LEFT JOIN transport_proxy_bindings b ON b.account_id = a.id LEFT JOIN network_proxy_selection_policies p ON p.account_id = a.id WHERE a.id = $1 AND t.external_id = $2")
+            .bind(id.to_string()).bind(external).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
         let current_group: Option<String> = current.try_get("group_id")?;
-        let group_id = target
+        let initial: Option<String> = current.try_get("initial_member_id")?;
+        let source_group = target
             .map(|id| id.to_string())
-            .or_else(|| current_group.clone())
+            .or(current_group.clone())
             .ok_or_else(invalid)?;
-        let row =
-            sqlx::query("SELECT * FROM transport_proxy_groups WHERE id = $1 AND tenant_id = $2")
-                .bind(&group_id)
-                .bind(&tenant_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .ok_or(AppError::NotFound)?;
-        if row.try_get::<i64, _>("version")? != group_version {
+        let actual_version: i64 = sqlx::query_scalar("SELECT g.version FROM transport_proxy_groups g JOIN tenants t ON t.id = g.tenant_id WHERE g.id = $1 AND t.external_id = $2")
+            .bind(&source_group).bind(external).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
+        if actual_version != group_version {
             return Err(conflict("proxy_group_version_conflict"));
         }
-        let members = load_group_members(&mut *tx, &group_id, key).await?;
-        let requested = members
-            .iter()
-            .find(|candidate| candidate.id == member)
-            .ok_or_else(invalid)?;
-        let initial: Option<String> = current.try_get("initial_member_id")?;
-        let selected = if target.is_some() && current_group.as_deref() == Some(group_id.as_str()) {
-            members
-                .iter()
-                .find(|candidate| Some(candidate.id.to_string()) == initial)
-                .ok_or_else(invalid)?
-        } else {
-            requested
-        };
-        let version = version
-            .checked_add(1)
-            .ok_or(AppError::internal("bindings_change_transport_binding_1"))?;
-        let stamp = BindingStamp {
-            selection_version: revision(&mut tx).await?,
-            binding_version: version,
-            group_id: target,
-            group_version: target.map(|_| group_version),
-        };
-        self.write_transport_account(
-            &mut tx,
-            id,
-            &tenant_id,
-            &stamp,
-            &selected.proxy_url,
-            Some((generation, updated_at)),
-            key,
-        )
-        .await?;
-        if target.is_some() {
-            let previous = if current_group.as_deref() == Some(group_id.as_str()) {
-                members.as_slice()
-            } else {
-                &[]
-            };
-            selection::rebase_selection(&mut tx, id, previous, &members, selected.id, None, key)
-                .await?;
+        let members = load_group_members(&mut *tx, &source_group, key).await?;
+        if !members.iter().any(|item| item.id == member) {
+            return Err(invalid());
         }
-        sqlx::query("INSERT INTO transport_proxy_bindings (account_id, group_id, version, initial_member_id, replacement_member_id, updated_at) VALUES ($1, $2, $3, $4, NULL, $5) ON CONFLICT (account_id) DO UPDATE SET group_id = excluded.group_id, version = excluded.version, initial_member_id = excluded.initial_member_id, replacement_member_id = NULL, updated_at = excluded.updated_at")
-            .bind(id.to_string()).bind(target.map(|id| id.to_string())).bind(version)
-            .bind(target.map(|_| selected.id.to_string())).bind(unix_millis()).execute(&mut *tx).await?;
-        budget(&mut tx, key).await?;
-        sqlx::query("DELETE FROM network_proxy_selection_policies WHERE account_id = $1")
-            .bind(id.to_string())
-            .execute(&mut *tx)
+        let selected =
+            if target.is_some() && current_group.as_deref() == Some(source_group.as_str()) {
+                members
+                    .iter()
+                    .find(|candidate| Some(candidate.id.to_string()) == initial)
+                    .ok_or_else(invalid)?
+                    .id
+            } else {
+                member
+            };
+        // Legacy bind/unbind requests now express the same policy transition
+        // as the account settings editor. Unbinding retains the chosen proxy
+        // as an explicit manual policy instead of a second credential source.
+        let policy = UpdateProxySelection {
+            tenant_external_id: external.to_owned(),
+            expected_selection_version: current.try_get("policy_version")?,
+            expected_binding_version: expected_binding,
+            expected_credential_generation: generation,
+            expected_updated_at: updated_at,
+            expected_group_version: target.map(|_| group_version),
+            mode: if target.is_some() { "auto" } else { "manual" }.into(),
+            proxy_id: target.is_none().then_some(member),
+            group_id: target,
+            plugin_id: None,
+            plugin_version: None,
+            config: serde_json::json!({}),
+        };
+        self.apply_network_proxy_selection(&mut tx, id, &policy, Some(selected), actor, key)
             .await?;
-        audit(
-            &mut tx,
-            &tenant_id,
-            id,
-            if target.is_some() { "bind" } else { "unbind" },
-            version,
-            actor,
-        )
-        .await?;
         let row = sqlx::query(BINDING_SELECT)
             .bind(id.to_string())
             .bind(external)

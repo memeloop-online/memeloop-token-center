@@ -151,12 +151,24 @@ impl RuntimeRole {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+pub struct TrainingS3Config {
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub allow_http: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default, skip_serializing)]
     pub transport_proxy_groups: String,
     pub listen: String,
     pub database_url: String,
     pub database_max_connections: u32,
+    #[serde(default = "default_database_aux_pool_max_connections")]
+    pub database_aux_pool_max_connections: u32,
     #[serde(default = "default_terminal_projection_enabled")]
     pub terminal_projection_enabled: bool,
     /// Legacy deployment compatibility value; lifecycle admission uses bytes.
@@ -207,6 +219,11 @@ pub struct Config {
     pub s3_allow_http: bool,
     #[serde(default)]
     pub s3_timeouts: S3Timeouts,
+    /// Independent immutable training CAS. Legacy S3 settings retain their meaning.
+    #[serde(default)]
+    pub training_s3: Option<TrainingS3Config>,
+    #[serde(default)]
+    pub training_cas_writes: bool,
     pub upstream_openai_url: Option<String>,
     pub upstream_openai_key: Option<String>,
     pub upstream_anthropic_url: Option<String>,
@@ -215,6 +232,13 @@ pub struct Config {
     pub pricing_litellm_url: String,
     pub pricing_openrouter_url: String,
     pub plugin_dir: Option<String>,
+    /// Private, fixed-tenant Health Intelligence companion. Never guest config.
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_origin: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_tenant: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub plugin_advice_read_token: Option<String>,
     /// Host-provisioned JSON inventory; never accepted from plugin/tenant input.
     #[serde(default)]
     pub plugin_inventory_file: Option<String>,
@@ -237,6 +261,10 @@ impl std::fmt::Debug for Config {
             .field("listen", &self.listen)
             .field("database_url", &"[redacted]")
             .field("database_max_connections", &self.database_max_connections)
+            .field(
+                "database_aux_pool_max_connections",
+                &self.database_aux_pool_max_connections,
+            )
             .field(
                 "terminal_projection_enabled",
                 &self.terminal_projection_enabled,
@@ -426,6 +454,8 @@ impl Config {
                 "postgres://postgres:postgres@127.0.0.1:5432/memeloop_token_center",
             ),
             database_max_connections: env_u32("MTC_DATABASE_MAX_CONNECTIONS", 4)?.clamp(1, 32),
+            database_aux_pool_max_connections: env_u32("MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS", 2)?
+                .clamp(1, 2),
             terminal_projection_enabled: env_bool(
                 "MTC_TERMINAL_PROJECTION_ENABLED",
                 DEFAULT_TERMINAL_PROJECTION_ENABLED,
@@ -490,6 +520,18 @@ impl Config {
             s3_secret_key: env::var("MTC_S3_SECRET_KEY").ok(),
             s3_allow_http: env_bool("MTC_S3_ALLOW_HTTP", false),
             s3_timeouts: S3Timeouts::from_env()?,
+            training_s3: match env::var("MTC_TRAINING_S3_ENDPOINT").ok() {
+                Some(endpoint) => Some(TrainingS3Config {
+                    endpoint,
+                    bucket: required("MTC_TRAINING_S3_BUCKET")?,
+                    region: env_string("MTC_TRAINING_S3_REGION", "us-east-1"),
+                    access_key: required("MTC_TRAINING_S3_ACCESS_KEY")?,
+                    secret_key: required("MTC_TRAINING_S3_SECRET_KEY")?,
+                    allow_http: env_bool("MTC_TRAINING_S3_ALLOW_HTTP", false),
+                }),
+                None => None,
+            },
+            training_cas_writes: env_bool("MTC_TRAINING_CAS_WRITES", false),
             upstream_openai_url: env::var("MTC_UPSTREAM_OPENAI_URL").ok(),
             upstream_openai_key: env::var("MTC_UPSTREAM_OPENAI_KEY").ok(),
             upstream_anthropic_url: env::var("MTC_UPSTREAM_ANTHROPIC_URL").ok(),
@@ -498,6 +540,9 @@ impl Config {
             pricing_litellm_url,
             pricing_openrouter_url,
             plugin_dir: env::var("MTC_PLUGIN_DIR").ok(),
+            plugin_advice_origin: env::var("MTC_PLUGIN_ADVICE_ORIGIN").ok(),
+            plugin_advice_tenant: env::var("MTC_PLUGIN_ADVICE_TENANT").ok(),
+            plugin_advice_read_token: env::var("MTC_PLUGIN_ADVICE_READ_TOKEN").ok(),
             plugin_inventory_file: env::var("MTC_PLUGIN_INVENTORY_FILE").ok(),
             plugin_install_policy_file: env::var("MTC_PLUGIN_INSTALL_POLICY_FILE").ok(),
             allow_oauth_loopback,
@@ -540,6 +585,7 @@ impl Config {
             listen: "127.0.0.1:0".to_owned(),
             database_url,
             database_max_connections: 8,
+            database_aux_pool_max_connections: 2,
             terminal_projection_enabled: false,
             proxy_lifecycle_concurrency: 64,
             proxy_memory_budget_bytes: DEFAULT_PROXY_MEMORY_BUDGET_BYTES,
@@ -572,6 +618,8 @@ impl Config {
             s3_secret_key: None,
             s3_allow_http: true,
             s3_timeouts: S3Timeouts::default(),
+            training_s3: None,
+            training_cas_writes: false,
             upstream_openai_url: None,
             upstream_openai_key: None,
             upstream_anthropic_url: None,
@@ -582,6 +630,9 @@ impl Config {
             pricing_litellm_url: String::new(),
             pricing_openrouter_url: String::new(),
             plugin_dir: None,
+            plugin_advice_origin: None,
+            plugin_advice_tenant: None,
+            plugin_advice_read_token: None,
             plugin_inventory_file: None,
             plugin_install_policy_file: None,
             allow_oauth_loopback: true,
@@ -1081,4 +1132,8 @@ mod tests {
             UpstreamHealthConfig::DEFAULT
         );
     }
+}
+
+fn default_database_aux_pool_max_connections() -> u32 {
+    2
 }

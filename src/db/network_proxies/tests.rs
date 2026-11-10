@@ -218,7 +218,7 @@ async fn contract(database: &Database) {
             .await,
         Err(AppError::ProxyGroupConflict(_))
     ));
-    let policy: UpdateProxySelection = serde_json::from_value(serde_json::json!({"tenant_external_id":external,"expected_selection_version":0,"expected_binding_version":1,"expected_credential_generation":current.credential_generation,"expected_updated_at":current.updated_at,"mode":"manual","proxy_id":id})).unwrap();
+    let policy: UpdateProxySelection = serde_json::from_value(serde_json::json!({"tenant_external_id":external,"expected_selection_version":1,"expected_binding_version":1,"expected_credential_generation":current.credential_generation,"expected_updated_at":current.updated_at,"mode":"manual","proxy_id":id})).unwrap();
     policy
         .validate(&crate::plugin::PluginRuntime::default())
         .unwrap();
@@ -426,6 +426,7 @@ async fn contract(database: &Database) {
     assert_eq!(state["applied"]["selected_proxy_id"], id.to_string());
     signal_contract(database, id, account.id, &external).await;
     legacy_contract(database, &external).await;
+    manual_rotation_contract(database, &external, account.id, id, shared_group_id).await;
 }
 
 async fn assert_list_references(database: &Database, external: &str) {
@@ -708,4 +709,146 @@ async fn postgres_network_proxy_canonical_crud_manual_and_migration_contract() {
     let database = Database::connect(&url).await.unwrap();
     database.migrate().await.unwrap();
     contract(&database).await;
+}
+
+// Shared by the SQLite and PostgreSQL contracts: imported URL changes must not
+// rewrite a shared proxy or leave a second, conflicting source of truth.
+async fn manual_rotation_contract(
+    database: &Database,
+    external: &str,
+    account: Uuid,
+    proxy: Uuid,
+    shared_group: Uuid,
+) {
+    let shared_before = database
+        .get_transport_group(shared_group, external, KEY)
+        .await
+        .unwrap();
+    let proxy_before = database
+        .get_network_proxy(proxy, external, KEY)
+        .await
+        .unwrap();
+    let current = database
+        .get_network_proxy_selection(account, external)
+        .await
+        .unwrap();
+    database.update_network_proxy_selection(account, serde_json::from_value(serde_json::json!({
+        "tenant_external_id": external, "expected_selection_version": current["selection_version"],
+        "expected_binding_version": current["binding_version"], "expected_credential_generation": current["credential_generation"],
+        "expected_updated_at": current["account_updated_at"], "mode":"manual", "proxy_id":proxy
+    })).unwrap(), None, KEY).await.unwrap();
+    let (manual, credential) = database
+        .upstream_account_with_credential(account, KEY)
+        .await
+        .unwrap();
+    let runtime = TransportProxyGroups::parse("[]", KEY).unwrap();
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let drifted = credential
+        .with_transport_proxy("socks5h://10.20.30.99:1080".into())
+        .unwrap();
+    assert_eq!(
+        runtime
+            .select_config(
+                account,
+                manual.credential_generation,
+                &drifted,
+                &manual.config
+            )
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        BACKUP
+    );
+    let cold = TransportProxyGroups::parse("[]", KEY).unwrap();
+    assert!(
+        cold.select_config(
+            account,
+            manual.credential_generation,
+            &drifted,
+            &manual.config
+        )
+        .is_err()
+    );
+    let replacement = "socks5h://10.20.30.98:1080";
+    let (rotated, changed) = database
+        .rotate_codex_transport_proxy(
+            account,
+            external,
+            replacement.into(),
+            manual.updated_at,
+            manual.credential_generation,
+            "manual-policy-rotation",
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(changed);
+    let (replayed, changed) = database
+        .rotate_codex_transport_proxy(
+            account,
+            external,
+            replacement.into(),
+            manual.updated_at,
+            manual.credential_generation,
+            "manual-policy-rotation",
+            None,
+            KEY,
+        )
+        .await
+        .unwrap();
+    assert!(!changed);
+    assert_eq!(
+        replayed.credential_generation,
+        rotated.credential_generation
+    );
+    let policy = database
+        .get_network_proxy_selection(account, external)
+        .await
+        .unwrap();
+    assert_eq!(policy["desired"]["mode"], "manual");
+    assert_ne!(policy["desired"]["proxy_id"], proxy.to_string());
+    assert_eq!(
+        database
+            .get_transport_group(shared_group, external, KEY)
+            .await
+            .unwrap()["version"],
+        shared_before["version"]
+    );
+    assert_eq!(
+        database
+            .get_network_proxy(proxy, external, KEY)
+            .await
+            .unwrap()["version"],
+        proxy_before["version"]
+    );
+    runtime
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
+    let (current, credential) = database
+        .upstream_account_with_credential(account, KEY)
+        .await
+        .unwrap();
+    assert_eq!(credential.proxy().unwrap().0, replacement);
+    assert_eq!(
+        runtime
+            .select_config(
+                account,
+                current.credential_generation,
+                &credential,
+                &current.config
+            )
+            .unwrap()
+            .credential
+            .proxy()
+            .unwrap()
+            .0,
+        replacement
+    );
 }

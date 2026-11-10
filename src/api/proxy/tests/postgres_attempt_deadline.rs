@@ -204,6 +204,7 @@ async fn postgres_archive_lock_isolation(lock_request_chunks: bool) {
     .await
     .expect("bounded PostgreSQL archive drain");
 
+    state.drain_proxy_tasks().await;
     state.db.close().await;
     holder_pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))

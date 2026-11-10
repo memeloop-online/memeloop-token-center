@@ -86,8 +86,18 @@ pub(crate) struct DeleteGroup {
     pub expected_version: i64,
 }
 
+#[derive(Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TransportPolicyMode {
+    Manual,
+    Auto,
+    Plugin,
+}
+
 #[derive(Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct BindingStamp {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<TransportPolicyMode>,
     pub selection_version: i64,
     pub binding_version: i64,
     pub group_id: Option<Uuid>,

@@ -1867,6 +1867,20 @@ async fn postgres_outbox_projection_reconciles_child_projected_before_parent() {
             .any(|task| task.request_id == parent_request_id)
     );
     assert!(tasks.iter().any(|task| task.request_id == child_request_id));
+    for (request_id, document) in [
+        (parent_request_id, &parent_json),
+        (child_request_id, &child_json),
+    ] {
+        let (atoms, nodes) =
+            crate::conversation::session_body_from_documents(document, &serde_json::json!({}))
+                .into_prefix();
+        assert!(
+            database
+                .prepare_session_body_archive(projector, request_id, atoms, &nodes, &[])
+                .await
+                .unwrap()
+        );
+    }
     assert!(
         database
             .project_claimed_conversation_projection_task(projector, child_request_id)
@@ -2331,7 +2345,11 @@ async fn archive_queued_lifecycle_body(
     assert_eq!(row.get::<i64, _>("payloads"), 0);
     let queued_request: serde_json::Value =
         serde_json::from_str(&row.get::<String, _>("request_json")).unwrap();
-    assert_eq!(&queued_request, request);
+    assert_eq!(
+        queued_request,
+        serde_json::json!({}),
+        "SQL outbox must not retain dialogue text"
+    );
     let owner = Uuid::now_v7();
     let tasks = database
         .claim_conversation_projection_tasks(owner, 32)
