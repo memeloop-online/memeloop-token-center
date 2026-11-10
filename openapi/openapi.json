@@ -6948,7 +6948,7 @@
           }
         ],
         "x-required-scope": "providers:write",
-        "description": "Requires the same global operator authority as editing private transport\nproxies and verifies the explicitly selected tenant owns the account.\nReturns only credential-backed proxy settings and account CAS revisions,\nincluding proxy username and password where configured. Never returns\nAPI keys, OAuth access/refresh tokens, adapter state or configuration.\nWorks for supported OAuth and API-key proxy credentials. An unconfigured\nproxy is null. Ordinary account lists remain sanitized. No upstream\nconnection, probe, refresh or mutation is performed.\n",
+        "description": "Requires the same global operator authority as editing private transport\nproxies and verifies the explicitly selected tenant owns the account.\nReturns effective policy-backed proxy settings and account CAS revisions,\nincluding proxy username and password where configured. Never returns\nAPI keys, OAuth access/refresh tokens, adapter state or configuration.\nWorks for supported OAuth and API-key proxy credentials. An unconfigured\nproxy is null. Ordinary account lists remain sanitized. No upstream\nconnection, probe, refresh or mutation is performed.\n",
         "parameters": [
           {
             "$ref": "#/components/parameters/AccountId"
@@ -6979,7 +6979,12 @@
                     "proxy_network_scope",
                     "updated_at",
                     "credential_generation",
-                    "supported"
+                    "supported",
+                    "source",
+                    "proxy_id",
+                    "group_id",
+                    "selected_member_id",
+                    "configuration_state"
                   ],
                   "properties": {
                     "account_id": {
@@ -7013,6 +7018,44 @@
                     "supported": {
                       "type": "boolean",
                       "description": "Whether this credential has an OAuth or proxied API-key container supported by the transport editor."
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "credential",
+                        "manual",
+                        "auto",
+                        "plugin"
+                      ]
+                    },
+                    "proxy_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "uuid"
+                    },
+                    "group_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "uuid"
+                    },
+                    "selected_member_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "uuid"
+                    },
+                    "configuration_state": {
+                      "type": "string",
+                      "enum": [
+                        "credential",
+                        "applied",
+                        "pending"
+                      ]
                     }
                   }
                 }
@@ -7665,6 +7708,50 @@
           },
           "502": {
             "$ref": "#/components/responses/UpstreamError"
+          }
+        }
+      }
+    },
+    "/internal/v1/upstreams/{account_id}/oauth/recover": {
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "recoverUpstreamOAuthCredential",
+        "summary": "Finalize an already saved OAuth refresh result without contacting the authorization server",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "oauth:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recovered stable upstream identity.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamProvider"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "No saved result exists, or its generation/attempt no longer matches."
           }
         }
       }
@@ -12978,6 +13065,65 @@
         }
       }
     },
+    "/internal/v1/sessions/{session_id}/requests/{request_id}/training": {
+      "get": {
+        "tags": ["Operator traffic"],
+        "operationId": "getOperatorSessionTrainingArchive",
+        "summary": "Export verified conversation events and durable raw and media references",
+        "description": "Reads immutable tenant archive objects. Incomplete captures or missing media fail rather than being labelled complete training data. Raw JSON and SSE can be streamed separately without a document size limit.",
+        "security": [{"serviceBearer": []}],
+        "x-required-scope": "requests:read",
+        "parameters": [
+          {"$ref": "#/components/parameters/ContextSessionId"},
+          {"$ref": "#/components/parameters/RequestIdPath"},
+          {"$ref": "#/components/parameters/TenantFilter"},
+          {"$ref": "#/components/parameters/ContextKeyId"}
+        ],
+        "responses": {
+          "200": {
+            "description": "NDJSON manifest and event references with descending ordinals. Require the verified end record and EOF; a truncated stream is not a complete export.",
+            "content": {"application/x-ndjson": {"schema": {"type": "string"}}}
+          },
+          "400": {"$ref": "#/components/responses/InvalidRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "503": {"description": "Archive is incomplete, inconsistent or unavailable."}
+        }
+      }
+    },
+    "/internal/v1/sessions/{session_id}/requests/{request_id}/training/raw/{side}": {
+      "get": {
+        "tags": ["Operator traffic"],
+        "operationId": "getOperatorSessionTrainingRaw",
+        "summary": "Stream the exact retained raw request or response",
+        "description": "Rechecks session ownership and streams the durable object with byte and BLAKE3 verification. Consumers must read to EOF and verify x-content-blake3 and x-content-bytes. This endpoint does not certify that a partial upstream response is a complete dialogue.",
+        "security": [{"serviceBearer": []}],
+        "x-required-scope": "requests:read",
+        "parameters": [
+          {"$ref": "#/components/parameters/ContextSessionId"},
+          {"$ref": "#/components/parameters/RequestIdPath"},
+          {"$ref": "#/components/parameters/TenantFilter"},
+          {"$ref": "#/components/parameters/ContextKeyId"},
+          {"name": "side", "in": "path", "required": true, "schema": {"type": "string", "enum": ["request", "response"]}}
+        ],
+        "responses": {
+          "200": {
+            "description": "Exact JSON or SSE bytes, never an evictable cache reference.",
+            "headers": {
+              "x-content-blake3": {"schema": {"type": "string"}},
+              "x-content-bytes": {"schema": {"type": "string"}}
+            },
+            "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}}
+          },
+          "400": {"$ref": "#/components/responses/InvalidRequest"},
+          "401": {"$ref": "#/components/responses/Unauthorized"},
+          "403": {"$ref": "#/components/responses/Forbidden"},
+          "404": {"$ref": "#/components/responses/NotFound"},
+          "503": {"description": "Archive is inconsistent or unavailable."}
+        }
+      }
+    },
     "/internal/v1/sessions/{session_id}/requests/{request_id}/dialogue": {
       "get": {
         "tags": [
@@ -12985,7 +13131,7 @@
         ],
         "operationId": "getOperatorSessionDialogue",
         "summary": "Read the cleaned session dialogue stored for this request",
-        "description": "Returns the cleaned dialogue already stored in Postgres. It does not read the raw request JSON, the raw return JSON, or object storage, and it does not return object locators.",
+        "description": "Returns cleaned dialogue from immutable archive bodies through tenant-scoped context metadata. This presentation is not the byte-exact raw training archive and does not return object locators.",
         "security": [
           {
             "serviceBearer": []
@@ -16725,6 +16871,100 @@
                       }
                     }
                   }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
+    },
+    "/internal/v1/upstreams/{account_id}/health-probe-settings": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getUpstreamHealthProbeSettings",
+        "summary": "Read per-upstream scheduled probe settings",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Scheduled probing is disabled by default.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthProbeSettings"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "putUpstreamHealthProbeSettings",
+        "summary": "Configure per-upstream scheduled probes",
+        "description": "Requires providers:write and keys:write. The probe credential must differ from the system AI credential. Disabling scheduling leaves manual probes available.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HealthProbeSettings"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved settings.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthProbeSettings"
                 }
               }
             }
@@ -22405,6 +22645,55 @@
           "updated_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "oauth_refresh": {
+            "type": "object",
+            "properties": {
+              "allowed_actions": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "refresh",
+                    "resume_local",
+                    "reauthorize"
+                  ]
+                }
+              },
+              "lease_expires_at": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "access_state": {
+                "type": "string",
+                "enum": [
+                  "valid",
+                  "expired",
+                  "revoked",
+                  "unknown"
+                ]
+              },
+              "refresh_state": {
+                "type": "string",
+                "enum": [
+                  "not_observed",
+                  "in_progress",
+                  "pending_local",
+                  "outcome_unknown",
+                  "failed",
+                  "reauthorization_required"
+                ]
+              },
+              "reauthorization_required": {
+                "type": "boolean"
+              },
+              "automatic_refresh_paused": {
+                "type": "boolean"
+              }
+            }
           }
         }
       },
@@ -32763,6 +33052,48 @@
               "type": "integer",
               "minimum": 0
             }
+          }
+        }
+      },
+      "HealthProbeSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "billing_key_id",
+          "interval_seconds",
+          "model",
+          "prompt"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "billing_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "interval_seconds": {
+            "type": "integer",
+            "minimum": 3600,
+            "maximum": 2592000,
+            "default": 3600
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 200
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
           }
         }
       }

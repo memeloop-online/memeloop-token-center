@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use sqlx::AnyPool;
+use crate::db::request_pool::RequestPool as AnyPool;
 
 use super::{Entry, Snapshot, TransportProxyGroups};
 use crate::db::unix_millis;

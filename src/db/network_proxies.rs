@@ -89,6 +89,7 @@ pub(crate) fn proxy_view(row: &AnyRow, external: &str, _key: &[u8]) -> Result<Va
     Ok(serde_json::json!({
         "id": row.try_get::<String, _>("id")?, "tenant_external_id": external,
         "name": row.try_get::<String, _>("name")?, "version": row.try_get::<i64, _>("version")?,
+        "proxy_url": proxy,
         "address": {"scheme": parsed.scheme(), "host": parsed.host_str(),
             "port": parsed.port_or_known_default().unwrap_or(1080), "remote_dns": parsed.scheme() == "socks5h",
             "has_auth": !parsed.username().is_empty() || parsed.password().is_some()},

@@ -22,6 +22,7 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const RECOVERY_MIN_INTERVAL: Duration = Duration::from_secs(5);
 const RECOVERY_MAX_INTERVAL: Duration = Duration::from_secs(300);
 const RECOVERY_BATCH_SIZE: usize = 32;
+const RECEIPT_PUBLICATION_CONCURRENCY: usize = 4;
 
 /// Admission rejection or explicit transport non-delivery permits a zero-cost
 /// settlement. A request-stage error alone leaves provider execution unknown.
@@ -186,6 +187,8 @@ pub(crate) struct Snapshot {
     terminal_cause: Option<String>,
     error_code: Option<String>,
     response_object: String,
+    #[serde(default)]
+    supplier_summary: Option<String>,
     routing_session_id: Option<String>,
     routing_terminal_observed_at: Option<i64>,
     conversation: Option<OwnedConversation>,
@@ -249,6 +252,7 @@ impl Snapshot {
             terminal_cause: input.terminal_cause.map(|cause| cause.as_str().to_owned()),
             error_code: input.error_code.map(str::to_owned),
             response_object: input.response_object.to_owned(),
+            supplier_summary: None,
             routing_session_id: input.routing_session_id.map(str::to_owned),
             routing_terminal_observed_at: input.routing_terminal_observed_at,
             conversation: input.conversation.map(OwnedConversation::capture),
@@ -272,6 +276,32 @@ impl Snapshot {
         } else {
             ProxyRequestUpstreamAttribution::LastDispatched(self.last_dispatched)
         }
+    }
+
+    pub(crate) fn with_supplier_summary(mut self, body: &[u8]) -> Self {
+        if self.status_code >= 400
+            && body.len() <= 2048
+            && let Ok(body) = std::str::from_utf8(body)
+        {
+            let envelope = format!("inline-json:{body}");
+            if crate::supplier_error::supplier_error_from_inline_json(Some(&envelope)).is_some() {
+                self.supplier_summary = Some(envelope);
+            }
+        }
+        self
+    }
+
+    async fn persist_supplier_summary(
+        &self,
+        database: &Database,
+    ) -> Result<(), crate::error::AppError> {
+        if let Some(summary) = &self.supplier_summary {
+            database
+                .body_archive()?
+                .publish_supplier_summary(self.tenant_id, self.request_id, summary)
+                .await?;
+        }
+        Ok(())
     }
 
     fn financial_evidence_unavailable(&self) -> bool {
@@ -390,25 +420,52 @@ struct Pending {
     conversation_pending: bool,
     preparation_running: bool,
     recovered: bool,
+    publication_running: bool,
+    publication_retry_after: tokio::time::Instant,
+    snapshot_revision: u64,
+    published_revision: Option<u64>,
+    retiring: bool,
 }
 
 type Preparation =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<PreparedConversation>> + Send>>;
 
+const AWAITING_EVIDENCE_CAPACITY: usize = 65_536;
+
+#[derive(Default)]
+struct AwaitingEvidence {
+    entries: HashMap<Uuid, ([u8; 32], Option<[u8; 32]>)>,
+}
+
+impl AwaitingEvidence {
+    fn remember(&mut self, id: Uuid, digest: [u8; 32]) {
+        // Keep the admitted working set stable across ordered scans. FIFO/LRU
+        // eviction would turn an oversized archive into an all-miss ring.
+        if !self.entries.contains_key(&id) && self.entries.len() == AWAITING_EVIDENCE_CAPACITY {
+            return;
+        }
+        self.entries.insert(id, (digest, None));
+    }
+}
+
 pub(crate) struct Journal {
     directory: PathBuf,
     archive: Option<crate::archive::ArchiveStore>,
     pending: Mutex<HashMap<Uuid, Pending>>,
+    awaiting_evidence: Mutex<AwaitingEvidence>,
     claims: Mutex<HashMap<Uuid, ClaimState>>,
     wake: Notify,
     progress: Notify,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     recovery_worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
     tasks: Mutex<Vec<(Work, tokio::task::JoinHandle<()>)>>,
+    publication_permits: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     publication_failures: AtomicU64,
     #[cfg(test)]
     writer_gate: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    publication_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
     retirement_gate: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -427,6 +484,7 @@ enum Work {
     Operational(Uuid),
     Unknown(Uuid),
     Preparation(Uuid),
+    Publication(Uuid),
 }
 
 impl Journal {
@@ -452,16 +510,22 @@ impl Journal {
             directory,
             archive,
             pending: Mutex::new(HashMap::new()),
+            awaiting_evidence: Mutex::new(AwaitingEvidence::default()),
             claims: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             progress: Notify::new(),
             worker: Mutex::new(None),
             recovery_worker: Mutex::new(None),
             tasks: Mutex::new(Vec::new()),
+            publication_permits: Arc::new(tokio::sync::Semaphore::new(
+                RECEIPT_PUBLICATION_CONCURRENCY,
+            )),
             #[cfg(test)]
             publication_failures: AtomicU64::new(0),
             #[cfg(test)]
             writer_gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            #[cfg(test)]
+            publication_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
             retirement_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             #[cfg(test)]
@@ -523,6 +587,9 @@ impl Journal {
                 .values()
                 .all(|entry| {
                     entry.reconcile
+                        && entry.durable
+                        && entry.published_revision == Some(entry.snapshot_revision)
+                        && !entry.publication_running
                         && !entry.running
                         && !entry.operational_running
                         && !entry.conversation_pending
@@ -611,6 +678,16 @@ impl Journal {
                         // an interrupted future is not a completed projection.
                         entry.snapshot.request_id
                     }
+                    Work::Publication(receipt_id) => {
+                        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                        let Some(entry) = pending.get_mut(&receipt_id) else {
+                            continue;
+                        };
+                        entry.publication_running = false;
+                        entry.publication_retry_after =
+                            tokio::time::Instant::now() + RETRY_INTERVAL;
+                        entry.snapshot.request_id
+                    }
                 };
                 tracing::error!(%request_id, financial_state = "unknown", "pending terminal worker interrupted; evidence retained for supervised retry");
             }
@@ -640,9 +717,11 @@ impl Journal {
                 && entry.snapshot.usage_basis
                     != Some(crate::model::RequestUsageBasis::ProviderReported)
                 && !entry.conversation_enqueued;
-            if !keep_unknown_conversation && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot)
+            if !keep_unknown_conversation
+                && let Some(snapshot) = Arc::get_mut(&mut entry.snapshot)
+                && snapshot.conversation.take().is_some()
             {
-                snapshot.conversation = None;
+                entry.snapshot_revision += 1;
             }
             // The budgeted body can leave once its projection is durable.
             // Until then the permit stays with the unenqueued evidence.
@@ -717,6 +796,11 @@ impl Journal {
                 conversation_pending,
                 preparation_running: false,
                 recovered: false,
+                publication_running: false,
+                publication_retry_after: tokio::time::Instant::now(),
+                snapshot_revision: 0,
+                published_revision: None,
+                retiring: false,
             },
         );
         tracing::info!(%request_id, %receipt_id, financial_state = "pending_unacknowledged", "terminal responsibility accepted in memory; journal durability not acknowledged");
@@ -763,6 +847,7 @@ impl Journal {
             }
             entry.snapshot.clone()
         };
+        snapshot.persist_supplier_summary(database).await?;
         let request_id = snapshot.request_id;
         if snapshot.claim.is_none() {
             // Legacy claimless finish owns both the financial transaction and
@@ -994,6 +1079,11 @@ impl Journal {
     }
 
     #[cfg(test)]
+    pub(crate) async fn hold_publication_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.publication_gate.clone().acquire_owned().await.unwrap()
+    }
+
+    #[cfg(test)]
     pub(crate) async fn hold_preparation_for_test(&self) -> tokio::sync::OwnedSemaphorePermit {
         self.preparation_gate.clone().acquire_owned().await.unwrap()
     }
@@ -1029,6 +1119,25 @@ impl Journal {
             }
         }
         receipts
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn recover_snapshot_for_test(
+        &self,
+        database: &Database,
+        snapshot: serde_json::Value,
+    ) -> bool {
+        self.recover_one(database, serde_json::from_value(snapshot).unwrap())
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn awaiting_evidence_for_test(&self, receipt_id: Uuid) -> bool {
+        self.awaiting_evidence
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&receipt_id)
     }
 
     #[cfg(test)]
@@ -1191,7 +1300,7 @@ impl Journal {
                     // Remote state is authoritative; never overwrite it from a
                     // cache that may predate its latest acknowledged update.
                     Ok(true) | Err(_) => continue,
-                    Ok(false) if !self.publish_receipt(&snapshot).await => continue,
+                    Ok(false) if !self.publish_receipt(&snapshot, None).await => continue,
                     Ok(false) => {}
                 }
             }
@@ -1222,6 +1331,7 @@ impl Journal {
             let task = tokio::spawn(async move {
                 let request_id = snapshot.request_id;
                 let result = async {
+                    snapshot.persist_supplier_summary(&database).await?;
                     let claim = snapshot
                         .claim
                         .as_ref()
@@ -1329,6 +1439,7 @@ impl Journal {
                         Arc::make_mut(&mut entry.snapshot).conversation =
                             Some(prepared.conversation);
                         entry.projection_retained = Some(prepared.retained);
+                        entry.snapshot_revision += 1;
                     }
                     entry.conversation_pending = false;
                     entry.preparation_running = false;
@@ -1344,6 +1455,7 @@ impl Journal {
 
     fn start_pending(self: &Arc<Self>, database: &Database) {
         self.start_preparations();
+        self.start_publications();
         let mut pending = self
             .pending
             .lock()
@@ -1352,29 +1464,90 @@ impl Journal {
             !entry.running
                 && !entry.recovered
                 && (entry.snapshot.claim.is_some() || !entry.conversation_pending)
-                && (!entry.durable
-                    || !entry.reconcile
-                    || (!entry.conversation_enqueued
-                        && (!entry.conversation_pending
-                            || (entry.snapshot.separate_conversation
-                                && entry.snapshot.conversation.is_some()))))
                 && tokio::time::Instant::now() >= entry.retry_after
         }) {
             entry.running = true;
             let journal = self.clone();
             let database = database.clone();
             let snapshot = entry.snapshot.clone();
-            let durable = entry.durable;
             let applied = entry.applied;
             let receipt_id = snapshot.receipt_id;
             let task = tokio::spawn(async move {
-                journal.attempt(database, snapshot, durable, applied).await;
+                journal.attempt(database, snapshot, applied).await;
             });
             self.tasks
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .push((Work::Receipt(receipt_id), task));
         }
+    }
+
+    fn start_publications(self: &Arc<Self>) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        for entry in pending.values_mut().filter(|entry| {
+            !entry.recovered
+                && !entry.retiring
+                && !entry.publication_running
+                && entry.published_revision != Some(entry.snapshot_revision)
+                && (entry.snapshot.separate_conversation || !entry.conversation_pending)
+                && tokio::time::Instant::now() >= entry.publication_retry_after
+        }) {
+            // Background storage work stays in the existing responsibility map.
+            // No waiting task or request-admission limit is created here.
+            let Ok(permit) = self.publication_permits.clone().try_acquire_owned() else {
+                break;
+            };
+            entry.publication_running = true;
+            let snapshot = entry.snapshot.clone();
+            let receipt_id = snapshot.receipt_id;
+            let revision = entry.snapshot_revision;
+            let journal = self.clone();
+            let task = tokio::spawn(async move {
+                let _permit = permit;
+                #[cfg(test)]
+                {
+                    let _writer = journal.writer_gate.acquire().await.unwrap();
+                }
+                #[cfg(test)]
+                let _publication = journal.publication_gate.acquire().await.unwrap();
+                let published = journal.publish_receipt(&snapshot, Some(revision)).await;
+                if let Some(entry) = journal
+                    .pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&receipt_id)
+                {
+                    entry.publication_running = false;
+                    entry.publication_retry_after = tokio::time::Instant::now()
+                        + if published {
+                            Duration::ZERO
+                        } else {
+                            RETRY_INTERVAL
+                        };
+                }
+                journal.wake.notify_one();
+            });
+            self.tasks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push((Work::Publication(receipt_id), task));
+        }
+    }
+
+    fn acknowledge_publication(&self, snapshot: &Snapshot, revision: Option<u64>) {
+        if let Some(revision) = revision
+            && let Some(entry) = self
+                .pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_mut(&snapshot.receipt_id)
+        {
+            entry.durable = true;
+            entry.published_revision = Some(revision);
+        }
+        tracing::info!(request_id = %snapshot.request_id, receipt_id = %snapshot.receipt_id,
+            financial_state = "pending_durable",
+            "terminal receipt persisted independently of financial settlement");
     }
 
     fn receipt_namespace(&self) -> &str {
@@ -1392,7 +1565,7 @@ impl Journal {
         )
     }
 
-    async fn publish_receipt(&self, snapshot: &Snapshot) -> bool {
+    async fn publish_receipt(&self, snapshot: &Snapshot, revision: Option<u64>) -> bool {
         let compact = snapshot.clone();
         // New claimed receipts contain only the small source metadata seed;
         // legacy receipts preserve their original conversation/digest.
@@ -1406,6 +1579,7 @@ impl Journal {
                         bytes.clone().into(),
                     )
                     .await?;
+                self.acknowledge_publication(snapshot, revision);
                 // A compact local cache preserves existing process-restart
                 // recovery. Remote publication, not this cache, is the ACK.
                 let _ = write_compact_receipt(&self.directory, &bytes, snapshot.receipt_id).await;
@@ -1413,6 +1587,7 @@ impl Journal {
                 write_compact_receipt(&self.directory, &bytes, snapshot.receipt_id)
                     .await
                     .map_err(|_| crate::error::AppError::storage("terminal_receipt_write"))?;
+                self.acknowledge_publication(snapshot, revision);
             }
             Ok::<(), crate::error::AppError>(())
         }
@@ -1447,7 +1622,9 @@ impl Journal {
                 // A new scan from its first unknown receipt would starve later work.
                 tokio::time::sleep(RECOVERY_MIN_INTERVAL).await;
             }
-            let Ok(location) = entry else { break };
+            let Ok((location, version)) = entry else {
+                break;
+            };
             let Some(receipt_id) = location
                 .rsplit('/')
                 .next()
@@ -1465,6 +1642,16 @@ impl Journal {
             {
                 continue;
             }
+            if self
+                .awaiting_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get(&receipt_id)
+                .is_some_and(|(_, known)| version.is_some() && *known == version)
+            {
+                continue;
+            }
             let Ok(bytes) = archive.get(&location).await else {
                 continue;
             };
@@ -1475,6 +1662,15 @@ impl Journal {
                 continue;
             }
             progressed |= self.recover_one(database, snapshot).await;
+            if let Some((_, known)) = self
+                .awaiting_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get_mut(&receipt_id)
+            {
+                *known = version;
+            }
         }
         progressed
     }
@@ -1483,6 +1679,24 @@ impl Journal {
     /// checkpoint while waiting; unknown predecessors never fill an in-memory
     /// backlog or prevent later receipts from being visited.
     async fn recover_one(&self, database: &Database, snapshot: Snapshot) -> bool {
+        let digest = serde_json::to_vec(&snapshot)
+            .ok()
+            .map(|bytes| *blake3::hash(&bytes).as_bytes());
+        if digest.is_some_and(|digest| {
+            self.awaiting_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get(&snapshot.receipt_id)
+                .is_some_and(|(known, _)| *known == digest)
+        }) {
+            return false;
+        }
+        self.awaiting_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .remove(&snapshot.receipt_id);
         let snapshot = Arc::new(snapshot);
         let receipt_id = snapshot.receipt_id;
         let applied = snapshot.financial_ack.as_ref().is_some_and(|ack| {
@@ -1520,45 +1734,60 @@ impl Journal {
                     && snapshot.conversation.is_none(),
                 preparation_running: false,
                 recovered: true,
+                publication_running: false,
+                publication_retry_after: tokio::time::Instant::now(),
+                snapshot_revision: 0,
+                published_revision: Some(0),
+                retiring: false,
             });
         }
         if let Err(error) = self.record_operational_receipt(database, receipt_id).await {
             tracing::warn!(request_id = %snapshot.request_id, error_category = error.diagnostic_category(),
                 "recovered terminal observation remains pending");
         }
-        self.attempt(database.clone(), snapshot, true, applied)
-            .await;
+        let financial_applied = self.attempt(database.clone(), snapshot, applied).await;
         // No process-owned body/future belongs to a recovered item. Its durable
         // receipt survives a failed or unknown attempt and will be revisited.
-        self.pending
+        let completed = self
+            .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&receipt_id)
-            .is_none()
+            .is_none();
+        if digest.is_some_and(|digest| {
+            self.awaiting_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get(&receipt_id)
+                .is_some_and(|(known, _)| *known == digest)
+        }) {
+            return false;
+        }
+        completed && financial_applied
     }
 
     async fn attempt(
         &self,
         database: Database,
         snapshot: Arc<Snapshot>,
-        mut durable: bool,
         mut applied: bool,
-    ) {
+    ) -> bool {
         let request_id = snapshot.request_id;
         let receipt_id = snapshot.receipt_id;
-        let mut financial_ack = snapshot.financial_ack.clone();
-        if !durable {
-            #[cfg(test)]
+        #[cfg(test)]
+        {
             let _writer = self.writer_gate.acquire().await.unwrap();
-            durable = self.publish_receipt(&snapshot).await;
-            if durable {
-                tracing::info!(%request_id, %receipt_id, financial_state = "pending_durable", "terminal receipt persisted independently of conversation preparation");
-            }
         }
+        let mut financial_ack = snapshot.financial_ack.clone();
         let mut reconcile = false;
         if !applied {
             let attribution = snapshot.attribution();
-            let result = match snapshot.terminal() {
+            let result = match snapshot
+                .persist_supplier_summary(&database)
+                .await
+                .and_then(|()| snapshot.terminal())
+            {
                 Ok(input) => {
                     if let Some(claim) = snapshot.claim.as_ref() {
                         let evidence = match input.usage_basis {
@@ -1635,7 +1864,7 @@ impl Journal {
                 Ok(Some(FinishProxyRequestResult::Finished { .. })) => applied = true,
                 Ok(None) => {
                     reconcile = true;
-                    tracing::error!(%request_id, %receipt_id, financial_state = "unknown", "terminal lacks authoritative provider usage; receipt retained without zero-usage settlement");
+                    tracing::info!(%request_id, %receipt_id, financial_state = "awaiting_evidence", "terminal awaits authoritative provider usage; receipt retained without zero-usage settlement");
                 }
                 Ok(Some(FinishProxyRequestResult::AlreadyFinished { .. })) => {
                     reconcile = true;
@@ -1650,12 +1879,31 @@ impl Journal {
                 }
             }
         }
-        let recovered = self
+        // The DB transaction already owns authoritative usage and its outbox.
+        // Publish its ACK before any source, metadata or object-store await.
+        if let Some(entry) = self
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&receipt_id)
-            .is_some_and(|entry| entry.recovered);
+            .get_mut(&receipt_id)
+        {
+            if entry.snapshot.financial_ack.is_none() && financial_ack.is_some() {
+                Arc::make_mut(&mut entry.snapshot).financial_ack = financial_ack.clone();
+                entry.snapshot_revision += 1;
+            }
+            if entry.snapshot.reconciliation_required != reconcile {
+                Arc::make_mut(&mut entry.snapshot).reconciliation_required = reconcile;
+                entry.snapshot_revision += 1;
+            }
+            if applied && !entry.applied {
+                tracing::info!(%request_id, %receipt_id, financial_state = "acknowledged", "terminal settlement acknowledged independently of receipt publication");
+            }
+            entry.applied |= applied;
+            entry.reconcile = reconcile;
+            if applied || reconcile {
+                entry.activity = None;
+            }
+        }
         let mut source_durable = false;
         let projection = {
             let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
@@ -1686,6 +1934,13 @@ impl Journal {
                             client_name: conversation.client_name.as_deref(),
                             upstream_response_id: conversation.upstream_response_id.as_deref(),
                         };
+                        // Identity is bounded receipt metadata, not archive
+                        // content. Publish it even while the durable source is
+                        // pending, without acknowledging conversation completion
+                        // or releasing receipt/body ownership below.
+                        let identity_enqueued = database
+                            .enqueue_operational_conversation_projection(claim, receipt_id, &input)
+                            .await;
                         let source = crate::gateway_body::request_spool::request_body_object_key(
                             &request_id.to_string(),
                         );
@@ -1698,12 +1953,10 @@ impl Journal {
                                 false
                             };
                         source_durable = source_ready;
-                        if source_ready {
-                            database
-                                .enqueue_operational_conversation_projection(
-                                    claim, receipt_id, &input,
-                                )
-                                .await
+                        if let Err(error) = identity_enqueued {
+                            Err(error)
+                        } else if source_ready {
+                            Ok(())
                         } else {
                             Err(crate::error::AppError::storage(
                                 "terminal_conversation_source_pending",
@@ -1731,6 +1984,7 @@ impl Journal {
                     entry.preparation = None;
                     Arc::make_mut(&mut entry.snapshot).conversation_state =
                         ConversationState::Enqueued;
+                    entry.snapshot_revision += 1;
                     entry.projection_retained = None;
                 }
             } else {
@@ -1754,20 +2008,21 @@ impl Journal {
             .unwrap_or_else(|e| e.into_inner())
             .get(&receipt_id)
             .is_some_and(|entry| !entry.conversation_pending && entry.conversation_enqueued);
-        let removed = applied && operational_acknowledged && conversation_complete;
-        let mut compact_published = false;
-        if durable && !removed && (reconcile || applied) && !recovered {
-            let mut compact = self
-                .pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(&receipt_id)
-                .map(|entry| (*entry.snapshot).clone())
-                .unwrap_or_else(|| (*snapshot).clone());
-            compact.financial_ack = financial_ack.clone();
-            compact.reconciliation_required = reconcile;
-            compact_published = self.publish_receipt(&compact).await;
-        }
+        // A publication owns its PUT and local-cache write until completion.
+        // Pin retirement under the same lock used to start publishers so no
+        // late writer can recreate a receipt after deletion.
+        let removed = if applied && operational_acknowledged && conversation_complete {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.get_mut(&receipt_id).is_some_and(|entry| {
+                if entry.publication_running {
+                    return false;
+                }
+                entry.retiring = true;
+                true
+            })
+        } else {
+            false
+        };
         if removed {
             if let Some(archive) = &self.archive
                 && archive
@@ -1786,7 +2041,7 @@ impl Journal {
                     entry.applied = true;
                     entry.retry_after = tokio::time::Instant::now() + RETRY_INTERVAL;
                 }
-                return;
+                return applied;
             }
             let _ = tokio::fs::remove_file(self.directory.join(format!("{receipt_id}.json"))).await;
         }
@@ -1801,6 +2056,11 @@ impl Journal {
                 && entry.snapshot.conversation.is_none()
                 && entry.preparation.is_none()
         });
+        let compact_published = pending.get(&receipt_id).is_some_and(|entry| {
+            entry.durable
+                && !entry.publication_running
+                && entry.published_revision == Some(entry.snapshot_revision)
+        });
         let evict_unknown = compact_published
             && (reconcile || applied)
             && operational_acknowledged
@@ -1808,6 +2068,23 @@ impl Journal {
                 || preparation_failed
                 || (reconcile && source_durable && !snapshot.financial_evidence_unavailable()));
         if removed || evict_unknown {
+            if evict_unknown
+                && !removed
+                && conversation_complete
+                && pending.get(&receipt_id).is_some_and(|entry| {
+                    entry.recovered
+                        && entry.unknown_annotated
+                        && entry.snapshot.claim.is_some()
+                        && entry.snapshot.financial_ack.is_none()
+                        && entry.snapshot.financial_evidence_unavailable()
+                })
+                && let Ok(bytes) = serde_json::to_vec(snapshot.as_ref())
+            {
+                self.awaiting_evidence
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remember(receipt_id, *blake3::hash(&bytes).as_bytes());
+            }
             pending.remove(&receipt_id);
             if removed {
                 tracing::info!(%request_id, %receipt_id, financial_state = "settled", "terminal settlement acknowledged and receipt retired");
@@ -1815,21 +2092,16 @@ impl Journal {
                 tracing::info!(%request_id, %receipt_id, financial_state = "unknown", "terminal reconciliation retained in durable storage; memory released");
             }
         } else if let Some(entry) = pending.get_mut(&receipt_id) {
-            if financial_ack.is_some() {
-                Arc::make_mut(&mut entry.snapshot).financial_ack = financial_ack;
-            }
             entry.running = false;
             entry.retry_after = tokio::time::Instant::now() + RETRY_INTERVAL;
-            entry.durable = durable;
-            entry.applied = applied;
-            entry.reconcile = reconcile;
-            if (durable || applied) && conversation_complete {
+            if (entry.durable || applied) && conversation_complete {
                 entry.retained = None;
             }
             if reconcile || applied {
                 entry.activity = None;
             }
         }
+        applied
     }
 }
 
@@ -1874,6 +2146,21 @@ impl Drop for Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn awaiting_evidence_keeps_a_bounded_stable_working_set_and_accepts_updates() {
+        let mut cache = AwaitingEvidence::default();
+        for index in 0..AWAITING_EVIDENCE_CAPACITY {
+            cache.remember(Uuid::from_u128(index as u128 + 1), [1; 32]);
+        }
+        let first = Uuid::from_u128(1);
+        cache.remember(Uuid::from_u128(u128::MAX), [2; 32]);
+        assert_eq!(cache.entries.len(), AWAITING_EVIDENCE_CAPACITY);
+        assert_eq!(cache.entries.get(&first).unwrap().0, [1; 32]);
+        cache.remember(first, [3; 32]);
+        assert_eq!(cache.entries.get(&first).unwrap().0, [3; 32]);
+        assert!(!cache.entries.contains_key(&Uuid::from_u128(u128::MAX)));
+    }
 
     #[tokio::test]
     async fn unavailable_journal_never_acknowledges_memory_as_durable_or_hot_loops() {
@@ -1930,13 +2217,37 @@ mod tests {
             false,
             "buffered_response_ready",
         );
+        // Keep paused time fixed while SQLite/filesystem blocking I/O completes.
+        // Otherwise auto-advance can legitimately expire an earlier publication
+        // retry while the independent receipt attempt is still finishing.
+        async fn finish_io_at(journal: &Journal, expected: tokio::time::Instant) {
+            let tasks = std::mem::take(&mut *journal.tasks.lock().unwrap());
+            for (_, task) in tasks {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                task.await.unwrap();
+                assert_eq!(tokio::time::Instant::now(), expected);
+            }
+        }
+
+        fn assert_retries_are_future(journal: &Journal) {
+            let now = tokio::time::Instant::now();
+            for pending in journal.pending.lock().unwrap().values() {
+                assert!(pending.retry_after > now);
+                assert!(pending.publication_retry_after > now);
+            }
+        }
+
         tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
         journal.submit_with_preparation(snapshot.clone(), (), None, async { None });
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen).await;
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen).await;
         assert_eq!(journal.failed_publications_for_test(), 1);
+        assert_retries_are_future(&journal);
         for _ in 0..100 {
             journal.start_pending(&database);
             assert!(journal.tasks.lock().unwrap().is_empty());
@@ -1946,13 +2257,14 @@ mod tests {
         second.receipt_id = Uuid::now_v7();
         journal.submit_with_preparation(second, (), None, async { None });
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen).await;
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen).await;
         assert_eq!(journal.failed_publications_for_test(), 2);
+        assert_retries_are_future(&journal);
         tokio::time::advance(RETRY_INTERVAL).await;
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen + RETRY_INTERVAL).await;
         assert_eq!(journal.failed_publications_for_test(), 4);
         {
             let pending = journal.pending.lock().unwrap();

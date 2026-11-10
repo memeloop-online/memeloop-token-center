@@ -30,7 +30,7 @@ export const networkProxyStrategies: NetworkProxyStrategy[] = [
 export const legacySelection: NetworkProxySelection = {
   configuration_revision: null, account_id: 'account-native', tenant_external_id: 'fixture', selection_version: 0,
   binding_version: 0, credential_generation: 7, account_updated_at: 100,
-  desired: { mode: 'legacy', proxy_id: null, group_id: null, plugin_id: null, plugin_version: null, config: {} },
+  desired: { mode: 'credential', proxy_id: null, group_id: null, plugin_id: null, plugin_version: null, config: {} },
   applied: { pending: false, scope: 'this_process' },
 };
 

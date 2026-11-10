@@ -1,7 +1,9 @@
 import { ApiError } from '../api.js';
 import type { ProviderType, UpstreamAccount } from '../types.js';
 
-export function canReauthorizeAccount(account: Pick<UpstreamAccount, 'driver' | 'can_reauthorize'>, provider?: Pick<ProviderType, 'id' | 'oauth_adapter'>): boolean {
+export function canReauthorizeAccount(account: Pick<UpstreamAccount, 'driver' | 'can_reauthorize'> & Partial<Pick<UpstreamAccount, 'credential_generation' | 'oauth_refresh'>>, provider?: Pick<ProviderType, 'id' | 'oauth_adapter'>): boolean {
+  const diagnostic = account.oauth_refresh?.credential_generation === account.credential_generation ? account.oauth_refresh : undefined;
+  if (diagnostic?.allowed_actions && !diagnostic.allowed_actions.includes('reauthorize')) return false;
   if (!account.can_reauthorize || !provider || provider.id !== account.driver) return false;
   return Boolean(provider.oauth_adapter);
 }

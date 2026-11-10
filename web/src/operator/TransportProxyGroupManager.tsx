@@ -78,19 +78,6 @@ export function TransportProxyGroups(props: Props & { children: ReactNode; onNav
   </ProxyGroupContext.Provider>;
 }
 
-export function TransportProxyGroupAction({ accountId, disabled = false }: { accountId?: string; disabled?: boolean }) {
-  const context = useContext(ProxyGroupContext);
-  const { locale } = useI18n();
-  const copy = transportProxyGroupCopy(locale);
-  const description = useId();
-  if (!context || !accountId) return null;
-  return <div className="row-actions transport-proxy-management-action">
-    <Button appearance="secondary" type="button" disabled={disabled || !context.allowed} aria-describedby={context.reason ? description : undefined} onClick={() => context.open(accountId)}>{copy.chooseGroup}</Button>
-    {context.reason && <span id={description} className="muted" role="status">{context.reason}</span>}
-    {context.retry && <Button appearance="secondary" type="button" onClick={context.reload}>{copy.retry}</Button>}
-  </div>;
-}
-
 export function TransportProxyGroupFields({ groups, groupId, initialMember, onGroupChange, onMemberChange, disabled = false, emptyLabel }: {
   groups: TransportProxyGroup[]; groupId: string; initialMember: string;
   onGroupChange: (value: string) => void; onMemberChange: (value: string) => void;
@@ -222,7 +209,7 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
   function editGroup(group: TransportProxyGroup | null) {
     setEditing(group); setName(group?.name ?? ''); setProbeUrl(group?.probe_url ?? ''); setProbeAttempts(String(group?.probe_attempts ?? 2)); setError(''); setMessage('');
     setMembers(group ? group.members.map(member => {
-      const address = member.has_auth ? '' : egressAddress(member, locale);
+      const address = member.proxy_url ?? (member.has_auth ? '' : egressAddress(member, locale));
       return { key: member.id, id: member.id, label: member.label, proxyUrl: address, originalProxyUrl: address };
     }) : [newMember()]);
   }
@@ -310,14 +297,13 @@ export function ProxyGroupWorkspace({ token, tenant, onChanged, closeRequest }: 
         <FormSection title={editing ? copy.edit(editing.name) : copy.create}>
           <Field label={copy.name} required><Input required maxLength={64} value={name} onChange={(_, data) => setName(data.value)} /></Field>
           {members.map((member, index) => {
-            const savedMember = editing?.members.find(saved => saved.id === member.id);
             return <FormSection key={member.key} title={copy.candidate(index + 1)}>
             <Field label={copy.memberName} required><Input required maxLength={64} value={member.label} onChange={(_, data) => updateMember(member.key, { label: data.value })} /></Field>
             <div className="proxy-address-field">
-              <Label htmlFor={`${inputPrefix}-${member.key}`}>{savedMember?.has_auth ? copy.replaceAddress : member.id ? copy.address : copy.requiredAddress}</Label>
+              <Label htmlFor={`${inputPrefix}-${member.key}`}>{member.id ? copy.address : copy.requiredAddress}</Label>
               <ProxyAddressInput id={`${inputPrefix}-${member.key}`} value={member.proxyUrl} disabled={busy || !ready} required={!member.id}
                 onChange={value => updateMember(member.key, { proxyUrl: value })}
-                placeholder={savedMember ? egressAddress(savedMember, locale) : 'socks5h://mihomo.egress.svc:1080'} />
+                placeholder="socks5h://mihomo.egress.svc:1080" />
             </div>
             <div className="button-row">
               <Button type="button" disabled={index === 0} onClick={() => setMembers(current => { const next = [...current]; [next[index - 1], next[index]] = [next[index], next[index - 1]]; return next; })}>{t('common.moveUp')}</Button>

@@ -49,7 +49,7 @@ pub(in crate::api) async fn create_image_generation(
     };
     let operation = super::super::early_request::preserve_observation(operation);
     #[cfg(test)]
-    let operation = crate::api::proxy::codex_transport::preserve_test_endpoint(operation);
+    let operation = crate::api::proxy::codex_transport::inherit_test_endpoint(operation);
     tokio::spawn(super::super::proxy_diagnostics::CONTEXT.scope(context, operation))
         .await
         .map_err(|_| AppError::internal("synchronous_image_owner_failed"))?

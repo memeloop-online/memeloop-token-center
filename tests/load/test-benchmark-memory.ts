@@ -2,17 +2,55 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
-import { assetGatewayRssEvidence, chatPayload, createMockServer, createRequestSpool, HarnessFailure, MockState, seed, smallChat, streamChat, waitForTextRouteRecovery } from "./benchmark-memory.ts";
+import { assetGatewayRssEvidence, chatPayload, createMockServer, createRequestSpool, HarnessFailure, MockState, seed, smallChat, streamChat, waitForPriorArchivePhase, waitForTextRouteRecovery } from "./benchmark-memory.ts";
 import { StreamStartBarrier } from "./benchmark-stream-barrier.ts";
 import { DatabaseSync } from "node:sqlite";
 import { FirstSoakFailureEvidence, readSoakFailureClassification } from "./benchmark-soak-diagnostics.ts";
 
 const benchmarkEntry = resolve(import.meta.dirname, "./benchmark-memory.ts");
 const factoryEntry = resolve(import.meta.dirname, "../../src/http_settings/factory.rs");
+
+test("asset measurement waits for both prior CAS writers and SQL projection, and refuses absent metrics", async () => {
+  const directory = mkdtempSync(resolve(tmpdir(), "mtc-archive-phase-"));
+  const path = resolve(directory, "phase.db");
+  const database = new DatabaseSync(path);
+  database.exec("CREATE TABLE conversation_projection_outbox(projected_at INTEGER); INSERT INTO conversation_projection_outbox VALUES(NULL)");
+  let reads = 0;
+  let omitGauge = false;
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, "Bearer synthetic-phase-token");
+    reads += 1;
+    if (reads >= 2) database.exec("UPDATE conversation_projection_outbox SET projected_at = 1");
+    response.writeHead(200, { "content-type": "text/plain" });
+    response.end([
+      `memeloop_token_center_background_work_items{queue="proxy_archive_streams",state="active"} ${reads < 3 ? 1 : 0}`,
+      'memeloop_token_center_deferred_persistence_jobs 0',
+      'memeloop_token_center_request_persistence_jobs 0',
+      ...(omitGauge ? [] : ['memeloop_token_center_background_work_items{queue="proxy_lifecycles",state="active"} 0']),
+    ].join("\n"));
+  });
+  try {
+    await new Promise<void>((done) => server.listen(0, "127.0.0.1", done));
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `http://127.0.0.1:${address.port}`;
+    const drained = await waitForPriorArchivePhase(path, url, "synthetic-phase-token");
+    assert.ok(reads >= 3, "finished SQL projection alone cannot release a live writer");
+    assert.equal(drained.pending_projections, 0);
+    assert.deepEqual(Object.values(drained.gauges), [0, 0, 0, 0]);
+    omitGauge = true;
+    await assert.rejects(waitForPriorArchivePhase(path, url, "synthetic-phase-token"), /gauge absent: lifecycles/u);
+  } finally {
+    await new Promise<void>((done) => server.close(() => done()));
+    database.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test("memory roles use a real owner-private journal directory rather than the production default", () => {
   const temporary = mkdtempSync(resolve(tmpdir(), "mtc-memory-spool-"));

@@ -100,6 +100,115 @@ pub(super) fn safe_error_body(raw: &[u8]) -> Bytes {
         .unwrap_or_else(|_| fallback_body())
 }
 
+// A model lookup rejection is execution evidence only when its complete,
+// unique JSON envelope contains an explicit provider code and no result/usage.
+// Human messages and our sanitized display text never authorize replay.
+fn model_rejected_before_execution(raw: &[u8]) -> bool {
+    let Ok(value) = crate::api::sse::parse_unique_json(raw) else {
+        return false;
+    };
+    let Some(root) = value.as_object() else {
+        return false;
+    };
+    let error = match root.get("error") {
+        Some(Value::Object(error)) if root.len() == 1 => error,
+        None => root,
+        _ => return false,
+    };
+    if error.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "code" | "type" | "message" | "msg" | "param" | "status"
+        )
+    }) {
+        return false;
+    }
+    if error
+        .values()
+        .any(|value| value.is_object() || value.is_array())
+    {
+        return false;
+    }
+    // A type-only/general message is insufficient: the provider must explicitly
+    // reject model resolution, rather than report an interrupted generation.
+    let Some(code) = error.get("code").and_then(Value::as_str) else {
+        return false;
+    };
+    matches!(
+        code.to_ascii_lowercase().as_str(),
+        "model_not_found" | "unsupported_model" | "model_unavailable"
+    )
+}
+
+/// Inspect using the existing error-reader budget, retaining every consumed
+/// chunk for delivery/archive. Over-budget, partial and non-JSON bodies retain
+/// their original stream and remain non-replayable.
+pub(super) async fn inspect_model_rejection(
+    response: UpstreamResponse,
+) -> (UpstreamResponse, bool) {
+    if !matches!(
+        response.status(),
+        StatusCode::BAD_REQUEST
+            | StatusCode::NOT_FOUND
+            | StatusCode::UNPROCESSABLE_ENTITY
+            | StatusCode::SERVICE_UNAVAILABLE
+    ) || rejection_content_class(response.headers()) != "json"
+        || response
+            .headers()
+            .get_all(header::CONTENT_ENCODING)
+            .iter()
+            .any(|value| !value.as_bytes().eq_ignore_ascii_case(b"identity"))
+        || response
+            .content_length()
+            .is_some_and(|length| length == 0 || length > MAX_ERROR_BYTES as u64)
+    {
+        return (response, false);
+    }
+    let mut parts = response.into_parts();
+    let mut prefix = Vec::new();
+    let mut body = Vec::new();
+    let read = async {
+        for _ in 0..64 {
+            match parts.stream.next().await {
+                Some(Ok(chunk)) => {
+                    let fits = chunk.len() <= MAX_ERROR_BYTES.saturating_sub(body.len());
+                    if fits {
+                        body.extend_from_slice(&chunk);
+                    }
+                    prefix.push(Ok(chunk));
+                    if !fits {
+                        return false;
+                    }
+                }
+                Some(Err(error)) => {
+                    prefix.push(Err(error));
+                    return false;
+                }
+                None => return true,
+            }
+        }
+        false
+    };
+    let complete = tokio::time::timeout(MAX_ERROR_WAIT, read)
+        .await
+        .unwrap_or(false);
+    let rejected = complete
+        && parts
+            .content_length
+            .is_none_or(|length| length == body.len() as u64)
+        && model_rejected_before_execution(&body);
+    (
+        UpstreamResponse::Prefetched {
+            status: parts.status,
+            headers: parts.headers,
+            version: parts.version,
+            content_length: parts.content_length,
+            stream: Box::pin(futures_util::stream::iter(prefix).chain(parts.stream)),
+        },
+        rejected,
+    )
+}
+
 pub(super) async fn read_rejection(response: UpstreamResponse) -> Rejection {
     let status = response.status();
     if status == StatusCode::BAD_GATEWAY {
@@ -164,6 +273,136 @@ mod tests {
     use super::*;
     use futures_util::stream;
     use http::{HeaderMap, HeaderValue, Version};
+
+    #[test]
+    fn model_replay_requires_explicit_code_and_no_execution_evidence() {
+        for raw in [
+            r#"{"error":{"code":"model_not_found","message":"private arbitrary detail"}}"#,
+            r#"{"code":"MODEL_NOT_FOUND","message":"arbitrary detail"}"#,
+            r#"{"error":{"code":"unsupported_model"}}"#,
+            r#"{"error":{"code":"model_unavailable"}}"#,
+        ] {
+            assert!(model_rejected_before_execution(raw.as_bytes()), "{raw}");
+        }
+        for raw in [
+            r#"{"error":{"message":"The requested upstream model is unavailable"}}"#,
+            r#"{"error":{"code":"service_unavailable"}}"#,
+            r#"{"error":{"code":"model_not_found"},"usage":{"total_tokens":0}}"#,
+            r#"{"error":{"code":"model_not_found","usage":null}}"#,
+            r#"{"error":{"code":"model_not_found"},"output":[]}"#,
+            r#"{"error":{"code":"model_not_found"},"choices":[{"text":"already generated"}]}"#,
+            r#"{"error":{"code":"model_not_found","param":{"output":"generated"}}}"#,
+            r#"{"error":{"code":"model_not_found","code":"service_unavailable"}}"#,
+            r#"{"error":{"code":"model_not_found"}"#,
+        ] {
+            assert!(!model_rejected_before_execution(raw.as_bytes()), "{raw}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn model_rejection_inspection_preserves_wire_and_does_not_reject_over_budget_bodies() {
+        let raw = Bytes::from_static(br#"{"error":{"code":"MODEL_NOT_FOUND"}}"#);
+        for (status, content_type, length, chunks, expected) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                Some(raw.len() as u64),
+                vec![Ok(raw.clone())],
+                true,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "application/problem+json",
+                None,
+                vec![Ok(raw.slice(..10)), Ok(raw.slice(10..))],
+                true,
+            ),
+            (
+                StatusCode::OK,
+                "application/json",
+                None,
+                vec![Ok(raw.clone())],
+                false,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "text/event-stream",
+                None,
+                vec![Ok(raw.clone())],
+                false,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                Some(raw.len() as u64 + 1),
+                vec![Ok(raw.clone())],
+                false,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                None,
+                vec![Ok(raw.clone()), Err("upstream_stream_read_error")],
+                false,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                None,
+                vec![
+                    Ok(Bytes::from(vec![b'x'; MAX_ERROR_BYTES + 1])),
+                    Ok(raw.clone()),
+                ],
+                false,
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                Some(MAX_ERROR_BYTES as u64 + 1),
+                vec![Ok(raw.clone())],
+                false,
+            ),
+        ] {
+            let expected_chunks = chunks.clone();
+            let (inspected, rejected) = inspect_model_rejection(response(
+                status,
+                content_type,
+                length,
+                Box::pin(stream::iter(chunks)),
+            ))
+            .await;
+            assert_eq!(rejected, expected);
+            assert_eq!(inspected.status(), status);
+            assert_eq!(inspected.content_length(), length);
+            assert_eq!(
+                inspected.bytes_stream().collect::<Vec<_>>().await,
+                expected_chunks
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn partial_model_rejection_times_out_without_losing_consumed_prefix() {
+        let prefix = Bytes::from_static(br#"{"error":{"code":"model_not_found"}}"#);
+        let upstream = stream::iter([Ok(prefix.clone())]).chain(stream::pending());
+        let started = tokio::time::Instant::now();
+        let (inspected, rejected) = inspect_model_rejection(response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "application/json",
+            None,
+            Box::pin(upstream),
+        ))
+        .await;
+        assert!(!rejected);
+        assert_eq!(tokio::time::Instant::now() - started, MAX_ERROR_WAIT);
+        let mut retained = inspected.bytes_stream();
+        assert_eq!(retained.next().await, Some(Ok(prefix)));
+        assert!(
+            tokio::time::timeout(MAX_ERROR_WAIT, retained.next())
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn rejection_header_classes_are_fixed_and_share_the_reader_eligibility_rule() {

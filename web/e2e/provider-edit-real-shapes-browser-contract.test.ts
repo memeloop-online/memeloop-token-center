@@ -34,11 +34,13 @@ test('real Codex config shapes localize transport controls and preserve advanced
       }
       const advanced = workspace.getByRole('button', { name: '高级网络与用量设置', exact: true });
       assert.equal(await advanced.getAttribute('aria-expanded'), 'false');
-      const proxy = workspace.getByRole('button', { name: '配置网络代理', exact: true });
-      await workspace.locator('.provider-proxy-value input').waitFor();
+      const proxy = workspace.getByLabel(/^固定出口\s*\*?$/);
+      await proxy.waitFor();
+      assert.equal(await proxy.inputValue(), 'exit-15');
       assert.ok(await proxy.evaluate(element => element.getBoundingClientRect().bottom < innerHeight), 'proxy action is available in the initial desktop viewport');
       assert.doesNotMatch(await workspace.innerText(), /reservation_token_bounds|Conservative token|network_scope|代理标识|synthetic-diagnostic-fingerprint/);
-      assert.equal(await workspace.locator('.provider-readable-proxy').getByRole('button', { name: '配置网络代理', exact: true }).count(), 1, 'editing and copying sit beside the single authorized proxy value');
+      assert.equal(await workspace.locator('.network-proxy-policy-workspace').count(), 1, 'one policy editor owns the selected network exit');
+      assert.equal(await workspace.locator('.provider-proxy-value input').count(), 0, 'the account editor uses managed proxy identities rather than a second raw-address editor');
       const retry = workspace.getByRole('button', { name: '配置超时与重试', exact: true });
       assert.equal(await retry.getAttribute('aria-expanded'), 'false');
       await retry.focus(); await page.keyboard.press('Enter');
