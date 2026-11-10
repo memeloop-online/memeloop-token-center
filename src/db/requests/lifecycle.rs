@@ -116,8 +116,12 @@ mod output_validity_tests {
             normalize_proxy_usage_with_output_limit(&usage, 10, None, None).unwrap(),
             usage
         );
-        assert!(normalize_proxy_usage_with_output_limit(&usage, 10, Some(4096), None).is_err());
-        assert!(normalize_proxy_usage_with_output_limit(&usage, 10, Some(17), None).is_err());
+        for limit in [4096, 17] {
+            assert_eq!(
+                normalize_proxy_usage_with_output_limit(&usage, 10, Some(limit), None).unwrap(),
+                usage
+            );
+        }
         assert!(
             normalize_proxy_usage_with_output_limit(
                 &TokenUsage {

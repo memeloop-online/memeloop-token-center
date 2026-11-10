@@ -1443,7 +1443,8 @@ async fn fenced_source_upload_contract(database_url: String) {
         .await
         .is_err()
     );
-    sqlx::query("UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE attempt_id = $1")
+    // Fencing schedules cleanup before a cleaner claims its own lease.
+    sqlx::query("UPDATE archive_staging_attempts SET state = 'cleanup_pending', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, next_cleanup_at = updated_at WHERE attempt_id = $1")
         .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
     assert!(
         tokio::time::timeout(

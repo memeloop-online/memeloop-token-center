@@ -1032,3 +1032,98 @@ async fn consumed_and_discarded_readers_retain_full_capture_with_bounded_backpre
         );
     }
 }
+
+#[tokio::test]
+async fn original_delivery_reaches_eof_while_object_storage_is_paused() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("local-original.db").display(),
+    )))
+    .await
+    .unwrap();
+    let identity = crate::db::ArchiveSpoolIdentity {
+        tenant_id: Uuid::now_v7(),
+        request_id: Uuid::now_v7(),
+        reservation_id: Uuid::now_v7(),
+    };
+    let (entering, release) = crate::response_archive_spool::pause_next_begin_ack_for_test(&state);
+    let mut expected = blake3::Hasher::new();
+    for index in 0..1040 {
+        expected.update(&vec![(index % 251) as u8; 64 * 1024]);
+    }
+    let response = UpstreamResponse::Prefetched {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        version: http::Version::HTTP_11,
+        content_length: Some(65 * 1024 * 1024),
+        stream: Box::pin(futures_util::stream::iter(
+            (0..1040).map(|index| Ok(Bytes::from(vec![(index % 251) as u8; 64 * 1024]))),
+        )),
+    }
+    .with_original_archive_capture(&state, identity);
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut reader = response.bytes_stream();
+    let mut delivered = blake3::Hasher::new();
+    let mut count = 0;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(chunk) = reader.next().await {
+            let chunk = chunk.unwrap();
+            count += chunk.len();
+            delivered.update(&chunk);
+        }
+    })
+    .await
+    .expect("storage pause must not block client EOF");
+    entering.await.unwrap();
+    assert_eq!(count, 65 * 1024 * 1024);
+    assert_eq!(delivered.finalize(), expected.finalize());
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        state.persistence.stream_memory.snapshot().0,
+        crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES
+            / crate::PROXY_ARCHIVE_STREAM_CONCURRENCY,
+        "the original complete capture envelope remains charged while storage is paused",
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), state.drain_proxy_tasks())
+        .await
+        .unwrap();
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.size_bytes, count as u64);
+    assert_eq!(
+        reference.blake3_digest,
+        expected.finalize().to_hex().to_string()
+    );
+    let mut download = state
+        .archive
+        .open_stream(&reference.object_locator, None)
+        .await
+        .unwrap();
+    let mut restored = blake3::Hasher::new();
+    let mut archived = 0;
+    while let Some(chunk) = download.stream.next().await {
+        let chunk = chunk.unwrap();
+        archived += chunk.len();
+        restored.update(&chunk);
+    }
+    assert_eq!(archived, count);
+    assert_eq!(restored.finalize(), delivered.finalize());
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+    assert_eq!(
+        state.proxy_archive_stream_permits.available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+    );
+}

@@ -34,6 +34,41 @@ async fn fixture_with_members(label: &str, members: &[&str]) -> CodexRouteFixtur
         )
         .await
         .unwrap();
+    // This suite exercises pre-policy environment groups. The URL editor now
+    // migrates managed accounts, so explicitly restore the legacy fixture.
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let mut config: Value = serde_json::from_str(
+        &sqlx::query_scalar::<_, String>("SELECT config_json FROM upstream_accounts WHERE id = $1")
+            .bind(account.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    config
+        .as_object_mut()
+        .unwrap()
+        .remove(crate::db::transport_proxy_management::CONFIG_KEY);
+    sqlx::query("UPDATE upstream_accounts SET config_json = $1 WHERE id = $2")
+        .bind(config.to_string())
+        .bind(account.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    for table in [
+        "network_proxy_selection_policies",
+        "transport_proxy_bindings",
+        "upstream_transport_proxy_selections",
+    ] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table} WHERE account_id = $1"
+        )))
+        .bind(account.id.to_string())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    pool.close().await;
     let groups = if members.is_empty() {
         json!([])
     } else {

@@ -379,6 +379,33 @@ async fn two_connection_pool_keeps_all_control_pages_bounded_under_concurrent_re
 }
 
 #[tokio::test]
+async fn auxiliary_pool_limit_keeps_independent_pools_and_survives_refresh() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("auxiliary-pools.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 2)
+        .await
+        .unwrap()
+        .with_auxiliary_pool_max_connections(1);
+    let mut first = database.independent_persistence_pool();
+    let second = database.independent_persistence_pool();
+    assert_eq!(first.pool.options().get_max_connections(), 1);
+    let held = first.pool.acquire().await.unwrap();
+    let other = tokio::time::timeout(Duration::from_secs(1), second.pool.acquire())
+        .await
+        .unwrap()
+        .unwrap();
+    drop(held);
+    drop(other);
+    first.close().await;
+    first.refresh_closed_persistence_pool();
+    assert_eq!(first.pool.options().get_max_connections(), 1);
+    first.pool.acquire().await.unwrap();
+}
+
+#[tokio::test]
 async fn request_pool_wait_survives_timeout_and_cancels_cleanly() {
     let directory = tempfile::tempdir().unwrap();
     let database_url = format!(
@@ -416,6 +443,48 @@ async fn request_pool_wait_survives_timeout_and_cancels_cleanly() {
     database.pool.close().await;
     assert!(matches!(
         database.acquire_request_connection("test").await,
+        Err(sqlx::Error::PoolClosed)
+    ));
+}
+
+#[tokio::test]
+async fn startup_waits_through_delayed_pool_availability_and_remains_cancellable() {
+    let directory = tempfile::tempdir().unwrap();
+    let database_url = format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("startup-wait.db").display()
+    );
+    let database = Database::connect_with_max(&database_url, 1).await.unwrap();
+    let pool = database
+        .pool
+        .options()
+        .clone()
+        .acquire_timeout(Duration::from_millis(20))
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+    let held = pool.acquire().await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(70),
+            super::super::wait_for_initial_postgres_connection(&pool),
+        )
+        .await
+        .is_err()
+    );
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        drop(held);
+    });
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        super::super::wait_for_initial_postgres_connection(&pool),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    release.await.unwrap();
+    pool.close().await;
+    assert!(matches!(
+        super::super::wait_for_initial_postgres_connection(&pool).await,
         Err(sqlx::Error::PoolClosed)
     ));
 }
