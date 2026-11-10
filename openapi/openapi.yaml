@@ -2831,7 +2831,7 @@ paths:
       description: |
         Requires the same global operator authority as editing private transport
         proxies and verifies the explicitly selected tenant owns the account.
-        Returns only credential-backed proxy settings and account CAS revisions,
+        Returns effective policy-backed proxy settings and account CAS revisions,
         including proxy username and password where configured. Never returns
         API keys, OAuth access/refresh tokens, adapter state or configuration.
         Works for supported OAuth and API-key proxy credentials. An unconfigured
@@ -2851,7 +2851,7 @@ paths:
               schema:
                 type: object
                 additionalProperties: false
-                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported]
+                required: [account_id, proxy_url, proxy_network_scope, updated_at, credential_generation, supported, source, proxy_id, group_id, selected_member_id, configuration_state]
                 properties:
                   account_id: { type: string, format: uuid }
                   proxy_url: { type: [string, 'null'] }
@@ -2859,6 +2859,11 @@ paths:
                   updated_at: { type: integer, format: int64 }
                   credential_generation: { type: integer, format: int64 }
                   supported: { type: boolean, description: Whether this credential has an OAuth or proxied API-key container supported by the transport editor. }
+                  source: {"type":"string","enum":["credential","manual","auto","plugin"]}
+                  proxy_id: {"type":["string","null"],"format":"uuid"}
+                  group_id: {"type":["string","null"],"format":"uuid"}
+                  selected_member_id: {"type":["string","null"],"format":"uuid"}
+                  configuration_state: {"type":"string","enum":["credential","applied","pending"]}
         '400': { $ref: '#/components/responses/InvalidRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -3157,6 +3162,8 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '502': { $ref: '#/components/responses/UpstreamError' }
+
+  /internal/v1/upstreams/{account_id}/oauth/recover: {"post":{"tags":["Upstream providers"],"operationId":"recoverUpstreamOAuthCredential","summary":"Finalize an already saved OAuth refresh result without contacting the authorization server","security":[{"serviceBearer":[]}],"x-required-scope":"oauth:write","parameters":[{"$ref":"#/components/parameters/AccountId"}],"responses":{"200":{"description":"Recovered stable upstream identity.","content":{"application/json":{"schema":{"$ref":"#/components/schemas/UpstreamProvider"}}}},"401":{"$ref":"#/components/responses/Unauthorized"},"403":{"$ref":"#/components/responses/Forbidden"},"404":{"$ref":"#/components/responses/NotFound"},"409":{"description":"No saved result exists, or its generation/attempt no longer matches."}}}}
 
   /internal/v1/upstreams/{account_id}/oauth/disconnect:
     post:
@@ -10343,6 +10350,7 @@ components:
       additionalProperties: false
       required: [id, tenant_id, tenant_external_id, name, notes, driver, auth_kind, connection_method, credential_generation, status, config, credential_expires_at, has_proxy, proxy_scheme, proxy_remote_dns, proxy_label, proxy_fingerprint, can_update_transport_proxy, import_source_identity_hash, import_source_document_sha256, can_refresh, can_rotate, can_reauthorize, route_count, created_at, updated_at]
       properties:
+        oauth_refresh: {"type":"object","properties":{"allowed_actions":{"type":"array","items":{"type":"string","enum":["refresh","resume_local","reauthorize"]}},"lease_expires_at":{"type":["integer","null"],"format":"int64"},"access_state":{"type":"string","enum":["valid","expired","revoked","unknown"]},"refresh_state":{"type":"string","enum":["not_observed","in_progress","pending_local","outcome_unknown","failed","reauthorization_required"]},"reauthorization_required":{"type":"boolean"},"automatic_refresh_paused":{"type":"boolean"}}}
         id: { type: string, format: uuid }
         tenant_id: { type: string, format: uuid }
         tenant_external_id: { type: [string, 'null'] }
