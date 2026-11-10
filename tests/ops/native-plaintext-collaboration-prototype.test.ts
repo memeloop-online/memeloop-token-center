@@ -39,7 +39,7 @@ test('captured SSE restores item identities consistently without touching parame
     { type: 'response.function_call_arguments.delta', item_id: call.id, delta: call.arguments },
     { type: 'response.function_call_arguments.done', item_id: call.id, arguments: call.arguments },
     { type: 'response.output_item.done', item: call },
-    { type: 'response.completed', response: { output: [call, opaque], usage: { output_tokens: 12 } } },
+    { type: 'response.completed', response: { status: 'completed', output: [call, opaque], usage: { output_tokens: 12 } } },
   ];
   const frames = events.map(event => `event: ${event.type}\r\ndata: ${JSON.stringify(event)}\r\n\r\n`);
   const restored = restoreCapturedSse(frames.join(''), { version: 1, alias, tools: ['spawn_agent'] });
@@ -55,6 +55,26 @@ test('captured SSE restores item identities consistently without touching parame
   assert.deepEqual(decoded[4].response.output[1], opaque);
   assert.deepEqual(decoded[4].response.usage, { output_tokens: 12 });
   assert.equal(restoreCapturedSse(frames.slice(0, 4).join(''), { version: 1, alias, tools: ['spawn_agent'] }), frames.slice(0, 4).join(''));
+  const encode = (value: unknown[]) => value.map(event => `data: ${JSON.stringify(event)}\n\n`).join('');
+  const invalidCaptures = [
+    [...events, { type: 'response.failed', response: { status: 'failed' } }],
+    [events[0], events[1], events[4], events[2], events[3]],
+    events.map(event => event.type === 'response.completed' ? { ...event, response: { ...event.response, status: 'failed' } } : event),
+    [
+      { ...events[0], item: { ...call, arguments: 'different' } },
+      ...events.slice(2),
+    ],
+    [
+      ...events.slice(0, 4),
+      { type: 'response.output_item.added', item: { ...call, id: 'orphan', call_id: 'orphan-call' } },
+      events[4],
+    ],
+    events.map(event => event.type === 'response.completed' ? { ...event, response: { ...event.response, output: [call, { ...opaque, call_id: call.call_id }] } } : event),
+  ];
+  for (const invalidEvents of invalidCaptures) {
+    const invalid = encode(invalidEvents);
+    assert.equal(restoreCapturedSse(invalid, { version: 1, alias, tools: ['spawn_agent'] }), invalid);
+  }
   const badEvents = structuredClone(events);
   badEvents[1]!.delta = 'different';
   const inconsistent = badEvents.map(event => `event: ${event.type}\r\ndata: ${JSON.stringify(event)}\r\n\r\n`).join('');
@@ -66,7 +86,7 @@ test('a capture with conflicting completed arguments is preserved rather than re
   const call = { type: 'function_call', id: 'new', call_id: 'new-call', namespace: alias, name: 'spawn_agent', arguments: '{"message":"task"}' };
   const source = [
     { type: 'response.output_item.done', item: { ...call, arguments: '{"message":"different"}' } },
-    { type: 'response.completed', response: { output: [call] } },
+    { type: 'response.completed', response: { status: 'completed', output: [call] } },
   ].map(event => `data: ${JSON.stringify(event)}\n\n`).join('');
   assert.equal(restoreCapturedSse(source, { version: 1, alias, tools: ['spawn_agent'] }), source);
   assert.deepEqual(restoreResponse({ output: [{ ...call, encrypted_function_args: ['message'] }] }, { version: 1, alias, tools: ['spawn_agent'] }), { output: [{ ...call, encrypted_function_args: ['message'] }] });

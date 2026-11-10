@@ -33,8 +33,11 @@ payload; retain that same context for the response. Response mode takes
 `{response, context}`; sse mode takes `{sse, context}`. These modes are offline
 and never deliver their output to a host automatically. The same functions are
 library entry points for an isolated test harness.
+The context is caller-managed pairing information, not a cryptographic proof
+that an arbitrary response came from that request or a durable replay identity.
 SSE conversion takes a fully captured successful stream, confirms complete
-alias arguments, and changes added/done/completed item metadata consistently.
+alias arguments, successful terminal status, unique identities and ordered
+added/delta/arguments-done/item-done events, then changes item metadata consistently.
 Argument delta/done frames remain byte-for-byte identical. Failed, truncated or
 inconsistent captures remain unchanged. No live streaming support is claimed.
 

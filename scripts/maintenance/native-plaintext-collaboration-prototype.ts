@@ -79,38 +79,60 @@ export function restoreCapturedSse(source: string, context: PrototypeContext) {
   });
   // A completed response is required as provenance for the complete arguments.
   // A failed or truncated capture passes through unchanged.
-  const terminals = parsed.filter(event => event?.type === 'response.completed');
-  if (terminals.length !== 1) return source;
-  const completed = terminals[0]!;
+  const terminals = parsed.flatMap((event, index) => event?.type === 'response.completed' ? [{ event, index }] : []);
+  if (terminals.length !== 1 || parsed.some(event =>
+    ['error', 'response.failed', 'response.incomplete', 'response.cancelled'].includes(event?.type))) return source;
+  const terminal = terminals[0]!;
+  if (terminal.event.response?.status !== 'completed') return source;
   const calls = new Map<string, Wire>();
+  const itemIds = new Set<string>();
   const callIds = new Set<string>();
-  for (const item of completed.response?.output ?? []) {
+  for (const item of terminal.event.response.output ?? []) {
+    if (typeof item.id === 'string') {
+      if (itemIds.has(item.id)) return source;
+      itemIds.add(item.id);
+    }
+    if (typeof item.call_id === 'string') {
+      if (callIds.has(item.call_id)) return source;
+      callIds.add(item.call_id);
+    }
     if (item.namespace !== alias) continue;
     if (!plaintextAlias(item) || !context.tools.includes(item.name) ||
-        typeof item.id !== 'string' || typeof item.call_id !== 'string' ||
-        calls.has(item.id) || callIds.has(item.call_id)) return source;
+        typeof item.id !== 'string' || typeof item.call_id !== 'string') return source;
     calls.set(item.id, item);
-    callIds.add(item.call_id);
+  }
+  const indexed = parsed.flatMap((event, index) => event ? [{ event, index }] : []);
+  // Every alias item event must belong to exactly one completed output call.
+  // Ordinary calls may not reuse the same call ID as an alias event either.
+  for (const { event, index } of indexed) {
+    if (event.type !== 'response.output_item.added' && event.type !== 'response.output_item.done') continue;
+    const item = event.item;
+    const original = calls.get(item?.id);
+    if (item?.namespace === alias && (!original || index >= terminal.index)) return source;
+    if (original && (item.namespace !== alias || item.call_id !== original.call_id || item.name !== original.name)) return source;
+    if (!original && [...calls.values()].some(call => call.call_id === item?.call_id)) return source;
   }
   for (const original of calls.values()) {
-    const itemEvents = parsed.filter(event =>
-      (event?.type === 'response.output_item.added' || event?.type === 'response.output_item.done') && event.item?.id === original.id);
-    const added = itemEvents.filter(event => event!.type === 'response.output_item.added');
-    const done = itemEvents.filter(event => event!.type === 'response.output_item.done');
-    const argumentDone = parsed.filter(event => event?.type === 'response.function_call_arguments.done' && event.item_id === original.id);
-    if (added.length !== 1 || done.length !== 1 || argumentDone.length !== 1 ||
-        argumentDone[0]!.arguments !== original.arguments) return source;
-    if (argumentDone[0]!.encrypted_function_args !== undefined &&
-        (!Array.isArray(argumentDone[0]!.encrypted_function_args) || argumentDone[0]!.encrypted_function_args.length !== 0)) return source;
-    for (const event of itemEvents) {
-      const item = event!.item;
-      if (item.namespace !== alias || item.call_id !== original.call_id || item.name !== original.name ||
-          (item.encrypted_function_args !== undefined &&
-            (!Array.isArray(item.encrypted_function_args) || item.encrypted_function_args.length !== 0)) ||
-          (event!.type === 'response.output_item.done' && item.arguments !== original.arguments)) return source;
+    const related = indexed.filter(({ event }) => event.item?.id === original.id || event.item_id === original.id);
+    const added = related.filter(({ event }) => event.type === 'response.output_item.added');
+    const done = related.filter(({ event }) => event.type === 'response.output_item.done');
+    const argumentDone = related.filter(({ event }) => event.type === 'response.function_call_arguments.done');
+    const deltas = related.filter(({ event }) => event.type === 'response.function_call_arguments.delta');
+    if (added.length !== 1 || done.length !== 1 || argumentDone.length !== 1) return source;
+    if (!(added[0]!.index < argumentDone[0]!.index && argumentDone[0]!.index < done[0]!.index && done[0]!.index < terminal.index)) return source;
+    if (related.some(({ index }) => index >= terminal.index)) return source;
+    for (const { event } of related) {
+      const item = event.item ?? event;
+      if ((item.encrypted_function_args !== undefined &&
+          (!Array.isArray(item.encrypted_function_args) || item.encrypted_function_args.length !== 0)) ||
+          (item.call_id !== undefined && item.call_id !== original.call_id) ||
+          (item.namespace !== undefined && item.namespace !== alias) ||
+          (item.name !== undefined && item.name !== original.name)) return source;
     }
-    const deltas = parsed.filter(event => event?.type === 'response.function_call_arguments.delta' && event.item_id === original.id);
-    if (deltas.length && (added[0]!.item.arguments ?? '') + deltas.map(event => event!.delta).join('') !== original.arguments) return source;
+    if (done[0]!.event.item.arguments !== original.arguments || argumentDone[0]!.event.arguments !== original.arguments) return source;
+    if (deltas.some(({ event, index }) => typeof event.delta !== 'string' || index <= added[0]!.index || index >= argumentDone[0]!.index)) return source;
+    const initial = added[0]!.event.item.arguments;
+    if (typeof initial !== 'string' || initial + deltas.map(({ event }) => event.delta).join('') !== original.arguments) return source;
   }
   return frames.map((frame, index) => {
     const event = parsed[index];
