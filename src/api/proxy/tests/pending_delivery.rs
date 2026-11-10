@@ -1395,6 +1395,24 @@ async fn unknown_failure_retries_operational_projection() {
     .expect("unknown finance must retain its durable receipt");
     let request_id = Uuid::parse_str(original["request_id"].as_str().unwrap()).unwrap();
     assert!(original["conversation"].is_object());
+    let recovery_directory = tempfile::tempdir().unwrap();
+    let recovery = crate::proxy_lifecycle::pending_terminal::Journal::with_archive(
+        recovery_directory.path().to_owned(),
+        fixture.state.db.clone(),
+        fixture.state.archive.clone(),
+    );
+    recovery.stop_for_test().await;
+    let mut replay = original.clone();
+    replay["conversation_state"] = json!("Enqueued");
+    replay["reconciliation_required"] = json!(true);
+    recovery
+        .recover_snapshot_for_test(&fixture.state.db, replay.clone())
+        .await;
+    assert!(
+        !recovery.awaiting_evidence_for_test(receipt_id),
+        "failed operational ACK must remain retryable"
+    );
+
     tokio::time::timeout(Duration::from_secs(3), async {
         while fixture
             .state
@@ -1436,6 +1454,15 @@ async fn unknown_failure_retries_operational_projection() {
         .execute(&pool)
         .await
         .unwrap();
+    let mut incomplete = replay.clone();
+    incomplete["conversation_state"] = json!("Pending");
+    recovery
+        .recover_snapshot_for_test(&fixture.state.db, incomplete)
+        .await;
+    assert!(
+        !recovery.awaiting_evidence_for_test(receipt_id),
+        "unfinished source/projection work must remain retryable"
+    );
     let receipt = cancellation::assert_single_unknown_receipt(
         &fixture,
         502,
@@ -1566,6 +1593,52 @@ async fn unknown_failure_retries_operational_projection() {
     .await
     .unwrap();
     assert_eq!(effects, (1, 0, 1));
+    assert!(
+        !recovery
+            .recover_snapshot_for_test(&fixture.state.db, replay.clone())
+            .await
+    );
+    assert!(recovery.awaiting_evidence_for_test(receipt_id));
+    sqlx::query("CREATE TRIGGER no_unknown_replay BEFORE UPDATE OF unknown_reason ON pending_proxy_settlements WHEN NEW.unknown_reason IS NOT NULL BEGIN SELECT RAISE(ABORT, 'UNCHANGED_EVIDENCE_MUST_NOT_WRITE'); END")
+        .execute(&pool).await.unwrap();
+    assert!(
+        !recovery
+            .recover_snapshot_for_test(&fixture.state.db, replay.clone())
+            .await
+    );
+    assert!(recovery.awaiting_evidence_for_test(receipt_id));
+    replay["usage_basis"] = json!("provider_reported");
+    replay["usage"]["input_tokens"] = json!(3);
+    replay["usage"]["output_tokens"] = json!(2);
+    let completed_before: Option<i64> =
+        sqlx::query_scalar("SELECT completed_at FROM request_records WHERE id=$1")
+            .bind(request_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let progressed = recovery
+        .recover_snapshot_for_test(&fixture.state.db, replay)
+        .await;
+    assert!(
+        !recovery.awaiting_evidence_for_test(receipt_id),
+        "changed provider evidence must leave the cache and re-enter the original financial guard"
+    );
+    let financial: (String, Option<i64>, i64) = sqlx::query_as(
+        "SELECT p.state,p.cost_micros,(SELECT COUNT(*) FROM ledger_entries WHERE source=p.reservation_id) FROM pending_proxy_settlements p WHERE p.request_id=$1",
+    ).bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
+    if completed_before.is_some() {
+        // A completed record without a matching receipt remains an authority
+        // conflict. Evidence caching must not bypass that financial guard.
+        assert!(!progressed);
+        assert_eq!(financial, ("pending".to_owned(), None, 0));
+    } else {
+        // The operational/statistical terminal can exist while finance still
+        // owns the pending request. Real evidence then uses the normal finish.
+        assert!(progressed);
+        assert_eq!(financial.0, "applied");
+        assert!(financial.1.unwrap() > 0);
+        assert_eq!(financial.2, 1);
+    }
     pool.close().await;
     upstream.verify().await;
 }
