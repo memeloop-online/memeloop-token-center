@@ -5,7 +5,7 @@ use serde::{
 
 const MAX_INLINE_JSON_BYTES: usize = 2048;
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupplierError {
     pub code: String,
     pub message: String,
@@ -144,7 +144,8 @@ impl SafeReason {
 }
 
 /// The stream terminal records this existing safe reason without changing its
-/// archive locator. HTTP rejections retain their native inline projection.
+/// archive locator. New HTTP rejections use a separate fixed-vocabulary object;
+/// this parser also validates the legacy projections during migration.
 pub(crate) fn supplier_error_from_record(
     inline: Option<&str>,
     status_code: Option<i64>,

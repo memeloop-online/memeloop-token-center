@@ -3,10 +3,9 @@ use super::*;
 #[tokio::test]
 async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
     let upstream = MockServer::start().await;
-    // Small encoded input, but a JSON tree larger than the reserved envelope.
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "choices": [], "dense": vec![0; 2000]
+            "choices": [], "dense": vec![0; 1_100_000]
         })))
         .expect(1)
         .mount(&upstream)
@@ -66,7 +65,94 @@ async fn response_memory_rejection_is_counted_without_retry_or_status_change() {
 }
 
 #[tokio::test]
-async fn ingress_memory_counter_has_no_fabricated_route_label() {
+async fn dense_small_response_is_delivered_once_and_client_body_retains_its_lease() {
+    let upstream = MockServer::start().await;
+    let original = serde_json::to_vec(&json!({
+        "id":"dense-small", "object":"chat.completion",
+        "choices":[{"index":0,"message":{"role":"assistant","content":"complete"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},
+        "dense":vec![0;300]
+    })).unwrap();
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(original.clone())
+                .insert_header("content-type", "application/json"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let fixture = resilient_route_fixture("dense-response-lease", &[(upstream.uri(), 0)]).await;
+    let response = send_resilient_chat(&fixture, None, false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    fixture.state.persistence.drain_for_test().await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.state.pending_terminals.drain(),
+    )
+    .await
+    .unwrap();
+    let rows = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(fixture.state.proxy_memory_budget.snapshot().0 >= 64 * 1024);
+    let delivered = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(delivered.as_ref(), original);
+    let rendered = fixture
+        .state
+        .metrics
+        .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(
+        rendered.lines().any(|line| line
+            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"response\"} 0")
+    );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: Option<(String, String)> =
+                sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            if let Some((tenant, request)) = row {
+                let tenant = Uuid::parse_str(&tenant).unwrap();
+                let request = Uuid::parse_str(&request).unwrap();
+                if let Some(reference) = fixture
+                    .state
+                    .archive
+                    .raw_capture_reference(tenant, request, "response")
+                    .await
+                    .unwrap()
+                {
+                    let restored = fixture
+                        .state
+                        .archive
+                        .get_tenant_content(tenant, &reference, 1024 * 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(restored.as_ref(), original.as_slice());
+                    assert_eq!(
+                        reference.blake3_digest,
+                        blake3::hash(&original).to_hex().to_string()
+                    );
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful delivery and exact durable original are separate assertions");
+    pool.close().await;
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn source_json_memory_counter_has_no_fabricated_ingress_or_route_label() {
     let fixture = codex_route_fixture("ingress-memory-metrics").await;
     let held = fixture.state.proxy_memory_budget.reservation();
     assert!(held.try_grow(fixture.state.config.proxy_memory_budget_bytes as usize, 1));
@@ -85,9 +171,12 @@ async fn ingress_memory_counter_has_no_fabricated_route_label() {
         .state
         .metrics
         .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(rendered.lines().any(
+        |line| line == "memeloop_token_center_proxy_memory_rejections_total{stage=\"json\"} 1"
+    ));
     assert!(
         rendered.lines().any(|line| line
-            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"ingress\"} 1")
+            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"ingress\"} 0")
     );
     assert!(!rendered.lines().any(|line| {
         line.starts_with("memeloop_token_center_gateway_body_rejections_total{")

@@ -4,6 +4,8 @@ This package defines the versioned React contract for MTC Operator extensions. T
 
 Hosts also provide optional `ReactDOM` and `ReactJSXRuntime` bindings containing the complete `react-dom` and `react/jsx-runtime` namespaces. Packages that use portals or automatic JSX should check these bindings during activation and map their bundled externals to the host bindings before evaluating component libraries. This keeps hooks, contexts and portals on the host's React instance. Existing packages that only read `React` and `Fluent` keep the same activation contract.
 
+`host.EChart` is an optional shared ECharts component for line, bar and heatmap visualizations. It loads when rendered and follows the host theme, resizing and disposal lifecycle. Pass `option`, `ariaLabel`, `locale`, `timeZone`, and a chart height through `style` or a plugin CSS class. A package running on an earlier host can show its data as cards while offering charts on hosts that provide this binding.
+
 ```tsx
 export function activateOperatorUi({ React, Fluent, defineOperatorUiPackage }) {
   function Workspace({ contribution }) {
@@ -25,5 +27,7 @@ The component receives tenant and locale context, declared service-data feeds, a
 - `api.navigate(route, context?)` navigates through the host's unsaved-change guard. The destination receives optional in-memory `props.context`; this context expires on navigation away or a tenant/credential change.
 
 `operator.model-route.action` is a component-only slot rendered in each model-route row. The component receives `context.modelRoute`. It has no sidebar category, route, or target route; a separate `operator.sidebar.tab` contribution owns the destination page. Neither the host nor this SDK defines a playground feature.
+
+`operator.upstream-account.reset-settings` is a component-only slot rendered inside the existing reset settings for one upstream account. The component receives `context.upstreamAccount` with `id`, `name`, `provider`, and `tenantExternalId`. The optional `context.quotaSnapshot` shares the current non-secret quota observation without initiating another quota read. It has no route, category, or target route, so the host supplies the current account rather than making the component choose another one.
 
 For temporary inference, `POST /internal/v1/inference/chat/completions` and `POST /internal/v1/inference/messages` accept `{ key_id, request }`, where `request` is a non-streaming OpenAI chat or Anthropic Messages request respectively. The signed-in service needs `keys:write` for that existing, tenant-authorized billing key. The host retains the plaintext credential and applies the key's normal model policy, balance, routing and usage accounting. A service credential alone does not identify an inference principal. Temporary UI chat history is a plugin concern; normal gateway request records and billing still apply.

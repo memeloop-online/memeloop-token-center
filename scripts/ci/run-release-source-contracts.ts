@@ -7,6 +7,7 @@ for (const script of [
   'tests/ops/release-packaging-contract.test.ts',
   'tests/ops/github-release-assets-contract.test.ts',
   'tests/ops/github-workflow-policy-fixtures.test.ts',
+  'tests/ops/candidate-publish-contract.test.ts',
   'tests/ops/readme-canonical-contract.test.ts',
   'tests/ops/request-stats-reconcile-static.ts',
   'scripts/ci/compact-runtime-probe.test.ts',

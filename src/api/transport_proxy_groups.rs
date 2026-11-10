@@ -56,6 +56,10 @@ pub(super) async fn transport_group_response(
 pub(super) async fn transport_group_headers(request: Request, next: Next) -> Response {
     let path = request.uri().path();
     let managed = path == "/internal/v1/transport-proxy-groups"
+        || path == "/internal/v1/transport-proxies"
+        || path == "/internal/v1/transport-proxy-strategies"
+        || path.starts_with("/internal/v1/transport-proxies/")
+        || path.ends_with("/transport-proxy-selection")
         || path.starts_with("/internal/v1/transport-proxy-groups/")
         || (path.starts_with("/internal/v1/upstreams/")
             && path.ends_with("/transport-proxy-group"));
@@ -288,7 +292,10 @@ pub(super) async fn unbind_transport_group(
     )
 }
 
-async fn validate_binding_provider(state: &AppState, account_id: Uuid) -> Result<(), AppError> {
+pub(super) async fn validate_binding_provider(
+    state: &AppState,
+    account_id: Uuid,
+) -> Result<(), AppError> {
     let (account, credential, _, flow) = state
         .db
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())

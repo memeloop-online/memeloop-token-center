@@ -45,6 +45,12 @@
       "items": {
         "oneOf": [
           {
+            "type": "object", "additionalProperties": false,
+            "required": ["kind"],
+            "properties": { "kind": { "const": "quota_reset_credit" } },
+            "description": "Pure background reset-credit intents; requires explicit tenant/account authorization."
+          },
+          {
             "type": "object",
             "additionalProperties": false,
             "required": ["kind"],
@@ -85,12 +91,21 @@
       "additionalProperties": false,
       "properties": {
         "traffic_policy": { "type": "boolean", "default": false },
+        "background_actions": {
+          "type": "object", "additionalProperties": false,
+          "required": ["interval_seconds"],
+          "properties": {
+            "interval_seconds": { "type": "integer", "minimum": 5, "maximum": 3600 }
+          },
+          "description": "Independent memeloop:background-actions@0.1.0 pure planner ABI; no host imports."
+        },
         "group_routing": {
           "type": ["object", "null"],
           "additionalProperties": false,
           "required": ["version", "schema", "default"],
           "properties": {
             "version": { "enum": ["group-routing-v1", "group-routing-v2"] },
+            "allocation_context": {"const": "account-history-v1"},
             "health_policy": {
               "enum": ["plugin", "native"],
               "default": "plugin",
@@ -103,6 +118,16 @@
             "default": { "type": "object" }
           },
           "description": "Independent group-routing-plugin WIT world. Requires a component; host validates this contribution's configuration schema and default."
+        },
+        "network_proxy_strategy": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "required": ["version", "schema", "default"],
+          "properties": {
+            "version": { "const": "network-proxy-strategy-v1" },
+            "schema": { "type": "object" },
+            "default": { "type": "object" }
+          }
         },
         "request_rewrite": {
           "type": "boolean",
@@ -404,7 +429,7 @@
             "required": ["id", "slot", "label", "icon", "renderer"],
             "properties": {
               "id": { "type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[a-z0-9-]+$" },
-              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after", "operator.model-route.action"] },
+              "slot": { "enum": ["operator.sidebar.tab", "operator.overview.card", "operator.page.before", "operator.page.after", "operator.model-route.action", "operator.upstream-account.reset-settings"] },
               "category": {
                 "type": "object",
                 "additionalProperties": false,
@@ -455,7 +480,7 @@
                 "then": { "not": { "anyOf": [{ "required": ["route"] }, { "required": ["category"] }, { "required": ["target_route"] }] } }
               },
               {
-                "if": { "properties": { "slot": { "const": "operator.model-route.action" } }, "required": ["slot"] },
+                "if": { "properties": { "slot": { "enum": ["operator.model-route.action", "operator.upstream-account.reset-settings"] } }, "required": ["slot"] },
                 "then": {
                   "properties": { "renderer": { "const": "component_v1" } },
                   "not": { "anyOf": [{ "required": ["route"] }, { "required": ["category"] }, { "required": ["target_route"] }] }

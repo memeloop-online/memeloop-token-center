@@ -34,6 +34,9 @@ pub enum TypedFilterField {
     CostMicros,
     KeyAlias,
     Principal,
+    SessionAssociation,
+    SessionId,
+    ClientSessionId,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -162,7 +165,10 @@ fn validate_condition(condition: &TypedFilterCondition) -> Result<(), AppError> 
         | TypedFilterField::UpstreamAccountId
         | TypedFilterField::RouteId
         | TypedFilterField::Protocol
-        | TypedFilterField::Status => matches!(
+        | TypedFilterField::Status
+        | TypedFilterField::SessionId
+        | TypedFilterField::ClientSessionId
+        | TypedFilterField::SessionAssociation => matches!(
             condition.operator,
             TypedFilterOperator::Equals | TypedFilterOperator::NotEquals
         ),
@@ -198,6 +204,13 @@ fn validate_condition(condition: &TypedFilterCondition) -> Result<(), AppError> 
             "filter status is not supported".into(),
         ));
     }
+    if condition.field == TypedFilterField::SessionAssociation
+        && !matches!(filter_text(&condition.value), "confirmed" | "unlinked")
+    {
+        return Err(AppError::BadRequest(
+            "session association must be confirmed or unlinked".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -210,7 +223,12 @@ fn expected_value_kind(field: TypedFilterField) -> fn(&TypedFilterValue) -> bool
         TypedFilterField::Model => |value| matches!(value, TypedFilterValue::Model(_)),
         TypedFilterField::Protocol => |value| matches!(value, TypedFilterValue::Protocol(_)),
         TypedFilterField::Status => |value| matches!(value, TypedFilterValue::Status(_)),
-        TypedFilterField::ErrorCode | TypedFilterField::KeyAlias | TypedFilterField::Principal => {
+        TypedFilterField::ErrorCode
+        | TypedFilterField::KeyAlias
+        | TypedFilterField::Principal
+        | TypedFilterField::SessionId
+        | TypedFilterField::ClientSessionId
+        | TypedFilterField::SessionAssociation => {
             |value| matches!(value, TypedFilterValue::Text(_))
         }
         TypedFilterField::DurationMs => |value| matches!(value, TypedFilterValue::Integer(_)),

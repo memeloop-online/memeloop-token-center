@@ -283,6 +283,8 @@ fn usage_from_value_diagnosed(value: &Value) -> Result<Option<TokenUsage>, Usage
     let cache_hit = integer("prompt_cache_hit_tokens")?;
     let cache_miss = integer("prompt_cache_miss_tokens")?;
     for (field, count) in [
+        ("reported_input_tokens", input),
+        ("reported_output_tokens", output),
         ("prompt_cache_hit_tokens", cache_hit),
         ("prompt_cache_miss_tokens", cache_miss),
     ] {
@@ -471,6 +473,34 @@ pub(super) fn usage_from_value(value: &Value) -> Option<TokenUsage> {
 #[cfg(test)]
 mod cache_coverage_tests {
     use super::*;
+
+    #[test]
+    fn reported_input_range_precedes_cache_subtraction() {
+        for (input_field, output_field, details_field) in [
+            (
+                "prompt_tokens",
+                "completion_tokens",
+                "prompt_tokens_details",
+            ),
+            ("input_tokens", "output_tokens", "input_tokens_details"),
+        ] {
+            for input in [MAX_REPORTED_TOKENS, MAX_REPORTED_TOKENS + 1] {
+                let mut usage = serde_json::json!({});
+                usage[input_field] = serde_json::json!(input);
+                usage[output_field] = serde_json::json!(1);
+                usage[details_field] = serde_json::json!({"cached_tokens":11});
+                let parsed = usage_from_value_checked(&serde_json::json!({"usage":usage}));
+                if input == MAX_REPORTED_TOKENS {
+                    let parsed = parsed.unwrap().unwrap();
+                    assert_eq!(parsed.input_tokens, input - 11);
+                    assert_eq!(parsed.cached_input_tokens, 11);
+                    assert_eq!(parsed.output_tokens, 1);
+                } else {
+                    assert!(parsed.is_err());
+                }
+            }
+        }
+    }
 
     #[test]
     fn cache_presence_preserves_financial_counts_and_compatible_denominators() {

@@ -43,6 +43,8 @@ mod cloud_entitlements;
 mod logical_sessions;
 #[path = "steps/security_acceptance.rs"]
 mod security_acceptance;
+#[path = "steps/tkmarket_seedance.rs"]
+mod tkmarket_seedance;
 #[path = "steps/wasu_wan.rs"]
 mod wasu_wan;
 
@@ -182,15 +184,27 @@ impl Drop for TokenCenterWorld {
 
 async fn spawn_cursor_socks5h_proxy(
     target: std::net::SocketAddr,
-) -> (String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
+) -> (String, String, Arc<Mutex<Vec<String>>>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_address = listener.local_addr().unwrap();
+    // A direct connection to the advertised port cannot reach the mock server.
+    // Successful HTTP operations therefore prove proxy use even with pooling.
+    let direct = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target_port = direct.local_addr().unwrap().port();
     let requested_hosts = Arc::new(Mutex::new(Vec::new()));
     let recorded = requested_hosts.clone();
     let task = tokio::spawn(async move {
         loop {
-            let Ok((mut client, _)) = listener.accept().await else {
-                return;
+            let (mut client, _) = tokio::select! {
+                connection = listener.accept() => match connection {
+                    Ok(connection) => connection,
+                    Err(_) => return,
+                },
+                connection = direct.accept() => {
+                    drop(connection);
+                    recorded.lock().await.push("direct-bypass".to_owned());
+                    continue;
+                }
             };
             let recorded = recorded.clone();
             tokio::spawn(async move {
@@ -212,7 +226,7 @@ async fn spawn_cursor_socks5h_proxy(
                 let hostname = String::from_utf8(hostname).unwrap();
                 let mut port = [0_u8; 2];
                 client.read_exact(&mut port).await.unwrap();
-                assert_eq!(u16::from_be_bytes(port), target.port());
+                assert_eq!(u16::from_be_bytes(port), target_port);
                 recorded.lock().await.push(hostname);
 
                 let mut upstream = TcpStream::connect(target).await.unwrap();
@@ -226,7 +240,12 @@ async fn spawn_cursor_socks5h_proxy(
             });
         }
     });
-    (format!("socks5h://{proxy_address}"), requested_hosts, task)
+    (
+        format!("socks5h://{proxy_address}"),
+        format!("http://localhost:{target_port}"),
+        requested_hosts,
+        task,
+    )
 }
 
 fn spawn_test_worker(state: AppState) -> (watch::Sender<bool>, JoinHandle<()>) {
@@ -265,60 +284,41 @@ async fn wait_for_bound_proxy_archives(world: &TokenCenterWorld, request_ids: &[
         !request_ids.is_empty(),
         "archive barrier requires a request"
     );
-    let response = world
-        .client
-        .get(format!(
-            "{}/internal/v1/request-events?after_event_at=0",
-            world.service_url
-        ))
-        .bearer_auth("test-service-token")
-        .send()
-        .await
-        .expect("proxy archive event stream");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let mut pending = request_ids.to_vec();
-    let mut stream = response.bytes_stream();
+    let token = if world.matrix_global_service_token.is_empty() {
+        "test-service-token"
+    } else {
+        &world.matrix_global_service_token
+    };
+    // A raw root may bind before terminal completion, so its archive event can
+    // precede the finished event. Verify durable completed references through
+    // the authorized detail API rather than depending on event arrival order.
     tokio::time::timeout(Duration::from_secs(5), async {
-        let mut buffered = String::new();
-        while let Some(chunk) = stream.next().await {
-            buffered.push_str(&String::from_utf8_lossy(
-                &chunk.expect("proxy archive SSE chunk"),
-            ));
-            while let Some(end) = buffered.find("\n\n") {
-                let frame = buffered[..end].to_owned();
-                buffered.drain(..end + 2);
-                let Some(data) = frame
-                    .lines()
-                    .find_map(|line| line.strip_prefix("data:").map(str::trim_start))
-                else {
-                    continue;
-                };
-                let Ok(event) = serde_json::from_str::<Value>(data) else {
-                    continue;
-                };
-                if event["event_kind"] != "archive_bound" || event["archive_state"] != "bound" {
-                    continue;
-                }
-                let Some(request_id) = event["request_id"]
-                    .as_str()
-                    .and_then(|value| Uuid::parse_str(value).ok())
-                else {
-                    continue;
-                };
-                pending.retain(|candidate| *candidate != request_id);
-                if pending.is_empty() {
-                    return;
+        let mut pending = request_ids.to_vec();
+        while !pending.is_empty() {
+            let mut remaining = Vec::new();
+            for request_id in pending {
+                let response = world
+                    .client
+                    .get(format!(
+                        "{}/internal/v1/requests/{request_id}",
+                        world.service_url
+                    ))
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .expect("proxy archive detail");
+                assert_eq!(response.status(), StatusCode::OK);
+                let detail: Value = response.json().await.expect("proxy archive detail JSON");
+                if detail["archive_complete"] != true {
+                    remaining.push(request_id);
                 }
             }
+            pending = remaining;
+            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("proxy archives reached a terminal bound event");
-    assert!(
-        pending.is_empty(),
-        "missing bound archive events: {pending:?}"
-    );
+    .expect("proxy originals reached durable completed references");
 }
 
 fn panic_message(panic: Box<dyn Any + Send>) -> String {
@@ -6188,8 +6188,9 @@ async fn oauth_upstream_retains_id(world: &mut TokenCenterWorld) {
 #[given("the mock Cursor OAuth server and compatible upstream are ready")]
 async fn mock_cursor_oauth(world: &mut TokenCenterWorld) {
     let target = *world.mock.as_ref().expect("mock server").address();
-    let (proxy_url, proxy_hosts, proxy_task) = spawn_cursor_socks5h_proxy(target).await;
-    world.cursor_mock_origin = format!("http://localhost:{}", target.port());
+    let (proxy_url, mock_origin, proxy_hosts, proxy_task) =
+        spawn_cursor_socks5h_proxy(target).await;
+    world.cursor_mock_origin = mock_origin;
     world.cursor_proxy_url = proxy_url;
     world.cursor_proxy_hosts = proxy_hosts;
     world.cursor_proxy_task = Some(proxy_task);
@@ -6526,8 +6527,8 @@ async fn reauthorized_cursor_account_is_stable(world: &mut TokenCenterWorld) {
     assert_eq!(cursor_routes, 1);
     let proxy_hosts = world.cursor_proxy_hosts.lock().await;
     assert!(
-        proxy_hosts.len() >= 4,
-        "Cursor OAuth, refresh and routed calls must use the account proxy: {proxy_hosts:?}"
+        !proxy_hosts.is_empty(),
+        "Cursor operations must reach the proxy; pooled connections may serve multiple requests"
     );
     assert!(
         proxy_hosts.iter().all(|host| host == "localhost"),
@@ -7345,10 +7346,7 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         .await
         .expect("authenticate test key");
     let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-    assert_eq!(
-        refs.request_object,
-        format!("staging/proxy/{request_uuid}/request/{request_uuid}/body.json")
-    );
+    assert!(refs.request_object.starts_with(&cas_prefix));
     let original_request = state
         .archive
         .get(&refs.request_object)
@@ -7366,6 +7364,10 @@ async fn realtime_stream_contains_request_lifecycle(world: &mut TokenCenterWorld
         "messages": [{"role": "user", "content": "hi"}]
     }))
     .expect("original request JSON bytes");
+    assert!(
+        refs.request_object
+            .ends_with(&blake3::hash(&original_body).to_hex().to_string())
+    );
     assert_eq!(original_request.as_ref(), original_body.as_slice());
     assert_eq!(
         upstream_requests

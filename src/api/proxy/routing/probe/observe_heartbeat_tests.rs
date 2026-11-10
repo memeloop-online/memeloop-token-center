@@ -90,15 +90,7 @@ async fn customer_success_does_not_wait_on_observe_or_heal_the_breaker() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(status, "healthy");
-    sqlx::query(
-        "UPDATE upstream_service_probes SET status = 'unhealthy', error_code = 'upstream_unavailable'
-         WHERE upstream_account_id = $1",
-    )
-    .bind(account.to_string())
-    .execute(&pool)
-    .await
-    .unwrap();
+    assert_eq!(status, "unhealthy");
     let mut observed = UpstreamAttemptGuard::new(
         &state,
         Uuid::now_v7(),
@@ -118,6 +110,28 @@ async fn customer_success_does_not_wait_on_observe_or_heal_the_breaker() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(status, "healthy");
+    assert_eq!(status, "unhealthy");
+    let probe = state
+        .db
+        .upstream_service_probe(account)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(probe["checked_at"], 1);
+    assert_eq!(probe["status"], "unknown");
+    assert_eq!(probe["source"], "legacy_unverified");
+    assert_eq!(
+        probe["historical_result"]["error_code"],
+        "upstream_unavailable"
+    );
+    assert_eq!(probe["historical_result"]["latency_ms"], 1);
+    assert!(
+        state
+            .db
+            .upstream_service_probes_due(0, 1, 32)
+            .await
+            .unwrap()
+            .contains(&account)
+    );
     pool.close().await;
 }

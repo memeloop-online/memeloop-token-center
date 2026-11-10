@@ -30,3 +30,21 @@ test('row actions register only components without page navigation declarations'
     assert.deepEqual(registerOperatorPluginContributions([invalid]).modelRouteActions, []);
   }
 });
+
+test('account reset settings register without adding navigation', () => {
+  const action: PluginOperatorUiContribution = {
+    id: 'open-route', slot: 'operator.upstream-account.reset-settings', label: 'Open route', icon: 'plug',
+    renderer: 'component_v1', module_entry: 'ui/actions.mjs', module_sha256: `sha256:${'a'.repeat(64)}`, component_id: 'open-route',
+  };
+  const manifest: PluginManifest = { id: 'extension', version: '1.0.0', wit_version: '0.2.0', capabilities: [], contributions: { operator_ui: [action] } };
+  const registry = registerOperatorPluginContributions([manifest]);
+  assert.deepEqual(registry.upstreamAccountResetSettings.map(value => value.contribution.id), ['open-route']);
+  assert.equal(registry.pages.size, 0);
+  assert.deepEqual(registry.navigation, []);
+  for (const extra of [{ route: 'page' }, { category: { id: 'monitoring' } }, { target_route: 'routes' }, { renderer: 'typed_data_v1', module_entry: undefined, module_sha256: undefined, component_id: undefined, data_endpoint: 'data' }]) {
+    const invalid = structuredClone(manifest);
+    invalid.contributions.service_data = [{ id: 'data', required_scope: 'metrics:read', response_schema: {}, fallback: {}, cache_ttl_seconds: 60, timeout_millis: 1000, max_body_bytes: 1024 }];
+    invalid.contributions.operator_ui = [{ ...action, ...extra } as PluginOperatorUiContribution];
+    assert.deepEqual(registerOperatorPluginContributions([invalid]).upstreamAccountResetSettings, []);
+  }
+});

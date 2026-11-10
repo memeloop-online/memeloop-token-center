@@ -138,13 +138,17 @@ Then('同时间戳会话详情分页无重复遗漏且 USD 与 CNY 分行', asyn
   const page = this.requirePage();
   await page.route('**/internal/v1/sessions/**', async (route) => {
     const url = new URL(route.request().url());
+    if (route.request().method() !== 'GET' || !/^\/internal\/v1\/sessions\/[^/]+$/.test(url.pathname)) {
+      await route.fallback();
+      return;
+    }
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
       body: JSON.stringify(detailFixture(url.searchParams.has('before_request_id'))),
     });
   });
-  const firstCard = page.locator('.session-card').first();
+  const firstCard = page.locator('.session-card[data-session-association="confirmed"]').first();
   await visible(firstCard);
   await firstCard.getByRole('button', { name: /^打开 / }).click();
   const drawer = page.locator('.session-detail-region .session-detail');
@@ -187,7 +191,7 @@ Then('六类可靠关系、候选关系、未关联请求和语义执行图被�
   assert.match(await candidate.textContent() ?? '', /不计入会话统计/);
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
   await appPreferenceControls(page).getByRole('button', { name: 'English', exact: true }).click();
-  await page.locator('.session-card').first().getByRole('button', { name: /^Open / }).click();
+  await page.locator('.session-card[data-session-association="confirmed"]').first().getByRole('button', { name: /^Open / }).click();
   const englishDrawer = page.locator('.session-detail-region .session-detail');
   await visible(englishDrawer);
   const englishText = await englishDrawer.textContent() ?? '';
@@ -264,7 +268,7 @@ When('连续新请求进入活跃状态并分别完成为成功和错误', async
     }),
   });
   const sessionReady = observeSessionReadyRequests({
-    credential: seed.serviceCredential,
+    credential: seed.sessionObserverCredential,
     keyId: seed.sessionClientKeyId,
     requestModel: sessionModel,
     sessionName: 'Codex release dogfood',
@@ -447,6 +451,10 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   });
   assert.ok(before.sessions.length > 0, 'rotation continuity needs an existing session');
   const oldCredential = seed.clientCredential;
+  // End the browser session before rotating its key through the service API.
+  // The old-key rejection below remains a separate, explicit HTTP assertion.
+  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
+  await visible(page.locator('input[type="password"]'));
   const rotated = await requestJson<{ key: string }>(`/internal/v1/keys/${seed.clientKeyId}/rotate`, {
     method: 'POST',
     credential: seed.serviceCredential,
@@ -475,7 +483,6 @@ Then('实际轮换后的新凭据保留旧会话历史而旧凭据和其他身�
   assert.equal(forbiddenDetail.status, 404);
 
   seed.clientCredential = rotated.key;
-  await page.getByRole('button', { name: '清空凭据', exact: true }).click();
   await page.locator('input[type="password"]').fill(rotated.key);
   await page.getByRole('button', { name: '进入', exact: true }).click();
   await openAppRoute(page, 'portal', 'sessions');

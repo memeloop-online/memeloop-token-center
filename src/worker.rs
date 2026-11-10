@@ -13,6 +13,9 @@ use crate::{
     error::AppError, generation, metrics::BackgroundProjectionKind,
 };
 
+#[cfg(test)]
+mod background_actions_tests;
+
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const ORPHANED_RESERVATION_REAPER_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const GENERATION_INTERVAL: Duration = Duration::from_millis(500);
@@ -63,10 +66,19 @@ async fn refresh_expiring_oauth(
     generation: i64,
     blocking: &BlockingTasks,
 ) -> Result<(), AppError> {
-    let recovery_key = format!("oauth-worker-{account_id}-generation-{generation}");
-    let result =
-        api::refresh_managed_upstream_oauth_for_worker(state, account_id, &recovery_key, blocking)
-            .await;
+    let recovery_key = state
+        .db
+        .upstream_oauth_refresh_recovery_key(account_id, generation)
+        .await?
+        .unwrap_or_else(|| format!("oauth-worker-{account_id}-generation-{generation}"));
+    let result = api::refresh_managed_upstream_oauth_for_worker(
+        state,
+        account_id,
+        &recovery_key,
+        generation,
+        blocking,
+    )
+    .await;
     match result {
         Err(AppError::Conflict(message))
             if message == "OAuth refresh is already in progress for this Idempotency-Key" =>
@@ -80,6 +92,7 @@ async fn refresh_expiring_oauth(
                 state,
                 account_id,
                 &takeover_key,
+                generation,
                 blocking,
             )
             .await?;
@@ -178,9 +191,16 @@ pub async fn run_until_shutdown_with_oauth_stop(
     let (oauth_stop, oauth_role_shutdown) = watch::channel(false);
     let mut roles = JoinSet::new();
     let mut oauth_refresh_roles = JoinSet::new();
+    let history_state = state.clone();
+    let history_shutdown = role_shutdown.clone();
+    roles.spawn(async move {
+        crate::request_history::migration::run_worker(history_state, history_shutdown).await;
+        "request_history"
+    });
     let blocking_tasks = BlockingTasks::new();
     let oauth_blocking = blocking_tasks.clone();
     let service_data_blocking = blocking_tasks.clone();
+    let background_action_blocking = blocking_tasks.clone();
     let worker_id = format!("worker-{}", Uuid::now_v7());
     let projection_owner = Uuid::now_v7();
     let reaper_owner = ArchiveStagingLeaseOwner::new(format!("archive-reaper-{}", Uuid::now_v7()))
@@ -375,6 +395,24 @@ pub async fn run_until_shutdown_with_oauth_stop(
             process_terminal_projection_batch(state, Uuid::now_v7()).await;
         }
     );
+    let terminal_recovery_cursor = Mutex::new(None::<String>);
+    periodic!(
+        "terminal_projection_recovery",
+        PROJECTION_INTERVAL,
+        async |state: &AppState, _shutdown: &watch::Receiver<bool>| {
+            let after = terminal_recovery_cursor.lock().unwrap().clone();
+            match state
+                .db
+                .recover_unknown_terminal_projections(after.as_deref())
+                .await
+            {
+                Ok(next) => *terminal_recovery_cursor.lock().unwrap() = next,
+                Err(error) => {
+                    tracing::error!(%error, "worker failed to recover unknown terminal projections");
+                }
+            }
+        }
+    );
     periodic!(
         "metered_projection",
         PROJECTION_INTERVAL,
@@ -488,6 +526,13 @@ pub async fn run_until_shutdown_with_oauth_stop(
         }
     );
     periodic!(
+        "plugin_background_actions",
+        PLUGIN_SERVICE_DATA_INTERVAL,
+        async |state: &AppState, shutdown: &watch::Receiver<bool>| {
+            run_plugin_background_actions(state, shutdown, &background_action_blocking).await;
+        }
+    );
+    periodic!(
         "plugin_service_data",
         PLUGIN_SERVICE_DATA_INTERVAL,
         async |state: &AppState, shutdown: &watch::Receiver<bool>| {
@@ -508,6 +553,106 @@ pub async fn run_until_shutdown_with_oauth_stop(
         blocking_tasks,
     )
     .await;
+}
+
+async fn run_plugin_background_actions(
+    state: &AppState,
+    shutdown: &watch::Receiver<bool>,
+    blocking: &BlockingTasks,
+) {
+    let pinned = match state.clone().pin_application_plugins().await {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error,"worker background action runtime pin failed");
+            return;
+        }
+    };
+    for (plugin, interval) in pinned.plugins.background_action_targets() {
+        let now = crate::db::unix_millis();
+        let grants = match pinned.db.due_background_action_grants(&plugin, now).await {
+            Ok(grants) => grants,
+            Err(error) => {
+                tracing::warn!(%error,"worker background action grant enumeration failed");
+                continue;
+            }
+        };
+        for grant in grants {
+            if *shutdown.borrow() {
+                return;
+            }
+            let owner = format!("plugin-action-{}", Uuid::now_v7());
+            match pinned
+                .db
+                .claim_background_action_tick(
+                    &grant,
+                    &owner,
+                    crate::db::unix_millis(),
+                    (interval as i64) * 1000,
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    tracing::warn!(%error,"worker background action tick claim failed");
+                    continue;
+                }
+            }
+            let result = tokio::time::timeout(
+                Duration::from_secs(90),
+                crate::plugin::background_actions::execute_tick(
+                    pinned.clone(),
+                    grant.clone(),
+                    owner.clone(),
+                    blocking,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::error::AppError::capacity_error(
+                    "background_action_timeout",
+                ))
+            });
+            let code = result
+                .as_ref()
+                .err()
+                .map(|error| error.diagnostic_category());
+            let operation = result
+                .as_ref()
+                .ok()
+                .and_then(|operation| operation.as_ref());
+            let outcome = Some(if let Some(operation) = operation {
+                operation.state.as_str()
+            } else if result.is_ok() {
+                "no_action"
+            } else if matches!(
+                result,
+                Err(crate::error::AppError::Capacity { .. }
+                    | crate::error::AppError::Overloaded
+                    | crate::error::AppError::DatabaseUnavailable(_))
+            ) {
+                "retryable_error"
+            } else {
+                "blocked"
+            });
+            if let Err(error) = pinned
+                .db
+                .finish_background_action_tick(
+                    &grant,
+                    &owner,
+                    code,
+                    outcome,
+                    operation.map(|op| op.id.as_str()),
+                )
+                .await
+            {
+                tracing::warn!(%error,"worker background action tick completion failed");
+            }
+            if let Err(error) = result {
+                tracing::warn!(plugin_id=%plugin,upstream_account_id=%grant.upstream_account_id,error_category=error.diagnostic_category(),"plugin background action tick failed");
+            }
+        }
+    }
 }
 
 async fn refresh_plugin_service_data(
@@ -913,12 +1058,10 @@ async fn process_metered_usage_projection_batch(state: &AppState, lease_owner: U
     }
 }
 
-const SESSION_BODY_ARCHIVE_READ_LIMIT: usize = 128 * 1024 * 1024;
-
 async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uuid) {
     if let Err(error) = state
         .db
-        .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT)
+        .reopen_session_body_rebuilds(PROJECTION_BATCH_LIMIT / 4)
         .await
     {
         state
@@ -960,14 +1103,16 @@ async fn process_conversation_projection_batch(state: &AppState, lease_owner: Uu
     }
 }
 
-/// 读取原始请求 JSON 和原始返回 JSON 的 locator，整理会话正文并写入 CNPG。
+/// 读取原始请求/返回，正文写对象存储，CNPG 仅记录引用和投影元数据。
 /// locator 缺失或文档读不出来时记下原因并结束这条队列，不让客户端失败。
 pub(crate) async fn archive_session_body(
     state: &AppState,
     lease_owner: Uuid,
     request_id: Uuid,
 ) -> Result<bool, AppError> {
-    let Some(locators) = state.db.session_body_locators(request_id).await? else {
+    let (tenant_id, hints, response_complete) =
+        state.db.conversation_object_context(request_id).await?;
+    let Some(mut locators) = state.db.session_body_locators(request_id).await? else {
         return skip_session_body(
             state,
             lease_owner,
@@ -976,32 +1121,98 @@ pub(crate) async fn archive_session_body(
         )
         .await;
     };
-    if locators.pending {
+    if let Some(response) = state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "response")
+        .await?
+    {
+        state
+            .db
+            .bind_raw_capture(tenant_id, request_id, "response", &response)
+            .await?;
+        locators.response = Some(response.object_locator);
+        locators.pending = false;
+    } else if state
+        .archive
+        .raw_capture_failed(tenant_id, request_id, "response")
+        .await?
+    {
+        locators.response = None;
+        locators.pending = false;
+    }
+    if let Some(request) = state
+        .archive
+        .raw_capture_reference(tenant_id, request_id, "request")
+        .await?
+    {
+        state
+            .db
+            .bind_raw_capture(tenant_id, request_id, "request", &request)
+            .await?;
+        locators.request = request.object_locator;
+        locators.source_identity = None;
+    }
+    let request_capture_pending = locators.request == format!("gap://{request_id}/request")
+        && !state
+            .archive
+            .raw_capture_failed(tenant_id, request_id, "request")
+            .await?;
+    if locators.pending || request_capture_pending {
+        state
+            .db
+            .project_claimed_conversation_identity(lease_owner, request_id)
+            .await?;
         state
             .db
             .defer_pending_session_body_archive(lease_owner, request_id)
             .await?;
         return Ok(false);
     }
-    let request_bytes = match load_raw_document(state, &locators.request).await {
-        Ok(bytes) => {
-            if let Some(identity) = locators.source_identity
-                && !locators.source_recorded
-            {
-                state
-                    .db
-                    .record_request_source(
-                        identity,
-                        &locators.request,
-                        bytes.len(),
-                        *blake3::hash(&bytes).as_bytes(),
-                        true,
-                    )
-                    .await?;
+    if missing_raw_document(&locators.request) {
+        return skip_session_body(
+            state,
+            lease_owner,
+            request_id,
+            "session_body_skipped_missing_request_locator",
+        )
+        .await;
+    }
+    let projection = state.archive.prepare_session_body_streamed(
+        tenant_id,
+        request_id,
+        hints,
+        locators.request.clone(),
+        locators
+            .response
+            .clone()
+            .filter(|locator| !missing_raw_document(locator)),
+        response_complete,
+    );
+    tokio::pin!(projection);
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    heartbeat.tick().await;
+    let prepared = loop {
+        tokio::select! {
+            result = &mut projection => break result,
+            _ = heartbeat.tick() => {
+                if !state.db.renew_session_body_archive(lease_owner, request_id).await? {
+                    return Ok(false);
+                }
             }
-            bytes
         }
-        Err(_) => {
+    };
+    let prepared = match prepared {
+        Ok(Some(prepared)) => prepared,
+        Ok(None) => {
+            return skip_session_body(
+                state,
+                lease_owner,
+                request_id,
+                "session_body_skipped_archive_unreadable",
+            )
+            .await;
+        }
+        Err(error) => {
             let retry = if let Some(identity) = locators.source_identity {
                 state
                     .archive
@@ -1018,121 +1229,68 @@ pub(crate) async fn archive_session_body(
             if retry {
                 state
                     .db
-                    .defer_session_body_archive(lease_owner, request_id)
+                    .project_claimed_conversation_identity(lease_owner, request_id)
                     .await?;
-                return Ok(false);
-            }
-            let inline = state
-                .db
-                .session_body_inline_request(lease_owner, request_id)
-                .await?;
-            match inline {
-                Some(json) if json != "{}" && !json.is_empty() => bytes::Bytes::from(json),
-                _ => {
-                    return skip_session_body(
-                        state,
-                        lease_owner,
-                        request_id,
-                        "session_body_skipped_missing_request_locator",
-                    )
-                    .await;
-                }
-            }
-        }
-    };
-    let Ok(mut request_document) = serde_json::from_slice::<serde_json::Value>(&request_bytes)
-    else {
-        return skip_session_body(
-            state,
-            lease_owner,
-            request_id,
-            "session_body_skipped_archive_unreadable",
-        )
-        .await;
-    };
-    drop(request_bytes);
-    // locator 读出来的占位文档没有对话字段时，改用结算时留下的缩减请求 JSON。
-    if request_document.get("messages").is_none()
-        && request_document.get("input").is_none()
-        && let Some(json) = state
-            .db
-            .session_body_inline_request(lease_owner, request_id)
-            .await?
-        && json != "{}"
-        && !json.is_empty()
-        && let Ok(fallback) = serde_json::from_str::<serde_json::Value>(&json)
-        && (fallback.get("messages").is_some() || fallback.get("input").is_some())
-    {
-        request_document = fallback;
-    }
-    // Release the request JSON (including unused schemas/private fields) before
-    // loading/parsing the response. Public text moves into the body.
-    let mut body = crate::conversation::SessionBody::from_request_document(request_document);
-    // 没有可整理的返回正文时仍归档请求回合。跳过会不发 projected，
-    // 流式完成事件若只有用量、没有 output，续接边就永远等不到。
-    let return_bytes = match locators.response.filter(|locator| !locator.is_empty()) {
-        Some(locator) => match load_raw_document(state, &locator).await {
-            Ok(bytes) => bytes,
-            Err(_) if missing_raw_document(&locator) => bytes::Bytes::from_static(b"{}"),
-            Err(_) => {
                 state
                     .db
                     .defer_session_body_archive(lease_owner, request_id)
                     .await?;
                 return Ok(false);
             }
-        },
-        None => bytes::Bytes::from_static(b"{}"),
-    };
-    let return_document = crate::conversation::raw_return_document(&return_bytes)
-        .unwrap_or_else(|| serde_json::json!({}));
-    drop(return_bytes);
-    body.append_return_document(return_document);
-    let pending_media = body.take_media_bytes();
-    let mut media_staging = Vec::new();
-    let mut uploaded_media = std::collections::HashMap::new();
-    for (turn_index, part_index, bytes) in pending_media {
-        let hash = blake3::hash(&bytes).to_hex().to_string();
-        if let Some(locator) = uploaded_media.get(&hash) {
-            body.set_media_locator(turn_index, part_index, String::clone(locator));
-            continue;
-        }
-        let attempt = crate::proxy_lifecycle::begin_proxy_archive_attempt(
-            &state.db,
-            request_id,
-            crate::archive_staging::ArchiveStagingPurpose::Media,
-        )
-        .await?;
-        let locator = crate::archive_staging::conversation_media_locator(attempt.lease.key, &hash)?;
-        media_staging.push(attempt.lease);
-        {
-            let upload = state.archive.put(&locator, bytes::Bytes::from(bytes));
-            tokio::pin!(upload);
-            let mut heartbeat = tokio::time::interval(Duration::from_millis(
-                crate::archive_staging::ARCHIVE_STAGING_WRITE_HEARTBEAT_MILLIS as u64,
-            ));
-            loop {
-                tokio::select! {
-                    result = &mut upload => {
-                        result?;
-                        break;
-                    }
-                    _ = heartbeat.tick() => {
-                        for lease in &mut media_staging {
-                            if !state.db.heartbeat_archive_staging_write(lease).await? {
-                                return Err(AppError::Conflict("session media staging writer was fenced".into()));
-                            }
-                        }
-                    }
-                }
+            if locators.source_identity.is_some() {
+                // The writer's lease has been fenced and its actual source is
+                // absent. Keep explicit loss evidence; SQL snapshots are not
+                // substitutes for the missing original request.
+                state
+                    .archive
+                    .publish_raw_capture_failure(tenant_id, request_id, "request")
+                    .await?;
+                return skip_session_body(
+                    state,
+                    lease_owner,
+                    request_id,
+                    "session_body_skipped_missing_source",
+                )
+                .await;
             }
+            return Err(error);
         }
-        body.set_media_locator(turn_index, part_index, locator.clone());
-        uploaded_media.insert(hash, locator);
+    };
+    if let Some(identity) = locators.source_identity
+        && !locators.source_recorded
+    {
+        state
+            .db
+            .record_request_source(
+                identity,
+                &locators.request,
+                prepared.request_size,
+                prepared.request_digest,
+                true,
+            )
+            .await?;
     }
+    for side in ["request", "response"] {
+        if let Some(object) = state
+            .archive
+            .raw_capture_reference(tenant_id, request_id, side)
+            .await?
+        {
+            state
+                .db
+                .bind_raw_capture(tenant_id, request_id, side, &object)
+                .await?;
+        }
+    }
+    let crate::archive::PreparedSessionBody {
+        atoms,
+        nodes,
+        media,
+        ..
+    } = prepared;
     if !state
         .db
-        .prepare_staged_session_body_archive(lease_owner, request_id, body, &media_staging)
+        .prepare_archived_session_body_archive(lease_owner, request_id, atoms, &nodes, &media)
         .await?
     {
         return Ok(false);
@@ -1149,6 +1307,10 @@ async fn skip_session_body(
     request_id: Uuid,
     reason: &'static str,
 ) -> Result<bool, AppError> {
+    state
+        .db
+        .project_claimed_conversation_identity(lease_owner, request_id)
+        .await?;
     tracing::warn!(%request_id, reason, "会话正文归档跳过这条请求");
     state
         .db
@@ -1162,23 +1324,6 @@ fn missing_raw_document(locator: &str) -> bool {
         || locator.starts_with("gap://")
         || locator.starts_with("metadata-only-json:")
         || locator.starts_with("provider-reference-json:")
-}
-
-async fn load_raw_document(state: &AppState, locator: &str) -> Result<bytes::Bytes, &'static str> {
-    if missing_raw_document(locator) {
-        return Err("session_body_skipped_archive_unreadable");
-    }
-    if let Some(inline) = locator.strip_prefix("inline-json:") {
-        return Ok(bytes::Bytes::copy_from_slice(inline.as_bytes()));
-    }
-    match state
-        .archive
-        .get_bounded(locator, SESSION_BODY_ARCHIVE_READ_LIMIT)
-        .await
-    {
-        Ok(bytes) => Ok(bytes),
-        Err(_) => Err("session_body_skipped_archive_unreadable"),
-    }
 }
 
 #[cfg(test)]
@@ -1202,6 +1347,103 @@ mod tests {
     };
 
     use super::*;
+
+    #[tokio::test]
+    async fn oauth_worker_keeps_durable_refresh_and_continues_after_stalled_price_followup() {
+        let directory = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let mut config = Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("worker-oauth-followup.db").display()
+        ));
+        config.pricing_models_dev_url = format!("{}/prices", server.uri());
+        config.pricing_litellm_url = format!("{}/missing-litellm", server.uri());
+        config.pricing_openrouter_url = format!("{}/missing-openrouter", server.uri());
+        let state = AppState::initialize(config).await.unwrap();
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "accessToken": "fresh-access"
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": [{"id":"test-model"}]
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let stalled = Mock::given(path("/prices"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(120))
+                    .set_body_json(json!({})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let blocking = BlockingTasks::new();
+        for name in ["first", "next"] {
+            let account = state
+                .db
+                .create_upstream_account(
+                    CreateUpstreamAccountInput {
+                        tenant_external_id: "worker-oauth-followup".into(),
+                        name: name.into(),
+                        driver: "http-json".into(),
+                        config: json!({"base_url": server.uri()}),
+                        credential: UpstreamCredential::OAuth {
+                            access_token: "expired-access".into(),
+                            refresh_token: Some("refresh-token".into()),
+                            expires_at: Some(1),
+                            header: "authorization".into(),
+                            prefix: "Bearer ".into(),
+                            adapter_state: None,
+                            proxy_url: None,
+                            proxy_network_scope: None,
+                        },
+                        oauth_session_id: Some(Uuid::now_v7()),
+                        oauth_driver: Some("cursor".into()),
+                        oauth_refresh_url: Some(format!("{}/refresh", server.uri())),
+                    },
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(45),
+                refresh_expiring_oauth(&state, account.id, 1, &blocking),
+            )
+            .await
+            .expect("price work must yield the renewal lane")
+            .unwrap();
+            let (current, _) = state
+                .db
+                .upstream_account_with_credential(account.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(current.credential_generation, 2);
+            let catalog = state
+                .db
+                .upstream_model_catalog(account.id, "worker-oauth-followup", None, 100)
+                .await
+                .unwrap();
+            assert_eq!(catalog.status, "ready");
+            assert_eq!(catalog.models.len(), 1);
+            if name == "first" {
+                // Keep the first response stalled while the next account renews.
+                Mock::given(path("/prices"))
+                    .respond_with(ResponseTemplate::new(503))
+                    .with_priority(1)
+                    .mount(&server)
+                    .await;
+            }
+        }
+        drop(stalled);
+        server.verify().await;
+    }
 
     #[tokio::test]
     async fn oauth_worker_reclaims_stale_undispatched_claim_but_not_unknown_outcome() {
@@ -1316,6 +1558,105 @@ mod tests {
             refresh_expiring_oauth(&state, uncertain.id, 1, &blocking).await,
             Err(AppError::Conflict(message)) if message.contains("outcome is unknown")
         ));
+        // Both a manual endpoint and a stale worker takeover may have saved a
+        // result under a key different from the deterministic generation key.
+        for pending_key in ["manual-refresh-result", "oauth-worker-takeover-result"] {
+            let pending = state
+                .db
+                .create_upstream_account(
+                    make_account(pending_key),
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .claim_upstream_oauth_refresh(
+                    pending.id,
+                    pending_key,
+                    state.config.key_pepper.as_bytes(),
+                )
+                .await
+                .unwrap();
+            state
+                .db
+                .mark_upstream_oauth_refresh_request_started(pending.id, pending_key)
+                .await
+                .unwrap();
+            let saved = UpstreamCredential::OAuth {
+                access_token: "already-refreshed-access".into(),
+                refresh_token: Some("already-rotated-refresh".into()),
+                expires_at: Some(crate::db::unix_millis() + 900_000),
+                header: "authorization".into(),
+                prefix: "Bearer ".into(),
+                adapter_state: None,
+                proxy_url: None,
+                proxy_network_scope: None,
+            };
+            let encrypted =
+                crate::provider::seal_credential(&saved, state.config.key_pepper.as_bytes())
+                    .unwrap();
+            sqlx::query("UPDATE upstream_oauth_refresh_leases SET pending_credential_ciphertext = $1, pending_expires_at = $2, lease_expires_at = 0 WHERE account_id = $3")
+                .bind(encrypted).bind(saved.expires_at()).bind(pending.id.to_string())
+                .execute(&test_pool).await.unwrap();
+            refresh_expiring_oauth(&state, pending.id, 1, &blocking)
+                .await
+                .unwrap();
+            let installed = state
+                .db
+                .upstream_account_with_credential(pending.id, state.config.key_pepper.as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(installed.0.credential_generation, 2);
+            assert_eq!(
+                serde_json::to_value(&installed.1).unwrap()["refresh_token"],
+                "already-rotated-refresh"
+            );
+        }
+
+        // A new authorization installed after the scheduler's snapshot must
+        // not be refreshed with the old selected generation.
+        let replaced = state
+            .db
+            .create_upstream_account(
+                make_account("manual-replacement"),
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        let (_, replacement) = state
+            .db
+            .upstream_account_with_credential(replaced.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        state
+            .db
+            .rotate_upstream_credential(
+                replaced.id,
+                replacement,
+                "operator-replacement",
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            refresh_expiring_oauth(&state, replaced.id, 1, &blocking).await,
+            Err(AppError::Conflict(message)) if message.contains("changed after automatic refresh")
+        ));
+        let installed = state
+            .db
+            .upstream_account_with_credential(replaced.id, state.config.key_pepper.as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(installed.0.credential_generation, 2);
+        let claims: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+        )
+        .bind(replaced.id.to_string())
+        .fetch_one(&test_pool)
+        .await
+        .unwrap();
+        assert_eq!(claims, 0, "stale scheduling must roll back its claim");
         server.verify().await;
     }
 

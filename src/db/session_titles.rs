@@ -9,6 +9,8 @@ pub(crate) struct SessionTitleView {
     pub state: String,
     pub error_code: Option<String>,
     pub updated_at: Option<i64>,
+    pub source: String,
+    pub revision: i64,
 }
 
 pub(crate) struct SessionTitleTask {
@@ -52,7 +54,7 @@ impl Database {
         key_id: Uuid,
         session_id: Uuid,
     ) -> Result<SessionTitleView, AppError> {
-        let row = sqlx::query("SELECT title, state, error_code, updated_at FROM session_generated_titles WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3")
+        let row = sqlx::query("SELECT title, state, error_code, updated_at, title_source, revision FROM session_generated_titles WHERE tenant_id = $1 AND key_id = $2 AND session_id = $3")
             .bind(tenant_id.to_string()).bind(key_id.to_string()).bind(session_id.to_string())
             .fetch_optional(&self.pool).await?;
         match row {
@@ -61,12 +63,16 @@ impl Database {
                 state: row.try_get("state")?,
                 error_code: row.try_get("error_code")?,
                 updated_at: Some(row.try_get("updated_at")?),
+                source: row.try_get("title_source")?,
+                revision: row.try_get("revision")?,
             }),
             None => Ok(SessionTitleView {
                 title: None,
                 state: "unavailable".into(),
                 error_code: None,
                 updated_at: None,
+                source: "unknown".into(),
+                revision: 0,
             }),
         }
     }
@@ -80,7 +86,7 @@ impl Database {
         session_id: Uuid,
     ) -> Result<SessionTitleView, AppError> {
         let now = unix_millis();
-        sqlx::query("INSERT INTO session_generated_titles (tenant_id, key_id, session_id, next_attempt_at, updated_at) VALUES ($1, $2, $3, $4, $4) ON CONFLICT(tenant_id, key_id, session_id) DO UPDATE SET state = 'pending', revision = session_generated_titles.revision + 1, attempts = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at, lease_owner = NULL, lease_until = NULL, error_code = NULL WHERE session_generated_titles.state NOT IN ('pending', 'running') OR (session_generated_titles.state = 'running' AND session_generated_titles.lease_until <= excluded.updated_at)")
+        sqlx::query("INSERT INTO session_generated_titles (tenant_id, key_id, session_id, next_attempt_at, updated_at) VALUES ($1, $2, $3, $4, $4) ON CONFLICT(tenant_id, key_id, session_id) DO UPDATE SET state = 'pending', revision = session_generated_titles.revision + 1, attempts = 0, next_attempt_at = excluded.next_attempt_at, updated_at = excluded.updated_at, lease_owner = NULL, lease_until = NULL, error_code = NULL WHERE session_generated_titles.title_source = 'generated' AND (session_generated_titles.state NOT IN ('pending', 'running') OR (session_generated_titles.state = 'running' AND session_generated_titles.lease_until <= excluded.updated_at))")
             .bind(tenant_id.to_string()).bind(key_id.to_string()).bind(session_id.to_string())
             .bind(now).execute(&self.pool).await?;
         self.session_title(tenant_id, key_id, session_id).await
@@ -169,7 +175,8 @@ impl Database {
 
     /// Read only two small JSON prefixes from existing user-message atoms.
     /// Prefixes may end mid-JSON: they are untrusted model input, never parsed
-    /// as a protocol request. Neither tool bodies nor archive objects are read.
+    /// as a protocol request. Archive bytes are verified as a stream; only
+    /// the selected character prefix is retained in memory.
     pub(crate) async fn session_title_sample(
         &self,
         task: &SessionTitleTask,
@@ -190,16 +197,24 @@ impl Database {
              selected AS (SELECT p.atom_hash FROM path p JOIN semantic_atoms a \
                  ON a.tenant_id = $1 AND a.content_hash = p.atom_hash \
                  WHERE a.role = 'user' AND a.kind = 'message' ORDER BY p.depth {order} LIMIT 1) \
-             SELECT SUBSTR(a.content_json, 1, 1024) FROM selected \
+             SELECT a.content_json FROM selected \
              JOIN semantic_atoms a ON a.tenant_id = $1 AND a.content_hash = selected.atom_hash"
         );
-        Ok(sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
+        let reference: Option<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(statement))
             .bind(task.tenant_id.to_string())
             .bind(task.key_id.to_string())
             .bind(task.session_id.to_string())
             .fetch_optional(&self.pool)
-            .await?
-            .unwrap_or_default())
+            .await?;
+        match reference {
+            Some(reference) => {
+                let (sample, _) = self
+                    .read_body_reference_range(task.tenant_id, &reference, 0, 1024)
+                    .await?;
+                Ok(sample)
+            }
+            None => Ok(String::new()),
+        }
     }
 
     /// One indexed batch for the already authorized list page; never one
@@ -223,7 +238,7 @@ impl Database {
             .collect::<Vec<_>>()
             .join(" OR ");
         let statement = format!(
-            "SELECT key_id, session_id, title FROM session_generated_titles WHERE tenant_id = $1 AND title IS NOT NULL AND ({predicates})"
+            "SELECT key_id, session_id, title, title_source FROM session_generated_titles WHERE tenant_id = $1 AND title IS NOT NULL AND ({predicates})"
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(statement)).bind(tenant_id);
         for session in sessions.iter() {
@@ -241,13 +256,21 @@ impl Database {
                         row.try_get::<String, _>("key_id")?,
                         row.try_get::<String, _>("session_id")?,
                     ),
-                    row.try_get::<String, _>("title")?,
+                    (
+                        row.try_get::<String, _>("title")?,
+                        row.try_get::<String, _>("title_source")?,
+                    ),
                 ))
             })
             .collect::<Result<std::collections::HashMap<_, _>, AppError>>()?;
         for session in sessions {
-            if let Some(title) =
+            if let Some((title, source)) =
                 titles.get(&(session.key_id.to_string(), session.session_id.clone()))
+                && (source != "generated"
+                    || session
+                        .session_name
+                        .as_ref()
+                        .is_none_or(|name| name.trim().is_empty()))
             {
                 session.session_name = Some(title.clone());
             }
@@ -316,7 +339,7 @@ mod tests {
         let session = observe(
             &db,
             &key,
-            &json!({"input":[{"role":"user","content":"Repair session history loading"}]}),
+            &json!({"input":[{"role":"user","content":format!("Repair session history loading {}", "工具😀".repeat(20_000))}]}),
             &ConversationHints::default(),
             Uuid::now_v7(),
             1,
@@ -348,12 +371,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(
-            db.session_title_sample(&first, false)
-                .await
-                .unwrap()
-                .contains("Repair session")
-        );
+        let sample = db.session_title_sample(&first, false).await.unwrap();
+        assert!(sample.contains("Repair session"));
+        assert_eq!(sample.chars().count(), 1024);
+        assert!(sample.contains("工具😀"));
         assert!(
             db.session_title_tenant("other", key.key_id, session)
                 .await

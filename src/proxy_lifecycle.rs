@@ -23,6 +23,7 @@ pub(crate) mod pending_terminal;
 #[derive(Default)]
 pub(crate) struct ProxyLifecycleCounter {
     active: AtomicUsize,
+    idle: tokio::sync::Notify,
 }
 
 impl ProxyLifecycleCounter {
@@ -38,10 +39,15 @@ impl ProxyLifecycleCounter {
         self.active.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
     pub(crate) async fn wait_for_idle(&self) {
-        while self.active() != 0 {
-            tokio::task::yield_now().await;
+        loop {
+            let idle = self.idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.active() == 0 {
+                return;
+            }
+            idle.await;
         }
     }
 }
@@ -65,7 +71,9 @@ impl ProxyLifecycleActivity {
 
 impl Drop for ProxyLifecycleActivity {
     fn drop(&mut self) {
-        self.counter.active.fetch_sub(1, Ordering::AcqRel);
+        if self.counter.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.counter.idle.notify_waiters();
+        }
     }
 }
 
@@ -214,6 +222,20 @@ pub(crate) fn response_archive_requires_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_idle_notification_retains_all_accepted_activities() {
+        let counter = Arc::new(ProxyLifecycleCounter::default());
+        let first = counter.start();
+        let second = counter.start();
+        let mut drain = Box::pin(counter.wait_for_idle());
+        assert!(futures_util::poll!(&mut drain).is_pending());
+        drop(first);
+        assert!(futures_util::poll!(&mut drain).is_pending());
+        drop(second);
+        assert!(futures_util::poll!(&mut drain).is_ready());
+        counter.wait_for_idle().await;
+    }
 
     #[tokio::test]
     async fn proxy_staging_intent_does_not_persist_a_body_digest() {

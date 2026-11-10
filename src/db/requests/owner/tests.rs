@@ -67,7 +67,7 @@ impl Fixture {
         Some(Self {
             database,
             replica,
-            admin,
+            admin: admin.into(),
             schema,
             replica_name,
             key,

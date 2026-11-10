@@ -61,7 +61,7 @@ test("drain exempts only one explicitly owned unknown hold and its exact durable
 });
 
 test("unknown requires owned semantics exactly once while retaining its receipt, hold and no financial ACK", () => {
-  const responseObject = 'inline-json:{"error":{"code":"upstream_invalid_response","message":"上游请求失败。上游响应无效。","message_en":"upstream request failed. the upstream response was invalid.","type":"upstream_error"}}';
+  const responseObject = 'gap://request/response';
   const claim = {
     request_id: "request", tenant_id: "tenant", key_id: "key", account_id: "account",
     reservation_id: "reservation", owner_token: "owner", fence: "fence", contract_digest: "digest",
@@ -147,46 +147,54 @@ test("unknown requires owned semantics exactly once while retaining its receipt,
   assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, usage_basis: "provider_reported" }), /fabricate provider usage/u);
   assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, reservation: { id: "reservation", reserved_micros: 0 } }), /original reservation/u);
   assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, operational_terminal: { ...receipt.operational_terminal, completed_at: 1235 } }), /operational ACK/u);
-  assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, response_object: "inline-json:private upstream body" }), /safe local error/u);
+  assert.throws(() => assertUnknownFinancialEvidence(row, { ...receipt, response_object: "inline-json:private upstream body" }), /raw response handoff/u);
 });
 
-test("unknown source requires the exact bound locator, digest and original object bytes", () => {
+test("unknown source requires exact tenant CAS roots, source digests and observed original bytes", () => {
   const archive = mkdtempSync(join(tmpdir(), "mtc-unknown-source-contract-"));
   const requestId = "00000000-0000-4000-8000-000000000001";
-  const locator = `staging/proxy/${requestId}/request/${requestId}/body.json`;
+  const tenant = "00000000-0000-4000-8000-000000000002";
+  const digest = "a".repeat(64);
+  const locator = `tenants/${tenant}/cas/v1/blake3/aa/${digest}`;
+  const staged = `staging/proxy/${requestId}/request/${requestId}/body.json`;
   const row = {
-    request_id: requestId, request_object: locator, bound_locator: locator, spool_state: "bound",
-    body_byte_count: 512, body_blake3: "a".repeat(64), source_intent_digest: "a".repeat(64),
+    request_id: requestId, tenant_id: tenant, request_object: locator, bound_locator: staged, spool_state: "bound",
+    body_byte_count: 512, body_blake3: digest, source_intent_digest: digest,
     spool_plain_bytes: 0, spool_cipher_bytes: 0, chunk_count: 0,
   };
   const plan = inputPlan(512);
   const body = Buffer.concat([plan.prefix, Buffer.alloc(plan.fillBytes, "x"), plan.suffix]);
-  const path = join(archive, locator);
+  const writeOriginal = (side: string, hash: string, bytes: Buffer) => {
+    const object = `tenants/${tenant}/cas/v1/blake3/${hash.slice(0, 2)}/${hash}`;
+    const root = join(archive, `tenants/${tenant}/raw/v1/${requestId}/${side}.json`);
+    mkdirSync(dirname(root), { recursive: true });
+    mkdirSync(dirname(join(archive, object)), { recursive: true });
+    writeFileSync(join(archive, object), bytes);
+    writeFileSync(root, JSON.stringify({ object_locator: object, size_bytes: bytes.length, blake3_digest: hash }));
+  };
   try {
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, body);
+    writeOriginal("request", digest, body);
+    writeOriginal("response", "b".repeat(64), outputPlan(512).prefix.subarray(0, 16));
     const evidence = assertUnknownArchiveEvidence(row, archive);
-    assert.deepEqual(evidence, { locator, bytes: 512, blake3: row.body_blake3, sha256: planHash(plan) });
+    assert.equal(evidence.locator, locator);
+    assert.equal(evidence.sha256, planHash(plan));
+    assert.equal(evidence.complete_training_fidelity_certified, false);
     assert.throws(() => assertUnknownArchiveEvidence({ ...row, request_id: "../outside" }, archive), /canonical request identity/u);
+    assert.throws(() => assertUnknownArchiveEvidence({ ...row, tenant_id: "../outside" }, archive), /canonical tenant identity/u);
     assert.throws(() => assertUnknownArchiveEvidence({ ...row, source_intent_digest: "b".repeat(64) }, archive), /staging digest/u);
-    for (const field of ["request_object", "bound_locator"]) {
-      for (const value of ["gap://missing", locator.replace(requestId, "other-request"), "../outside"]) {
-        assert.throws(() => assertUnknownArchiveEvidence({ ...row, [field]: value }, archive), /exact request-bound source locator/u);
-      }
-    }
+    assert.throws(() => assertUnknownArchiveEvidence({ ...row, bound_locator: "../outside" }, archive), /exact request-bound source locator/u);
+    assert.throws(() => assertUnknownArchiveEvidence({ ...row, request_object: staged }, archive), /exact CAS locator/u);
     for (const state of ["pending", "capturing", "gap"]) assert.throws(() => assertUnknownArchiveEvidence({ ...row, spool_state: state }, archive), /remain durable/u);
     assert.throws(() => assertUnknownArchiveEvidence({ ...row, body_byte_count: 511 }, archive), /exact 512 byte length/u);
-    for (const digest of [null, "", "0".repeat(64), "A".repeat(64), "b".repeat(64)]) {
-      assert.throws(() => assertUnknownArchiveEvidence({ ...row, body_blake3: digest }, archive), /staging digest/u);
-    }
     for (const field of ["spool_plain_bytes", "spool_cipher_bytes", "chunk_count"]) {
       assert.throws(() => assertUnknownArchiveEvidence({ ...row, [field]: 1 }, archive), /zero encrypted spool accounting/u);
     }
-    writeFileSync(path, Buffer.alloc(512, "y"));
-    assert.throws(() => assertUnknownArchiveEvidence(row, archive), /original request bytes\/hash/u);
-    writeFileSync(path, body.subarray(0, 511));
-    assert.throws(() => assertUnknownArchiveEvidence(row, archive), /original request bytes\/hash/u);
-    rmSync(path);
+    writeOriginal("response", "b".repeat(64), Buffer.from("safe local error"));
+    assert.throws(() => assertUnknownArchiveEvidence(row, archive), /original response bytes/u);
+    writeOriginal("response", "b".repeat(64), outputPlan(512).prefix.subarray(0, 16));
+    writeFileSync(join(archive, locator), Buffer.alloc(512, "y"));
+    assert.throws(() => assertUnknownArchiveEvidence(row, archive), /original request bytes/u);
+    rmSync(join(archive, locator));
     assert.throws(() => assertUnknownArchiveEvidence(row, archive), /ENOENT/u);
   } finally { rmSync(archive, { recursive: true, force: true }); }
 });

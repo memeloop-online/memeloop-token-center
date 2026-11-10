@@ -1,4 +1,5 @@
-use sqlx::{Any, AnyPool, Row, Transaction};
+use crate::db::request_pool::RequestPool as AnyPool;
+use sqlx::{Any, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::AppError;

@@ -39,7 +39,8 @@ impl Server {
     }
 
     async fn start_with_response_gate(gate: Option<(Arc<Notify>, Arc<Notify>)>) -> Self {
-        let (state, directory) = crate::api::tests::test_state().await;
+        let (mut state, directory) = crate::api::tests::test_state().await;
+        Arc::make_mut(&mut state.config).audio_body_max_bytes = LIMIT as u32;
         let issued = state
             .db
             .create_key(
@@ -62,13 +63,32 @@ impl Server {
         // middleware, with a counted upstream substitute after admission.
         let app = Router::new()
             .route(
-                "/v1/chat/completions",
+                "/v1/audio/transcriptions",
                 post(move || {
                     let calls = calls.clone();
                     async move {
                         calls.fetch_add(1, Ordering::Relaxed);
                         "ok"
                     }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|request: axum::extract::Request| async move {
+                    let source = request
+                        .extensions()
+                        .get::<Arc<crate::gateway_body::request_spool::RequestSpool>>()
+                        .expect("durable chat retains its captured source")
+                        .clone();
+                    let bytes = source.read_all().await.unwrap();
+                    assert!(bytes.len() > LIMIT);
+                    let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        document["messages"][0]["content"].as_str().unwrap().len(),
+                        LIMIT + 1024
+                    );
+                    assert_eq!(document["sentinel"], "complete upload");
+                    "ok"
                 }),
             )
             .layer(middleware::from_fn_with_state(
@@ -115,7 +135,7 @@ impl Server {
 
     fn headers(&self, framing: &str) -> Vec<u8> {
         format!(
-            "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\n{framing}\r\n",
+            "POST /v1/audio/transcriptions HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\n{framing}\r\n",
             self.key
         )
         .into_bytes()
@@ -148,16 +168,60 @@ async fn read_response(reader: &mut (impl tokio::io::AsyncRead + Unpin)) -> Vec<
     response
 }
 
+fn response_body(response: &[u8]) -> Vec<u8> {
+    let header_end = response
+        .windows(4)
+        .position(|bytes| bytes == b"\r\n\r\n")
+        .expect("complete response headers");
+    let headers = std::str::from_utf8(&response[..header_end]).unwrap();
+    let mut body = &response[header_end + 4..];
+    let mut content_length = None;
+    let mut chunked = false;
+    for line in headers.lines().skip(1) {
+        let (name, value) = line.split_once(':').unwrap();
+        if name.eq_ignore_ascii_case("content-length") {
+            assert!(content_length.is_none(), "duplicate Content-Length");
+            content_length = Some(value.trim().parse::<usize>().unwrap());
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            assert!(!chunked, "duplicate Transfer-Encoding");
+            assert!(value.trim().eq_ignore_ascii_case("chunked"));
+            chunked = true;
+        }
+    }
+    if !chunked {
+        assert_eq!(body.len(), content_length.expect("framed response body"));
+        return body.to_vec();
+    }
+    assert!(content_length.is_none(), "ambiguous response framing");
+    let mut decoded = Vec::new();
+    loop {
+        let line_end = body
+            .windows(2)
+            .position(|bytes| bytes == b"\r\n")
+            .expect("complete chunk size");
+        let size = std::str::from_utf8(&body[..line_end]).unwrap();
+        let size = usize::from_str_radix(size.split(';').next().unwrap(), 16).unwrap();
+        body = &body[line_end + 2..];
+        if size == 0 {
+            // This handler emits no trailers. Require the terminating blank
+            // line and reject any bytes beyond the complete response.
+            assert_eq!(body, b"\r\n", "complete chunk terminator");
+            return decoded;
+        }
+        assert!(body.len() >= 2 && size <= body.len() - 2, "complete chunk");
+        decoded.extend_from_slice(&body[..size]);
+        assert_eq!(&body[size..size + 2], b"\r\n");
+        body = &body[size + 2..];
+    }
+}
+
 fn assert_rejection(response: &[u8]) {
     let response = std::str::from_utf8(response).unwrap();
     assert!(response.starts_with("HTTP/1.1 413"), "{response}");
     assert!(!response.contains("100 Continue"), "{response}");
     let (headers, body) = response.split_once("\r\n\r\n").unwrap();
-    let id = headers
-        .lines()
-        .find_map(|line| line.strip_prefix("x-mtc-request-id: "))
-        .expect("production request ID survives transport teardown");
-    uuid::Uuid::parse_str(id).unwrap();
+    // Audio requests do not enter the text-request ID journal; the response
+    // framing and rejection remain mandatory for the audio admission path.
     let json: serde_json::Value = serde_json::from_str(body).unwrap();
     assert_eq!(json["error"]["code"], "request_body_too_large");
     assert!(headers.contains("connection: close"));
@@ -187,7 +251,7 @@ async fn http1_completed_upload_half_close_preserves_pending_response() {
     release.notify_one();
     let response = read_response(&mut socket).await;
     assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
-    assert!(response.ends_with(b"ok"), "{response:?}");
+    assert_eq!(response_body(&response), b"ok");
     assert_eq!(server.reached_handler.load(Ordering::Relaxed), 1);
     assert_eq!(server.state.gateway_body_reads.load(Ordering::Acquire), 0);
     server.stop().await;
@@ -296,4 +360,37 @@ async fn http1_never_ending_rejected_upload_does_not_block_shutdown() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn http1_durable_chat_exceeds_hot_body_limit_without_truncation_or_resource_leaks() {
+    let server = Server::start().await;
+    let initial_permits = server.state.gateway_body_read_permits.available_permits();
+    let body = serde_json::to_vec(&serde_json::json!({
+        "messages": [{"role": "user", "content": "x".repeat(LIMIT + 1024)}],
+        "sentinel": "complete upload"
+    }))
+    .unwrap();
+    let mut socket = TcpStream::connect(server.address).await.unwrap();
+    let headers = String::from_utf8(server.headers(&format!(
+        "Content-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    )))
+    .unwrap()
+    .replace("/v1/audio/transcriptions", "/v1/chat/completions");
+    socket.write_all(headers.as_bytes()).await.unwrap();
+    socket.write_all(&body).await.unwrap();
+    let response = read_response(&mut socket).await;
+    assert!(response.starts_with(b"HTTP/1.1 200"), "{response:?}");
+    assert_eq!(response_body(&response), b"ok");
+    assert_eq!(server.state.gateway_body_reads.load(Ordering::Acquire), 0);
+    assert_eq!(server.state.proxy_memory_budget.snapshot().0, 0);
+    let spool = server.state.responses_request_spool.snapshot();
+    assert_eq!(spool.used_bytes, 0);
+    assert_eq!(spool.active_files, 0);
+    assert_eq!(
+        server.state.gateway_body_read_permits.available_permits(),
+        initial_permits
+    );
+    server.stop().await;
 }

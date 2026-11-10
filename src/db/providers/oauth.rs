@@ -221,6 +221,7 @@ impl Database {
             return Ok((view, false));
         }
 
+        crate::db::transport_proxy_management::lock(&mut tx).await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a, c"
@@ -295,7 +296,30 @@ impl Database {
         };
         let mut view = upstream_account_view(row)?;
 
-        if proxy_changed {
+        let managed_transport = driver == crate::oauth::codex_device::PROVIDER_DRIVER
+            || crate::oauth::authorization_code::supports_managed_transport(&current_credential);
+        let changed = if managed_transport {
+            let changed = self
+                .apply_legacy_transport_proxy(
+                    &mut tx,
+                    account_id,
+                    tenant_external_id,
+                    &proxy_url,
+                    generation,
+                    updated_at,
+                    !proxy_changed,
+                    actor_service_id,
+                    key_material,
+                )
+                .await?;
+            let current = sqlx::query("SELECT config_json, credential_generation, updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(account_id.to_string()).fetch_one(&mut *tx).await?;
+            view.config = serde_json::from_str(&current.try_get::<String, _>("config_json")?)
+                .map_err(|_| AppError::internal("transport_policy_projection"))?;
+            view.credential_generation = current.try_get("credential_generation")?;
+            view.updated_at = current.try_get("updated_at")?;
+            changed
+        } else if proxy_changed {
             let mut preserve_refresh_fence = false;
             if let Some(refresh) = refresh {
                 let dispatched = refresh
@@ -367,13 +391,21 @@ impl Database {
                     "reload the upstream provider before changing its transport proxy".into(),
                 ));
             }
+            view.credential_generation = next_generation;
+            view.credential_expires_at = replacement.expires_at();
+            view.updated_at = next_updated_at;
+            true
+        } else {
+            false
+        };
+        if changed {
             sqlx::query(
                 "INSERT INTO upstream_transport_proxy_audit (id, upstream_account_id, tenant_id, credential_generation, previous_fingerprint, previous_scheme, new_fingerprint, new_scheme, remote_dns, actor_service_id, operator_is_bootstrap, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(account_id.to_string())
             .bind(view.tenant_id.to_string())
-            .bind(next_generation)
+            .bind(view.credential_generation)
             .bind(old_metadata.fingerprint)
             .bind(old_metadata.scheme)
             .bind(new_metadata.fingerprint.clone())
@@ -384,9 +416,6 @@ impl Database {
             .bind(now)
             .execute(&mut *tx)
             .await?;
-            view.credential_generation = next_generation;
-            view.credential_expires_at = replacement.expires_at();
-            view.updated_at = next_updated_at;
         }
         view.attach_proxy_metadata(&replacement, key_material)?;
         store_credential_rotation_response(
@@ -400,7 +429,7 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok((view, proxy_changed))
+        Ok((view, changed))
     }
 
     pub async fn disconnect_upstream_oauth(
@@ -833,6 +862,24 @@ impl Database {
         idempotency_key: &str,
         key_material: &[u8],
     ) -> Result<ClaimUpstreamOAuthRefreshResult, AppError> {
+        self.claim_upstream_oauth_refresh_for_generation(
+            account_id,
+            idempotency_key,
+            None,
+            key_material,
+        )
+        .await
+    }
+
+    /// Worker selection is a snapshot. Do not dispatch against authorization
+    /// installed after that snapshot by a manual refresh or reauthorization.
+    pub(crate) async fn claim_upstream_oauth_refresh_for_generation(
+        &self,
+        account_id: Uuid,
+        idempotency_key: &str,
+        expected_generation: Option<i64>,
+        key_material: &[u8],
+    ) -> Result<ClaimUpstreamOAuthRefreshResult, AppError> {
         validate_idempotency_key(idempotency_key, "Idempotency-Key")?;
         let idempotency_key = idempotency_key.trim();
         let now = unix_millis();
@@ -937,7 +984,48 @@ impl Database {
             ));
         }
         let generation: i64 = account.try_get("credential_generation")?;
+        if expected_generation.is_some_and(|expected| expected != generation) {
+            return Err(AppError::Conflict(
+                "OAuth credential changed after automatic refresh was scheduled".into(),
+            ));
+        }
         let (driver, refresh_url) = oauth_refresh_lifecycle_from_row(&account)?;
+        // Kimi's official refresh contract permits retrying a transient failed
+        // exchange with the same token. Only an explicit operator request may
+        // take over a completed, expired operation; the worker cannot turn
+        // exhausted retries into an unbounded background loop.
+        if expected_generation.is_none() && driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+            let prior = sqlx::query(
+                "SELECT l.created_at, l.lease_expires_at, l.request_started_at, l.pending_credential_ciphertext, c.oauth_refresh_diagnostic_json FROM upstream_oauth_refresh_leases l JOIN upstream_credentials c ON c.upstream_account_id = l.account_id AND c.generation = l.credential_generation WHERE l.account_id = $1 AND l.credential_generation = $2",
+            ).bind(account_id.to_string()).bind(generation).fetch_optional(&mut *tx).await?;
+            if let Some(prior) = prior {
+                let created: i64 = prior.try_get("created_at")?;
+                let diagnostic: Option<String> = prior.try_get("oauth_refresh_diagnostic_json")?;
+                let request_started_at: Option<i64> = prior.try_get("request_started_at")?;
+                let retryable = diagnostic
+                    .as_deref()
+                    .and_then(|value| {
+                        crate::oauth::OAuthRefreshDiagnostic::from_json(value, generation)
+                    })
+                    .is_some_and(|value| {
+                        request_started_at
+                            .is_some_and(|started| value.allows_kimi_retry(created, started))
+                    });
+                if retryable
+                    && prior.try_get::<i64, _>("lease_expires_at")? <= now
+                    && prior
+                        .try_get::<Option<i64>, _>("request_started_at")?
+                        .is_some()
+                    && prior
+                        .try_get::<Option<String>, _>("pending_credential_ciphertext")?
+                        .is_none()
+                {
+                    sqlx::query("DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 AND created_at = $3 AND lease_expires_at <= $4 AND pending_credential_ciphertext IS NULL")
+                        .bind(account_id.to_string()).bind(generation).bind(created).bind(now)
+                        .execute(&mut *tx).await?;
+                }
+            }
+        }
         let lease_expires_at = now.saturating_add(UPSTREAM_OAUTH_REFRESH_LEASE_MILLIS);
         let leased = sqlx::query(
             "INSERT INTO upstream_oauth_refresh_leases (account_id, credential_generation, idempotency_key, lease_expires_at, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(account_id) DO UPDATE SET credential_generation = excluded.credential_generation, idempotency_key = excluded.idempotency_key, pending_credential_ciphertext = NULL, pending_expires_at = NULL, request_started_at = NULL, lease_expires_at = excluded.lease_expires_at, created_at = excluded.created_at WHERE (upstream_oauth_refresh_leases.pending_credential_ciphertext IS NULL AND upstream_oauth_refresh_leases.request_started_at IS NULL AND upstream_oauth_refresh_leases.lease_expires_at <= $5) OR upstream_oauth_refresh_leases.credential_generation <> excluded.credential_generation",
@@ -1084,23 +1172,6 @@ impl Database {
             credential,
             idempotency_key,
             key_material,
-            &[std::time::Duration::ZERO, std::time::Duration::ZERO],
-        )
-        .await
-    }
-
-    pub(crate) async fn finish_kimi_oauth_refresh(
-        &self,
-        account_id: Uuid,
-        credential: UpstreamCredential,
-        idempotency_key: &str,
-        key_material: &[u8],
-    ) -> Result<UpstreamAccountView, AppError> {
-        self.finish_upstream_oauth_refresh_with_retry_delays(
-            account_id,
-            credential,
-            idempotency_key,
-            key_material,
             &[
                 std::time::Duration::from_millis(100),
                 std::time::Duration::from_millis(500),
@@ -1140,10 +1211,7 @@ impl Database {
                 Ok(view) => return Ok(view),
                 Err(error)
                     if attempt < retry_delays.len()
-                        && matches!(
-                            error,
-                            AppError::Internal { .. } | AppError::Storage { .. }
-                        ) =>
+                        && retryable_oauth_local_persistence_failure(&error) =>
                 {
                     if retry_delays[attempt].is_zero() {
                         tokio::task::yield_now().await;
@@ -1389,6 +1457,45 @@ impl Database {
         }
         oauth_refresh_lifecycle_from_row(&row)
     }
+    /// The recovery endpoint can only finalize ciphertext already saved by
+    /// the original attempt. It has no dispatch path and never exports its key.
+    pub(crate) async fn recover_upstream_oauth_refresh(
+        &self,
+        account_id: Uuid,
+        key_material: &[u8],
+    ) -> Result<UpstreamAccountView, AppError> {
+        let row = sqlx::query("SELECT l.idempotency_key, l.pending_credential_ciphertext FROM upstream_oauth_refresh_leases l JOIN upstream_accounts a ON a.id = l.account_id AND a.credential_generation = l.credential_generation WHERE l.account_id = $1 AND l.pending_credential_ciphertext IS NOT NULL")
+            .bind(account_id.to_string()).fetch_optional(&self.pool).await?
+            .ok_or_else(|| AppError::Conflict("No saved authorization result is available. Check the current authorization state before continuing.".into()))?;
+        let key: String = row.try_get("idempotency_key")?;
+        let pending: String = row.try_get("pending_credential_ciphertext")?;
+        let credential = open_credential(&pending, key_material)?;
+        self.finish_upstream_oauth_refresh_attempt(
+            account_id,
+            credential,
+            &pending,
+            &key,
+            key_material,
+        )
+        .await
+    }
+
+    /// Recover a saved result (including manual/takeover attempts) with the
+    /// original key. A fresh key cannot install another attempt's pending token.
+    pub(crate) async fn upstream_oauth_refresh_recovery_key(
+        &self,
+        account_id: Uuid,
+        generation: i64,
+    ) -> Result<Option<String>, AppError> {
+        Ok(sqlx::query_scalar(
+            "SELECT idempotency_key FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 AND (pending_credential_ciphertext IS NOT NULL OR request_started_at IS NULL)",
+        )
+        .bind(account_id.to_string())
+        .bind(generation)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
     pub async fn list_managed_oauth_refresh_candidates(
         &self,
         refresh_before: i64,
@@ -1564,6 +1671,22 @@ impl Database {
     }
 }
 
+// These failures can occur before staging a returned, rotated refresh token.
+// Retrying is strictly local and bounded; authorization-server POSTs stay fenced.
+fn retryable_oauth_local_persistence_failure(error: &AppError) -> bool {
+    matches!(
+        error,
+        AppError::Internal { .. }
+            | AppError::Storage { .. }
+            | AppError::Overloaded
+            | AppError::Capacity {
+                code: "database_pool_exhausted",
+                ..
+            }
+            | AppError::DatabaseUnavailable(crate::error::DatabaseFailure::Unavailable)
+    )
+}
+
 fn upstream_credential_rotation_request_hash(
     account_id: Uuid,
     credential: &UpstreamCredential,
@@ -1627,6 +1750,32 @@ mod tests {
         AppState, api,
         config::{Config, RuntimeRole},
     };
+
+    #[test]
+    fn local_retry_tracks_transient_sqlx_classes_without_retrying_fences() {
+        for error in [
+            AppError::from(sqlx::Error::PoolTimedOut),
+            AppError::from(sqlx::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::ConnectionReset,
+            ))),
+            AppError::internal("oauth_local_retry_fixture"),
+            AppError::storage("oauth_local_retry_fixture"),
+        ] {
+            assert!(retryable_oauth_local_persistence_failure(&error));
+        }
+        for error in [
+            AppError::DatabaseUnavailable(crate::error::DatabaseFailure::StorageFull),
+            AppError::capacity_error("unrelated_resource_exhausted"),
+            AppError::Conflict("credential generation superseded".into()),
+            AppError::BadRequest("claim missing".into()),
+            AppError::OAuthRefresh(crate::oauth::OAuthRefreshFailure::new(
+                crate::oauth::OAuthRefreshFailureKind::InvalidGrant,
+                Some(400),
+            )),
+        ] {
+            assert!(!retryable_oauth_local_persistence_failure(&error));
+        }
+    }
 
     mod http1_request {
         include!(concat!(

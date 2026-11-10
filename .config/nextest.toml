@@ -1,0 +1,5 @@
+# These fixtures run concurrent database clients and assert real 25ms budgets.
+# Reserve the four CI suite slots while their own contention scenarios execute.
+[[profile.default.overrides]]
+filter = 'test(allocation_two_gateways_retry_share_history_and_restart)'
+threads-required = 4

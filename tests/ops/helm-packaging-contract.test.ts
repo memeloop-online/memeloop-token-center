@@ -24,12 +24,56 @@ const runtimeFlags = [
   '--set', 'plugins.runtimeInventory.registrySecrets[0].keys[1]=password',
 ];
 
+test('dedicated RustFS is isolated and archive routing requires explicit cutover', () => {
+  const render = (flags: string[] = []): any[] => parseAllDocuments(run(helm, ['template', 'rustfs-test', chart, '--namespace', 'token-center', ...flags])).map(document => document.toJSON()).filter(Boolean);
+  const flags = ['--values', join(chart, 'values-rustfs-test.yaml')];
+  assert.equal(render().some(document => document.metadata?.name?.endsWith('-rustfs')), false);
+  const prepared = render(flags);
+  const storage = prepared.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(storage.spec.replicas, 1);
+  assert.equal(storage.spec.strategy.type, 'Recreate');
+  assert.equal(storage.spec.template.spec.automountServiceAccountToken, false);
+  assert.equal(storage.spec.template.spec.securityContext.runAsUser, 10001);
+  assert.equal(storage.spec.template.spec.containers[0].image, 'rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2');
+  assert.deepEqual(storage.spec.template.spec.volumes.find((volume: any) => volume.name === 'tmp').emptyDir, {});
+  assert.equal(storage.spec.template.spec.volumes.some((volume: any) => volume.name === 'logs'), false);
+  assert.equal(storage.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'RUSTFS_OBS_LOG_DIRECTORY').value, '');
+  const tuned = render([...flags, '--set', 'rustfs.terminationGracePeriodSeconds=180', '--set', 'rustfs.probes.readiness.timeoutSeconds=7']);
+  const tunedStorage = tuned.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(tunedStorage.spec.template.spec.terminationGracePeriodSeconds, 180);
+  assert.equal(tunedStorage.spec.template.spec.containers[0].readinessProbe.timeoutSeconds, 7);
+  assert.throws(() => render([...flags, '--set', 'rustfs.probes.startup.periodSeconds=0']));
+  const claim = prepared.find(document => document.kind === 'PersistentVolumeClaim' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(claim.spec.storageClassName, 'longhorn-large-single');
+  assert.equal(claim.metadata.annotations['helm.sh/resource-policy'], 'keep');
+  const service = prepared.find(document => document.kind === 'Service' && document.metadata.name.endsWith('-rustfs'));
+  assert.equal(service.spec.type, 'ClusterIP');
+  assert.deepEqual(service.spec.selector, storage.spec.selector.matchLabels);
+  assert.equal(service.spec.ports.length, 1);
+  const policy = prepared.find(document => document.kind === 'NetworkPolicy' && document.metadata.name.endsWith('-rustfs'));
+  assert.deepEqual(policy.spec.egress, []);
+  for (const document of prepared.filter(document => document.kind === 'Deployment' && document !== storage)) {
+    assert.equal(document.spec.template.spec.containers[0].env.find((entry: any) => entry.name === 'MTC_S3_ENDPOINT').value, '');
+  }
+  const connected = render([...flags, '--set', 'rustfs.connectArchive=true']);
+  for (const document of connected.filter(document => document.kind === 'Deployment' && !document.metadata.name.endsWith('-rustfs'))) {
+    const environment = document.spec.template.spec.containers[0].env;
+    assert.equal(environment.find((entry: any) => entry.name === 'MTC_S3_ENDPOINT').value, 'http://rustfs-test-memeloop-token-center-rustfs:9000');
+    assert.equal(environment.find((entry: any) => entry.name === 'MTC_S3_ALLOW_HTTP').value, 'true');
+  }
+  assert.equal(render([...flags, '--set', 'rustfs.persistence.existingClaim=retained-archive']).some(document => document.kind === 'PersistentVolumeClaim' && document.metadata.name.endsWith('-rustfs')), false);
+  assert.throws(() => render(['--set', 'rustfs.connectArchive=true']));
+  const pinned = render([...flags, '--set-string', `rustfs.image.digest=${reviewed}`]);
+  assert.equal(pinned.find(document => document.kind === 'Deployment' && document.metadata.name.endsWith('-rustfs')).spec.template.spec.containers[0].image, `rustfs/rustfs@${reviewed}`);
+  if (process.env.KUBECONFORM_BIN) run(process.env.KUBECONFORM_BIN, ['-strict', '-summary', '-ignore-missing-schemas'], { input: run(helm, ['template', 'rustfs-test', chart, ...flags]), stdio: ['pipe', 'pipe', 'pipe'] });
+});
+
 interface RuntimeDeployment {
   kind: string;
   metadata: { annotations: Record<string, string> };
   spec: { template: { metadata: { labels: Record<string, string> }; spec: {
     securityContext: { runAsUser: number; runAsGroup: number; fsGroup: number };
-    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; readOnly?: boolean; subPath?: string }> }>;
+    containers: Array<{ image: string; env: Array<{ name: string; value?: string }>; resources: { requests: Record<string, string>; limits: Record<string, string> }; volumeMounts: Array<{ name: string; mountPath?: string; readOnly?: boolean; subPath?: string }> }>;
     initContainers: Array<{ name: string; image: string; args: string[]; volumeMounts: Array<{ readOnly?: boolean }> }>;
     volumes: Array<{ name: string; emptyDir?: { sizeLimit?: string; medium?: string }; persistentVolumeClaim?: { claimName: string; readOnly: boolean }; secret?: { secretName: string } }>;
   } } };
@@ -136,6 +180,19 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       const role = deployment.spec.template.metadata.labels['app.kubernetes.io/component'];
       const writer = role === 'control';
       const pod = deployment.spec.template.spec;
+      const resources = pod.containers[0]!.resources;
+      const spoolMount = pod.containers[0]!.volumeMounts?.find(item => item.name === 'request-spool');
+      const spoolVolume = pod.volumes?.find(item => item.name === 'request-spool');
+      if (role === 'gateway' || role === 'control' || role === 'all') {
+        assert.equal(spoolMount?.mountPath, '/var/lib/memeloop-token-center/request-spool');
+        assert.deepEqual(spoolVolume?.emptyDir, {});
+        assert.equal(resources.requests['ephemeral-storage'], '2Gi');
+        assert.equal(resources.limits['ephemeral-storage'], undefined);
+        assert.equal(pod.containers[0]!.env.find(item => item.name === 'MTC_RESPONSES_REQUEST_SPOOL_PATH')?.value, spoolMount?.mountPath);
+      } else {
+        assert.equal(spoolMount, undefined);
+        assert.equal(spoolVolume, undefined);
+      }
       const container = pod.containers[0]!;
       assert.equal(pod.securityContext.runAsUser, 10001);
       assert.equal(pod.securityContext.runAsGroup, 10001);
@@ -146,6 +203,7 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(volume.persistentVolumeClaim?.claimName, 'shared-plugin-inventories');
       assert.equal(volume.persistentVolumeClaim?.readOnly, !writer);
       const prepare = pod.initContainers.find(item => item.name === 'prepare-plugin-inventory')!;
+      assert.equal(prepare.args.includes('--allow-unavailable'), true, `${role}: optional inventory must not block startup`);
       assert.equal(prepare.args.includes('--read-only'), !writer, `${role}: readers never initialize`);
       assert.equal(prepare.volumeMounts[0]!.readOnly, !writer);
       assert.equal(pod.volumes.some(item => item.secret?.secretName === 'publisher-trust'), writer);
@@ -158,11 +216,11 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
     count('proxyMemory', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 3);
     count('dev', /name: MTC_PROXY_MEMORY_BUDGET_BYTES\n\s+value: "536870912"/, 1);
     const gatewayDeployment = output.default!.split(/^---$/m).find((document) => document.includes('kind: Deployment') && document.includes('app.kubernetes.io/component: gateway'))!;
-    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+ephemeral-storage: 256Mi\s+memory: 8Gi/);
-    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 64Mi\s+memory: 512Mi/);
+    assert.match(gatewayDeployment, /limits:\s+cpu: [^\n]+\s+memory: 8Gi/);
+    assert.match(gatewayDeployment, /requests:\s+cpu: [^\n]+\s+ephemeral-storage: 2Gi\s+memory: 512Mi/);
     has('fractionalMemory', 'memory: 0.75Gi');
     assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_BYTES'));
-    assert.ok(!output.default!.includes('MTC_RESPONSES_REQUEST_SPOOL_PATH'));
+    count('default', /name: MTC_RESPONSES_REQUEST_SPOOL_PATH\n\s+value: \/var\/lib\/memeloop-token-center\/request-spool/, 2);
     assert.ok(!output.default!.includes('responses-request-spool'));
     const deployments = parseAllDocuments(output.default!).map(document => document.toJSON() as RuntimeDeployment).filter(document => document?.kind === 'Deployment');
     const defaultMemory: Record<string, string[]> = { gateway: ['512Mi', '8Gi'], control: ['128Mi', '256Mi'], worker: ['192Mi', '384Mi'] };
@@ -206,6 +264,8 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(deployment.spec.template.spec.initContainers.find(item => item.name === 'prepare-plugin-inventory')!.image, expected, `${role}: init/runtime image compatibility`);
     }
     count('default', 'type: RollingUpdate', 3); count('recreate', 'type: Recreate', 3); lacks('recreate', 'rollingUpdate:');
+    count('default', 'maxUnavailable: 0', 1);
+    count('default', 'maxSurge: 1', 1);
     count('default', /readinessProbe:\s+httpGet: \{ path: "?\/readyz"?, port: http \}/g, 3);
     const services = parseAllDocuments(output.default!).map(document => document.toJSON()).filter(document => document?.kind === 'Service');
     for (const role of ['gateway', 'control']) {
@@ -319,4 +379,22 @@ test('Helm chart packaging, security, ingress, and schema contracts', () => {
       assert.equal(result.status, 0, result.stderr);
     }
   } finally { rmSync(workspace, { recursive: true, force: true }); }
+});
+
+
+test('worker shares bootstrap grant authority while gateway keeps its role sentinel', () => {
+  const documents = parseAllDocuments(run(helm, ['template', 'grant-authority', chart,
+    '--set', 'config.serviceTokenSecret.name=grant-authority-secret',
+    '--set', 'config.serviceTokenSecret.key=authority-token',
+  ])).map(document => document.toJSON()).filter(Boolean);
+  for (const role of ['control', 'worker', 'gateway']) {
+    const deployment = documents.find(document => document.kind === 'Deployment'
+      && document.metadata.name.endsWith(`-${role}`));
+    assert.ok(deployment, `${role} deployment is rendered`);
+    const environment = deployment.spec.template.spec.containers[0].env;
+    const token = environment.find((entry: any) => entry.name === 'MTC_SERVICE_TOKEN');
+    if (role === 'gateway') assert.equal(token.value, 'bootstrap-disabled-for-this-role');
+    else assert.deepEqual(token.valueFrom.secretKeyRef, { name: 'grant-authority-secret', key: 'authority-token' });
+    if (role === 'worker') assert.equal(environment.some((entry: any) => entry.name === 'MTC_RUNTIME_PROFILING_ENABLED'), false);
+  }
 });

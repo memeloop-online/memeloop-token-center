@@ -24,6 +24,7 @@ use super::{
 };
 
 impl Database {
+    #[cfg(test)]
     pub(crate) async fn prepare_staged_session_body_archive(
         &self,
         lease_owner: Uuid,
@@ -121,6 +122,9 @@ impl Database {
             }
         }
         let (atoms, nodes, media) = body.into_archive_parts();
+        let atoms = self
+            .archive_atom_bodies(super::parse_uuid(tenant_id)?, &atoms)
+            .await?;
         if !self
             .prepare_session_body_archive_in_transaction(
                 &mut transaction,

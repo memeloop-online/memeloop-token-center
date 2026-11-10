@@ -5,7 +5,9 @@
 //! a Responses envelope. Generic HTTP JSON accounts need an explicit
 //! `responses_compact_v2_bridge` opt-in; New API keeps its built-in contract.
 use super::AppError;
+#[cfg(test)]
 use crate::api::kimi_transport::responses::compaction_item;
+#[cfg(test)]
 use bytes::Bytes;
 use serde_json::{Value, json};
 
@@ -80,6 +82,7 @@ pub(in crate::api) fn prepare_compact_request(
     Ok(forwarded)
 }
 
+#[cfg(test)]
 pub(in crate::api) fn compact_to_responses(compact: &Value) -> Result<Value, &'static str> {
     if compact.get("error").is_some_and(|error| !error.is_null()) {
         return Err("provider_error");
@@ -135,6 +138,7 @@ pub(in crate::api) fn compact_to_responses(compact: &Value) -> Result<Value, &'s
     Ok(response)
 }
 
+#[cfg(test)]
 fn require_completed_status(value: &Value) -> Result<(), &'static str> {
     if value
         .get("incomplete_details")
@@ -149,6 +153,7 @@ fn require_completed_status(value: &Value) -> Result<(), &'static str> {
     }
 }
 
+#[cfg(test)]
 fn message_text(item: &Value) -> Option<String> {
     let content = item.get("content")?;
     if let Some(text) = content.as_str() {
@@ -167,6 +172,7 @@ fn message_text(item: &Value) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+#[cfg(test)]
 pub(in crate::api) fn responses_to_sse(response: &Value) -> Result<Bytes, &'static str> {
     require_completed_status(response)?;
     let output = response
@@ -203,6 +209,7 @@ pub(in crate::api) fn responses_to_sse(response: &Value) -> Result<Bytes, &'stat
     Ok(Bytes::from(body))
 }
 
+#[cfg(test)]
 fn push_sse(body: &mut Vec<u8>, event: &str, data: Value) -> Result<(), &'static str> {
     let payload = serde_json::to_vec(&data).map_err(|_| "event_serialization")?;
     body.extend_from_slice(b"event: ");

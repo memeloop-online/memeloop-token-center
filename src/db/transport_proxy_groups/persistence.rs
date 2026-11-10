@@ -1,16 +1,41 @@
 use super::*;
 
 impl TransportProxyGroups {
-    pub(crate) fn start(self: &Arc<Self>, database_url: &str) -> Result<(), sqlx::Error> {
-        let pool = AnyPoolOptions::new()
+    pub(crate) fn start(
+        self: &Arc<Self>,
+        database_url: &str,
+        plugins: crate::plugin::PluginRuntime,
+        #[cfg(feature = "experimental-plugin-revisions")] application_plugins: Option<
+            Arc<crate::plugin::application::ApplicationPlugins>,
+        >,
+    ) -> Result<(), sqlx::Error> {
+        let pool: AnyPool = labeled_pool_options(database_url, "mtc-proxy-group")
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_lazy(database_url)?;
+            .connect_lazy(database_url)?
+            .into();
         let groups = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(current) = groups.upgrade() {
                 if current.refresh_managed(&pool).await.is_err() {
                     tracing::debug!("transport proxy configuration refresh deferred");
+                }
+                let active_plugins = plugins.clone();
+                #[cfg(feature = "experimental-plugin-revisions")]
+                let active_plugins = if let Some(application) = &application_plugins {
+                    match application.pin().await {
+                        Ok(snapshot) => snapshot.runtime.runtime().clone(),
+                        Err(_) => crate::plugin::PluginRuntime::default(),
+                    }
+                } else {
+                    active_plugins
+                };
+                if current
+                    .evaluate_strategies(&pool, &active_plugins)
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("network proxy strategy refresh deferred");
                 }
                 for entry in current.persistence_entries().unwrap_or_default() {
                     if entry.synchronize(&pool).await.is_err() {
@@ -19,6 +44,38 @@ impl TransportProxyGroups {
                 }
                 current.spawn_due_probes(&pool);
                 drop(current);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let probe_pool: AnyPool = labeled_pool_options(database_url, "mtc-proxy-probe")
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_lazy(database_url)?
+            .into();
+        let groups = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(current) = groups.upgrade() {
+                if current.spawn_entity_probes(&probe_pool).await.is_err() {
+                    tracing::debug!("network proxy probe scheduling deferred");
+                }
+                drop(current);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let signal_pool: AnyPool = labeled_pool_options(database_url, "mtc-proxy-signal")
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_lazy(database_url)?
+            .into();
+        let groups = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while groups.upgrade().is_some() {
+                if crate::db::network_proxies::signals::merge_pending(&signal_pool)
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("network proxy signal merge deferred");
+                }
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
@@ -128,4 +185,21 @@ impl Entry {
         }
         Ok(())
     }
+}
+
+fn labeled_pool_options(database_url: &str, name: &'static str) -> AnyPoolOptions {
+    let postgres = !database_url.starts_with("sqlite:");
+    let application_name = crate::db::postgres_application_name(name);
+    AnyPoolOptions::new().test_before_acquire(!postgres).after_connect(move |connection, _| {
+        let application_name = application_name.clone();
+        Box::pin(async move {
+            if postgres {
+                sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
+                    .bind(application_name)
+                    .execute(connection)
+                    .await?;
+            }
+            Ok(())
+        })
+    })
 }

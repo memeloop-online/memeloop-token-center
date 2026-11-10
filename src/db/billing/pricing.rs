@@ -480,9 +480,12 @@ impl Database {
         price_per_unit: Decimal,
     ) -> Result<GenerationPrice, AppError> {
         validate_currency(currency)?;
-        if !matches!(billing_unit, "job" | "second" | "image" | "megapixel") {
+        if !matches!(
+            billing_unit,
+            "job" | "second" | "image" | "megapixel" | "million_tokens"
+        ) {
             return Err(AppError::BadRequest(
-                "billing_unit must be job, second, image, or megapixel".into(),
+                "billing_unit must be job, second, image, megapixel, or million_tokens".into(),
             ));
         }
         let micros_per_unit = decimal_to_micros(price_per_unit)?;

@@ -4,15 +4,28 @@ ARG GO_IMAGE=golang:1.27.3-bookworm
 ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 
 FROM ${GO_IMAGE} AS cosign-builder
-ADD --checksum=sha256:424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa \
-    https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64 /tmp/cosign
-ADD --checksum=sha256:c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4 \
-    https://raw.githubusercontent.com/sigstore/cosign/0e48502cf5ef34e2e60bbd3617aa19945712f705/LICENSE /build/cosign/LICENSE
-RUN chmod 0555 /tmp/cosign \
+# Pin the upstream source and authenticate the single security module update
+# against the public Go checksum database before compiling the reviewed graph.
+ADD --checksum=sha256:04215e967f12c2388c9179b0f18097626a4f1d370cf315f404bebe16218f4cb1 \
+    https://api.github.com/repos/sigstore/cosign/tarball/0e48502cf5ef34e2e60bbd3617aa19945712f705 /tmp/cosign.tar.gz
+RUN mkdir -p /build/cosign /tmp/module-auth \
+    && tar -xzf /tmp/cosign.tar.gz -C /build/cosign --strip-components=1
+COPY packaging/cosign/v3.1.4-xnet-security.patch /tmp/cosign-security.patch
+WORKDIR /build/cosign
+RUN git apply --unidiff-zero --check /tmp/cosign-security.patch \
+    && git apply --unidiff-zero /tmp/cosign-security.patch \
+    && cd /tmp/module-auth \
+    && GOWORK=off GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org go mod download -json golang.org/x/net@v0.62.0 \
+    && cd /build/cosign \
+    && CGO_ENABLED=0 go build -mod=readonly -trimpath -tags=netgo,osusergo \
+      -ldflags '-buildid= -X sigs.k8s.io/release-utils/version.gitVersion=v3.1.4-mtc.1 -X sigs.k8s.io/release-utils/version.gitCommit=0e48502cf5ef34e2e60bbd3617aa19945712f705 -X sigs.k8s.io/release-utils/version.gitTreeState=modified' \
+      -o /tmp/cosign ./cmd/cosign \
     && go version -m /tmp/cosign | grep -Eq 'go1\.27\.3$' \
+    && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+golang.org/x/net[[:space:]]+v0\.62\.0[[:space:]]' \
     && go version -m /tmp/cosign | grep -Eq '[[:space:]]dep[[:space:]]+github.com/klauspost/compress[[:space:]]+v1\.20\.1[[:space:]]' \
     && /tmp/cosign version --json \
-      | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v3\.1\.4"'
+      | grep -Eq '"gitVersion"[[:space:]]*:[[:space:]]*"v3\.1\.4-mtc\.1"'
+WORKDIR /
 
 FROM ${RUST_IMAGE} AS builder
 RUN apt-get update \
@@ -47,9 +60,9 @@ RUN cargo build --locked --release --features plugin-distribution,experimental-p
 
 FROM ${RUNTIME_IMAGE}
 LABEL org.opencontainers.image.title="MemeLoop Token Center OCI plugin installer" \
-      org.opencontainers.image.description="Digest-pinned OCI plugin installer with official Cosign v3.1.4" \
+      org.opencontainers.image.description="Digest-pinned OCI plugin installer with Cosign v3.1.4-mtc.1 with the x/net security fix" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      io.memeloop.cosign.version="v3.1.4" \
+      io.memeloop.cosign.version="v3.1.4-mtc.1" \
       io.memeloop.cosign.upstream-commit="0e48502cf5ef34e2e60bbd3617aa19945712f705"
 ENV LD_LIBRARY_PATH=/usr/local/lib
 COPY --from=cosign-builder /tmp/cosign /usr/local/bin/cosign

@@ -1,13 +1,12 @@
-use std::time::Duration;
-
-use futures_util::StreamExt;
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
 use serde_json::Value;
+#[cfg(test)]
+use std::time::Duration;
 
 #[cfg(test)]
 use crate::network::OutboundScope;
-use crate::oauth::OAuthRefreshRequestGuard;
+use crate::oauth::{OAuthRefreshFailure, OAuthRefreshFailureKind, OAuthRefreshRequestGuard};
 use crate::{error::AppError, network, provider::UpstreamCredential};
 
 pub const TOKEN_ENDPOINT: &str = "https://auth.openai.com/oauth/token";
@@ -19,12 +18,7 @@ pub(crate) const USER_AGENT: &str =
     "codex-tui/0.160.0 (Mac OS 26.5.0; arm64) iTerm.app/3.6.10 (codex-tui; 0.160.0)";
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const NATIVE_ADAPTER_SCHEMA: &str = "openai-codex-oauth-v1";
-const RESPONSE_LIMIT: usize = 1024 * 1024;
 const MAX_EXPIRES_IN_SECONDS: i64 = 365 * 24 * 60 * 60;
-#[cfg(not(test))]
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const REFRESH_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Deserialize)]
 struct TokenResponse {
@@ -35,7 +29,7 @@ struct TokenResponse {
 }
 
 pub async fn refresh(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
     request_guard: &dyn OAuthRefreshRequestGuard,
@@ -51,7 +45,7 @@ pub async fn refresh(
 }
 
 async fn refresh_at(
-    http: &reqwest::Client,
+    http: &dyn crate::http_settings::HttpClientSource,
     credential: &UpstreamCredential,
     allow_test_loopback: bool,
     endpoint: &str,
@@ -78,7 +72,7 @@ async fn refresh_at(
         allow_test_loopback,
     )
     .await
-    .map_err(|_| refresh_failed())?;
+    .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
     let form = url::form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", "refresh_token")
         .append_pair("client_id", CLIENT_ID)
@@ -93,24 +87,15 @@ async fn refresh_at(
             "application/x-www-form-urlencoded",
         )
         .body(form)
-        .timeout(REFRESH_TIMEOUT)
         .build()
-        .map_err(|_| refresh_failed())?;
-    request_guard.mark_request_started().await?;
-    let operation = async {
-        let response = client
-            .execute(request)
-            .await
-            .map_err(|_| refresh_failed())?;
-        if !response.status().is_success() {
-            return Err(refresh_failed());
-        }
-        bounded_body(response).await
-    };
-    let body = tokio::time::timeout(REFRESH_TIMEOUT, operation)
-        .await
-        .map_err(|_| refresh_failed())??;
-    let response: TokenResponse = serde_json::from_slice(&body).map_err(|_| refresh_failed())?;
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
+    let (status, body) =
+        super::super::refresh_exchange::execute(&client, request, request_guard).await?;
+    if !(200..300).contains(&status) {
+        return Err(super::super::refresh_exchange::rejected(status, &body));
+    }
+    let response: TokenResponse = serde_json::from_slice(&body)
+        .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseDecode, Some(status)))?;
     super::bearer_token(&response.access_token, "OpenAI Codex").map_err(|_| refresh_failed())?;
     if response.refresh_token.as_deref().is_some_and(str::is_empty) {
         return Err(refresh_failed());
@@ -203,27 +188,12 @@ fn invalid_adapter_state() -> AppError {
     AppError::BadRequest("OpenAI Codex OAuth credential has invalid adapter state".into())
 }
 
-async fn bounded_body(response: reqwest::Response) -> Result<Vec<u8>, AppError> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > RESPONSE_LIMIT as u64)
-    {
-        return Err(refresh_failed());
-    }
-    let mut body = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| refresh_failed())?;
-        if body.len().saturating_add(chunk.len()) > RESPONSE_LIMIT {
-            return Err(refresh_failed());
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body)
+fn refresh_failure(kind: OAuthRefreshFailureKind, status: Option<u16>) -> AppError {
+    AppError::OAuthRefresh(OAuthRefreshFailure::new(kind, status))
 }
 
 fn refresh_failed() -> AppError {
-    AppError::upstream("openai_codex_oauth_refresh_failed")
+    refresh_failure(OAuthRefreshFailureKind::ResponseValidation, Some(200))
 }
 
 #[cfg(test)]
@@ -434,7 +404,7 @@ mod tests {
             ResponseTemplate::new(401).set_body_string("response-body-secret"),
             ResponseTemplate::new(200).set_body_string("response-body-secret"),
             ResponseTemplate::new(200)
-                .set_body_string("response-body-secret".repeat(RESPONSE_LIMIT / 20 + 2)),
+                .set_body_string("response-body-secret".repeat(1024 * 1024 / 20 + 2)),
             ResponseTemplate::new(200)
                 .set_delay(Duration::from_millis(500))
                 .set_body_json(json!({
@@ -450,7 +420,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let error = refresh_at(
-                &crate::build_http_client().unwrap(),
+                &crate::http_settings::tests::configured_timeout(200),
                 &credential("request-refresh-secret"),
                 true,
                 &format!("{}/token", server.uri()),
@@ -459,10 +429,7 @@ mod tests {
             .await
             .unwrap_err();
             let rendered = format!("{error:?} {error}");
-            assert_eq!(
-                error.to_string(),
-                "configured upstream is unavailable: openai_codex_oauth_refresh_failed"
-            );
+            assert!(matches!(error, AppError::OAuthRefresh(_)));
             for secret in [
                 "response-body-secret",
                 "delayed-response-secret",

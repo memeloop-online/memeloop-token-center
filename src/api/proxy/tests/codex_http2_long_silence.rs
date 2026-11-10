@@ -131,15 +131,28 @@ impl QuietUpstream {
     }
 }
 
-async fn fixture(label: &str) -> CodexRouteFixture {
+async fn fixture(label: &str, pool_idle_timeout_ms: Option<u64>) -> CodexRouteFixture {
     let fixture = codex_route_fixture(label).await;
-    fixture.state.codex_clients.install_test_client(
-        crate::build_codex_http2_test_client(
-            crate::provider::CodexTransportPolicy::default(),
-            crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
-        )
-        .unwrap(),
-    );
+    if let Some(timeout) = pool_idle_timeout_ms {
+        fixture.state.db.http_clients.publish(
+            serde_json::from_value(json!({
+                "revision": 1,
+                "settings": {"purposes": {"codex": {"pool_idle_timeout_ms": timeout}}}
+            }))
+            .unwrap(),
+        );
+    }
+    let client = crate::simple_http::configured_codex_builder(
+        &fixture.state.db.http_clients.snapshot(),
+        crate::provider::CodexTransportPolicy::default(),
+        crate::CODEX_HTTP2_KEEP_ALIVE_INTERVAL,
+        None,
+    )
+    .unwrap()
+    .http2_prior_knowledge()
+    .build()
+    .unwrap();
+    fixture.state.codex_clients.install_test_client(client);
     fixture
 }
 
@@ -198,7 +211,7 @@ async fn assert_settled(fixture: &CodexRouteFixture, count: usize) {
 
 async fn created_then_310_seconds_of_real_http2_silence_keeps_progress_and_settles_once() {
     tokio::time::timeout(Duration::from_secs(360), async {
-        let fixture = fixture("h2-310-second-silence").await;
+        let fixture = fixture("h2-310-second-silence", None).await;
         let mut upstream = QuietUpstream::start().await;
         let (body, mut post) = start_post(&fixture, &mut upstream).await;
         let mut body = body.into_data_stream();
@@ -274,9 +287,9 @@ async fn complete_post(fixture: &CodexRouteFixture, upstream: &mut QuietUpstream
     (post.connection_id, post.stream_id)
 }
 
-async fn same_http2_client_reuses_short_idle_pool_and_reconnects_after_95_seconds() {
+async fn same_http2_client_observes_pool_idle_setting(pool_idle_timeout_ms: Option<u64>) {
     tokio::time::timeout(Duration::from_secs(130), async {
-        let fixture = fixture("h2-pool-real-idle").await;
+        let fixture = fixture("h2-pool-real-idle", pool_idle_timeout_ms).await;
         let mut upstream = QuietUpstream::start().await;
         let first = complete_post(&fixture, &mut upstream).await;
         assert_settled(&fixture, 1).await;
@@ -296,17 +309,28 @@ async fn same_http2_client_reuses_short_idle_pool_and_reconnects_after_95_second
         assert!(long_idle.elapsed() > Duration::from_secs(90));
         let idle_seconds = long_idle.elapsed().as_secs_f64();
         let third = complete_post(&fixture, &mut upstream).await;
-        assert_ne!(
-            second.0, third.0,
-            "expired pool entry must create a fresh TCP/HTTP2 connection"
-        );
-        upstream.finish(3, 2).await;
+        let expected_connections = if pool_idle_timeout_ms.is_some() {
+            assert_ne!(
+                second.0, third.0,
+                "explicit idle timeout must expire the pool entry"
+            );
+            2
+        } else {
+            assert_eq!(
+                second.0, third.0,
+                "unlimited default must survive the old 90-second expiry"
+            );
+            assert!(third.1 > second.1, "reuse must open a new HTTP/2 stream");
+            1
+        };
+        upstream.finish(3, expected_connections).await;
         assert_settled(&fixture, 3).await;
         record_evidence(json!({
-            "case": "same_client_short_idle_reuse_then_expiry",
+            "case": "same_client_observes_configured_pool_idle",
+            "pool_idle_timeout_ms": pool_idle_timeout_ms,
             "idle_wall_seconds": idle_seconds,
             "connection_stream_ids": [first, second, third],
-            "posts": 3, "connections": 2, "terminals": 3, "settlements": 3
+            "posts": 3, "connections": expected_connections, "terminals": 3, "settlements": 3
         }));
     })
     .await
@@ -317,6 +341,7 @@ async fn same_http2_client_reuses_short_idle_pool_and_reconnects_after_95_second
 async fn real_http2_long_silence_and_idle_pool_acceptance() {
     tokio::join!(
         created_then_310_seconds_of_real_http2_silence_keeps_progress_and_settles_once(),
-        same_http2_client_reuses_short_idle_pool_and_reconnects_after_95_seconds(),
+        same_http2_client_observes_pool_idle_setting(None),
+        same_http2_client_observes_pool_idle_setting(Some(90_000)),
     );
 }

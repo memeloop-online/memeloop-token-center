@@ -214,16 +214,17 @@ fn report_failure(
 }
 
 pub(in crate::api::proxy) fn translate(
-    response: reqwest::Response,
+    response: impl Into<UpstreamResponse>,
     context: responses_via_chat::Context,
     streaming: bool,
     sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<UpstreamResponse, ProxySendError> {
+    let response = response.into();
     if !response.status().is_success() {
-        return Ok(response.into());
+        return Ok(response);
     }
     let diagnostic = crate::api::proxy_diagnostics::Context::current();
-    let mut parts = UpstreamResponse::from(response).into_parts();
+    let mut parts = response.into_parts();
     if parts
         .headers
         .get_all(header::CONTENT_ENCODING)

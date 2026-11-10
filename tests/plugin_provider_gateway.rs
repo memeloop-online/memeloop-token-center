@@ -21,6 +21,7 @@ use memeloop_token_center::{
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::{
     net::TcpListener,
     sync::{oneshot, watch},
@@ -339,7 +340,15 @@ async fn component_provider_fixture(
 #[tokio::test]
 async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_secrets_billing_and_archive()
  {
+    let _logs = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_env_filter("memeloop_token_center::response_archive_spool=warn")
+            .with_test_writer()
+            .finish(),
+    );
     let mock = MockServer::start().await;
+    let original_response =
+        serde_json::to_vec(&json!({"vendor_answer": "non-openai-shape"})).unwrap();
     Mock::given(method("POST"))
         .and(path("/vendor/infer"))
         .and(matches_header("x-plugin-shape", "buffered-v1"))
@@ -347,9 +356,9 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             "prompt": "from-component",
             "model": "vendor-model"
         })))
-        .respond_with(ResponseTemplate::new(207).set_body_json(json!({
-            "vendor_answer": "non-openai-shape"
-        })))
+        .respond_with(
+            ResponseTemplate::new(207).set_body_raw(original_response.clone(), "application/json"),
+        )
         .expect(2)
         .mount(&mock)
         .await;
@@ -459,9 +468,6 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         .unwrap();
     assert_eq!(exact_account.summary.total_requests, 2);
 
-    let inspection = sqlx::AnyPool::connect(&state.config.database_url)
-        .await
-        .unwrap();
     for request in requests {
         let refs = state
             .db
@@ -469,30 +475,31 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .await
             .unwrap();
         let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-        assert_eq!(
-            refs.request_object,
-            format!(
-                "staging/proxy/{0}/request/{0}/body.json",
-                request.request_id
-            )
-        );
+        assert!(refs.request_object.starts_with(&cas_prefix));
         let response_object = refs.response_object.as_deref().unwrap();
-        assert!(
-            response_object.starts_with(&cas_prefix)
-                || response_object
-                    .starts_with(&format!("staging/proxy/{}/response/", request.request_id))
-        );
-        let bound: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM response_archive_spools s JOIN request_records r ON r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id WHERE r.id = $1 AND r.key_id = $2 AND r.tenant_id = $3 AND s.state = 'bound' AND s.bound_locator = $4 AND r.response_object = $4",
-        )
-        .bind(request.request_id.to_string())
-        .bind(key.key_id.to_string())
-        .bind(key.tenant_id.to_string())
-        .bind(response_object)
-        .fetch_one(&inspection)
-        .await
-        .unwrap();
-        assert_eq!(bound, 1);
+        assert!(response_object.starts_with(&cas_prefix));
+        for (side, locator) in [
+            ("request", refs.request_object.as_str()),
+            ("response", response_object),
+        ] {
+            let root = state
+                .archive
+                .raw_capture_reference(key.tenant_id, request.request_id, side)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(root.object_locator, locator);
+            let bytes = state
+                .archive
+                .get_tenant_content(key.tenant_id, &root, 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(root.size_bytes, bytes.len() as u64);
+            assert_eq!(
+                root.blake3_digest,
+                blake3::hash(&bytes).to_hex().to_string()
+            );
+        }
         let archived_request = state
             .archive
             .get_bounded(&refs.request_object, 1024 * 1024)
@@ -512,10 +519,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
                 "max_tokens": 32
             })
         );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&archived_response).unwrap()["choices"][0]["message"]["content"],
-            "normalized by component"
-        );
+        assert_eq!(archived_response.as_ref(), original_response.as_slice());
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&archived_request),
@@ -524,7 +528,6 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         assert!(!combined.contains("component-api-secret"));
         assert!(!combined.contains("component-api-secret-rotated"));
     }
-    inspection.close().await;
 }
 
 #[tokio::test]
@@ -622,6 +625,7 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
     let mut pending = request_ids.to_vec();
     let mut archive_events_pending = request_ids.to_vec();
     let mut financial_pending = request_ids.to_vec();
+    let mut observed = Vec::new();
     let mut stream = response.into_body().into_data_stream();
     let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         let mut buffered = String::new();
@@ -645,6 +649,15 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
                 else {
                     continue;
                 };
+                if request_ids.contains(&request_id) {
+                    observed.push(json!({
+                        "request_id": request_id,
+                        "event_id": event["event_id"],
+                        "event_at": event["event_at"],
+                        "event_kind": event["event_kind"],
+                        "archive_state": event["archive_state"],
+                    }));
+                }
                 if event["event_kind"] == "archive_bound" {
                     archive_events_pending.retain(|candidate| *candidate != request_id);
                 }
@@ -664,6 +677,40 @@ async fn wait_for_bound_plugin_archives(state: &AppState, request_ids: &[Uuid]) 
         }
     })
     .await;
+    if result.is_err() {
+        eprintln!("plugin completion observed events: {observed:?}");
+        let diagnostic = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let pool = sqlx::AnyPool::connect(&state.config.database_url)
+                .await
+                .unwrap();
+            let mut spools = Vec::new();
+            for request_id in request_ids {
+                let rows = sqlx::query(
+                    "SELECT 'request' AS purpose, state, attempts, next_attempt_at, last_error_code, byte_count FROM request_archive_spools WHERE request_id = $1 UNION ALL SELECT 'response' AS purpose, state, attempts, next_attempt_at, last_error_code, byte_count FROM response_archive_spools WHERE request_id = $1",
+                )
+                .bind(request_id.to_string())
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+                for row in rows {
+                    spools.push(json!({
+                        "request_id": request_id,
+                        "observed_at": unix_millis(),
+                        "purpose": row.get::<String, _>("purpose"),
+                        "state": row.get::<String, _>("state"),
+                        "attempts": row.get::<i64, _>("attempts"),
+                        "next_attempt_at": row.get::<i64, _>("next_attempt_at"),
+                        "last_error_code": row.get::<Option<String>, _>("last_error_code"),
+                        "byte_count": row.get::<i64, _>("byte_count"),
+                    }));
+                }
+            }
+            pool.close().await;
+            spools
+        })
+        .await;
+        eprintln!("plugin completion spools after timeout: {diagnostic:?}");
+    }
     assert!(
         result.is_ok(),
         "plugin completion barrier: unbound={pending:?}, missing_archive_events={archive_events_pending:?}, missing_financial_events={financial_pending:?}"

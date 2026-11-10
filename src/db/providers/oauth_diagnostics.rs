@@ -92,7 +92,7 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let statement = format!(
-            "WITH selected(account_id, generation, tenant_id) AS (VALUES {placeholders}) SELECT a.id, a.credential_generation, c.expires_at, c.revoked_at, c.oauth_refresh_diagnostic_json, l.created_at AS lease_created_at, l.lease_expires_at, l.request_started_at, CASE WHEN l.pending_credential_ciphertext IS NOT NULL THEN 1 ELSE 0 END AS has_pending FROM selected s JOIN upstream_accounts a ON a.id = s.account_id AND a.tenant_id = s.tenant_id AND a.credential_generation = s.generation AND a.auth_kind = 'oauth' LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation LEFT JOIN upstream_oauth_refresh_leases l ON l.account_id = a.id AND l.credential_generation = a.credential_generation"
+            "WITH selected(account_id, generation, tenant_id) AS (VALUES {placeholders}) SELECT a.id, a.oauth_driver, a.credential_generation, c.expires_at, c.revoked_at, c.oauth_refresh_diagnostic_json, l.created_at AS lease_created_at, l.lease_expires_at, l.request_started_at, CASE WHEN l.pending_credential_ciphertext IS NOT NULL THEN 1 ELSE 0 END AS has_pending FROM selected s JOIN upstream_accounts a ON a.id = s.account_id AND a.tenant_id = s.tenant_id AND a.credential_generation = s.generation AND a.auth_kind = 'oauth' LEFT JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation LEFT JOIN upstream_oauth_refresh_leases l ON l.account_id = a.id AND l.credential_generation = a.credential_generation"
         );
         let mut query = sqlx::query(sqlx::AssertSqlSafe(statement));
         for account in selected {
@@ -109,6 +109,8 @@ impl Database {
             .map(|row| {
                 let account_id = parse_uuid(row.try_get("id")?)?;
                 let metadata = OAuthRefreshMetadata {
+                    kimi: row.try_get::<Option<String>, _>("oauth_driver")?.as_deref()
+                        == Some(crate::oauth::managed::kimi::PROVIDER_DRIVER),
                     generation: row.try_get("credential_generation")?,
                     expires_at: row.try_get("expires_at")?,
                     revoked_at: row.try_get("revoked_at")?,
@@ -118,7 +120,15 @@ impl Database {
                     has_pending: row.try_get::<i64, _>("has_pending")? != 0,
                     diagnostic_json: row.try_get("oauth_refresh_diagnostic_json")?,
                 };
-                Ok((account_id, metadata.status(now)))
+                let mut status = metadata.status(now);
+                if let Some(account) = accounts.iter().find(|account| account.id == account_id) {
+                    status.allowed_actions.retain(|action| match *action {
+                        "reauthorize" => account.can_reauthorize,
+                        "refresh" => account.can_refresh,
+                        _ => true,
+                    });
+                }
+                Ok((account_id, status))
             })
             .collect()
     }
@@ -208,6 +218,36 @@ mod tests {
         assert_eq!(value["access_state"], "expired");
         assert_eq!(value["reauthorization_required"], false);
         assert_eq!(value["automatic_refresh_paused"], true);
+        assert!(
+            !value["allowed_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action == "resume_local" || action == "refresh")
+        );
+        assert!(matches!(
+            database
+                .recover_upstream_oauth_refresh(account.id, PEPPER)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let started: Option<i64> = sqlx::query_scalar(
+            "SELECT request_started_at FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(started.is_some());
+        assert_eq!(
+            database
+                .upstream_account_with_credential(account.id, PEPPER)
+                .await
+                .unwrap()
+                .0
+                .credential_generation,
+            account.credential_generation
+        );
         let persisted: Option<String> = sqlx::query_scalar("SELECT oauth_refresh_diagnostic_json FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1")
             .bind(account.id.to_string()).fetch_one(&database.pool).await.unwrap();
         assert!(persisted.is_none());
@@ -316,6 +356,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn received_result_survives_pool_timeout_before_durable_staging() {
+        let (database, directory, account) = setup().await;
+        let key = "pool-timeout-stage-recovery";
+        claim(&database, &account, key).await;
+        database
+            .mark_upstream_oauth_refresh_request_started(account.id, key)
+            .await
+            .unwrap();
+        // A separate one-connection process pool reproduces worker/control
+        // pool exhaustion without changing any application-wide timeouts.
+        let mut writer = database.clone();
+        writer.pool = sqlx::any::AnyPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(25))
+            .connect(&format!(
+                "sqlite://{}",
+                directory.path().join("diagnostics.db").display()
+            ))
+            .await
+            .unwrap()
+            .into();
+        let held = writer.pool.acquire().await.unwrap();
+        let account_id = account.id;
+        let finish = tokio::spawn(async move {
+            writer
+                .finish_upstream_oauth_refresh(
+                    account_id,
+                    credential(unix_millis() + 900_000),
+                    key,
+                    PEPPER,
+                )
+                .await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !finish.is_finished(),
+            "pool timeouts must retain the received rotated token for local retry"
+        );
+        drop(held);
+        let installed = tokio::time::timeout(std::time::Duration::from_secs(10), finish)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(installed.credential_generation, 2);
+        let replay = database
+            .claim_upstream_oauth_refresh(account_id, key, PEPPER)
+            .await
+            .unwrap();
+        assert!(matches!(replay, ClaimUpstreamOAuthRefreshResult::Replay(_)));
+        let statuses = database
+            .upstream_oauth_refresh_statuses(&[installed])
+            .await
+            .unwrap();
+        assert!(!statuses[&account_id].automatic_refresh_paused);
+        assert!(!statuses[&account_id].reauthorization_required);
+    }
+
+    #[tokio::test]
     async fn kimi_received_result_survives_a_temporary_local_stage_failure() {
         let (database, directory, account) = setup().await;
         claim(&database, &account, "kimi-stage-recovery").await;
@@ -340,7 +439,7 @@ mod tests {
         let account_id = account.id;
         let finish = tokio::spawn(async move {
             writer
-                .finish_kimi_oauth_refresh(
+                .finish_upstream_oauth_refresh(
                     account_id,
                     credential(unix_millis() + 900_000),
                     "kimi-stage-recovery",
@@ -555,5 +654,104 @@ mod tests {
         let oversized = "x".repeat(2049);
         assert!(sqlx::query("UPDATE upstream_credentials SET oauth_refresh_diagnostic_json = $1 WHERE upstream_account_id = $2")
             .bind(oversized).bind(account.id.to_string()).execute(&database.pool).await.is_err());
+    }
+    #[tokio::test]
+    async fn only_explicit_kimi_retry_can_claim_a_completed_expired_transient_operation() {
+        let (database, _directory, account) = setup().await;
+        sqlx::query("UPDATE upstream_accounts SET oauth_driver = 'kimi-oauth' WHERE id = $1")
+            .bind(account.id.to_string())
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let created = claim(&database, &account, "old-kimi-operation").await;
+        database
+            .mark_upstream_oauth_refresh_request_started(account.id, "old-kimi-operation")
+            .await
+            .unwrap();
+        database
+            .record_upstream_oauth_refresh_failure(
+                account.id,
+                1,
+                created,
+                "old-kimi-operation",
+                OAuthRefreshFailure {
+                    kind: OAuthRefreshFailureKind::Timeout,
+                    http_status: Some(200),
+                    observation: Some(crate::oauth::OAuthRefreshObservation {
+                        phase: crate::oauth::OAuthRefreshPhase::ResponseBody,
+                        elapsed_ms: 100,
+                        budget_ms: 0,
+                        connector_failure: false,
+                        timeout_source: Some(crate::oauth::OAuthRefreshTimeoutSource::HttpClient),
+                    }),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            database
+                .claim_upstream_oauth_refresh(account.id, "still-owned", PEPPER)
+                .await
+                .is_err()
+        );
+        sqlx::query(
+            "UPDATE upstream_oauth_refresh_leases SET lease_expires_at = 0 WHERE account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        assert!(
+            database
+                .claim_upstream_oauth_refresh_for_generation(
+                    account.id,
+                    "worker-retry",
+                    Some(1),
+                    PEPPER
+                )
+                .await
+                .is_err()
+        );
+        let status = database
+            .upstream_oauth_refresh_statuses(std::slice::from_ref(&account))
+            .await
+            .unwrap();
+        assert!(status[&account.id].allowed_actions.contains(&"refresh"));
+        assert!(
+            database
+                .recover_upstream_oauth_refresh(account.id, PEPPER)
+                .await
+                .is_err(),
+            "local recovery must not dispatch"
+        );
+        assert!(matches!(
+            database
+                .claim_upstream_oauth_refresh(account.id, "explicit-retry", PEPPER)
+                .await
+                .unwrap(),
+            ClaimUpstreamOAuthRefreshResult::Claimed(_)
+        ));
+        assert!(
+            database
+                .claim_upstream_oauth_refresh(account.id, "concurrent-retry", PEPPER)
+                .await
+                .is_err()
+        );
+        database
+            .mark_upstream_oauth_refresh_request_started(account.id, "explicit-retry")
+            .await
+            .unwrap();
+        let saved = database
+            .finish_upstream_oauth_refresh(account.id, credential(100), "explicit-retry", PEPPER)
+            .await
+            .unwrap();
+        assert_eq!(saved.credential_generation, 2);
+        assert!(matches!(
+            database
+                .claim_upstream_oauth_refresh(account.id, "explicit-retry", PEPPER)
+                .await
+                .unwrap(),
+            ClaimUpstreamOAuthRefreshResult::Replay(_)
+        ));
     }
 }

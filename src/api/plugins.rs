@@ -98,6 +98,7 @@ pub(in crate::api) async fn application_plugin_status(
         None => crate::plugin::application::ApplicationPluginStatus {
             current: None,
             candidates: Vec::new(),
+            runtime: serde_json::json!({"ready": true, "error": null}),
         },
     };
     Ok((
@@ -263,7 +264,8 @@ pub(super) async fn resolve_application_plugin_release(
             password: frozen.password.as_deref(),
             addresses: &frozen.proxy_addresses,
         });
-    let release = crate::plugin_release::resolve_github_release(&body.url, proxy).await?;
+    let release =
+        crate::plugin_release::resolve_github_release(&state.http, &body.url, proxy).await?;
     let (base_revision, retained) = authority.installation_base_snapshot().await?;
     let resolution = state
         .db

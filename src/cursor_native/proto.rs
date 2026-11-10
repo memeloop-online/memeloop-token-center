@@ -1,4 +1,4 @@
-//! Bounded protobuf wire reader for the small, read-only Cursor RPC surface.
+//! Protobuf wire reader for the read-only Cursor RPC surface.
 //! Unknown proto3 fields are skipped by consumers; no generated/vendor code.
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -41,9 +41,6 @@ fn take<'a>(input: &mut &'a [u8], length: usize) -> Result<&'a [u8], &'static st
 }
 
 pub(crate) fn fields(mut input: &[u8]) -> Result<Vec<Field<'_>>, &'static str> {
-    if input.len() > super::MAX_RESPONSE_BYTES {
-        return Err("response_too_large");
-    }
     let mut result = Vec::new();
     while !input.is_empty() {
         if result.len() >= 50_000 {
@@ -111,5 +108,17 @@ mod tests {
             ]
         );
         assert!(fields(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn large_unknown_bytes_field_has_no_http_body_cap() {
+        let mut body = vec![18, 129, 128, 128, 1];
+        body.resize(body.len() + 2 * 1024 * 1024 + 1, 0);
+        let decoded = fields(&body).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(
+            decoded[0].value,
+            WireValue::Bytes(bytes) if bytes.len() == 2 * 1024 * 1024 + 1
+        ));
     }
 }

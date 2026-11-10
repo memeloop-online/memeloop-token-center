@@ -14,6 +14,13 @@ impl Routes {
     pub(super) async fn from_selection(
         mut selection: ProxySelection,
     ) -> Result<Self, &'static str> {
+        #[cfg(test)]
+        if super::r2_tests::fixture_url(USAGE_URL).is_some() {
+            return Ok(Self(vec![Route {
+                proxy_url: None,
+                egress: None,
+            }]));
+        }
         let mut routes = Vec::new();
         let mut attempted = Vec::new();
         loop {
@@ -211,6 +218,7 @@ mod tests {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             get_codex_json_with_routes(
+                &crate::codex_clients::CodexClients::default(),
                 policy,
                 CodexQuotaAuth {
                     credential_header: http::header::AUTHORIZATION,

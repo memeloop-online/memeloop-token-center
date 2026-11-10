@@ -4,6 +4,8 @@ mod config_secret_graph;
 mod config_secret_paths;
 mod config_secrets;
 mod health;
+#[cfg(test)]
+pub(in crate::api) use health::run_upstream_service_probe;
 mod models;
 mod native_cursor_import;
 mod native_oauth_import;
@@ -33,7 +35,10 @@ pub(in crate::api) use accounts::{
 };
 pub(in crate::api) use availability::upstream_account_availability;
 pub(crate) use health::run_upstream_service_probes;
-pub(in crate::api) use health::{probe_upstream_health, read_upstream_service_probe};
+pub(in crate::api) use health::{
+    get_health_probe_settings, probe_upstream_health, put_health_probe_settings,
+    read_upstream_service_probe,
+};
 pub(crate) use models::sync_upstream_models_after_refresh;
 pub(crate) use models::trigger_upstream_model_sync;
 pub(in crate::api) use models::{
@@ -50,11 +55,11 @@ pub(in crate::api) use quota::{
     confirm_quota_reset, current_quota_reset, get_quota_reset, prepare_quota_reset,
     reconcile_quota_reset, recover_quota_reset,
 };
-pub(in crate::api) use quota::{upstream_quota, upstream_quota_batch};
+pub(in crate::api) use quota::{upstream_quota, upstream_quota_batch, upstream_quota_windows};
 
 pub(in crate::api) use oauth::{
-    disconnect_upstream_oauth, poll_codex_oauth, poll_cursor_oauth, refresh_upstream_oauth,
-    start_codex_oauth, start_cursor_oauth, start_provider_adapter_oauth,
+    disconnect_upstream_oauth, poll_codex_oauth, poll_cursor_oauth, recover_upstream_oauth,
+    refresh_upstream_oauth, start_codex_oauth, start_cursor_oauth, start_provider_adapter_oauth,
 };
 pub(crate) use oauth::{poll_codex_oauth_for_worker, refresh_managed_upstream_oauth_for_worker};
 pub(in crate::api) use oauth_authorization_code::{

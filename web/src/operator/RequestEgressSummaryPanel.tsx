@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ApiError } from '../api';
-import { Button, Field, FormSection, LoadingProgress, LoadingState, Select } from '../design-system';
+import { Button, Disclosure, Field, FormSection, LoadingProgress, LoadingState, Select } from '../design-system';
 import { useI18n } from '../i18n';
 import type { RequestEgressSummaryResponse } from '../types';
 import { useOperatorResource } from './hooks/useOperatorResource';
@@ -39,7 +39,6 @@ export function RequestEgressSummaryPanel({ token, tenant }: { token: string; te
   const rows = data?.groups.filter(row => !activeGroup || egressGroupKey(row.selected) === activeGroup) ?? [];
   return <section className="request-egress" aria-label={copy.title}>
     <FormSection title={copy.title} description={copy.scope}>
-      <p className="muted">{copy.exclusions}</p>
       <div className="egress-controls">
         <Field label={copy.period}><Select value={String(hours)} onChange={event => { setHours(Number(event.target.value)); setEnd(Date.now()); setGroup(''); }}>
           <option value="1">{copy.hour}</option><option value="24">{copy.day}</option><option value="168">{copy.week}</option>
@@ -47,13 +46,17 @@ export function RequestEgressSummaryPanel({ token, tenant }: { token: string; te
         <Field label={copy.groupFilter}><Select value={activeGroup} disabled={!data} onChange={event => setGroup(event.target.value)}>
           <option value="">{copy.allGroups}</option>{[...choices].map(([key, name]) => <option key={key} value={key}>{name}</option>)}
         </Select></Field>
-        <Button appearance="secondary" type="button" disabled={busy} onClick={() => setEnd(Date.now())}>{copy.refresh}</Button>
+        <div className="egress-refresh-control"><Button appearance="secondary" type="button" disabled={busy} onClick={() => setEnd(Date.now())}>{copy.refresh}</Button></div>
       </div>
       <LoadingProgress active={busy} label={copy.loading} />
       {failure && <div className="notice error" role="alert"><span>{failure}</span><Button appearance="secondary" type="button" onClick={() => void resource.reload()}>{copy.retry}</Button></div>}
       {!data && busy && <LoadingState label={copy.loading} variant="compact" />}
       {data && <>
         <p>{new Date(data.start).toLocaleString(locale)} ≤ {copy.observed} &lt; {new Date(data.end).toLocaleString(locale)}</p>
+        <Disclosure title={copy.measurementDetailsTitle}>
+          <p>{copy.measurementDetails}</p>
+          <p>{copy.exclusions}</p>
+        </Disclosure>
         <p className="muted">{copy.historical}</p>
         <p>{copy.wire}: {copy.unknown} · {copy.billed}: {copy.unknown}</p>
         {!rows.length ? <p role="status">{copy.empty}</p> : rows.map(row => <article className="egress-card" key={egressSelectionKey(row.selected)} data-egress-summary>

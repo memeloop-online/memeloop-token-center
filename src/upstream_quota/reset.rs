@@ -8,6 +8,257 @@ use crate::{
 
 const CONSUME_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume";
 
+/// Dropping a dispatch never proves that the supplier did not consume a credit.
+/// Preserve uncertainty and the durable idempotency record, but do not strand
+/// an operation in submitted after its owning future has actually ended.
+struct DispatchCompletion {
+    db: crate::db::Database,
+    operation: String,
+    owner: Uuid,
+    accepted: bool,
+    error: Option<String>,
+    finished: bool,
+}
+
+impl Drop for DispatchCompletion {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let db = self.db.clone();
+        let operation = self.operation.clone();
+        let owner = self.owner;
+        let accepted = self.accepted;
+        let error = self.error.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let mut delay = Duration::from_secs(1);
+                loop {
+                    match db
+                        .finish_quota_reset_owned(
+                            &operation,
+                            Some(owner),
+                            accepted,
+                            error.as_deref(),
+                        )
+                        .await
+                    {
+                        Ok(()) => return,
+                        Err(error) => tracing::error!(
+                            operation_id = %operation,
+                            error = %error,
+                            "quota reset outcome persistence will retry without redispatch"
+                        ),
+                    }
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                }
+            });
+        }
+    }
+}
+
+// Test binaries may redirect the fixed supplier to a loopback fixture.
+// Production builds retain the fixed supplier endpoints.
+#[cfg(test)]
+pub(super) fn test_supplier_url(account: &UpstreamAccountView, original: &str) -> String {
+    let Some(base) = account
+        .config
+        .get("reset_test_supplier_url")
+        .and_then(Value::as_str)
+    else {
+        return original.to_owned();
+    };
+    let base = url::Url::parse(base).unwrap();
+    assert!(base.scheme() == "http" && base.host_str() == Some("127.0.0.1"));
+    base.join(match original {
+        CONSUME_URL => "consume",
+        USAGE_URL => "usage",
+        _ => "credits",
+    })
+    .unwrap()
+    .to_string()
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CreditEvidence {
+    pub fingerprint: String,
+    pub granted_at_ms: i64,
+    pub expires_at_ms: i64,
+}
+
+pub(crate) struct CreditInventory {
+    pub credits: Vec<CreditEvidence>,
+    pub fingerprint: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct BackgroundResetGuard {
+    pub grant: crate::db::plugin_background_actions::BackgroundActionGrant,
+    /// Exact host-validated plugin snapshot, separate from business identity.
+    pub runtime_revision: Option<i64>,
+    pub lease_owner: String,
+    pub credit_fingerprint: String,
+    pub inventory_fingerprint: String,
+    pub not_before_ms: i64,
+    pub deadline_ms: i64,
+}
+
+pub(super) fn credit_fingerprint(credit: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    // Supplier credit identity, where present, distinguishes equal-count
+    // replacements with otherwise identical lifetime fields. The host uses
+    // this identity as a fresh precondition; the supplier body carries a redeem ID.
+    let field = |snake: &str, camel: &str| {
+        credit
+            .get(snake)
+            .or_else(|| credit.get(camel))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let evidence = json!({
+        "id": credit.get("id").cloned().unwrap_or_else(||field("credit_id","creditId")),
+        "type": field("reset_type","resetType"),
+        "status": credit.get("status"),
+        "granted": field("granted_at","grantedAt"),
+        "expires": field("expires_at","expiresAt"),
+    });
+    format!("{:x}", Sha256::digest(evidence.to_string().as_bytes()))
+}
+
+fn inventory(snapshot: &QuotaSnapshot, now: i64) -> CreditInventory {
+    use sha2::{Digest, Sha256};
+    let mut credits = snapshot
+        .reset_credits
+        .iter()
+        .filter_map(|credit| {
+            let granted = credit.granted_at?;
+            let expires = credit.expires_at?;
+            (credit.status.as_deref() == Some("available") && granted <= now && now < expires).then(
+                || CreditEvidence {
+                    fingerprint: credit.fingerprint.clone(),
+                    granted_at_ms: granted,
+                    expires_at_ms: expires,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    credits.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+    // Include multiplicity and supplier counts. A same-count replacement is
+    // insufficient evidence even when the selected credit is still present.
+    let evidence = json!({"credits":credits.iter().map(|c|&c.fingerprint).collect::<Vec<_>>(),
+        "available":snapshot.reset_capability.available_credits,
+        "applicable":snapshot.reset_capability.applicable_credits});
+    CreditInventory {
+        credits,
+        fingerprint: format!("{:x}", Sha256::digest(evidence.to_string().as_bytes())),
+    }
+}
+
+pub(crate) async fn background_credit_inventory(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+) -> Result<CreditInventory, AppError> {
+    let snapshot = fresh(state, account, credential, tenant).await?;
+    Ok(inventory(&snapshot, unix_millis()))
+}
+
+fn validate_background_evidence(
+    snapshot: &QuotaSnapshot,
+    guard: &BackgroundResetGuard,
+    now: i64,
+) -> Result<(), AppError> {
+    if snapshot
+        .reset_capability
+        .available_credits
+        .is_none_or(|count| count < 1)
+        || snapshot
+            .reset_capability
+            .applicable_credits
+            .is_none_or(|count| count < 1)
+    {
+        return Err(blocked());
+    }
+    let current = inventory(snapshot, now);
+    let target = current
+        .credits
+        .iter()
+        .find(|credit| credit.fingerprint == guard.credit_fingerprint)
+        .ok_or_else(blocked)?;
+    if current.fingerprint != guard.inventory_fingerprint
+        || guard.not_before_ms > now
+        || guard.deadline_ms <= now
+        || guard.deadline_ms > target.expires_at_ms
+        || guard.not_before_ms < target.granted_at_ms
+        || guard.not_before_ms >= guard.deadline_ms
+    {
+        return Err(blocked());
+    }
+    Ok(())
+}
+
+/// An authorized worker enters this path. Stable business identity spans
+/// runtime, package, configuration and authorization revisions, preserving
+/// one dispatch identity through upgrades and re-enablement.
+pub(crate) async fn background_reset(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    guard: &BackgroundResetGuard,
+) -> Result<QuotaResetOperation, AppError> {
+    let actor = format!("plugin:{}", guard.grant.plugin_id);
+    let key = format!(
+        "background-reset-credit-v1:{}:{}",
+        account.id, guard.credit_fingerprint
+    );
+    // Validate before creating durable work. Scheduler ticks outside the window
+    // or with replaced credits leave the durable operation set unchanged.
+    let snapshot = fresh(state, account, credential, &guard.grant.tenant_external_id).await?;
+    validate_background_evidence(&snapshot, guard, unix_millis())?;
+    let prepared = prepare(
+        state,
+        account,
+        credential,
+        &guard.grant.tenant_external_id,
+        &actor,
+        &key,
+    )
+    .await?;
+    if matches!(prepared.operation.state.as_str(), "prepared" | "expired") {
+        state
+            .db
+            .refresh_background_quota_reset_prepare(
+                account,
+                &prepared.operation.id,
+                snapshot
+                    .reset_capability
+                    .available_credits
+                    .ok_or_else(blocked)?,
+                snapshot
+                    .reset_capability
+                    .applicable_credits
+                    .ok_or_else(blocked)?,
+                snapshot.observed_at.ok_or_else(blocked)?,
+                guard,
+            )
+            .await?;
+    }
+    confirm_guarded(
+        state,
+        account,
+        credential,
+        &guard.grant.tenant_external_id,
+        &actor,
+        &prepared.operation.id,
+        &prepared.confirmation_token,
+        &key,
+        Some(guard),
+    )
+    .await
+}
+
 #[derive(Serialize)]
 pub(crate) struct PreparedReset {
     operation: QuotaResetOperation,
@@ -48,8 +299,8 @@ async fn fresh_snapshot(
         .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
     let mut budget = codex_quota_budget(&account.config)
         .map_err(|_| temporarily_unavailable("quota_reset_budget"))?;
-    // Even the reset workflow's credit precheck remains a single attempt.
-    // Consumption below is a separate no-retry transport and never enters the reader.
+    // The reset workflow's credit precheck uses one attempt. Consumption below
+    // uses its own fixed transport after the fresh read completes.
     budget.attempt_limit = 1;
     let session = retry::ReadSession::new(
         Some(state),
@@ -73,12 +324,18 @@ async fn fresh_snapshot(
         proxy_url: credential.proxy().map(|(url, _)| url),
     };
     let refresh_started = tokio::time::Instant::now();
+    let credits_url = CREDITS_URL;
+    #[cfg(test)]
+    let fixture_url = test_supplier_url(account, credits_url);
+    #[cfg(test)]
+    let credits_url = fixture_url.as_str();
     let reset = match tokio::time::timeout(
         budget.total,
         get_codex_json(
+            &state.codex_clients,
             policy,
             auth,
-            CREDITS_URL,
+            credits_url,
             QuotaRequestContext::for_account(account, "credits", QuotaReadTrigger::ResetWorkflow),
             budget,
             &session,
@@ -290,6 +547,32 @@ pub(crate) async fn confirm(
     token: &str,
     idempotency_key: &str,
 ) -> Result<QuotaResetOperation, AppError> {
+    confirm_guarded(
+        state,
+        account,
+        credential,
+        tenant,
+        actor,
+        operation,
+        token,
+        idempotency_key,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn confirm_guarded(
+    state: &AppState,
+    account: &UpstreamAccountView,
+    credential: &UpstreamCredential,
+    tenant: &str,
+    actor: &str,
+    operation: &str,
+    token: &str,
+    idempotency_key: &str,
+    guard: Option<&BackgroundResetGuard>,
+) -> Result<QuotaResetOperation, AppError> {
     if !(32..=256).contains(&token.len()) {
         return Err(blocked());
     }
@@ -320,6 +603,9 @@ pub(crate) async fn confirm(
         };
     }
     let snapshot = fresh(state, account, credential, tenant).await?;
+    if let Some(guard) = guard {
+        validate_background_evidence(&snapshot, guard, unix_millis())?;
+    }
     if snapshot.reset_capability.available_credits != Some(original.available_credits)
         || snapshot.reset_capability.applicable_credits != Some(original.applicable_credits)
         || original.applicable_credits < 1
@@ -341,62 +627,103 @@ pub(crate) async fn confirm(
         .permits
         .try_acquire()
         .map_err(|_| temporarily_unavailable("quota_reset_permit"))?;
-    // Use the existing mutation-only network factory (including its shared
-    // HTTP settings integration); do not impose another reset-specific deadline.
-    let http = crate::network::client_for_codex_url_without_retries(
-        &state.http,
-        CONSUME_URL,
-        &json!({"network_scope":"public"}),
-        dispatch_credential.proxy(),
-        false,
-    )
+    let http = consume_client(state, dispatch_credential).await?;
+    #[cfg(test)]
+    let http = if account.config.get("reset_test_supplier_url").is_some() {
+        crate::build_no_retry_http_client(None, &[]).unwrap()
+    } else {
+        http
+    };
+    // Keep the claim and its completion guard in one owned task. Cancellation
+    // while COMMIT is in flight cannot drop the only recovery owner before the
+    // claim's database outcome is known. This task never sends to the supplier.
+    let db = state.db.clone();
+    let claim_account = account.clone();
+    let claim_operation = operation.to_owned();
+    let claim_actor = actor.to_owned();
+    let claim_guard = guard.cloned();
+    let (claim, mut completion) = tokio::spawn(async move {
+        let mut completion = DispatchCompletion {
+            db: db.clone(),
+            operation: claim_operation.clone(),
+            owner: Uuid::now_v7(),
+            accepted: false,
+            error: Some("reset_dispatch_owner_ended".into()),
+            finished: false,
+        };
+        let claim = db
+            .claim_quota_reset_owned(
+                &claim_account,
+                &claim_operation,
+                &claim_actor,
+                &confirmation_hash,
+                &confirm_idempotency_hash,
+                claim_guard.as_ref(),
+                Some(completion.owner),
+            )
+            .await?;
+        if matches!(claim, QuotaResetClaim::Replayed(_)) {
+            completion.finished = true;
+        }
+        Ok::<_, AppError>((claim, completion))
+    })
     .await
-    .map_err(|_| temporarily_unavailable("quota_reset_transport"))?;
-    let claim = state
-        .db
-        .claim_quota_reset(
-            account,
-            operation,
-            actor,
-            &confirmation_hash,
-            &confirm_idempotency_hash,
-        )
-        .await?;
+    .map_err(|_| AppError::internal("quota_reset_claim_task"))??;
     let redeem = match claim {
         QuotaResetClaim::Claimed { redeem_request_id } => redeem_request_id,
         QuotaResetClaim::Replayed(operation) => return Ok(*operation),
     };
-    // No automatic retry and no new redeem ID on any ambiguous outcome.
-    let result = dispatch_once(
-        &http,
-        dispatch_credential,
-        account_header,
-        CONSUME_URL,
-        &redeem,
-    )
-    .await;
+    // Each durable operation keeps one redeem ID and one supplier dispatch.
+    let result = if guard.is_some_and(|guard| unix_millis() >= guard.deadline_ms) {
+        Err("quota_reset_deadline_elapsed".to_owned())
+    } else {
+        let consume_url = CONSUME_URL;
+        #[cfg(test)]
+        let r2_fixture_url = r2_tests::fixture_url(consume_url);
+        #[cfg(test)]
+        let fixture_url = r2_fixture_url.unwrap_or_else(|| test_supplier_url(account, consume_url));
+        #[cfg(test)]
+        let consume_url = fixture_url.as_str();
+        dispatch_once(
+            &http,
+            dispatch_credential,
+            account_header,
+            consume_url,
+            &redeem,
+        )
+        .await
+    };
     drop(_permit);
     let accepted = result.is_ok();
+    completion.accepted = accepted;
+    completion.error = result.err();
     state
         .db
-        .finish_quota_reset(operation, accepted, result.err().as_deref())
+        .finish_quota_reset_owned(
+            operation,
+            Some(completion.owner),
+            accepted,
+            completion.error.as_deref(),
+        )
         .await?;
+    completion.finished = true;
     state
         .upstream_quota
         .entries
         .lock()
         .await
         .retain(|key, _| key.account != account.id);
+    #[cfg(test)]
+    r2_tests::after_reset_eviction().await;
     if accepted {
         // The consume response proves only that the reset was accepted. A
         // separate fresh supplier read is the evidence that may clear the
         // exact quota-exhausted health row through the existing fenced CAS.
         // Recovery failure must never replay the paid reset or change its
         // accepted durable result.
-        // Always pass the stored credential, never the request-local selected
-        // proxy credential: read_fresh owns selection and the normal quota,
-        // cache, accepted-credit settlement and health recovery implementation.
-        let snapshot = state
+        // read_fresh selects its own transport from the stored credential,
+        // never from the consume request's selected proxy credential.
+        let readback = state
             .upstream_quota
             .read_fresh(
                 state,
@@ -406,15 +733,31 @@ pub(crate) async fn confirm(
                 QuotaReadTrigger::ResetWorkflow,
             )
             .await;
-        let error = snapshot
+        let readback_error = readback
             .error_code
-            .or(snapshot.reset_capability.credit_error_code);
+            .or(readback.reset_capability.credit_error_code);
         state
             .db
-            .record_quota_reset_readback(account, operation, actor, error)
+            .record_quota_reset_readback(account, operation, actor, readback_error)
             .await?;
+        match readback_error {
+            None => tracing::info!(
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
+                "refreshed quota evidence after an accepted reset"
+            ),
+            Some(error) => tracing::warn!(
+                upstream_account_id = %account.id,
+                credential_generation = account.credential_generation,
+                trigger = QuotaReadTrigger::ResetWorkflow.as_str(),
+                error = %error,
+                error_code = "quota_reset_recovery_pending",
+                "accepted quota reset supplier evidence refresh is pending"
+            ),
+        }
     }
-    // Accepted means only supplier HTTP 2xx. It does not assert window state.
+    // Accepted records the supplier HTTP 2xx response; quota windows remain independently observed.
     state
         .db
         .quota_reset_operation(
@@ -423,6 +766,25 @@ pub(crate) async fn confirm(
             operation,
         )
         .await
+}
+
+async fn consume_client(
+    state: &AppState,
+    dispatch_credential: &UpstreamCredential,
+) -> Result<reqwest::Client, AppError> {
+    #[cfg(test)]
+    if r2_tests::fixture_url(CONSUME_URL).is_some() {
+        return Ok(crate::build_no_retry_http_client(None, &[]).unwrap());
+    }
+    crate::network::client_for_codex_url_without_retries(
+        &state.http,
+        CONSUME_URL,
+        &json!({"network_scope":"public"}),
+        dispatch_credential.proxy(),
+        false,
+    )
+    .await
+    .map_err(|_| temporarily_unavailable("quota_reset_transport"))
 }
 
 pub(crate) async fn reconcile(
@@ -466,7 +828,6 @@ pub(crate) async fn reconcile(
         .await
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn recover(
     state: &AppState,
     account: &UpstreamAccountView,
@@ -474,8 +835,6 @@ pub(crate) async fn recover(
     tenant: &str,
     actor: &str,
     operation: &str,
-    expected_updated_at: i64,
-    reason: &str,
 ) -> Result<QuotaResetOperation, AppError> {
     let tenant_id = account.tenant_id.to_string();
     let account_id = account.id.to_string();
@@ -483,12 +842,13 @@ pub(crate) async fn recover(
         .db
         .quota_reset_operation(&tenant_id, &account_id, operation)
         .await?;
-    if !original.manual_unlock_available || original.updated_at != expected_updated_at {
+    if original.state != "unknown" {
         return Err(AppError::Conflict(
-            "only the reviewed, locked unknown operation can be recovered".into(),
+            "reset recovery requires an unknown result and recorded dispatch completion".into(),
         ));
     }
-    // GET only. No balance observation is treated as proof of non-execution.
+    // A current balance informs the operator; it cannot attribute an unknown
+    // supplier outcome. Recovery releases the local slot, never consumes.
     let snapshot = fresh(state, account, credential, tenant).await?;
     state
         .db
@@ -496,8 +856,6 @@ pub(crate) async fn recover(
             account,
             operation,
             actor,
-            expected_updated_at,
-            reason,
             snapshot
                 .reset_capability
                 .available_credits
@@ -531,13 +889,14 @@ async fn dispatch_once(
             crate::oauth::managed::codex::USER_AGENT,
         )
         .header("originator", crate::oauth::managed::codex::ORIGINATOR)
+        // A slow successful consumption must not become unknown merely because
+        // eight seconds elapsed. Use the configured transport policy, with no
+        // extra reset response deadline and no implicit HTTP retry.
         .json(&json!({"redeem_request_id":redeem}));
     let request = credential
         .apply(request, unix_millis())
         .map_err(|_| "reset_prepare_credential_invalid".to_owned())?;
     let response = request.send().await.map_err(|error| {
-        // Never retain Display/source/URL: reqwest errors may contain proxy
-        // authentication, account credentials or supplier-controlled strings.
         let reason = match (error.is_connect(), error.is_timeout()) {
             (true, true) => "connect_timeout",
             (true, false) => "connect_failed",
@@ -565,83 +924,110 @@ mod tests {
         matchers::{body_json, method, path},
     };
 
-    #[test]
-    fn reset_readback_requires_stored_credential_after_sticky_proxy_failover() {
-        let account = Uuid::now_v7();
-        let proxies = ["socks5h://100.64.0.4:1080", "socks5h://100.64.0.5:1080"];
-        let groups = crate::db::TransportProxyGroups::parse(
-            &json!([{"account_id":account,"version":1,"proxies":proxies}]).to_string(),
-            b"reset-readback-regression",
-        )
-        .unwrap();
-        let stored = UpstreamCredential::OAuth {
-            access_token: "fixture-access".into(),
-            refresh_token: None,
-            expires_at: None,
-            header: "authorization".into(),
-            prefix: "Bearer ".into(),
-            adapter_state: None,
-            proxy_url: Some(proxies[0].into()),
-            proxy_network_scope: Some(crate::network::OutboundScope::Private),
-        };
-        let first = groups
-            .select_config(account, 1, &stored, &json!({}))
-            .unwrap();
-        assert!(first.advance_after_connect_failure(&[0]).unwrap());
-        let dispatch = groups
-            .select_config(account, 1, &stored, &json!({}))
-            .unwrap();
-        assert_eq!(dispatch.credential.proxy().unwrap().0, proxies[1]);
-        // This is the former success-path failure, reproduced without sending
-        // any supplier mutation. A selected credential is not a stored base.
-        assert!(
-            groups
-                .select_config(account, 1, &dispatch.credential, &json!({}))
-                .is_err()
-        );
-        let readback = groups
-            .select_config(account, 1, &stored, &json!({}))
-            .unwrap();
-        assert_eq!(readback.credential.proxy().unwrap().0, proxies[1]);
-        assert_eq!(stored.proxy().unwrap().0, proxies[0]);
-    }
-
     #[tokio::test]
-    async fn dispatch_timeout_uses_existing_client_policy_and_keeps_only_safe_reason() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/consume"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(200)))
-            .expect(1)
-            .mount(&server)
+    async fn explicit_unknown_recovery_only_reads_credits_and_never_consumes() {
+        let supplier = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/credits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "available_count": 1,
+                "credits": [{
+                    "id": "fixture-credit",
+                    "reset_type": "codex_rate_limits",
+                    "status": "available",
+                    "granted_at": "2020-01-01T00:00:00Z",
+                    "expires_at": "2099-01-01T00:00:00Z"
+                }]
+            })))
+            .expect(2)
+            .mount(&supplier)
             .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&supplier)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("reset-recovery.db").display()
+        )))
+        .await
+        .unwrap();
+        let tenant = "reset-recovery-fixture";
         let credential = UpstreamCredential::OAuth {
-            access_token: "fixture-private-access".into(),
+            access_token: "fixture-only".into(),
             refresh_token: None,
             expires_at: None,
             header: "authorization".into(),
             prefix: "Bearer ".into(),
-            adapter_state: None,
+            adapter_state: Some(json!({
+                "schema": "openai-codex-oauth-v1", "account_id": "fixture-account"
+            })),
             proxy_url: None,
             proxy_network_scope: None,
         };
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .retry(reqwest::retry::never())
-            .timeout(Duration::from_millis(40))
-            .build()
+        let account = state
+            .db
+            .create_upstream_account(
+                crate::db::CreateUpstreamAccountInput {
+                    tenant_external_id: tenant.into(),
+                    name: "reset recovery".into(),
+                    driver: "openai-codex".into(),
+                    config: json!({
+                        "base_url": "https://chatgpt.com",
+                        "reset_test_supplier_url": format!("{}/", supplier.uri())
+                    }),
+                    credential: credential.clone(),
+                    oauth_session_id: None,
+                    oauth_driver: None,
+                    oauth_refresh_url: None,
+                },
+                state.config.key_pepper.as_bytes(),
+            )
+            .await
             .unwrap();
-        let code = dispatch_once(
-            &http,
-            &credential,
-            reqwest::header::HeaderValue::from_static("fixture-private-account"),
-            &format!("{}/consume?private=fixture-query-secret", server.uri()),
-            "fixture-redeem",
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(code, "reset_send_timeout");
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let operation = state
+            .db
+            .prepare_quota_reset(PrepareQuotaReset {
+                id: Uuid::now_v7(),
+                account: account.clone(),
+                actor: "fixture".into(),
+                confirmation_hash: "fixture".into(),
+                prepare_idempotency_hash: "fixture".into(),
+                available: 2,
+                applicable: 2,
+                observed_at: unix_millis() - 1_000,
+            })
+            .await
+            .unwrap()
+            .operation;
+        state
+            .db
+            .claim_quota_reset(&account, &operation.id, "fixture", "fixture", "fixture")
+            .await
+            .unwrap();
+        state
+            .db
+            .finish_quota_reset(&operation.id, false, Some("reset_dispatch_owner_ended"))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            let recovered = recover(
+                &state,
+                &account,
+                &credential,
+                tenant,
+                "operator",
+                &operation.id,
+            )
+            .await
+            .unwrap();
+            assert_eq!(recovered.state, "unknown");
+            assert!(recovered.settled_at.is_some());
+            assert_eq!(recovered.reconciled_available_credits, Some(1));
+        }
+        assert_eq!(supplier.received_requests().await.unwrap().len(), 2);
     }
 
     #[tokio::test]

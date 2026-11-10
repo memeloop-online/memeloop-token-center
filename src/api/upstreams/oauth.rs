@@ -881,6 +881,28 @@ pub(in crate::api) async fn refresh_upstream_oauth(
     )?))
 }
 
+/// Resume only an encrypted result that is already durable. A new
+/// refresh-token request is deliberately unavailable from this endpoint.
+pub(in crate::api) async fn recover_upstream_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_upstream_tenant(account_id, tenant).await?;
+    }
+    let mut account = state
+        .db
+        .recover_upstream_oauth_refresh(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    super::restrict_transport_proxy_capability(&service, &mut account);
+    super::trigger_upstream_model_sync(state.clone(), account_id);
+    Ok(Json(super::config_secrets::public_account(
+        &state, account,
+    )?))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct DisconnectUpstreamOAuthRequest {
@@ -943,31 +965,41 @@ pub(crate) async fn refresh_managed_upstream_oauth(
     account_id: Uuid,
     idempotency_key: &str,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
-    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, None).await
+    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, None, None).await
 }
 
 pub(crate) async fn refresh_managed_upstream_oauth_for_worker(
     state: &AppState,
     account_id: Uuid,
     idempotency_key: &str,
+    expected_generation: i64,
     blocking: &crate::worker::BlockingTasks,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
-    refresh_managed_upstream_oauth_impl(state, account_id, idempotency_key, Some(blocking)).await
+    refresh_managed_upstream_oauth_impl(
+        state,
+        account_id,
+        idempotency_key,
+        Some(expected_generation),
+        Some(blocking),
+    )
+    .await
 }
 
 async fn refresh_managed_upstream_oauth_impl(
     state: &AppState,
     account_id: Uuid,
     idempotency_key: &str,
+    expected_generation: Option<i64>,
     blocking: Option<&crate::worker::BlockingTasks>,
 ) -> Result<crate::provider::UpstreamAccountView, AppError> {
     let pinned = state.clone().pin_application_plugins().await?;
     let state = &pinned;
     let claim = match state
         .db
-        .claim_upstream_oauth_refresh(
+        .claim_upstream_oauth_refresh_for_generation(
             account_id,
             idempotency_key,
+            expected_generation,
             state.config.key_pepper.as_bytes(),
         )
         .await?
@@ -1157,27 +1189,15 @@ async fn refresh_managed_upstream_oauth_impl(
     // A successful authorization-server refresh may have invalidated the old
     // refresh token. Finalize retries therefore stay local; on exhaustion the
     // encrypted pending result and lease remain for exact same-key recovery.
-    let finalized = if driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
-        state
-            .db
-            .finish_kimi_oauth_refresh(
-                account_id,
-                refreshed,
-                idempotency_key,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await
-    } else {
-        state
-            .db
-            .finish_upstream_oauth_refresh(
-                account_id,
-                refreshed,
-                idempotency_key,
-                state.config.key_pepper.as_bytes(),
-            )
-            .await
-    };
+    let finalized = state
+        .db
+        .finish_upstream_oauth_refresh(
+            account_id,
+            refreshed,
+            idempotency_key,
+            state.config.key_pepper.as_bytes(),
+        )
+        .await;
     let account = match finalized {
         Ok(account) => account,
         Err(error) => {
@@ -1204,9 +1224,24 @@ async fn refresh_managed_upstream_oauth_impl(
         }
     };
     if let Some(blocking) = blocking {
-        // The worker owns this future: no detached model-sync survives its
-        // role's shutdown/join boundary.
-        super::models::sync_upstream_models_after_refresh(state, account.id, Some(blocking)).await;
+        // The credential is already durable. Catalog and public price-source
+        // work must yield the serial renewal lane even when a price semaphore
+        // or a remote catalog never completes. This deadline never wraps the
+        // OAuth exchange, and blocking plugin work remains worker-owned.
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::models::sync_upstream_models_after_refresh(state, account.id, Some(blocking)),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!(
+                %account_id,
+                credential_generation = account.credential_generation,
+                stage = "oauth_refresh_catalog_followup",
+                "credential renewal completed; catalog follow-up yielded the renewal lane"
+            );
+        }
     } else {
         super::trigger_upstream_model_sync(state.clone(), account.id);
     }

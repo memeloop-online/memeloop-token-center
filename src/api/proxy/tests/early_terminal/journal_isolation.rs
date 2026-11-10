@@ -35,12 +35,41 @@ fn rejected_chat(fixture: &ResilientRouteFixture) -> tokio::task::JoinHandle<Res
 
 async fn wait_for_pending(fixture: &ResilientRouteFixture, expected: usize) {
     tokio::time::timeout(Duration::from_secs(3), async {
-        while fixture.state.early_requests.pending_writes_for_test() != expected {
+        // The detached request spool writer may still own ingress permits
+        // after the handler returns. Observe journal isolation only once that
+        // owner exits, while the journal is still pending. Cancellation must
+        // continue to check queue and memory release without waiting on spool.
+        while fixture.state.early_requests.pending_writes_for_test() != expected
+            || (expected != 0
+                && fixture
+                    .state
+                    .responses_request_spool
+                    .snapshot()
+                    .active_files
+                    != 0)
+        {
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("journal queue reached expected ownership state");
+}
+
+async fn assert_no_request_memory_after_spool(fixture: &ResilientRouteFixture) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture
+            .state
+            .responses_request_spool
+            .snapshot()
+            .active_files
+            != 0
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("rejected request spool owners must release independently of the journal");
+    assert_no_request_memory(fixture);
 }
 
 fn assert_no_request_memory(fixture: &ResilientRouteFixture) {
@@ -76,7 +105,7 @@ async fn blocked_journal_releases_rejected_chat_memory_before_valid_forwarding()
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(response.headers()["x-mtc-request-recording"], "unavailable");
     }
-    assert_no_request_memory(&fixture);
+    assert_no_request_memory_after_spool(&fixture).await;
 
     set_active(&fixture, true).await;
     let valid = send_resilient_chat(&fixture, None, false).await;
@@ -135,7 +164,7 @@ async fn journal_wait_timeout_is_explicit_and_recovery_projects_only_once() {
     assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(rejected.headers()["x-mtc-request-recording"], "unavailable");
     assert_eq!(fixture.state.early_requests.pending_writes_for_test(), 0);
-    assert_no_request_memory(&fixture);
+    assert_no_request_memory_after_spool(&fixture).await;
     assert!(
         fixture
             .state
@@ -196,7 +225,7 @@ async fn unavailable_journal_filesystem_keeps_original_error_and_no_memory_owner
         !rejected.headers().contains_key("x-mtc-request-recording"),
         "a blocked journal path must not drop the database record"
     );
-    assert_no_request_memory(&fixture);
+    assert_no_request_memory_after_spool(&fixture).await;
     let body: Value =
         serde_json::from_slice(&to_bytes(rejected.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["error"]["code"], "no_authorized_upstream_candidate");

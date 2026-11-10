@@ -36,11 +36,7 @@ impl Database {
         .bind(lease_token.to_string())
         .execute(&self.pool)
         .await?;
-        let recovered = result.rows_affected() == 1;
-        if recovered {
-            self.note_service_available(upstream_account_id).await;
-        }
-        Ok(recovered)
+        Ok(result.rows_affected() == 1)
     }
 
     #[cfg(test)]

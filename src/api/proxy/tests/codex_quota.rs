@@ -11,7 +11,7 @@ async fn codex_explicit_quota_rejection_fails_over_and_is_observed_without_admis
             "error": {"type":"usage_limit_reached", "resets_in_seconds":3600,
                 "message":"fixture private exhausted quota"}
         })))
-        .expect(2)
+        .expect(1)
         .mount(&upstream)
         .await;
     Mock::given(method("POST"))
@@ -39,12 +39,24 @@ async fn codex_explicit_quota_rejection_fails_over_and_is_observed_without_admis
             .await
             .unwrap();
         assert!(!String::from_utf8_lossy(&body).contains("fixture private exhausted quota"));
+        fixture.state.routing_persistence.drain_for_test().await;
     }
     fixture.state.routing_persistence.drain_for_test().await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let health_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_account_health WHERE upstream_account_id = $1 AND consecutive_failures > 0")
         .bind(fixture.upstream_account_id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(health_rows, 0);
+    let evidence = sqlx::query(
+        "SELECT failure_kind, reset_at, reset_source, upstream_model
+         FROM upstream_supplier_availability WHERE upstream_account_id = $1",
+    )
+    .bind(fixture.upstream_account_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(evidence.get::<String, _>("failure_kind"), "quota_exhausted");
+    assert_eq!(evidence.get::<String, _>("reset_source"), "provider_reset");
+    assert!(evidence.get::<Option<i64>, _>("reset_at").unwrap() > unix_millis());
     let actual: String = sqlx::query_scalar("SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1")
         .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
     assert_eq!(actual, standby.to_string());
@@ -53,7 +65,7 @@ async fn codex_explicit_quota_rejection_fails_over_and_is_observed_without_admis
 }
 
 #[tokio::test]
-async fn codex_sse_quota_error_with_unknown_consumption_is_never_replayed() {
+async fn codex_sse_quota_after_output_keeps_unknown_consumption_without_replay() {
     let fixture = codex_route_fixture("quota-sse-unknown").await;
     codex_output_limits::enable_provider_default_limits(&fixture).await;
     let upstream = MockServer::start().await;
@@ -63,6 +75,7 @@ async fn codex_sse_quota_error_with_unknown_consumption_is_never_replayed() {
         .respond_with(ResponseTemplate::new(200).set_body_raw(
             concat!(
                 "data: {\"type\":\"response.created\",\"response\":{\"id\":\"quota-unknown\"}}\n\n",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"already generated\"}\n\n",
                 "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"quota-unknown\",\"error\":{\"type\":\"usage_limit_reached\",\"message\":\"fixture private quota\"}}}\n\n"
             ), "text/event-stream"))
         .expect(1).mount(&upstream).await;
@@ -86,7 +99,10 @@ async fn codex_sse_quota_error_with_unknown_consumption_is_never_replayed() {
     )
     .await;
     if let Ok(body) = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY).await {
+        assert!(String::from_utf8_lossy(&body).contains("already generated"));
         assert!(!String::from_utf8_lossy(&body).contains("must not replay"));
     }
+    cancellation::assert_single_unknown_receipt(&fixture, 502, Some("upstream_failed_response"))
+        .await;
     upstream.verify().await;
 }

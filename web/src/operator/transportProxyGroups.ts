@@ -2,6 +2,7 @@ import { ApiError, api } from '../api.js';
 import { transportProxyGroupCopy } from './transportProxyGroupCopy.js';
 
 export interface TransportProxyMember {
+  proxy_url?: string;
   id: string;
   label: string;
   scheme: string;

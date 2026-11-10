@@ -48,11 +48,20 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Publish or reclaim disposable RustFS cache copies without opening SQL.
+    ArchiveCache {
+        #[command(subcommand)]
+        command: memeloop_token_center::archive::cache_command::CacheCommand,
+    },
     Serve {
         #[arg(long, value_enum, default_value_t)]
         role: RuntimeRole,
     },
     Migrate,
+    RequestHistory {
+        #[command(subcommand)]
+        command: memeloop_token_center::request_history::migration::HistoryCommand,
+    },
     #[command(
         about = "Preview an exact USD contract-ceiling failure manifest; --apply only changes statistical projections"
     )]
@@ -103,6 +112,9 @@ enum Command {
         /// Reader roles validate the file without creating it.
         #[arg(long)]
         read_only: bool,
+        /// Leave optional inventory recovery to the running application.
+        #[arg(long)]
+        allow_unavailable: bool,
     },
     /// Internal release-package check for the installer, runtime library path,
     /// and Cosign companion. It performs no registry or database access.
@@ -143,13 +155,19 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), &'static str> {
     let cli = Cli::parse();
+    if let Command::ArchiveCache { command } = cli.command {
+        return memeloop_token_center::archive::cache_command::run(command)
+            .await
+            .map_err(|_| "archive_cache_operation_failed");
+    }
     #[cfg(feature = "experimental-plugin-revisions")]
     if let Command::PreparePluginInventory {
         directory,
         read_only,
+        allow_unavailable,
     } = &cli.command
     {
-        return if *read_only {
+        let prepared = if *read_only {
             memeloop_token_center::plugin::application::prepare::check_inventory_directory(
                 directory,
             )
@@ -157,8 +175,12 @@ async fn run() -> Result<(), &'static str> {
             memeloop_token_center::plugin::application::prepare::prepare_inventory_directory(
                 directory,
             )
+        };
+        if prepared.is_err() && *allow_unavailable {
+            eprintln!("plugin inventory unavailable; application will report status and retry");
+            return Ok(());
         }
-        .map_err(|_| "plugin_inventory_preparation_failed");
+        return prepared.map_err(|_| "plugin_inventory_preparation_failed");
     }
     #[cfg(all(
         feature = "experimental-plugin-revisions",
@@ -172,6 +194,14 @@ async fn run() -> Result<(), &'static str> {
     let config = Config::from_env().map_err(|_| "configuration_invalid")?;
 
     match cli.command {
+        Command::ArchiveCache { .. } => unreachable!("handled before database configuration"),
+        Command::RequestHistory { command } => {
+            let result =
+                memeloop_token_center::request_history::migration::command(&config, command)
+                    .await
+                    .map_err(|_| "request_history_operation_failed")?;
+            println!("{result}");
+        }
         #[cfg(feature = "experimental-plugin-revisions")]
         Command::PreparePluginInventory { .. } => {
             unreachable!("handled before configuration loading")
@@ -284,6 +314,8 @@ async fn run() -> Result<(), &'static str> {
             let (app, startup) = api::startup::router(role);
             let (worker_shutdown, mut receiver) = watch::channel(false);
             let (oauth_shutdown, oauth_receiver) = watch::channel(false);
+            let proxy_state = std::sync::Arc::new(std::sync::OnceLock::new());
+            let initialized_proxy_state = proxy_state.clone();
             // Keep dependency initialization off the HTTP lifecycle. A database
             // outage retains the existing static shell and explicit 503 API
             // errors, then recovers through the original router/auth chain.
@@ -295,6 +327,7 @@ async fn run() -> Result<(), &'static str> {
                     };
                     match initialized {
                         Ok(state) => {
+                            let _ = initialized_proxy_state.set(state.clone());
                             startup.install(api::router_for_role(state.clone(), role));
                             #[cfg(feature = "experimental-plugin-revisions")]
                             let refresh = async {
@@ -347,6 +380,11 @@ async fn run() -> Result<(), &'static str> {
                 Some(worker_task),
                 Some(worker_shutdown),
                 Some(oauth_shutdown),
+                async move {
+                    if let Some(state) = proxy_state.get() {
+                        state.drain_proxy_tasks().await;
+                    }
+                },
             )
             .await?;
         }
@@ -362,6 +400,7 @@ async fn serve_with_worker_shutdown(
     mut worker_task: Option<tokio::task::JoinHandle<()>>,
     worker_shutdown: Option<watch::Sender<bool>>,
     oauth_shutdown: Option<watch::Sender<bool>>,
+    proxy_drain: impl std::future::Future<Output = ()>,
 ) -> Result<(), &'static str> {
     let mut worker_failed = false;
     let result = memeloop_token_center::server::serve(listener, app, async {
@@ -371,6 +410,7 @@ async fn serve_with_worker_shutdown(
         }
     })
     .await;
+    proxy_drain.await;
     if let Some(sender) = oauth_shutdown {
         let _ = sender.send(true);
     }
@@ -409,6 +449,10 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 }
+
+#[cfg(test)]
+#[path = "shutdown_durability_tests.rs"]
+mod shutdown_durability_tests;
 
 #[cfg(test)]
 mod lifecycle_tests {
@@ -490,6 +534,7 @@ mod lifecycle_tests {
             Some(worker),
             Some(worker_stop),
             Some(oauth_stop),
+            async {},
         ));
         let request = tokio::spawn(async move {
             reqwest::Client::builder()

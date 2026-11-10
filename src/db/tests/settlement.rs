@@ -546,6 +546,14 @@ async fn metered_usage_projection_is_exactly_once_and_skips_prepaid_hot_rows() {
         .await
         .unwrap();
     assert_eq!(conversation_tasks.len(), 1);
+    let atoms = crate::conversation::extract_atoms(&request_json);
+    let nodes = crate::conversation::build_prefix(&atoms);
+    assert!(
+        database
+            .prepare_session_body_archive(conversation_projector, request_id, atoms, &nodes, &[])
+            .await
+            .unwrap()
+    );
     assert!(
         database
             .project_claimed_conversation_projection_task(conversation_projector, request_id)

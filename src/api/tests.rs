@@ -14,6 +14,7 @@ use super::*;
 use crate::config::{ArchiveBackend, Config};
 
 mod optional_limits;
+mod request_event_stream;
 
 pub(super) async fn test_state() -> (AppState, tempfile::TempDir) {
     let directory = tempfile::tempdir().unwrap();
@@ -1076,69 +1077,6 @@ fn upstream_image_idempotency_is_secret_and_scoped_to_stable_identity() {
     assert_ne!(first, other_identity);
     assert!(first.starts_with("mtc-img-"));
     assert!(!first.contains("shared-low-entropy-key"));
-}
-
-#[tokio::test]
-async fn synchronous_image_budget_is_acquired_before_reading_the_request_body() {
-    let fixture = generation_api_fixture(
-        "image-lifecycle",
-        "comfyui",
-        "job",
-        KeyPolicy {
-            allowed_models: vec!["generation-api-model-image-lifecycle".to_owned()],
-            ..KeyPolicy::default()
-        },
-        Decimal::TEN,
-    )
-    .await;
-    let both = fixture
-        .state
-        .image_response_permits
-        .acquire_many(2)
-        .await
-        .expect("acquire both image permits");
-    let cloned = fixture.state.clone();
-    assert!(std::sync::Arc::ptr_eq(
-        &fixture.state.image_response_permits,
-        &cloned.image_response_permits,
-    ));
-    assert!(cloned.image_response_permits.try_acquire().is_err());
-    assert!(
-        tokio::time::timeout(
-            Duration::from_millis(25),
-            fixture.state.image_response_permits.acquire()
-        )
-        .await
-        .is_err(),
-        "a third synchronous image lifecycle must not have a permit"
-    );
-
-    let response = tokio::time::timeout(
-        Duration::from_millis(100),
-        router_for_role(fixture.state.clone(), RuntimeRole::Gateway).oneshot(
-            Request::post("/v1/images/generations")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {}", fixture.key))
-                .body(Body::from_stream(futures_util::stream::pending::<
-                    Result<Bytes, Infallible>,
-                >()))
-                .unwrap(),
-        ),
-    )
-    .await
-    .expect("an exhausted image budget must reject without reading the body")
-    .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.headers().get(header::RETRY_AFTER).unwrap(), "1");
-
-    drop(both);
-    let _released = tokio::time::timeout(
-        Duration::from_millis(100),
-        fixture.state.image_response_permits.acquire(),
-    )
-    .await
-    .expect("permit becomes available")
-    .expect("semaphore remains open");
 }
 
 #[tokio::test]
@@ -2212,7 +2150,7 @@ async fn public_responses_include_browser_security_headers() {
 }
 
 #[tokio::test]
-async fn quiet_request_event_streams_disconnect_promptly_and_are_service_bounded() {
+async fn quiet_request_event_streams_support_multiple_tabs_and_disconnect_promptly() {
     let (state, _directory) = test_state().await;
     let service_token = state.config.service_token.clone();
     let application = router_for_role(state.clone(), RuntimeRole::Control);
@@ -2226,20 +2164,17 @@ async fn quiet_request_event_streams_disconnect_promptly_and_are_service_bounded
     };
 
     let mut streams = Vec::new();
-    for _ in 0..crate::request_event_stream::REQUEST_EVENT_STREAMS_PER_SERVICE {
+    for _ in 0..8 {
         let response = open_stream().await.expect("open request event stream");
         assert_eq!(response.status(), StatusCode::OK);
         streams.push(response);
     }
-    let rejected = open_stream().await.expect("bounded request event stream");
-    assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(state.request_event_streams.active_count(), 8);
     drop(streams);
 
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if state.request_event_streams.global_available_permits()
-                == crate::request_event_stream::GLOBAL_REQUEST_EVENT_STREAMS
-            {
+            if state.request_event_streams.active_count() == 0 {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2250,7 +2185,7 @@ async fn quiet_request_event_streams_disconnect_promptly_and_are_service_bounded
 
     for _ in 0..4 {
         let mut dropped_batch = Vec::new();
-        for _ in 0..crate::request_event_stream::REQUEST_EVENT_STREAMS_PER_SERVICE {
+        for _ in 0..8 {
             let response = open_stream().await.expect("reopened request event stream");
             assert_eq!(response.status(), StatusCode::OK);
             dropped_batch.push(response);
@@ -2258,16 +2193,14 @@ async fn quiet_request_event_streams_disconnect_promptly_and_are_service_bounded
         drop(dropped_batch);
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if state.request_event_streams.global_available_permits()
-                    == crate::request_event_stream::GLOBAL_REQUEST_EVENT_STREAMS
-                {
+                if state.request_event_streams.active_count() == 0 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .expect("immediately dropped stream bodies release every permit");
+        .expect("immediately dropped stream bodies release every producer");
     }
 }
 

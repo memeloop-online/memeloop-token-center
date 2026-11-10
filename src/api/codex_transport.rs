@@ -65,7 +65,6 @@ const MAX_OUTPUT_ITEMS: usize = 16_384;
 // health. Keep the exceptional definite-rejection inspection deliberately
 // small: it happens before any downstream bytes are delivered and its body is
 // never retained, archived, logged, or returned.
-const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(super) fn is_driver(driver: &str) -> bool {
     driver == DRIVER
@@ -331,6 +330,19 @@ where
     TEST_ENDPOINT.scope(endpoint, future).await
 }
 
+#[cfg(test)]
+pub(in crate::api) fn inherit_test_endpoint<F: Future>(
+    future: F,
+) -> impl Future<Output = F::Output> {
+    let endpoint = TEST_ENDPOINT.try_with(Clone::clone).ok();
+    async move {
+        match endpoint {
+            Some(endpoint) => TEST_ENDPOINT.scope(endpoint, future).await,
+            None => future.await,
+        }
+    }
+}
+
 /// Rewrite only the upstream wire document. The original downstream body is
 /// archived by `proxy()` before this document is sent.
 #[cfg(test)]
@@ -367,6 +379,8 @@ pub(super) fn prepare_request_with_id(
     let chat_controls = matches!(protocol, Protocol::OpenAiChat)
         .then(|| translate_chat_request(request, transport_policy.chat_controls))
         .transpose()?;
+    // Codex reserves collaboration tools and requires their configured schemas.
+    // Rewriting encrypted message fields makes the native provider reject tools.
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".into()))?;
@@ -1208,14 +1222,13 @@ pub(super) async fn admit_event_stream_response(
     }
 
     let mut parts = response.into_parts();
-    let deadline = tokio::time::Instant::now() + MISSING_CONTENT_TYPE_SNIFF_TIMEOUT;
     let mut prefetched = Vec::new();
     let mut inspected = Vec::new();
     let mut sanitizer = ResponsesStreamingSanitizer::with_limits(sse_framing_limits);
     loop {
-        let next = tokio::time::timeout_at(deadline, parts.stream.next())
-            .await
-            .map_err(|_| ResponseAdmissionError::Ambiguous("upstream_timeout"))?;
+        // Admission shares the upstream body's timeout/cancellation policy.
+        // Missing Content-Type must not introduce a separate response deadline.
+        let next = parts.stream.next().await;
         let Some(next) = next else {
             return Err(ResponseAdmissionError::Invalid(
                 "upstream_invalid_content_type",
@@ -1883,6 +1896,21 @@ pub(super) async fn buffer_response(
     conversation: Option<&super::ProxyConversation>,
     sse_framing_limits: crate::provider::SseFramingLimits,
 ) -> Result<BufferedCodexResponse, &'static str> {
+    struct ReadMemory<'a> {
+        memory: &'a crate::gateway_body::memory::ProxyMemoryReservation,
+        conversation: Option<&'a super::ProxyConversation>,
+        keep: bool,
+    }
+    impl Drop for ReadMemory<'_> {
+        fn drop(&mut self) {
+            if !self.keep {
+                self.memory.release_buffered_response();
+                if let Some(conversation) = self.conversation {
+                    conversation.reject_projection();
+                }
+            }
+        }
+    }
     if response
         .headers()
         .get_all(header::CONTENT_ENCODING)
@@ -1900,6 +1928,7 @@ pub(super) async fn buffer_response(
     {
         return Err("upstream_response_too_large");
     }
+    let has_content_length = response.content_length().is_some();
     let maximum = response
         .content_length()
         .and_then(|length| usize::try_from(length).ok())
@@ -1909,14 +1938,22 @@ pub(super) async fn buffer_response(
     let diagnostic_context = proxy_diagnostics::Context::current();
     let capacity = proxy_diagnostics::Phase::new(diagnostic_context, "buffered_response_memory");
     let reserved = if let Some(conversation) = conversation {
-        conversation.reserve_for_buffered_response(memory, maximum, deadline)
+        conversation.reserve_for_buffered_response(memory, 0, deadline)
     } else {
-        memory.reserve_buffered_response(maximum, deadline)
+        memory.reserve_buffered_response(0, deadline)
     };
     if !reserved {
+        tracing::warn!(request_id = %diagnostic_context.request_id,
+            stage = "codex_response_admission", reserved_bytes = memory.buffered_response_reserved_bytes(),
+            actual_bytes = 0, has_content_length, "Codex response memory unavailable");
         capacity.finish("rejected", None, None);
         return Err("upstream_response_memory_capacity");
     }
+    let mut read_memory = ReadMemory {
+        memory,
+        conversation,
+        keep: false,
+    };
     capacity.finish("completed", None, None);
     let mut first_byte = Some(proxy_diagnostics::Phase::new(
         diagnostic_context,
@@ -1938,17 +1975,38 @@ pub(super) async fn buffer_response(
         if total > maximum {
             return Err("upstream_response_too_large");
         }
+        let pending_bytes = parser.pending_wire_bytes.saturating_add(chunk.len());
+        if !memory.grow_buffered_response(pending_bytes) {
+            tracing::warn!(request_id = %diagnostic_context.request_id,
+                stage = "codex_response_frame", reserved_bytes = memory.buffered_response_reserved_bytes(),
+                actual_bytes = pending_bytes, has_content_length, "Codex response frame memory unavailable");
+            return Err("upstream_response_memory_capacity");
+        }
         parser.push_accounted(&chunk, Some(memory))?;
+        memory.shrink_buffered_response_capacity(parser.pending_wire_bytes);
     }
     if let Some(phase) = first_byte.take() {
         phase.finish("no_bytes", None, Some(0));
     }
-    parser.finish()
+    let result = parser.finish()?;
+    if !memory.reserve_response_json(&result.body) {
+        tracing::warn!(request_id = %diagnostic_context.request_id,
+            stage = "codex_response_json", reserved_bytes = memory.buffered_response_reserved_bytes(),
+            actual_bytes = result.body.len(), has_content_length, "Codex response JSON memory unavailable");
+        return Err("upstream_response_memory_capacity");
+    }
+    memory.shrink_buffered_response(&result.body);
+    tracing::debug!(request_id = %diagnostic_context.request_id,
+        stage = "codex_response_ready", reserved_bytes = memory.buffered_response_reserved_bytes(),
+        actual_bytes = result.body.len(), has_content_length, "Codex response memory accounted");
+    read_memory.keep = true;
+    Ok(result)
 }
 
 #[derive(Default)]
 struct BufferedResponsesParser {
     framer: BoundedSseFramer,
+    pending_wire_bytes: usize,
     output_items: BTreeMap<usize, Value>,
     identity: ResponseIdentityGate,
     terminal_response: Option<(Value, BufferedCodexTerminal)>,
@@ -2019,6 +2077,7 @@ impl BufferedResponsesParser {
         chunk: &[u8],
         memory: Option<&std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
     ) -> Result<(), &'static str> {
+        self.pending_wire_bytes = self.pending_wire_bytes.saturating_add(chunk.len());
         let batch = self.framer.push(chunk);
         if let Some(rejection) = batch.rejection {
             return Err(match rejection {
@@ -2027,6 +2086,7 @@ impl BufferedResponsesParser {
             });
         }
         for event in batch.events {
+            self.pending_wire_bytes = self.pending_wire_bytes.saturating_sub(event.bytes.len());
             self.dispatch(event, memory)?;
         }
         Ok(())
@@ -2383,6 +2443,58 @@ mod tests {
         assert!(!codex_transient_error(&json!({
             "error": {"type": "invalid_request_error"}
         })));
+    }
+
+    #[test]
+    fn native_parent_preserves_reserved_collaboration_schema_and_native_history() {
+        let mut request = json!({
+            "tools": [{"type":"namespace","name":"collaboration","tools":[
+                {"type":"function","name":"spawn_agent","parameters":{"type":"object",
+                    "properties":{"message":{"type":"string","encrypted":true,"description":"task"}}}}
+            ]}, {"type":"function","name":"unrelated","parameters":{"type":"object",
+                "properties":{"message":{"type":"string","encrypted":true}}}}],
+            "input": [{"type":"agent_message","content":[
+                {"type":"encrypted_content","encrypted_content":"opaque-history"}
+            ]}, {"type":"additional_tools","tools":[
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"send_message","parameters":{"type":"object",
+                        "properties":{"message":{"type":"string","encrypted":true}}}}
+                ]}
+            ]}]
+        });
+        let native_history = request["input"][0].clone();
+        let native_tools = request["tools"].clone();
+        let late_tools = request["input"][1].clone();
+        prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).unwrap();
+        assert_eq!(
+            request.pointer("/tools/0/tools/0/parameters/properties/message/encrypted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            request.pointer("/input/1/tools/0/tools/0/parameters/properties/message/encrypted"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            request["tools"][1]["parameters"]["properties"]["message"]["encrypted"],
+            true
+        );
+        assert_eq!(request["input"][0], native_history);
+        assert_eq!(request["tools"], native_tools);
+        assert_eq!(request["input"][1], late_tools);
+        assert_eq!(
+            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]["description"],
+            "task"
+        );
+
+        let task =
+            "Review PR757. Preserve usage and never retry OAuth.\nReport the exact findings.";
+        let mut child = json!({"input":[{"type":"agent_message","content":[
+            {"type":"input_text","text":task}
+        ]}]});
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut child, true)
+            .unwrap();
+        assert_eq!(child["input"][0]["role"], "user");
+        assert_eq!(child["input"][0]["content"][0]["text"], task);
     }
 
     fn config(model: &str, limit: i64) -> Value {
@@ -2871,6 +2983,85 @@ mod tests {
         assert_eq!(body["output"][1]["id"], "item-1");
         assert_eq!(result.usage.input_tokens, 3);
         assert_eq!(result.usage.output_tokens, 2);
+    }
+
+    #[tokio::test]
+    async fn buffered_codex_small_output_does_not_hold_maximum_and_cancel_refunds() {
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(1024 * 1024);
+        let memory = budget.reservation();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            http::HeaderValue::from_static("text/event-stream"),
+        );
+        let response = UpstreamResponse::Prefetched {
+            status: http::StatusCode::OK,
+            headers: headers.clone(),
+            version: http::Version::HTTP_11,
+            content_length: None,
+            stream: Box::pin(futures_util::stream::iter(
+                completed_stream()
+                    .chunks(17)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect::<Vec<_>>(),
+            )),
+        };
+        let result = buffer_response(
+            response,
+            &memory,
+            std::time::Duration::from_secs(30),
+            None,
+            crate::provider::SseFramingLimits::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.usage.output_tokens, 2);
+        assert!(memory.response_json_fits(&result.body));
+        assert!(budget.snapshot().0 < 1024 * 1024);
+        drop(result);
+        memory.release_buffered_response();
+        assert_eq!(budget.snapshot().0, 0);
+        let owned = memory.clone();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let response = UpstreamResponse::Prefetched {
+                status: http::StatusCode::OK,
+                headers,
+                version: http::Version::HTTP_11,
+                content_length: None,
+                stream: Box::pin(futures_util::stream::once(async move {
+                    let _ = started.send(());
+                    futures_util::future::pending().await
+                })),
+            };
+            buffer_response(
+                response,
+                &owned,
+                std::time::Duration::from_secs(30),
+                None,
+                crate::provider::SseFramingLimits::default(),
+            )
+            .await
+            .is_ok()
+        });
+        waiting.await.unwrap();
+        assert_eq!(budget.snapshot().0, 64 * 1024);
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[test]
+    fn buffered_parser_counts_only_unemitted_wire_bytes_across_partial_events() {
+        let mut parser = BufferedResponsesParser::default();
+        let progress = b"data: {\"type\":\"response.in_progress\",\"response\":{\"id\":\"resp-1\",\"status\":\"in_progress\"}}\r\n\r\n";
+        for _ in 0..1000 {
+            for chunk in progress.chunks(17) {
+                parser.push(chunk).unwrap();
+                assert!(parser.pending_wire_bytes <= progress.len());
+            }
+            assert_eq!(parser.pending_wire_bytes, 0);
+        }
     }
 
     #[test]

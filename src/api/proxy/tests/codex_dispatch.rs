@@ -264,19 +264,50 @@ async fn failover_dispatch_overload_preserves_response_archive_and_releases_old_
             Some(fixture.upstream_account_id)
         );
         pool.close().await;
-        let refs = fixture
+        drain_archive_capture(&fixture).await;
+        let key = fixture
             .state
             .db
-            .request_archive_refs(fixture.key_id, rows[0].request_id)
+            .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
             .await
             .unwrap();
-        let locator = refs.response_object.as_deref().unwrap();
-        let archived: Value = if let Some(body) = locator.strip_prefix("inline-json:") {
-            serde_json::from_str(body).unwrap()
-        } else {
-            serde_json::from_slice(&fixture.state.archive.get(locator).await.unwrap()).unwrap()
-        };
-        assert_eq!(archived, body);
+        let attempt = fixture
+            .state
+            .archive
+            .response_attempt(key.tenant_id, rows[0].request_id, 1)
+            .await
+            .unwrap()
+            .expect("definite supplier rejection must survive next-lane overload");
+        assert_eq!(
+            attempt.attempt.upstream_account_id,
+            fixture.upstream_account_id
+        );
+        assert_eq!(attempt.attempt.model_route_id, fixture.route_id);
+        assert_eq!(attempt.attempt.status_code, 429);
+        let archived = fixture
+            .state
+            .archive
+            .get_tenant_content(key.tenant_id, &attempt.response, 1024)
+            .await
+            .unwrap();
+        let original =
+            serde_json::to_vec(&json!({"error":{"type":"rate_limit_exceeded"}})).unwrap();
+        assert_eq!(archived.as_ref(), original.as_slice());
+        assert_eq!(attempt.response.size_bytes, original.len() as u64);
+        assert_eq!(
+            attempt.response.blake3_digest,
+            blake3::hash(&original).to_hex().to_string()
+        );
+        assert!(
+            fixture
+                .state
+                .archive
+                .raw_capture_reference(key.tenant_id, rows[0].request_id, "response")
+                .await
+                .unwrap()
+                .is_none(),
+            "local overload must not masquerade as a supplier response"
+        );
         assert_eq!(upstream.received_requests().await.unwrap().len(), 1);
         drop(held);
     }
@@ -328,6 +359,7 @@ async fn admitted_invalid_dispatch_policy_finishes_as_configuration_error_withou
         conversation: None,
         protocol: Protocol::OpenAiResponses,
         tenant_id: key.tenant_id,
+        original_response_capture: false,
         memory: fixture.state.proxy_memory_budget.reservation(),
     };
     let response = lifecycle::finish_dispatch_failure(

@@ -91,9 +91,9 @@ Then('管理员可以重命名凭据并查看当前限制状态', async function
   await assertContains(resource, 'Browser E2E credential');
 
   await resource.getByRole('button', { name: '更多操作', exact: true }).click();
-  await page.getByRole('menuitem', { name: '修改别名', exact: true }).click();
-  const editor = page.locator('.credential-active-editor .inline-editor').filter({ hasText: '修改' });
-  await editor.locator('input').fill('Browser E2E renamed credential');
+  await page.getByRole('menuitem', { name: '编辑', exact: true }).click();
+  const editor = page.locator('.credential-active-editor .inline-editor').filter({ hasText: '编辑' });
+  await editor.getByRole('textbox', { name: '凭据别名', exact: true }).fill('Browser E2E renamed credential');
   const renameResponse = page.waitForResponse((response) =>
     response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/alias`) &&
     response.request().method() === 'PATCH');
@@ -122,9 +122,9 @@ Then('管理员可以重命名凭据并查看当前限制状态', async function
 
   await page.locator('.create-journey [data-workspace-toggle]').click();
   await resource.getByRole('button', { name: '更多操作', exact: true }).click();
-  await page.getByRole('menuitem', { name: '修改别名', exact: true }).click();
-  const restoreEditor = page.locator('.credential-active-editor .inline-editor').filter({ hasText: '修改' });
-  await restoreEditor.locator('input').fill('Browser E2E credential');
+  await page.getByRole('menuitem', { name: '编辑', exact: true }).click();
+  const restoreEditor = page.locator('.credential-active-editor .inline-editor').filter({ hasText: '编辑' });
+  await restoreEditor.getByRole('textbox', { name: '凭据别名', exact: true }).fill('Browser E2E credential');
   const restoreResponse = page.waitForResponse((response) =>
     response.url().endsWith(`/internal/v1/keys/${seed.clientKeyId}/alias`) &&
     response.request().method() === 'PATCH');

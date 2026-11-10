@@ -56,6 +56,7 @@ async fn empty_and_oversized_snapshots_do_not_wait_for_database_preflight() {
             Uuid::now_v7(),
             started + Duration::from_secs(1),
             &mut candidates,
+            None,
         )
         .await
         .unwrap();
@@ -73,6 +74,7 @@ fn snapshot_phases_correlate_duration_without_policy_or_error_data() {
     let subscriber = tracing_subscriber::fmt()
         .json()
         .without_time()
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(move || sink.clone())
         .finish();
     let request_id = Uuid::now_v7();
@@ -89,6 +91,14 @@ fn snapshot_phases_correlate_duration_without_policy_or_error_data() {
     let events = writer.events();
     assert_eq!(events.len(), 6);
     for event in &events {
+        assert_eq!(
+            event["level"],
+            if event["fields"]["outcome"] == "not_completed" {
+                "INFO"
+            } else {
+                "DEBUG"
+            }
+        );
         let fields = event["fields"].as_object().unwrap();
         assert_eq!(fields.len(), 4);
         assert_eq!(fields["request_id"], request_id.to_string());
@@ -130,6 +140,7 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
     let subscriber = tracing_subscriber::fmt()
         .json()
         .without_time()
+        .with_max_level(tracing::Level::DEBUG)
         .with_writer(move || sink.clone())
         .finish();
     let request_id = Uuid::now_v7();
@@ -147,6 +158,7 @@ async fn blocked_snapshot_with_maximum_candidates_cannot_extend_frozen_deadline(
         request_id,
         deadline,
         &mut candidates,
+        None,
     )
     .with_subscriber(subscriber)
     .await
@@ -188,6 +200,7 @@ fn reversed_plan_retains_exact_generation_and_health_snapshot() {
         config: serde_json::json!({}),
         candidates: vec![first.candidate.clone(), second.candidate.clone()],
         quota_context: None,
+        allocation_context: None,
     };
     assert_eq!(
         planned_candidate(&input, &second.directive),

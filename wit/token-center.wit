@@ -90,6 +90,15 @@ world group-routing-plugin {
   export group-routing-v1;
 }
 
+interface network-proxy-strategy-v1 {
+  plan: func(input-json: string) -> result<string, string>;
+}
+
+world network-proxy-strategy-plugin {
+  import host;
+  export network-proxy-strategy-v1;
+}
+
 /// Independent ABI: packages without service-data contributions keep using
 /// the original `plugin` world and need no additional exports.
 world service-data-plugin {

@@ -170,7 +170,7 @@ async fn require_members_tenant(
 }
 
 async fn select_key_grant_ids(
-    pool: &sqlx::AnyPool,
+    pool: &crate::db::request_pool::RequestPool,
     tenant_id: &str,
     key_id: Uuid,
     exact: bool,

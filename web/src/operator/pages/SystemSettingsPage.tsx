@@ -6,6 +6,7 @@ import { useI18n } from '../../i18n';
 import { ModelPicker } from '../../ModelPicker';
 import type { FilterAssistantSettings } from '../../types';
 import { assistantRouteCatalog, type ModelPickerProjectionItem, type ModelPickerProjectionPage } from '../modelCatalog';
+import { RequestConfigSettings } from '../RequestConfigSettings';
 import { messageOf } from '../scope/operatorShared';
 import './systemSettings.css';
 
@@ -38,7 +39,9 @@ async function loadAssistantRouteCatalog(token: string, tenant: string): Promise
  * fetches nor displays a client or upstream credential secret.
  */
 export function SystemSettingsPage({ token, tenant }: { token: string; tenant: string; writeTenant?: string }) {
-  return <AssistantSettings key={JSON.stringify([token, tenant])} token={token} tenant={tenant} />;
+  const scopeKey = JSON.stringify([token, tenant]);
+  return <><AssistantSettings key={scopeKey} token={token} tenant={tenant} />
+    <div className="system-settings"><RequestConfigSettings key={token} token={token} /></div></>;
 }
 
 function AssistantSettings({ token, tenant }: { token: string; tenant: string }) {
@@ -176,7 +179,6 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
           <div className="button-row"><Button appearance="primary" type="submit" disabled={saving || billingLoading || Boolean(billingError) || !selectedRouteId || !selectedRouteIsVerified || !selectedRouteHasAvailableCandidate || !billingChoices.some((choice) => choice.key_id === selectedBillingId)}>{saving ? t('common.loading') : t('common.save')}</Button></div>
         </form>}
         {!loading && !loadError && selectedUnverifiedRoute && <p className="error-text" role="alert">{t('settings.assistantTextSelectedUnverified', { model: selectedUnverifiedRoute.label })}</p>}
-        {!loading && !loadError && unverifiedRoutes.length > 0 && <p className="settings-status-note" role="status">{t('settings.assistantTextUnverified', { count: unverifiedRoutes.length })}</p>}
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
         {settings && !settings.billing_key_id && <p className="settings-status-note">{t('settings.assistantExecutionNotEnabled')}</p>}
       </article>

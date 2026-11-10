@@ -15,23 +15,42 @@ pub(crate) struct Persistence {
     rejected: AtomicU64,
     failed: AtomicU64,
     archives: AtomicU64,
+    archives_idle: tokio::sync::Notify,
+}
+
+pub(crate) struct ArchiveActivity(Arc<Persistence>);
+
+impl Drop for ArchiveActivity {
+    fn drop(&mut self) {
+        if self.0.archives.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.archives_idle.notify_waiters();
+        }
+    }
 }
 
 impl Default for Persistence {
     fn default() -> Self {
         Self {
-            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(4 * 1024 * 1024),
+            stream_memory: crate::gateway_body::memory::ProxyMemoryBudget::new(
+                crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES as u64,
+            ),
             jobs: Arc::new(tokio::sync::Semaphore::new(JOBS)),
             bytes: Arc::new(tokio::sync::Semaphore::new(BYTES)),
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             archives: AtomicU64::new(0),
+            archives_idle: tokio::sync::Notify::new(),
         }
     }
 }
 
 impl Persistence {
+    pub(crate) fn register_archive(self: &Arc<Self>) -> ArchiveActivity {
+        self.archives.fetch_add(1, Ordering::Release);
+        ArchiveActivity(self.clone())
+    }
+
     pub(crate) fn record_capacity_gap(&self) {
         self.rejected.fetch_add(1, Ordering::Relaxed);
     }
@@ -48,20 +67,35 @@ impl Persistence {
             .replace("deferred_persistence", "routing_persistence")
     }
 
+    pub(crate) async fn drain(&self) {
+        // Capture registers before spawn, including writers still waiting for
+        // a job. Taking all job permits alone could overtake those writers.
+        loop {
+            let idle = self.archives_idle.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.archives.load(Ordering::Acquire) == 0 {
+                break;
+            }
+            idle.await;
+        }
+        let _permits = self
+            .jobs
+            .acquire_many(JOBS as u32)
+            .await
+            .expect("buffered persistence admission remains open during shutdown");
+    }
+
     #[cfg(test)]
     pub(crate) async fn drain_for_test(&self) {
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while self.archives.load(Ordering::Acquire) != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("all accepted archive bodies must finish their handoff");
-        let _permits =
-            tokio::time::timeout(Duration::from_secs(5), self.jobs.acquire_many(JOBS as u32))
-                .await
-                .expect("bounded buffered persistence drain")
-                .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), self.drain())
+            .await
+            .expect("all accepted archive bodies must finish their handoff");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_archives_for_test(&self) -> u64 {
+        self.archives.load(Ordering::Acquire)
     }
 
     pub(crate) fn submit(
@@ -142,7 +176,44 @@ impl Persistence {
     }
 }
 
-pub(super) fn capture(
+pub(crate) fn record_capture_failure(state: &AppState, identity: crate::db::ArchiveSpoolIdentity) {
+    record_capture_failure_target(
+        state,
+        identity,
+        crate::response_archive_spool::CaptureTarget::Response,
+    );
+}
+
+pub(crate) fn record_capture_failure_target(
+    state: &AppState,
+    identity: crate::db::ArchiveSpoolIdentity,
+    target: crate::response_archive_spool::CaptureTarget,
+) {
+    let background = state.clone();
+    state.persistence.archives.fetch_add(1, Ordering::Release);
+    tokio::spawn(async move {
+        loop {
+            match target.publish_failure(&background.archive, identity).await {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                        "raw response capture admission failure awaits durable evidence");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            }
+        }
+        if background
+            .persistence
+            .archives
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            background.persistence.archives_idle.notify_waiters();
+        }
+    });
+}
+
+pub(crate) fn capture(
     state: &AppState,
     identity: crate::db::ArchiveSpoolIdentity,
     purpose: crate::response_archive_spool::BufferedArchivePurpose,
@@ -161,24 +232,65 @@ pub(super) fn capture(
             .acquire_owned()
             .await
             .expect("archive capture semaphore stays open");
+        let mut durable = None;
         let mut db = background.persistence_db.clone();
         loop {
             db.refresh_closed_persistence_pool();
             let result: Result<bool, AppError> = async {
-                if db
-                    .deferred_archive_is_captured(identity, purpose, &body)
-                    .await?
-                {
-                    return Ok(true);
-                }
-                let archive = BufferedArchive::new(
-                    identity,
-                    purpose,
-                    &body,
-                    background.config.key_pepper.as_bytes(),
-                    background.config.archive_spool_compression_enabled,
-                )?;
-                db.capture_deferred_archive(&archive).await
+                let reference = match &durable {
+                    Some(reference) => reference,
+                    None => {
+                        durable = Some({
+                            let staging = format!(
+                                "raw-capture-staging/{}/{}/{}",
+                                identity.tenant_id,
+                                identity.request_id,
+                                Uuid::now_v7()
+                            );
+                            let mut writer = background.archive.start_writer(&staging).await?;
+                            for chunk in body.chunks(crate::response_archive_spool::CHUNK_BYTES) {
+                                writer.write(Bytes::copy_from_slice(chunk)).await?;
+                            }
+                            let staged = writer.finish_staged().await?;
+                            let reference = background
+                                .archive
+                                .promote_staged_text_to_cas(identity.tenant_id, &staged)
+                                .await?;
+                            background
+                                .archive
+                                .publish_raw_capture(
+                                    identity.tenant_id,
+                                    identity.request_id,
+                                    purpose.as_str(),
+                                    &reference,
+                                )
+                                .await?;
+                            background.archive.delete(&staged.object_locator).await?;
+                            reference
+                        });
+                        durable
+                            .as_ref()
+                            .expect("archive reference was just persisted")
+                    }
+                };
+                background
+                    .archive
+                    .publish_raw_capture(
+                        identity.tenant_id,
+                        identity.request_id,
+                        purpose.as_str(),
+                        reference,
+                    )
+                    .await?;
+                let _ = db
+                    .bind_raw_capture(
+                        identity.tenant_id,
+                        identity.request_id,
+                        purpose.as_str(),
+                        reference,
+                    )
+                    .await?;
+                Ok(true)
             }
             .await;
             match result {
@@ -195,10 +307,14 @@ pub(super) fn capture(
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
-        background
+        if background
             .persistence
             .archives
-            .fetch_sub(1, Ordering::Release);
+            .fetch_sub(1, Ordering::AcqRel)
+            == 1
+        {
+            background.persistence.archives_idle.notify_waiters();
+        }
     });
 }
 
@@ -226,7 +342,12 @@ mod tests {
             .bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string())
             .bind(Uuid::new_v4().to_string()).bind(identity.reservation_id.to_string())
             .execute(&pool).await.unwrap();
-        sqlx::query("CREATE TRIGGER pause_buffered_capture BEFORE INSERT ON response_archive_spool_chunks BEGIN SELECT RAISE(ABORT, 'injected archive outage'); END")
+        sqlx::query("UPDATE request_records SET completed_at = 2 WHERE id = $1")
+            .bind(identity.request_id.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TRIGGER pause_buffered_capture BEFORE UPDATE OF response_object ON request_records BEGIN SELECT RAISE(ABORT, 'injected metadata outage'); END")
             .execute(&pool).await.unwrap();
         let jobs = state
             .persistence
@@ -248,6 +369,9 @@ mod tests {
         assert_eq!(state.persistence.rejected.load(Ordering::Relaxed), 0);
         assert_eq!(state.persistence.archives.load(Ordering::Acquire), 1);
         assert!(state.proxy_memory_budget.snapshot().0 > 0);
+        // No await since capture: the writer has not even been polled yet.
+        let mut shutdown = Box::pin(state.drain_proxy_tasks());
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
         drop(jobs);
         tokio::time::timeout(Duration::from_secs(5), async {
             while state.persistence.failed.load(Ordering::Relaxed) == 0 {
@@ -257,34 +381,31 @@ mod tests {
         .await
         .unwrap();
         assert!(state.proxy_memory_budget.snapshot().0 > 0);
+        assert!(futures_util::poll!(&mut shutdown).is_pending());
         sqlx::query("DROP TRIGGER pause_buffered_capture")
             .execute(&pool)
             .await
             .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown waits through capture retry until durable handoff");
         state.persistence.drain_for_test().await;
-        assert!(
-            state
-                .db
-                .deferred_archive_is_captured(
-                    identity,
-                    crate::response_archive_spool::BufferedArchivePurpose::Response,
-                    &body,
-                )
-                .await
-                .unwrap()
+        let reference = state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reference.blake3_digest,
+            blake3::hash(&body).to_hex().to_string()
         );
-        assert!(
-            !state
-                .db
-                .deferred_archive_is_captured(
-                    identity,
-                    crate::response_archive_spool::BufferedArchivePurpose::Response,
-                    &vec![b'x'; body.len()],
-                )
+        let encrypted_chunks: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM response_archive_spool_chunks")
+                .fetch_one(&pool)
                 .await
-                .unwrap()
-        );
-        assert!(crate::response_archive_spool::process_one_for_test(&state).await);
+                .unwrap();
+        assert_eq!(encrypted_chunks, 0);
         let locator: String =
             sqlx::query_scalar("SELECT response_object FROM request_records WHERE id = $1")
                 .bind(identity.request_id.to_string())

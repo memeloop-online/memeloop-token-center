@@ -1,5 +1,5 @@
-//! Native Kimi Code transport. Model aliases/catalog are pinned to
-//! linonetwo/CLIProxyAPI v7.2.128-onetwo.1, not a runtime dependency on that service.
+//! Native Kimi Code transport. Aliases follow the coding dialect and the
+//! built-in catalog contains only current provider models.
 use super::{AppError, Protocol};
 use serde_json::{Value, json};
 mod messages;
@@ -99,14 +99,12 @@ pub(super) fn repair_responses_messages(
 
 pub(super) fn catalog() -> Vec<crate::db::DiscoveredUpstreamModel> {
     [
-        ("kimi-k2", 131_072, 32_768),
-        ("kimi-k2-thinking", 131_072, 32_768),
-        ("kimi-k2.5", 262_144, 32_768),
-        ("kimi-k2.6", 262_144, 65_536),
         ("kimi-k2.7-code", 262_144, 65_536),
         ("kimi-k2.7-code-highspeed", 262_144, 65_536),
         ("kimi-k3", 1_048_576, 65_536),
         ("kimi-k3-256k", 262_144, 65_536),
+        ("kimi-k3.1-pro", 262_144, 65_536),
+        ("kimi-k3.1-pro-highspeed", 262_144, 65_536),
     ]
     .into_iter()
     .flat_map(|(id, context, output)| {
@@ -133,6 +131,8 @@ mod tests {
             ("kimi-for-coding", "kimi-for-coding"),
             ("k2.7-code-highspeed", "kimi-for-coding-highspeed"),
             ("kimi-k3-256k", "k3-256k"),
+            ("kimi-k3.1-pro", "k3.1-pro"),
+            ("kimi-k3.1-pro-highspeed", "k3.1-pro-highspeed"),
         ] {
             assert_eq!(normalize_model(input), expected);
         }
@@ -159,6 +159,23 @@ mod tests {
         assert_eq!(responses["messages"][0]["content"], "hello");
         assert!(prepare(Protocol::OpenAiEmbeddings, "kimi-k3", &mut body).is_err());
         assert!(supports(Protocol::AnthropicCountTokens));
-        assert_eq!(catalog().len(), 16);
+        assert_eq!(catalog().len(), 12);
+        let ids = catalog()
+            .into_iter()
+            .map(|model| model.model_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for current in [
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "kimi-k3",
+            "kimi-k3-256k",
+            "kimi-k3.1-pro",
+            "kimi-k3.1-pro-highspeed",
+        ] {
+            assert!(ids.contains(current));
+        }
+        for retired in ["kimi-k2", "kimi-k2-thinking", "kimi-k2.5", "kimi-k2.6"] {
+            assert!(!ids.contains(retired));
+        }
     }
 }

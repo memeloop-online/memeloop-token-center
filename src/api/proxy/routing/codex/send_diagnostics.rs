@@ -12,13 +12,13 @@ use std::{
 use super::*;
 
 #[derive(Clone, Default)]
-pub(super) struct BodyConsumption {
+pub(in crate::api::proxy) struct BodyConsumption {
     polls: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
 }
 
 impl BodyConsumption {
-    pub(super) fn attach(&self, request: &mut reqwest::Request) {
+    pub(in crate::api::proxy) fn attach(&self, request: &mut reqwest::Request) {
         if let Some(body) = request.body_mut().take() {
             *request.body_mut() = Some(reqwest::Body::wrap(ObservedRequestBody {
                 inner: body,

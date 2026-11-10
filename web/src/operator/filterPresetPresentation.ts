@@ -12,6 +12,7 @@ function displayValue(value: TypedFilterValue, field: TypedFilterCondition['fiel
       : { dateStyle: 'short', timeStyle: 'short' }).format(date);
   }
   if (value.type === 'status') return t(value.value === 'success' ? 'traffic.success' : value.value === 'error' ? 'traffic.failure' : 'common.running');
+  if (field === 'session_association') return t(`filter.association.${value.value}`);
   if (field === 'upstream_account_id') return accounts.find((account) => account.id === value.value)?.name ?? String(value.value);
   return String(value.value);
 }

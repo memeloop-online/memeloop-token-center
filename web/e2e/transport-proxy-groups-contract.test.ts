@@ -3,6 +3,9 @@ import test from 'node:test';
 import { ApiError } from '../src/api.js';
 import { transportProxyError, transportProxyFailureKind, transportProxyRequest } from '../src/operator/transportProxyGroups.js';
 import { transportProxyGroupCopy } from '../src/operator/transportProxyGroupCopy.js';
+import { networkProxyAddressValid, networkProxyError, networkProxyLiveConcurrency } from '../src/operator/NetworkProxies.js';
+import { networkProxyCopy } from '../src/operator/NetworkProxyCopy.js';
+import { concurrencySnapshot, csilProxy } from './fixtures/transport-proxy-entities.js';
 
 test('transport proxy failures distinguish editable validation, CAS, denied and uncertain outcomes without exposing response secrets', () => {
   const secret = 'socks5h://privateProxySecret@10.0.0.1:1080';
@@ -64,4 +67,24 @@ test('stopping client wait rejects even when fetch ignores abort; late response 
     release(new Response('{}'));
     await assert.rejects(pending, /result unknown/);
   } finally { globalThis.fetch = original; }
+});
+
+test('network exit presentation uses exact CSIL addressing and only live unfinished request concurrency', () => {
+  assert.equal(networkProxyLiveConcurrency(concurrencySnapshot, csilProxy.address), 1);
+  assert.equal(networkProxyLiveConcurrency({ ...concurrencySnapshot, stale: true }, csilProxy.address), undefined);
+  assert.equal(networkProxyLiveConcurrency({ ...concurrencySnapshot, samples_truncated: true }, csilProxy.address), undefined);
+  assert.equal(networkProxyLiveConcurrency(concurrencySnapshot, { ...csilProxy.address, port: 1081 }), 0);
+  assert.equal(networkProxyAddressValid('socks5h://100.64.0.16:1080'), true);
+  assert.equal(networkProxyAddressValid('socks5h://user:privateProxySecret@100.64.0.16:1080'), true);
+  for (const invalid of ['', 'http://100.64.0.16:1080', 'socks5h://100.64.0.16:1080/path', 'socks5h://100.64.0.16:1080/path?query', 'socks5h://100.64.0.16:1080 #fragment']) {
+    assert.equal(networkProxyAddressValid(invalid), false, invalid);
+  }
+  assert.equal(networkProxyCopy('zh-CN').summary('CSIL'), 'CSIL');
+  assert.equal(networkProxyCopy('en').summary('CSIL', 1, 2), 'CSIL · 1 group · 2 accounts');
+  assert.doesNotMatch(JSON.stringify(networkProxyCopy('en')), /[\u3400-\u9fff]/);
+  const secret = 'privateProxySecret';
+  for (const locale of ['zh-CN', 'en']) {
+    assert.equal(networkProxyError(new ApiError(secret, 409, 'network_proxy_version_conflict'), locale), networkProxyCopy(locale).errors.versionConflict);
+    assert.doesNotMatch(networkProxyError(new ApiError(secret, 503), locale), new RegExp(secret));
+  }
 });

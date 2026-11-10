@@ -1,6 +1,7 @@
 use super::*;
 
 pub(in crate::api::proxy) struct PreparedProxyRoute {
+    pub(in crate::api::proxy) inspect_stream_rejection: bool,
     pub(in crate::api::proxy) route: ResolvedUpstream,
     pub(super) forwarded_body: Bytes,
     pub(in crate::api::proxy) upstream_stream: bool,
@@ -166,6 +167,10 @@ pub(in crate::api::proxy) enum ProxySendError {
 }
 
 pub(in crate::api::proxy) struct ProxyRouteResponse {
+    pub(in crate::api::proxy) preoutput_quota: Option<(
+        crate::db::UpstreamFailureKind,
+        crate::db::SupplierQuotaEvidence,
+    )>,
     pub(in crate::api::proxy) egress_selection: Option<super::codex::egress::FinalSelection>,
     pub(in crate::api::proxy) response: UpstreamResponse,
     pub(in crate::api::proxy) upstream_activity: crate::metrics::ActivityGuard,

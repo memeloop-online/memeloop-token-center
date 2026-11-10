@@ -37,7 +37,7 @@ function OverviewMonitoringSection({ state, points, token, tenant }: { state: Re
   return <div aria-busy={state.refreshing === true}><LoadingProgress active={state.refreshing === true} label={t('common.loading')} level="page" />{state.refreshError && <div className="notice error" role="alert">{state.refreshError}</div>}<MonitoringSnapshot snapshot={state.value} points={points} quotaSummary={<OverviewUpstreamQuota token={token} tenant={tenant} snapshot={state.value} />} /></div>;
 }
 
-function OverviewRecentRequestsSection({ state, onOpenRequest, onOpenSession }: { state: ResourceState<RequestView[]>; onOpenRequest: (requestId: string) => void; onOpenSession: (sessionId: string) => void }) {
+function OverviewRecentRequestsSection({ state, onOpenRequest, onOpenSession }: { state: ResourceState<RequestView[]>; onOpenRequest: (requestId: string) => void; onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void }) {
   const { t } = useI18n();
   return <article className="panel operator-overview-recent" aria-busy={state.kind === 'loading' || (state.kind === 'ready' && state.refreshing === true)}><div className="panel-title"><h2>{t('self.recent')}</h2><span>{t('sessions.requests')}</span></div>
     {state.kind === 'idle' || state.kind === 'loading'
@@ -53,7 +53,7 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenRequest, onOpenS
   onRequestDrilldown: (ast: TypedFilterAst) => void;
   onOpenUsageSession: (session: UsageAnalysisSessionBucket) => void;
   onOpenRequest: (requestId: string) => void;
-  onOpenSession: (sessionId: string) => void;
+  onOpenSession: (sessionId: string, keyId?: string, requestId?: string) => void;
 }) {
   const { t } = useI18n();
   const requestResource = useOperatorResource(
@@ -75,7 +75,7 @@ export function OverviewPage({ token, tenant, onNavigate, onOpenRequest, onOpenS
 }
 
 export function UsagePage({ token, tenant, onOpenSession }: OperatorPageProps & {
-  onOpenSession: (session: UsageAnalysisSessionBucket) => void;
+  onOpenSession: (session: UsageAnalysisSessionBucket, source?: TypedFilterAst) => void;
 }) {
   const { t } = useI18n();
   const resource = useOperatorResource(
@@ -87,10 +87,15 @@ export function UsagePage({ token, tenant, onOpenSession }: OperatorPageProps & 
   const upstreamMetadataError = resource.state.kind === 'failed'
     ? resource.state.message
     : resource.state.kind === 'ready' ? resource.state.refreshError : undefined;
+  const upstreamMetadataDenied = resource.state.kind === 'failed'
+    ? resource.state.status === 403
+    : resource.state.kind === 'ready' && resource.state.refreshErrorStatus === 403;
   return <PageLoadingRegion scopeKey={`${token}\0${tenant}\0usage`} label={t('common.loading')}>
     {(resource.state.kind === 'loading' || (resource.state.kind === 'idle' && !resource.state.disabled)) && <LoadingState label={t('common.loading')} variant="compact" />}
     <LoadingProgress active={resource.state.kind === 'ready' && resource.state.refreshing === true} label={t('common.loading')} />
-    {upstreamMetadataError && <div className="notice error" role="alert">{t('usage.upstreams')}: {upstreamMetadataError}</div>}
+    {upstreamMetadataDenied
+      ? <div className="notice warning" role="status">{t('usage.upstreamCatalogDenied')}</div>
+      : upstreamMetadataError && <div className="notice error" role="alert">{t('usage.upstreams')}: {upstreamMetadataError}</div>}
     <UsageAnalysis token={token} tenant={tenant} upstreams={upstreams} onOpenSession={onOpenSession} />
   </PageLoadingRegion>;
 }
