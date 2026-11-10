@@ -1678,6 +1678,8 @@ impl Journal {
             .unwrap_or_else(|e| e.into_inner())
             .entries
             .remove(&snapshot.receipt_id);
+        let lacks_financial_evidence =
+            snapshot.financial_evidence_unavailable() && snapshot.financial_ack.is_none();
         let snapshot = Arc::new(snapshot);
         let receipt_id = snapshot.receipt_id;
         let applied = snapshot.financial_ack.as_ref().is_some_and(|ack| {
@@ -1745,7 +1747,7 @@ impl Journal {
         }) {
             return false;
         }
-        completed
+        completed && !lacks_financial_evidence
     }
 
     async fn attempt(&self, database: Database, snapshot: Arc<Snapshot>, mut applied: bool) {
