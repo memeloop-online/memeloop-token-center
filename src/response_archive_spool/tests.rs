@@ -9,7 +9,13 @@ const PEPPER: &[u8] = b"existing-test-pepper-over-thirty-two-bytes";
 
 #[tokio::test]
 async fn object_capture_recovers_a_completed_request_without_a_response_locator() {
-    let (_directory, state, pool, identity) = fixture().await;
+    let capture_directory = tempfile::tempdir().unwrap();
+    let configured = capture_directory
+        .path()
+        .join("configured")
+        .join("request-spool");
+    let (_directory, state, pool, identity) =
+        fixture_with_capture_directory(false, Some(configured.clone())).await;
     sqlx::query(
         "UPDATE request_records SET completed_at = 2, response_object = NULL WHERE id = $1",
     )
