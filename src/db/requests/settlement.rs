@@ -112,9 +112,9 @@ impl Database {
     }
 
     pub async fn release_orphaned_reservations(&self, limit: i64) -> Result<u64, AppError> {
-        let now = self
-            .request_owner_now(&mut *self.pool.acquire().await?)
-            .await?;
+        let mut connection = self.pool.acquire().await?;
+        let now = self.request_owner_now(&mut connection).await?;
+        connection.finish();
         let cutoff = now.saturating_sub(30 * 60 * 1_000);
         // A process can die after the durable send fence and before recording
         // its unknown result, including requests without an idempotency key.

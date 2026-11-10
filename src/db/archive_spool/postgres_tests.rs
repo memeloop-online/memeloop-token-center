@@ -456,7 +456,7 @@ async fn postgres_request_admission_lost_commit_ack_never_dispatches_and_orphan_
     fixture.db = Database {
         archive: fixture.db.archive.clone(),
         http_clients: fixture.db.http_clients.clone(),
-        pool: schema_pool(&fixture.url, &fixture.schema).await,
+        pool: schema_pool(&fixture.url, &fixture.schema).await.into(),
         pool_role: "serve",
         auxiliary_pool_max_connections: 2,
         connection_profile: crate::db::ConnectionProfile::Serve,
@@ -837,7 +837,7 @@ impl PgFixture {
         let db = Database {
             archive: Some(crate::archive::ArchiveStore::memory_for_test()),
             http_clients: std::sync::Arc::default(),
-            pool: schema_pool(&url, &schema).await,
+            pool: schema_pool(&url, &schema).await.into(),
             pool_role: "serve",
             auxiliary_pool_max_connections: 2,
             connection_profile: crate::db::ConnectionProfile::Serve,
@@ -1054,7 +1054,7 @@ async fn postgres_seal_precedes_terminal_delivery_and_survives_producer_loss() {
     fixture.db = Database {
         archive: fixture.db.archive.clone(),
         http_clients: fixture.db.http_clients.clone(),
-        pool: schema_pool(&fixture.url, &fixture.schema).await,
+        pool: schema_pool(&fixture.url, &fixture.schema).await.into(),
         pool_role: "serve",
         auxiliary_pool_max_connections: 2,
         connection_profile: crate::db::ConnectionProfile::Serve,
@@ -1129,7 +1129,7 @@ async fn postgres_seal_cancelled_inside_commit_remains_recoverable_after_reconne
     fixture.db = Database {
         archive: fixture.db.archive.clone(),
         http_clients: fixture.db.http_clients.clone(),
-        pool: schema_pool(&fixture.url, &fixture.schema).await,
+        pool: schema_pool(&fixture.url, &fixture.schema).await.into(),
         pool_role: "serve",
         auxiliary_pool_max_connections: 2,
         connection_profile: crate::db::ConnectionProfile::Serve,

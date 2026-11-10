@@ -602,7 +602,11 @@ impl Database {
         request_id: Uuid,
     ) -> Result<Option<SessionBodyLocators>, AppError> {
         let mut connection = self.pool.acquire().await?;
-        Self::session_body_locators_on(&mut connection, request_id).await
+        let result = Self::session_body_locators_on(&mut connection, request_id).await;
+        if result.is_ok() {
+            connection.finish();
+        }
+        result
     }
 
     async fn session_body_locators_on(

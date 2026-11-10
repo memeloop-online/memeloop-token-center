@@ -375,7 +375,8 @@ mod tests {
                 directory.path().join("diagnostics.db").display()
             ))
             .await
-            .unwrap();
+            .unwrap()
+            .into();
         let held = writer.pool.acquire().await.unwrap();
         let account_id = account.id;
         let finish = tokio::spawn(async move {

@@ -548,7 +548,7 @@ pub(super) async fn require_members_tenant(
 }
 
 pub(super) async fn select_ids(
-    pool: &sqlx::AnyPool,
+    pool: &crate::db::request_pool::RequestPool,
     sql: &'static str,
     tenant_id: &str,
     route_id: Uuid,
@@ -564,7 +564,7 @@ pub(super) async fn select_ids(
 }
 
 pub(super) async fn candidate_upstream_ids(
-    pool: &sqlx::AnyPool,
+    pool: &crate::db::request_pool::RequestPool,
     tenant_id: &str,
     route_id: Uuid,
 ) -> Result<Vec<Uuid>, AppError> {
