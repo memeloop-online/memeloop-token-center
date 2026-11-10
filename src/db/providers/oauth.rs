@@ -990,6 +990,42 @@ impl Database {
             ));
         }
         let (driver, refresh_url) = oauth_refresh_lifecycle_from_row(&account)?;
+        // Kimi's official refresh contract permits retrying a transient failed
+        // exchange with the same token. Only an explicit operator request may
+        // take over a completed, expired operation; the worker cannot turn
+        // exhausted retries into an unbounded background loop.
+        if expected_generation.is_none() && driver == crate::oauth::managed::kimi::PROVIDER_DRIVER {
+            let prior = sqlx::query(
+                "SELECT l.created_at, l.lease_expires_at, l.request_started_at, l.pending_credential_ciphertext, c.oauth_refresh_diagnostic_json FROM upstream_oauth_refresh_leases l JOIN upstream_credentials c ON c.upstream_account_id = l.account_id AND c.generation = l.credential_generation WHERE l.account_id = $1 AND l.credential_generation = $2",
+            ).bind(account_id.to_string()).bind(generation).fetch_optional(&mut *tx).await?;
+            if let Some(prior) = prior {
+                let created: i64 = prior.try_get("created_at")?;
+                let diagnostic: Option<String> = prior.try_get("oauth_refresh_diagnostic_json")?;
+                let request_started_at: Option<i64> = prior.try_get("request_started_at")?;
+                let retryable = diagnostic
+                    .as_deref()
+                    .and_then(|value| {
+                        crate::oauth::OAuthRefreshDiagnostic::from_json(value, generation)
+                    })
+                    .is_some_and(|value| {
+                        request_started_at
+                            .is_some_and(|started| value.allows_kimi_retry(created, started))
+                    });
+                if retryable
+                    && prior.try_get::<i64, _>("lease_expires_at")? <= now
+                    && prior
+                        .try_get::<Option<i64>, _>("request_started_at")?
+                        .is_some()
+                    && prior
+                        .try_get::<Option<String>, _>("pending_credential_ciphertext")?
+                        .is_none()
+                {
+                    sqlx::query("DELETE FROM upstream_oauth_refresh_leases WHERE account_id = $1 AND credential_generation = $2 AND created_at = $3 AND lease_expires_at <= $4 AND pending_credential_ciphertext IS NULL")
+                        .bind(account_id.to_string()).bind(generation).bind(created).bind(now)
+                        .execute(&mut *tx).await?;
+                }
+            }
+        }
         let lease_expires_at = now.saturating_add(UPSTREAM_OAUTH_REFRESH_LEASE_MILLIS);
         let leased = sqlx::query(
             "INSERT INTO upstream_oauth_refresh_leases (account_id, credential_generation, idempotency_key, lease_expires_at, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT(account_id) DO UPDATE SET credential_generation = excluded.credential_generation, idempotency_key = excluded.idempotency_key, pending_credential_ciphertext = NULL, pending_expires_at = NULL, request_started_at = NULL, lease_expires_at = excluded.lease_expires_at, created_at = excluded.created_at WHERE (upstream_oauth_refresh_leases.pending_credential_ciphertext IS NULL AND upstream_oauth_refresh_leases.request_started_at IS NULL AND upstream_oauth_refresh_leases.lease_expires_at <= $5) OR upstream_oauth_refresh_leases.credential_generation <> excluded.credential_generation",

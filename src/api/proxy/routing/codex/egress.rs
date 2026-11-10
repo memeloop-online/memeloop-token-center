@@ -85,7 +85,7 @@ impl Observation {
     }
 }
 
-pub(super) struct AttemptRecorder(Arc<Observation>);
+pub(in crate::api::proxy) struct AttemptRecorder(Arc<Observation>);
 
 impl AttemptRecorder {
     pub(super) fn begin(
@@ -133,6 +133,52 @@ impl AttemptRecorder {
             response_body_complete: false,
             measurement_basis: "application_payload_estimate",
         };
+        Some(Self::from_attempt(state, attempt, request_body))
+    }
+
+    pub(in crate::api::proxy) fn begin_http(
+        state: &AppState,
+        route: &ResolvedUpstream,
+        request_id: Uuid,
+        outbound_attempt: usize,
+        selected: Option<SelectedEgress>,
+        request_body: send_diagnostics::BodyConsumption,
+    ) -> Option<Self> {
+        let Some(selected) = selected else {
+            state.routing_persistence.record_failure_gap();
+            return None;
+        };
+        let attempt = RequestEgressAttempt {
+            request_id,
+            attempt_id: Uuid::now_v7(),
+            outbound_attempt: outbound_attempt as i64,
+            connect_attempt: 1,
+            route_id: route.route_id,
+            upstream_account_id: route.account_id,
+            credential_generation: route.credential_generation,
+            transport_revision: route.transport_revision,
+            observed_at: chrono::Utc::now().timestamp_millis(),
+            selected,
+            transport: serde_json::json!({
+                "transport_family": "reqwest_no_retry",
+                "wire_delivery_state": "unknown"
+            }),
+            connection_binding: None,
+            request_payload_bytes: None,
+            response_payload_bytes: None,
+            completed: false,
+            final_response: false,
+            response_body_complete: false,
+            measurement_basis: "application_payload_estimate",
+        };
+        Some(Self::from_attempt(state, attempt, request_body))
+    }
+
+    fn from_attempt(
+        state: &AppState,
+        attempt: RequestEgressAttempt,
+        request_body: send_diagnostics::BodyConsumption,
+    ) -> Self {
         let recorder = Self(Arc::new(Observation {
             database: state.routing_persistence_db.clone(),
             queue: state.routing_persistence.clone(),
@@ -146,7 +192,7 @@ impl AttemptRecorder {
             pending: Mutex::new(Pending::default()),
         }));
         recorder.0.submit();
-        Some(recorder)
+        recorder
     }
 
     fn finish(&self) {
@@ -171,7 +217,7 @@ impl FinalSelection {
     }
 }
 
-pub(super) fn observe_response(
+pub(in crate::api::proxy) fn observe_response(
     response: UpstreamResponse,
     recorder: Option<AttemptRecorder>,
 ) -> (UpstreamResponse, Option<FinalSelection>) {
@@ -179,6 +225,7 @@ pub(super) fn observe_response(
         return (response, None);
     };
     recorder.0.response_started.store(true, Ordering::Relaxed);
+    recorder.0.submit();
     let selection = FinalSelection(recorder.0.clone());
     let parts = response.into_parts();
     (

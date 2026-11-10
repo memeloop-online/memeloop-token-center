@@ -411,19 +411,16 @@ fn take_append_failure_for_test(state: &AppState) -> bool {
 }
 
 pub(crate) struct ResponseArchiveProducer {
-    #[cfg(test)]
     identity: ArchiveSpoolIdentity,
     #[cfg(test)]
     state: AppState,
-    sender: Option<tokio::sync::mpsc::Sender<QueuedArchiveChunk>>,
-    chunk_memory: Arc<tokio::sync::Semaphore>,
-    terminal: Option<tokio::sync::oneshot::Sender<Bytes>>,
-    pending: Vec<u8>,
+    local: LocalCapture,
     writer: super::OwnedTask<()>,
     active: Arc<AtomicBool>,
     _queue_memory: Arc<CaptureQueueMemory>,
 }
 
+#[cfg(test)]
 struct QueuedArchiveChunk {
     bytes: Bytes,
     _memory: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -485,7 +482,83 @@ impl Drop for ResponseArchiveWriter {
     }
 }
 
+struct LocalCapture {
+    directory: std::path::PathBuf,
+    #[cfg(test)]
+    write_pause: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    source: Option<
+        tokio::sync::oneshot::Sender<Arc<crate::gateway_body::local_body_file::LocalBodyFile>>,
+    >,
+    progress: tokio::sync::watch::Sender<(u64, bool)>,
+    file: Option<std::fs::File>,
+    length: u64,
+}
+
+impl LocalCapture {
+    async fn append(
+        &mut self,
+        bytes: Bytes,
+        memory: Arc<CaptureQueueMemory>,
+    ) -> std::io::Result<()> {
+        if self.file.is_none() {
+            let charge = memory.clone();
+            let directory = self.directory.clone();
+            let (local, file) = tokio::task::spawn_blocking(move || {
+                let _charge = charge;
+                std::fs::create_dir_all(&directory)?;
+                let local = Arc::new(crate::gateway_body::local_body_file::LocalBodyFile::new(
+                    &directory,
+                )?);
+                let file = local.writer()?;
+                Ok::<_, std::io::Error>((local, file))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            self.source
+                .take()
+                .ok_or_else(|| std::io::Error::other("capture closed"))?
+                .send(local)
+                .map_err(|_| std::io::Error::other("capture writer closed"))?;
+            self.file = Some(file);
+        }
+        for chunk in bytes.chunks(super::CHUNK_BYTES) {
+            let mut file = self
+                .file
+                .take()
+                .ok_or_else(|| std::io::Error::other("capture closed"))?;
+            let chunk = chunk.to_vec();
+            let length = chunk.len() as u64;
+            let charge = memory.clone();
+            #[cfg(test)]
+            let pause = self.write_pause.take();
+            self.file = Some(
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    let _charge = charge;
+                    #[cfg(test)]
+                    if let Some((entered, release)) = pause {
+                        let _ = entered.send(());
+                        let _ = release.recv();
+                    }
+                    file.write_all(&chunk)?;
+                    Ok::<_, std::io::Error>(file)
+                })
+                .await
+                .map_err(std::io::Error::other)??,
+            );
+            self.length += length;
+            self.progress.send_replace((self.length, false));
+        }
+        Ok(())
+    }
+}
+
 struct CaptureQueueMemory {
+    // Blocking IO cannot be aborted. Keep admission until the actual IO exits.
+    _archive_permit: tokio::sync::OwnedSemaphorePermit,
     reservation: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 }
 
@@ -699,12 +772,10 @@ impl ResponseArchiveProducer {
     ) -> Self {
         let queue_memory = Arc::new(CaptureQueueMemory {
             reservation: memory,
+            _archive_permit: archive_permit,
         });
-        let chunk_memory = Arc::new(tokio::sync::Semaphore::new(
-            super::CAPTURE_DATABASE_BATCH_CHUNKS,
-        ));
-        let (sender, receiver) = tokio::sync::mpsc::channel(super::CAPTURE_QUEUE_CHUNKS);
-        let (terminal, terminal_receiver) = tokio::sync::oneshot::channel();
+        let (source, source_receiver) = tokio::sync::oneshot::channel();
+        let (progress, progress_receiver) = tokio::sync::watch::channel((0_u64, false));
         let active = Arc::new(AtomicBool::new(true));
         let writer_active = active.clone();
         let failure_active = active.clone();
@@ -714,8 +785,7 @@ impl ResponseArchiveProducer {
         let writer_memory = queue_memory.clone();
         let writer = super::OwnedTask::spawn(
             async move {
-                let _archive_permit = archive_permit;
-                let _queue_memory = writer_memory;
+                let _queue_memory = writer_memory.clone();
                 let _capture_metrics = writer_state.metrics.memory_usage(
                     crate::metrics::MemoryComponent::StreamCapture,
                     super::CAPTURE_MEMORY_BYTES,
@@ -723,8 +793,9 @@ impl ResponseArchiveProducer {
                 match run_response_archive_writer(
                     writer_state.clone(),
                     identity,
-                    receiver,
-                    terminal_receiver,
+                    source_receiver,
+                    progress_receiver,
+                    writer_memory,
                     writer_active,
                     target,
                 )
@@ -748,14 +819,18 @@ impl ResponseArchiveProducer {
             Some(active.clone()),
         );
         Self {
-            #[cfg(test)]
             identity,
             #[cfg(test)]
             state: state.clone(),
-            sender: Some(sender),
-            chunk_memory,
-            terminal: Some(terminal),
-            pending: Vec::with_capacity(super::CHUNK_BYTES),
+            local: LocalCapture {
+                directory: state.config.responses_request_spool_path.clone().into(),
+                #[cfg(test)]
+                write_pause: None,
+                source: Some(source),
+                progress,
+                file: None,
+                length: 0,
+            },
             writer,
             active,
             _queue_memory: queue_memory,
@@ -770,104 +845,49 @@ impl ResponseArchiveProducer {
         ResponseArchiveWriter::begin_inner(state.clone(), identity).await
     }
 
-    #[cfg(test)]
-    pub(crate) fn append(&mut self, chunks: Vec<Bytes>) -> bool {
-        if !self.active.load(Ordering::Acquire) {
-            self.abandon("writer_inactive");
-            return false;
-        }
-        #[cfg(test)]
-        if take_append_failure_for_test(&self.state) {
-            self.abandon("injected_append_failure");
-            return false;
-        }
-        for chunk in chunks {
-            let mut remaining = chunk.as_ref();
-            while !remaining.is_empty() {
-                let take = remaining.len().min(super::CHUNK_BYTES - self.pending.len());
-                self.pending.extend_from_slice(&remaining[..take]);
-                remaining = &remaining[take..];
-                if self.pending.len() == super::CHUNK_BYTES {
-                    let Some(sender) = self.sender.clone() else {
-                        return false;
-                    };
-                    let permit = match sender.try_reserve() {
-                        Ok(permit) => permit,
-                        Err(error) => {
-                            self.abandon(match error {
-                                tokio::sync::mpsc::error::TrySendError::Full(_) => "queue_capacity",
-                                tokio::sync::mpsc::error::TrySendError::Closed(_) => "queue_closed",
-                            });
-                            return false;
-                        }
-                    };
-                    let memory = match self.chunk_memory.clone().try_acquire_owned() {
-                        Ok(memory) => memory,
-                        Err(_) => {
-                            self.abandon("queue_capacity");
-                            return false;
-                        }
-                    };
-                    let full = Bytes::from(std::mem::take(&mut self.pending));
-                    permit.send(QueuedArchiveChunk {
-                        bytes: full,
-                        _memory: Some(memory),
-                    });
-                    self.pending = Vec::with_capacity(super::CHUNK_BYTES);
-                }
-            }
-        }
-        true
-    }
-
-    /// Await the bounded queue for both live reads and detached original-body
-    /// drains. Queue saturation is backpressure, not a body truncation policy.
+    /// Only local bounded IO is on the delivery path. Object storage progress
+    /// never determines whether the supplier's next bytes can reach the client.
     pub(crate) async fn append_with_backpressure(&mut self, chunk: Bytes) -> bool {
         #[cfg(test)]
         if take_append_failure_for_test(&self.state) {
             self.abandon("injected_append_failure");
             return false;
         }
-        let mut remaining = chunk.as_ref();
-        while !remaining.is_empty() {
-            if !self.active.load(Ordering::Acquire) {
-                return false;
-            }
-            let take = remaining.len().min(super::CHUNK_BYTES - self.pending.len());
-            self.pending.extend_from_slice(&remaining[..take]);
-            remaining = &remaining[take..];
-            if self.pending.len() == super::CHUNK_BYTES {
-                let Some(sender) = self.sender.clone() else {
-                    return false;
-                };
-                let Ok(permit) = sender.reserve().await else {
-                    return false;
-                };
-                let Ok(memory) = self.chunk_memory.clone().acquire_owned().await else {
-                    return false;
-                };
-                permit.send(QueuedArchiveChunk {
-                    bytes: Bytes::from(std::mem::take(&mut self.pending)),
-                    _memory: Some(memory),
-                });
-                self.pending = Vec::with_capacity(super::CHUNK_BYTES);
-            }
+        if !self.active.load(Ordering::Acquire) {
+            return false;
         }
-        true
+        let result = tokio::time::timeout(
+            crate::proxy_lifecycle::MAX_DOWNSTREAM_SEND_WAIT,
+            self.local.append(chunk, self._queue_memory.clone()),
+        )
+        .await;
+        if matches!(result, Ok(Ok(()))) {
+            true
+        } else {
+            self.abandon("local_capture_unavailable");
+            false
+        }
     }
 
-    #[cfg(test)]
     fn abandon(&mut self, reason: &'static str) {
         tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_producer", outcome = reason, "response capture abandoned");
         self.active.store(false, Ordering::Release);
-        self.sender.take();
-        self.terminal.take();
-        self.pending.clear();
+        self.local.source.take();
+        self.local.file.take();
+        self.local.progress.send_replace((self.local.length, true));
     }
 
     #[cfg(test)]
-    pub(super) fn queue_memory_owners_for_test(&self) -> usize {
-        Arc::strong_count(&self._queue_memory)
+    pub(super) fn pause_local_write_for_test(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        self.local.write_pause = Some((entered, released));
+        (entering, release)
     }
 
     #[cfg(test)]
@@ -876,27 +896,20 @@ impl ResponseArchiveProducer {
         self.writer.wait().await
     }
 
-    /// Hand the terminal tail to the owned writer. Database completion is
-    /// intentionally not on the downstream delivery path; the supervisor
-    /// observes the writer until it seals or fences the capture as a gap.
-    pub(crate) fn seal(self) -> Option<ResponseArchiveSettlement> {
-        let Self {
-            mut sender,
-            mut terminal,
-            pending,
-            mut writer,
-            active,
-            ..
-        } = self;
-        let tail = Bytes::from(pending);
-        let terminal = terminal.take()?;
-        if terminal.send(tail).is_err() {
-            active.store(false, Ordering::Release);
+    /// Local EOF is not an ACK. The owned writer still must publish its CAS root.
+    pub(crate) fn seal(mut self) -> Option<ResponseArchiveSettlement> {
+        if !self.active.load(Ordering::Acquire) {
             return None;
         }
-        sender.take();
-        writer.continue_on_drop();
-        Some(ResponseArchiveSettlement { _writer: writer })
+        // Publish EOF before closing an empty source: the receiver can wake
+        // concurrently as soon as its sender is dropped.
+        self.local.progress.send_replace((self.local.length, true));
+        self.local.file.take();
+        self.local.source.take();
+        self.writer.continue_on_drop();
+        Some(ResponseArchiveSettlement {
+            _writer: self.writer,
+        })
     }
 }
 
@@ -1082,11 +1095,75 @@ enum WriterOutcome {
     Abandoned,
 }
 
+// Local EOF is only an input handoff. CAS completion and root publication
+// stay in the owned writer below and remain the archive acknowledgement.
+async fn drain_local_capture(
+    writer: &mut crate::archive::ArchiveWriter,
+    identity: ArchiveSpoolIdentity,
+    source: tokio::sync::oneshot::Receiver<
+        Arc<crate::gateway_body::local_body_file::LocalBodyFile>,
+    >,
+    mut progress: tokio::sync::watch::Receiver<(u64, bool)>,
+    memory: Arc<CaptureQueueMemory>,
+    active: Arc<AtomicBool>,
+) -> Result<WriterOutcome, AppError> {
+    let local = source.await.ok();
+    if let Some(local) = local {
+        let owner = local.clone();
+        let charge = memory.clone();
+        let mut file = tokio::task::spawn_blocking(move || {
+            let _charge = charge;
+            owner.reopen()
+        })
+        .await
+        .map_err(|_| AppError::internal("capture_local_open_task"))?
+        .map_err(|_| AppError::internal("capture_local_open"))?;
+        let mut offset = 0_u64;
+        loop {
+            if !active.load(Ordering::Acquire) {
+                return Ok(writer_interrupted(identity, "abandoned_before_append"));
+            }
+            let (available, sealed) = *progress.borrow_and_update();
+            if offset < available {
+                let take = (available - offset).min(super::CHUNK_BYTES as u64) as usize;
+                let charge = memory.clone();
+                let owner = local.clone();
+                let (next, bytes) = tokio::task::spawn_blocking(move || {
+                    use std::io::Read;
+                    let (_charge, _owner) = (charge, owner);
+                    let mut bytes = vec![0_u8; take];
+                    file.read_exact(&mut bytes)?;
+                    Ok::<_, std::io::Error>((file, Bytes::from(bytes)))
+                })
+                .await
+                .map_err(|_| AppError::internal("capture_local_read_task"))?
+                .map_err(|_| AppError::internal("capture_local_read"))?;
+                file = next;
+                offset += take as u64;
+                writer.write(bytes).await?;
+            } else if sealed {
+                break;
+            } else if progress.changed().await.is_err() {
+                return Ok(writer_interrupted(identity, "local_source_dropped"));
+            }
+        }
+    } else if !progress.borrow().1 {
+        return Ok(writer_interrupted(identity, "local_source_dropped"));
+    }
+    if !active.load(Ordering::Acquire) {
+        return Ok(writer_interrupted(identity, "abandoned_before_seal"));
+    }
+    Ok(WriterOutcome::Sealed)
+}
+
 async fn run_response_archive_writer(
     mut state: AppState,
     identity: ArchiveSpoolIdentity,
-    mut receiver: tokio::sync::mpsc::Receiver<QueuedArchiveChunk>,
-    terminal: tokio::sync::oneshot::Receiver<Bytes>,
+    source: tokio::sync::oneshot::Receiver<
+        Arc<crate::gateway_body::local_body_file::LocalBodyFile>,
+    >,
+    progress: tokio::sync::watch::Receiver<(u64, bool)>,
+    memory: Arc<CaptureQueueMemory>,
     active: Arc<AtomicBool>,
     target: CaptureTarget,
 ) -> Result<WriterOutcome, AppError> {
@@ -1117,23 +1194,25 @@ async fn run_response_archive_writer(
     };
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
-    while let Some(first) = receiver.recv().await {
-        if !active.load(Ordering::Acquire) {
-            return Ok(writer_interrupted(identity, "abandoned_before_append"));
+    let captured =
+        drain_local_capture(&mut writer, identity, source, progress, memory, active).await;
+    if !matches!(captured, Ok(WriterOutcome::Sealed)) {
+        // Keep the owned task, memory charge and admission until abort really
+        // completes. ArchiveWriter::Drop remains only the crash/unwind fallback.
+        let cleanup_deadline =
+            std::time::Duration::from_millis(state.config.s3_timeouts.request_millis.into());
+        match tokio::time::timeout(cleanup_deadline, writer.abort()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                "failed to abort interrupted original capture")
+            }
+            Err(_) => {
+                tracing::warn!(request_id = %identity.request_id, error_code = "archive_abort_timeout",
+                "interrupted original cleanup reached the configured storage deadline")
+            }
         }
-        writer.write(first.bytes).await?;
-    }
-    let Ok(tail) = terminal.await else {
-        return Ok(writer_interrupted(identity, "terminal_sender_dropped"));
-    };
-    if !active.load(Ordering::Acquire) {
-        return Ok(writer_interrupted(identity, "abandoned_before_tail"));
-    }
-    if !tail.is_empty() {
-        writer.write(tail).await?;
-    }
-    if !active.load(Ordering::Acquire) {
-        return Ok(writer_interrupted(identity, "abandoned_before_seal"));
+        return captured;
     }
     let staged = writer.finish_staged().await?;
     let object = loop {

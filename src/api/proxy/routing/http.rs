@@ -74,6 +74,7 @@ pub(super) async fn send_reqwest_proxy_route(
     protocol: Protocol,
     request_id: Uuid,
     route: &PreparedProxyRoute,
+    outbound_attempt: usize,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
     let request_timeout = configured_timeout(&route.route.config)?;
     let managed =
@@ -93,6 +94,8 @@ pub(super) async fn send_reqwest_proxy_route(
             route,
             &route.route.credential,
             request_timeout,
+            outbound_attempt,
+            None,
         )
         .await;
     }
@@ -123,6 +126,8 @@ pub(super) async fn send_reqwest_proxy_route(
         route,
         &selection.credential,
         request_timeout,
+        outbound_attempt,
+        selection.egress_snapshot(),
     )
     .await;
     if matches!(result, Err(ProxySendError::RetryableConnection(_))) {
@@ -152,7 +157,19 @@ async fn send_reqwest_proxy_route_once(
     route: &PreparedProxyRoute,
     transport_credential: &UpstreamCredential,
     request_timeout: RequestTimeout,
+    outbound_attempt: usize,
+    selected: Option<crate::db::egress::SelectedEgress>,
 ) -> Result<ProxyRouteResponse, ProxySendError> {
+    let selected = selected.or_else(|| {
+        let mut selected = crate::db::egress::SelectedEgress::capture(
+            transport_credential.proxy().map(|value| value.0),
+        )
+        .ok()?;
+        if transport_credential.proxy().is_none() {
+            selected.kind = "direct".into();
+        }
+        Some(selected)
+    });
     send_reqwest_proxy_route_with_preparation(
         state,
         headers,
@@ -160,6 +177,8 @@ async fn send_reqwest_proxy_route_once(
         request_id,
         route,
         request_timeout,
+        outbound_attempt,
+        selected,
         async {
             #[cfg(test)]
             if STALL_PROBE_PREPARATION
@@ -181,6 +200,7 @@ async fn send_reqwest_proxy_route_once(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_reqwest_proxy_route_with_preparation<F>(
     state: &AppState,
     headers: &HeaderMap,
@@ -188,6 +208,8 @@ async fn send_reqwest_proxy_route_with_preparation<F>(
     request_id: Uuid,
     route: &PreparedProxyRoute,
     request_timeout: RequestTimeout,
+    outbound_attempt: usize,
+    selected: Option<crate::db::egress::SelectedEgress>,
     preparation: F,
 ) -> Result<ProxyRouteResponse, ProxySendError>
 where
@@ -293,9 +315,20 @@ where
     }
     let upstream_activity = state.metrics.active_upstream(&route.route.driver, "proxy");
     let upstream_started = Instant::now();
+    let request_body = super::codex::send_diagnostics::BodyConsumption::default();
+    let mut egress_recorder = None;
     let upstream_result = send_until_request_deadline(request_deadline, async {
         let (client, request) = request.build_split();
-        let request = request?;
+        let mut request = request?;
+        request_body.attach(&mut request);
+        egress_recorder = super::codex::egress::AttemptRecorder::begin_http(
+            state,
+            &route.route,
+            request_id,
+            outbound_attempt,
+            selected,
+            request_body,
+        );
         IndependentProbeTarget::dispatched(&route.route);
         let response = client.execute(request).await?;
         IndependentProbeTarget::response(response.status());
@@ -310,6 +343,10 @@ where
     );
     match upstream_result {
         Ok(response) => {
+            let (response, egress_selection) = super::codex::egress::observe_response(
+                UpstreamResponse::Reqwest(response),
+                egress_recorder,
+            );
             let response = if route.compact_v2_bridge {
                 translate_new_api_compact_v2(
                     response,
@@ -318,7 +355,7 @@ where
                 )
                 .await?
             } else {
-                UpstreamResponse::Reqwest(response)
+                response
             };
             let response = match (request_deadline, timeout) {
                 (Some(deadline), Some(timeout)) => response.with_body_timeouts(deadline, timeout),
@@ -356,7 +393,7 @@ where
             };
             Ok(ProxyRouteResponse {
                 preoutput_quota,
-                egress_selection: None,
+                egress_selection,
                 response,
                 upstream_activity,
                 codex_retry: CodexRetryTerminalGuard::inactive(),
@@ -410,7 +447,7 @@ fn classify_reqwest_send_error(error: reqwest::Error) -> ProxySendError {
 }
 
 async fn translate_new_api_compact_v2(
-    response: reqwest::Response,
+    response: UpstreamResponse,
     wrap_as_sse: bool,
     spool_path: &std::path::Path,
 ) -> Result<UpstreamResponse, ProxySendError> {
@@ -419,7 +456,7 @@ async fn translate_new_api_compact_v2(
     // upstream rejection as a live response so ordinary error handling owns
     // its body, accounting, and delivery without waiting for EOF here.
     if !status.is_success() {
-        return Ok(UpstreamResponse::Reqwest(response));
+        return Ok(response);
     }
     let version = response.version();
     let mut headers = response.headers().clone();
@@ -682,7 +719,7 @@ mod tests {
     async fn compact_translation_preserves_upstream_error_status_headers_and_body() {
         let directory = tempfile::tempdir().unwrap();
         let response = translate_new_api_compact_v2(
-            compact_response(StatusCode::TOO_MANY_REQUESTS, "private-canary error"),
+            compact_response(StatusCode::TOO_MANY_REQUESTS, "private-canary error").into(),
             true,
             directory.path(),
         )
@@ -707,7 +744,7 @@ mod tests {
                     panic!("compact translation must not poll an upstream rejection body")
                 },
             );
-            let response = http::Response::builder()
+            let response: reqwest::Response = http::Response::builder()
                 .status(status)
                 .header(header::CONTENT_TYPE, "text/plain")
                 .header(header::RETRY_AFTER, "7")
@@ -733,7 +770,7 @@ mod tests {
         ] {
             for wrap_as_sse in [false, true] {
                 let result = translate_new_api_compact_v2(
-                    compact_response(StatusCode::OK, body),
+                    compact_response(StatusCode::OK, body).into(),
                     wrap_as_sse,
                     directory.path(),
                 )
@@ -1096,6 +1133,8 @@ mod tests {
             request_id,
             &route,
             configured_timeout(&route.route.config).unwrap(),
+            1,
+            None,
             std::future::pending(),
         )
         .await;

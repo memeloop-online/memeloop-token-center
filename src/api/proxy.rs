@@ -2876,9 +2876,29 @@ async fn execute_component_provider(
         .active_upstream(driver, "component_provider");
     let upstream_started = Instant::now();
     IndependentProbeTarget::validate_target(route)?;
+    let body_consumption = routing::codex::send_diagnostics::BodyConsumption::default();
+    let selected_egress =
+        crate::db::egress::SelectedEgress::capture(credential.proxy().map(|value| value.0))
+            .ok()
+            .map(|mut selected| {
+                if credential.proxy().is_none() {
+                    selected.kind = "direct".into();
+                }
+                selected
+            });
+    let mut egress_recorder = None;
     let upstream_result = async {
         let (client, prepared) = upstream_request.build_split();
-        let prepared = prepared?;
+        let mut prepared = prepared?;
+        body_consumption.attach(&mut prepared);
+        egress_recorder = routing::codex::egress::AttemptRecorder::begin_http(
+            request.state,
+            route,
+            request.request_id,
+            1,
+            selected_egress,
+            body_consumption,
+        );
         IndependentProbeTarget::dispatched(route);
         let response = client.execute(prepared).await?;
         IndependentProbeTarget::response(response.status());
@@ -2897,7 +2917,14 @@ async fn execute_component_provider(
         upstream_started.elapsed(),
     );
     let upstream = match upstream_result {
-        Ok(response) => response,
+        Ok(response) => {
+            let (response, selected) =
+                routing::codex::egress::observe_response(response.into(), egress_recorder);
+            if let Some(selected) = selected {
+                selected.select();
+            }
+            response
+        }
         Err(error) => {
             tracing::warn!(
                 request_id = %request.request_id,
@@ -2930,7 +2957,29 @@ async fn execute_component_provider(
         }
     };
     let upstream_status = upstream.status();
+    let stage_db = request.state.routing_persistence_db.clone();
+    let (stage_request, stage_tenant, stage_key, stage_reservation) = (
+        request.request_id,
+        request.tenant_id,
+        request.reservation.key_id,
+        request.reservation.id,
+    );
+    request
+        .state
+        .routing_persistence
+        .submit_observation(1024, async move {
+            stage_db
+                .record_proxy_in_flight_stage(
+                    stage_request,
+                    stage_tenant,
+                    stage_key,
+                    stage_reservation,
+                    "upstream_response_body",
+                )
+                .await
+        });
     let upstream = request.capture_original_response(upstream.into()).await;
+
     IndependentProbeTarget::response(upstream_status);
     if !upstream_status.is_success() && !upstream_status.is_redirection() {
         if let Some(attempt) = upstream_attempt.as_mut() {
