@@ -1117,6 +1117,8 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             web/package-lock.json
+      - name: Validate plaintext review and isolated file-task protocols
+        run: node --test tests/ops/kimi-plaintext-review.test.ts tests/ops/plaintext-file-task.test.ts
       - name: Install pinned workflow-policy parser dependencies
         run: |
           npm ci --ignore-scripts
