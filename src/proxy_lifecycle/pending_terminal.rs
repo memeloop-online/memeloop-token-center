@@ -1697,8 +1697,6 @@ impl Journal {
             .unwrap_or_else(|e| e.into_inner())
             .entries
             .remove(&snapshot.receipt_id);
-        let lacks_financial_evidence =
-            snapshot.financial_evidence_unavailable() && snapshot.financial_ack.is_none();
         let snapshot = Arc::new(snapshot);
         let receipt_id = snapshot.receipt_id;
         let applied = snapshot.financial_ack.as_ref().is_some_and(|ack| {
@@ -1747,7 +1745,7 @@ impl Journal {
             tracing::warn!(request_id = %snapshot.request_id, error_category = error.diagnostic_category(),
                 "recovered terminal observation remains pending");
         }
-        self.attempt(database.clone(), snapshot, applied).await;
+        let financial_applied = self.attempt(database.clone(), snapshot, applied).await;
         // No process-owned body/future belongs to a recovered item. Its durable
         // receipt survives a failed or unknown attempt and will be revisited.
         let completed = self
@@ -1766,10 +1764,15 @@ impl Journal {
         }) {
             return false;
         }
-        completed && !lacks_financial_evidence
+        completed && financial_applied
     }
 
-    async fn attempt(&self, database: Database, snapshot: Arc<Snapshot>, mut applied: bool) {
+    async fn attempt(
+        &self,
+        database: Database,
+        snapshot: Arc<Snapshot>,
+        mut applied: bool,
+    ) -> bool {
         let request_id = snapshot.request_id;
         let receipt_id = snapshot.receipt_id;
         #[cfg(test)]
@@ -2038,7 +2041,7 @@ impl Journal {
                     entry.applied = true;
                     entry.retry_after = tokio::time::Instant::now() + RETRY_INTERVAL;
                 }
-                return;
+                return applied;
             }
             let _ = tokio::fs::remove_file(self.directory.join(format!("{receipt_id}.json"))).await;
         }
@@ -2098,6 +2101,7 @@ impl Journal {
                 entry.activity = None;
             }
         }
+        applied
     }
 }
 
