@@ -381,6 +381,36 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn inspected_non_fused_eof_can_be_delivered_and_archived_again() {
+        for (raw, expected_rejection) in [
+            (r#"{"error":{"code":"model_not_found"}}"#, true),
+            (
+                r#"{"error":{"code":"model_not_found"},"usage":{"total_tokens":1}}"#,
+                false,
+            ),
+        ] {
+            let body = Bytes::from_static(raw.as_bytes());
+            // Unfold panics if polled after its first None, like the timeout
+            // wrapper used by real HTTP upstream responses.
+            let upstream = stream::unfold(Some(body.clone()), |body| async move {
+                body.map(|bytes| (Ok(bytes), None))
+            });
+            let (inspected, rejected) = inspect_model_rejection(response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "application/json",
+                Some(body.len() as u64),
+                Box::pin(upstream),
+            ))
+            .await;
+            assert_eq!(rejected, expected_rejection);
+            let mut replay = inspected.into_parts().stream;
+            assert_eq!(replay.next().await, Some(Ok(body)));
+            assert_eq!(replay.next().await, None);
+            assert_eq!(replay.next().await, None);
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn partial_model_rejection_times_out_without_losing_consumed_prefix() {
         let prefix = Bytes::from_static(br#"{"error":{"code":"model_not_found"}}"#);
