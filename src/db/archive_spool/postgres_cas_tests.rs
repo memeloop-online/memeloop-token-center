@@ -174,7 +174,9 @@ async fn postgres_cas_commit_disconnect_rolls_back_or_replays_the_exact_committe
         }
     });
     let mut database = fixture.db.clone();
-    database.pool = schema_pool(relay_url.as_str(), &fixture.schema).await;
+    database.pool = schema_pool(relay_url.as_str(), &fixture.schema)
+        .await
+        .into();
     let fault_pool = database.pool.clone();
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(fixture.gate)
@@ -246,7 +248,7 @@ async fn postgres_cas_commit_disconnect_rolls_back_or_replays_the_exact_committe
     assert_eq!(events_before[0].3, key_id.to_string());
     assert_eq!(events_before[0].4, fixture.id.request_id.to_string());
     let mut restarted = fixture.db.clone();
-    restarted.pool = schema_pool(&fixture.url, &fixture.schema).await;
+    restarted.pool = schema_pool(&fixture.url, &fixture.schema).await.into();
     for _ in 0..2 {
         assert!(
             restarted

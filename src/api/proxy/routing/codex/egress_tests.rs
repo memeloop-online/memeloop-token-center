@@ -1,6 +1,81 @@
 use super::*;
 use futures_util::StreamExt;
 
+#[tokio::test]
+async fn generic_http_egress_records_selected_endpoint_and_cancelled_body_without_secrets() {
+    let fixture = Fixture::new().await;
+    let context = fixture.context();
+    let selected =
+        SelectedEgress::capture(Some("socks5h://private-user:private-pass@10.0.0.5:1080")).unwrap();
+    let recorder = AttemptRecorder::begin_http(
+        &fixture.state,
+        &fixture.route.route,
+        context.request_id,
+        3,
+        Some(selected),
+        send_diagnostics::BodyConsumption::default(),
+    );
+    let (response, selection) = observe_response(
+        UpstreamResponse::for_test(
+            HeaderMap::new(),
+            ::http::Version::HTTP_11,
+            vec![
+                Ok(bytes::Bytes::from_static(b"first")),
+                Ok(bytes::Bytes::from_static(b"remaining")),
+            ],
+        ),
+        recorder,
+    );
+    selection.unwrap().select();
+    let mut body = response.bytes_stream();
+    assert_eq!(body.next().await.unwrap().unwrap(), "first");
+    drop(body);
+    let attempts = fixture.attempts(context).await;
+    assert_eq!(attempts.len(), 1);
+    let attempt = &attempts[0];
+    assert_eq!(attempt.outbound_attempt, 3);
+    assert!(attempt.completed);
+    assert!(attempt.final_response);
+    assert!(!attempt.response_body_complete);
+    assert_eq!(attempt.response_payload_bytes, Some(5));
+    assert!(attempt.selected.concurrency_identity().is_some());
+    let encoded = serde_json::to_string(attempt).unwrap();
+    assert!(!encoded.contains("private-user"));
+    assert!(!encoded.contains("private-pass"));
+    assert_eq!(attempt.transport["transport_family"], "reqwest_no_retry");
+}
+
+#[tokio::test]
+async fn generic_http_egress_finishes_only_at_actual_eof() {
+    let fixture = Fixture::new().await;
+    let context = fixture.context();
+    let recorder = AttemptRecorder::begin_http(
+        &fixture.state,
+        &fixture.route.route,
+        context.request_id,
+        1,
+        Some(fixture.selected.clone()),
+        send_diagnostics::BodyConsumption::default(),
+    );
+    let (response, _) = observe_response(
+        UpstreamResponse::for_test(
+            HeaderMap::new(),
+            ::http::Version::HTTP_11,
+            vec![Ok(bytes::Bytes::from_static(b"body"))],
+        ),
+        recorder,
+    );
+    let mut body = response.bytes_stream();
+    assert!(body.next().await.unwrap().is_ok());
+    assert!(!fixture.attempts(context).await[0].completed);
+    assert!(body.next().await.is_none());
+    let attempts = fixture.attempts(context).await;
+    assert!(attempts[0].completed);
+    assert!(attempts[0].response_body_complete);
+    assert!(!attempts[0].final_response);
+    assert_eq!(attempts[0].response_payload_bytes, Some(4));
+}
+
 struct Fixture {
     state: AppState,
     route: PreparedProxyRoute,

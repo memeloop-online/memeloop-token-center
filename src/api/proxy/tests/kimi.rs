@@ -563,7 +563,7 @@ async fn send_official_codex_responses_to_endpoint(
 }
 
 #[tokio::test]
-async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the_wire() {
+async fn native_codex_responses_preserves_reserved_collaboration_schemas_and_opaque_input() {
     let upstream = MockServer::start().await;
     let fixture = codex_route_fixture("native-collaboration-wire").await;
     Mock::given(method("POST"))

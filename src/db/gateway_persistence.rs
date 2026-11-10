@@ -6,9 +6,10 @@ use std::{
     time::Duration,
 };
 
+use super::request_pool::RequestPool as AnyPool;
 #[cfg(test)]
 use bytes::Bytes;
-use sqlx::{AnyPool, Row, any::AnyPoolOptions};
+use sqlx::{Row, any::AnyPoolOptions};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 
@@ -60,12 +61,20 @@ impl GatewayPersistence {
         let acquire_timeout = TEST_SOURCE_POOL_TIMEOUT
             .try_with(|timeout| *timeout)
             .unwrap_or(acquire_timeout);
+        let application_name = super::postgres_application_name("mtc-gateway-archive");
         let pool = AnyPoolOptions::new()
             .max_connections(1)
+            .test_before_acquire(matches!(backend, DatabaseBackend::Sqlite))
             .min_connections(0)
             .acquire_timeout(acquire_timeout)
             .idle_timeout(Some(Duration::from_secs(60)))
+            .after_release(move |connection, _metadata| {
+                Box::pin(
+                    async move { Ok(super::request_connection::can_reuse(connection, backend)) },
+                )
+            })
             .after_connect(move |connection, _| {
+                let application_name = application_name.clone();
                 Box::pin(async move {
                     match backend {
                         DatabaseBackend::Sqlite => {
@@ -74,23 +83,19 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
-                            // Reuse the serving session policy in one simple
-                            // query exchange, not three prepared SET exchanges.
-                            let settings = [
-                                super::POSTGRES_SERVE_STATEMENT_TIMEOUT,
-                                super::POSTGRES_SERVE_LOCK_TIMEOUT,
-                                super::POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
-                            ]
-                            .join(";");
-                            sqlx::raw_sql(sqlx::AssertSqlSafe(settings))
-                                .execute(connection)
-                                .await?;
+                            super::initialize_postgres_connection(
+                                connection,
+                                &application_name,
+                                super::ConnectionProfile::Serve,
+                            )
+                            .await?;
                         }
                     }
                     Ok(())
                 })
             })
-            .connect_lazy(url)?;
+            .connect_lazy(url)?
+            .into();
         Ok(Self {
             pool,
             slots: Arc::new(Semaphore::new(TASK_LIMIT)),
@@ -670,7 +675,7 @@ impl Database {
     #[cfg(test)]
     pub(crate) async fn hold_gateway_archive_connection_for_test(
         &self,
-    ) -> sqlx::pool::PoolConnection<sqlx::Any> {
+    ) -> super::request_connection::RequestConnection {
         self.gateway_persistence.pool.acquire().await.unwrap()
     }
 
