@@ -17,6 +17,7 @@ mod group_routing;
 pub mod http_settings;
 #[cfg(not(target_env = "msvc"))]
 mod jemalloc_control;
+mod json_source;
 pub mod metrics;
 pub mod model;
 #[cfg(unix)]
@@ -212,7 +213,8 @@ impl AppState {
         let db = Database::connect_with_max(&config.database_url, config.database_max_connections)
             .await
             .map_err(|error| InitializationError::Database(error.into()))?
-            .with_terminal_projection_enabled(config.terminal_projection_enabled);
+            .with_terminal_projection_enabled(config.terminal_projection_enabled)
+            .with_auxiliary_pool_max_connections(config.database_aux_pool_max_connections);
         db.refresh_http_settings()
             .await
             .map_err(InitializationError::Database)?;

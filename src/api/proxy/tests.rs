@@ -1559,6 +1559,91 @@ async fn rate_limit_response_fails_over_to_standby_in_the_same_request() {
 }
 
 #[tokio::test]
+async fn explicit_model_lookup_rejection_fails_over_to_authorized_equivalent_route() {
+    let unavailable = MockServer::start().await;
+    let healthy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+            "error": {"code": "MODEL_NOT_FOUND", "message": "private supplier detail"}
+        })))
+        .expect(1)
+        .mount(&unavailable)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(successful_chat_response())
+        .expect(1)
+        .mount(&healthy)
+        .await;
+    // The fixture explicitly grants both routes to this key, with the same
+    // public model/protocol and price. Model aliases stay route-owned.
+    let fixture = resilient_route_fixture(
+        "model-rejection-failover",
+        &[(unavailable.uri(), 0), (healthy.uri(), 10)],
+    )
+    .await;
+    let response = send_resilient_chat(&fixture, Some("model-rejection-session"), false).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert!(!String::from_utf8_lossy(&body).contains("private supplier detail"));
+    unavailable.verify().await;
+    healthy.verify().await;
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let actual: String = sqlx::query_scalar("SELECT upstream_account_id FROM request_records WHERE key_id = $1 ORDER BY created_at DESC LIMIT 1")
+        .bind(fixture.key_id.to_string()).fetch_one(&pool).await.unwrap();
+    assert_eq!(actual, fixture.accounts[1].to_string());
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn model_errors_with_execution_evidence_and_general_503_never_replay() {
+    for (label, rejection) in [
+        (
+            "usage",
+            json!({"error":{"code":"model_not_found"},"usage":{"total_tokens":0}}),
+        ),
+        (
+            "output",
+            json!({"error":{"code":"model_not_found"},"output":[{"text":"already generated"}]}),
+        ),
+        (
+            "message-only",
+            json!({"error":{"message":"The requested upstream model is unavailable"}}),
+        ),
+        (
+            "general",
+            json!({"error":{"code":"service_unavailable","message":"try later"}}),
+        ),
+    ] {
+        let unavailable = MockServer::start().await;
+        let healthy = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(503).set_body_json(rejection))
+            .expect(1)
+            .mount(&unavailable)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(successful_chat_response())
+            .expect(0)
+            .mount(&healthy)
+            .await;
+        let fixture = resilient_route_fixture(
+            &format!("model-no-replay-{label}"),
+            &[(unavailable.uri(), 0), (healthy.uri(), 10)],
+        )
+        .await;
+        let response = send_resilient_chat(&fixture, Some(label), false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+        unavailable.verify().await;
+        healthy.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn rate_limit_response_is_preserved_without_a_standby() {
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))

@@ -5,13 +5,14 @@ mod admission;
 mod anthropic;
 mod candidates;
 mod clock;
-mod codex;
+pub(super) mod codex;
+mod compact_file;
 pub(super) mod diagnostics;
 mod http;
 #[cfg(test)]
 pub(super) use http::with_stalled_probe_preparation;
 pub(super) mod kimi;
-mod outcome;
+pub(super) mod outcome;
 mod policy;
 mod probe;
 mod readiness;
@@ -36,6 +37,7 @@ pub(super) use codex::with_test_pre_delivery_connect_failures;
 #[cfg(test)]
 pub(super) use codex::with_test_send_failures;
 pub(super) use codex::{CodexRetryTerminal, CodexRetryTerminalGuard, runtime_transport_policy};
+pub(super) use compact_file::ValidatedCompact;
 pub(super) use outcome::{attempt_failure_stage, classify_attempt_failure, failover_disposition};
 pub(crate) use policy::RequestAttemptBudget;
 pub(super) use probe::{SharedProbePermit, join_shared_probe};
@@ -500,7 +502,15 @@ pub(super) async fn send_proxy_route(
         )
         .await;
     }
-    http::send_reqwest_proxy_route(state, headers, protocol, request_id, route).await
+    http::send_reqwest_proxy_route(
+        state,
+        headers,
+        protocol,
+        request_id,
+        route,
+        outbound_attempt,
+    )
+    .await
 }
 
 pub(super) fn retryable_upstream_status(status: StatusCode) -> bool {

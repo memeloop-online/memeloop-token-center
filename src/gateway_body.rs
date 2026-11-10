@@ -14,6 +14,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 
+pub(crate) mod local_body_file;
 pub(crate) mod memory;
 pub(crate) mod request_spool;
 
@@ -283,7 +284,11 @@ async fn admit_request_body_for_route(
 ) -> Result<Request, GatewayBodyAdmissionError> {
     let source_backed = matches!(
         request.uri().path(),
-        "/v1/chat/completions" | "/v1/messages" | "/v1/alpha/search" | "/v1/embeddings"
+        "/v1/chat/completions"
+            | "/v1/messages"
+            | "/v1/messages/count_tokens"
+            | "/v1/alpha/search"
+            | "/v1/embeddings"
     );
     // Request transport needs a correct replay, not a healthy archive service.
     // Missing shared admission falls back to an owned local carrier.
@@ -579,6 +584,7 @@ mod tests {
             "/v1/responses/compact",
             "/v1/chat/completions",
         ] {
+            let started = tokio::time::Instant::now();
             let body = stream::once(async {
                 tokio::time::sleep(Duration::from_secs(120)).await;
                 Ok::<_, Infallible>(Bytes::from_static(b"{}"))
@@ -592,15 +598,19 @@ mod tests {
             )
             .await
             .unwrap();
-            if path.starts_with("/v1/responses") {
-                let captured = admitted
-                    .extensions()
-                    .get::<Arc<request_spool::RequestSpool>>()
-                    .unwrap();
-                assert_eq!(captured.len(), 2);
-            } else {
-                assert_eq!(to_bytes(admitted.into_body(), 1024).await.unwrap(), "{}");
-            }
+            assert!(started.elapsed() >= Duration::from_secs(120), "{path}");
+            let captured = admitted
+                .extensions()
+                .get::<Arc<request_spool::RequestSpool>>()
+                .unwrap();
+            assert_eq!(captured.len(), 2, "{path}");
+            assert_eq!(captured.read_all().await.unwrap(), "{}", "{path}");
+            assert!(
+                to_bytes(admitted.into_body(), 1024)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

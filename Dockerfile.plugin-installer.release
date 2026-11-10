@@ -6,9 +6,9 @@ ARG RUNTIME_IMAGE=gcr.io/distroless/base-nossl-debian13:nonroot
 # assembly-only: it never invokes Cargo, Go, or npm.
 FROM ${RUNTIME_IMAGE}
 LABEL org.opencontainers.image.title="MemeLoop Token Center OCI plugin installer" \
-      org.opencontainers.image.description="Digest-pinned OCI plugin installer with official Cosign v3.1.4" \
+      org.opencontainers.image.description="Digest-pinned OCI plugin installer with Cosign v3.1.4-mtc.1 with the x/net security fix" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      io.memeloop.cosign.version="v3.1.4" \
+      io.memeloop.cosign.version="v3.1.4-mtc.1" \
       io.memeloop.cosign.upstream-commit="0e48502cf5ef34e2e60bbd3617aa19945712f705"
 ENV LD_LIBRARY_PATH=/usr/local/lib
 COPY --chmod=0555 --from=release-input /cosign /usr/local/bin/cosign

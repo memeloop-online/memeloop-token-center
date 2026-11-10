@@ -1,7 +1,7 @@
 //! Choose the model a real upstream probe will call.
 //!
 //! An explicit `probe_model` on the account wins. Otherwise the account's own
-//! catalog is used: the cheapest priced model, then the lowest numeric version,
+//! catalog is used: the lowest estimated probe cost, then the lowest numeric version,
 //! then the first model in the supplied catalog order. The filter assistant's
 //! model is never a candidate.
 
@@ -21,10 +21,13 @@ pub(crate) fn select_probe_model(
     }
     let text: Vec<&CatalogModel> = models
         .iter()
-        .filter(|model| is_text(&model.protocol))
+        .filter(|model| is_text(&model.protocol) && is_generation_model(&model.model_id))
         .collect();
     let pool: Vec<&CatalogModel> = if text.is_empty() {
-        models.iter().collect()
+        models
+            .iter()
+            .filter(|model| is_generation_model(&model.model_id))
+            .collect()
     } else {
         text
     };
@@ -55,6 +58,13 @@ pub(crate) fn select_probe_model(
         return Some(versioned[0].1.model_id.clone());
     }
     Some(pool[0].model_id.clone())
+}
+
+fn is_generation_model(model: &str) -> bool {
+    let name = model.to_ascii_lowercase();
+    !["bge-", "embed", "rerank"]
+        .iter()
+        .any(|part| name.contains(part))
 }
 
 fn is_text(protocol: &str) -> bool {
@@ -112,6 +122,20 @@ mod tests {
             select_probe_model(Some(" gpt-5.4-mini "), &models).as_deref(),
             Some("gpt-5.4-mini")
         );
+    }
+
+    #[test]
+    fn automatic_probe_excludes_embedding_and_reranking_models() {
+        let models = vec![
+            model("bge-m3", "any", Some(1)),
+            model("bge-reranker-v2-m3", "any", Some(1)),
+            model("small-chat", "any", Some(2)),
+        ];
+        assert_eq!(
+            select_probe_model(None, &models).as_deref(),
+            Some("small-chat")
+        );
+        assert_eq!(select_probe_model(None, &models[..2]), None);
     }
 
     #[test]

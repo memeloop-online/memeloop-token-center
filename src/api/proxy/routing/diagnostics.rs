@@ -25,6 +25,7 @@ pub(in crate::api::proxy) fn observe_send(
     outbound_attempt: usize,
     result: &Result<ProxyRouteResponse, ProxySendError>,
     quota_failure: Option<crate::db::UpstreamFailureKind>,
+    model_rejected: bool,
 ) {
     let status = result
         .as_ref()
@@ -38,6 +39,7 @@ pub(in crate::api::proxy) fn observe_send(
         status,
         error,
         quota_failure,
+        model_rejected,
     );
 }
 
@@ -48,13 +50,14 @@ fn emit(
     status: Option<StatusCode>,
     error: Option<&ProxySendError>,
     quota_failure: Option<crate::db::UpstreamFailureKind>,
+    model_rejected: bool,
 ) {
     tracing::info!(
         %request_id, candidate_rank, outbound_attempt,
         stage = "upstream_attempt_observed",
         outcome = classification(status, error),
         status = status.map(|value| value.as_u16()),
-        disposition = super::failover_disposition(status, error, quota_failure).as_str(),
+        disposition = if model_rejected { "model_rejected_before_execution" } else { super::failover_disposition(status, error, quota_failure).as_str() },
         "proxy observed attempt delivery evidence"
     );
 }
@@ -93,6 +96,7 @@ mod tests {
                 None,
                 Some(&ProxySendError::AmbiguousResponse("SECRET_CANARY")),
                 None,
+                false,
             );
             emit(
                 Uuid::nil(),
@@ -101,6 +105,7 @@ mod tests {
                 Some(StatusCode::SERVICE_UNAVAILABLE),
                 None,
                 None,
+                false,
             );
             emit(
                 Uuid::nil(),
@@ -111,6 +116,7 @@ mod tests {
                     TransportFailureKind::Http2Reset,
                 )),
                 None,
+                false,
             );
             emit(
                 Uuid::nil(),
@@ -121,6 +127,7 @@ mod tests {
                     TransportFailureKind::Http2GoAway,
                 )),
                 None,
+                false,
             );
         });
         let bytes = writer.0.lock().unwrap();

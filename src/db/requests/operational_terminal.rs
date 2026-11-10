@@ -239,9 +239,9 @@ impl Database {
     /// lease. Record that the connection is over so the list does not keep
     /// showing the request as still running. Billing stays unknown.
     pub(crate) async fn close_expired_proxy_owners(&self, limit: i64) -> Result<u64, AppError> {
-        let now = self
-            .request_owner_now(&mut *self.pool.acquire().await?)
-            .await?;
+        let mut connection = self.pool.acquire().await?;
+        let now = self.request_owner_now(&mut connection).await?;
+        connection.finish();
         let rows = sqlx::query(
             "SELECT p.request_id, p.tenant_id, p.key_id, p.account_id, p.reservation_id, p.owner_token, p.fence, p.contract_digest, p.contract_json, q.created_at FROM pending_proxy_settlements p JOIN request_records q ON q.id = p.request_id AND q.tenant_id = p.tenant_id AND q.key_id = p.key_id AND q.reservation_id = p.reservation_id WHERE p.state = 'pending' AND q.completed_at IS NULL AND q.proxy_owner_expires_at IS NOT NULL AND q.proxy_owner_expires_at <= $1 AND NOT EXISTS (SELECT 1 FROM proxy_operational_terminals o WHERE o.request_id = p.request_id AND o.reservation_id = p.reservation_id) ORDER BY q.proxy_owner_expires_at, p.request_id LIMIT $2",
         )

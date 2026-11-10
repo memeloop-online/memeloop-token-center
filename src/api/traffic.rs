@@ -210,10 +210,21 @@ pub(super) async fn proxy_anthropic_count_tokens(
     axum::Extension(memory): axum::Extension<
         std::sync::Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
     >,
+    spool: Option<
+        axum::Extension<std::sync::Arc<crate::gateway_body::request_spool::RequestSpool>>,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    super::proxy::proxy(state, headers, body, Protocol::AnthropicCountTokens, memory).await
+    proxy_source_or_body(
+        state,
+        headers,
+        body,
+        Protocol::AnthropicCountTokens,
+        memory,
+        spool,
+    )
+    .await
 }
 
 #[derive(Clone, Copy)]

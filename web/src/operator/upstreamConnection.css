@@ -42,3 +42,8 @@
   .provider-account > .account-main > .upstream-health-details { grid-column: 2; }
 }
 @media (max-width: 600px) { .upstream-connection dl > div { grid-template-columns: 1fr; gap: 4px; } }
+
+.unified-account-proxy .network-proxy-policy-summary > div { display: block; }
+.unified-account-proxy .network-proxy-policy-summary { margin-block: 12px 20px; }
+
+.provider-authorization-status { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }

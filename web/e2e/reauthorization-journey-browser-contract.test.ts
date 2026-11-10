@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { networkProxyCopy } from '../src/operator/NetworkProxyCopy.js';
 import { editProviderAccount } from './support/provider-account-navigation.js';
 import { quotaBatchFixtureResponse } from './support/quota-batch.js';
 import { mkdir } from 'node:fs/promises';
@@ -159,6 +160,9 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       await page.addInitScript(value => localStorage.setItem('mtc-locale', value), locale);
       let account = { id: 'reauthorization-fixture', name: 'reauthorize@example.org', tenant_external_id: 'fixture-a', driver: 'openai-codex', auth_kind: 'oauth', connection_method: 'oauth', status: 'active', credential_generation: 2, credential_expires_at: null, updated_at: 3, route_count: 0, config: { base_url: 'https://provider.example.invalid' }, can_reauthorize: true, can_update_transport_proxy: true, has_proxy: true, proxy_scheme: 'socks5h', proxy_remote_dns: true };
       let proxy = 'socks5h://10.0.0.8:1080';
+      let selectionVersion = 0;
+      let proxyId = 'exit-8';
+      const selection = () => ({ configuration_revision: selectionVersion, account_id: account.id, tenant_external_id: account.tenant_external_id, selection_version: selectionVersion, binding_version: selectionVersion, credential_generation: account.credential_generation, account_updated_at: account.updated_at, desired: { mode: 'manual', proxy_id: proxyId, group_id: null, plugin_id: null, plugin_version: null, config: {} }, applied: { pending: false } });
       let pollCount = 0;
       let failPoll = true;
       let failStart = true;
@@ -172,17 +176,22 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
           if (url.pathname.includes('monitoring') || url.pathname.includes('availability')) return route.fulfill({ status: 503, json: { error: { message: 'Fixture statistics unavailable' } } });
           if (url.pathname === '/internal/v1/provider-types') return route.fulfill({ json: [{ id: 'openai-codex', display_name: 'Fixture Codex', source: 'builtin', protocols: ['openai'], modalities: ['text'], config_schema: { type: 'object', properties: { base_url: { type: 'string' } } }, credential_schema: { type: 'object', properties: { type: { const: 'oauth' } } }, oauth_adapter: { flow_kind: 'openai_device' } }] });
           if (url.pathname === '/internal/v1/upstreams') return route.fulfill({ json: [account] });
-          if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, updated_at: account.updated_at, proxy_url: proxy } });
+          if (url.pathname === '/internal/v1/transport-proxies') return route.fulfill({ json: { items: [8, 9].map(id => ({ id: `exit-${id}`, name: `Fixture exit ${id}`, version: 1, tenant_external_id: account.tenant_external_id, address: { scheme: 'socks5h', host: `10.0.0.${id}`, port: 1080, remote_dns: true, has_auth: false }, probe: { enabled: false, target_url: 'https://example.invalid/', interval_ms: 60000, attempts: 1 }, active_health: { status: 'unknown', checked_at: null, latency_ms: null, scope: 'process' }, created_at: 1, updated_at: 1 })) } });
+          if (url.pathname === '/internal/v1/transport-proxy-groups') return route.fulfill({ json: { items: [] } });
+          if (url.pathname === '/internal/v1/transport-proxy-strategies') return route.fulfill({ json: { items: [{ id: 'manual', version: '1', schema: { type: 'object', properties: {} }, default: {} }] } });
+          if (url.pathname.endsWith('/transport-proxy-selection')) { assert.equal(url.searchParams.get('tenant_external_id'), account.tenant_external_id); return route.fulfill({ json: selection() }); }
+          if (url.pathname.endsWith('/transport-proxy')) return route.fulfill({ json: { account_id: account.id, credential_generation: account.credential_generation, updated_at: account.updated_at, proxy_url: proxy, selected_member_id: proxyId, source: 'manual', configuration_state: 'applied' } });
           return route.fulfill({ json: [] });
         }
         if (url.pathname === '/internal/v1/upstreams/quota/batch') return route.fulfill({ json: quotaBatchFixtureResponse(request.postDataJSON(), [{ id: account.id, tenant: account.tenant_external_id, driver: account.driver }]) });
         const body = request.postDataJSON(); writes.push({ path: url.pathname, body });
-        if (url.pathname.endsWith('/transport-proxy')) {
+        if (url.pathname.endsWith('/transport-proxy-selection')) {
           assert.equal(request.method(), 'PUT');
-          assert.equal(body.expected_credential_generation, 2); assert.equal(body.expected_updated_at, 3);
-          proxy = body.proxy_url;
+          assert.equal(url.pathname, '/internal/v1/upstreams/reauthorization-fixture/transport-proxy-selection');
+          assert.deepEqual(body, { tenant_external_id: 'fixture-a', expected_selection_version: 0, expected_binding_version: 0, expected_credential_generation: 2, expected_updated_at: 3, mode: 'manual', proxy_id: 'exit-9', config: {} });
+          proxy = 'socks5h://10.0.0.9:1080'; proxyId = 'exit-9'; selectionVersion++;
           account = { ...account, credential_generation: 3, updated_at: 4 };
-          return route.fulfill({ json: account });
+          return route.fulfill({ status: 202, json: selection() });
         }
         assert.equal(request.method(), 'POST');
         if (url.pathname === '/internal/v1/oauth/codex/start') {
@@ -211,16 +220,17 @@ test('reauthorization saves its proxy in place, copies device codes, polls autom
       await page.screenshot({ path: `${screenshotRoot}/reauthorization-${locale}-390.png`, fullPage: true });
       const start = workspace.getByRole('button', { name: chinese ? '开始登录' : 'Start login', exact: true });
       assert.equal(writes.length, 0, 'opening an already-authorized account never starts OAuth');
-      await workspace.getByRole('button', { name: chinese ? '配置网络代理' : 'Configure network proxy', exact: true }).click();
+      const networkCopy = networkProxyCopy(locale);
+      const proxyInput = workspace.getByLabel(chinese ? /^固定出口\s*\*?$/ : /^Fixed exit\s*\*?$/);
+      await proxyInput.selectOption('exit-9');
       assert.equal(await start.isDisabled(), true);
       await workspace.getByText(chinese ? '正在编辑网络代理。请先保存或取消代理编辑，再开始登录。' : 'You are editing the network proxy. Save or cancel proxy editing before starting login.', { exact: true }).waitFor();
-      const proxyInput = workspace.locator('.upstream-proxy-editor input');
-      await proxyInput.fill('socks5h://10.0.0.9:1080');
-      await proxyInput.press('Enter');
-      await workspace.locator('.provider-readable-proxy input').waitFor();
+      await workspace.getByRole('button', { name: networkCopy.savePolicy, exact: true }).click();
+      await start.click({ trial: true });
+      await proxyInput.waitFor();
+      assert.equal(await proxyInput.inputValue(), 'exit-9');
       assert.equal(await workspace.getByText(chinese ? '正在编辑网络代理。' : 'You are editing the network proxy.', { exact: false }).count(), 0, 'proxy editing hint clears once the proxy is saved');
-      assert.equal(await workspace.locator('.provider-readable-proxy input').inputValue(), 'socks5h://10.0.0.9:1080');
-      assert.equal(writes.filter(write => write.path.endsWith('/transport-proxy')).length, 1, 'proxy save is immediate and does not start login');
+      assert.equal(writes.filter(write => write.path.endsWith('/transport-proxy-selection')).length, 1, 'policy save is immediate and does not start login');
       await workspace.getByRole('button', { name: chinese ? '关闭' : 'Close', exact: true }).click();
       await page.locator('.provider-detail-workspace').getByRole('heading', { name: 'reauthorize@example.org', exact: true }).waitFor();
       assert.equal(await page.locator('.provider-detail-workspace').count(), 1);
