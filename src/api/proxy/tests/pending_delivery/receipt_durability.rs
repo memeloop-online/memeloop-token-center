@@ -32,8 +32,13 @@ async fn block_projection(fixture: &CodexRouteFixture) {
 }
 
 #[tokio::test]
-async fn finance_completes_while_conversation_projection_is_blocked() {
+async fn finance_completes_while_receipt_publication_and_conversation_projection_are_blocked() {
     let fixture = codex_route_fixture("receipt-before-preparation").await;
+    let publication = fixture
+        .state
+        .pending_terminals
+        .hold_publication_for_test()
+        .await;
     let held = fixture
         .state
         .pending_terminals
@@ -51,10 +56,27 @@ async fn finance_completes_while_conversation_projection_is_blocked() {
         .unwrap();
     let request_id = rows[0].request_id;
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
-    let (_, receipt) = wait_for_receipt(&fixture).await;
+    let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     assert_eq!(receipt["conversation_state"], "Pending");
     assert_eq!(receipt["conversation"]["request_json"], json!({}));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let financial: (String, i64, i64) = sqlx::query_as(
+        "SELECT p.state, (SELECT COUNT(*) FROM ledger_entries WHERE source = p.reservation_id), \
+         (SELECT COUNT(*) FROM terminal_projection_outbox WHERE request_id = p.request_id) \
+         FROM pending_proxy_settlements p WHERE p.request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(financial, ("applied".into(), 1, 1));
+    assert!(
+        !fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id),
+        "DB settlement must not falsely acknowledge the blocked journal publication"
+    );
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1",
     )
@@ -68,6 +90,7 @@ async fn finance_completes_while_conversation_projection_is_blocked() {
         .await
         .unwrap();
     drop(held);
+    drop(publication);
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     pool.close().await;
     upstream.verify().await;

@@ -199,6 +199,37 @@ async fn postgres_projection_queue_fairness_and_source_retry_wake() {
     isolated.cleanup().await;
 }
 
+#[tokio::test]
+async fn postgres_rebuild_replenishment_does_not_wait_for_another_worker() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("rebuild serialization regression requires PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    let fixture = Fixture::new(isolated.url().to_owned(), true).await;
+    let mut owner = fixture.state.db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(82420261105)")
+        .execute(&mut *owner)
+        .await
+        .unwrap();
+    let replenished = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fixture.state.db.reopen_session_body_rebuilds(8),
+    )
+    .await
+    .expect("another replenisher must not block the worker")
+    .unwrap();
+    assert_eq!(replenished, 0);
+    owner.rollback().await.unwrap();
+    // The transaction-scoped lock is released and normal replenishment resumes.
+    fixture
+        .state
+        .db
+        .reopen_session_body_rebuilds(8)
+        .await
+        .unwrap();
+    drop(fixture);
+    isolated.cleanup().await;
+}
+
 struct Fixture {
     state: AppState,
     key: AuthenticatedKey,
@@ -513,7 +544,16 @@ impl Fixture {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("gap://{request_id}/request"));
         let response_locator = if source.is_some() {
-            r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#.to_owned()
+            let object = state.archive.put_tenant_content(
+                key.tenant_id,
+                Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#),
+            ).await.unwrap();
+            state
+                .archive
+                .publish_raw_capture(key.tenant_id, request_id, "response", &object)
+                .await
+                .unwrap();
+            object.object_locator
         } else {
             format!("gap://{request_id}/response")
         };
@@ -698,9 +738,6 @@ impl Fixture {
             (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
             (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
         ] {
-            // Terminal projection has already completed the request. Use the
-            // deferred writer's matching-gap fence instead of recapturing it
-            // through the pre-terminal compatibility helper.
             let archive = BufferedArchive::new(
                 self.identity,
                 purpose,
@@ -709,13 +746,17 @@ impl Fixture {
                 self.state.config.archive_spool_compression_enabled,
             )
             .unwrap();
+            let mut transaction = self.state.db.begin_write_transaction().await.unwrap();
             assert!(
                 self.state
                     .db
-                    .capture_deferred_archive(&archive)
+                    .capture_buffered_archive_body_in_transaction(
+                        &mut transaction, unix_millis(), &archive, None,
+                    )
                     .await
                     .unwrap()
             );
+            transaction.commit().await.unwrap();
         }
     }
 
@@ -971,6 +1012,28 @@ async fn sqlite_final_archive_gap_keeps_request_turn() {
     )
     .await;
     fixture.capture().await;
+    // This fixture knows the original request. Persist those exact bytes;
+    // the empty SQL outbox cannot stand in for a missing original.
+    let object = fixture
+        .state
+        .archive
+        .put_tenant_content(
+            fixture.identity.tenant_id,
+            Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .publish_raw_capture(
+            fixture.identity.tenant_id,
+            fixture.request_id,
+            "request",
+            &object,
+        )
+        .await
+        .unwrap();
     sqlx::query("UPDATE request_archive_spools SET state = 'gap' WHERE request_id = $1")
         .bind(fixture.request_id.to_string())
         .execute(&fixture.state.db.pool)
@@ -1030,6 +1093,10 @@ async fn source_contract(database_url: String) {
         fixture.state.responses_request_spool.drain_uploads().await;
         fixture.state.db.drain_gateway_persistence_for_test().await;
         assert!(String::from_utf8_lossy(&original).contains("provider_secret_field"));
+        // Upload EOF precedes the independent metadata handoff. Drain the real
+        // writer before simulating deletion/restart, so it cannot recreate the
+        // metadata after the fixture removes it.
+        fixture.state.responses_request_spool.drain_uploads().await;
         fixture
             .state
             .db
@@ -1067,18 +1134,42 @@ async fn source_contract(database_url: String) {
             .execute(&fixture.state.db.pool)
             .await
             .unwrap();
-        fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+        fixture.state.db = Database::connect_with_max(&database_url, 4)
+            .await
+            .unwrap()
+            .with_archive(fixture.state.archive.clone());
         fixture.assert_completed(true).await;
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
+        let root = fixture
+            .state
+            .archive
+            .raw_capture_reference(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.size_bytes, original.len() as u64);
+        assert_eq!(
+            root.blake3_digest,
+            blake3::hash(&original).to_hex().to_string()
+        );
+        assert_eq!(
+            fixture
+                .state
+                .archive
+                .get_tenant_content(fixture.identity.tenant_id, &root, original.len())
+                .await
+                .unwrap(),
+            original
+        );
+        let recreated: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1")
                 .bind(fixture.request_id.to_string())
                 .fetch_one(&fixture.state.db.pool)
                 .await
                 .unwrap();
-        assert_eq!(state, "bound");
-        let archived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'cleanup_pending'")
-            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
-        assert_eq!(archived, 1);
+        assert_eq!(
+            recreated, 0,
+            "immutable roots restore content without recreating retired spools"
+        );
         let chunks: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = $1",
         )
@@ -1118,8 +1209,13 @@ async fn failed_source_metadata_contract(database_url: String) {
     let release = store.pause_next_write();
     let admission =
         RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
-    let mut fixture =
-        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    // Inject the metadata outage explicitly. Production now gives a healthy
+    // cold/queued connection ten seconds rather than failing within 250ms.
+    let mut fixture = Database::with_source_pool_timeout_for_test(
+        Duration::from_millis(250),
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)),
+    )
+    .await;
     let source = fixture.source.take().unwrap();
     let locator = source.object_locator().unwrap().to_owned();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1198,8 +1294,11 @@ async fn expired_live_source_writer_contract(database_url: String) {
     let release = store.pause_next_write();
     let admission =
         RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
-    let mut fixture =
-        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    let mut fixture = Database::with_source_pool_timeout_for_test(
+        Duration::from_millis(250),
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)),
+    )
+    .await;
     let source = fixture.source.take().unwrap();
     let locator = source.object_locator().unwrap().to_owned();
     let length = source.len();
@@ -1227,25 +1326,45 @@ async fn expired_live_source_writer_contract(database_url: String) {
         charged > 0,
         "the pending Put still owns the raw bytes after request drop"
     );
-    // The occupied archive pool may keep the heartbeat waiting. It must not
-    // cancel the still-pending upload or release its resident-memory charge.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(
-        !release.is_closed(),
-        "metadata failure must retain the paused Put"
-    );
-    assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, charged);
-    drop(held);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let expiry: i64 = sqlx::query_scalar("SELECT lease_expires_at FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
-                .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
-            if expiry > unix_millis() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+    {
+        // Explicitly poll this writer's real heartbeat while its pool is held.
+        // The background writer may be between its normal 20-second ticks;
+        // a five-second assertion must not depend on that timer firing.
+        let (_outcome, receiver) = tokio::sync::watch::channel(None);
+        let heartbeat = fixture.state.db.wait_request_source_upload(
+            fixture.identity,
+            &locator,
+            length,
+            digest,
+            receiver,
+        );
+        tokio::pin!(heartbeat);
+        tokio::select! {
+            result = &mut heartbeat => panic!("pending source heartbeat unexpectedly ended: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(300)) => {}
         }
-    }).await.expect("the original writer must renew its expired lease before takeover");
+        assert!(
+            !release.is_closed(),
+            "metadata failure must retain the paused Put"
+        );
+        assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, charged);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut heartbeat => panic!("pending source heartbeat unexpectedly ended: {result:?}"),
+                _ = async {
+                    loop {
+                        let expiry: i64 = sqlx::query_scalar("SELECT lease_expires_at FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'writing'")
+                            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+                        if expiry > unix_millis() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                } => {}
+            }
+        }).await.expect("the original writer must renew its expired lease before takeover");
+    }
     assert!(
         !release.is_closed(),
         "renewal must keep the original Put alive"
@@ -1454,20 +1573,56 @@ async fn lost_source_writer_contract(database_url: String) {
     );
     sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
         .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
-    fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+    fixture.state.db = Database::connect_with_max(&database_url, 4)
+        .await
+        .unwrap()
+        .with_archive(fixture.state.archive.clone());
     assert!(fixture.state.archive.get(&locator).await.is_err());
-    fixture.assert_completed(true).await;
-    fixture
-        .state
-        .db
-        .complete_request_source(
-            fixture.identity,
-            &locator,
-            2,
-            *blake3::hash(b"{}").as_bytes(),
-            true,
-        )
-        .await;
+    let owner = fixture.claim().await;
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let skipped: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&skipped).unwrap()["session_body_skip"],
+        "session_body_skipped_missing_source"
+    );
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        observations, 0,
+        "an aborted original cannot become a fabricated training turn"
+    );
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_failed(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .record_request_source_state(
+                fixture.identity,
+                &locator,
+                2,
+                *blake3::hash(b"{}").as_bytes(),
+                Some(true),
+                false,
+            )
+            .await
+            .unwrap()
+    );
     let state: String =
         sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
             .bind(fixture.request_id.to_string())

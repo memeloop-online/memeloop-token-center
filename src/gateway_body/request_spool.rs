@@ -142,6 +142,44 @@ impl DurableRequestBodies {
         }
     }
 
+    async fn put_file(&self, key: &str, source: &LocalBodyFile) -> Result<(), ()> {
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::from_std(source.reopen().map_err(|_| ())?);
+        match self {
+            Self::Archive(archive) => {
+                let mut writer = archive.start_writer(key).await.map_err(|_| ())?;
+                let mut buffer = vec![0u8; REQUEST_SPOOL_CHUNK_BYTES];
+                loop {
+                    let length = match file.read(&mut buffer).await {
+                        Ok(length) => length,
+                        Err(_) => {
+                            let _ = writer.abort().await;
+                            return Err(());
+                        }
+                    };
+                    if length == 0 {
+                        break;
+                    }
+                    if writer
+                        .write(Bytes::copy_from_slice(&buffer[..length]))
+                        .await
+                        .is_err()
+                    {
+                        let _ = writer.abort().await;
+                        return Err(());
+                    }
+                }
+                writer.finish_staged().await.map(|_| ()).map_err(|_| ())
+            }
+            #[cfg(test)]
+            Self::Memory(_) => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes).await.map_err(|_| ())?;
+                self.put(key, Bytes::from(bytes)).await
+            }
+        }
+    }
+
     async fn delete(&self, key: &str) {
         match self {
             Self::Archive(archive) => {
@@ -157,15 +195,59 @@ impl DurableRequestBodies {
     }
 }
 
-enum SpillSink {
-    Archive(Box<crate::archive::ArchiveWriter>),
-    #[cfg(test)]
-    Memory(Vec<u8>),
+struct LocalBodyFile {
+    #[cfg(target_os = "linux")]
+    file: std::fs::File,
+    #[cfg(not(target_os = "linux"))]
+    file: tempfile::NamedTempFile,
+}
+
+impl LocalBodyFile {
+    fn new(directory: &std::path::Path) -> std::io::Result<Self> {
+        #[cfg(target_os = "linux")]
+        let file = tempfile::tempfile_in(directory)?;
+        #[cfg(not(target_os = "linux"))]
+        let file = tempfile::NamedTempFile::new_in(directory)?;
+        Ok(Self { file })
+    }
+
+    fn writer(&self) -> std::io::Result<std::fs::File> {
+        #[cfg(target_os = "linux")]
+        {
+            self.file.try_clone()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.file.reopen()
+        }
+    }
+
+    fn reopen(&self) -> std::io::Result<std::fs::File> {
+        // Reopen an owned descriptor, not a pathname supplied by a client.
+        // Each reader has an independent offset; the Linux file is anonymous
+        // so a killed gateway leaves no request-body orphan on its volume.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            std::fs::File::open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.file.reopen()
+        }
+    }
+}
+
+struct SpillSink {
+    owner: Arc<LocalBodyFile>,
+    file: tokio::fs::File,
 }
 
 struct CapturedBody {
     body: Option<Bytes>,
+    local: Option<Arc<LocalBodyFile>>,
     length: usize,
+    json_nodes: usize,
     digest: [u8; 32],
     metadata: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     frames: Vec<Arc<tokio::sync::OwnedSemaphorePermit>>,
@@ -234,13 +316,13 @@ impl RequestSpoolAdmission {
             sources.insert(request_id, Arc::downgrade(source));
         }
     }
-    pub(crate) fn has_durable_store(&self) -> bool {
-        self.usage.durable.is_some()
-    }
 
-    pub(crate) fn new(_directory: PathBuf) -> Self {
+    pub(crate) fn new(directory: PathBuf) -> Self {
         Self {
-            usage: Arc::new(RequestSpoolUsage::default()),
+            usage: Arc::new(RequestSpoolUsage {
+                directory,
+                ..RequestSpoolUsage::default()
+            }),
             #[cfg(test)]
             read_count: Arc::new(AtomicUsize::new(0)),
         }
@@ -284,10 +366,10 @@ impl RequestSpoolAdmission {
         body_key: Option<&str>,
     ) -> Result<RequestSpool, RequestSpoolCaptureError> {
         let durable = self.usage.durable.clone();
-        let object_key = durable.as_ref().and_then(|_| {
+        let object_key = {
             request_body_object_key(body_key.unwrap_or(""))
                 .or_else(|| request_body_object_key(&uuid::Uuid::now_v7().to_string()))
-        });
+        };
         let metadata_bytes = request_metadata_bytes
             .saturating_add(std::mem::size_of::<RequestSpool>())
             .saturating_add(std::mem::size_of::<Mutex<RequestSpoolLease>>())
@@ -304,9 +386,6 @@ impl RequestSpoolAdmission {
                     .map(Arc::new)
             });
         }
-        if memory.is_some() && metadata.is_none() && durable.is_none() {
-            return Err(RequestSpoolCaptureError::MemoryExhausted);
-        }
         let lease = Arc::new(Mutex::new(RequestSpoolLease::new(self.usage.clone())));
         if declared_content_length.is_some_and(|length| length > maximum) {
             return Err(RequestSpoolCaptureError::TooLarge);
@@ -322,10 +401,10 @@ impl RequestSpoolAdmission {
         let mut retained_frames = Vec::new();
         let mut length = 0_usize;
         let mut hasher = blake3::Hasher::new();
-        let mut spilling = memory.is_some() && metadata.is_none() && durable.is_some();
+        let mut json_scanner = super::memory::JsonMemoryScanner::default();
+        let mut spilling = memory.is_some() && metadata.is_none();
         let mut sink = if spilling {
-            let (store, key) = spill_target(&durable, &object_key)?;
-            Some(open_spill(store, key).await?)
+            Some(open_spill(&self.usage.directory).await?)
         } else {
             None
         };
@@ -362,12 +441,6 @@ impl RequestSpoolAdmission {
                     });
                 }
                 if frame_memory.is_none() && memory.is_some() {
-                    let Some(store) = durable.as_ref() else {
-                        return Err(RequestSpoolCaptureError::MemoryExhausted);
-                    };
-                    let Some(key) = object_key.as_deref() else {
-                        return Err(RequestSpoolCaptureError::Unavailable);
-                    };
                     spilling = true;
                     let prior = Bytes::from(std::mem::take(&mut retained));
                     retained_frames.clear();
@@ -375,7 +448,7 @@ impl RequestSpoolAdmission {
                     if let Ok(mut lease) = lease.lock() {
                         lease.release_all();
                     }
-                    sink = Some(open_spill(store, key).await?);
+                    sink = Some(open_spill(&self.usage.directory).await?);
                     if let Some(sink) = sink.as_mut() {
                         write_spill(sink, prior).await?;
                         write_spill(sink, chunk.clone()).await?;
@@ -394,33 +467,40 @@ impl RequestSpoolAdmission {
                 write_spill(sink, chunk.clone()).await?;
             }
             hasher.update(&chunk);
+            json_scanner.observe(&chunk);
             length = next;
         }
         let digest = *hasher.finalize().as_bytes();
         if spilling {
-            let (store, key) = spill_target(&durable, &object_key)?;
             let Some(sink) = sink.take() else {
                 return Err(RequestSpoolCaptureError::Unavailable);
             };
-            finish_spill(store, key, sink).await?;
-            return Ok(self.finished_spool(CapturedBody {
-                body: None,
-                length,
-                digest,
-                metadata: None,
-                frames: Vec::new(),
-                lease,
-                durable,
-                object_key,
-                durable_settled: true,
-            }));
+            let local = finish_spill(sink).await?;
+            let publish = durable.is_some();
+            return Ok(self
+                .finished_spool(CapturedBody {
+                    body: None,
+                    local: Some(local),
+                    length,
+                    json_nodes: json_scanner.observe(&[]),
+                    digest,
+                    metadata: None,
+                    frames: Vec::new(),
+                    lease,
+                    durable,
+                    object_key,
+                    durable_settled: !publish,
+                })
+                .arm());
         }
         let retained = Bytes::from(retained);
         let publish = durable.is_some() && object_key.is_some();
         Ok(self
             .finished_spool(CapturedBody {
                 body: Some(retained),
+                local: None,
                 length,
+                json_nodes: json_scanner.observe(&[]),
                 digest,
                 metadata,
                 frames: retained_frames,
@@ -433,10 +513,13 @@ impl RequestSpoolAdmission {
     }
 
     fn finished_spool(&self, captured: CapturedBody) -> RequestSpool {
+        let durable_ok = captured.durable_settled && captured.durable.is_some();
         RequestSpool {
             shared: Arc::new(SharedBody {
                 body: Mutex::new(captured.body),
+                local: captured.local,
                 length: captured.length,
+                json_nodes: captured.json_nodes,
                 digest: captured.digest,
                 residency: Arc::new(BodyResidency {
                     frames: Mutex::new(captured.frames),
@@ -447,8 +530,8 @@ impl RequestSpoolAdmission {
                 lease: captured.lease,
                 durable: captured.durable,
                 object_key: captured.object_key,
-                durable_ok: Arc::new(AtomicBool::new(captured.durable_settled)),
-                durable_phase: Arc::new(AtomicU8::new(if captured.durable_settled {
+                durable_ok: Arc::new(AtomicBool::new(durable_ok)),
+                durable_phase: Arc::new(AtomicU8::new(if durable_ok {
                     DURABLE_COMMITTED
                 } else {
                     DURABLE_IN_FLIGHT
@@ -456,7 +539,7 @@ impl RequestSpoolAdmission {
                 durable_write: Mutex::new(None),
                 archived: AtomicBool::new(false),
                 outcome: tokio::sync::watch::channel(if captured.durable_settled {
-                    Some(true)
+                    Some(durable_ok)
                 } else {
                     None
                 })
@@ -489,6 +572,7 @@ pub(crate) struct RequestSpoolSnapshot {
 
 #[derive(Default)]
 struct RequestSpoolUsage {
+    directory: PathBuf,
     uploads: Arc<crate::proxy_lifecycle::ProxyLifecycleCounter>,
     used_bytes: AtomicUsize,
     active_files: AtomicUsize,
@@ -553,7 +637,9 @@ impl Drop for RequestSpoolLease {
 
 struct SharedBody {
     body: Mutex<Option<Bytes>>,
+    local: Option<Arc<LocalBodyFile>>,
     length: usize,
+    json_nodes: usize,
     digest: [u8; 32],
     residency: Arc<BodyResidency>,
     lease: Arc<Mutex<RequestSpoolLease>>,
@@ -624,6 +710,7 @@ impl RequestSpool {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn shared_bytes(self: &Arc<Self>, bytes: Bytes) -> Bytes {
         struct BodySource {
             bytes: Bytes,
@@ -641,6 +728,122 @@ impl RequestSpool {
     }
     pub(crate) fn len(&self) -> usize {
         self.shared.length
+    }
+
+    pub(crate) fn json_nodes(&self) -> usize {
+        self.shared.json_nodes
+    }
+
+    pub(crate) fn reclaim_for(&self, mut reserve: impl FnMut() -> bool) -> bool {
+        let usage = self
+            .shared
+            .lease
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .usage
+            .clone();
+        loop {
+            if reserve() {
+                return true;
+            }
+            if !evict_oldest_settled(&usage) {
+                return false;
+            }
+        }
+    }
+
+    pub(crate) async fn open_stream(
+        &self,
+    ) -> Result<crate::archive::ArchiveDownload, RequestSpoolReadError> {
+        #[cfg(test)]
+        self.read_count.fetch_add(1, Ordering::AcqRel);
+        let resident = self
+            .shared
+            .body
+            .lock()
+            .map_err(|_| RequestSpoolReadError)?
+            .clone();
+        let download = if let Some(body) = resident {
+            crate::archive::ArchiveDownload {
+                object_size: self.len() as u64,
+                range: 0..self.len() as u64,
+                stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+            }
+        } else if let Some(local) = &self.shared.local {
+            let file =
+                tokio::fs::File::from_std(local.reopen().map_err(|_| RequestSpoolReadError)?);
+            crate::archive::ArchiveDownload {
+                object_size: self.len() as u64,
+                range: 0..self.len() as u64,
+                stream: Box::pin(futures_util::stream::try_unfold(
+                    file,
+                    |mut file| async move {
+                        use tokio::io::AsyncReadExt;
+                        let mut chunk = vec![0; 64 * 1024];
+                        let count = file.read(&mut chunk).await?;
+                        if count == 0 {
+                            return Ok::<_, std::io::Error>(None);
+                        }
+                        chunk.truncate(count);
+                        Ok(Some((Bytes::from(chunk), file)))
+                    },
+                )),
+            }
+        } else {
+            if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
+                return Err(RequestSpoolReadError);
+            }
+            let key = self.object_locator().ok_or(RequestSpoolReadError)?;
+            match self.shared.durable.as_ref().ok_or(RequestSpoolReadError)? {
+                DurableRequestBodies::Archive(archive) => archive
+                    .open_stream(key, None)
+                    .await
+                    .map_err(|_| RequestSpoolReadError)?,
+                #[cfg(test)]
+                store @ DurableRequestBodies::Memory(_) => {
+                    let body = store
+                        .get(key, self.len())
+                        .await
+                        .map_err(|_| RequestSpoolReadError)?;
+                    crate::archive::ArchiveDownload {
+                        object_size: self.len() as u64,
+                        range: 0..self.len() as u64,
+                        stream: Box::pin(futures_util::stream::once(async move { Ok(body) })),
+                    }
+                }
+            }
+        };
+        if download.object_size != self.len() as u64 {
+            return Err(RequestSpoolReadError);
+        }
+        let expected = self.shared.digest;
+        let length = self.len();
+        let stream = futures_util::stream::unfold(
+            (download.stream, blake3::Hasher::new(), 0usize, false),
+            move |(mut stream, mut hasher, mut bytes, done)| async move {
+                if done {
+                    return None;
+                }
+                let invalid = || std::io::Error::other("request source integrity failed");
+                let chunk = match stream.next().await {
+                    Some(Ok(chunk)) if chunk.len() <= length.saturating_sub(bytes) => {
+                        bytes += chunk.len();
+                        hasher.update(&chunk);
+                        Ok(chunk)
+                    }
+                    None if bytes == length && hasher.finalize().as_bytes() == &expected => {
+                        return None;
+                    }
+                    _ => return Some((Err(invalid()), (stream, hasher, bytes, true))),
+                };
+                Some((chunk, (stream, hasher, bytes, false)))
+            },
+        );
+        Ok(crate::archive::ArchiveDownload {
+            object_size: length as u64,
+            range: 0..length as u64,
+            stream: Box::pin(stream.fuse()),
+        })
     }
 
     #[cfg(test)]
@@ -699,6 +902,16 @@ impl RequestSpool {
             .clone();
         if let Some(body) = resident {
             return verified_body(&self.shared, body);
+        }
+        if let Some(local) = &self.shared.local {
+            use tokio::io::AsyncReadExt;
+            let mut file =
+                tokio::fs::File::from_std(local.reopen().map_err(|_| RequestSpoolReadError)?);
+            let mut body = Vec::with_capacity(self.len());
+            file.read_to_end(&mut body)
+                .await
+                .map_err(|_| RequestSpoolReadError)?;
+            return verified_body(&self.shared, Bytes::from(body));
         }
         if !self.shared.durable_ok.load(Ordering::Acquire) && !self.upload_outcome().await {
             return Err(RequestSpoolReadError);
@@ -766,6 +979,7 @@ impl Drop for RequestSpool {
     }
 }
 
+#[cfg(test)]
 fn verified_body(shared: &SharedBody, body: Bytes) -> Result<Bytes, RequestSpoolReadError> {
     if body.len() != shared.length || *blake3::hash(&body).as_bytes() != shared.digest {
         return Err(RequestSpoolReadError);
@@ -828,14 +1042,15 @@ fn publish_durable(shared: &Arc<SharedBody>) {
     let Some(key) = shared.object_key.clone() else {
         return;
     };
-    let Some(bytes) = shared
+    let bytes = shared
         .body
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .clone()
-    else {
+        .clone();
+    let local = shared.local.clone();
+    if bytes.is_none() && local.is_none() {
         return;
-    };
+    }
     let ok = Arc::clone(&shared.durable_ok);
     let phase = Arc::clone(&shared.durable_phase);
     let residency = shared.residency.clone();
@@ -854,7 +1069,12 @@ fn publish_durable(shared: &Arc<SharedBody>) {
         let upload = async {
             let retry_upload = async {
                 loop {
-                    if store.put(&key, bytes.clone()).await.is_ok() {
+                    let result = match (&bytes, &local) {
+                        (Some(bytes), _) => store.put(&key, bytes.clone()).await,
+                        (_, Some(local)) => store.put_file(&key, local).await,
+                        _ => Err(()),
+                    };
+                    if result.is_ok() {
                         break true;
                     }
                     if source.source_dropped.load(Ordering::Acquire)
@@ -930,6 +1150,16 @@ fn publish_durable(shared: &Arc<SharedBody>) {
                                 break false;
                             }
                         };
+                        if success {
+                            database
+                                .publish_request_source(
+                                    identity,
+                                    &key,
+                                    source.length,
+                                    source.digest,
+                                )
+                                .await;
+                        }
                         let permit = if success {
                             database.try_request_source_completion()
                         } else {
@@ -987,77 +1217,48 @@ fn publish_durable(shared: &Arc<SharedBody>) {
         .unwrap_or_else(|error| error.into_inner()) = Some(handle);
 }
 
-fn spill_target<'a>(
-    durable: &'a Option<DurableRequestBodies>,
-    object_key: &'a Option<String>,
-) -> Result<(&'a DurableRequestBodies, &'a str), RequestSpoolCaptureError> {
-    match (durable.as_ref(), object_key.as_deref()) {
-        (Some(store), Some(key)) => Ok((store, key)),
-        _ => Err(RequestSpoolCaptureError::Unavailable),
-    }
-}
-
-async fn open_spill(
-    durable: &DurableRequestBodies,
-    key: &str,
-) -> Result<SpillSink, RequestSpoolCaptureError> {
-    match durable {
-        DurableRequestBodies::Archive(archive) => archive
-            .start_writer(key)
-            .await
-            .map(|writer| SpillSink::Archive(Box::new(writer)))
-            .map_err(|_| RequestSpoolCaptureError::Unavailable),
-        #[cfg(test)]
-        DurableRequestBodies::Memory(_) => Ok(SpillSink::Memory(Vec::new())),
-    }
+async fn open_spill(directory: &std::path::Path) -> Result<SpillSink, RequestSpoolCaptureError> {
+    tokio::fs::create_dir_all(directory)
+        .await
+        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+    let owner =
+        Arc::new(LocalBodyFile::new(directory).map_err(|_| RequestSpoolCaptureError::Unavailable)?);
+    let mut file = tokio::fs::File::from_std(
+        owner
+            .writer()
+            .map_err(|_| RequestSpoolCaptureError::Unavailable)?,
+    );
+    file.set_max_buf_size(REQUEST_SPOOL_CHUNK_BYTES);
+    Ok(SpillSink { owner, file })
 }
 
 async fn write_spill(sink: &mut SpillSink, bytes: Bytes) -> Result<(), RequestSpoolCaptureError> {
-    match sink {
-        SpillSink::Archive(writer) => writer
-            .write(bytes)
+    use tokio::io::AsyncWriteExt;
+    for chunk in bytes.chunks(REQUEST_SPOOL_CHUNK_BYTES) {
+        sink.file
+            .write_all(chunk)
             .await
-            .map_err(|_| RequestSpoolCaptureError::Unavailable),
-        #[cfg(test)]
-        SpillSink::Memory(buffered) => {
-            buffered.extend_from_slice(&bytes);
-            Ok(())
-        }
+            .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
     }
+    Ok(())
 }
 
-async fn finish_spill(
-    durable: &DurableRequestBodies,
-    key: &str,
-    sink: SpillSink,
-) -> Result<(), RequestSpoolCaptureError> {
-    match sink {
-        SpillSink::Archive(writer) => {
-            let _staged = (*writer)
-                .finish_staged()
-                .await
-                .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
-            let _ = (durable, key);
-            Ok(())
-        }
-        #[cfg(test)]
-        SpillSink::Memory(buffered) => durable
-            .put(key, Bytes::from(buffered))
-            .await
-            .map_err(|_| RequestSpoolCaptureError::Unavailable),
-    }
+async fn finish_spill(mut sink: SpillSink) -> Result<Arc<LocalBodyFile>, RequestSpoolCaptureError> {
+    use tokio::io::AsyncWriteExt;
+    sink.file
+        .flush()
+        .await
+        .map_err(|_| RequestSpoolCaptureError::Unavailable)?;
+    Ok(sink.owner)
 }
 
 async fn abort_spill(sink: Option<SpillSink>) {
-    if let Some(SpillSink::Archive(writer)) = sink {
-        let _ = (*writer).abort().await;
-    }
+    drop(sink);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestSpoolCaptureError {
     TooLarge,
-    MemoryExhausted,
     BodyReadRejected,
     Unavailable,
 }
@@ -1170,6 +1371,85 @@ mod tests {
         let restarted = RequestSpoolAdmission::new(path.clone());
         assert_eq!(restarted.snapshot().used_bytes, 0);
         assert_eq!(file_count(&path), 0);
+    }
+
+    #[tokio::test]
+    async fn local_spill_forwards_complete_body_without_an_archive_backend() {
+        let directory = tempfile::tempdir().unwrap();
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned());
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(64 * 1024);
+        let memory = budget.reservation();
+        let body = Bytes::from(vec![b'x'; 512 * 1024]);
+        let spool = admission
+            .capture_with_memory(
+                Body::from(body.clone()),
+                usize::MAX,
+                Some(body.len()),
+                Some(&memory),
+                0,
+                Some("11111111-1111-4111-8111-111111111111"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spool.read_all().await.unwrap(), body);
+        assert!(spool.object_locator().is_some());
+        assert!(
+            !spool.upload_outcome().await,
+            "local transport is not a durable archive receipt"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            file_count(directory.path()),
+            0,
+            "anonymous file cannot survive a process crash"
+        );
+        drop(spool);
+        assert_eq!(admission.snapshot().active_files, 0);
+        assert_eq!(budget.snapshot().0, 0);
+    }
+
+    #[tokio::test]
+    async fn failed_archive_upload_does_not_block_local_spill_replay() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = MemoryObjectStore::new();
+        store.fail_writes.store(true, Ordering::Release);
+        let admission = RequestSpoolAdmission::new(directory.path().to_owned())
+            .with_memory_store(store.clone());
+        let budget = crate::gateway_body::memory::ProxyMemoryBudget::new(64 * 1024);
+        let memory = budget.reservation();
+        let body = Bytes::from(vec![b'z'; 512 * 1024]);
+        let spool = admission
+            .capture_with_memory(
+                Body::from(body.clone()),
+                usize::MAX,
+                Some(body.len()),
+                Some(&memory),
+                0,
+                Some("22222222-2222-4222-8222-222222222222"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(spool.read_all().await.unwrap(), body);
+        assert!(!spool.shared.durable_ok.load(Ordering::Acquire));
+        store.fail_writes.store(false, Ordering::Release);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), spool.upload_outcome())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .objects
+                .lock()
+                .unwrap()
+                .get(spool.object_locator().unwrap()),
+            Some(&body)
+        );
+        assert_eq!(
+            spool.read_all().await.unwrap(),
+            body,
+            "archive and forwarding readers have independent offsets"
+        );
     }
 
     #[tokio::test]
@@ -1372,10 +1652,12 @@ mod tests {
             .unwrap();
         assert_eq!(newest.read_all().await.unwrap(), second);
         let reads_after_spill = store.reads.load(Ordering::Acquire);
-        assert!(
-            reads_after_spill >= 1,
-            "the new body was not kept in memory"
+        assert_eq!(
+            reads_after_spill, 0,
+            "local replay must not wait for an archive download"
         );
+        assert!(newest.shared.body.lock().unwrap().is_none());
+        assert!(newest.shared.local.is_some());
         assert_eq!(oldest.read_all().await.unwrap(), first);
         assert_eq!(store.reads.load(Ordering::Acquire), reads_after_spill);
         let _ = release.send(());
