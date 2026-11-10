@@ -1106,6 +1106,7 @@ export interface PluginConfiguration {
 }
 
 export interface UpstreamAccount {
+  oauth_refresh?: import('./operator/providerAccountState').OAuthRefreshStatus | null;
   can_update_transport_proxy?: boolean;
   has_proxy?: boolean;
   proxy_scheme?: 'socks5' | 'socks5h' | null;

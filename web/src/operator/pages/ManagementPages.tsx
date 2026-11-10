@@ -427,13 +427,29 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
     window.location.assign(appHref('operator', 'routes'));
   };
 
+  function oauthAction(value: UpstreamAccount): 'refresh' | 'resume_local' | undefined {
+    if (value.auth_kind !== 'oauth') return undefined;
+    const actions = providerAccountStatus(value, accountStatusNow).allowedActions;
+    if (actions) return actions.includes('resume_local') ? 'resume_local' : actions.includes('refresh') ? 'refresh' : undefined;
+    return value.can_refresh ? 'refresh' : undefined;
+  }
+
+  async function checkAuthorization(value: UpstreamAccount) {
+    if (!canManage(value) || busy) return;
+    setBusy(`authorization-${value.id}`); setError(''); setMessage('');
+    try { await onChanged(); setMessage(connectionCopy.authorizationChecked); }
+    catch (reason) { setError(messageOf(reason, t('common.requestFailed'))); }
+    finally { setBusy(''); }
+  }
+
   async function refreshOAuth(value: UpstreamAccount) {
-    if (!canManage(value)) return;
+    const action = oauthAction(value);
+    if (!canManage(value) || !action || busy) return;
     setBusy(`refresh-${value.id}`);
     setError(''); setMessage('');
     try {
-      await api(`/internal/v1/upstreams/${value.id}/oauth/refresh`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } });
-      setMessage(t('providers.refreshed', { name: value.name }));
+      await api(`/internal/v1/upstreams/${encodeURIComponent(value.id)}/oauth/${action === 'resume_local' ? 'recover' : 'refresh'}`, token, { method: 'POST', headers: { 'Idempotency-Key': crypto.randomUUID() } });
+      setMessage(action === 'resume_local' ? connectionCopy.authorizationRecovered : t('providers.refreshed', { name: value.name }));
       await onChanged();
     } catch (reason) { if (!(reason instanceof AccountListRefreshError)) setError(messageOf(reason, t('common.requestFailed'))); }
     finally { setBusy(''); }
@@ -543,6 +559,7 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
       {proxyEditorOpen && <p role="status">{t('connection.finishProxyFirst')}</p>}
     </>,
     providerAuthentication: <FormSection title={connectionCopy.authentication}>
+      <ProviderAccountStatus account={editing} credential />
       <span>{editProvider?.display_name ?? t('providerDirectory.other')} · {editing.auth_kind === 'oauth' ? t('providers.oauth') : enumLabel(t, 'auth', editing.connection_method)}</span>
       <div className="row-actions">
         {canReauthorizeAccount(editing, providers.find(provider => provider.id === editing.driver)) && <Button data-reauthorization-trigger={editing.id} appearance="secondary" type="button" disabled={Boolean(busy) || proxyEditorOpen} onClick={() => void leaveProviderSettings(() => openReauthorization(editing))}>{editing.driver === 'kimi-oauth' ? connectionCopy.signInAgain : t('providers.reauthorize')}</Button>}
@@ -615,7 +632,8 @@ function UpstreamProviders({ renderResetSettings, token, tenant, writeTenant = t
             <section aria-label={t('connection.manageAccount')}><h3>{t('connection.manageAccount')}</h3><div className="row-actions">
               {providerAvailable && <>
                 <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkHealth(value)}>{t('providers.runManualHealthCheck')}</Button>
-                {value.can_refresh && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void refreshOAuth(value)}>{t('providers.refreshAuthorization')}</Button>}
+                {value.auth_kind === 'oauth' && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void checkAuthorization(value)}>{connectionCopy.checkAuthorization}</Button>}
+                {oauthAction(value) && <Button appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => void refreshOAuth(value)}>{oauthAction(value) === 'resume_local' ? connectionCopy.resumeAuthorization : t('providers.refreshAuthorization')}</Button>}
                 {!needsReauthorization && canReauthorizeAccount(value, providers.find(provider => provider.id === value.driver)) && <Button data-reauthorization-trigger={value.id} appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openReauthorization(value)}>{value.driver === 'kimi-oauth' ? connectionCopy.signInAgain : t('providers.reauthorize')}</Button>}
                 {value.can_rotate && <Button data-rotation-trigger={value.id} appearance="secondary" type="button" disabled={!manageable || Boolean(busy) || proxyEditorOpen} onClick={() => openRotation(value)}>{t('providers.rotateCredential')}</Button>}
               </>}

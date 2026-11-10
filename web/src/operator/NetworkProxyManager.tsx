@@ -10,11 +10,12 @@ import { ProxyAddressInput } from './TransportProxyGroupManager';
 import {
   networkProxyAddressValid, networkProxyError, networkProxyLiveConcurrency, networkProxyObservationsPath,
   networkProxiesPath, networkProxySelectionPath, networkProxyStrategiesPath, upstreamConcurrencyPath,
-  type NetworkProxy, type NetworkProxyObservations, type NetworkProxySelection, type NetworkProxyStrategy,
+  type AccountProxyConnection, type NetworkProxy, type NetworkProxyObservations, type NetworkProxySelection, type NetworkProxyStrategy,
   type UpstreamConcurrencySnapshot,
 } from './NetworkProxies';
 import { networkProxyCopy } from './NetworkProxyCopy';
 import { transportProxyFailureKind, transportProxyGroupsPath, transportProxyRequest, type TransportProxyGroup } from './transportProxyGroups';
+import { useNavigationGuard } from '../app/NavigationGuard';
 import './requestEgress.css';
 
 interface WorkspaceProps {
@@ -408,7 +409,10 @@ function policyDraft(selection: NetworkProxySelection, strategies: NetworkProxyS
   };
 }
 
-export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsState = 'ready', initialAccountId, onChanged, closeRequest }: WorkspaceProps & {
+export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsState = 'ready', initialAccountId, onChanged, closeRequest, embedded = false, disabled = false, onEditingChange }: WorkspaceProps & {
+  embedded?: boolean;
+  disabled?: boolean;
+  onEditingChange?: (editing: boolean) => void;
   accounts: UpstreamAccount[];
   accountsState?: 'loading' | 'failed' | 'ready';
 }) {
@@ -423,6 +427,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   const [strategies, setStrategies] = useState<NetworkProxyStrategy[]>([]);
   const [accountId, setAccountId] = useState(() => eligibleAccounts.find(account => account.id === initialAccountId)?.id ?? '');
   const [selection, setSelection] = useState<NetworkProxySelection>();
+  const [effective, setEffective] = useState<AccountProxyConnection>();
   const [draft, setDraft] = useState<PolicyDraft>(emptyPolicyDraft);
   const [dirty, setDirty] = useState(false);
   const [ready, setReady] = useState(false);
@@ -435,6 +440,13 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   const pendingWrite = useRef<AbortController | null>(null);
   const feedback = useRef<HTMLDivElement>(null);
   const query = `?${new URLSearchParams({ tenant_external_id: tenant })}`;
+  const effectiveAddress = (() => {
+    if (!effective?.proxy_url) return copy.directExit;
+    try {
+      const url = new URL(effective.proxy_url);
+      return egressAddress({ scheme: url.protocol.slice(0, -1), host: url.hostname, port: Number(url.port) }, locale);
+    } catch { return copy.unknownSource; }
+  })();
   const strategy = strategyFor(strategies, draft.mode, draft.pluginKey);
   const properties = strategyProperties(strategy);
   const useJson = !scalarStrategy(strategy);
@@ -445,6 +457,12 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   const request = <Result,>(path: string, init: RequestInit = {}) => transportProxyRequest<Result>(path, token, {
     ...init, signal: pendingWrite.current?.signal,
   });
+
+  useNavigationGuard(async () => !embedded || await requestClose());
+  useLayoutEffect(() => {
+    onEditingChange?.(dirty || busy);
+    return () => onEditingChange?.(false);
+  }, [dirty, busy, onEditingChange]);
 
   function changeDraft(change: Partial<PolicyDraft>) {
     setDraft(current => ({ ...current, ...change }));
@@ -489,29 +507,40 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   }, [dirty]);
 
   function clearRestrictedState() {
-    setProxies([]); setGroups([]); setStrategies([]); setSelection(undefined); setDraft(emptyPolicyDraft()); setDirty(false); setAccountId('');
+    setProxies([]); setGroups([]); setStrategies([]); setEffective(undefined); setSelection(undefined); setDraft(emptyPolicyDraft()); setDirty(false); setAccountId('');
+  }
+
+  async function readEffective(id: string) {
+    if (!id) return undefined;
+    const connection = await request<AccountProxyConnection>(`/internal/v1/upstreams/${encodeURIComponent(id)}/transport-proxy${query}`);
+    if (connection.account_id !== id) throw new Error(copy.errors.load);
+    return connection;
   }
 
   async function readSelection(id: string): Promise<NetworkProxySelection | undefined> {
     if (!id) return undefined;
-    return request<NetworkProxySelection>(`${networkProxySelectionPath(id)}${query}`);
+    const selection = await request<NetworkProxySelection>(`${networkProxySelectionPath(id)}${query}`);
+    if (selection.account_id !== id || !selection.desired || typeof selection.desired.mode !== 'string') throw new Error(copy.errors.load);
+    return selection;
   }
 
   async function refresh() {
     if (locked.current) return;
     locked.current = true;
     const revision = ++readRevision.current;
-    setBusy(true); setReady(false); setError(''); setMessage(''); setSelection(undefined); setDirty(false);
+    setBusy(true); setReady(false); setError(''); setMessage(''); setSelection(undefined); setEffective(undefined); setDirty(false);
     try {
       const [proxyList, groupList, strategyList] = await Promise.all([
         request<{ items: NetworkProxy[] }>(`${networkProxiesPath}${query}`),
         request<{ items: TransportProxyGroup[] }>(`${transportProxyGroupsPath}${query}`),
         request<{ items: NetworkProxyStrategy[] }>(`${networkProxyStrategiesPath}${query}`),
       ]);
-      const current = await readSelection(accountId);
+      if (![proxyList.items, groupList.items, strategyList.items].every(Array.isArray)) throw new Error(copy.errors.load);
+      const [current, currentEffective] = await Promise.all([readSelection(accountId), readEffective(accountId)]);
       if (!alive.current || revision !== readRevision.current) return;
+      if (current && currentEffective && current.credential_generation !== currentEffective.credential_generation) throw new Error(copy.errors.selectionConflict);
       setProxies(proxyList.items); setGroups(groupList.items); setStrategies(strategyList.items);
-      setSelection(current); setDraft(current ? policyDraft(current, strategyList.items) : emptyPolicyDraft());
+      setEffective(currentEffective); setSelection(current); setDraft(current ? policyDraft(current, strategyList.items) : emptyPolicyDraft());
       setReady(true);
       if (failureKind === 'unknown') setMessage(copy.refreshedUnknown);
       setFailureKind(undefined);
@@ -527,11 +556,12 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
     if (locked.current || dirty && !await confirm(copy.switchAccountDraft)) return;
     locked.current = true;
     const revision = ++readRevision.current;
-    setAccountId(id); setSelection(undefined); setDraft(emptyPolicyDraft()); setDirty(false); setBusy(true); setError(''); setMessage('');
+    setAccountId(id); setSelection(undefined); setEffective(undefined); setDraft(emptyPolicyDraft()); setDirty(false); setBusy(true); setError(''); setMessage('');
     try {
-      const current = await readSelection(id);
+      const [current, currentEffective] = await Promise.all([readSelection(id), readEffective(id)]);
       if (!alive.current || revision !== readRevision.current) return;
-      setSelection(current); setDraft(current ? policyDraft(current, strategies) : emptyPolicyDraft()); setReady(true);
+      if (current && currentEffective && current.credential_generation !== currentEffective.credential_generation) throw new Error(copy.errors.selectionConflict);
+      setEffective(currentEffective); setSelection(current); setDraft(current ? policyDraft(current, strategies) : emptyPolicyDraft()); setReady(true);
     } catch (reason) {
       if (alive.current && revision === readRevision.current) {
         setError(networkProxyError(reason, locale, 'read')); setReady(false);
@@ -566,7 +596,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   }
 
   async function savePolicy() {
-    if (!selection || locked.current || !ready || !validDraft) return;
+    if (!selection || disabled || locked.current || !ready || !validDraft) return;
     const config = draftConfig();
     if (!config) { setError(copy.configInvalid); return; }
     const base = {
@@ -587,7 +617,9 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
     try {
       const saved = await request<NetworkProxySelection>(networkProxySelectionPath(selection.account_id), { method: 'PUT', body: JSON.stringify(body) });
       if (!alive.current) return;
-      setSelection(saved); setDraft(policyDraft(saved, strategies)); setDirty(false); setMessage(copy.policySaved);
+      setSelection(saved); setEffective(undefined); setDraft(policyDraft(saved, strategies)); setDirty(false); setMessage(copy.policySaved);
+      try { const current = await readEffective(saved.account_id); if (current?.credential_generation !== saved.credential_generation) throw new Error(); if (alive.current) setEffective(current); }
+      catch { if (alive.current) setError(copy.accountRefreshFailed); }
       void onChanged().catch(() => { if (alive.current) setError(copy.accountRefreshFailed); });
     } catch (reason) {
       if (alive.current) {
@@ -600,7 +632,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
 
   return <div className="transport-proxy-workspace network-proxy-policy-workspace">
     {confirmationDialog}
-    <p>{copy.policyHint}</p>
+    {!embedded && <p>{copy.policyHint}</p>}
     <div className="button-row"><Button type="button" disabled={busy} onClick={async () => {
       if (dirty && !await confirm(copy.refreshDraft)) return;
       void refresh();
@@ -614,42 +646,43 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
       {accountsState === 'loading' ? <LoadingState label={t('common.loading')} variant="compact" />
         : accountsState === 'failed' ? null
         : eligibleAccounts.length === 0 ? <p>{copy.noAccounts}</p> : <>
-          <Field label={copy.account} required><Select value={accountId} disabled={busy || !ready} onChange={event => void selectAccount(event.target.value)}>
-            <option value="">{copy.selectAccount}</option>
-            {eligibleAccounts.map(account => <option key={account.id} value={account.id}>{account.name}</option>)}
-          </Select></Field>
+          {!embedded && <div className="network-proxy-account-list" aria-label={copy.account}>{eligibleAccounts.map(account => <Button key={account.id} type="button" appearance={account.id === accountId ? 'primary' : 'secondary'} aria-pressed={account.id === accountId} disabled={disabled || busy || !ready} onClick={() => void selectAccount(account.id)}>{account.name}</Button>)}</div>}
           {accountId && busy && !selection && <LoadingState label={copy.loadingPolicy} variant="compact" />}
           {selection && <>
-            <p>{copy.currentPolicy}: {copy.modes[selection.desired.mode] ?? copy.policyLegacy}{selection.applied?.pending ? ` · ${copy.appliedPending}` : ''}</p>
-            <Field label={copy.mode} required><Select value={draft.mode} disabled={busy || !ready} onChange={event => changeStrategy(event.target.value)}>
+            <dl className="network-proxy-policy-summary">
+              <div><dt>{copy.currentPolicy}</dt><dd><DetailTooltip content={`${copy.effectiveSource}: ${effective?.source === 'credential' ? copy.credentialSource : effective?.source ? copy.modes[effective.source] ?? copy.unknownSource : copy.unknownSource}`}><span tabIndex={0}>{copy.modes[selection.desired.mode] ?? copy.policyLegacy}</span></DetailTooltip></dd></div>
+              <div><dt>{copy.effectiveExit}</dt><dd>{effective ? proxies.find(proxy => proxy.id === effective.proxy_id)?.name ?? groups.flatMap(group => group.members).find(member => member.id === effective.selected_member_id)?.label ?? effectiveAddress : copy.unknownSource}</dd></div>
+              <div><dt>{copy.appliedStatus}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective?.configuration_state === 'applied' ? copy.appliedReady : effective?.configuration_state === 'credential' ? copy.credentialSource : copy.appliedUnknown}</dd></div>
+            </dl>
+            <Field label={copy.mode} required><Select value={draft.mode} disabled={disabled || busy || !ready} onChange={event => changeStrategy(event.target.value)}>
               <option value="manual">{copy.modes.manual}</option><option value="auto">{copy.modes.auto}</option>
               {(plugins.length > 0 || selection.desired.mode === 'plugin') && <option value="plugin">{copy.modes.plugin}</option>}
             </Select></Field>
-            {draft.mode === 'manual' ? <Field label={copy.targetProxy} required><Select value={draft.proxyId} disabled={busy || !ready}
+            {draft.mode === 'manual' ? <Field label={copy.targetProxy} required><Select value={draft.proxyId} disabled={disabled || busy || !ready}
               onChange={event => changeDraft({ proxyId: event.target.value })}>
               <option value="">{copy.selectProxy}</option>{proxies.map(proxy => <option key={proxy.id} value={proxy.id}>{proxy.name}</option>)}
             </Select></Field> : <>
-              <Field label={copy.targetGroup} required><Select value={draft.groupId} disabled={busy || !ready}
+              <Field label={copy.targetGroup} required><Select value={draft.groupId} disabled={disabled || busy || !ready}
                 onChange={event => changeDraft({ groupId: event.target.value })}>
                 <option value="">{copy.selectGroup}</option>{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
               </Select></Field>
-              {draft.mode === 'plugin' && <Field label={copy.strategy} required><Select value={draft.pluginKey} disabled={busy || !ready}
+              {draft.mode === 'plugin' && <Field label={copy.strategy} required><Select value={draft.pluginKey} disabled={disabled || busy || !ready}
                 onChange={event => changeStrategy('plugin', event.target.value)}>
                 <option value="">{copy.selectStrategy}</option>{plugins.map(item => <option key={`${item.id}\0${item.version}`} value={`${item.id}\0${item.version}`}>{item.id} · {item.version}</option>)}
               </Select></Field>}
               {(draft.mode === 'auto' || draft.mode === 'plugin' && strategy) && <FormSection title={copy.strategyConfig}>
                 {useJson ? <>
                   <p className="muted">{copy.configUnsupported}</p>
-                  <Textarea rows={10} value={draft.configText} disabled={busy || !ready} onChange={(_, data) => changeDraft({ configText: data.value })} />
+                  <Textarea rows={10} value={draft.configText} disabled={disabled || busy || !ready} onChange={(_, data) => changeDraft({ configText: data.value })} />
                 </> : Object.entries(properties).map(([key, property]) => property.type === 'boolean'
-                  ? <Checkbox key={key} label={key} checked={draft.fields[key] === true} disabled={busy || !ready}
+                  ? <Checkbox key={key} label={key} checked={draft.fields[key] === true} disabled={disabled || busy || !ready}
                     onChange={(_, data) => changeDraft({ fields: { ...draft.fields, [key]: data.checked === true } })} />
                   : <Field key={key} label={key} required><Input type={property.type === 'string' ? 'text' : 'number'} value={String(draft.fields[key] ?? '')}
-                    min={property.minimum} max={property.maximum} maxLength={property.maxLength} step={property.type === 'integer' ? 1 : 'any'} disabled={busy || !ready}
+                    min={property.minimum} max={property.maximum} maxLength={property.maxLength} step={property.type === 'integer' ? 1 : 'any'} disabled={disabled || busy || !ready}
                     onChange={(_, data) => changeDraft({ fields: { ...draft.fields, [key]: data.value } })} /></Field>)}
               </FormSection>}
             </>}
-            <div className="button-row"><Button appearance="primary" type="button" disabled={busy || !ready || !validDraft} onClick={() => void savePolicy()}>{copy.savePolicy}</Button></div>
+            <div className="button-row">{dirty && <Button appearance="secondary" type="button" disabled={busy} onClick={() => { setDraft(policyDraft(selection, strategies)); setDirty(false); setError(''); setMessage(''); }}>{copy.cancelPolicy}</Button>}<Button appearance="primary" type="button" disabled={disabled || busy || !ready || !dirty || !validDraft} onClick={() => void savePolicy()}>{copy.savePolicy}</Button></div>
           </>}
         </>}
     </FormSection>

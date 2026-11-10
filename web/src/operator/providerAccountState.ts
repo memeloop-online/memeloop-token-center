@@ -7,6 +7,8 @@ export interface OAuthRefreshStatus {
   failure_class: string | null;
   reauthorization_required: boolean;
   automatic_refresh_paused: boolean;
+  allowed_actions?: string[];
+  lease_expires_at?: number | null;
 }
 
 export type AccountStatusInput = Pick<UpstreamAccount, 'status' | 'auth_kind' | 'credential_expires_at'> & {
@@ -18,8 +20,8 @@ export function providerAccountStatus(account: AccountStatusInput, now: number) 
   const expiry = account.credential_expires_at;
   const known = typeof expiry === 'number' && Number.isFinite(expiry);
   const diagnostic = account.auth_kind === 'oauth' && account.oauth_refresh?.credential_generation === account.credential_generation ? account.oauth_refresh : undefined;
-  const expired = diagnostic?.access_state === 'expired' || (known && expiry <= now);
-  const revoked = diagnostic?.access_state === 'revoked' || diagnostic?.reauthorization_required === true || diagnostic?.refresh_state === 'reauthorization_required';
+  const expired = diagnostic?.access_state === 'expired' || (diagnostic?.access_state !== 'valid' && known && expiry <= now);
+  const revoked = diagnostic?.access_state === 'revoked';
   const renewalLabel = diagnostic?.refresh_state === 'outcome_unknown'
     ? diagnostic.failure_class === 'network' ? 'providers.renewalNetworkUnknown' : diagnostic.failure_class === 'local_persistence' ? 'providers.renewalLocalUnknown' : 'providers.renewalUnknown'
     : diagnostic?.refresh_state === 'pending_local' ? 'providers.renewalPendingLocal'
@@ -29,7 +31,8 @@ export function providerAccountStatus(account: AccountStatusInput, now: number) 
   return {
     expired,
     uncertain: account.status === 'active' && !revoked && diagnostic?.refresh_state === 'outcome_unknown',
-    needsReauthorization: expired || revoked || diagnostic?.automatic_refresh_paused === true,
+    needsReauthorization: diagnostic?.reauthorization_required === true,
+    allowedActions: diagnostic?.allowed_actions,
     credentialLabel,
     renewalLabel,
     paused: diagnostic?.automatic_refresh_paused === true,
