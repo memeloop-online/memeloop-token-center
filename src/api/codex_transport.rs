@@ -27,11 +27,14 @@ use crate::{
 
 #[path = "codex_transport/bad_request.rs"]
 mod bad_request;
+#[path = "codex_transport/chat_digest.rs"]
+mod chat_digest;
 #[path = "codex_transport/chat_request.rs"]
 mod chat_request;
 #[cfg(test)]
 #[path = "codex_transport/chat_tests.rs"]
 mod chat_tests;
+use chat_digest::EmittedText;
 #[path = "codex_transport/chat_tools.rs"]
 mod chat_tools;
 #[cfg(test)]
@@ -1414,12 +1417,12 @@ pub(super) struct CodexChatStreamTranslator {
     model: String,
     created: i64,
     output_kind: Option<ChatOutputKind>,
-    refusal_delta: String,
-    refusal_done: Option<String>,
+    refusal_delta: EmittedText,
+    refusal_done: Option<EmittedText>,
     started: bool,
     terminal: bool,
     include_usage: bool,
-    text_delta: String,
+    text_delta: EmittedText,
     tools: BTreeMap<usize, chat_tools::StreamingTool>,
     completed_items: BTreeMap<usize, Value>,
     retained_bytes: usize,
@@ -1448,12 +1451,12 @@ impl CodexChatStreamTranslator {
             model,
             created: crate::db::unix_millis() / 1_000,
             output_kind: None,
-            refusal_delta: String::new(),
+            refusal_delta: EmittedText::default(),
             refusal_done: None,
             started: false,
             terminal: false,
             include_usage,
-            text_delta: String::new(),
+            text_delta: EmittedText::default(),
             tools: BTreeMap::new(),
             completed_items: BTreeMap::new(),
             retained_bytes: 0,
@@ -1490,8 +1493,7 @@ impl CodexChatStreamTranslator {
                     .and_then(Value::as_str)
                     .ok_or("upstream_invalid_response")?;
                 self.observe_output_kind(ChatOutputKind::Text)?;
-                self.retain_bytes(delta.len())?;
-                self.text_delta.push_str(delta);
+                self.text_delta.observe(delta)?;
                 Ok(Some(self.text_delta_chunk(delta)?))
             }
             "response.refusal.delta" => {
@@ -1504,8 +1506,7 @@ impl CodexChatStreamTranslator {
                     .filter(|delta| !delta.is_empty())
                     .ok_or("upstream_invalid_response")?;
                 self.observe_output_kind(ChatOutputKind::Refusal)?;
-                self.retain_bytes(delta.len())?;
-                self.refusal_delta.push_str(delta);
+                self.refusal_delta.observe(delta)?;
                 Ok(Some(self.refusal_delta_chunk(delta)?))
             }
             "response.refusal.done" => {
@@ -1518,7 +1519,7 @@ impl CodexChatStreamTranslator {
                     .and_then(Value::as_str)
                     .filter(|refusal| !refusal.is_empty())
                     .ok_or("upstream_invalid_response")?;
-                self.refusal_done = Some(refusal.to_owned());
+                self.refusal_done = Some(EmittedText::from_text(refusal));
                 Ok(None)
             }
             "response.output_item.added" | "response.output_item.done" => {
@@ -1661,13 +1662,13 @@ impl CodexChatStreamTranslator {
             }
             ChatResponseContent::Refusal(completed) => {
                 self.observe_output_kind(ChatOutputKind::Refusal)?;
-                if !self.refusal_delta.is_empty() && self.refusal_delta != completed {
+                if !self.refusal_delta.is_empty() && !self.refusal_delta.matches(&completed) {
                     return Err("upstream_invalid_response");
                 }
                 if self
                     .refusal_done
-                    .as_deref()
-                    .is_some_and(|refusal| refusal != completed)
+                    .as_ref()
+                    .is_some_and(|refusal| !refusal.matches(&completed))
                 {
                     return Err("upstream_invalid_response");
                 }
@@ -1718,8 +1719,9 @@ impl CodexChatStreamTranslator {
     }
 
     fn complete_text(&mut self, completed: &str, output: &mut Vec<u8>) -> Result<(), &'static str> {
-        let remaining = completed
-            .strip_prefix(&self.text_delta)
+        let remaining = self
+            .text_delta
+            .remaining(completed)
             .ok_or("upstream_invalid_response")?;
         if !remaining.is_empty() || !self.started {
             output.extend_from_slice(&self.text_delta_chunk(remaining)?);
