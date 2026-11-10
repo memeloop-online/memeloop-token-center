@@ -7,6 +7,229 @@ use crate::{
 };
 use bytes::Bytes;
 
+async fn fair_projection_queue_contract(database_url: String) {
+    let fixture = Fixture::new(database_url, true).await;
+    let db = &fixture.state.db;
+    sqlx::query("UPDATE conversation_projection_outbox SET projected_at = 1, statistics_outcome = NULL WHERE request_id = $1")
+        .bind(fixture.request_id.to_string()).execute(&db.pool).await.unwrap();
+    let mut fresh = Vec::new();
+    let mut retries = Vec::new();
+    let mut rebuilds = Vec::new();
+    for lane in 0..3 {
+        for index in 0..32 {
+            let id = Uuid::now_v7();
+            let terminal = lane != 2 && index % 2 == 0;
+            sqlx::query(
+                "INSERT INTO conversation_projection_outbox
+                 (request_id, tenant_id, key_id, principal_id, request_json, hints_json,
+                  observed_at, attempts, lease_owner, lease_expires_at,
+                  semantic_snapshot_json, statistics_outcome)
+                 SELECT $1, tenant_id, key_id, principal_id, request_json, hints_json,
+                    $2, $3, $4, $5, $6, $7
+                 FROM conversation_projection_outbox WHERE request_id = $8",
+            )
+            .bind(id.to_string())
+            // Historical work predates all new requests.
+            .bind(if lane == 0 { 1000_i64 + index } else { index })
+            .bind(if lane == 1 { 106950_i64 } else { 0 })
+            .bind(if lane == 2 {
+                Some(SESSION_BODY_REBUILD_LEASE_OWNER)
+            } else if terminal {
+                Some("terminal-v118")
+            } else {
+                None
+            })
+            .bind(if lane == 2 || terminal {
+                Some(i64::MAX)
+            } else {
+                None
+            })
+            .bind(if terminal { Some("{}") } else { None })
+            .bind(if lane == 2 {
+                Some(SESSION_BODY_REBUILD_OUTCOME)
+            } else {
+                None
+            })
+            .bind(fixture.request_id.to_string())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+            match lane {
+                0 => fresh.push(id),
+                1 => retries.push(id),
+                _ => rebuilds.push(id),
+            }
+        }
+    }
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 0);
+    let owner = Uuid::now_v7();
+    let first = db
+        .claim_conversation_projection_tasks(owner, 32)
+        .await
+        .unwrap();
+    assert_eq!(first.len(), 32);
+    for (ids, expected) in [(&fresh, 16), (&retries, 8), (&rebuilds, 8)] {
+        assert_eq!(
+            first
+                .iter()
+                .filter(|task| ids.contains(&task.request_id))
+                .count(),
+            expected
+        );
+    }
+    let terminal_claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM conversation_projection_outbox WHERE terminal_lease_owner = $1",
+    )
+    .bind(owner.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        terminal_claims, 12,
+        "terminal sentinels must sort by their terminal deadline, not their permanent primary lease"
+    );
+    let second = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 32);
+    assert!(second.iter().all(|task| {
+        first
+            .iter()
+            .all(|prior| prior.request_id != task.request_id)
+    }));
+    for (ids, expected) in [(&fresh, 16), (&retries, 8), (&rebuilds, 8)] {
+        assert_eq!(
+            second
+                .iter()
+                .filter(|task| ids.contains(&task.request_id))
+                .count(),
+            expected
+        );
+    }
+    // With the first-attempt lane drained, its slots are borrowed.
+    let third = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(third.len(), 32);
+    assert!(third.iter().all(|task| {
+        first
+            .iter()
+            .chain(&second)
+            .all(|prior| prior.request_id != task.request_id)
+    }));
+    assert!(
+        third
+            .iter()
+            .filter(|task| retries.contains(&task.request_id))
+            .count()
+            >= 8
+    );
+    assert!(
+        third
+            .iter()
+            .filter(|task| rebuilds.contains(&task.request_id))
+            .count()
+            >= 8
+    );
+
+    let retry = first
+        .iter()
+        .find(|task| retries.contains(&task.request_id))
+        .unwrap()
+        .request_id;
+    let before = unix_millis();
+    db.defer_session_body_archive(owner, retry).await.unwrap();
+    let deadline: i64 = sqlx::query_scalar("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(retry.to_string()).fetch_one(&db.pool).await.unwrap();
+    assert!(deadline >= before + 300000 && deadline <= unix_millis() + 300000);
+    // A stale worker cannot shorten the retry deadline or change its owner.
+    db.defer_session_body_archive(Uuid::now_v7(), retry)
+        .await
+        .unwrap();
+    assert_eq!(deadline, sqlx::query_scalar::<_, i64>("SELECT terminal_lease_expires_at FROM conversation_projection_outbox WHERE request_id = $1")
+        .bind(retry.to_string()).fetch_one(&db.pool).await.unwrap());
+    assert!(
+        db.claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut transaction = db.begin_write_transaction().await.unwrap();
+    wake_session_body_archive_in_transaction(&mut transaction, retry)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let woken = db
+        .claim_conversation_projection_tasks(Uuid::now_v7(), 32)
+        .await
+        .unwrap();
+    assert_eq!(woken.len(), 1);
+    assert_eq!(woken[0].request_id, retry);
+
+    // Repeated reopen scans do not accumulate unclaimed historical tasks.
+    sqlx::query(
+        "UPDATE conversation_projection_outbox SET projected_at = 1 WHERE request_id <> $1",
+    )
+    .bind(fixture.request_id.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 1);
+    assert_eq!(db.reopen_session_body_rebuilds(8).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn sqlite_projection_queue_fairness_and_source_retry_wake() {
+    let directory = tempfile::tempdir().unwrap();
+    fair_projection_queue_contract(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("fairness.db").display()
+    ))
+    .await;
+}
+
+#[tokio::test]
+async fn postgres_projection_queue_fairness_and_source_retry_wake() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("projection fairness PostgreSQL regression must not silently skip");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    fair_projection_queue_contract(isolated.url().to_owned()).await;
+    isolated.cleanup().await;
+}
+
+#[tokio::test]
+async fn postgres_rebuild_replenishment_does_not_wait_for_another_worker() {
+    let database_url = std::env::var("MTC_TEST_POSTGRES_URL")
+        .expect("rebuild serialization regression requires PostgreSQL");
+    let isolated = PostgresTestDatabase::create(&database_url).await;
+    let fixture = Fixture::new(isolated.url().to_owned(), true).await;
+    let mut owner = fixture.state.db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(82420261105)")
+        .execute(&mut *owner)
+        .await
+        .unwrap();
+    let replenished = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        fixture.state.db.reopen_session_body_rebuilds(8),
+    )
+    .await
+    .expect("another replenisher must not block the worker")
+    .unwrap();
+    assert_eq!(replenished, 0);
+    owner.rollback().await.unwrap();
+    // The transaction-scoped lock is released and normal replenishment resumes.
+    fixture
+        .state
+        .db
+        .reopen_session_body_rebuilds(8)
+        .await
+        .unwrap();
+    drop(fixture);
+    isolated.cleanup().await;
+}
+
 struct Fixture {
     state: AppState,
     key: AuthenticatedKey,
@@ -321,7 +544,16 @@ impl Fixture {
             .map(str::to_owned)
             .unwrap_or_else(|| format!("gap://{request_id}/request"));
         let response_locator = if source.is_some() {
-            r#"inline-json:{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#.to_owned()
+            let object = state.archive.put_tenant_content(
+                key.tenant_id,
+                Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#),
+            ).await.unwrap();
+            state
+                .archive
+                .publish_raw_capture(key.tenant_id, request_id, "response", &object)
+                .await
+                .unwrap();
+            object.object_locator
         } else {
             format!("gap://{request_id}/response")
         };
@@ -506,9 +738,6 @@ impl Fixture {
             (BufferedArchivePurpose::Request, Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#)),
             (BufferedArchivePurpose::Response, Bytes::from_static(br#"{"choices":[{"message":{"role":"assistant","content":"archive assistant answer"}}]}"#)),
         ] {
-            // Terminal projection has already completed the request. Use the
-            // deferred writer's matching-gap fence instead of recapturing it
-            // through the pre-terminal compatibility helper.
             let archive = BufferedArchive::new(
                 self.identity,
                 purpose,
@@ -517,13 +746,17 @@ impl Fixture {
                 self.state.config.archive_spool_compression_enabled,
             )
             .unwrap();
+            let mut transaction = self.state.db.begin_write_transaction().await.unwrap();
             assert!(
                 self.state
                     .db
-                    .capture_deferred_archive(&archive)
+                    .capture_buffered_archive_body_in_transaction(
+                        &mut transaction, unix_millis(), &archive, None,
+                    )
                     .await
                     .unwrap()
             );
+            transaction.commit().await.unwrap();
         }
     }
 
@@ -779,6 +1012,28 @@ async fn sqlite_final_archive_gap_keeps_request_turn() {
     )
     .await;
     fixture.capture().await;
+    // This fixture knows the original request. Persist those exact bytes;
+    // the empty SQL outbox cannot stand in for a missing original.
+    let object = fixture
+        .state
+        .archive
+        .put_tenant_content(
+            fixture.identity.tenant_id,
+            Bytes::from_static(br#"{"messages":[{"role":"user","content":"archive question"}]}"#),
+        )
+        .await
+        .unwrap();
+    fixture
+        .state
+        .archive
+        .publish_raw_capture(
+            fixture.identity.tenant_id,
+            fixture.request_id,
+            "request",
+            &object,
+        )
+        .await
+        .unwrap();
     sqlx::query("UPDATE request_archive_spools SET state = 'gap' WHERE request_id = $1")
         .bind(fixture.request_id.to_string())
         .execute(&fixture.state.db.pool)
@@ -838,6 +1093,10 @@ async fn source_contract(database_url: String) {
         fixture.state.responses_request_spool.drain_uploads().await;
         fixture.state.db.drain_gateway_persistence_for_test().await;
         assert!(String::from_utf8_lossy(&original).contains("provider_secret_field"));
+        // Upload EOF precedes the independent metadata handoff. Drain the real
+        // writer before simulating deletion/restart, so it cannot recreate the
+        // metadata after the fixture removes it.
+        fixture.state.responses_request_spool.drain_uploads().await;
         fixture
             .state
             .db
@@ -875,18 +1134,42 @@ async fn source_contract(database_url: String) {
             .execute(&fixture.state.db.pool)
             .await
             .unwrap();
-        fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+        fixture.state.db = Database::connect_with_max(&database_url, 4)
+            .await
+            .unwrap()
+            .with_archive(fixture.state.archive.clone());
         fixture.assert_completed(true).await;
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
+        let root = fixture
+            .state
+            .archive
+            .raw_capture_reference(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.size_bytes, original.len() as u64);
+        assert_eq!(
+            root.blake3_digest,
+            blake3::hash(&original).to_hex().to_string()
+        );
+        assert_eq!(
+            fixture
+                .state
+                .archive
+                .get_tenant_content(fixture.identity.tenant_id, &root, original.len())
+                .await
+                .unwrap(),
+            original
+        );
+        let recreated: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spools WHERE request_id = $1")
                 .bind(fixture.request_id.to_string())
                 .fetch_one(&fixture.state.db.pool)
                 .await
                 .unwrap();
-        assert_eq!(state, "bound");
-        let archived: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM archive_staging_attempts WHERE attempt_id = $1 AND state = 'cleanup_pending'")
-            .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
-        assert_eq!(archived, 1);
+        assert_eq!(
+            recreated, 0,
+            "immutable roots restore content without recreating retired spools"
+        );
         let chunks: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM request_archive_spool_chunks WHERE request_id = $1",
         )
@@ -926,8 +1209,13 @@ async fn failed_source_metadata_contract(database_url: String) {
     let release = store.pause_next_write();
     let admission =
         RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
-    let mut fixture =
-        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    // Inject the metadata outage explicitly. Production now gives a healthy
+    // cold/queued connection ten seconds rather than failing within 250ms.
+    let mut fixture = Database::with_source_pool_timeout_for_test(
+        Duration::from_millis(250),
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)),
+    )
+    .await;
     let source = fixture.source.take().unwrap();
     let locator = source.object_locator().unwrap().to_owned();
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -1006,8 +1294,11 @@ async fn expired_live_source_writer_contract(database_url: String) {
     let release = store.pause_next_write();
     let admission =
         RequestSpoolAdmission::new(std::path::PathBuf::new()).with_memory_store(store.clone());
-    let mut fixture =
-        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)).await;
+    let mut fixture = Database::with_source_pool_timeout_for_test(
+        Duration::from_millis(250),
+        Fixture::new_with_source(database_url, true, Some("openai"), Some(admission)),
+    )
+    .await;
     let source = fixture.source.take().unwrap();
     let locator = source.object_locator().unwrap().to_owned();
     let length = source.len();
@@ -1283,20 +1574,56 @@ async fn lost_source_writer_contract(database_url: String) {
     );
     sqlx::query("UPDATE archive_staging_attempts SET lease_expires_at = 0 WHERE attempt_id = $1 AND state = 'writing'")
         .bind(fixture.request_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
-    fixture.state.db = Database::connect_with_max(&database_url, 4).await.unwrap();
+    fixture.state.db = Database::connect_with_max(&database_url, 4)
+        .await
+        .unwrap()
+        .with_archive(fixture.state.archive.clone());
     assert!(fixture.state.archive.get(&locator).await.is_err());
-    fixture.assert_completed(true).await;
-    fixture
-        .state
-        .db
-        .complete_request_source(
-            fixture.identity,
-            &locator,
-            2,
-            *blake3::hash(b"{}").as_bytes(),
-            true,
-        )
-        .await;
+    let owner = fixture.claim().await;
+    assert!(
+        !crate::worker::archive_session_body(&fixture.state, owner, fixture.request_id)
+            .await
+            .unwrap()
+    );
+    let skipped: String = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1 AND projected_at IS NOT NULL")
+        .bind(fixture.request_id.to_string()).fetch_one(&fixture.state.db.pool).await.unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&skipped).unwrap()["session_body_skip"],
+        "session_body_skipped_missing_source"
+    );
+    let observations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM conversation_observations WHERE request_id = $1")
+            .bind(fixture.request_id.to_string())
+            .fetch_one(&fixture.state.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        observations, 0,
+        "an aborted original cannot become a fabricated training turn"
+    );
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_failed(fixture.identity.tenant_id, fixture.request_id, "request")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !fixture
+            .state
+            .db
+            .record_request_source_state(
+                fixture.identity,
+                &locator,
+                2,
+                *blake3::hash(b"{}").as_bytes(),
+                Some(true),
+                false,
+            )
+            .await
+            .unwrap()
+    );
     let state: String =
         sqlx::query_scalar("SELECT state FROM request_archive_spools WHERE request_id = $1")
             .bind(fixture.request_id.to_string())

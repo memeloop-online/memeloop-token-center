@@ -548,9 +548,8 @@ async fn assert_inference_archive(
                 assert_eq!(row.get::<String, _>("explicit_session_id"), "playground-fixture");
                 assert_eq!(row.get::<String, _>("turn_id"), "turn-1");
                 assert_eq!(row.get::<String, _>("parent_turn_id"), "turn-0");
-                // The archived conversation includes returned turns and staged
-                // media locators; its leaf is not the ingress-only fingerprint.
-                assert!(row.get::<Option<String>, _>("leaf_node_hash").is_some());
+                let (_, expected_prefix) = crate::conversation::session_body_from_documents(request, response).into_prefix();
+                assert_eq!(row.get::<Option<String>, _>("leaf_node_hash").as_deref(), expected_prefix.last().map(|node| node.node_hash.as_str()));
                 break;
             }
             tokio::task::yield_now().await;

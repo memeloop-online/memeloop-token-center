@@ -85,12 +85,14 @@ test('account recovery uses the production shell and workspace with contained Fl
       await page.screenshot({ path: join(artifacts, `kimi-workspace-directory-${theme}-${width}.png`), fullPage: true });
       for (const [accountId, reason] of [['kimi-0142', /网络读取失败/], ['kimi-7021', /续期结果未能保存/]] as const) {
         const workspace = await manageProviderAccount(page, accountId);
-        const badge = workspace.locator('.account-main > .status');
-        assert.equal(await badge.innerText(), '续期结果待核对');
+        const authorization = workspace.locator('.account-main > .provider-authorization-status');
+        assert.match(await authorization.innerText(), /访问令牌已过期/);
+        const badge = authorization.locator('[tabindex="0"]');
+        assert.match(await badge.innerText(), reason);
         assert.equal(await workspace.getByRole('button', { name: '重新登录', exact: true }).isVisible(), true);
         await badge.focus();
         await page.getByRole('tooltip').filter({ hasText: reason }).waitFor();
-        assert.match(await page.getByRole('tooltip').innerText(), /访问令牌已过期.*自动续期已暂停/);
+        assert.match(await page.getByRole('tooltip').innerText(), /自动续期已暂停/);
         await badge.press('Tab');
         await page.getByRole('tooltip').waitFor({ state: 'hidden' });
         await page.screenshot({ path: join(artifacts, `kimi-workspace-${accountId}-${theme}-${width}.png`), fullPage: true });

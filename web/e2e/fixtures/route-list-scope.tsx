@@ -9,6 +9,10 @@ import '../../src/operator/operator.css';
 declare global { interface Window { routeListWrites: number } }
 window.routeListWrites = 0;
 const accounts = ['personal', 'team'].map(id => ({ id, tenant_external_id: 'fixture', name: id === 'personal' ? 'Kimi personal account' : 'Kimi team account', driver: 'kimi-oauth', status: 'active', config: {}, credential_generation: 1, created_at: 1, updated_at: 1 }));
+accounts.push(
+  { ...accounts[0], id: '11111111-1111-4111-8111-111111111111', name: 'Shared subscription', config: { base_url: 'https://kimi.example.invalid' } },
+  { ...accounts[0], id: '22222222-2222-4222-8222-222222222222', name: 'Shared subscription', driver: 'http-json', config: { base_url: 'https://provider.example.invalid' } },
+);
 const groups = [
   { id: 'kimi-group', tenant_external_id: 'fixture', name: 'Kimi 模型组', member_ids: ['personal', 'team'], member_count: 2, created_at: 1, updated_at: 1 },
   { id: 'excluded-group', tenant_external_id: 'fixture', name: '团队排除组', member_ids: ['team'], member_count: 1, created_at: 1, updated_at: 1 },
@@ -20,12 +24,15 @@ const routes = [
   { ...common, id: 'empty', public_model: 'Kimi empty', included_provider_group_ids: ['kimi-group'], excluded_provider_group_ids: ['kimi-group'], candidate_upstream_account_ids: [] },
   { ...common, id: 'unknown', public_model: 'Kimi unknown', included_provider_group_ids: ['missing-group'] },
   { ...common, id: 'direct', public_model: 'Kimi direct', upstream_account_ids: ['personal'], candidate_upstream_account_ids: ['personal'] },
+  { ...common, id: 'duplicate-kimi', public_model: 'terra-model-7770', upstream_account_ids: ['11111111-1111-4111-8111-111111111111'], candidate_upstream_account_ids: ['11111111-1111-4111-8111-111111111111'] },
+  { ...common, id: 'duplicate-other', public_model: 'terra-model-other', upstream_account_ids: ['22222222-2222-4222-8222-222222222222'], candidate_upstream_account_ids: ['22222222-2222-4222-8222-222222222222'] },
+  { ...common, id: 'missing-source', public_model: 'Missing source', upstream_account_ids: ['33333333-3333-4333-8333-333333333333'], candidate_upstream_account_ids: ['33333333-3333-4333-8333-333333333333'] },
 ];
 window.fetch = async (input, init) => {
   const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url, location.origin);
   const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
   if (method !== 'GET') { window.routeListWrites++; throw new Error('Route list fixture is read-only'); }
-  const values: Record<string, unknown> = { '/internal/v1/upstreams': accounts, '/internal/v1/provider-types': [{ id: 'kimi-oauth', display_name: 'Kimi Coding', protocols: ['openai'] }], '/internal/v1/model-routes': routes, '/internal/v1/provider-groups': groups, '/internal/v1/route-groups': [], '/internal/v1/plugins/group-routing-strategies': [] };
+  const values: Record<string, unknown> = { '/internal/v1/upstreams': accounts, '/internal/v1/provider-types': [{ id: 'kimi-oauth', display_name: 'Kimi Coding', protocols: ['openai'] }, { id: 'http-json', display_name: 'Other provider', protocols: ['openai'] }], '/internal/v1/model-routes': routes, '/internal/v1/provider-groups': groups, '/internal/v1/route-groups': [], '/internal/v1/plugins/group-routing-strategies': [] };
   if (!(url.pathname in values)) throw new Error(`Unexpected route list read: ${url.pathname}`);
   return new Response(JSON.stringify(values[url.pathname]), { headers: { 'Content-Type': 'application/json' } });
 };

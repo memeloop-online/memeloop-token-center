@@ -89,8 +89,16 @@ async fn reserved_capture_preserves_exact_accounting_through_commit_recovery_and
         .execute(&db.pool)
         .await
         .unwrap();
-    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 1);
-    assert_eq!(budget(&db).await, 0);
+    assert_eq!(db.cleanup_response_archive_spools(32).await.unwrap(), 0);
+    assert_eq!(budget(&db).await, actual);
+    let chunks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_archive_spool_chunks")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(
+        chunks > 0,
+        "unverified migration source must remain recoverable"
+    );
 }
 
 #[tokio::test]

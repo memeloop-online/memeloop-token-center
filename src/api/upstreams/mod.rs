@@ -58,8 +58,8 @@ pub(in crate::api) use quota::{
 pub(in crate::api) use quota::{upstream_quota, upstream_quota_batch, upstream_quota_windows};
 
 pub(in crate::api) use oauth::{
-    disconnect_upstream_oauth, poll_codex_oauth, poll_cursor_oauth, refresh_upstream_oauth,
-    start_codex_oauth, start_cursor_oauth, start_provider_adapter_oauth,
+    disconnect_upstream_oauth, poll_codex_oauth, poll_cursor_oauth, recover_upstream_oauth,
+    refresh_upstream_oauth, start_codex_oauth, start_cursor_oauth, start_provider_adapter_oauth,
 };
 pub(crate) use oauth::{poll_codex_oauth_for_worker, refresh_managed_upstream_oauth_for_worker};
 pub(in crate::api) use oauth_authorization_code::{

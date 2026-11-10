@@ -1,5 +1,57 @@
 use super::*;
 
+pub(super) async fn assert_original_response(
+    fixture: &CodexRouteFixture,
+    request_id: Uuid,
+    expected: &[u8],
+) {
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    let object = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(object) = fixture
+                .state
+                .archive
+                .raw_capture_reference(key.tenant_id, request_id, "response")
+                .await
+                .unwrap()
+            {
+                break object;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the supplier original must survive downstream cancellation");
+    assert_eq!(object.size_bytes, expected.len() as u64);
+    assert_eq!(
+        object.blake3_digest,
+        blake3::hash(expected).to_hex().to_string()
+    );
+    assert_eq!(
+        fixture
+            .state
+            .archive
+            .get_tenant_content(key.tenant_id, &object, expected.len())
+            .await
+            .unwrap()
+            .as_ref(),
+        expected
+    );
+    assert!(
+        !fixture
+            .state
+            .archive
+            .raw_capture_failed(key.tenant_id, request_id, "response")
+            .await
+            .unwrap()
+    );
+}
+
 pub(super) async fn assert_unknown_request(
     fixture: &CodexRouteFixture,
     request_id: Uuid,
