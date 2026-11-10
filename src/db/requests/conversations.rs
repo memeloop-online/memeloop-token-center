@@ -941,6 +941,7 @@ impl Database {
         // before taking the explicit-session lock below. A stale lease is
         // rechecked in the final transaction; its durable outbox row makes a
         // committed content-only prefix retryable rather than user-visible.
+        let mut prepared_payload = None;
         let prepared_snapshot = {
             let prepare_now = unix_millis();
             let prepare = sqlx::query(
@@ -1005,6 +1006,10 @@ impl Database {
                         &prepare.try_get::<String, _>("principal_id")?,
                     )
                     .await?
+                    .map(|loaded| {
+                        prepared_payload = Some(loaded.verified);
+                        loaded.body
+                    })
                     .filter(|body| body != "{}" && !body.is_empty())
                     .unwrap_or_default()
                 };
@@ -1070,7 +1075,7 @@ impl Database {
                 let prepare_request_json = if let Some(expected) =
                     snapshot.as_ref().and_then(|s| s.payload_digest.as_deref())
                 {
-                    semantic_payload::load(
+                    let loaded = semantic_payload::load(
                         self,
                         request_id,
                         &prepare_tenant_id,
@@ -1078,7 +1083,9 @@ impl Database {
                         &prepare.try_get::<String, _>("principal_id")?,
                         expected,
                     )
-                    .await?
+                    .await?;
+                    prepared_payload = Some(loaded.verified);
+                    loaded.body
                 } else {
                     prepare.try_get::<String, _>("request_json")?
                 };
@@ -1226,6 +1233,11 @@ impl Database {
                 "conversation semantic snapshot changed during projection".into(),
             ).into());
         }
+        if let Some(verified) = prepared_payload.as_ref() {
+            semantic_payload::verify_in_transaction(
+                &mut transaction, self.backend, request_id, &projection_key, verified,
+            ).await?;
+        }
         // A declared identity may already have been published without waiting
         // for archive content. Enrich that same observation rather than
         // counting the request again or replacing its client provenance.
@@ -1249,19 +1261,6 @@ impl Database {
             false
         };
         if !rewrote_existing {
-            if let Some(expected) = snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.payload_digest.as_deref())
-            {
-                semantic_payload::verify_in_transaction(
-                    &mut transaction,
-                    self.backend,
-                    request_id,
-                    &projection_key,
-                    expected,
-                )
-                .await?;
-            }
             self.record_conversation_observation_with_snapshot_in_transaction(
                 &mut transaction,
                 ConversationObservationInput {

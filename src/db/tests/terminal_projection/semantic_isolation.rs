@@ -28,12 +28,16 @@ async fn reclaim(database: &Database, request_id: Uuid) -> Uuid {
     owner
 }
 
-async fn recovery_contract(database_url: &str) {
-    let archive = crate::archive::ArchiveStore::from_config(&crate::config::Config::for_test(
-        database_url.to_owned(),
-    ))
-    .await
-    .unwrap();
+async fn recovery_contract(database_url: &str, reference_v2: bool) {
+    let archive = if reference_v2 {
+        crate::archive::ArchiveStore::training_memory_for_test()
+    } else {
+        crate::archive::ArchiveStore::from_config(&crate::config::Config::for_test(
+            database_url.to_owned(),
+        ))
+        .await
+        .unwrap()
+    };
     let database = Database::connect(database_url)
         .await
         .unwrap()
@@ -292,6 +296,34 @@ async fn recovery_contract(database_url: &str) {
         .await
         .unwrap();
     assert_eq!(atoms, 0);
+    if reference_v2 {
+        let object = archive
+            .put_tenant_content(key.tenant_id, bytes::Bytes::from(encoded.clone()))
+            .await
+            .unwrap();
+        let reference = serde_json::to_string(&crate::archive::ConversationBodyReference {
+            conversation_body_v1: object,
+            chars: encoded.chars().count() as u64,
+        })
+        .unwrap();
+        sqlx::query("UPDATE conversation_semantic_payloads SET format_version = 2, request_json = $1 WHERE request_id = $2")
+            .bind(&reference).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        // An unavailable object backend must leave pending and financial state intact.
+        let unavailable = database
+            .clone()
+            .with_archive(crate::archive::ArchiveStore::training_memory_for_test());
+        let owner = reclaim(&database, request_id).await;
+        assert!(
+            unavailable
+                .project_claimed_conversation_projection_task(owner, request_id)
+                .await
+                .is_err()
+        );
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1 AND format_version = 2")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(retained, 1);
+        assert_counts(&database, request_id, reservation.id, 1).await;
+    }
     let reject_ack = match database.backend {
         DatabaseBackend::Sqlite => {
             "CREATE TRIGGER reject_semantic_ack BEFORE UPDATE OF projected_at ON conversation_projection_outbox BEGIN SELECT RAISE(ABORT, 'injected semantic ack failure'); END;"
@@ -410,10 +442,13 @@ async fn recovery_contract(database_url: &str) {
 #[tokio::test]
 async fn sqlite_semantic_payload_recovers_without_source_or_duplicate_finance() {
     let directory = tempfile::tempdir().unwrap();
-    recovery_contract(&format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("semantic.db").display()
-    ))
+    recovery_contract(
+        &format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("semantic.db").display()
+        ),
+        false,
+    )
     .await;
 }
 
@@ -432,7 +467,42 @@ async fn postgres_semantic_payload_recovers_without_source_or_duplicate_finance(
     isolated
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
-    recovery_contract(isolated.as_str()).await;
+    recovery_contract(isolated.as_str(), false).await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_semantic_payload_v2_recovers_without_duplicate_finance() {
+    let directory = tempfile::tempdir().unwrap();
+    recovery_contract(
+        &format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("semantic-v2.db").display()
+        ),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the configured CI PostgreSQL service"]
+async fn postgres_semantic_payload_v2_recovers_without_duplicate_finance() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL CI fixture");
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("semantic_v2_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    recovery_contract(isolated.as_str(), true).await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await
