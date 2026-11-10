@@ -6,23 +6,32 @@ pub(super) async fn read_archived_request_source(
     pool: &sqlx::AnyPool,
     request_id: Uuid,
 ) -> Option<bytes::Bytes> {
-    let locator: String = sqlx::query_scalar(
-        "SELECT request_object FROM request_records WHERE id = $1 AND key_id = $2",
+    let tenant: String =
+        sqlx::query_scalar("SELECT tenant_id FROM request_records WHERE id = $1 AND key_id = $2")
+            .bind(request_id.to_string())
+            .bind(fixture.key_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let tenant = Uuid::parse_str(&tenant).unwrap();
+    let reference = fixture
+        .state
+        .archive
+        .raw_capture_reference(tenant, request_id, "request")
+        .await
+        .unwrap()?;
+    Some(
+        fixture
+            .state
+            .archive
+            .get_tenant_content(
+                tenant,
+                &reference,
+                usize::try_from(reference.size_bytes).unwrap(),
+            )
+            .await
+            .unwrap(),
     )
-    .bind(request_id.to_string())
-    .bind(fixture.key_id.to_string())
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    if locator.starts_with("gap://") {
-        return None;
-    }
-    assert_eq!(
-        Some(locator.as_str()),
-        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
-            .as_deref()
-    );
-    fixture.state.archive.get(&locator).await.ok()
 }
 
 pub(super) fn assert_raw_request_source(raw: &[u8], expected: &Value) {
@@ -42,33 +51,25 @@ async fn owned_enqueued_source(
         .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
         .await
         .unwrap();
-    let locator: String = tokio::time::timeout(Duration::from_secs(3), async {
+    let tenant: String = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if let Some(locator) = sqlx::query_scalar::<_, String>(
-                "SELECT r.request_object FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3 AND o.principal_id = $4 AND o.projected_at IS NULL",
+            if let Some(tenant) = sqlx::query_scalar::<_, String>(
+                "SELECT r.tenant_id FROM conversation_projection_outbox o JOIN request_records r ON r.id = o.request_id AND r.tenant_id = o.tenant_id AND r.key_id = o.key_id WHERE o.request_id = $1 AND o.tenant_id = $2 AND o.key_id = $3 AND o.principal_id = $4 AND o.projected_at IS NULL",
             )
             .bind(request_id.to_string())
             .bind(key.tenant_id.to_string())
             .bind(key.key_id.to_string())
             .bind(key.principal_id.to_string())
             .fetch_optional(pool).await.unwrap() {
-                break locator;
+                break tenant;
             }
             tokio::task::yield_now().await;
         }
     }).await.expect("original identity must retain an enqueued source object");
-    assert_eq!(
-        locator,
-        crate::gateway_body::request_spool::request_body_object_key(&request_id.to_string())
-            .unwrap()
-    );
-    assert_eq!(
-        crate::gateway_body::request_spool::source_request_id(&locator),
-        Some(request_id)
-    );
+    assert_eq!(Uuid::parse_str(&tenant).unwrap(), key.tenant_id);
     let raw = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            if let Ok(raw) = fixture.state.archive.get(&locator).await {
+            if let Some(raw) = read_archived_request_source(fixture, pool, request_id).await {
                 break raw;
             }
             tokio::task::yield_now().await;
@@ -76,10 +77,7 @@ async fn owned_enqueued_source(
     })
     .await
     .expect("original source bytes must remain readable after enqueue");
-    assert_eq!(
-        raw.as_ref(),
-        serde_json::to_vec(expected).unwrap().as_slice()
-    );
+    assert_raw_request_source(&raw, expected);
     let payloads: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
     )
@@ -1294,19 +1292,20 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
         .pending_terminals
         .directory_for_test()
         .to_path_buf();
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !directory.join(format!("{receipt_id}.json")).is_file() {
+    let compact: Value = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(bytes) = tokio::fs::read(directory.join(format!("{receipt_id}.json"))).await
+                && let Ok(compact) = serde_json::from_slice::<Value>(&bytes)
+                && compact["financial_ack"]["receipt_id"] == receipt["receipt_id"]
+                && compact["financial_ack"]["request_id"] == receipt["request_id"]
+            {
+                break compact;
+            }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("unprojected financial ACK must retain a compact recovery receipt");
-    let compact: Value = serde_json::from_slice(
-        &tokio::fs::read(directory.join(format!("{receipt_id}.json")))
-            .await
-            .unwrap(),
-    )
-    .unwrap();
     assert_eq!(compact["conversation"]["request_json"], json!({}));
     assert_eq!(compact["usage"], receipt["usage"]);
     assert_eq!(
@@ -1581,6 +1580,9 @@ async fn unknown_failure_retries_operational_projection() {
     .expect(
         "unknown with durable semantic enqueue must release memory and the parsed conversation",
     );
+    // This gateway-only fixture must run the raw archive worker before the
+    // source-backed conversation can consume its response locator.
+    drain_completed_response_archive(&fixture).await;
     let terminal_owner = Uuid::now_v7();
     for pending_id in fixture
         .state

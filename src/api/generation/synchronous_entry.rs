@@ -23,7 +23,7 @@ pub(in crate::api) async fn create_image_generation(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
-    let owner = async move {
+    let operation = async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
         let result = async move {
             let value: Value = serde_json::from_slice(&body)
@@ -46,8 +46,8 @@ pub(in crate::api) async fn create_image_generation(
         result.map(|response| super::super::auth::hold_response_body_permit(response, resources))
     };
     #[cfg(test)]
-    let owner = crate::api::proxy::codex_transport::inherit_test_endpoint(owner);
-    tokio::spawn(owner)
+    let operation = super::super::proxy::codex_transport::inherit_test_endpoint(operation);
+    tokio::spawn(operation)
         .await
         .map_err(|_| AppError::internal("synchronous_image_owner_failed"))?
 }

@@ -4,6 +4,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(test)]
 use tracing::Instrument;
 
 use crate::{AppState, db::ArchiveSpoolIdentity, error::AppError};
@@ -413,15 +414,13 @@ pub(crate) struct ResponseArchiveProducer {
     identity: ArchiveSpoolIdentity,
     #[cfg(test)]
     state: AppState,
-    sender: Option<tokio::sync::mpsc::Sender<QueuedArchiveChunk>>,
-    chunk_memory: Arc<tokio::sync::Semaphore>,
-    terminal: Option<tokio::sync::oneshot::Sender<Bytes>>,
-    pending: Vec<u8>,
+    local: LocalCapture,
     writer: super::OwnedTask<()>,
     active: Arc<AtomicBool>,
     _queue_memory: Arc<CaptureQueueMemory>,
 }
 
+#[cfg(test)]
 struct QueuedArchiveChunk {
     bytes: Bytes,
     _memory: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -460,6 +459,7 @@ impl ResponseArchiveSettlement {
     }
 }
 
+#[cfg(test)]
 pub(super) struct ResponseArchiveWriter {
     state: AppState,
     identity: ArchiveSpoolIdentity,
@@ -471,6 +471,7 @@ pub(super) struct ResponseArchiveWriter {
     max_append_wait: std::time::Duration,
 }
 
+#[cfg(test)]
 impl Drop for ResponseArchiveWriter {
     fn drop(&mut self) {
         tracing::info!(request_id = %self.identity.request_id, phase = "response_spool_writer_summary",
@@ -481,7 +482,83 @@ impl Drop for ResponseArchiveWriter {
     }
 }
 
+struct LocalCapture {
+    directory: std::path::PathBuf,
+    #[cfg(test)]
+    write_pause: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+    )>,
+    source: Option<
+        tokio::sync::oneshot::Sender<Arc<crate::gateway_body::local_body_file::LocalBodyFile>>,
+    >,
+    progress: tokio::sync::watch::Sender<(u64, bool)>,
+    file: Option<std::fs::File>,
+    length: u64,
+}
+
+impl LocalCapture {
+    async fn append(
+        &mut self,
+        bytes: Bytes,
+        memory: Arc<CaptureQueueMemory>,
+    ) -> std::io::Result<()> {
+        if self.file.is_none() {
+            let charge = memory.clone();
+            let directory = self.directory.clone();
+            let (local, file) = tokio::task::spawn_blocking(move || {
+                let _charge = charge;
+                std::fs::create_dir_all(&directory)?;
+                let local = Arc::new(crate::gateway_body::local_body_file::LocalBodyFile::new(
+                    &directory,
+                )?);
+                let file = local.writer()?;
+                Ok::<_, std::io::Error>((local, file))
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            self.source
+                .take()
+                .ok_or_else(|| std::io::Error::other("capture closed"))?
+                .send(local)
+                .map_err(|_| std::io::Error::other("capture writer closed"))?;
+            self.file = Some(file);
+        }
+        for chunk in bytes.chunks(super::CHUNK_BYTES) {
+            let mut file = self
+                .file
+                .take()
+                .ok_or_else(|| std::io::Error::other("capture closed"))?;
+            let chunk = chunk.to_vec();
+            let length = chunk.len() as u64;
+            let charge = memory.clone();
+            #[cfg(test)]
+            let pause = self.write_pause.take();
+            self.file = Some(
+                tokio::task::spawn_blocking(move || {
+                    use std::io::Write;
+                    let _charge = charge;
+                    #[cfg(test)]
+                    if let Some((entered, release)) = pause {
+                        let _ = entered.send(());
+                        let _ = release.recv();
+                    }
+                    file.write_all(&chunk)?;
+                    Ok::<_, std::io::Error>(file)
+                })
+                .await
+                .map_err(std::io::Error::other)??,
+            );
+            self.length += length;
+            self.progress.send_replace((self.length, false));
+        }
+        Ok(())
+    }
+}
+
 struct CaptureQueueMemory {
+    // Blocking IO cannot be aborted. Keep admission until the actual IO exits.
+    _archive_permit: tokio::sync::OwnedSemaphorePermit,
     reservation: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
 }
 
@@ -497,17 +574,11 @@ impl Drop for CaptureQueueMemory {
 async fn fence_failed_capture(
     state: &AppState,
     identity: ArchiveSpoolIdentity,
+    target: CaptureTarget,
 ) -> Result<(), AppError> {
     #[cfg(test)]
     super::fence_probe::observe(state).await;
-    let result = observe_writer_database(identity, "response_spool_failed_fence", 0, async {
-        state
-            .db
-            .fail_response_archive_spool(identity, "capture_failed")
-            .await
-            .map(|()| true)
-    })
-    .await;
+    let result = target.publish_failure(&state.archive, identity).await;
     if let Err(error) = &result {
         tracing::warn!(
             request_id = %identity.request_id,
@@ -516,10 +587,150 @@ async fn fence_failed_capture(
             "failed response archive acknowledgement could not be fenced"
         );
     }
-    result.map(|_| ())
+    result
+}
+
+struct OriginalAdmission {
+    state: Option<AppState>,
+    identity: ArchiveSpoolIdentity,
+    target: CaptureTarget,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CaptureTarget {
+    Response,
+    DiscardedAttempt(crate::archive::RawResponseAttempt),
+}
+
+impl CaptureTarget {
+    pub(crate) async fn publish_failure(
+        self,
+        archive: &crate::archive::ArchiveStore,
+        identity: ArchiveSpoolIdentity,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Response => {
+                archive
+                    .publish_raw_capture_failure(
+                        identity.tenant_id,
+                        identity.request_id,
+                        "response",
+                    )
+                    .await
+            }
+            Self::DiscardedAttempt(attempt) => {
+                archive
+                    .publish_response_attempt_failure(
+                        identity.tenant_id,
+                        identity.request_id,
+                        attempt,
+                    )
+                    .await
+            }
+        }
+    }
+    async fn publish(
+        self,
+        archive: &crate::archive::ArchiveStore,
+        identity: ArchiveSpoolIdentity,
+        object: &crate::archive::CasArchiveObject,
+    ) -> Result<(), AppError> {
+        match self {
+            Self::Response => {
+                archive
+                    .publish_raw_capture(
+                        identity.tenant_id,
+                        identity.request_id,
+                        "response",
+                        object,
+                    )
+                    .await
+            }
+            Self::DiscardedAttempt(attempt) => {
+                archive
+                    .publish_response_attempt(
+                        identity.tenant_id,
+                        identity.request_id,
+                        attempt,
+                        object,
+                    )
+                    .await
+            }
+        }
+    }
+}
+
+impl OriginalAdmission {
+    fn disarm(mut self) {
+        self.state.take();
+    }
+}
+
+impl Drop for OriginalAdmission {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            crate::api::proxy::persistence::record_capture_failure_target(
+                &state,
+                self.identity,
+                self.target,
+            );
+        }
+    }
 }
 
 impl ResponseArchiveProducer {
+    #[cfg(test)]
+    pub(crate) async fn begin_original(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+    ) -> Option<Self> {
+        Self::admit_original(state, identity).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_original(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+    ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
+        Self::admit_target(state, identity, CaptureTarget::Response)
+    }
+
+    pub(crate) fn admit_target(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+        target: CaptureTarget,
+    ) -> impl std::future::Future<Output = Option<Self>> + Send + 'static {
+        let state = state.clone();
+        let admission = OriginalAdmission {
+            state: Some(state.clone()),
+            identity,
+            target,
+        };
+        async move {
+            // Keep the supplier stream unpolled while a bounded writer is busy.
+            // Accepted originals must not disappear merely because another
+            // response still owns the upload envelope.
+            let archive_permit = state
+                .proxy_archive_stream_permits
+                .clone()
+                .acquire_owned()
+                .await
+                .ok()?;
+            let memory = state
+                .persistence
+                .stream_memory
+                .temporary_wait(
+                    super::CAPTURE_MEMORY_BYTES,
+                    crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+                )
+                .await?;
+            let producer = Self::begin_admitted(&state, identity, memory, archive_permit, target);
+            admission.disarm();
+            Some(producer)
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn begin(
         state: &AppState,
         identity: ArchiveSpoolIdentity,
@@ -543,14 +754,28 @@ impl ResponseArchiveProducer {
             tracing::warn!(request_id = %identity.request_id, stage = "response_spool_memory_admission", "proxy archive gap");
             return None;
         }
+        Some(Self::begin_admitted(
+            state,
+            identity,
+            memory,
+            archive_permit,
+            CaptureTarget::Response,
+        ))
+    }
+
+    fn begin_admitted(
+        state: &AppState,
+        identity: ArchiveSpoolIdentity,
+        memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+        archive_permit: tokio::sync::OwnedSemaphorePermit,
+        target: CaptureTarget,
+    ) -> Self {
         let queue_memory = Arc::new(CaptureQueueMemory {
             reservation: memory,
+            _archive_permit: archive_permit,
         });
-        let chunk_memory = Arc::new(tokio::sync::Semaphore::new(
-            super::CAPTURE_DATABASE_BATCH_CHUNKS,
-        ));
-        let (sender, receiver) = tokio::sync::mpsc::channel(super::CAPTURE_QUEUE_CHUNKS);
-        let (terminal, terminal_receiver) = tokio::sync::oneshot::channel();
+        let (source, source_receiver) = tokio::sync::oneshot::channel();
+        let (progress, progress_receiver) = tokio::sync::watch::channel((0_u64, false));
         let active = Arc::new(AtomicBool::new(true));
         let writer_active = active.clone();
         let failure_active = active.clone();
@@ -560,8 +785,7 @@ impl ResponseArchiveProducer {
         let writer_memory = queue_memory.clone();
         let writer = super::OwnedTask::spawn(
             async move {
-                let _archive_permit = archive_permit;
-                let _queue_memory = writer_memory;
+                let _queue_memory = writer_memory.clone();
                 let _capture_metrics = writer_state.metrics.memory_usage(
                     crate::metrics::MemoryComponent::StreamCapture,
                     super::CAPTURE_MEMORY_BYTES,
@@ -569,9 +793,11 @@ impl ResponseArchiveProducer {
                 match run_response_archive_writer(
                     writer_state.clone(),
                     identity,
-                    receiver,
-                    terminal_receiver,
+                    source_receiver,
+                    progress_receiver,
+                    writer_memory,
                     writer_active,
+                    target,
                 )
                 .await
                 {
@@ -580,11 +806,11 @@ impl ResponseArchiveProducer {
                     // after its producer disappears. A successful gap fence
                     // is not a failed database operation.
                     Ok(WriterOutcome::Abandoned) => {
-                        fence_failed_capture(&writer_state, identity).await
+                        fence_failed_capture(&writer_state, identity, target).await
                     }
                     Err(error) => {
                         failure_active.store(false, Ordering::Release);
-                        let _ = fence_failed_capture(&writer_state, identity).await;
+                        let _ = fence_failed_capture(&writer_state, identity, target).await;
                         Err(error)
                     }
                 }
@@ -592,18 +818,23 @@ impl ResponseArchiveProducer {
             "response_spool_writer",
             Some(active.clone()),
         );
-        Some(Self {
+        Self {
             identity,
             #[cfg(test)]
             state: state.clone(),
-            sender: Some(sender),
-            chunk_memory,
-            terminal: Some(terminal),
-            pending: Vec::with_capacity(super::CHUNK_BYTES),
+            local: LocalCapture {
+                directory: state.config.responses_request_spool_path.clone().into(),
+                #[cfg(test)]
+                write_pause: None,
+                source: Some(source),
+                progress,
+                file: None,
+                length: 0,
+            },
             writer,
             active,
             _queue_memory: queue_memory,
-        })
+        }
     }
 
     #[cfg(test)]
@@ -614,66 +845,49 @@ impl ResponseArchiveProducer {
         ResponseArchiveWriter::begin_inner(state.clone(), identity).await
     }
 
-    pub(crate) fn append(&mut self, chunks: Vec<Bytes>) -> bool {
-        if !self.active.load(Ordering::Acquire) {
-            self.abandon("writer_inactive");
-            return false;
-        }
+    /// Only local bounded IO is on the delivery path. Object storage progress
+    /// never determines whether the supplier's next bytes can reach the client.
+    pub(crate) async fn append_with_backpressure(&mut self, chunk: Bytes) -> bool {
         #[cfg(test)]
         if take_append_failure_for_test(&self.state) {
             self.abandon("injected_append_failure");
             return false;
         }
-        for chunk in chunks {
-            let mut remaining = chunk.as_ref();
-            while !remaining.is_empty() {
-                let take = remaining.len().min(super::CHUNK_BYTES - self.pending.len());
-                self.pending.extend_from_slice(&remaining[..take]);
-                remaining = &remaining[take..];
-                if self.pending.len() == super::CHUNK_BYTES {
-                    let Some(sender) = self.sender.clone() else {
-                        return false;
-                    };
-                    let permit = match sender.try_reserve() {
-                        Ok(permit) => permit,
-                        Err(error) => {
-                            self.abandon(match error {
-                                tokio::sync::mpsc::error::TrySendError::Full(_) => "queue_capacity",
-                                tokio::sync::mpsc::error::TrySendError::Closed(_) => "queue_closed",
-                            });
-                            return false;
-                        }
-                    };
-                    let memory = match self.chunk_memory.clone().try_acquire_owned() {
-                        Ok(memory) => memory,
-                        Err(_) => {
-                            self.abandon("queue_capacity");
-                            return false;
-                        }
-                    };
-                    let full = Bytes::from(std::mem::take(&mut self.pending));
-                    permit.send(QueuedArchiveChunk {
-                        bytes: full,
-                        _memory: Some(memory),
-                    });
-                    self.pending = Vec::with_capacity(super::CHUNK_BYTES);
-                }
-            }
+        if !self.active.load(Ordering::Acquire) {
+            return false;
         }
-        true
+        let result = tokio::time::timeout(
+            crate::proxy_lifecycle::MAX_DOWNSTREAM_SEND_WAIT,
+            self.local.append(chunk, self._queue_memory.clone()),
+        )
+        .await;
+        if matches!(result, Ok(Ok(()))) {
+            true
+        } else {
+            self.abandon("local_capture_unavailable");
+            false
+        }
     }
 
     fn abandon(&mut self, reason: &'static str) {
         tracing::warn!(request_id = %self.identity.request_id, phase = "response_spool_producer", outcome = reason, "response capture abandoned");
         self.active.store(false, Ordering::Release);
-        self.sender.take();
-        self.terminal.take();
-        self.pending.clear();
+        self.local.source.take();
+        self.local.file.take();
+        self.local.progress.send_replace((self.local.length, true));
     }
 
     #[cfg(test)]
-    pub(super) fn queue_memory_owners_for_test(&self) -> usize {
-        Arc::strong_count(&self._queue_memory)
+    pub(super) fn pause_local_write_for_test(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered, entering) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        self.local.write_pause = Some((entered, released));
+        (entering, release)
     }
 
     #[cfg(test)]
@@ -682,30 +896,24 @@ impl ResponseArchiveProducer {
         self.writer.wait().await
     }
 
-    /// Hand the terminal tail to the owned writer. Database completion is
-    /// intentionally not on the downstream delivery path; the supervisor
-    /// observes the writer until it seals or fences the capture as a gap.
-    pub(crate) fn seal(self) -> Option<ResponseArchiveSettlement> {
-        let Self {
-            mut sender,
-            mut terminal,
-            pending,
-            mut writer,
-            active,
-            ..
-        } = self;
-        let tail = Bytes::from(pending);
-        let terminal = terminal.take()?;
-        if terminal.send(tail).is_err() {
-            active.store(false, Ordering::Release);
+    /// Local EOF is not an ACK. The owned writer still must publish its CAS root.
+    pub(crate) fn seal(mut self) -> Option<ResponseArchiveSettlement> {
+        if !self.active.load(Ordering::Acquire) {
             return None;
         }
-        sender.take();
-        writer.continue_on_drop();
-        Some(ResponseArchiveSettlement { _writer: writer })
+        // Publish EOF before closing an empty source: the receiver can wake
+        // concurrently as soon as its sender is dropped.
+        self.local.progress.send_replace((self.local.length, true));
+        self.local.file.take();
+        self.local.source.take();
+        self.writer.continue_on_drop();
+        Some(ResponseArchiveSettlement {
+            _writer: self.writer,
+        })
     }
 }
 
+#[cfg(test)]
 impl ResponseArchiveWriter {
     async fn begin_inner(
         state: AppState,
@@ -820,14 +1028,6 @@ impl ResponseArchiveWriter {
         Ok(())
     }
 
-    async fn append_chunk(&mut self, bytes: Bytes) -> Result<(), AppError> {
-        self.append_chunks(vec![QueuedArchiveChunk {
-            bytes,
-            _memory: None,
-        }])
-        .await
-    }
-
     #[cfg(test)]
     pub(super) async fn append_for_test(&mut self, chunks: Vec<Bytes>) -> Result<(), AppError> {
         let mut buffered = Vec::with_capacity(super::CHUNK_BYTES);
@@ -895,30 +1095,98 @@ enum WriterOutcome {
     Abandoned,
 }
 
+// Local EOF is only an input handoff. CAS completion and root publication
+// stay in the owned writer below and remain the archive acknowledgement.
+async fn drain_local_capture(
+    writer: &mut crate::archive::ArchiveWriter,
+    identity: ArchiveSpoolIdentity,
+    source: tokio::sync::oneshot::Receiver<
+        Arc<crate::gateway_body::local_body_file::LocalBodyFile>,
+    >,
+    mut progress: tokio::sync::watch::Receiver<(u64, bool)>,
+    memory: Arc<CaptureQueueMemory>,
+    active: Arc<AtomicBool>,
+) -> Result<WriterOutcome, AppError> {
+    let local = source.await.ok();
+    if let Some(local) = local {
+        let owner = local.clone();
+        let charge = memory.clone();
+        let mut file = tokio::task::spawn_blocking(move || {
+            let _charge = charge;
+            owner.reopen()
+        })
+        .await
+        .map_err(|_| AppError::internal("capture_local_open_task"))?
+        .map_err(|_| AppError::internal("capture_local_open"))?;
+        let mut offset = 0_u64;
+        loop {
+            if !active.load(Ordering::Acquire) {
+                return Ok(writer_interrupted(identity, "abandoned_before_append"));
+            }
+            let (available, sealed) = *progress.borrow_and_update();
+            if offset < available {
+                let take = (available - offset).min(super::CHUNK_BYTES as u64) as usize;
+                let charge = memory.clone();
+                let owner = local.clone();
+                let (next, bytes) = tokio::task::spawn_blocking(move || {
+                    use std::io::Read;
+                    let (_charge, _owner) = (charge, owner);
+                    let mut bytes = vec![0_u8; take];
+                    file.read_exact(&mut bytes)?;
+                    Ok::<_, std::io::Error>((file, Bytes::from(bytes)))
+                })
+                .await
+                .map_err(|_| AppError::internal("capture_local_read_task"))?
+                .map_err(|_| AppError::internal("capture_local_read"))?;
+                file = next;
+                offset += take as u64;
+                writer.write(bytes).await?;
+            } else if sealed {
+                break;
+            } else if progress.changed().await.is_err() {
+                return Ok(writer_interrupted(identity, "local_source_dropped"));
+            }
+        }
+    } else if !progress.borrow().1 {
+        return Ok(writer_interrupted(identity, "local_source_dropped"));
+    }
+    if !active.load(Ordering::Acquire) {
+        return Ok(writer_interrupted(identity, "abandoned_before_seal"));
+    }
+    Ok(WriterOutcome::Sealed)
+}
+
 async fn run_response_archive_writer(
     mut state: AppState,
     identity: ArchiveSpoolIdentity,
-    mut receiver: tokio::sync::mpsc::Receiver<QueuedArchiveChunk>,
-    terminal: tokio::sync::oneshot::Receiver<Bytes>,
+    source: tokio::sync::oneshot::Receiver<
+        Arc<crate::gateway_body::local_body_file::LocalBodyFile>,
+    >,
+    progress: tokio::sync::watch::Receiver<(u64, bool)>,
+    memory: Arc<CaptureQueueMemory>,
     active: Arc<AtomicBool>,
+    target: CaptureTarget,
 ) -> Result<WriterOutcome, AppError> {
     #[cfg(test)]
     pause_begin_for_test(&state).await;
+    let staging = format!(
+        "raw-capture-staging/{}/{}/{}",
+        identity.tenant_id,
+        identity.request_id,
+        uuid::Uuid::now_v7()
+    );
     let mut writer = loop {
-        state.db.refresh_closed_persistence_pool();
-        match ResponseArchiveWriter::begin_inner(state.clone(), identity).await {
+        if !active.load(Ordering::Acquire) {
+            return Ok(writer_interrupted(
+                identity,
+                "abandoned_before_storage_admission",
+            ));
+        }
+        match state.archive.start_writer(&staging).await {
             Ok(writer) => break writer,
-            Err(error)
-                if active.load(Ordering::Acquire)
-                    && (error.diagnostic_category() == "database_operation_failed"
-                        || error.diagnostic_category() == "database_pool_exhausted"
-                        || matches!(&error, AppError::DatabaseUnavailable(_))) =>
-            {
-                tracing::warn!(
-                    request_id = %identity.request_id,
-                    error_category = error.diagnostic_category(),
-                    "response archive retains queued bytes while begin recovers"
-                );
+            Err(error @ AppError::Storage { .. }) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    "accepted original awaits object storage admission");
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
             Err(error) => return Err(error),
@@ -926,34 +1194,72 @@ async fn run_response_archive_writer(
     };
     #[cfg(test)]
     pause_begin_ack_for_test(&state).await;
-    while let Some(first) = receiver.recv().await {
-        if !active.load(Ordering::Acquire) {
-            return Ok(writer_interrupted(identity, "abandoned_before_append"));
-        }
-        let mut batch = Vec::with_capacity(super::CAPTURE_DATABASE_BATCH_CHUNKS);
-        batch.push(first);
-        while batch.len() < super::CAPTURE_DATABASE_BATCH_CHUNKS {
-            match receiver.try_recv() {
-                Ok(chunk) => batch.push(chunk),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+    let captured =
+        drain_local_capture(&mut writer, identity, source, progress, memory, active).await;
+    if !matches!(captured, Ok(WriterOutcome::Sealed)) {
+        // Keep the owned task, memory charge and admission until abort really
+        // completes. ArchiveWriter::Drop remains only the crash/unwind fallback.
+        let cleanup_deadline =
+            std::time::Duration::from_millis(state.config.s3_timeouts.request_millis.into());
+        match tokio::time::timeout(cleanup_deadline, writer.abort()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                "failed to abort interrupted original capture")
+            }
+            Err(_) => {
+                tracing::warn!(request_id = %identity.request_id, error_code = "archive_abort_timeout",
+                "interrupted original cleanup reached the configured storage deadline")
             }
         }
-        writer.append_chunks(batch).await?;
+        return captured;
     }
-    let Ok(tail) = terminal.await else {
-        return Ok(writer_interrupted(identity, "terminal_sender_dropped"));
+    let staged = writer.finish_staged().await?;
+    let object = loop {
+        match state
+            .archive
+            .promote_staged_text_to_cas(identity.tenant_id, &staged)
+            .await
+        {
+            Ok(object) => break object,
+            Err(error @ AppError::Storage { .. }) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    "sealed original awaits immutable CAS promotion");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
     };
-    if !active.load(Ordering::Acquire) {
-        return Ok(writer_interrupted(identity, "abandoned_before_tail"));
+    loop {
+        match target.publish(&state.archive, identity, &object).await {
+            Ok(()) => break,
+            Err(error @ AppError::Storage { .. }) => {
+                tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+                    "immutable original awaits durable root publication");
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error),
+        }
     }
-    if !tail.is_empty() {
-        writer.append_chunk(tail).await?;
+    if let Err(error) = state.archive.delete(&staged.object_locator).await {
+        tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+            "complete original retains its temporary staging object for cleanup");
     }
-    if !active.load(Ordering::Acquire) {
-        return Ok(writer_interrupted(identity, "abandoned_before_seal"));
+    if matches!(target, CaptureTarget::DiscardedAttempt(_)) {
+        return Ok(WriterOutcome::Sealed);
     }
-    writer.seal_inner().await?;
+    state.db.refresh_closed_persistence_pool();
+    if let Err(error) = state
+        .db
+        .bind_raw_capture(identity.tenant_id, identity.request_id, "response", &object)
+        .await
+    {
+        // The immutable root is already the durable authority. The body
+        // worker retries relational binding from that root; a metadata outage
+        // must not relabel this complete original as a failed capture.
+        tracing::warn!(request_id = %identity.request_id, error_category = error.diagnostic_category(),
+            "raw response root awaits relational projection");
+    }
     Ok(WriterOutcome::Sealed)
 }
 
@@ -980,6 +1286,7 @@ fn writer_interrupted(identity: ArchiveSpoolIdentity, reason: &'static str) -> W
     WriterOutcome::Abandoned
 }
 
+#[cfg(test)]
 async fn observe_writer_database(
     identity: ArchiveSpoolIdentity,
     phase: &'static str,

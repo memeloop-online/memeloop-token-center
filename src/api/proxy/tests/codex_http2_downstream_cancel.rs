@@ -12,10 +12,13 @@ const PREFIX: &[u8] = concat!(
 )
 .as_bytes();
 
+const TAIL: &[u8] = b": retained after downstream cancellation\n\ndata: [DONE]\n\n";
+
 struct StalledHttp2 {
     endpoint: String,
     posts: Arc<AtomicUsize>,
     resets: tokio::sync::mpsc::UnboundedReceiver<http2::Reason>,
+    finish_body: tokio::sync::watch::Sender<bool>,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
 }
@@ -33,6 +36,7 @@ impl StalledHttp2 {
         let posts = Arc::new(AtomicUsize::new(0));
         let count = posts.clone();
         let (reset_sender, resets) = tokio::sync::mpsc::unbounded_channel();
+        let (finish_body, finished_body) = tokio::sync::watch::channel(false);
         let (stop, mut stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
@@ -46,6 +50,7 @@ impl StalledHttp2 {
                         let (stream, _) = accepted.unwrap();
                         let count = count.clone();
                         let reset_sender = reset_sender.clone();
+                        let finished_body = finished_body.clone();
                         tasks.spawn(async move {
                             let mut connection = http2::server::handshake(stream).await.unwrap();
                             let mut monitors = tokio::task::JoinSet::new();
@@ -83,10 +88,18 @@ impl StalledHttp2 {
                                         let mut stream = response.send_response(headers, false).unwrap();
                                         stream.send_data(bytes::Bytes::from_static(PREFIX), false).unwrap();
                                         let reset_sender = reset_sender.clone();
+                                        let mut finished_body = finished_body.clone();
                                         monitors.spawn(async move {
-                                            let reason = std::future::poll_fn(|context| stream.poll_reset(context))
-                                                .await.unwrap();
-                                            reset_sender.send(reason).unwrap();
+                                            tokio::select! {
+                                                reason = std::future::poll_fn(|context| stream.poll_reset(context)) => {
+                                                    reset_sender.send(reason.unwrap()).unwrap();
+                                                }
+                                                changed = finished_body.changed() => {
+                                                    changed.unwrap();
+                                                    assert!(*finished_body.borrow());
+                                                    stream.send_data(bytes::Bytes::from_static(TAIL), true).unwrap();
+                                                }
+                                            }
                                         });
                                         held_requests.push(request);
                                     }
@@ -110,6 +123,7 @@ impl StalledHttp2 {
             endpoint,
             posts,
             resets,
+            finish_body,
             stop: Some(stop),
             server,
         }
@@ -280,11 +294,13 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         connection.abort();
         drop(body);
     }
-    let reason = tokio::time::timeout(Duration::from_secs(3), upstream.resets.recv())
-        .await
-        .expect("downstream cancellation must cancel the silent upstream immediately")
-        .unwrap();
-    assert_eq!(reason, http2::Reason::CANCEL);
+    if pre_header {
+        let reason = tokio::time::timeout(Duration::from_secs(3), upstream.resets.recv())
+            .await
+            .expect("cancellation before response headers must release the upstream immediately")
+            .unwrap();
+        assert_eq!(reason, http2::Reason::CANCEL);
+    }
     tokio::time::timeout(
         Duration::from_secs(3),
         fixture.state.proxy_lifecycles.wait_for_idle(),
@@ -297,7 +313,6 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         .acquire_dispatch(&route, &fixture.state.metrics)
         .await
         .expect("dispatch permit must be returned without upstream EOF");
-    upstream.finish(expected_posts).await;
     let rows = fixture
         .state
         .db
@@ -326,7 +341,15 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         )
         .await;
         assert_eq!(receipt["terminal_cause"], "client_disconnected");
+        assert!(upstream.resets.try_recv().is_err());
+        // The request owner and dispatch lane are already released. Only
+        // the bounded original-body capture waits for the supplier's EOF.
+        upstream.finish_body.send(true).unwrap();
+        let original = [PREFIX, TAIL].concat();
+        cancellation::assert_original_response(&fixture, settled_request_id, &original).await;
+        cancellation::assert_unknown_request(&fixture, settled_request_id, 0).await;
     }
+    upstream.finish(expected_posts).await;
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     let reservations: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM usage_reservations WHERE id = (SELECT reservation_id FROM request_records WHERE id = $1)",
@@ -357,7 +380,8 @@ async fn assert_network_cancellation(reset_stream: bool, pre_header: bool, recov
         format!(
             "MTC_CONTROLLED_HTTP2_CANCEL {}\n",
             json!({
-                "case": label, "pre_header": pre_header, "posts": expected_posts, "upstream_reset": "CANCEL", "settlements": 0,
+                "case": label, "pre_header": pre_header, "posts": expected_posts,
+                "upstream_reset": pre_header.then_some("CANCEL"), "original_body_retained": !pre_header, "settlements": 0,
                 "financial_state": "unknown", "delivery_error": expected_error, "lifecycle_permit_released": true,
                 "dispatch_permit_released": true, "upstream_failures": 0
             })

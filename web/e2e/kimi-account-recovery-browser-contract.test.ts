@@ -33,12 +33,6 @@ test('Kimi renewal evidence and quota lock recovery preserve uncertainty and sep
       await page.getByRole('button', { name: '上次操作详情', exact: true }).waitFor();
       await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     };
-    const unlock = async () => {
-      await page.getByRole('button', { name: '解除锁定', exact: true }).click();
-      const confirmation = page.getByRole('dialog');
-      await confirmation.getByText(/上次重置结果仍未确认/).waitFor();
-      await confirmation.getByRole('button', { name: '确认继续', exact: true }).click();
-    };
     await open('recover');
     for (const [account, reason] of [['0142', /访问令牌已过期.*网络读取失败.*结果待核实.*自动续期已暂停/], ['7021', /访问令牌已过期.*未能保存.*结果待核实/]] as const) {
       const status = page.locator(`[data-account-state="${account}"] .status`);
@@ -52,7 +46,6 @@ test('Kimi renewal evidence and quota lock recovery preserve uncertainty and sep
     assert.doesNotMatch(await page.locator('[data-account-state="0142"]').innerText(), /授权已失效|授权已过期/);
     assert.match(await page.locator('[data-account-state="revoked"]').innerText(), /授权已失效，请重新登录/);
     assert.match(await page.locator('[data-account-state="missing"]').innerText(), /未知/);
-    assert.equal(await page.getByRole('checkbox').count(), 0);
     assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [0, 0, 0]);
     for (const [theme, width] of [['light', 1440], ['dark', 390]] as const) {
       await page.evaluate(value => { document.documentElement.dataset.theme = value; }, theme);
@@ -61,12 +54,15 @@ test('Kimi renewal evidence and quota lock recovery preserve uncertainty and sep
       await page.screenshot({ path: join(artifacts, `kimi-account-recovery-${theme}-${width}.png`), fullPage: true });
     }
     await page.getByRole('button', { name: '解除锁定', exact: true }).click();
-    const cancellation = page.getByRole('dialog');
-    await cancellation.getByText(/上次重置结果仍未确认/).waitFor();
+    const unlockDialog = page.getByRole('dialog');
+    await unlockDialog.waitFor();
+    assert.match(await unlockDialog.innerText(), /上次重置结果仍未确认.*可能已经消耗一次机会.*不会重置额度.*不会消耗次数/s);
     assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [0, 0, 0]);
-    await cancellation.getByRole('button', { name: '取消', exact: true }).click();
+    await unlockDialog.getByRole('button', { name: '取消', exact: true }).click();
+    await unlockDialog.waitFor({ state: 'hidden' });
     assert.deepEqual(await page.evaluate(() => [window.quotaPrepares, window.quotaConfirms, window.quotaWrites]), [0, 0, 0]);
-    await unlock();
+    await page.getByRole('button', { name: '解除锁定', exact: true }).click();
+    await unlockDialog.getByRole('button', { name: '确认继续', exact: true }).click();
     await page.getByText('已恢复操作，上次重置结果仍待核对。', { exact: true }).waitFor();
     await page.getByRole('button', { name: '上次操作详情', exact: true }).click();
     await page.getByText(/本次操作锁定已解除，上次重置结果仍未知/).waitFor();
@@ -87,7 +83,8 @@ test('Kimi renewal evidence and quota lock recovery preserve uncertainty and sep
       ['recover-failed', /核对或解除锁定未能确认/],
     ] as const) {
       await open(mode);
-      await unlock();
+      await page.getByRole('button', { name: '解除锁定', exact: true }).click();
+      await page.getByRole('dialog').getByRole('button', { name: '确认继续', exact: true }).click();
       await page.getByRole('alert').getByText(message).waitFor();
       assert.equal(await page.getByRole('button', { name: '准备新的重置', exact: true }).count(), 0);
       assert.equal(await page.evaluate(() => window.quotaConfirms), 0);

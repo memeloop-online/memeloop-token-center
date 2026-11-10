@@ -118,7 +118,15 @@ impl Database {
                     has_pending: row.try_get::<i64, _>("has_pending")? != 0,
                     diagnostic_json: row.try_get("oauth_refresh_diagnostic_json")?,
                 };
-                Ok((account_id, metadata.status(now)))
+                let mut status = metadata.status(now);
+                if let Some(account) = accounts.iter().find(|account| account.id == account_id) {
+                    status.allowed_actions.retain(|action| match *action {
+                        "reauthorize" => account.can_reauthorize,
+                        "refresh" => account.can_refresh,
+                        _ => true,
+                    });
+                }
+                Ok((account_id, status))
             })
             .collect()
     }
@@ -208,6 +216,36 @@ mod tests {
         assert_eq!(value["access_state"], "expired");
         assert_eq!(value["reauthorization_required"], false);
         assert_eq!(value["automatic_refresh_paused"], true);
+        assert!(
+            !value["allowed_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|action| action == "resume_local" || action == "refresh")
+        );
+        assert!(matches!(
+            database
+                .recover_upstream_oauth_refresh(account.id, PEPPER)
+                .await,
+            Err(AppError::Conflict(_))
+        ));
+        let started: Option<i64> = sqlx::query_scalar(
+            "SELECT request_started_at FROM upstream_oauth_refresh_leases WHERE account_id = $1",
+        )
+        .bind(account.id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert!(started.is_some());
+        assert_eq!(
+            database
+                .upstream_account_with_credential(account.id, PEPPER)
+                .await
+                .unwrap()
+                .0
+                .credential_generation,
+            account.credential_generation
+        );
         let persisted: Option<String> = sqlx::query_scalar("SELECT oauth_refresh_diagnostic_json FROM upstream_credentials WHERE upstream_account_id = $1 AND generation = 1")
             .bind(account.id.to_string()).fetch_one(&database.pool).await.unwrap();
         assert!(persisted.is_none());

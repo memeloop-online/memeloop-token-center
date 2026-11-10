@@ -129,6 +129,7 @@ async fn stream_fixture(
             conversation: None,
             protocol: Protocol::OpenAiResponses,
             tenant_id: key.tenant_id,
+            original_response_capture: false,
             memory: fixture.state.proxy_memory_budget.reservation(),
         },
         proxy_lifecycle_permit: fixture.state.proxy_lifecycles.start(),

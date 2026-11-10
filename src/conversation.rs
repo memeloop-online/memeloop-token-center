@@ -554,13 +554,7 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
     if !bytes.windows(5).any(|window| window == b"data:") {
         return None;
     }
-    let mut completed = None;
-    let mut text = String::new();
-    let mut chat_message = Map::new();
-    let mut chat_tools = BTreeMap::new();
-    let mut anthropic_message = None;
-    let mut blocks = BTreeMap::new();
-    let mut tool_inputs = BTreeMap::<u64, String>::new();
+    let mut accumulator = ReturnDocumentAccumulator::default();
     for line in bytes.split(|byte| *byte == b'\n') {
         let line = trim_ascii(line);
         let Some(payload) = line.strip_prefix(b"data:") else {
@@ -573,17 +567,44 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
         let Ok(value) = serde_json::from_slice::<Value>(payload) else {
             continue;
         };
+        accumulator.push(value);
+    }
+    accumulator.finish()
+}
+
+#[derive(Default)]
+pub(crate) struct ReturnDocumentAccumulator {
+    completed: Option<Value>,
+    text: String,
+    chat_message: Map<String, Value>,
+    chat_tools: BTreeMap<u64, Map<String, Value>>,
+    anthropic_message: Option<Value>,
+    blocks: BTreeMap<u64, Value>,
+    tool_inputs: BTreeMap<u64, String>,
+}
+
+impl ReturnDocumentAccumulator {
+    pub(crate) fn push(&mut self, value: Value) {
+        let Self {
+            completed,
+            text,
+            chat_message,
+            chat_tools,
+            anthropic_message,
+            blocks,
+            tool_inputs,
+        } = self;
         if let Some(response) = value.get("response").filter(|response| {
             response.get("output").is_some() || response.get("choices").is_some()
         }) {
-            completed = Some(response.clone());
-            continue;
+            *completed = Some(response.clone());
+            return;
         }
         if value.get("output").is_some()
             || (value.get("role").is_some() && value.get("content").is_some())
         {
-            completed = Some(value);
-            continue;
+            *completed = Some(value);
+            return;
         }
         if let Some(choices) = value.get("choices").and_then(Value::as_array) {
             for choice in choices {
@@ -591,7 +612,7 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
                     continue;
                 }
                 if let Some(message) = choice.get("message").and_then(Value::as_object) {
-                    chat_message = message.clone();
+                    *chat_message = message.clone();
                     chat_tools.clear();
                     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
                         for (index, call) in calls.iter().enumerate() {
@@ -604,7 +625,7 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
                     if let Some(role) = delta.get("role") {
                         chat_message.insert("role".into(), role.clone());
                     }
-                    append_stream_string(&mut chat_message, "content", delta.get("content"));
+                    append_stream_string(chat_message, "content", delta.get("content"));
                     if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                         for call in calls {
                             let Some(index) = call.get("index").and_then(Value::as_u64) else {
@@ -630,12 +651,12 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
                     }
                 }
             }
-            continue;
+            return;
         }
         match value.get("type").and_then(Value::as_str) {
             Some("message_start") => {
-                anthropic_message = value.get("message").cloned();
-                continue;
+                *anthropic_message = value.get("message").cloned();
+                return;
             }
             Some("content_block_start") => {
                 if let (Some(index), Some(block)) = (
@@ -644,7 +665,7 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
                 ) {
                     blocks.insert(index, block.clone());
                 }
-                continue;
+                return;
             }
             Some("content_block_delta") => {
                 if let Some(index) = value.get("index").and_then(Value::as_u64)
@@ -657,13 +678,13 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
                         tool_inputs.entry(index).or_default().push_str(fragment);
                     }
                 }
-                continue;
+                return;
             }
             _ => {}
         }
         if let Some(fragment) = value.get("delta").and_then(Value::as_str) {
             text.push_str(fragment);
-            continue;
+            return;
         }
         if let Some(fragment) = value
             .pointer("/delta/content")
@@ -673,46 +694,113 @@ pub fn raw_return_document(bytes: &[u8]) -> Option<Value> {
             text.push_str(fragment);
         }
     }
-    if let Some(value) = completed {
-        return Some(value);
-    }
-    if !chat_message.is_empty() || !chat_tools.is_empty() {
-        chat_message
-            .entry("role")
-            .or_insert_with(|| "assistant".into());
-        if !chat_tools.is_empty() {
-            chat_message.insert(
-                "tool_calls".into(),
-                chat_tools.into_values().map(Value::Object).collect(),
-            );
+
+    pub(crate) fn try_map_strings<E>(
+        &mut self,
+        mut transform: impl FnMut(&mut String) -> Result<(), E>,
+    ) -> Result<(), E> {
+        fn walk<E>(
+            value: &mut Value,
+            transform: &mut impl FnMut(&mut String) -> Result<(), E>,
+        ) -> Result<(), E> {
+            match value {
+                Value::String(text) => transform(text)?,
+                Value::Array(values) => {
+                    for value in values {
+                        walk(value, transform)?;
+                    }
+                }
+                Value::Object(values) => {
+                    for value in values.values_mut() {
+                        walk(value, transform)?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
         }
-        return Some(serde_json::json!({"choices": [{"message": chat_message}]}));
-    }
-    if anthropic_message.is_some() || !blocks.is_empty() {
-        let mut message =
-            anthropic_message.unwrap_or_else(|| serde_json::json!({"role": "assistant"}));
-        for (index, input) in tool_inputs {
-            if let Some(block) = blocks.get_mut(&index)
-                && let Ok(input) = serde_json::from_str::<Value>(&input)
-            {
-                block["input"] = input;
+        transform(&mut self.text)?;
+        if let Some(value) = &mut self.completed {
+            walk(value, &mut transform)?;
+        }
+        if let Some(value) = &mut self.anthropic_message {
+            walk(value, &mut transform)?;
+        }
+        for value in self.chat_message.values_mut() {
+            walk(value, &mut transform)?;
+        }
+        for call in self.chat_tools.values_mut() {
+            for value in call.values_mut() {
+                walk(value, &mut transform)?;
             }
         }
-        if !blocks.is_empty() {
-            message["content"] = blocks.into_values().collect();
+        for value in self.blocks.values_mut() {
+            walk(value, &mut transform)?;
         }
-        return Some(message);
+        for text in self.tool_inputs.values_mut() {
+            transform(text)?;
+        }
+        Ok(())
     }
-    if text.is_empty() {
-        return None;
+
+    pub(crate) fn finish(self) -> Option<Value> {
+        self.finish_with_tool_input(|input| serde_json::from_str::<Value>(input).ok())
     }
-    Some(serde_json::json!({
-        "output": [{
-            "type": "message",
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text}]
-        }]
-    }))
+
+    pub(crate) fn finish_with_tool_input(
+        self,
+        mut decode: impl FnMut(&str) -> Option<Value>,
+    ) -> Option<Value> {
+        let Self {
+            completed,
+            text,
+            mut chat_message,
+            chat_tools,
+            anthropic_message,
+            mut blocks,
+            tool_inputs,
+        } = self;
+        if let Some(value) = completed {
+            return Some(value);
+        }
+        if !chat_message.is_empty() || !chat_tools.is_empty() {
+            chat_message
+                .entry("role")
+                .or_insert_with(|| "assistant".into());
+            if !chat_tools.is_empty() {
+                chat_message.insert(
+                    "tool_calls".into(),
+                    chat_tools.into_values().map(Value::Object).collect(),
+                );
+            }
+            return Some(serde_json::json!({"choices": [{"message": chat_message}]}));
+        }
+        if anthropic_message.is_some() || !blocks.is_empty() {
+            let mut message =
+                anthropic_message.unwrap_or_else(|| serde_json::json!({"role": "assistant"}));
+            for (index, input) in tool_inputs {
+                if let Some(block) = blocks.get_mut(&index)
+                    && let Some(input) = decode(&input)
+                {
+                    block["input"] = input;
+                }
+            }
+            if !blocks.is_empty() {
+                message["content"] = blocks.into_values().collect();
+            }
+            return Some(message);
+        }
+        if text.is_empty() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}]
+            }]
+        }))
+    }
 }
 
 fn append_stream_string(target: &mut Map<String, Value>, key: &str, fragment: Option<&Value>) {
@@ -1599,7 +1687,7 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
     &bytes[start..end]
 }
 
-pub(crate) fn digest_parts(parent: Option<&str>, atom: &str) -> String {
+pub fn digest_parts(parent: Option<&str>, atom: &str) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(parent.unwrap_or("root").as_bytes());
     hash.update(&[0]);
