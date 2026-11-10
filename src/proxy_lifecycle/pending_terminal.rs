@@ -1678,13 +1678,6 @@ impl Journal {
             .unwrap_or_else(|e| e.into_inner())
             .entries
             .remove(&snapshot.receipt_id);
-        let awaiting_candidate = snapshot.claim.is_some()
-            && snapshot.financial_ack.is_none()
-            && snapshot.financial_evidence_unavailable()
-            && matches!(
-                snapshot.conversation_state,
-                ConversationState::Enqueued | ConversationState::NotRequested
-            );
         let snapshot = Arc::new(snapshot);
         let receipt_id = snapshot.receipt_id;
         let applied = snapshot.financial_ack.as_ref().is_some_and(|ack| {
@@ -1742,13 +1735,14 @@ impl Journal {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&receipt_id)
             .is_none();
-        if completed && awaiting_candidate {
-            if let Some(digest) = digest {
-                self.awaiting_evidence
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remember(receipt_id, digest);
-            }
+        if digest.is_some_and(|digest| {
+            self.awaiting_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get(&receipt_id)
+                .is_some_and(|(known, _)| *known == digest)
+        }) {
             return false;
         }
         completed
@@ -2050,6 +2044,23 @@ impl Journal {
                 || preparation_failed
                 || (reconcile && source_durable && !snapshot.financial_evidence_unavailable()));
         if removed || evict_unknown {
+            if evict_unknown
+                && !removed
+                && conversation_complete
+                && pending.get(&receipt_id).is_some_and(|entry| {
+                    entry.recovered
+                        && entry.unknown_annotated
+                        && entry.snapshot.claim.is_some()
+                        && entry.snapshot.financial_ack.is_none()
+                        && entry.snapshot.financial_evidence_unavailable()
+                })
+                && let Ok(bytes) = serde_json::to_vec(snapshot.as_ref())
+            {
+                self.awaiting_evidence
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remember(receipt_id, *blake3::hash(&bytes).as_bytes());
+            }
             pending.remove(&receipt_id);
             if removed {
                 tracing::info!(%request_id, %receipt_id, financial_state = "settled", "terminal settlement acknowledged and receipt retired");
