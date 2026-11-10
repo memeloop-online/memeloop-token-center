@@ -347,6 +347,8 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .finish(),
     );
     let mock = MockServer::start().await;
+    let original_response =
+        serde_json::to_vec(&json!({"vendor_answer": "non-openai-shape"})).unwrap();
     Mock::given(method("POST"))
         .and(path("/vendor/infer"))
         .and(matches_header("x-plugin-shape", "buffered-v1"))
@@ -354,9 +356,9 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             "prompt": "from-component",
             "model": "vendor-model"
         })))
-        .respond_with(ResponseTemplate::new(207).set_body_json(json!({
-            "vendor_answer": "non-openai-shape"
-        })))
+        .respond_with(
+            ResponseTemplate::new(207).set_body_raw(original_response.clone(), "application/json"),
+        )
         .expect(2)
         .mount(&mock)
         .await;
@@ -466,9 +468,6 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         .unwrap();
     assert_eq!(exact_account.summary.total_requests, 2);
 
-    let inspection = sqlx::AnyPool::connect(&state.config.database_url)
-        .await
-        .unwrap();
     for request in requests {
         let refs = state
             .db
@@ -476,30 +475,31 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
             .await
             .unwrap();
         let cas_prefix = format!("tenants/{}/cas/v1/blake3/", key.tenant_id);
-        assert_eq!(
-            refs.request_object,
-            format!(
-                "staging/proxy/{0}/request/{0}/body.json",
-                request.request_id
-            )
-        );
+        assert!(refs.request_object.starts_with(&cas_prefix));
         let response_object = refs.response_object.as_deref().unwrap();
-        assert!(
-            response_object.starts_with(&cas_prefix)
-                || response_object
-                    .starts_with(&format!("staging/proxy/{}/response/", request.request_id))
-        );
-        let bound: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM response_archive_spools s JOIN request_records r ON r.id = s.request_id AND r.tenant_id = s.tenant_id AND r.reservation_id = s.reservation_id WHERE r.id = $1 AND r.key_id = $2 AND r.tenant_id = $3 AND s.state = 'bound' AND s.bound_locator = $4 AND r.response_object = $4",
-        )
-        .bind(request.request_id.to_string())
-        .bind(key.key_id.to_string())
-        .bind(key.tenant_id.to_string())
-        .bind(response_object)
-        .fetch_one(&inspection)
-        .await
-        .unwrap();
-        assert_eq!(bound, 1);
+        assert!(response_object.starts_with(&cas_prefix));
+        for (side, locator) in [
+            ("request", refs.request_object.as_str()),
+            ("response", response_object),
+        ] {
+            let root = state
+                .archive
+                .raw_capture_reference(key.tenant_id, request.request_id, side)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(root.object_locator, locator);
+            let bytes = state
+                .archive
+                .get_tenant_content(key.tenant_id, &root, 1024 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(root.size_bytes, bytes.len() as u64);
+            assert_eq!(
+                root.blake3_digest,
+                blake3::hash(&bytes).to_hex().to_string()
+            );
+        }
         let archived_request = state
             .archive
             .get_bounded(&refs.request_object, 1024 * 1024)
@@ -519,10 +519,7 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
                 "max_tokens": 32
             })
         );
-        assert_eq!(
-            serde_json::from_slice::<Value>(&archived_response).unwrap()["choices"][0]["message"]["content"],
-            "normalized by component"
-        );
+        assert_eq!(archived_response.as_ref(), original_response.as_slice());
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&archived_request),
@@ -531,7 +528,6 @@ async fn real_component_provider_normalizes_non_openai_upstream_and_core_owns_se
         assert!(!combined.contains("component-api-secret"));
         assert!(!combined.contains("component-api-secret-rotated"));
     }
-    inspection.close().await;
 }
 
 #[tokio::test]

@@ -576,6 +576,24 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
         .execute(&inspection)
         .await
         .unwrap();
+    let request = state
+        .archive
+        .put_tenant_content(
+            key.tenant_id,
+            bytes::Bytes::from_static(br#"{"prompt":"bounded"}"#),
+        )
+        .await
+        .unwrap();
+    state
+        .archive
+        .publish_raw_capture(key.tenant_id, text_id, "request", &request)
+        .await
+        .unwrap();
+    state
+        .archive
+        .publish_raw_capture_failure(key.tenant_id, text_id, "response")
+        .await
+        .unwrap();
     let (status, text_detail) = get_json(
         &state,
         &format!("/internal/v1/requests/{text_id}"),
@@ -589,7 +607,7 @@ async fn request_projection_preserves_source_truth_scope_and_cross_source_cursor
     assert_eq!(text_detail["archive"]["response"]["state"], "gap");
     assert_eq!(
         text_detail["archive"]["response"]["reason"],
-        "upload_failed"
+        "capture_failed"
     );
     assert_eq!(text_detail["usage"]["tokens"]["input_tokens"], 4);
     assert_eq!(text_detail["billing"]["cost"], "0.125");

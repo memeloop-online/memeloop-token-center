@@ -188,8 +188,8 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     assert_eq!(
         fixture.state.responses_request_spool.read_count_for_test(),
-        spool_reads + 2,
-        "terminal projection reads the durable source once after routing released its JSON working set"
+        spool_reads + 1,
+        "terminal metadata seeds reuse the archived source without rereading the request spool"
     );
     let mut found_receipt = false;
     for receipt in fixture.state.pending_terminals.receipt_jsons_for_test() {
@@ -201,10 +201,7 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
             bytes.len() < RETAINED_BYTES,
             "journal must not copy raw padding"
         );
-        assert_eq!(
-            receipt["conversation"]["request_json"],
-            json!({"input": "small semantic input"})
-        );
+        assert_eq!(receipt["conversation"]["request_json"], json!({}));
         found_receipt = true;
     }
     assert!(
@@ -263,8 +260,8 @@ async fn large_source_backed_conversation_stream_releases_raw_bytes_before_termi
     );
     assert_eq!(
         fixture.state.responses_request_spool.read_count_for_test(),
-        spool_reads + 2,
-        "settlement and archival reuse the terminal projection without a third source read"
+        spool_reads + 1,
+        "the source archive worker preserves conversation content without another request-spool read"
     );
     pool.close().await;
     drop(retirement);
@@ -581,7 +578,7 @@ async fn terminal_followed_by_unterminated_data_never_leaks_terminal_or_archives
 }
 
 #[tokio::test]
-async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
+async fn codex_crlf_terminal_redacts_delivery_and_archives_original_comments() {
     let fixture = codex_route_fixture("terminal-crlf-safe-comment").await;
     let upstream = MockServer::start().await;
     let secret = "Authorization: provider-comment-secret";
@@ -636,7 +633,7 @@ async fn codex_crlf_terminal_releases_at_eof_and_archives_only_safe_comments() {
         .get(refs.response_object.as_deref().expect("response archive"))
         .await
         .unwrap();
-    assert!(!String::from_utf8_lossy(&archived).contains(secret));
+    assert_eq!(archived.as_ref(), sse.as_bytes());
     upstream.verify().await;
 }
 
@@ -644,73 +641,36 @@ pub(super) async fn pending_response_archive(
     fixture: &CodexRouteFixture,
     receipt: &Value,
 ) -> String {
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-
     drain_archive_capture(fixture).await;
-    let request_id = receipt["request_id"].as_str().unwrap();
+    let tenant = Uuid::parse_str(receipt["tenant_id"].as_str().unwrap()).unwrap();
+    let request = Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap();
+    let reference = fixture
+        .state
+        .archive
+        .raw_capture_reference(tenant, request, "response")
+        .await
+        .unwrap()
+        .expect("the original upstream response must be independently retained");
+    let archived = fixture
+        .state
+        .archive
+        .get_tenant_content(tenant, &reference, MAX_PROXY_RESPONSE_BODY)
+        .await
+        .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
-    let spool = sqlx::query(
-        "SELECT tenant_id, reservation_id, state, chunk_count, byte_count \
-         FROM response_archive_spools WHERE request_id = $1",
+    let chunks: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM response_archive_spool_chunks WHERE request_id = $1",
     )
-    .bind(request_id)
+    .bind(request.to_string())
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(
-        spool.get::<String, _>("tenant_id"),
-        receipt["tenant_id"].as_str().unwrap()
+        chunks, 0,
+        "new raw capture must not put body chunks back in CNPG"
     );
-    assert_eq!(
-        spool.get::<String, _>("reservation_id"),
-        receipt["reservation"]["id"].as_str().unwrap()
-    );
-    assert_eq!(spool.get::<String, _>("state"), "pending");
-    let chunks = sqlx::query(
-        "SELECT seq, ciphertext, byte_count FROM response_archive_spool_chunks \
-         WHERE request_id = $1 ORDER BY seq",
-    )
-    .bind(request_id)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(chunks.len() as i64, spool.get::<i64, _>("chunk_count"));
-    assert!(!chunks.is_empty());
-    let mut archived = Vec::new();
-    for (index, chunk) in chunks.iter().enumerate() {
-        let sequence = chunk.get::<i64, _>("seq");
-        assert_eq!(sequence, index as i64);
-        let ciphertext = chunk.get::<String, _>("ciphertext");
-        let (sealed, compressed, version) = match ciphertext.strip_prefix("zstd1.") {
-            Some(sealed) => (sealed, true, 2),
-            None => (ciphertext.as_str(), false, 1),
-        };
-        let aad = format!(
-            "memeloop-token-center/response-archive-spool/v{version}/{}/{request_id}/{}/{sequence}",
-            spool.get::<String, _>("tenant_id"),
-            spool.get::<String, _>("reservation_id"),
-        );
-        let envelope: Value = crate::provider::open_envelope(
-            sealed,
-            fixture.state.config.key_pepper.as_bytes(),
-            aad.as_bytes(),
-        )
-        .unwrap();
-        let payload = URL_SAFE_NO_PAD
-            .decode(envelope["bytes"].as_str().unwrap())
-            .unwrap();
-        let expected_bytes = usize::try_from(chunk.get::<i64, _>("byte_count")).unwrap();
-        let payload = if compressed {
-            zstd::bulk::decompress(&payload, expected_bytes).unwrap()
-        } else {
-            payload
-        };
-        assert_eq!(payload.len(), expected_bytes);
-        archived.extend_from_slice(&payload);
-    }
-    assert_eq!(archived.len() as i64, spool.get::<i64, _>("byte_count"));
     pool.close().await;
-    String::from_utf8(archived).unwrap()
+    String::from_utf8(archived.to_vec()).unwrap()
 }
 
 pub(super) async fn assert_unknown_response_archives_omit(
@@ -750,7 +710,8 @@ pub(super) async fn assert_unknown_response_archives_omit(
 }
 
 #[tokio::test]
-async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive() {
+async fn codex_failed_then_bare_secret_event_is_redacted_for_delivery_and_preserved_in_raw_archive()
+{
     let fixture = codex_route_fixture("failed-bare-secret-event").await;
     let active_owners = fixture.state.proxy_lifecycles.active();
     let upstream = MockServer::start().await;
@@ -795,8 +756,6 @@ async fn codex_failed_then_bare_secret_event_never_reaches_delivery_or_archive()
     )
     .await;
     let archived = pending_response_archive(&fixture, &receipt).await;
-    assert!(archived.contains("upstream request failed"));
-    assert!(!archived.contains("provider-payload-secret"));
-    assert!(!archived.contains("bare-event-secret"));
+    assert_eq!(archived, sse);
     upstream.verify().await;
 }

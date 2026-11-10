@@ -35,6 +35,10 @@ curl https://mtc.example.com/v1/models \
   -H "Authorization: Bearer mtc_example_client_key"
 ```
 
+## 交互式请求示例
+
+<RequestExample locale="zh" />
+
 ## 查看自己的请求与用量
 
 客户端凭证可以通过 `/self/v1/*` 查询自己的数据：
