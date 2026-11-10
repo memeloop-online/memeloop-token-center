@@ -979,7 +979,6 @@ impl Drop for RequestSpool {
     }
 }
 
-#[cfg(test)]
 fn verified_body(shared: &SharedBody, body: Bytes) -> Result<Bytes, RequestSpoolReadError> {
     if body.len() != shared.length || *blake3::hash(&body).as_bytes() != shared.digest {
         return Err(RequestSpoolReadError);
