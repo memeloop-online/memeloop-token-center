@@ -637,13 +637,20 @@ async fn assert_inference_archive(
                 .request_archive_refs(key_id, request_id)
                 .await
                 .unwrap();
-            let response_location = refs.response_object.clone();
-            let detail = crate::api::request_detail::request_detail(state, refs).await;
+            let detail = crate::api::request_detail::request_detail(state, refs.clone()).await;
             if detail.archive_complete {
                 if let Some(expected) = expected_sse {
-                    let archived = state
-                        .archive
-                        .get(response_location.as_deref().expect("canonical SSE object"))
+                    let canonical_response =
+                        crate::api::request_detail::request_archive_content_response(
+                            state,
+                            &axum::http::HeaderMap::new(),
+                            &refs,
+                            crate::api::request_detail::RequestArchiveSide::Response,
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(canonical_response.status(), StatusCode::OK);
+                    let archived = axum::body::to_bytes(canonical_response.into_body(), 65_536)
                         .await
                         .unwrap();
                     assert_eq!(
