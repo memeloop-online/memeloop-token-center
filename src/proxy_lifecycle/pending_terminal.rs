@@ -1122,6 +1122,25 @@ impl Journal {
     }
 
     #[cfg(test)]
+    pub(crate) async fn recover_snapshot_for_test(
+        &self,
+        database: &Database,
+        snapshot: serde_json::Value,
+    ) -> bool {
+        self.recover_one(database, serde_json::from_value(snapshot).unwrap())
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn awaiting_evidence_for_test(&self, receipt_id: Uuid) -> bool {
+        self.awaiting_evidence
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&receipt_id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn contains_receipt_for_test(&self, receipt_id: Uuid) -> bool {
         self.pending
             .lock()
@@ -1629,7 +1648,7 @@ impl Journal {
                 .unwrap_or_else(|e| e.into_inner())
                 .entries
                 .get(&receipt_id)
-                .is_some_and(|(_, known)| known.as_ref() == Some(&version))
+                .is_some_and(|(_, known)| version.is_some() && *known == version)
             {
                 continue;
             }
@@ -1650,7 +1669,7 @@ impl Journal {
                 .entries
                 .get_mut(&receipt_id)
             {
-                *known = Some(version);
+                *known = version;
             }
         }
         progressed
