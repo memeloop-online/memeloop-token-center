@@ -34,9 +34,11 @@ test('Kimi renewal evidence and quota lock recovery preserve uncertainty and sep
       await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     };
     await open('recover');
-    for (const [account, reason] of [['0142', /访问令牌已过期.*网络读取失败.*结果待核实.*自动续期已暂停/], ['7021', /访问令牌已过期.*未能保存.*结果待核实/]] as const) {
-      const status = page.locator(`[data-account-state="${account}"] .status`);
-      assert.equal(await status.innerText(), '续期结果待核对');
+    for (const [account, label, reason] of [['0142', '续期时网络读取失败，结果待核实', /网络读取失败.*结果待核实.*自动续期已暂停/], ['7021', '续期结果未能保存，结果待核实', /未能保存.*结果待核实/]] as const) {
+      const accountState = page.locator(`[data-account-state="${account}"]`);
+      assert.equal(await accountState.getByText('访问令牌已过期', { exact: true }).count(), 1);
+      const status = accountState.locator('.status[tabindex="0"]');
+      assert.equal(await status.innerText(), label);
       await status.focus();
       await page.getByRole('tooltip').filter({ hasText: reason }).waitFor();
       assert.match(await page.getByRole('tooltip').innerText(), reason);
