@@ -148,7 +148,7 @@ async fn native_codex_image_uses_oauth_transport_and_non_streaming_responses_too
     });
     let response = crate::api::proxy::codex_transport::with_test_endpoint(
         upstream.uri(),
-        router_for_role(state, RuntimeRole::Gateway).oneshot(
+        router_for_role(state.clone(), RuntimeRole::Gateway).oneshot(
             Request::post("/v1/images/generations")
                 .header(header::CONTENT_TYPE, "application/json")
                 .header(header::AUTHORIZATION, format!("Bearer {}", issued.key))
@@ -185,15 +185,10 @@ async fn native_codex_image_uses_oauth_transport_and_non_streaming_responses_too
     assert_eq!(forwarded["store"], false);
     assert_eq!(forwarded["tools"][0]["type"], "image_generation");
     assert_eq!(forwarded["tools"][0]["model"], "gpt-image-2");
-    tokio::time::timeout(Duration::from_secs(5), fixture.state.drain_proxy_tasks())
+    tokio::time::timeout(Duration::from_secs(5), state.drain_proxy_tasks())
         .await
         .unwrap();
-    let records = fixture
-        .state
-        .db
-        .list_requests(fixture.key_id, 10)
-        .await
-        .unwrap();
+    let records = state.db.list_requests(issued.key_id, 10).await.unwrap();
     assert_eq!(
         records.len(),
         1,
