@@ -1611,19 +1611,21 @@ async fn unknown_failure_retries_operational_projection() {
     replay["usage"]["input_tokens"] = json!(3);
     replay["usage"]["output_tokens"] = json!(2);
     assert!(
-        recovery
+        !recovery
             .recover_snapshot_for_test(&fixture.state.db, replay)
-            .await,
-        "new provider evidence must re-enter the original fenced financial transaction"
+            .await
     );
-    assert!(!recovery.awaiting_evidence_for_test(receipt_id));
-    let financial: (String, i64, i64) = sqlx::query_as(
+    assert!(
+        !recovery.awaiting_evidence_for_test(receipt_id),
+        "changed provider evidence must leave the cache and re-enter the original financial guard"
+    );
+    // This fixture has already projected its unknown terminal. The original
+    // finish guard refuses a completed record without a matching financial
+    // receipt; recovery must preserve that authority conflict, not bypass it.
+    let financial: (String, Option<i64>, i64) = sqlx::query_as(
         "SELECT p.state,p.cost_micros,(SELECT COUNT(*) FROM ledger_entries WHERE source=p.reservation_id) FROM pending_proxy_settlements p WHERE p.request_id=$1",
     ).bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
-    assert_eq!(financial.0, "applied");
-    assert!(financial.1 > 0);
-    assert_eq!(financial.2, 1);
-
+    assert_eq!(financial, ("pending".to_owned(), None, 0));
     pool.close().await;
     upstream.verify().await;
 }
