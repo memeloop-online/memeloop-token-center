@@ -1657,6 +1657,18 @@ async fn proxy_with_cancellation_guard(
             }
             result => (result, None),
         };
+        let (result, model_rejected) = match result {
+            Ok(mut result)
+                if !route_candidates.as_slice().is_empty()
+                    || !deferred_shared_probes.is_empty() =>
+            {
+                let (response, rejected) =
+                    upstream_error::inspect_model_rejection(result.response).await;
+                result.response = response;
+                (Ok(result), rejected)
+            }
+            result => (result, false),
+        };
         if active_route.is_codex()
             && let Ok(response) = &result
         {
@@ -1705,6 +1717,7 @@ async fn proxy_with_cancellation_guard(
             outbound_attempt,
             &result,
             rate_limit,
+            model_rejected,
         );
         let candidate_unavailable = matches!(
             &result,
@@ -1752,11 +1765,15 @@ async fn proxy_with_cancellation_guard(
                 })
                 .await;
         }
-        let disposition = routing::failover_disposition(
-            result.as_ref().ok().map(|result| result.response.status()),
-            result.as_ref().err(),
-            rate_limit,
-        );
+        let disposition = if model_rejected {
+            routing::outcome::FailoverDisposition::ModelRejected
+        } else {
+            routing::failover_disposition(
+                result.as_ref().ok().map(|result| result.response.status()),
+                result.as_ref().err(),
+                rate_limit,
+            )
+        };
         if disposition.is_definite_rejection() {
             attempt_budget.note_definite_rejection();
             rejected_models.insert(candidate_model);
