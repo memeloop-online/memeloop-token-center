@@ -224,7 +224,7 @@ impl OAuthRefreshMetadata {
             allowed_actions.insert(0, "resume_local");
         } else if self.revoked_at.is_none()
             && ((self.request_started_at.is_none()
-                && !self.lease_expires_at.is_some_and(|expiry| expiry > now)
+                && self.lease_expires_at.is_none_or(|expiry| expiry <= now)
                 && matches!(
                     refresh_state,
                     OAuthRefreshState::NotObserved | OAuthRefreshState::Failed
