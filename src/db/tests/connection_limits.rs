@@ -83,7 +83,8 @@ async fn pool_timeout_diagnostics_distinguish_roles_without_exposing_connection_
             .options()
             .clone()
             .acquire_timeout(Duration::from_millis(20))
-            .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+            .connect_lazy_with(database.pool.connect_options().as_ref().clone())
+            .into();
         let mut held = Vec::new();
         for _connection in 0..pool_max {
             held.push(database.pool.acquire().await.unwrap());
@@ -423,7 +424,8 @@ async fn request_pool_wait_survives_timeout_and_cancels_cleanly() {
         .options()
         .clone()
         .acquire_timeout(Duration::from_millis(20))
-        .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone())
+        .into();
     // Exercise the PostgreSQL retry policy with a local held connection;
     // the helper only acquires a slot and does not execute backend SQL.
     database.backend = super::super::DatabaseBackend::PostgreSql;
@@ -460,12 +462,13 @@ async fn startup_waits_through_delayed_pool_availability_and_remains_cancellable
         directory.path().join("startup-wait.db").display()
     );
     let database = Database::connect_with_max(&database_url, 1).await.unwrap();
-    let pool = database
+    let pool: super::super::AnyPool = database
         .pool
         .options()
         .clone()
         .acquire_timeout(Duration::from_millis(20))
-        .connect_lazy_with(database.pool.connect_options().as_ref().clone());
+        .connect_lazy_with(database.pool.connect_options().as_ref().clone())
+        .into();
     let held = pool.acquire().await.unwrap();
     assert!(
         tokio::time::timeout(
@@ -513,10 +516,7 @@ async fn postgres_request_lock_wait_exceeds_ten_seconds_and_can_be_cancelled() {
         .await
         .unwrap();
     let mut waiting = tokio::spawn(async move {
-        let mut connection = super::super::request_connection::RequestConnection::new(
-            waiter_connection,
-            super::super::DatabaseBackend::PostgreSql,
-        );
+        let mut connection = waiter_connection;
         let result = sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(lock_id)
             .execute(&mut *connection)

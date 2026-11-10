@@ -6,9 +6,10 @@ use std::{
     time::Duration,
 };
 
+use super::request_pool::RequestPool as AnyPool;
 #[cfg(test)]
 use bytes::Bytes;
-use sqlx::{AnyPool, Row, any::AnyPoolOptions};
+use sqlx::{Row, any::AnyPoolOptions};
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 
@@ -63,11 +64,14 @@ impl GatewayPersistence {
         let application_name = super::postgres_application_name("mtc-gateway-archive");
         let pool = AnyPoolOptions::new()
             .max_connections(1)
+            .test_before_acquire(matches!(backend, DatabaseBackend::Sqlite))
             .min_connections(0)
             .acquire_timeout(acquire_timeout)
             .idle_timeout(Some(Duration::from_secs(60)))
             .after_release(move |connection, _metadata| {
-                Box::pin(async move { Ok(super::request_connection::can_reuse(connection, backend)) })
+                Box::pin(
+                    async move { Ok(super::request_connection::can_reuse(connection, backend)) },
+                )
             })
             .after_connect(move |connection, _| {
                 let application_name = application_name.clone();
@@ -79,19 +83,19 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
-                            sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
-                                .bind(application_name)
-                                .execute(&mut *connection)
-                                .await?;
-                            sqlx::raw_sql(super::POSTGRES_SERVE_SETTINGS)
-                                .execute(&mut *connection)
-                                .await?;
+                            super::initialize_postgres_connection(
+                                connection,
+                                &application_name,
+                                super::ConnectionProfile::Serve,
+                            )
+                            .await?;
                         }
                     }
                     Ok(())
                 })
             })
-            .connect_lazy(url)?;
+            .connect_lazy(url)?
+            .into();
         Ok(Self {
             pool,
             slots: Arc::new(Semaphore::new(TASK_LIMIT)),
@@ -671,7 +675,7 @@ impl Database {
     #[cfg(test)]
     pub(crate) async fn hold_gateway_archive_connection_for_test(
         &self,
-    ) -> sqlx::pool::PoolConnection<sqlx::Any> {
+    ) -> super::request_connection::RequestConnection {
         self.gateway_persistence.pool.acquire().await.unwrap()
     }
 

@@ -18,6 +18,26 @@ impl RequestConnection {
         }
     }
 
+    pub(super) fn close_on_drop(&mut self) {
+        self.connection
+            .as_mut()
+            .expect("request connection present")
+            .close_on_drop();
+    }
+
+    /// Transfer ownership only to SQLx Transaction::begin, whose open=true
+    /// rollback guard covers BEGIN, statements and COMMIT cancellation.
+    pub(super) fn into_pool(mut self) -> PoolConnection<Any> {
+        self.connection.take().expect("request connection present")
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn return_to_pool(&mut self) {
+        if let Some(mut connection) = self.connection.take() {
+            connection.return_to_pool().await;
+        }
+    }
+
     /// Only a completed operation takes the normal SQLx return/reuse path.
     pub(super) fn finish(mut self) {
         drop(self.connection.take());
@@ -98,8 +118,7 @@ mod tests {
             return;
         };
         let database = Database::connect_with_max(&url, 1).await.unwrap();
-        let connection = database.pool.acquire().await.unwrap();
-        let mut read = RequestConnection::new(connection, DatabaseBackend::PostgreSql);
+        let mut read = database.pool.acquire().await.unwrap();
         let first: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
             .fetch_one(&mut *read)
             .await
@@ -194,6 +213,80 @@ mod tests {
             .await
             .unwrap();
         database.close().await;
+    }
+
+    async fn cancelled_direct_query(stream: bool) {
+        use futures_util::TryStreamExt;
+        let Ok(url) = std::env::var("MTC_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let database = Database::connect_with_max(&url, 3).await.unwrap();
+        let table = format!("mtc_direct_cancel_{}", uuid::Uuid::now_v7().simple());
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE {table} (value INTEGER NOT NULL); INSERT INTO {table} VALUES (0)"
+        )))
+        .execute(&database.pool)
+        .await
+        .unwrap();
+        let mut blocker = database.begin_write_transaction().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE {table} SET value = 1")))
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let statement = format!("UPDATE {table} SET value = value + 100 RETURNING value");
+        let worker_statement = statement.clone();
+        let worker_database = database.clone();
+        let waiting = tokio::spawn(async move {
+            let query = sqlx::query(sqlx::AssertSqlSafe(worker_statement));
+            if stream {
+                // No transaction/check-out guard at this call site: the pool
+                // executor itself must own the socket for the complete stream.
+                let _ = query
+                    .fetch(&worker_database.pool)
+                    .try_collect::<Vec<_>>()
+                    .await;
+            } else {
+                let _ = query.fetch_optional(&worker_database.pool).await;
+            }
+        });
+        let pid: i32 = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(pid) = sqlx::query_scalar("SELECT pid FROM pg_stat_activity WHERE query = $1 AND wait_event_type = 'Lock'")
+                    .bind(&statement).fetch_optional(&database.pool).await.unwrap() {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }).await.unwrap();
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        // Never unlock or pg_cancel_backend to make the production path pass.
+        backend_absent(&database, pid).await;
+        blocker.commit().await.unwrap();
+        let value: i32 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT value FROM {table}")))
+                .fetch_one(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            value, 1,
+            "cancelled direct SQL must not execute after unlock"
+        );
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn postgres_cancelled_direct_pool_future_closes_its_locked_socket() {
+        cancelled_direct_query(false).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_cancelled_direct_pool_stream_closes_its_locked_socket() {
+        cancelled_direct_query(true).await;
     }
 
     #[tokio::test]

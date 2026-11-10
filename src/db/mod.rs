@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{
-    Any, AnyConnection, AnyPool, Row, Transaction,
+    Any, AnyConnection, Row, Transaction,
     any::{AnyPoolOptions, AnyQueryResult, AnyRow},
 };
 use uuid::Uuid;
@@ -52,8 +52,10 @@ mod archive_spool;
 mod archive_staging;
 mod gateway_persistence;
 mod request_connection;
+mod request_pool;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
+use request_pool::RequestPool as AnyPool;
 pub(crate) mod allocation;
 mod billing;
 mod constants;
@@ -145,15 +147,29 @@ pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
 use validation::*;
 
-const POSTGRES_SERVE_SETTINGS: &str = "SET statement_timeout = 0; SET lock_timeout = 0; SET idle_in_transaction_session_timeout = 30000; SET client_connection_check_interval = 1000";
-const POSTGRES_MIGRATION_SETTINGS: &str = "SET statement_timeout = 900000; SET lock_timeout = 60000; SET idle_in_transaction_session_timeout = 300000";
+// One startup round trip per new socket. Session settings are not re-applied
+// on request checkout; transaction-local overrides retain their original scope.
+async fn initialize_postgres_connection(
+    connection: &mut sqlx::AnyConnection,
+    application_name: &str,
+    profile: ConnectionProfile,
+) -> Result<(), sqlx::Error> {
+    let (statement, lock, idle) = match profile {
+        ConnectionProfile::Serve => ("0", "0", "30000"),
+        ConnectionProfile::Migration => ("900000", "60000", "300000"),
+    };
+    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false), set_config('statement_timeout', $2, false), set_config('lock_timeout', $3, false), set_config('idle_in_transaction_session_timeout', $4, false), set_config('client_connection_check_interval', '1000', false)")
+        .bind(application_name).bind(statement).bind(lock).bind(idle)
+        .execute(connection).await?;
+    Ok(())
+}
 
 async fn wait_for_initial_postgres_connection(pool: &AnyPool) -> Result<(), sqlx::Error> {
     let mut timeouts = 0_u64;
     loop {
         match pool.acquire().await {
             Ok(connection) => {
-                drop(connection);
+                connection.finish();
                 return Ok(());
             }
             Err(sqlx::Error::PoolTimedOut) => {
@@ -501,7 +517,6 @@ impl Database {
         let connection = self.pool.acquire().await.inspect_err(|error| {
             self.observe_pool_timeout("readiness", started, error);
         })?;
-        let connection = request_connection::RequestConnection::new(connection, self.backend);
         progress.enter(stage, DatabaseReadinessPhase::Query).await;
         Ok(connection)
     }
@@ -666,19 +681,12 @@ impl Database {
                 })
             });
         } else {
+            pool_options = pool_options.test_before_acquire(false);
             let application_name = postgres_application_name("mtc-serve");
             pool_options = pool_options.after_connect(move |connection, _metadata| {
                 let application_name = application_name.clone();
                 Box::pin(async move {
-                    let settings = match profile {
-                        ConnectionProfile::Serve => POSTGRES_SERVE_SETTINGS,
-                        ConnectionProfile::Migration => POSTGRES_MIGRATION_SETTINGS,
-                    };
-                    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
-                        .bind(application_name)
-                        .execute(&mut *connection)
-                        .await?;
-                    sqlx::raw_sql(settings).execute(&mut *connection).await?;
+                    initialize_postgres_connection(connection, &application_name, profile).await?;
                     Ok(())
                 })
             });
@@ -687,11 +695,11 @@ impl Database {
         // invalid URL, so the same `sqlite://...` fixtures never open a file.
         let database_url = Self::normalized_sqlite_url(database_url);
         let pool = if matches!(backend, DatabaseBackend::PostgreSql) {
-            let pool = pool_options.connect_lazy(database_url.as_ref())?;
+            let pool: AnyPool = pool_options.connect_lazy(database_url.as_ref())?.into();
             wait_for_initial_postgres_connection(&pool).await?;
             pool
         } else {
-            pool_options.connect(database_url.as_ref()).await?
+            AnyPool::from(pool_options.connect(database_url.as_ref()).await?)
         };
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
@@ -733,7 +741,7 @@ impl Database {
     async fn acquire_request_connection(
         &self,
         operation: &'static str,
-    ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
+    ) -> Result<request_connection::RequestConnection, sqlx::Error> {
         let started = tokio::time::Instant::now();
         let mut timeouts = 0_u64;
         loop {
@@ -781,7 +789,7 @@ impl Database {
             DatabaseBackend::Sqlite => "BEGIN IMMEDIATE",
         };
         Box::pin(Transaction::begin(
-            connection,
+            connection.into_pool(),
             Some(sqlx::SqlStr::from_static(statement)),
         ))
         .await
@@ -842,21 +850,19 @@ impl Database {
                                         .await?;
                                 }
                                 DatabaseBackend::PostgreSql => {
-                                    let settings = match profile {
-                                        ConnectionProfile::Serve => POSTGRES_SERVE_SETTINGS,
-                                        ConnectionProfile::Migration => POSTGRES_MIGRATION_SETTINGS,
-                                    };
-                                    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
-                                        .bind(application_name)
-                                        .execute(&mut *connection)
-                                        .await?;
-                                    sqlx::raw_sql(settings).execute(&mut *connection).await?;
+                                    initialize_postgres_connection(
+                                        connection,
+                                        &application_name,
+                                        profile,
+                                    )
+                                    .await?;
                                 }
                             }
                             Ok(())
                         })
                     })
                     .connect_lazy_with(self.pool.connect_options().as_ref().clone())
+                    .into()
             },
             backend: self.backend,
             terminal_projection_enabled: self.terminal_projection_enabled,
