@@ -279,10 +279,13 @@ async fn postgres_response_writer_does_not_block_streaming_on_the_budget_lock() 
     .unwrap();
     let memory = state.proxy_memory_budget.reservation();
     let mut producer = ResponseArchiveProducer::begin(&state, fixture.id, memory).unwrap();
-    assert!(producer.append(vec![
-        bytes::Bytes::from(vec![b'x'; crate::response_archive_spool::CHUNK_BYTES]),
-        bytes::Bytes::from_static(b"tail"),
-    ]));
+    let chunk = bytes::Bytes::from(vec![b'x'; crate::response_archive_spool::CHUNK_BYTES]);
+    assert!(producer.append_with_backpressure(chunk).await);
+    assert!(
+        producer
+            .append_with_backpressure(bytes::Bytes::from_static(b"tail"))
+            .await
+    );
     let settlement = producer
         .seal()
         .expect("terminal handoff must not wait for the writer's budget lock");

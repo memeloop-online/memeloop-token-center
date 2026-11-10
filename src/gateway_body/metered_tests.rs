@@ -175,12 +175,24 @@ async fn metered_text_reads_bypass_count_and_refund_unused_bytes() {
         let used = budget.snapshot().0;
         assert!(used >= 2 * memory::REQUEST_MEMORY_WEIGHT);
         assert!(used < MAX_DEFAULT_BODY * memory::REQUEST_MEMORY_WEIGHT);
-        assert_eq!(
-            to_bytes(admitted.into_body(), MAX_DEFAULT_BODY)
-                .await
-                .unwrap(),
-            "{}"
-        );
+        let source = admitted
+            .extensions()
+            .get::<Arc<request_spool::RequestSpool>>()
+            .cloned();
+        assert!(source.is_some());
+        match source {
+            Some(source) => {
+                assert_eq!(source.read_all().await.unwrap(), "{}");
+                drop(source);
+                drop(admitted);
+            }
+            None => assert_eq!(
+                to_bytes(admitted.into_body(), MAX_DEFAULT_BODY)
+                    .await
+                    .unwrap(),
+                "{}"
+            ),
+        }
         assert_eq!(budget.snapshot().0, 0);
     }
     assert_eq!(spool.snapshot().active_files, 0);
@@ -201,14 +213,19 @@ async fn metered_text_full_byte_budget_distinguishes_capture_and_materialization
             Ok::<_, Infallible>(bytes::Bytes::from_static(b"{}"))
         }));
         let request = Request::post(path).body(body).unwrap();
-        assert!(matches!(
-            admit(request, Some(&budget), &spool).await,
-            Err(GatewayBodyAdmissionError::CapacityExhausted)
-        ));
-        assert_eq!(
-            polled.load(Ordering::Acquire),
-            path != "/v1/messages/count_tokens",
-        );
+        let result = admit(request, Some(&budget), &spool).await;
+        let admitted = result.unwrap();
+        assert!(polled.load(Ordering::Acquire));
+        let source = admitted
+            .extensions()
+            .get::<Arc<request_spool::RequestSpool>>()
+            .unwrap()
+            .clone();
+        assert_eq!(source.read_all().await.unwrap(), "{}");
+        assert_eq!(spool.snapshot().active_files, 1);
+        assert_eq!(budget.snapshot().0, 16 * 1024 * 1024);
+        drop(source);
+        drop(admitted);
         assert_eq!(spool.snapshot().active_files, 0);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
         assert_eq!(budget.snapshot().0, 16 * 1024 * 1024);
@@ -272,18 +289,15 @@ async fn metered_text_inference_crosses_old_limit_and_releases_owners() {
                 &spool,
             )
             .await;
-            if path == "/v1/messages/count_tokens" {
-                assert!(matches!(
-                    result,
-                    Err(GatewayBodyAdmissionError::Rejected(_))
-                ));
-            } else {
-                let admitted = result.unwrap();
-                assert_eq!(
-                    to_bytes(admitted.into_body(), usize::MAX).await.unwrap(),
-                    payload
-                );
-            }
+            let admitted = result.unwrap();
+            let source = admitted
+                .extensions()
+                .get::<Arc<request_spool::RequestSpool>>()
+                .unwrap()
+                .clone();
+            assert_eq!(source.read_all().await.unwrap(), payload);
+            drop(source);
+            drop(admitted);
             assert_eq!(budget.snapshot().0, 0);
             assert_eq!(spool.snapshot().active_files, 0);
         }

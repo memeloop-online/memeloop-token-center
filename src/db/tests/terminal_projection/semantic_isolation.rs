@@ -28,12 +28,16 @@ async fn reclaim(database: &Database, request_id: Uuid) -> Uuid {
     owner
 }
 
-async fn recovery_contract(database_url: &str) {
-    let archive = crate::archive::ArchiveStore::from_config(&crate::config::Config::for_test(
-        database_url.to_owned(),
-    ))
-    .await
-    .unwrap();
+async fn recovery_contract(database_url: &str, reference_v2: bool) {
+    let archive = if reference_v2 {
+        crate::archive::ArchiveStore::training_memory_for_test()
+    } else {
+        crate::archive::ArchiveStore::from_config(&crate::config::Config::for_test(
+            database_url.to_owned(),
+        ))
+        .await
+        .unwrap()
+    };
     let database = Database::connect(database_url)
         .await
         .unwrap()
@@ -292,6 +296,86 @@ async fn recovery_contract(database_url: &str) {
         .await
         .unwrap();
     assert_eq!(atoms, 0);
+    if reference_v2 {
+        let object = archive
+            .put_tenant_content(key.tenant_id, bytes::Bytes::from(encoded.clone()))
+            .await
+            .unwrap();
+        let reference = serde_json::to_string(&crate::archive::ConversationBodyReference {
+            conversation_body_v1: object,
+            chars: encoded.chars().count() as u64,
+        })
+        .unwrap();
+        sqlx::query("UPDATE conversation_semantic_payloads SET format_version = 2, request_json = $1 WHERE request_id = $2")
+            .bind(&reference).bind(request_id.to_string()).execute(&database.pool).await.unwrap();
+        // An unavailable object backend must leave pending and financial state intact.
+        let unavailable = database
+            .clone()
+            .with_archive(crate::archive::ArchiveStore::training_memory_for_test());
+        let owner = reclaim(&database, request_id).await;
+        assert!(
+            unavailable
+                .project_claimed_conversation_projection_task(owner, request_id)
+                .await
+                .is_err()
+        );
+        let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1 AND format_version = 2")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(retained, 1);
+        assert_counts(&database, request_id, reservation.id, 1).await;
+    }
+    if reference_v2 {
+        // Mutate the persisted locator after the external read, while streamed
+        // materialization is running. The final source fence must fail without
+        // replacing the durable sentinel; a restarted worker must reload it.
+        let before: Option<String> = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        let change_source = match database.backend {
+            DatabaseBackend::Sqlite => {
+                "CREATE TRIGGER change_semantic_source AFTER INSERT ON semantic_atoms BEGIN UPDATE conversation_semantic_payloads SET request_json = ' ' || request_json WHERE format_version = 2; END;"
+            }
+            DatabaseBackend::PostgreSql => {
+                "CREATE FUNCTION change_semantic_source() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE conversation_semantic_payloads SET request_json = ' ' || request_json WHERE format_version = 2; RETURN NEW; END $$; CREATE TRIGGER change_semantic_source AFTER INSERT ON semantic_atoms FOR EACH ROW EXECUTE FUNCTION change_semantic_source();"
+            }
+        };
+        sqlx::raw_sql(change_source)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let owner = reclaim(&database, request_id).await;
+        assert!(
+            database
+                .project_claimed_conversation_projection_task(owner, request_id)
+                .await
+                .is_err()
+        );
+        let after: Option<String> = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(
+            after, before,
+            "source conflict must not durably replace the recovery sentinel"
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1);
+        let drop_change = match database.backend {
+            DatabaseBackend::Sqlite => "DROP TRIGGER change_semantic_source",
+            DatabaseBackend::PostgreSql => {
+                "DROP TRIGGER change_semantic_source ON semantic_atoms; DROP FUNCTION change_semantic_source();"
+            }
+        };
+        sqlx::raw_sql(drop_change)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        // The following ACK-failure and reconnect exercise the real retry path
+        // using the changed, still valid locator rather than the stale proof.
+    }
     let reject_ack = match database.backend {
         DatabaseBackend::Sqlite => {
             "CREATE TRIGGER reject_semantic_ack BEFORE UPDATE OF projected_at ON conversation_projection_outbox BEGIN SELECT RAISE(ABORT, 'injected semantic ack failure'); END;"
@@ -410,10 +494,13 @@ async fn recovery_contract(database_url: &str) {
 #[tokio::test]
 async fn sqlite_semantic_payload_recovers_without_source_or_duplicate_finance() {
     let directory = tempfile::tempdir().unwrap();
-    recovery_contract(&format!(
-        "sqlite://{}?mode=rwc",
-        directory.path().join("semantic.db").display()
-    ))
+    recovery_contract(
+        &format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("semantic.db").display()
+        ),
+        false,
+    )
     .await;
 }
 
@@ -432,7 +519,42 @@ async fn postgres_semantic_payload_recovers_without_source_or_duplicate_finance(
     isolated
         .query_pairs_mut()
         .append_pair("options", &format!("-csearch_path={schema}"));
-    recovery_contract(isolated.as_str()).await;
+    recovery_contract(isolated.as_str(), false).await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    admin.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_semantic_payload_v2_recovers_without_duplicate_finance() {
+    let directory = tempfile::tempdir().unwrap();
+    recovery_contract(
+        &format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("semantic-v2.db").display()
+        ),
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "requires the configured CI PostgreSQL service"]
+async fn postgres_semantic_payload_v2_recovers_without_duplicate_finance() {
+    let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("PostgreSQL CI fixture");
+    let admin = sqlx::PgPool::connect(&url).await.unwrap();
+    let schema = format!("semantic_v2_{}", Uuid::now_v7().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE SCHEMA {schema}")))
+        .execute(&admin)
+        .await
+        .unwrap();
+    let mut isolated = url::Url::parse(&url).unwrap();
+    isolated
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    recovery_contract(isolated.as_str(), true).await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP SCHEMA {schema} CASCADE")))
         .execute(&admin)
         .await

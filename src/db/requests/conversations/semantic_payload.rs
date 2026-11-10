@@ -208,6 +208,122 @@ pub(super) async fn persist(
     Ok(())
 }
 
+/// Carries exactly the source version verified before entering the final
+/// projection transaction. It contains no body and is never persisted as proof.
+pub(super) struct VerifiedPayload {
+    request_id: Uuid,
+    tenant_id: String,
+    key_id: String,
+    principal_id: String,
+    format_version: i64,
+    encoded_bytes: i64,
+    digest: String,
+    stored_digest: blake3::Hash,
+}
+
+pub(super) struct LoadedPayload {
+    pub body: String,
+    pub verified: VerifiedPayload,
+}
+
+async fn resolve_payload(
+    database: &Database,
+    row: &sqlx::any::AnyRow,
+    request_id: Uuid,
+    tenant_id: &str,
+    key_id: &str,
+    principal_id: &str,
+    expected: &str,
+) -> Result<LoadedPayload, AppError> {
+    let version: i64 = row.try_get("format_version")?;
+    let stored: String = row.try_get("request_json")?;
+    let stored_digest = blake3::hash(stored.as_bytes());
+    let encoded_bytes: i64 = row.try_get("encoded_bytes")?;
+    let body = match version {
+        1 => {
+            drop(stored);
+            validated_body(row, request_id, tenant_id, key_id, principal_id, expected)?
+        }
+        2 => {
+            use futures_util::StreamExt;
+            let reference: crate::archive::ConversationBodyReference =
+                serde_json::from_str(&stored)
+                    .map_err(|_| AppError::storage("semantic_payload_reference_invalid"))?;
+            // Version two is exclusively qualified training CAS, never a bare
+            // legacy key or an inline JSON document that happens to parse.
+            if !reference
+                .conversation_body_v1
+                .object_locator
+                .starts_with("stores/training/")
+                || encoded_bytes < 2
+                || u64::try_from(encoded_bytes).ok()
+                    != Some(reference.conversation_body_v1.size_bytes)
+                || row.try_get::<String, _>("tenant_id")? != tenant_id
+                || row.try_get::<String, _>("key_id")? != key_id
+                || row.try_get::<String, _>("principal_id")? != principal_id
+                || row.try_get::<String, _>("digest")? != expected
+            {
+                return Err(AppError::storage("semantic_payload_reference_invalid"));
+            }
+            let mut stream = database
+                .body_archive()?
+                .open_tenant_content(
+                    parse_uuid(tenant_id.to_owned())?,
+                    &reference.conversation_body_v1,
+                )
+                .await?
+                .stream;
+            let maximum = usize::try_from(encoded_bytes)
+                .map_err(|_| AppError::storage("semantic_payload_length_invalid"))?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk =
+                    chunk.map_err(|_| AppError::storage("semantic_payload_object_read_failed"))?;
+                if bytes
+                    .len()
+                    .checked_add(chunk.len())
+                    .is_none_or(|n| n > maximum)
+                {
+                    return Err(AppError::storage("semantic_payload_length_invalid"));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if bytes.len() != maximum {
+                return Err(AppError::storage("semantic_payload_length_invalid"));
+            }
+            let body = String::from_utf8(bytes)
+                .map_err(|_| AppError::storage("semantic_payload_encoding_invalid"))?;
+            if body.chars().count() as u64 != reference.chars
+                || digest(
+                    &request_id.to_string(),
+                    tenant_id,
+                    key_id,
+                    principal_id,
+                    &body,
+                ) != expected
+                || !json_document(&body)
+            {
+                return Err(AppError::storage("semantic_payload_integrity_mismatch"));
+            }
+            body
+        }
+        _ => return Err(AppError::storage("semantic_payload_format_unsupported")),
+    };
+    Ok(LoadedPayload {
+        body,
+        verified: VerifiedPayload {
+            request_id,
+            tenant_id: tenant_id.to_owned(),
+            key_id: key_id.to_owned(),
+            principal_id: principal_id.to_owned(),
+            format_version: version,
+            encoded_bytes,
+            digest: expected.to_owned(),
+            stored_digest,
+        },
+    })
+}
+
 /// 快照还是空哨兵时，用这行缩减后的对话重试。不把它当成会话正文。
 pub(super) async fn load_reduced(
     database: &Database,
@@ -215,13 +331,13 @@ pub(super) async fn load_reduced(
     tenant_id: &str,
     key_id: &str,
     principal_id: &str,
-) -> Result<Option<String>, AppError> {
+) -> Result<Option<LoadedPayload>, AppError> {
     let length = match database.backend {
         DatabaseBackend::PostgreSql => "octet_length(request_json)",
         DatabaseBackend::Sqlite => "length(CAST(request_json AS BLOB))",
     };
     let statement = format!(
-        "SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1 AND encoded_bytes BETWEEN 2 AND 134217728 AND {length} = encoded_bytes"
+        "SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1 AND ((format_version = 1 AND encoded_bytes BETWEEN 2 AND 134217728 AND {length} = encoded_bytes) OR format_version = 2)"
     );
     let Some(row) = sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(request_id.to_string())
@@ -231,14 +347,18 @@ pub(super) async fn load_reduced(
         return Ok(None);
     };
     let expected: String = row.try_get("digest")?;
-    Ok(Some(validated_body(
-        &row,
-        request_id,
-        tenant_id,
-        key_id,
-        principal_id,
-        &expected,
-    )?))
+    Ok(Some(
+        resolve_payload(
+            database,
+            &row,
+            request_id,
+            tenant_id,
+            key_id,
+            principal_id,
+            &expected,
+        )
+        .await?,
+    ))
 }
 
 fn digest(
@@ -304,20 +424,29 @@ pub(super) async fn load(
     key_id: &str,
     principal_id: &str,
     expected: &str,
-) -> Result<String, AppError> {
+) -> Result<LoadedPayload, AppError> {
     let length = match database.backend {
         DatabaseBackend::PostgreSql => "octet_length(request_json)",
         DatabaseBackend::Sqlite => "length(CAST(request_json AS BLOB))",
     };
     let statement = format!(
-        "SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1 AND encoded_bytes BETWEEN 2 AND 134217728 AND {length} = encoded_bytes"
+        "SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1 AND ((format_version = 1 AND encoded_bytes BETWEEN 2 AND 134217728 AND {length} = encoded_bytes) OR format_version = 2)"
     );
     let row = sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(request_id.to_string())
         .fetch_optional(&database.pool)
         .await?
         .ok_or_else(|| AppError::Conflict("conversation semantic payload is missing".into()))?;
-    validated_body(&row, request_id, tenant_id, key_id, principal_id, expected)
+    resolve_payload(
+        database,
+        &row,
+        request_id,
+        tenant_id,
+        key_id,
+        principal_id,
+        expected,
+    )
+    .await
 }
 
 pub(super) async fn verify_in_transaction(
@@ -325,28 +454,39 @@ pub(super) async fn verify_in_transaction(
     backend: DatabaseBackend,
     request_id: Uuid,
     key: &AuthenticatedKey,
-    expected: &str,
+    verified: &VerifiedPayload,
 ) -> Result<(), AppError> {
-    let (length, lock) = match backend {
-        DatabaseBackend::PostgreSql => ("octet_length(request_json)", " FOR UPDATE"),
-        DatabaseBackend::Sqlite => ("length(CAST(request_json AS BLOB))", ""),
+    let lock = if matches!(backend, DatabaseBackend::PostgreSql) {
+        " FOR UPDATE"
+    } else {
+        ""
     };
     let statement = format!(
-        "SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1 AND encoded_bytes BETWEEN 2 AND 134217728 AND {length} = encoded_bytes{lock}"
+        "SELECT tenant_id, key_id, principal_id, format_version, encoded_bytes, digest, request_json FROM conversation_semantic_payloads WHERE request_id = $1{lock}"
     );
     let row = sqlx::query(sqlx::AssertSqlSafe(statement))
         .bind(request_id.to_string())
         .fetch_optional(&mut **transaction)
         .await?
         .ok_or_else(|| AppError::Conflict("conversation semantic payload is missing".into()))?;
-    validated_body(
-        &row,
-        request_id,
-        &key.tenant_id.to_string(),
-        &key.key_id.to_string(),
-        &key.principal_id.to_string(),
-        expected,
-    )?;
+    let stored: String = row.try_get("request_json")?;
+    if request_id != verified.request_id
+        || key.tenant_id.to_string() != verified.tenant_id
+        || key.key_id.to_string() != verified.key_id
+        || key.principal_id.to_string() != verified.principal_id
+        || row.try_get::<String, _>("tenant_id")? != verified.tenant_id
+        || row.try_get::<String, _>("key_id")? != verified.key_id
+        || row.try_get::<String, _>("principal_id")? != verified.principal_id
+        || row.try_get::<i64, _>("format_version")? != verified.format_version
+        || row.try_get::<i64, _>("encoded_bytes")? != verified.encoded_bytes
+        || row.try_get::<String, _>("digest")? != verified.digest
+        || blake3::hash(stored.as_bytes()) != verified.stored_digest
+    {
+        return Err(AppError::Conflict(
+            "conversation semantic payload changed during projection".into(),
+        ));
+    }
+    // No object-store I/O occurs while this row and the projection fence are locked.
     Ok(())
 }
 
@@ -614,3 +754,6 @@ mod receipt_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod reference_tests;

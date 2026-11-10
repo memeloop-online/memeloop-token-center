@@ -3,7 +3,7 @@ import { api, ApiError } from '../api';
 import { formatCountdown, formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
 import { UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaEffectiveSnapshot, quotaObservationState, quotaReadErrorMessage, quotaRefreshDiagnostic, quotaRemaining, quotaResetCreditExpiry, quotaSourceLabel, quotaUnitMessage, quotaUsedPercent, upstreamQuotaPath, type UpstreamQuotaDiagnostic, type UpstreamQuotaSnapshot } from './upstreamQuota';
-import { QuotaCredits, useQuotaWindowLabel } from './QuotaSummary';
+import { QuotaCredits, QuotaWindowSelector, useQuotaWindowLabel } from './QuotaSummary';
 import { useQuotaClock } from './useQuotaClock';
 import type { QuotaReadState } from './useUpstreamQuotaReads';
 import './upstreamQuota.css';
@@ -34,6 +34,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError, diagnostic }: { s
       <p>{snapshot.observed_at === null ? t('quota.refreshFailedNoObservation') : t('quota.refreshFailedRetainedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</p>
     </div>}
     {hasObservation && snapshot.status === 'ready' && snapshot.windows.length === 0 && <p>{t(observation === 'historical' ? 'quota.noWindowsHistorical' : 'quota.noWindows')}</p>}
+    {hasObservation && <QuotaWindowSelector snapshot={snapshot} />}
     {hasObservation && <div className="upstream-quota-windows">{snapshot.windows.map((window) => {
       const used = quotaUsedPercent(window);
       const remaining = quotaRemaining(window);

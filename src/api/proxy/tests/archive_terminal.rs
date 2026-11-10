@@ -180,8 +180,7 @@ async fn original_capture_owns_silent_and_empty_bodies_through_shutdown() {
 }
 
 #[tokio::test]
-async fn original_capture_waits_for_bounded_writers_without_losing_overlapping_bodies() {
-    use crate::response_archive_spool::ResponseArchiveProducer;
+async fn original_capture_does_not_wait_for_bounded_writers_or_upload_memory() {
     let directory = tempfile::tempdir().unwrap();
     let state = AppState::initialize(crate::config::Config::for_test(format!(
         "sqlite://{}?mode=rwc",
@@ -189,19 +188,47 @@ async fn original_capture_waits_for_bounded_writers_without_losing_overlapping_b
     )))
     .await
     .unwrap();
-    let mut captures = Vec::new();
+    // Simulate every upload worker and all multipart memory being held by
+    // slow object storage. A fifth original must still be captured completely.
+    let permits = state
+        .proxy_archive_stream_permits
+        .clone()
+        .acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+        .await
+        .unwrap();
+    let upload_memory = state
+        .persistence
+        .stream_memory
+        .temporary_wait(crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES, 1)
+        .await
+        .unwrap();
     let mut expected = Vec::new();
-    for index in 0..crate::PROXY_ARCHIVE_STREAM_CONCURRENCY {
+    for index in 0..=crate::PROXY_ARCHIVE_STREAM_CONCURRENCY {
         let identity = crate::db::ArchiveSpoolIdentity {
             tenant_id: Uuid::now_v7(),
             request_id: Uuid::now_v7(),
             reservation_id: Uuid::now_v7(),
         };
         let body = Bytes::from(vec![index as u8; 128 * 1024]);
-        let capture = ResponseArchiveProducer::begin_original(&state, identity)
-            .await
-            .unwrap();
-        captures.push(capture);
+        let response = UpstreamResponse::Prefetched {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            version: http::Version::HTTP_11,
+            content_length: Some(body.len() as u64),
+            stream: Box::pin(futures_util::stream::iter(vec![Ok(body.clone())])),
+        }
+        .with_original_archive_capture(&state, identity);
+        let mut stream = response.bytes_stream();
+        let delivered = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut delivered = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                delivered.extend_from_slice(&chunk.unwrap());
+            }
+            delivered
+        })
+        .await
+        .expect("a fifth client EOF must not depend on archive upload resources");
+        assert_eq!(delivered.as_slice(), body.as_ref());
         expected.push((identity, body));
     }
     assert_eq!(state.proxy_archive_stream_permits.available_permits(), 0);
@@ -209,26 +236,21 @@ async fn original_capture_waits_for_bounded_writers_without_losing_overlapping_b
         state.persistence.stream_memory.snapshot().0,
         crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES
     );
-    let identity = crate::db::ArchiveSpoolIdentity {
-        tenant_id: Uuid::now_v7(),
-        request_id: Uuid::now_v7(),
-        reservation_id: Uuid::now_v7(),
-    };
-    let mut waiting = Box::pin(ResponseArchiveProducer::begin_original(&state, identity));
-    assert!(futures_util::poll!(&mut waiting).is_pending());
-    let mut first = captures.remove(0);
-    assert!(first.append_with_backpressure(expected[0].1.clone()).await);
-    first.seal().unwrap().wait().await;
-    let admitted = tokio::time::timeout(Duration::from_secs(5), waiting)
-        .await
-        .unwrap()
-        .unwrap();
-    captures.push(admitted);
-    expected.push((identity, Bytes::from(vec![99_u8; 128 * 1024])));
-    for (mut capture, (_, body)) in captures.into_iter().zip(expected.iter().skip(1)) {
-        assert!(capture.append_with_backpressure(body.clone()).await);
-        capture.seal().unwrap().wait().await;
+    for (identity, _) in &expected {
+        assert!(
+            state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response",)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
+    drop(upload_memory);
+    drop(permits);
+    tokio::time::timeout(Duration::from_secs(10), state.drain_proxy_tasks())
+        .await
+        .unwrap();
     for (identity, body) in expected {
         let object = state
             .archive
@@ -261,55 +283,117 @@ async fn original_capture_waits_for_bounded_writers_without_losing_overlapping_b
 }
 
 #[tokio::test]
-async fn cancelled_original_admission_records_missing_evidence_without_leaking_permits() {
-    let directory = tempfile::tempdir().unwrap();
-    let state = AppState::initialize(crate::config::Config::for_test(format!(
-        "sqlite://{}?mode=rwc",
-        directory
-            .path()
-            .join("cancel-original-admission.db")
-            .display()
-    )))
-    .await
-    .unwrap();
-    let permits = state
-        .proxy_archive_stream_permits
-        .clone()
-        .acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+async fn cancelled_unsealed_capture_releases_source_while_upload_resources_remain_busy() {
+    for wait_for_memory in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let state = AppState::initialize(crate::config::Config::for_test(format!(
+            "sqlite://{}?mode=rwc",
+            directory.path().join("cancel-original.db").display()
+        )))
         .await
         .unwrap();
-    let identity = crate::db::ArchiveSpoolIdentity {
-        tenant_id: Uuid::now_v7(),
-        request_id: Uuid::now_v7(),
-        reservation_id: Uuid::now_v7(),
-    };
-    let mut waiting = Box::pin(
-        crate::response_archive_spool::ResponseArchiveProducer::begin_original(&state, identity),
-    );
-    assert!(futures_util::poll!(&mut waiting).is_pending());
-    drop(waiting);
-    state.persistence.drain_for_test().await;
-    assert!(
-        state
-            .archive
-            .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+        let permits = if wait_for_memory {
+            None
+        } else {
+            Some(
+                state
+                    .proxy_archive_stream_permits
+                    .clone()
+                    .acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+                    .await
+                    .unwrap(),
+            )
+        };
+        let upload_memory = if wait_for_memory {
+            Some(
+                state
+                    .persistence
+                    .stream_memory
+                    .temporary_wait(crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES, 1)
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let identity = crate::db::ArchiveSpoolIdentity {
+            tenant_id: Uuid::now_v7(),
+            request_id: Uuid::now_v7(),
+            reservation_id: Uuid::now_v7(),
+        };
+        let mut capture = crate::response_archive_spool::ResponseArchiveProducer::begin_original(
+            &state, identity,
+        )
+        .await
+        .unwrap();
+        assert!(
+            capture
+                .append_with_backpressure(Bytes::from_static(b"partial original"))
+                .await
+        );
+        let source = capture.local_source_owner_for_test();
+        assert!(source.upgrade().is_some());
+        if wait_for_memory {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while state.proxy_archive_stream_permits.available_permits()
+                    == crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
             .await
-            .unwrap()
-    );
-    assert!(
-        state
-            .archive
-            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
-            .await
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
-    drop(permits);
-    assert_eq!(
-        state.proxy_archive_stream_permits.available_permits(),
-        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
-    );
+            .unwrap();
+        }
+        drop(capture);
+        // The contested resource remains held throughout cancellation/fencing.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state
+                    .archive
+                    .raw_capture_failed(identity.tenant_id, identity.request_id, "response")
+                    .await
+                    .unwrap()
+                    && source.upgrade().is_none()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unsealed cancellation must wake upload resource waits");
+        assert!(
+            state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            state.persistence.stream_memory.snapshot().0,
+            if wait_for_memory {
+                crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            state.proxy_archive_stream_permits.available_permits(),
+            if wait_for_memory {
+                crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+            } else {
+                0
+            }
+        );
+        drop(upload_memory);
+        drop(permits);
+        assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+        assert_eq!(
+            state.proxy_archive_stream_permits.available_permits(),
+            crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+        );
+    }
 }
 
 async fn assert_unknown_archive_terminal(
@@ -1031,4 +1115,99 @@ async fn consumed_and_discarded_readers_retain_full_capture_with_bounded_backpre
                 .unwrap()
         );
     }
+}
+
+#[tokio::test]
+async fn original_delivery_reaches_eof_while_object_storage_is_paused() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = AppState::initialize(crate::config::Config::for_test(format!(
+        "sqlite://{}?mode=rwc",
+        directory.path().join("local-original.db").display(),
+    )))
+    .await
+    .unwrap();
+    let identity = crate::db::ArchiveSpoolIdentity {
+        tenant_id: Uuid::now_v7(),
+        request_id: Uuid::now_v7(),
+        reservation_id: Uuid::now_v7(),
+    };
+    let (entering, release) = crate::response_archive_spool::pause_next_begin_ack_for_test(&state);
+    let mut expected = blake3::Hasher::new();
+    for index in 0..1040 {
+        expected.update(&vec![(index % 251) as u8; 64 * 1024]);
+    }
+    let response = UpstreamResponse::Prefetched {
+        status: StatusCode::OK,
+        headers: HeaderMap::new(),
+        version: http::Version::HTTP_11,
+        content_length: Some(65 * 1024 * 1024),
+        stream: Box::pin(futures_util::stream::iter(
+            (0..1040).map(|index| Ok(Bytes::from(vec![(index % 251) as u8; 64 * 1024]))),
+        )),
+    }
+    .with_original_archive_capture(&state, identity);
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut reader = response.bytes_stream();
+    let mut delivered = blake3::Hasher::new();
+    let mut count = 0;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(chunk) = reader.next().await {
+            let chunk = chunk.unwrap();
+            count += chunk.len();
+            delivered.update(&chunk);
+        }
+    })
+    .await
+    .expect("storage pause must not block client EOF");
+    entering.await.unwrap();
+    assert_eq!(count, 65 * 1024 * 1024);
+    assert_eq!(delivered.finalize(), expected.finalize());
+    assert!(
+        state
+            .archive
+            .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        state.persistence.stream_memory.snapshot().0,
+        crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES
+            / crate::PROXY_ARCHIVE_STREAM_CONCURRENCY,
+        "the original complete capture envelope remains charged while storage is paused",
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(20), state.drain_proxy_tasks())
+        .await
+        .unwrap();
+    let reference = state
+        .archive
+        .raw_capture_reference(identity.tenant_id, identity.request_id, "response")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reference.size_bytes, count as u64);
+    assert_eq!(
+        reference.blake3_digest,
+        expected.finalize().to_hex().to_string()
+    );
+    let mut download = state
+        .archive
+        .open_stream(&reference.object_locator, None)
+        .await
+        .unwrap();
+    let mut restored = blake3::Hasher::new();
+    let mut archived = 0;
+    while let Some(chunk) = download.stream.next().await {
+        let chunk = chunk.unwrap();
+        archived += chunk.len();
+        restored.update(&chunk);
+    }
+    assert_eq!(archived, count);
+    assert_eq!(restored.finalize(), delivered.finalize());
+    assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
+    assert_eq!(
+        state.proxy_archive_stream_permits.available_permits(),
+        crate::PROXY_ARCHIVE_STREAM_CONCURRENCY
+    );
 }

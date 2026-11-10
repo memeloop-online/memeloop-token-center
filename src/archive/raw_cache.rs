@@ -25,7 +25,7 @@ pub struct CacheFifoPass {
 
 fn cached_reference(key: &str) -> Option<(Uuid, CasArchiveObject)> {
     let parts: Vec<_> = key.strip_prefix(PREFIX)?.split('/').collect();
-    if parts.len() != 5 || Uuid::parse_str(parts[0]).ok()?.get_version_num() != 7 {
+    if !matches!(parts.len(), 5 | 6) || Uuid::parse_str(parts[0]).ok()?.get_version_num() != 7 {
         return None;
     }
     let tenant = Uuid::parse_str(parts[1]).ok()?;
@@ -39,11 +39,24 @@ fn cached_reference(key: &str) -> Option<(Uuid, CasArchiveObject)> {
         "mtcz1" => ".mtcz1",
         _ => return None,
     };
+    let backend_prefix = if parts.len() == 6 {
+        let identity = parts[5].strip_prefix("training-")?;
+        if identity.len() != 64
+            || !identity
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return None;
+        }
+        format!("{}{identity}/", super::routing::PREFIX)
+    } else {
+        String::new()
+    };
     Some((
         tenant,
         CasArchiveObject {
             object_locator: format!(
-                "tenants/{tenant}/cas/v1/blake3/{}/{digest}{suffix}",
+                "{backend_prefix}tenants/{tenant}/cas/v1/blake3/{}/{digest}{suffix}",
                 &digest[..2]
             ),
             blake3_digest: digest.into(),
@@ -68,8 +81,12 @@ impl ArchiveStore {
         } else {
             "plain"
         };
+        let backend_suffix = match super::routing::split(&original.object_locator)? {
+            Some((identity, _)) => format!("/training-{identity}"),
+            None => String::new(),
+        };
         let key = format!(
-            "{PREFIX}{}/{tenant}/{}/{}/{format}",
+            "{PREFIX}{}/{tenant}/{}/{}/{format}{backend_suffix}",
             Uuid::now_v7(),
             original.blake3_digest,
             original.size_bytes

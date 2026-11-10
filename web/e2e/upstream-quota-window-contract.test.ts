@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { quotaCreditPresentation } from '../src/operator/upstreamQuota.js';
 import { formatCountdown } from '../src/format.js';
-import { UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaEffectiveSnapshot, quotaHighestUsageWindow, quotaObservationState, quotaRefreshDiagnostic, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaBatchPath, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
+import { UPSTREAM_QUOTA_BATCH_TIMEOUT_MILLIS, UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, quotaEffectiveSnapshot, quotaHighestUsageWindow, quotaSummaryWindow, quotaObservationState, quotaRefreshDiagnostic, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, upstreamQuotaBatchPath, upstreamQuotaPath, type UpstreamQuotaSnapshot } from '../src/operator/upstreamQuota.js';
 
 test('quota URL requires and preserves explicit account and tenant identity', () => {
   assert.equal(UPSTREAM_QUOTA_READ_TIMEOUT_MILLIS, 85_000, 'operator deadline preserves ten seconds beyond the server read budget');
@@ -171,4 +171,17 @@ test('quota refresh diagnostics stay separate from the effective observation and
   const retained = quotaEffectiveSnapshot(observed, failed);
   assert.deepEqual(retained, { ...observed, stale: true, freshness: 'stale' }, 'the failed read keeps the last effective observation and marks it historical');
   assert.equal(quotaObservationState(retained), 'historical');
+});
+
+test('Kimi summary defaults to a real weekly window and honors only existing display choices', () => {
+  const window: UpstreamQuotaSnapshot['windows'][number] = { id: 'limit-0', label: 'limit-0', used_percent: 80, used: 80, remaining: 20, limit: 100, unit: null, reset_at: null, period_seconds: 18_000, source: 'kimi_usage', reset_is_estimated: false, allowed: null, limit_reached: null };
+  const snapshot = { provider: 'kimi-oauth', windows: [window, { ...window, id: 'summary', used_percent: 10, period_seconds: 604_800 }] } as UpstreamQuotaSnapshot;
+  assert.equal(quotaSummaryWindow(snapshot)?.id, 'summary');
+  assert.equal(quotaSummaryWindow(snapshot, 'limit-0')?.id, 'limit-0');
+  assert.equal(quotaSummaryWindow(snapshot, 'removed-window')?.id, 'summary');
+  assert.equal(quotaSummaryWindow({ ...snapshot, windows: [window] })?.id, 'limit-0');
+  assert.equal(quotaSummaryWindow({ ...snapshot, windows: [] }), undefined);
+  assert.equal(quotaSummaryWindow({ ...snapshot, provider: 'openai-codex' })?.id, 'limit-0');
+  const unknown = { ...snapshot, windows: [window, { ...window, id: 'summary', period_seconds: 604_800, used_percent: null, remaining: null }] };
+  assert.equal(quotaUsedPercent(quotaSummaryWindow(unknown)!), null, 'unknown weekly use must not become a known short window');
 });
