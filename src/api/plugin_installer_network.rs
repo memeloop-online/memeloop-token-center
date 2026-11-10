@@ -107,7 +107,12 @@ pub(super) async fn installer_network_groups(
         .await?;
     // Installer selection exposes labels and connection metadata, while full
     // authenticated URLs belong to the existing providers:write editor.
-    for group in &mut groups {
+    for group in groups
+        .get_mut("items")
+        .and_then(serde_json::Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
         if let Some(members) = group
             .get_mut("members")
             .and_then(serde_json::Value::as_array_mut)
