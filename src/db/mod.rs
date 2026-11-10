@@ -144,14 +144,27 @@ pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
 use validation::*;
 
-const POSTGRES_SERVE_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 30000";
-const POSTGRES_SERVE_LOCK_TIMEOUT: &str = "SET lock_timeout = 10000";
-const POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT: &str =
-    "SET idle_in_transaction_session_timeout = 30000";
-const POSTGRES_MIGRATION_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 900000";
-const POSTGRES_MIGRATION_LOCK_TIMEOUT: &str = "SET lock_timeout = 60000";
-const POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT: &str =
-    "SET idle_in_transaction_session_timeout = 300000";
+const POSTGRES_SERVE_SETTINGS: &str = "SET statement_timeout = 30000; SET lock_timeout = 10000; SET idle_in_transaction_session_timeout = 30000";
+const POSTGRES_MIGRATION_SETTINGS: &str = "SET statement_timeout = 900000; SET lock_timeout = 60000; SET idle_in_transaction_session_timeout = 300000";
+
+async fn wait_for_initial_postgres_connection(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let mut timeouts = 0_u64;
+    loop {
+        match pool.acquire().await {
+            Ok(connection) => {
+                drop(connection);
+                return Ok(());
+            }
+            Err(sqlx::Error::PoolTimedOut) => {
+                timeouts += 1;
+                if timeouts == 1 || timeouts.is_multiple_of(6) {
+                    tracing::warn!(timeouts, "waiting for initial PostgreSQL connection");
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ConnectionProfile {
@@ -630,26 +643,12 @@ impl Database {
         } else {
             pool_options = pool_options.after_connect(move |connection, _metadata| {
                 Box::pin(async move {
-                    let (statement_timeout, lock_timeout, idle_transaction_timeout) = match profile
-                    {
-                        ConnectionProfile::Serve => (
-                            POSTGRES_SERVE_STATEMENT_TIMEOUT,
-                            POSTGRES_SERVE_LOCK_TIMEOUT,
-                            POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
-                        ),
-                        ConnectionProfile::Migration => (
-                            POSTGRES_MIGRATION_STATEMENT_TIMEOUT,
-                            POSTGRES_MIGRATION_LOCK_TIMEOUT,
-                            POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT,
-                        ),
+                    let settings = match profile {
+                        ConnectionProfile::Serve => POSTGRES_SERVE_SETTINGS,
+                        ConnectionProfile::Migration => POSTGRES_MIGRATION_SETTINGS,
                     };
-                    sqlx::query(statement_timeout)
-                        .execute(&mut *connection)
-                        .await?;
-                    sqlx::query(lock_timeout).execute(&mut *connection).await?;
-                    sqlx::query(idle_transaction_timeout)
-                        .execute(&mut *connection)
-                        .await?;
+                    // One simple-query exchange instead of three serial WAN round trips.
+                    sqlx::raw_sql(settings).execute(&mut *connection).await?;
                     Ok(())
                 })
             });
@@ -657,7 +656,13 @@ impl Database {
         // Windows test paths use `\`. SQLite's URL parser treats that as an
         // invalid URL, so the same `sqlite://...` fixtures never open a file.
         let database_url = Self::normalized_sqlite_url(database_url);
-        let pool = pool_options.connect(database_url.as_ref()).await?;
+        let pool = if matches!(backend, DatabaseBackend::PostgreSql) {
+            let pool = pool_options.connect_lazy(database_url.as_ref())?;
+            wait_for_initial_postgres_connection(&pool).await?;
+            pool
+        } else {
+            pool_options.connect(database_url.as_ref()).await?
+        };
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
             // over the same lightweight/test database. WAL keeps readers on a

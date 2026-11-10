@@ -74,16 +74,9 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
-                            // Reuse the serving session policy in one simple
-                            // query exchange, not three prepared SET exchanges.
-                            let settings = [
-                                super::POSTGRES_SERVE_STATEMENT_TIMEOUT,
-                                super::POSTGRES_SERVE_LOCK_TIMEOUT,
-                                super::POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
-                            ]
-                            .join(";");
-                            sqlx::raw_sql(sqlx::AssertSqlSafe(settings))
-                                .execute(connection)
+                            // The serving profile is initialized in one exchange.
+                            sqlx::raw_sql(super::POSTGRES_SERVE_SETTINGS)
+                                .execute(&mut *connection)
                                 .await?;
                         }
                     }
