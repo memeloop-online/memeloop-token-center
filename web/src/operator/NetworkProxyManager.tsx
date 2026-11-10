@@ -658,7 +658,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
               <div><dt>{copy.effectiveExit}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective ? proxies.find(proxy => proxy.id === effective.selected_member_id)?.name ?? groups.flatMap(group => group.members).find(member => member.id === effective.selected_member_id)?.label ?? effectiveAddress : copy.unknownSource}</dd></div>
               <div><dt>{copy.appliedStatus}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective?.configuration_state === 'applied' ? copy.appliedReady : effective?.configuration_state === 'credential' ? copy.credentialSource : copy.appliedUnknown}</dd></div>
             </dl>
-            <div className="network-proxy-policy-controls">
+            <div className={embedded ? 'network-proxy-policy-controls' : 'operator-form-section-fields'}>
               <Field label={copy.mode} required><Select value={draft.mode} disabled={disabled || busy || !ready} onChange={event => changeStrategy(event.target.value)}>
                 <option value="manual">{copy.modes.manual}</option><option value="auto">{copy.modes.auto}</option>
                 {(plugins.length > 0 || selection.desired.mode === 'plugin') && <option value="plugin">{copy.modes.plugin}</option>}
