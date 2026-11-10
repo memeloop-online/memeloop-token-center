@@ -1116,15 +1116,12 @@ async fn first_billable_delta_arrives_while_upstream_terminal_and_journal_ack_ar
 
 #[tokio::test]
 async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_responsibility() {
-    let mut fixture = codex_route_fixture("pending-filesystem-fault").await;
-    let unavailable = fixture._directory.path().join("journal-is-a-file");
+    let fixture = codex_route_fixture("pending-filesystem-fault").await;
+    // Block receipt publication without disabling raw body archival or recovery.
+    let unavailable = fixture.archive_path.join("terminal-receipts");
     tokio::fs::write(&unavailable, b"not a directory")
         .await
         .unwrap();
-    fixture.state.pending_terminals = crate::proxy_lifecycle::pending_terminal::Journal::new(
-        unavailable.clone(),
-        fixture.state.db.independent_persistence_pool(),
-    );
     let upstream = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(codex_transport::RESPONSES_PATH))
@@ -1174,9 +1171,7 @@ async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_
         (recovered[0].input_tokens, recovered[0].output_tokens),
         (3, 2)
     );
-    // This local-only journal cannot enqueue a source-backed conversation.
-    // Its failure must still leave financial settlement exactly once.
-    assert_financial_settled_once(&fixture, record.request_id).await;
+    assert_exactly_once_side_effects(&fixture, record.request_id, Some("resp-codex")).await;
     pool.close().await;
     fixture.state.pending_terminals.stop_for_test().await;
     upstream.verify().await;
