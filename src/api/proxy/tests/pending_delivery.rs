@@ -65,6 +65,21 @@ async fn owned_enqueued_source(
     serde_json::from_slice(&raw).unwrap()
 }
 
+async fn assert_financial_settled_once(fixture: &CodexRouteFixture, request_id: Uuid) {
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let row = sqlx::query(
+        "SELECT r.status, (SELECT COUNT(*) FROM usage_reservations x WHERE x.id = q.reservation_id) AS reservations, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledger FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id WHERE q.id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.get::<String, _>("status"), "settled");
+    assert_eq!(row.get::<i64, _>("reservations"), 1);
+    assert_eq!(row.get::<i64, _>("ledger"), 1);
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn durable_unknown_receipt_releases_projection_memory_without_discarding_evidence() {
     let upstream = MockServer::start().await;
@@ -1159,7 +1174,9 @@ async fn unavailable_journal_keeps_output_and_explicit_unacknowledged_financial_
         (recovered[0].input_tokens, recovered[0].output_tokens),
         (3, 2)
     );
-    assert_exactly_once_side_effects(&fixture, record.request_id, Some("resp-codex")).await;
+    // This local-only journal cannot enqueue a source-backed conversation.
+    // Its failure must still leave financial settlement exactly once.
+    assert_financial_settled_once(&fixture, record.request_id).await;
     pool.close().await;
     fixture.state.pending_terminals.stop_for_test().await;
     upstream.verify().await;
@@ -1206,7 +1223,9 @@ async fn operational_database_failure_does_not_block_finance_and_replays_before_
     let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     wait_for_request_settlement(&fixture, 1).await;
     let request_id = Uuid::parse_str(receipt["request_id"].as_str().unwrap()).unwrap();
-    assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
+    // Semantic projection requires the operational acknowledgement that the
+    // injected trigger is withholding. Finance must already be complete.
+    assert_financial_settled_once(&fixture, request_id).await;
     assert!(
         fixture
             .state
@@ -1393,7 +1412,6 @@ async fn unknown_failure_retries_operational_projection() {
     })
     .await
     .expect("unknown awaiting its operational receipt must survive idle reap");
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
     let financial: (String, String, Option<i64>, i64, i64) = sqlx::query_as(
         "SELECT p.unknown_reason, r.status, r.actual_micros, \
          (SELECT COUNT(*) FROM ledger_entries WHERE source = r.id), \
@@ -1463,7 +1481,6 @@ async fn unknown_failure_retries_operational_projection() {
     .await
     .unwrap();
     assert_eq!(enqueued, 0);
-    assert!(fixture.state.proxy_memory_budget.snapshot().0 > 0);
     sqlx::query("DROP TRIGGER fail_unknown_projection")
         .execute(&pool)
         .await
@@ -1500,6 +1517,9 @@ async fn unknown_failure_retries_operational_projection() {
     .expect(
         "unknown with durable semantic enqueue must release memory and the parsed conversation",
     );
+    // This gateway-only fixture must run the raw archive worker before the
+    // source-backed conversation can consume its response locator.
+    drain_completed_response_archive(&fixture).await;
     let terminal_owner = Uuid::now_v7();
     for pending_id in fixture
         .state

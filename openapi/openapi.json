@@ -16886,6 +16886,100 @@
           }
         }
       }
+    },
+    "/internal/v1/upstreams/{account_id}/health-probe-settings": {
+      "get": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "getUpstreamHealthProbeSettings",
+        "summary": "Read per-upstream scheduled probe settings",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:read",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Scheduled probing is disabled by default.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthProbeSettings"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "putUpstreamHealthProbeSettings",
+        "summary": "Configure per-upstream scheduled probes",
+        "description": "Requires providers:write and keys:write. The probe credential must differ from the system AI credential. Disabling scheduling leaves manual probes available.",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "providers:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          },
+          {
+            "$ref": "#/components/parameters/TenantFilter"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HealthProbeSettings"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Saved settings.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthProbeSettings"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          }
+        }
+      }
     }
   },
   "components": {
@@ -32958,6 +33052,48 @@
               "type": "integer",
               "minimum": 0
             }
+          }
+        }
+      },
+      "HealthProbeSettings": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "enabled",
+          "billing_key_id",
+          "interval_seconds",
+          "model",
+          "prompt"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "default": false
+          },
+          "billing_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "interval_seconds": {
+            "type": "integer",
+            "minimum": 3600,
+            "maximum": 2592000,
+            "default": 3600
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 200
+          },
+          "prompt": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
           }
         }
       }
