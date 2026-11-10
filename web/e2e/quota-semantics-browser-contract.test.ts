@@ -47,6 +47,19 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     await choice.selectOption('');
     await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('10% used'));
 
+    await page.evaluate(() => {
+      Reflect.set(window, 'quotaOriginalSetItem', Storage.prototype.setItem);
+      Storage.prototype.setItem = () => { throw new DOMException('Storage unavailable', 'QuotaExceededError'); };
+    });
+    try {
+      await choice.selectOption('limit-0');
+      await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('80% used'));
+    } finally {
+      await page.evaluate(() => { Storage.prototype.setItem = Reflect.get(window, 'quotaOriginalSetItem'); });
+    }
+    await choice.selectOption('');
+    await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('10% used'));
+
     const summary = page.locator('[data-case="summary"]');
     assert.match(await summary.innerText(), /Codex usage · 5-hour limit · 51% used/);
     assert.equal(await summary.getByRole('meter').getAttribute('aria-valuenow'), '51');
