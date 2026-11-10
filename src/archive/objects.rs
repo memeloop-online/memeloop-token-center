@@ -4,7 +4,7 @@ use object_store::{ObjectStoreExt, PutPayload};
 
 use super::{
     ArchiveStore,
-    path::{archive_path, content_location, is_any_v1_cas_location},
+    path::{archive_path, content_location, is_any_v1_cas_location, is_conversation_root_location},
 };
 use crate::error::AppError;
 
@@ -20,7 +20,7 @@ impl ArchiveStore {
     }
 
     pub async fn put(&self, location: &str, data: Bytes) -> Result<(), AppError> {
-        if is_any_v1_cas_location(location) {
+        if is_any_v1_cas_location(location) || is_conversation_root_location(location) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));
@@ -39,7 +39,7 @@ impl ArchiveStore {
     }
 
     pub async fn delete(&self, location: &str) -> Result<(), AppError> {
-        if is_any_v1_cas_location(location) {
+        if is_any_v1_cas_location(location) || is_conversation_root_location(location) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));

@@ -137,7 +137,23 @@ impl Database {
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;
-        request_event_views(rows)
+        let tenants = rows
+            .iter()
+            .map(|row| parse_uuid(row.try_get("tenant_id")?))
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let mut events = request_event_views(rows)?;
+        if let Some(archive) = &self.archive {
+            for (event, tenant) in events.iter_mut().zip(tenants) {
+                if event.protocol != "generation"
+                    && event.status_code.is_some_and(|status| status >= 400)
+                    && let Some(summary) =
+                        archive.supplier_summary(tenant, event.request_id).await?
+                {
+                    event.supplier_error = Some(summary);
+                }
+            }
+        }
+        Ok(events)
     }
 
     pub async fn all_request_events_after(
@@ -168,7 +184,23 @@ impl Database {
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;
-        request_event_views(rows)
+        let tenants = rows
+            .iter()
+            .map(|row| parse_uuid(row.try_get("tenant_id")?))
+            .collect::<Result<Vec<_>, AppError>>()?;
+        let mut events = request_event_views(rows)?;
+        if let Some(archive) = &self.archive {
+            for (event, tenant) in events.iter_mut().zip(tenants) {
+                if event.protocol != "generation"
+                    && event.status_code.is_some_and(|status| status >= 400)
+                    && let Some(summary) =
+                        archive.supplier_summary(tenant, event.request_id).await?
+                {
+                    event.supplier_error = Some(summary);
+                }
+            }
+        }
+        Ok(events)
     }
 
     pub(crate) async fn source_history_event(
@@ -352,6 +384,17 @@ impl Database {
         for index in native_indices {
             let view = &mut views[index];
             view.egress = observations.remove(&view.request_id);
+            if view.status_code.is_some_and(|status| status >= 400)
+                && let Some(archive) = &self.archive
+                && let Some(locator) = self
+                    .request_record_locator(&view.request_id.to_string())
+                    .await?
+                && let Some(summary) = archive
+                    .supplier_summary(parse_uuid(locator.tenant_id)?, view.request_id)
+                    .await?
+            {
+                view.supplier_error = Some(summary);
+            }
         }
         Ok(views)
     }
@@ -401,7 +444,11 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(AppError::internal("queries_site_1"))?;
-            request_archive_refs_from_row(row)
+            self.resolve_raw_archive_roots(
+                parse_uuid(locator.tenant_id)?,
+                request_archive_refs_from_row(row)?,
+            )
+            .await
         } else {
             match self
                 .generation_archive_refs(key_id, parse_uuid(request_id.clone())?)
@@ -453,7 +500,12 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {
-                return request_archive_refs_from_row(row);
+                return self
+                    .resolve_raw_archive_roots(
+                        parse_uuid(locator.tenant_id)?,
+                        request_archive_refs_from_row(row)?,
+                    )
+                    .await;
             }
             let identity = self
                 .historical_credential_identity(
@@ -546,7 +598,12 @@ impl Database {
             .fetch_optional(&self.pool)
             .await?;
             if let Some(row) = row {
-                return request_archive_refs_from_row(row);
+                return self
+                    .resolve_raw_archive_roots(
+                        parse_uuid(locator.tenant_id)?,
+                        request_archive_refs_from_row(row)?,
+                    )
+                    .await;
             }
             let identity = self
                 .historical_credential_identity(&locator.tenant_id, &locator.key_id, None)

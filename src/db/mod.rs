@@ -93,6 +93,7 @@ pub(crate) use requests::{PendingProxyOperationalTerminal, PendingProxyOperation
 mod rotation;
 mod routing;
 pub use routing::egress;
+mod object_bodies;
 mod rows;
 mod session_analytics;
 mod session_reading;
@@ -261,6 +262,7 @@ pub use usage_analysis::{
 pub struct Database {
     pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
+    archive: Option<crate::archive::ArchiveStore>,
     pool_role: &'static str,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
@@ -668,6 +670,10 @@ impl Database {
                 .await?;
         }
         Ok(Self {
+            #[cfg(test)]
+            archive: Some(crate::archive::ArchiveStore::memory_for_test()),
+            #[cfg(not(test))]
+            archive: None,
             http_clients: std::sync::Arc::default(),
             gateway_persistence: std::sync::Arc::new(gateway_persistence::GatewayPersistence::new(
                 database_url.as_ref(),
@@ -771,6 +777,7 @@ impl Database {
 
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
+            archive: self.archive.clone(),
             http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",

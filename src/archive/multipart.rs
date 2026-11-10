@@ -35,7 +35,9 @@ pub struct StagedArchiveObject {
 
 impl ArchiveStore {
     pub async fn start_writer(&self, location: &str) -> Result<ArchiveWriter, AppError> {
-        if super::path::is_any_v1_cas_location(location) {
+        if super::path::is_any_v1_cas_location(location)
+            || super::path::is_conversation_root_location(location)
+        {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),
             ));
@@ -86,9 +88,6 @@ impl ArchiveWriter {
             .ok_or_else(|| AppError::storage("archive_object_size_overflow"))?;
         if self.inner.is_none() {
             return Err(AppError::storage("archive_writer_is_already_closed"));
-        }
-        if self.compressed && next_size > super::compressed::MAX_PLAIN {
-            return Err(AppError::storage("local_storage_failed"));
         }
         self.hasher.update(&bytes);
         self.size_bytes = next_size;
