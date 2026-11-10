@@ -1,5 +1,35 @@
 use super::*;
 
+async fn restored_rejection(fixture: &CodexRouteFixture, request_id: Uuid) -> Bytes {
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(reference) = fixture
+                .state
+                .archive
+                .raw_capture_reference(key.tenant_id, request_id, "response")
+                .await
+                .unwrap()
+            {
+                return fixture
+                    .state
+                    .archive
+                    .get_tenant_content(key.tenant_id, &reference, MAX_PROXY_RESPONSE_BODY)
+                    .await
+                    .unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("original rejection capture must finish independently of safe delivery")
+}
+
 #[derive(Clone, Default)]
 struct SupplierLogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -25,7 +55,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SupplierLogCapture {
 }
 
 #[tokio::test]
-async fn supplier_header_and_prompt_echoes_never_reach_response_archives_or_logs() {
+async fn supplier_echoes_are_private_in_raw_archive_and_absent_from_delivery_and_logs() {
     use tracing::instrument::WithSubscriber;
 
     let capture = SupplierLogCapture::default();
@@ -82,11 +112,14 @@ async fn supplier_header_and_prompt_echoes_never_reach_response_archives_or_logs
             }
             cancellation::assert_single_unknown_receipt(&fixture, 402, Some("http_402")).await;
             let records = fixture.state.db.list_requests(fixture.key_id, 10).await.unwrap();
+            let original = restored_rejection(&fixture, records[0].request_id).await;
+            let document: Value = serde_json::from_slice(&original).unwrap();
+            assert_eq!(document["error"]["code"], code);
+            assert!(String::from_utf8_lossy(&original).contains("private prompt/full-canary"));
             let refs = fixture.state.db.request_archive_refs(fixture.key_id, records[0].request_id).await.unwrap();
-            let stored = refs.response_object.as_deref().unwrap().strip_prefix("inline-json:").unwrap();
-            assert_eq!(stored.as_bytes(), bytes.as_ref());
+            assert!(!refs.response_object.as_deref().unwrap().starts_with("inline-json:"));
             let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
-            assert_eq!(detail.response_body, serde_json::from_slice::<Value>(&bytes).unwrap());
+            assert_eq!(detail.response_body, document);
             upstream.verify().await;
         }
     }.with_subscriber(dispatch).await;
@@ -254,21 +287,29 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         assert_eq!(record.route_id, Some(fixture.route_id));
         assert!(record.usage.tokens.is_none());
         assert_eq!(record.billing.cost, None);
+        let stored = restored_rejection(&fixture, record.request_id).await;
+        let original = json!({
+            "error": { "message": message, "code": code, "debug": "must-not-retain" },
+            "usage": { "prompt_tokens": 500, "completion_tokens": 100 }
+        });
+        assert_eq!(stored.as_ref(), serde_json::to_vec(&original).unwrap());
         let refs = fixture
             .state
             .db
             .request_archive_refs(fixture.key_id, record.request_id)
             .await
             .unwrap();
-        let stored = refs
-            .response_object
-            .as_deref()
-            .unwrap()
-            .strip_prefix("inline-json:")
-            .unwrap();
-        assert_eq!(stored.as_bytes(), bytes.as_ref());
-        let projected =
-            crate::supplier_error::supplier_error_from_inline_json(refs.response_object.as_deref());
+        assert!(
+            !refs
+                .response_object
+                .as_deref()
+                .unwrap()
+                .starts_with("inline-json:")
+        );
+        let projected = crate::supplier_error::supplier_error_from_inline_json(Some(&format!(
+            "inline-json:{}",
+            std::str::from_utf8(&bytes).unwrap()
+        )));
         assert_eq!(record.supplier_error, projected);
         assert_eq!(refs.view.supplier_error, projected);
         let download = crate::api::request_detail::request_archive_content_response(
@@ -283,10 +324,10 @@ async fn compatible_http_errors_classify_safe_reasons_and_preserve_financial_att
         let downloaded = to_bytes(download.into_body(), MAX_PROXY_RESPONSE_BODY)
             .await
             .unwrap();
-        assert_eq!(downloaded, bytes);
+        assert_eq!(downloaded, stored);
         let detail = crate::api::request_detail::request_detail(&fixture.state, refs).await;
         assert_eq!(detail.view.supplier_error, projected);
-        assert_eq!(detail.response_body, delivered);
+        assert_eq!(detail.response_body, original);
         assert!(detail.archive.response.complete);
         let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
         let spools: i64 = sqlx::query_scalar(
@@ -349,7 +390,7 @@ async fn compatible_http_402_without_safe_structured_detail_does_not_invent_a_pl
         let upstream = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(402).set_body_raw(body, content_type))
+            .respond_with(ResponseTemplate::new(402).set_body_raw(body.clone(), content_type))
             .expect(1)
             .mount(&upstream)
             .await;
@@ -384,14 +425,12 @@ async fn compatible_http_402_without_safe_structured_detail_does_not_invent_a_pl
             .request_archive_refs(fixture.key_id, records[0].request_id)
             .await
             .unwrap();
+        assert!(refs.view.supplier_error.is_none());
         assert_eq!(
-            refs.response_object
-                .as_deref()
-                .unwrap()
-                .strip_prefix("inline-json:")
-                .unwrap()
-                .as_bytes(),
-            bytes.as_ref()
+            restored_rejection(&fixture, records[0].request_id)
+                .await
+                .as_ref(),
+            body
         );
         upstream.verify().await;
     }
@@ -461,14 +500,37 @@ async fn compatible_http_stalled_json_rejects_before_supplier_body_or_release() 
         .request_archive_refs(fixture.key_id, records[0].request_id)
         .await
         .unwrap();
-    assert_eq!(
-        refs.response_object
-            .as_deref()
+    assert!(refs.view.supplier_error.is_none());
+    let key = fixture
+        .state
+        .db
+        .authenticate_key(&fixture.key, fixture.state.config.key_pepper.as_bytes())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture
+                .state
+                .archive
+                .raw_capture_failed(key.tenant_id, records[0].request_id, "response")
+                .await
+                .unwrap()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("incomplete upstream body must leave explicit missing capture evidence");
+    assert!(
+        fixture
+            .state
+            .archive
+            .raw_capture_reference(key.tenant_id, records[0].request_id, "response")
+            .await
             .unwrap()
-            .strip_prefix("inline-json:")
-            .unwrap()
-            .as_bytes(),
-        bytes.as_ref()
+            .is_none()
     );
 }
 
@@ -485,7 +547,7 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
         let sse = format!("data: {event}\n\n{suffix}");
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(sse.clone(), "text/event-stream"))
             .expect(1)
             .mount(&upstream)
             .await;
@@ -516,8 +578,7 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
         ] {
             assert!(!delivered.contains(forbidden));
         }
-        let receipt =
-            cancellation::assert_single_unknown_receipt(&fixture, 502, Some("rate_limited")).await;
+        cancellation::assert_single_unknown_receipt(&fixture, 502, Some("rate_limited")).await;
         let records = fixture
             .state
             .db
@@ -539,8 +600,8 @@ async fn supplier_tpm_sse_after_http_200_has_safe_record_and_detail_without_repl
             supplier.message,
             crate::supplier_error::SafeReason::RateLimited.message()
         );
-        let stored = sse_delivery::pending_response_archive(&fixture, &receipt).await;
-        assert_eq!(stored, delivered);
+        let stored = restored_rejection(&fixture, record.request_id).await;
+        assert_eq!(stored.as_ref(), sse.as_bytes());
         let refs = fixture
             .state
             .db
