@@ -379,13 +379,8 @@ pub(super) fn prepare_request_with_id(
     let chat_controls = matches!(protocol, Protocol::OpenAiChat)
         .then(|| translate_chat_request(request, transport_policy.chat_controls))
         .transpose()?;
-    // Native parents can delegate to third-party children. Ask for readable
-    // task arguments at the producer, before an opaque child envelope exists.
-    // Existing native encrypted messages and unrelated schemas stay intact.
-    crate::api::request_normalization::prepare_plaintext_collaboration_tools(
-        request,
-        matches!(protocol, Protocol::OpenAiResponses),
-    )?;
+    // Codex reserves collaboration tools and requires their configured schemas.
+    // Rewriting encrypted message fields makes the native provider reject tools.
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".into()))?;
@@ -2451,7 +2446,7 @@ mod tests {
     }
 
     #[test]
-    fn native_parent_emits_plaintext_collaboration_schema_and_preserves_native_history() {
+    fn native_parent_preserves_reserved_collaboration_schema_and_native_history() {
         let mut request = json!({
             "tools": [{"type":"namespace","name":"collaboration","tools":[
                 {"type":"function","name":"spawn_agent","parameters":{"type":"object",
@@ -2468,22 +2463,24 @@ mod tests {
             ]}]
         });
         let native_history = request["input"][0].clone();
+        let native_tools = request["tools"].clone();
+        let late_tools = request["input"][1].clone();
         prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).unwrap();
-        assert!(
-            request
-                .pointer("/tools/0/tools/0/parameters/properties/message/encrypted")
-                .is_none()
+        assert_eq!(
+            request.pointer("/tools/0/tools/0/parameters/properties/message/encrypted"),
+            Some(&json!(true))
         );
-        assert!(
-            request
-                .pointer("/input/1/tools/0/tools/0/parameters/properties/message/encrypted")
-                .is_none()
+        assert_eq!(
+            request.pointer("/input/1/tools/0/tools/0/parameters/properties/message/encrypted"),
+            Some(&json!(true))
         );
         assert_eq!(
             request["tools"][1]["parameters"]["properties"]["message"]["encrypted"],
             true
         );
         assert_eq!(request["input"][0], native_history);
+        assert_eq!(request["tools"], native_tools);
+        assert_eq!(request["input"][1], late_tools);
         assert_eq!(
             request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]["description"],
             "task"
