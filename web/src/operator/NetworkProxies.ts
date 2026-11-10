@@ -25,6 +25,7 @@ export interface NetworkProxyProbe {
 }
 
 export interface NetworkProxy {
+  proxy_url?: string;
   id: string;
   tenant_external_id: string;
   name: string;
