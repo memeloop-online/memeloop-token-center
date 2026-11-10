@@ -751,7 +751,7 @@ mod tests {
                 .body(reqwest::Body::wrap_stream(body))
                 .unwrap()
                 .into();
-            let response = translate_new_api_compact_v2(response, true, directory.path())
+            let response = translate_new_api_compact_v2(response.into(), true, directory.path())
                 .await
                 .unwrap();
             assert_eq!(response.status(), status);
@@ -792,7 +792,7 @@ mod tests {
             compact_response(
                 StatusCode::OK,
                 r#"{"id":"response-compact","usage":{"input_tokens":11,"output_tokens":3},"output":[{"type":"compaction","encrypted_content":"opaque"}]}"#,
-            ),
+            ).into(),
             true,
             directory.path(),
         )
