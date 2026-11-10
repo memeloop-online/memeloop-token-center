@@ -647,6 +647,10 @@ async fn native_codex_responses_preserves_v1_and_v2_collaboration_schemas_on_the
             "fixture retains the internal marker at {pointer}"
         );
     }
+    expected_wire["tools"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type": "image_generation", "output_format": "png"}));
     assert_eq!(forwarded["tools"], expected_wire["tools"]);
     assert_eq!(
         forwarded["tools"][0]["tools"][2],
