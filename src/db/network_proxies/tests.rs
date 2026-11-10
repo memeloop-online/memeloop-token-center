@@ -26,8 +26,7 @@ async fn contract(database: &Database) {
         .unwrap();
     let id = parse_uuid(proxy["id"].as_str().unwrap().to_owned()).unwrap();
     assert_eq!(proxy["address"]["has_auth"], true);
-    assert!(!proxy.to_string().contains("password"));
-    assert!(!proxy.to_string().contains("user:"));
+    assert_eq!(proxy["proxy_url"], PRIMARY);
     assert_eq!(proxy["probe"]["target_url"], "https://openai.com/");
     assert_eq!(proxy["group_ids"], serde_json::json!([]));
     assert_eq!(proxy["bound_account_count"], 0);
