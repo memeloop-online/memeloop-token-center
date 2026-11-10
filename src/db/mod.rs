@@ -51,6 +51,7 @@ use crate::{
 mod archive_spool;
 mod archive_staging;
 mod gateway_persistence;
+mod request_connection;
 pub(crate) use archive_spool::ArchiveSpoolChunk;
 pub(crate) use archive_spool::{ArchiveSpoolIdentity, ArchiveSpoolTask};
 pub(crate) mod allocation;
@@ -144,7 +145,7 @@ pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
 use validation::*;
 
-const POSTGRES_SERVE_SETTINGS: &str = "SET statement_timeout = 0; SET lock_timeout = 0; SET idle_in_transaction_session_timeout = 30000";
+const POSTGRES_SERVE_SETTINGS: &str = "SET statement_timeout = 0; SET lock_timeout = 0; SET idle_in_transaction_session_timeout = 30000; SET client_connection_check_interval = 1000";
 const POSTGRES_MIGRATION_SETTINGS: &str = "SET statement_timeout = 900000; SET lock_timeout = 60000; SET idle_in_transaction_session_timeout = 300000";
 
 async fn wait_for_initial_postgres_connection(pool: &AnyPool) -> Result<(), sqlx::Error> {
@@ -494,12 +495,13 @@ impl Database {
         &self,
         progress: &DatabaseReadinessProgress,
         stage: DatabaseReadinessStage,
-    ) -> Result<sqlx::pool::PoolConnection<Any>, sqlx::Error> {
+    ) -> Result<request_connection::RequestConnection, sqlx::Error> {
         progress.enter(stage, DatabaseReadinessPhase::Acquire).await;
         let started = tokio::time::Instant::now();
         let connection = self.pool.acquire().await.inspect_err(|error| {
             self.observe_pool_timeout("readiness", started, error);
         })?;
+        let connection = request_connection::RequestConnection::new(connection, self.backend);
         progress.enter(stage, DatabaseReadinessPhase::Query).await;
         Ok(connection)
     }
@@ -512,21 +514,26 @@ impl Database {
             .acquire_readiness_connection(progress, DatabaseReadinessStage::Ping)
             .await
             .map_err(AppError::from)?;
-        sqlx::query("SELECT 1")
-            .execute(&mut *connection)
-            .await
-            .map_err(AppError::from)?;
-        let schema = self
-            .schema_status(&mut connection, progress)
-            .await
-            .map_err(AppError::from)?;
-        if !schema.is_ready() {
-            return Err(DatabaseReadinessError::SchemaOutdated(schema));
+        let result = async {
+            sqlx::query("SELECT 1")
+                .execute(&mut *connection)
+                .await
+                .map_err(AppError::from)?;
+            let schema = self
+                .schema_status(&mut connection, progress)
+                .await
+                .map_err(AppError::from)?;
+            if !schema.is_ready() {
+                return Err(DatabaseReadinessError::SchemaOutdated(schema));
+            }
+            self.archive_staging_readiness_check(&mut connection, progress)
+                .await
+                .map_err(AppError::from)?;
+            Ok(())
         }
-        self.archive_staging_readiness_check(&mut connection, progress)
-            .await
-            .map_err(AppError::from)?;
-        Ok(())
+        .await;
+        connection.finish();
+        result
     }
 
     pub async fn list_tenants(&self) -> Result<Vec<TenantView>, AppError> {
@@ -638,7 +645,10 @@ impl Database {
             .max_connections(maximum_connections.clamp(1, 32))
             .acquire_timeout(Duration::from_secs(10))
             .idle_timeout(Some(Duration::from_secs(5 * 60)))
-            .max_lifetime(Some(Duration::from_secs(30 * 60)));
+            .max_lifetime(Some(Duration::from_secs(30 * 60)))
+            .after_release(move |connection, _metadata| {
+                Box::pin(async move { Ok(request_connection::can_reuse(connection, backend)) })
+            });
         if matches!(backend, DatabaseBackend::Sqlite) {
             // SQLite is a supported lightweight/test backend and can have a
             // background worker and an HTTP handler contend for its single

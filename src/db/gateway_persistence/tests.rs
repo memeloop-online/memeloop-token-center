@@ -69,9 +69,10 @@ async fn postgres_archive_pool_cold_reconnect_and_wait_preserve_session_policy()
         let mut connection = persistence.pool.acquire().await.unwrap();
         assert!(started.elapsed() >= Duration::from_millis(350));
         for (setting, expected) in [
-            ("statement_timeout", "30s"),
-            ("lock_timeout", "10s"),
+            ("statement_timeout", "0"),
+            ("lock_timeout", "0"),
             ("idle_in_transaction_session_timeout", "30s"),
+            ("client_connection_check_interval", "1s"),
         ] {
             let value: String = sqlx::query_scalar("SELECT current_setting($1)")
                 .bind(setting)

@@ -60,6 +60,10 @@ async fn pool_timeout_diagnostics_distinguish_roles_without_exposing_connection_
         directory.path().join(format!("{canary}.db")).display()
     );
     let serve = Database::connect_with_max(&database_url, 1).await.unwrap();
+    assert_eq!(
+        postgres_timeout(&serve, "client_connection_check_interval").await,
+        "1s"
+    );
     let persistence = serve.independent_persistence_pool();
     let mut archive = serve.clone();
     archive.pool = serve.gateway_persistence.pool.clone();
@@ -508,32 +512,44 @@ async fn postgres_request_lock_wait_exceeds_ten_seconds_and_can_be_cancelled() {
         .fetch_one(&mut *waiter_connection)
         .await
         .unwrap();
-    let waiting = sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(lock_id)
-        .execute(&mut *waiter_connection);
-    tokio::pin!(waiting);
+    let mut waiting = tokio::spawn(async move {
+        let mut connection = super::super::request_connection::RequestConnection::new(
+            waiter_connection,
+            super::super::DatabaseBackend::PostgreSql,
+        );
+        let result = sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(lock_id)
+            .execute(&mut *connection)
+            .await;
+        connection.finish();
+        result
+    });
     assert!(
         tokio::time::timeout(Duration::from_secs(11), &mut waiting)
             .await
-            .is_err()
+            .is_err(),
+        "valid remote lock waits must outlive the former ten-second deadline"
     );
-    let cancelled: bool = sqlx::query_scalar("SELECT pg_cancel_backend($1)")
-        .bind(waiter_pid)
-        .fetch_one(&database.pool)
-        .await
-        .unwrap();
-    assert!(cancelled);
-    let error = tokio::time::timeout(Duration::from_secs(5), &mut waiting)
-        .await
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(
-        error
-            .as_database_error()
-            .and_then(|error| error.code())
-            .as_deref(),
-        Some("57014")
-    );
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    // No pg_cancel_backend intervention: production cancellation closes the
+    // original socket, and the server checks disconnects during the lock wait.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let present: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)")
+                    .bind(waiter_pid)
+                    .fetch_one(&database.pool)
+                    .await
+                    .unwrap();
+            if !present {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cancelled read backend must exit while its lock remains held");
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(lock_id)
         .execute(&mut *holder)

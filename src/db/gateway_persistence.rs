@@ -66,6 +66,9 @@ impl GatewayPersistence {
             .min_connections(0)
             .acquire_timeout(acquire_timeout)
             .idle_timeout(Some(Duration::from_secs(60)))
+            .after_release(move |connection, _metadata| {
+                Box::pin(async move { Ok(super::request_connection::can_reuse(connection, backend)) })
+            })
             .after_connect(move |connection, _| {
                 let application_name = application_name.clone();
                 Box::pin(async move {
