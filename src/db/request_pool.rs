@@ -2,7 +2,7 @@
 //!
 //! No detached query task or SQL replay: dropping a future/stream drops its
 //! RequestConnection, while fully consumed operations use normal pool reuse.
-use std::{fmt, future::Future, sync::Arc, task::Poll};
+use std::{fmt, future::Future, sync::Arc};
 
 use futures_util::{TryStreamExt, future::BoxFuture, stream::BoxStream};
 use sqlx::{
@@ -118,15 +118,12 @@ impl<'pool> Executor<'pool> for &'pool RequestPool {
             }
         }));
         Box::pin(futures_util::stream::poll_fn(move |context| {
-            if let Some(future) = producer.as_mut() {
-                if future.as_mut().poll(context).is_ready() {
-                    producer = None;
-                }
+            if let Some(future) = producer.as_mut()
+                && future.as_mut().poll(context).is_ready()
+            {
+                producer = None;
             }
-            match receiver.poll_recv(context) {
-                Poll::Ready(value) => Poll::Ready(value),
-                Poll::Pending => Poll::Pending,
-            }
+            receiver.poll_recv(context)
         }))
     }
 
