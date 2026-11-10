@@ -11,6 +11,16 @@ pub(super) async fn execute(
     guard: &dyn OAuthRefreshRequestGuard,
 ) -> Result<(u16, Vec<u8>), AppError> {
     guard.mark_request_started().await?;
+    execute_started(client, request, Some(guard)).await
+}
+
+// A provider-owned retry operation keeps its single durable dispatch fence.
+// It must not clear that fence between attempts, including connector failures.
+pub(super) async fn execute_started(
+    client: &reqwest::Client,
+    request: reqwest::Request,
+    connector_guard: Option<&dyn OAuthRefreshRequestGuard>,
+) -> Result<(u16, Vec<u8>), AppError> {
     let started = tokio::time::Instant::now();
     let observed = |kind, status, phase, connector_failure, timeout_source| {
         AppError::OAuthRefresh(OAuthRefreshFailure {
@@ -31,7 +41,9 @@ pub(super) async fn execute(
             // Only connector evidence proves that no request reached the
             // authorization server. Every ambiguous dispatch retains its fence.
             if error.is_connect() {
-                guard.mark_request_not_sent(&error).await?;
+                if let Some(guard) = connector_guard {
+                    guard.mark_request_not_sent(&error).await?;
+                }
             }
             return Err(observed(
                 if error.is_timeout() {

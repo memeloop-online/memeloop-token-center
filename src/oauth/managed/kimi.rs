@@ -1,5 +1,4 @@
 //! Native Kimi OAuth refresh and request identity handling.
-#[cfg(test)]
 use std::time::Duration;
 
 #[cfg(test)]
@@ -285,11 +284,33 @@ async fn refresh_with_client(
         .body(form)
         .build()
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
-    let (status, bytes) =
-        super::super::refresh_exchange::execute(client, request, request_guard).await?;
-    if status != 200 {
-        return Err(super::super::refresh_exchange::rejected(status, &bytes));
-    }
+    // Match the official Kimi CLI's bounded refresh policy. All attempts belong
+    // to the same claimed operation and retain its fence until the result is
+    // durably installed or recorded as a completed failure.
+    request_guard.mark_request_started().await?;
+    let mut attempt = 0;
+    let bytes = loop {
+        let attempt_request = request
+            .try_clone()
+            .ok_or_else(|| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
+        let result = super::super::refresh_exchange::execute_started(client, attempt_request, None)
+            .await
+            .and_then(|(status, bytes)| {
+                if status == 200 {
+                    Ok(bytes)
+                } else {
+                    Err(super::super::refresh_exchange::rejected(status, &bytes))
+                }
+            });
+        match result {
+            Ok(bytes) => break bytes,
+            Err(AppError::OAuthRefresh(failure)) if failure.kimi_retryable() && attempt < 2 => {
+                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    };
     let response: TokenResponse = serde_json::from_slice(&bytes)
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseDecode, Some(200)))?;
     super::bearer_token(&response.access_token, "Kimi").map_err(|_| failed())?;
@@ -519,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_does_not_replay_after_the_server_accepts_the_post() {
+    async fn refresh_retries_transient_disconnects_with_one_fenced_operation() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -571,8 +592,8 @@ mod tests {
         server.await.unwrap();
         assert_eq!(
             attempts.load(Ordering::SeqCst),
-            1,
-            "an accepted refresh-token POST has an unknown outcome and must not be replayed"
+            3,
+            "Kimi retries a transient failure three times within its single fenced operation"
         );
     }
 
@@ -647,11 +668,14 @@ mod tests {
         assert!(!failure.requires_reauthorization());
         assert!(guard.started.load(Ordering::SeqCst));
         assert!(!guard.not_sent.load(Ordering::SeqCst));
-        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            if status.is_none() { 3 } else { 1 }
+        );
     }
 
     #[tokio::test]
-    async fn refresh_timeout_before_headers_does_not_invent_a_status_or_replay() {
+    async fn refresh_timeout_before_headers_preserves_status_and_bounds_retries() {
         assert_stalled_refresh_preserves_observed_status(None).await;
     }
 
@@ -866,7 +890,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_connector_failure_is_proven_unsent_without_a_second_attempt() {
+    async fn refresh_connector_failures_keep_one_operation_fenced_through_three_attempts() {
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = proxy.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -894,7 +918,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(result, Err(AppError::OAuthRefresh(_))));
-        assert!(guard.not_sent.load(Ordering::SeqCst));
+        assert!(guard.started.load(Ordering::SeqCst));
+        assert!(!guard.not_sent.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1086,6 +1111,77 @@ mod tests {
             };
             assert_eq!(failure.kind, expected);
             assert_eq!(failure.http_status, Some(status));
+        }
+    }
+    #[tokio::test]
+    async fn transient_kimi_rejection_retries_with_one_fence_and_original_token() {
+        struct CountFence(AtomicUsize);
+        #[async_trait::async_trait]
+        impl OAuthRefreshRequestGuard for CountFence {
+            async fn mark_request_started(&self) -> Result<(), AppError> {
+                assert_eq!(self.0.fetch_add(1, Ordering::SeqCst), 0);
+                Ok(())
+            }
+        }
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        Mock::given(method("POST"))
+            .and(body_string_contains("refresh_token=fixture-refresh"))
+            .respond_with(move |_: &wiremock::Request| {
+                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503).set_body_json(json!({"error":"temporarily_unavailable"}))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "access_token":"retry-access", "refresh_token":"retry-refresh", "expires_in":600
+                    }))
+                }
+            }).expect(2).mount(&server).await;
+        let guard = CountFence(AtomicUsize::new(0));
+        let refreshed = refresh_at(
+            &crate::build_http_client().unwrap(),
+            &credential("fixture-device"),
+            true,
+            &format!("{}/token", server.uri()),
+            &guard,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(refreshed).unwrap()["refresh_token"],
+            "retry-refresh"
+        );
+        assert_eq!(guard.0.load(Ordering::SeqCst), 1);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn authorization_rejection_is_terminal_and_transient_retries_are_bounded() {
+        for (status, attempts) in [(401, 1), (403, 1), (400, 1), (429, 3), (503, 3)] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(status).set_body_json(json!({"error":"rejected"})),
+                )
+                .expect(attempts)
+                .mount(&server)
+                .await;
+            let error = refresh_at(
+                &crate::build_http_client().unwrap(),
+                &credential("fixture-device"),
+                true,
+                &format!("{}/token", server.uri()),
+                &crate::oauth::TEST_OAUTH_REFRESH_REQUEST_GUARD,
+            )
+            .await
+            .unwrap_err();
+            let AppError::OAuthRefresh(failure) = error else {
+                panic!("typed refresh failure required")
+            };
+            assert_eq!(failure.http_status, Some(status));
+            assert!(!failure.requires_reauthorization());
+            server.verify().await;
         }
     }
 }

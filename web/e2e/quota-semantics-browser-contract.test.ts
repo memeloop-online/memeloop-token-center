@@ -33,6 +33,20 @@ test('failed quota refresh labels retained zeroes as historical and hides unobse
     await page.addInitScript(() => localStorage.setItem('mtc-locale', 'en'));
     await page.goto(`${origin}/e2e/fixtures/quota-semantics.html`);
 
+    const kimi = page.locator('[data-case="kimi-choice"]');
+    const kimiSummary = kimi.locator('.quota-summary');
+    const choice = kimi.getByRole('combobox', { name: 'Allowance shown in summaries' });
+    assert.match(await kimiSummary.innerText(), /Weekly limit.*10% used/);
+    await choice.selectOption('limit-0');
+    await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('80% used'));
+    assert.match(await kimiSummary.innerText(), /5-hour limit.*80% used/);
+    assert.match(await page.locator('[data-case="kimi-other-account"] .quota-summary').innerText(), /Weekly limit.*10% used/);
+    await page.reload();
+    assert.equal(await choice.inputValue(), 'limit-0');
+    assert.match(await kimiSummary.innerText(), /5-hour limit.*80% used/);
+    await choice.selectOption('');
+    await page.waitForFunction(() => document.querySelector('[data-case="kimi-choice"] .quota-summary')?.textContent?.includes('10% used'));
+
     const summary = page.locator('[data-case="summary"]');
     assert.match(await summary.innerText(), /Codex usage · 5-hour limit · 51% used/);
     assert.equal(await summary.getByRole('meter').getAttribute('aria-valuenow'), '51');
