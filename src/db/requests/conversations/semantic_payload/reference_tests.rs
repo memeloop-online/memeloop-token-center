@@ -150,6 +150,7 @@ async fn sqlite_semantic_reference_external_read_and_source_token_contract() {
 }
 
 #[tokio::test]
+#[ignore = "requires the configured CI PostgreSQL service"]
 async fn postgres_semantic_reference_external_read_and_source_token_contract() {
     let url = std::env::var("MTC_TEST_POSTGRES_URL").expect("configured PG contract fixture");
     let admin = sqlx::PgPool::connect(&url).await.unwrap();

@@ -141,6 +141,7 @@ jobs:
       - run: cargo test --locked --lib api::proxy::tests::upstream_error_details
       - run: cargo test --locked --lib sqlite_semantic_payload_recovers_without_source_or_duplicate_finance
       - run: cargo test --locked --lib semantic_payload::reference_tests
+      - run: cargo test --locked --lib postgres_semantic_reference_external_read_and_source_token_contract -- --ignored
       - run: cargo test --locked --lib sqlite_semantic_payload_v2_recovers_without_duplicate_finance
       - run: cargo test --locked --lib postgres_semantic_payload_v2_recovers_without_duplicate_finance -- --ignored
       - run: cargo test --locked --lib api::audio::tests
