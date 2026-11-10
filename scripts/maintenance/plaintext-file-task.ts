@@ -90,20 +90,25 @@ export async function chatTurn(response: Response) {
     } catch { error = { type: 'incomplete_or_invalid_stream' }; }
     assistant.tool_calls = [...calls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call);
   } else {
+    const raw = await response.text();
     try {
-      const data = await response.json();
+      const data = JSON.parse(raw);
       error = data.error; model = data.model; usage = data.usage;
       Object.assign(assistant, data.choices?.[0]?.message ?? {});
       finish = data.choices?.[0]?.finish_reason;
       done = !!data.choices?.[0]?.message;
-    } catch { error = { type: 'non_json_response' }; }
+    } catch { error = { type: 'non_json_response', message: raw }; }
   }
   const ids = new Set<string>();
   for (const call of assistant.tool_calls ?? []) {
     if (!call.id || ids.has(call.id) || call.type !== 'function' || !call.function?.name || typeof call.function.arguments !== 'string') error = { type: 'invalid_tool_call_identity' };
     ids.add(call.id);
   }
-  return { status: response.status, request_id: response.headers.get('x-mtc-request-id') ?? response.headers.get('x-request-id'), model, usage, finish_reason: finish, stream_complete: done && !error, error, assistant };
+  const response_headers = Object.fromEntries(['content-type', 'server', 'x-mtc-request-id', 'x-request-id'].flatMap(name => {
+    const value = response.headers.get(name);
+    return value === null ? [] : [[name, value]];
+  }));
+  return { status: response.status, request_id: response.headers.get('x-mtc-request-id') ?? response.headers.get('x-request-id'), response_headers, model, usage, finish_reason: finish, stream_complete: done && !error, error, assistant };
 }
 
 export async function runTask(options: Options, send: typeof fetch = fetch) {
@@ -126,6 +131,7 @@ export async function runTask(options: Options, send: typeof fetch = fetch) {
   await save();
   while (true) {
     let turn;
+    const started_at = new Date().toISOString();
     try {
       turn = await chatTurn(await send(`${options.baseUrl.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST', headers: { Authorization: `Bearer ${options.apiKey}`, 'Content-Type': 'application/json', 'X-Mtc-Client-Name': 'plaintext-file-task' },
@@ -133,7 +139,7 @@ export async function runTask(options: Options, send: typeof fetch = fetch) {
       }));
     } catch { record.error = { type: 'transport_error', outcome: 'unknown' }; await save(); return redact(record); }
     const { reasoning_content: _reasoning, ...visible } = turn.assistant;
-    record.turns.push({ ...turn, assistant: visible });
+    record.turns.push({ ...turn, started_at, completed_at: new Date().toISOString(), assistant: visible });
     await save();
     if (turn.status < 200 || turn.status >= 300 || !turn.stream_complete || turn.error) return redact(record);
     const pending = turn.assistant.tool_calls ?? [];
