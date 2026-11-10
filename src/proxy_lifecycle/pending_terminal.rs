@@ -2089,21 +2089,37 @@ mod tests {
             false,
             "buffered_response_ready",
         );
-        tokio::time::pause();
-        // SQLite runs on a real worker thread. Keep virtual time from advancing
-        // automatically while awaiting it, so only the explicit advance below
-        // can expire a retry deadline.
-        let clock_guard = tokio::spawn(async {
-            loop {
-                tokio::task::yield_now().await;
+        // Keep paused time fixed while SQLite/filesystem blocking I/O completes.
+        // Otherwise auto-advance can legitimately expire an earlier publication
+        // retry while the independent receipt attempt is still finishing.
+        async fn finish_io_at(journal: &Journal, expected: tokio::time::Instant) {
+            let tasks = std::mem::take(&mut *journal.tasks.lock().unwrap());
+            for (_, task) in tasks {
+                while !task.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                task.await.unwrap();
+                assert_eq!(tokio::time::Instant::now(), expected);
             }
-        });
+        }
+
+        fn assert_retries_are_future(journal: &Journal) {
+            let now = tokio::time::Instant::now();
+            for pending in journal.pending.lock().unwrap().values() {
+                assert!(pending.retry_after > now);
+                assert!(pending.publication_retry_after > now);
+            }
+        }
+
+        tokio::time::pause();
+        let frozen = tokio::time::Instant::now();
         journal.submit_with_preparation(snapshot.clone(), (), None, async { None });
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen).await;
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen).await;
         assert_eq!(journal.failed_publications_for_test(), 1);
+        assert_retries_are_future(&journal);
         for _ in 0..100 {
             journal.start_pending(&database);
             assert!(journal.tasks.lock().unwrap().is_empty());
@@ -2113,13 +2129,14 @@ mod tests {
         second.receipt_id = Uuid::now_v7();
         journal.submit_with_preparation(second, (), None, async { None });
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen).await;
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen).await;
         assert_eq!(journal.failed_publications_for_test(), 2);
+        assert_retries_are_future(&journal);
         tokio::time::advance(RETRY_INTERVAL).await;
         journal.start_pending(&database);
-        finish_attempts(&journal).await;
+        finish_io_at(&journal, frozen + RETRY_INTERVAL).await;
         assert_eq!(journal.failed_publications_for_test(), 4);
         {
             let pending = journal.pending.lock().unwrap();
@@ -2134,7 +2151,6 @@ mod tests {
                 serde_json::to_value(snapshot).unwrap()
             });
         }
-        clock_guard.abort();
         tokio::time::resume();
         journal.stop_for_test().await;
         database.close().await;

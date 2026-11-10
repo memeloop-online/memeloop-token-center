@@ -80,11 +80,8 @@ impl Server {
                         .get::<Arc<crate::gateway_body::request_spool::RequestSpool>>()
                         .expect("durable chat retains its captured source")
                         .clone();
-                    let bytes = axum::body::to_bytes(request.into_body(), usize::MAX)
-                        .await
-                        .unwrap();
+                    let bytes = source.read_all().await.unwrap();
                     assert!(bytes.len() > LIMIT);
-                    assert_eq!(source.read_all().await.unwrap(), bytes);
                     let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
                     assert_eq!(
                         document["messages"][0]["content"].as_str().unwrap().len(),

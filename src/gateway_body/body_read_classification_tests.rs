@@ -14,11 +14,7 @@ fn reset_body() -> Body {
 
 #[tokio::test]
 async fn read_failures_and_limits_are_distinct_across_spool_metered_and_fallback_readers() {
-    for route_class in [
-        GatewayBodyRouteClass::Responses,
-        GatewayBodyRouteClass::Default,
-        GatewayBodyRouteClass::Other,
-    ] {
+    for route_class in [GatewayBodyRouteClass::Default, GatewayBodyRouteClass::Other] {
         let directory = tempfile::tempdir().unwrap();
         let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
         let budget = memory::ProxyMemoryBudget::new(16 * 1024 * 1024);
@@ -98,6 +94,88 @@ async fn read_failures_and_limits_are_distinct_across_spool_metered_and_fallback
         assert_eq!(budget.snapshot().0, 0);
         assert_eq!(spool.snapshot().used_bytes, 0);
         assert_eq!(spool.snapshot().active_files, 0);
+    }
+}
+
+#[tokio::test]
+async fn responses_capture_complete_uploads_and_preserve_transport_error_classification() {
+    let directory = tempfile::tempdir().unwrap();
+    let spool = request_spool::RequestSpoolAdmission::new(directory.path().to_owned());
+    let budget = memory::ProxyMemoryBudget::new(16 * 1024 * 1024);
+    for (body, declared, reason) in [
+        (
+            reset_body(),
+            None,
+            GatewayBodyRejectionReason::BodyReadRejected,
+        ),
+        (
+            reset_body(),
+            Some(MAXIMUM),
+            GatewayBodyRejectionReason::BodyReadRejected,
+        ),
+        (
+            Body::from("{}"),
+            Some(1),
+            GatewayBodyRejectionReason::BodyLimitExceeded,
+        ),
+    ] {
+        let mut request = Request::post("/v1/responses");
+        if let Some(length) = declared {
+            request = request.header(header::CONTENT_LENGTH, length);
+        }
+        let error = admit_request_body_for_route(
+            request.body(body).unwrap(),
+            None,
+            MAXIMUM,
+            GatewayBodyRouteClass::Responses,
+            Some(budget.reservation()),
+            Some(&spool),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, GatewayBodyAdmissionError::Rejected(rejection)
+            if rejection.route_class == GatewayBodyRouteClass::Responses
+                && rejection.reason == reason
+                && rejection.declared_content_length == declared.map(|length| length as u64)
+                && rejection.limit_bytes == usize::MAX)
+        );
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+        assert_eq!(spool.snapshot().active_files, 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+    let expected = vec![b'x'; MAXIMUM + 1];
+    for declared in [None, Some(expected.len())] {
+        let mut request = Request::post("/v1/responses");
+        if let Some(length) = declared {
+            request = request.header(header::CONTENT_LENGTH, length);
+        }
+        let admitted = admit_request_body_for_route(
+            request.body(Body::from(expected.clone())).unwrap(),
+            None,
+            MAXIMUM,
+            GatewayBodyRouteClass::Responses,
+            Some(budget.reservation()),
+            Some(&spool),
+        )
+        .await
+        .unwrap();
+        let source = admitted
+            .extensions()
+            .get::<Arc<request_spool::RequestSpool>>()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            source.read_all().await.unwrap().as_ref(),
+            expected.as_slice()
+        );
+        drop(source);
+        drop(admitted);
+        assert_eq!(budget.snapshot().0, 0);
+        assert_eq!(spool.snapshot().used_bytes, 0);
+        assert_eq!(spool.snapshot().active_files, 0);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 }
 
