@@ -45,3 +45,5 @@
 .overview-quota-metrics .quota-summary-value { font-size: var(--fontSizeBase600, 24px); line-height: var(--lineHeightBase600, 32px); font-weight: var(--fontWeightSemibold, 600); }
 .quota-summary-reset { color: var(--colorNeutralForeground2, #a6bac0); font-size: var(--fontSizeBase200, 12px); }
 .quota-summary-provenance { color: var(--colorNeutralForeground2, #a6bac0); font-size: var(--fontSizeBase200, 12px); }
+
+.quota-window-display-choice { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-block: 12px; }

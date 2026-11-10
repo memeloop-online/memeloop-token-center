@@ -21,6 +21,9 @@ pub trait ArchiveStagingObjectStore: Send + Sync {
 
 impl ArchiveStore {
     pub async fn delete_prefix(&self, prefix: &str) -> Result<(), AppError> {
+        if prefix.starts_with(super::routing::PREFIX) {
+            return Err(AppError::storage("archive_cas_objects_are_immutable"));
+        }
         if super::path::may_include_v1_cas_location(prefix) {
             return Err(AppError::BadRequest(
                 "archive CAS objects are immutable".into(),

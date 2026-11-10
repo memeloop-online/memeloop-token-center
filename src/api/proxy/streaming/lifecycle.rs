@@ -25,6 +25,7 @@ pub(super) struct StreamingFinalizationInput<'a> {
     pub(super) transport_error: Option<&'static str>,
     pub(super) delivered_billable: bool,
     pub(super) sse_summary: Option<ResponsesSseSummary>,
+    pub(super) validated_compact: Option<crate::api::proxy::routing::ValidatedCompact>,
     pub(super) usage_capture: Vec<u8>,
     pub(super) stored_response: String,
     pub(super) routing_terminal_observed_at: Option<i64>,
@@ -219,6 +220,7 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
         transport_error,
         delivered_billable,
         sse_summary,
+        validated_compact,
         usage_capture,
         stored_response,
         routing_terminal_observed_at,
@@ -239,7 +241,15 @@ pub(super) async fn finalize_streaming_lifecycle(input: StreamingFinalizationInp
     // erase trustworthy provider usage. A validated provider-declared incomplete
     // terminal also carries final counters; an unknown EOF or error never does.
     // Keep the cancellation status and validate reservation bounds below.
-    let terminal_usage = trusted_streaming_terminal_usage(sse_summary.as_ref(), transport_error);
+    let terminal_usage = trusted_streaming_terminal_usage(sse_summary.as_ref(), transport_error)
+        .or_else(|| {
+            // The upstream compact document was completely validated before
+            // file delivery began. A subsequent local read or client failure
+            // changes delivery status, not the already observed provider cost.
+            validated_compact.as_ref().and_then(|evidence| {
+                trusted_streaming_terminal_usage(Some(&evidence.summary()), None)
+            })
+        });
     let mut usage = if error_code.is_some() {
         if let Some(usage) = terminal_usage {
             usage_basis = crate::model::RequestUsageBasis::ProviderReported;

@@ -1,7 +1,8 @@
-import { DetailTooltip, ProgressBar } from '../design-system';
+import { useQuotaWindowPreference } from './hooks/useQuotaWindowPreference';
+import { DetailTooltip, ProgressBar, Select } from '../design-system';
 import { formatNumber, formatPercent } from '../format';
 import { useI18n } from '../i18n';
-import { quotaHighestUsageWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, type UpstreamQuotaSnapshot } from './upstreamQuota';
+import { quotaSummaryWindow, quotaObservationState, quotaRemaining, quotaResetCreditExpiry, quotaSummaryPresentation, quotaUnitMessage, quotaUsedPercent, quotaWindowPresentation, type UpstreamQuotaSnapshot } from './upstreamQuota';
 import './upstreamQuota.css';
 import { useQuotaClock } from './useQuotaClock';
 import { quotaCreditPresentation } from './upstreamQuota';
@@ -58,8 +59,9 @@ export function QuotaSummary({
   const clock = useQuotaClock();
   const now = suppliedNow ?? clock;
   const label = useQuotaWindowLabel();
-  const presentation = quotaSummaryPresentation(snapshot, now, refreshFailed);
-  const highest = presentation.usedPercent !== null && snapshot ? quotaHighestUsageWindow(snapshot.windows) : undefined;
+  const preference = useQuotaWindowPreference(snapshot);
+  const presentation = quotaSummaryPresentation(snapshot, now, refreshFailed, preference.value);
+  const highest = snapshot ? quotaSummaryWindow(snapshot, preference.value) : undefined;
   const resetCreditExpiry = snapshot ? quotaResetCreditExpiry(snapshot, now) : undefined;
   const text = t(presentation.key, {
     name: highest && snapshot ? label(snapshot.provider, highest) : '',
@@ -108,6 +110,21 @@ export function QuotaSummary({
       <span>{text}</span>
       {showWindowReset && highest && resetText(highest) && <span className="quota-summary-reset">{resetText(highest)}</span>}
     </>}
-    {highest && (mode === 'used' || quotaRemaining(highest) !== null) && <ProgressBar className="quota-summary-meter" max={100} value={Math.max(0, Math.min(100, mode === 'remaining' ? 100 - presentation.usedPercent! : presentation.usedPercent!))} role="meter" aria-valuetext={mode === 'remaining' ? `${label(snapshot.provider, highest)} ${remainingText(highest)}${historical ? ` · ${text}` : ''}` : text} aria-label={t(mode === 'remaining' ? 'quota.remainingWindow' : historical ? 'quota.lastObservedUsedPercent' : 'quota.usedPercent', { name: label(snapshot.provider, highest) })} />}
+    {highest && presentation.usedPercent !== null && (mode === 'used' || quotaRemaining(highest) !== null) && <ProgressBar className="quota-summary-meter" max={100} value={Math.max(0, Math.min(100, mode === 'remaining' ? 100 - presentation.usedPercent! : presentation.usedPercent!))} role="meter" aria-valuetext={mode === 'remaining' ? `${label(snapshot.provider, highest)} ${remainingText(highest)}${historical ? ` · ${text}` : ''}` : text} aria-label={t(mode === 'remaining' ? 'quota.remainingWindow' : historical ? 'quota.lastObservedUsedPercent' : 'quota.usedPercent', { name: label(snapshot.provider, highest) })} />}
   </span></DetailTooltip>;
+}
+
+/** Only supplier-observed windows are offered; changing this never reads quota. */
+export function QuotaWindowSelector({ snapshot }: { snapshot: UpstreamQuotaSnapshot }) {
+  const { t } = useI18n();
+  const label = useQuotaWindowLabel();
+  const preference = useQuotaWindowPreference(snapshot);
+  if (snapshot.windows.length < 2) return null;
+  return <label className="quota-window-display-choice">
+    <span>{t('quota.displayWindow')}</span>
+    <Select value={preference.value ?? ''} onChange={event => preference.select(event.target.value)}>
+      <option value="">{t(snapshot.provider === 'kimi-oauth' ? 'quota.displayWeeklyDefault' : 'quota.displayHighestDefault')}</option>
+      {snapshot.windows.map(window => <option key={window.id} value={window.id}>{label(snapshot.provider, window)}</option>)}
+    </Select>
+  </label>;
 }
