@@ -180,7 +180,7 @@ async fn original_capture_owns_silent_and_empty_bodies_through_shutdown() {
 }
 
 #[tokio::test]
-async fn original_capture_waits_for_bounded_writers_without_losing_overlapping_bodies() {
+async fn original_capture_does_not_wait_for_bounded_writers_or_upload_memory() {
     use crate::response_archive_spool::ResponseArchiveProducer;
     let directory = tempfile::tempdir().unwrap();
     let state = AppState::initialize(crate::config::Config::for_test(format!(
@@ -189,19 +189,38 @@ async fn original_capture_waits_for_bounded_writers_without_losing_overlapping_b
     )))
     .await
     .unwrap();
-    let mut captures = Vec::new();
+    // Simulate every upload worker and all multipart memory being held by
+    // slow object storage. A fifth original must still be captured completely.
+    let permits = state
+        .proxy_archive_stream_permits
+        .clone()
+        .acquire_many_owned(crate::PROXY_ARCHIVE_STREAM_CONCURRENCY as u32)
+        .await
+        .unwrap();
+    let upload_memory = state
+        .persistence
+        .stream_memory
+        .temporary_wait(crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES, 1)
+        .await
+        .unwrap();
+    let mut settlements = Vec::new();
     let mut expected = Vec::new();
-    for index in 0..crate::PROXY_ARCHIVE_STREAM_CONCURRENCY {
+    for index in 0..=crate::PROXY_ARCHIVE_STREAM_CONCURRENCY {
         let identity = crate::db::ArchiveSpoolIdentity {
             tenant_id: Uuid::now_v7(),
             request_id: Uuid::now_v7(),
             reservation_id: Uuid::now_v7(),
         };
         let body = Bytes::from(vec![index as u8; 128 * 1024]);
-        let capture = ResponseArchiveProducer::begin_original(&state, identity)
-            .await
-            .unwrap();
-        captures.push(capture);
+        let mut capture = tokio::time::timeout(
+            Duration::from_secs(5),
+            ResponseArchiveProducer::begin_original(&state, identity),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(capture.append_with_backpressure(body.clone()).await);
+        settlements.push(capture.seal().unwrap());
         expected.push((identity, body));
     }
     assert_eq!(state.proxy_archive_stream_permits.available_permits(), 0);
@@ -209,25 +228,22 @@ async fn original_capture_waits_for_bounded_writers_without_losing_overlapping_b
         state.persistence.stream_memory.snapshot().0,
         crate::response_archive_spool::RAW_STREAM_MEMORY_BYTES
     );
-    let identity = crate::db::ArchiveSpoolIdentity {
-        tenant_id: Uuid::now_v7(),
-        request_id: Uuid::now_v7(),
-        reservation_id: Uuid::now_v7(),
-    };
-    let mut waiting = Box::pin(ResponseArchiveProducer::begin_original(&state, identity));
-    assert!(futures_util::poll!(&mut waiting).is_pending());
-    let mut first = captures.remove(0);
-    assert!(first.append_with_backpressure(expected[0].1.clone()).await);
-    first.seal().unwrap().wait().await;
-    let admitted = tokio::time::timeout(Duration::from_secs(5), waiting)
-        .await
-        .unwrap()
-        .unwrap();
-    captures.push(admitted);
-    expected.push((identity, Bytes::from(vec![99_u8; 128 * 1024])));
-    for (mut capture, (_, body)) in captures.into_iter().zip(expected.iter().skip(1)) {
-        assert!(capture.append_with_backpressure(body.clone()).await);
-        capture.seal().unwrap().wait().await;
+    for (identity, _) in &expected {
+        assert!(
+            state
+                .archive
+                .raw_capture_reference(identity.tenant_id, identity.request_id, "response",)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    drop(upload_memory);
+    drop(permits);
+    for settlement in settlements {
+        tokio::time::timeout(Duration::from_secs(5), settlement.wait())
+            .await
+            .unwrap();
     }
     for (identity, body) in expected {
         let object = state
@@ -283,11 +299,12 @@ async fn cancelled_original_admission_records_missing_evidence_without_leaking_p
         request_id: Uuid::now_v7(),
         reservation_id: Uuid::now_v7(),
     };
-    let mut waiting = Box::pin(
-        crate::response_archive_spool::ResponseArchiveProducer::begin_original(&state, identity),
-    );
-    assert!(futures_util::poll!(&mut waiting).is_pending());
-    drop(waiting);
+    let capture =
+        crate::response_archive_spool::ResponseArchiveProducer::begin_original(&state, identity)
+            .await
+            .unwrap();
+    drop(capture);
+    drop(permits);
     state.persistence.drain_for_test().await;
     assert!(
         state
@@ -305,7 +322,6 @@ async fn cancelled_original_admission_records_missing_evidence_without_leaking_p
             .is_none()
     );
     assert_eq!(state.persistence.stream_memory.snapshot().0, 0);
-    drop(permits);
     assert_eq!(
         state.proxy_archive_stream_permits.available_permits(),
         crate::PROXY_ARCHIVE_STREAM_CONCURRENCY

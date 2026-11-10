@@ -558,16 +558,18 @@ impl LocalCapture {
 
 struct CaptureQueueMemory {
     // Blocking IO cannot be aborted. Keep admission until the actual IO exits.
-    _archive_permit: tokio::sync::OwnedSemaphorePermit,
-    reservation: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
+    _archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    reservation: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
 }
 
 impl Drop for CaptureQueueMemory {
     fn drop(&mut self) {
-        self.reservation.release(
-            super::CAPTURE_MEMORY_BYTES,
-            crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-        );
+        if let Some(reservation) = &self.reservation {
+            reservation.release(
+                super::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            );
+        }
     }
 }
 
@@ -707,24 +709,9 @@ impl ResponseArchiveProducer {
             target,
         };
         async move {
-            // Keep the supplier stream unpolled while a bounded writer is busy.
-            // Accepted originals must not disappear merely because another
-            // response still owns the upload envelope.
-            let archive_permit = state
-                .proxy_archive_stream_permits
-                .clone()
-                .acquire_owned()
-                .await
-                .ok()?;
-            let memory = state
-                .persistence
-                .stream_memory
-                .temporary_wait(
-                    super::CAPTURE_MEMORY_BYTES,
-                    crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
-                )
-                .await?;
-            let producer = Self::begin_admitted(&state, identity, memory, archive_permit, target);
+            // Capture locally before competing for object-storage upload resources.
+            // The owned writer retains the source until its eventual CAS/root ACK.
+            let producer = Self::begin_admitted(&state, identity, None, None, target);
             admission.disarm();
             Some(producer)
         }
@@ -757,8 +744,8 @@ impl ResponseArchiveProducer {
         Some(Self::begin_admitted(
             state,
             identity,
-            memory,
-            archive_permit,
+            Some(memory),
+            Some(archive_permit),
             CaptureTarget::Response,
         ))
     }
@@ -766,8 +753,8 @@ impl ResponseArchiveProducer {
     fn begin_admitted(
         state: &AppState,
         identity: ArchiveSpoolIdentity,
-        memory: Arc<crate::gateway_body::memory::ProxyMemoryReservation>,
-        archive_permit: tokio::sync::OwnedSemaphorePermit,
+        memory: Option<Arc<crate::gateway_body::memory::ProxyMemoryReservation>>,
+        archive_permit: Option<tokio::sync::OwnedSemaphorePermit>,
         target: CaptureTarget,
     ) -> Self {
         let queue_memory = Arc::new(CaptureQueueMemory {
@@ -788,7 +775,7 @@ impl ResponseArchiveProducer {
                 let _queue_memory = writer_memory.clone();
                 let _capture_metrics = writer_state.metrics.memory_usage(
                     crate::metrics::MemoryComponent::StreamCapture,
-                    super::CAPTURE_MEMORY_BYTES,
+                    super::CHUNK_BYTES,
                 );
                 match run_response_archive_writer(
                     writer_state.clone(),
@@ -1167,6 +1154,39 @@ async fn run_response_archive_writer(
     active: Arc<AtomicBool>,
     target: CaptureTarget,
 ) -> Result<WriterOutcome, AppError> {
+    // Upload concurrency and multipart memory belong to this background task,
+    // never to admission of the supplier/client stream. The queued source is a
+    // file and a watch watermark, not a response-sized in-memory channel.
+    let _upload_memory = if memory._archive_permit.is_none() {
+        let permit = state
+            .proxy_archive_stream_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| AppError::internal("capture_upload_admission_closed"))?;
+        if !active.load(Ordering::Acquire) {
+            return Ok(writer_interrupted(identity, "abandoned_before_upload"));
+        }
+        let reservation = state
+            .persistence
+            .stream_memory
+            .temporary_wait(
+                super::CAPTURE_MEMORY_BYTES,
+                crate::gateway_body::memory::CAPTURE_MEMORY_WEIGHT,
+            )
+            .await
+            .ok_or_else(|| AppError::internal("capture_upload_memory_closed"))?;
+        Some(CaptureQueueMemory {
+            _archive_permit: Some(permit),
+            reservation: Some(reservation),
+        })
+    } else {
+        None
+    };
+    let _upload_metrics = state.metrics.memory_usage(
+        crate::metrics::MemoryComponent::StreamCapture,
+        super::CAPTURE_MEMORY_BYTES,
+    );
     #[cfg(test)]
     pause_begin_for_test(&state).await;
     let staging = format!(
