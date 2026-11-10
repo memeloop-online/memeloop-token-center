@@ -32,8 +32,13 @@ async fn block_projection(fixture: &CodexRouteFixture) {
 }
 
 #[tokio::test]
-async fn finance_completes_while_conversation_projection_is_blocked() {
+async fn finance_completes_while_receipt_publication_and_conversation_projection_are_blocked() {
     let fixture = codex_route_fixture("receipt-before-preparation").await;
+    let publication = fixture
+        .state
+        .pending_terminals
+        .hold_publication_for_test()
+        .await;
     let held = fixture
         .state
         .pending_terminals
@@ -51,10 +56,27 @@ async fn finance_completes_while_conversation_projection_is_blocked() {
         .unwrap();
     let request_id = rows[0].request_id;
     assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 2));
-    let (_, receipt) = wait_for_receipt(&fixture).await;
+    let (receipt_id, receipt) = wait_for_receipt(&fixture).await;
     assert_eq!(receipt["conversation_state"], "Pending");
     assert_eq!(receipt["conversation"]["request_json"], json!({}));
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    let financial: (String, i64, i64) = sqlx::query_as(
+        "SELECT p.state, (SELECT COUNT(*) FROM ledger_entries WHERE source = p.reservation_id), \
+         (SELECT COUNT(*) FROM terminal_projection_outbox WHERE request_id = p.request_id) \
+         FROM pending_proxy_settlements p WHERE p.request_id = $1",
+    )
+    .bind(request_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(financial, ("applied".into(), 1, 1));
+    assert!(
+        !fixture
+            .state
+            .pending_terminals
+            .contains_receipt_for_test(receipt_id),
+        "DB settlement must not falsely acknowledge the blocked journal publication"
+    );
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1",
     )
@@ -68,6 +90,7 @@ async fn finance_completes_while_conversation_projection_is_blocked() {
         .await
         .unwrap();
     drop(held);
+    drop(publication);
     assert_exactly_once_side_effects(&fixture, request_id, Some("resp-codex")).await;
     pool.close().await;
     upstream.verify().await;
@@ -113,6 +136,27 @@ async fn another_pod_recovers_finance_and_conversation_seed_without_the_original
     assert_eq!(persisted["conversation"]["request_json"], json!({}));
     fixture.state.pending_terminals.stop_for_test().await;
     drop(held);
+    let request_id = receipt["request_id"].as_str().unwrap();
+    let source_location =
+        crate::gateway_body::request_spool::request_body_object_key(request_id).unwrap();
+    let source_bytes = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(bytes) = fixture.state.archive.get(&source_location).await {
+                break bytes;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    // Model a source that is temporarily unavailable to the recovering Pod.
+    // Only this isolated fixture's object is removed and restored.
+    fixture
+        .state
+        .archive
+        .delete(&source_location)
+        .await
+        .unwrap();
     let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
     sqlx::query("DROP TRIGGER fail_pending_terminal")
         .execute(&pool)
@@ -131,7 +175,41 @@ async fn another_pod_recovers_finance_and_conversation_seed_without_the_original
             fixture.state.archive.clone(),
         );
     wait_for_request_settlement(&fixture, 1).await;
-    let request_id = receipt["request_id"].as_str().unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM conversation_projection_outbox WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bounded identity must enqueue before the source HEAD succeeds");
+    let retained = fixture.state.archive.get(&location).await.unwrap();
+    let retained: Value = serde_json::from_slice(&retained).unwrap();
+    assert_eq!(retained["conversation_state"], "Pending");
+    assert_eq!(retained["usage"], persisted["usage"]);
+    assert!(
+        !fixture
+            .state
+            .archive
+            .source_object_exists(&source_location)
+            .await
+            .unwrap()
+    );
+    fixture
+        .state
+        .archive
+        .put(&source_location, source_bytes)
+        .await
+        .unwrap();
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ledger_entries WHERE source = $1")
         .bind(receipt["reservation"]["id"].as_str().unwrap())
         .fetch_one(&pool)

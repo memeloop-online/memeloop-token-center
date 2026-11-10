@@ -181,7 +181,7 @@ Then('只能看到自己的错误正文且清除筛选后可加载完整历史',
   const page = this.requirePage();
   const drawer = page.getByRole('dialog');
   await assertContains(drawer, '429');
-  await assertContains(drawer, 'upstream rejected the request');
+  await assertContains(drawer, 'mock observable rate limit');
   await drawer.getByRole('button', { name: '关闭', exact: true }).click();
 
   const filters = page.locator('.self-request-filter-panel');
