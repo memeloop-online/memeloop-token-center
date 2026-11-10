@@ -13,10 +13,14 @@ node scripts/maintenance/kimi-review.ts < complete-review-task.txt
 
 The default model is `k3.1-pro`. `MTC_REVIEW_MODEL` changes the model;
 `MTC_BASE_URL` changes the gateway URL, including its `/v1` prefix. The command
-prints the actual review, finish reason, usage and request ID as JSON. Keep the
+collects streaming text and prints the actual review, finish reason, usage and
+request ID as JSON. Provider reasoning is not printed. Keep the
 request ID to inspect the archived plaintext task and returned review. It sends
 one request, leaves thinking at the provider default and sets no artificial
-output token cap. An empty review or a `length` finish reason remains visible.
+output token cap or total request deadline. An empty review or a `length` finish
+reason remains visible. `stream_complete: false` identifies a missing stream
+terminal or stream failure, preserving any partial text without calling it a
+completed review. Terminal usage is requested for normal gateway billing.
 
 This runs a Kimi review; it does not create a Codex child or give the model local
 tools. Native Codex reserves the `collaboration` schema. Changing its encrypted
