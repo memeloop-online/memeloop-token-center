@@ -65,7 +65,6 @@ const MAX_OUTPUT_ITEMS: usize = 16_384;
 // health. Keep the exceptional definite-rejection inspection deliberately
 // small: it happens before any downstream bytes are delivered and its body is
 // never retained, archived, logged, or returned.
-const MISSING_CONTENT_TYPE_SNIFF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(super) fn is_driver(driver: &str) -> bool {
     driver == DRIVER
@@ -331,6 +330,19 @@ where
     TEST_ENDPOINT.scope(endpoint, future).await
 }
 
+#[cfg(test)]
+pub(in crate::api) fn inherit_test_endpoint<F: Future>(
+    future: F,
+) -> impl Future<Output = F::Output> {
+    let endpoint = TEST_ENDPOINT.try_with(Clone::clone).ok();
+    async move {
+        match endpoint {
+            Some(endpoint) => TEST_ENDPOINT.scope(endpoint, future).await,
+            None => future.await,
+        }
+    }
+}
+
 /// Rewrite only the upstream wire document. The original downstream body is
 /// archived by `proxy()` before this document is sent.
 #[cfg(test)]
@@ -367,6 +379,13 @@ pub(super) fn prepare_request_with_id(
     let chat_controls = matches!(protocol, Protocol::OpenAiChat)
         .then(|| translate_chat_request(request, transport_policy.chat_controls))
         .transpose()?;
+    // Native parents can delegate to third-party children. Ask for readable
+    // task arguments at the producer, before an opaque child envelope exists.
+    // Existing native encrypted messages and unrelated schemas stay intact.
+    crate::api::request_normalization::prepare_plaintext_collaboration_tools(
+        request,
+        matches!(protocol, Protocol::OpenAiResponses),
+    )?;
     let object = request
         .as_object_mut()
         .ok_or_else(|| AppError::BadRequest("request body must be a JSON object".into()))?;
@@ -1208,14 +1227,13 @@ pub(super) async fn admit_event_stream_response(
     }
 
     let mut parts = response.into_parts();
-    let deadline = tokio::time::Instant::now() + MISSING_CONTENT_TYPE_SNIFF_TIMEOUT;
     let mut prefetched = Vec::new();
     let mut inspected = Vec::new();
     let mut sanitizer = ResponsesStreamingSanitizer::with_limits(sse_framing_limits);
     loop {
-        let next = tokio::time::timeout_at(deadline, parts.stream.next())
-            .await
-            .map_err(|_| ResponseAdmissionError::Ambiguous("upstream_timeout"))?;
+        // Admission shares the upstream body's timeout/cancellation policy.
+        // Missing Content-Type must not introduce a separate response deadline.
+        let next = parts.stream.next().await;
         let Some(next) = next else {
             return Err(ResponseAdmissionError::Invalid(
                 "upstream_invalid_content_type",
@@ -2430,6 +2448,56 @@ mod tests {
         assert!(!codex_transient_error(&json!({
             "error": {"type": "invalid_request_error"}
         })));
+    }
+
+    #[test]
+    fn native_parent_emits_plaintext_collaboration_schema_and_preserves_native_history() {
+        let mut request = json!({
+            "tools": [{"type":"namespace","name":"collaboration","tools":[
+                {"type":"function","name":"spawn_agent","parameters":{"type":"object",
+                    "properties":{"message":{"type":"string","encrypted":true,"description":"task"}}}}
+            ]}, {"type":"function","name":"unrelated","parameters":{"type":"object",
+                "properties":{"message":{"type":"string","encrypted":true}}}}],
+            "input": [{"type":"agent_message","content":[
+                {"type":"encrypted_content","encrypted_content":"opaque-history"}
+            ]}, {"type":"additional_tools","tools":[
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"send_message","parameters":{"type":"object",
+                        "properties":{"message":{"type":"string","encrypted":true}}}}
+                ]}
+            ]}]
+        });
+        let native_history = request["input"][0].clone();
+        prepare_request(&mut request, "gpt-codex", &config("gpt-codex", 10)).unwrap();
+        assert!(
+            request
+                .pointer("/tools/0/tools/0/parameters/properties/message/encrypted")
+                .is_none()
+        );
+        assert!(
+            request
+                .pointer("/input/1/tools/0/tools/0/parameters/properties/message/encrypted")
+                .is_none()
+        );
+        assert_eq!(
+            request["tools"][1]["parameters"]["properties"]["message"]["encrypted"],
+            true
+        );
+        assert_eq!(request["input"][0], native_history);
+        assert_eq!(
+            request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]["description"],
+            "task"
+        );
+
+        let task =
+            "Review PR757. Preserve usage and never retry OAuth.\nReport the exact findings.";
+        let mut child = json!({"input":[{"type":"agent_message","content":[
+            {"type":"input_text","text":task}
+        ]}]});
+        crate::api::request_normalization::normalize_codex_multi_agent_v2(&mut child, true)
+            .unwrap();
+        assert_eq!(child["input"][0]["role"], "user");
+        assert_eq!(child["input"][0]["content"][0]["text"], task);
     }
 
     fn config(model: &str, limit: i64) -> Value {

@@ -176,6 +176,7 @@ impl Database {
             return Err(invalid());
         }
         let stamp = BindingStamp {
+            mode: None,
             selection_version: revision(tx).await?,
             binding_version: 1,
             group_id: Some(snapshot.reference.group_id),

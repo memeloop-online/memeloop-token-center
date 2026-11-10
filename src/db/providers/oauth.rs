@@ -221,6 +221,7 @@ impl Database {
             return Ok((view, false));
         }
 
+        crate::db::transport_proxy_management::lock(&mut tx).await?;
         let select = match self.backend {
             DatabaseBackend::PostgreSql => {
                 "SELECT a.id, a.tenant_id, t.external_id AS tenant_external_id, a.name, a.notes, a.driver, a.auth_kind, a.config_json, a.status, a.credential_generation, a.oauth_session_id, a.oauth_driver, a.oauth_refresh_url, a.created_at, a.updated_at, c.expires_at, c.credential_ciphertext, (SELECT COUNT(DISTINCT candidate.model_route_id) FROM model_route_eligible_upstream_accounts candidate JOIN model_routes counted_route ON counted_route.tenant_id = candidate.tenant_id AND counted_route.id = candidate.model_route_id AND counted_route.archived_at IS NULL WHERE candidate.tenant_id = a.tenant_id AND candidate.upstream_account_id = a.id) AS route_count FROM upstream_accounts a JOIN tenants t ON t.id = a.tenant_id JOIN upstream_credentials c ON c.upstream_account_id = a.id AND c.generation = a.credential_generation AND c.revoked_at IS NULL WHERE a.id = $1 AND t.external_id = $2 FOR UPDATE OF a, c"
@@ -295,7 +296,30 @@ impl Database {
         };
         let mut view = upstream_account_view(row)?;
 
-        if proxy_changed {
+        let managed_transport = driver == crate::oauth::codex_device::PROVIDER_DRIVER
+            || crate::oauth::authorization_code::supports_managed_transport(&current_credential);
+        let changed = if managed_transport {
+            let changed = self
+                .apply_legacy_transport_proxy(
+                    &mut tx,
+                    account_id,
+                    tenant_external_id,
+                    &proxy_url,
+                    generation,
+                    updated_at,
+                    !proxy_changed,
+                    actor_service_id,
+                    key_material,
+                )
+                .await?;
+            let current = sqlx::query("SELECT config_json, credential_generation, updated_at FROM upstream_accounts WHERE id = $1")
+                .bind(account_id.to_string()).fetch_one(&mut *tx).await?;
+            view.config = serde_json::from_str(&current.try_get::<String, _>("config_json")?)
+                .map_err(|_| AppError::internal("transport_policy_projection"))?;
+            view.credential_generation = current.try_get("credential_generation")?;
+            view.updated_at = current.try_get("updated_at")?;
+            changed
+        } else if proxy_changed {
             let mut preserve_refresh_fence = false;
             if let Some(refresh) = refresh {
                 let dispatched = refresh
@@ -367,13 +391,21 @@ impl Database {
                     "reload the upstream provider before changing its transport proxy".into(),
                 ));
             }
+            view.credential_generation = next_generation;
+            view.credential_expires_at = replacement.expires_at();
+            view.updated_at = next_updated_at;
+            true
+        } else {
+            false
+        };
+        if changed {
             sqlx::query(
                 "INSERT INTO upstream_transport_proxy_audit (id, upstream_account_id, tenant_id, credential_generation, previous_fingerprint, previous_scheme, new_fingerprint, new_scheme, remote_dns, actor_service_id, operator_is_bootstrap, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             )
             .bind(Uuid::now_v7().to_string())
             .bind(account_id.to_string())
             .bind(view.tenant_id.to_string())
-            .bind(next_generation)
+            .bind(view.credential_generation)
             .bind(old_metadata.fingerprint)
             .bind(old_metadata.scheme)
             .bind(new_metadata.fingerprint.clone())
@@ -384,9 +416,6 @@ impl Database {
             .bind(now)
             .execute(&mut *tx)
             .await?;
-            view.credential_generation = next_generation;
-            view.credential_expires_at = replacement.expires_at();
-            view.updated_at = next_updated_at;
         }
         view.attach_proxy_metadata(&replacement, key_material)?;
         store_credential_rotation_response(
@@ -400,7 +429,7 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok((view, proxy_changed))
+        Ok((view, changed))
     }
 
     pub async fn disconnect_upstream_oauth(
@@ -1392,6 +1421,29 @@ impl Database {
         }
         oauth_refresh_lifecycle_from_row(&row)
     }
+    /// The recovery endpoint can only finalize ciphertext already saved by
+    /// the original attempt. It has no dispatch path and never exports its key.
+    pub(crate) async fn recover_upstream_oauth_refresh(
+        &self,
+        account_id: Uuid,
+        key_material: &[u8],
+    ) -> Result<UpstreamAccountView, AppError> {
+        let row = sqlx::query("SELECT l.idempotency_key, l.pending_credential_ciphertext FROM upstream_oauth_refresh_leases l JOIN upstream_accounts a ON a.id = l.account_id AND a.credential_generation = l.credential_generation WHERE l.account_id = $1 AND l.pending_credential_ciphertext IS NOT NULL")
+            .bind(account_id.to_string()).fetch_optional(&self.pool).await?
+            .ok_or_else(|| AppError::Conflict("No saved authorization result is available. Check the current authorization state before continuing.".into()))?;
+        let key: String = row.try_get("idempotency_key")?;
+        let pending: String = row.try_get("pending_credential_ciphertext")?;
+        let credential = open_credential(&pending, key_material)?;
+        self.finish_upstream_oauth_refresh_attempt(
+            account_id,
+            credential,
+            &pending,
+            &key,
+            key_material,
+        )
+        .await
+    }
+
     /// Recover a saved result (including manual/takeover attempts) with the
     /// original key. A fresh key cannot install another attempt's pending token.
     pub(crate) async fn upstream_oauth_refresh_recovery_key(

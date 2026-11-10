@@ -12,7 +12,7 @@ mod http;
 #[cfg(test)]
 pub(super) use http::with_stalled_probe_preparation;
 pub(super) mod kimi;
-mod outcome;
+pub(super) mod outcome;
 mod policy;
 mod probe;
 mod readiness;

@@ -179,7 +179,6 @@ function AssistantSettings({ token, tenant }: { token: string; tenant: string })
           <div className="button-row"><Button appearance="primary" type="submit" disabled={saving || billingLoading || Boolean(billingError) || !selectedRouteId || !selectedRouteIsVerified || !selectedRouteHasAvailableCandidate || !billingChoices.some((choice) => choice.key_id === selectedBillingId)}>{saving ? t('common.loading') : t('common.save')}</Button></div>
         </form>}
         {!loading && !loadError && selectedUnverifiedRoute && <p className="error-text" role="alert">{t('settings.assistantTextSelectedUnverified', { model: selectedUnverifiedRoute.label })}</p>}
-        {!loading && !loadError && unverifiedRoutes.length > 0 && <p className="settings-status-note" role="status">{t('settings.assistantTextUnverified', { count: unverifiedRoutes.length })}</p>}
         {settings === null && !loadError && <p className="settings-status-note">{t('settings.filterAssistantNotConfigured')}</p>}
         {settings && !settings.billing_key_id && <p className="settings-status-note">{t('settings.assistantExecutionNotEnabled')}</p>}
       </article>

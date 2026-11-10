@@ -78,19 +78,6 @@ export function TransportProxyGroups(props: Props & { children: ReactNode; onNav
   </ProxyGroupContext.Provider>;
 }
 
-export function TransportProxyGroupAction({ accountId, disabled = false }: { accountId?: string; disabled?: boolean }) {
-  const context = useContext(ProxyGroupContext);
-  const { locale } = useI18n();
-  const copy = transportProxyGroupCopy(locale);
-  const description = useId();
-  if (!context || !accountId) return null;
-  return <div className="row-actions transport-proxy-management-action">
-    <Button appearance="secondary" type="button" disabled={disabled || !context.allowed} aria-describedby={context.reason ? description : undefined} onClick={() => context.open(accountId)}>{copy.chooseGroup}</Button>
-    {context.reason && <span id={description} className="muted" role="status">{context.reason}</span>}
-    {context.retry && <Button appearance="secondary" type="button" onClick={context.reload}>{copy.retry}</Button>}
-  </div>;
-}
-
 export function TransportProxyGroupFields({ groups, groupId, initialMember, onGroupChange, onMemberChange, disabled = false, emptyLabel }: {
   groups: TransportProxyGroup[]; groupId: string; initialMember: string;
   onGroupChange: (value: string) => void; onMemberChange: (value: string) => void;

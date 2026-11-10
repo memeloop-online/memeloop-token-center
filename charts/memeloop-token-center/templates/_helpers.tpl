@@ -50,6 +50,8 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
       key: {{ .Values.config.databaseUrlSecret.key }}
 - name: MTC_DATABASE_MAX_CONNECTIONS
   value: {{ .Values.config.databaseMaxConnections | quote }}
+- name: MTC_DATABASE_AUX_POOL_MAX_CONNECTIONS
+  value: {{ .Values.config.databaseAuxPoolMaxConnections | quote }}
 - name: MTC_PROXY_LIFECYCLE_CONCURRENCY
   value: {{ .Values.config.proxyLifecycleConcurrency | quote }}
 - name: MTC_PROXY_MEMORY_BUDGET_BYTES

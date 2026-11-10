@@ -573,8 +573,8 @@ pub(crate) fn render_bilingual(code: &str, facts: ErrorFacts) -> (String, String
 pub(crate) fn public_error_sentences(code: &str) -> Option<(&'static str, &'static str)> {
     Some(match code {
         "proxy_memory_ingress" => (
-            "网关内存装不下这次请求体，也没有写入对象存储",
-            "gateway memory budget could not hold the request body, and the body was not written to object storage",
+            "网关当前没有足够内存接收请求体，请稍后重试",
+            "gateway memory is currently insufficient to receive the request body; retry later",
         ),
         "proxy_memory_json" => (
             "网关内存装不下解析后的 JSON 请求体",

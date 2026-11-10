@@ -1982,6 +1982,7 @@ mod tests {
             account_binding: Some((
                 account_id,
                 crate::db::transport_proxy_management::BindingStamp {
+                    mode: None,
                     selection_version: 1,
                     binding_version: 1,
                     group_id: Some(group_id),
