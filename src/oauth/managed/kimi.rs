@@ -2,16 +2,15 @@
 #[cfg(test)]
 use std::time::Duration;
 
+#[cfg(test)]
+use crate::oauth::{OAuthRefreshPhase, OAuthRefreshTimeoutSource};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
     error::AppError,
     network,
-    oauth::{
-        OAuthRefreshFailure, OAuthRefreshFailureKind, OAuthRefreshObservation, OAuthRefreshPhase,
-        OAuthRefreshRequestGuard, OAuthRefreshTimeoutSource,
-    },
+    oauth::{OAuthRefreshFailure, OAuthRefreshFailureKind, OAuthRefreshRequestGuard},
     provider::UpstreamCredential,
 };
 
@@ -53,43 +52,6 @@ fn failed() -> AppError {
 
 fn refresh_failure(kind: OAuthRefreshFailureKind, http_status: Option<u16>) -> AppError {
     AppError::OAuthRefresh(OAuthRefreshFailure::new(kind, http_status))
-}
-
-fn observed_failure(
-    error: AppError,
-    phase: OAuthRefreshPhase,
-    started: tokio::time::Instant,
-    connector_failure: bool,
-    timeout_source: Option<OAuthRefreshTimeoutSource>,
-) -> AppError {
-    match error {
-        AppError::OAuthRefresh(mut failure) => {
-            failure.observation = Some(OAuthRefreshObservation {
-                phase,
-                elapsed_ms: started.elapsed().as_millis() as u64,
-                budget_ms: 0,
-                connector_failure,
-                timeout_source,
-            });
-            AppError::OAuthRefresh(failure)
-        }
-        error => error,
-    }
-}
-
-fn rejected_refresh(status: u16, bytes: &[u8]) -> AppError {
-    let kind = serde_json::from_slice::<Value>(bytes)
-        .ok()
-        .and_then(
-            |response| match response.get("error").and_then(Value::as_str) {
-                Some("invalid_grant") => Some(OAuthRefreshFailureKind::InvalidGrant),
-                Some("refresh_revoked") => Some(OAuthRefreshFailureKind::RefreshRevoked),
-                Some("invalid_refresh_token") => Some(OAuthRefreshFailureKind::InvalidRefreshToken),
-                _ => None,
-            },
-        )
-        .unwrap_or(OAuthRefreshFailureKind::HttpRejected);
-    refresh_failure(kind, Some(status))
 }
 
 fn optional_text(value: Option<&str>) -> Result<(), AppError> {
@@ -323,49 +285,11 @@ async fn refresh_with_client(
         .body(form)
         .build()
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::Configuration, None))?;
-    request_guard.mark_request_started().await?;
-    let started = tokio::time::Instant::now();
-    let operation = async {
-        let response = match client.execute(request).await {
-            Ok(response) => response,
-            Err(error) => {
-                if error.is_connect() {
-                    request_guard.mark_request_not_sent(&error).await?;
-                }
-                return Err(observed_failure(
-                    refresh_failure(
-                        if error.is_timeout() {
-                            OAuthRefreshFailureKind::Timeout
-                        } else {
-                            OAuthRefreshFailureKind::Network
-                        },
-                        None,
-                    ),
-                    OAuthRefreshPhase::BeforeHeaders,
-                    started,
-                    error.is_connect(),
-                    error
-                        .is_timeout()
-                        .then_some(OAuthRefreshTimeoutSource::HttpClient),
-                ));
-            }
-        };
-        let status = response.status().as_u16();
-        let bytes = super::super::bounded_body(response).await.map_err(|_| {
-            observed_failure(
-                refresh_failure(OAuthRefreshFailureKind::ResponseBody, Some(status)),
-                OAuthRefreshPhase::ResponseBody,
-                started,
-                false,
-                None,
-            )
-        })?;
-        if status != 200 {
-            return Err(rejected_refresh(status, &bytes));
-        }
-        Ok(bytes)
-    };
-    let bytes = operation.await?;
+    let (status, bytes) =
+        super::super::refresh_exchange::execute(client, request, request_guard).await?;
+    if status != 200 {
+        return Err(super::super::refresh_exchange::rejected(status, &bytes));
+    }
     let response: TokenResponse = serde_json::from_slice(&bytes)
         .map_err(|_| refresh_failure(OAuthRefreshFailureKind::ResponseDecode, Some(200)))?;
     super::bearer_token(&response.access_token, "Kimi").map_err(|_| failed())?;
@@ -1151,7 +1075,10 @@ mod tests {
                 OAuthRefreshFailureKind::HttpRejected,
             ),
         ] {
-            let error = rejected_refresh(status, &serde_json::to_vec(&response).unwrap());
+            let error = super::super::super::refresh_exchange::rejected(
+                status,
+                &serde_json::to_vec(&response).unwrap(),
+            );
             assert!(!error.to_string().contains("remote-fixture-secret"));
             assert!(!format!("{error:?}").contains("remote-fixture-secret"));
             let AppError::OAuthRefresh(failure) = error else {

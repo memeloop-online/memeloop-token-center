@@ -443,6 +443,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
             post(refresh_upstream_oauth),
         )
         .route(
+            "/internal/v1/upstreams/{account_id}/oauth/recover",
+            post(recover_upstream_oauth),
+        )
+        .route(
             "/internal/v1/upstreams/{account_id}/oauth/disconnect",
             post(disconnect_upstream_oauth),
         )

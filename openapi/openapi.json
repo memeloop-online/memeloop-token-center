@@ -6948,7 +6948,7 @@
           }
         ],
         "x-required-scope": "providers:write",
-        "description": "Requires the same global operator authority as editing private transport\nproxies and verifies the explicitly selected tenant owns the account.\nReturns only credential-backed proxy settings and account CAS revisions,\nincluding proxy username and password where configured. Never returns\nAPI keys, OAuth access/refresh tokens, adapter state or configuration.\nWorks for supported OAuth and API-key proxy credentials. An unconfigured\nproxy is null. Ordinary account lists remain sanitized. No upstream\nconnection, probe, refresh or mutation is performed.\n",
+        "description": "Requires the same global operator authority as editing private transport\nproxies and verifies the explicitly selected tenant owns the account.\nReturns effective policy-backed proxy settings and account CAS revisions,\nincluding proxy username and password where configured. Never returns\nAPI keys, OAuth access/refresh tokens, adapter state or configuration.\nWorks for supported OAuth and API-key proxy credentials. An unconfigured\nproxy is null. Ordinary account lists remain sanitized. No upstream\nconnection, probe, refresh or mutation is performed.\n",
         "parameters": [
           {
             "$ref": "#/components/parameters/AccountId"
@@ -6979,7 +6979,12 @@
                     "proxy_network_scope",
                     "updated_at",
                     "credential_generation",
-                    "supported"
+                    "supported",
+                    "source",
+                    "proxy_id",
+                    "group_id",
+                    "selected_member_id",
+                    "configuration_state"
                   ],
                   "properties": {
                     "account_id": {
@@ -7013,6 +7018,44 @@
                     "supported": {
                       "type": "boolean",
                       "description": "Whether this credential has an OAuth or proxied API-key container supported by the transport editor."
+                    },
+                    "source": {
+                      "type": "string",
+                      "enum": [
+                        "credential",
+                        "manual",
+                        "auto",
+                        "plugin"
+                      ]
+                    },
+                    "proxy_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "uuid"
+                    },
+                    "group_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "uuid"
+                    },
+                    "selected_member_id": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "format": "uuid"
+                    },
+                    "configuration_state": {
+                      "type": "string",
+                      "enum": [
+                        "credential",
+                        "applied",
+                        "pending"
+                      ]
                     }
                   }
                 }
@@ -7665,6 +7708,50 @@
           },
           "502": {
             "$ref": "#/components/responses/UpstreamError"
+          }
+        }
+      }
+    },
+    "/internal/v1/upstreams/{account_id}/oauth/recover": {
+      "post": {
+        "tags": [
+          "Upstream providers"
+        ],
+        "operationId": "recoverUpstreamOAuthCredential",
+        "summary": "Finalize an already saved OAuth refresh result without contacting the authorization server",
+        "security": [
+          {
+            "serviceBearer": []
+          }
+        ],
+        "x-required-scope": "oauth:write",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/AccountId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Recovered stable upstream identity.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UpstreamProvider"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "description": "No saved result exists, or its generation/attempt no longer matches."
           }
         }
       }
@@ -22464,6 +22551,55 @@
           "updated_at": {
             "type": "integer",
             "format": "int64"
+          },
+          "oauth_refresh": {
+            "type": "object",
+            "properties": {
+              "allowed_actions": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "refresh",
+                    "resume_local",
+                    "reauthorize"
+                  ]
+                }
+              },
+              "lease_expires_at": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "access_state": {
+                "type": "string",
+                "enum": [
+                  "valid",
+                  "expired",
+                  "revoked",
+                  "unknown"
+                ]
+              },
+              "refresh_state": {
+                "type": "string",
+                "enum": [
+                  "not_observed",
+                  "in_progress",
+                  "pending_local",
+                  "outcome_unknown",
+                  "failed",
+                  "reauthorization_required"
+                ]
+              },
+              "reauthorization_required": {
+                "type": "boolean"
+              },
+              "automatic_refresh_paused": {
+                "type": "boolean"
+              }
+            }
           }
         }
       },
