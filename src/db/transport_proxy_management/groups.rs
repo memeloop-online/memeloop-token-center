@@ -171,6 +171,7 @@ impl Database {
                 .ok_or_else(invalid)?;
             let binding_version: i64 = account.try_get("version")?;
             let stamp = BindingStamp {
+                mode: None,
                 selection_version: revision(&mut tx).await?,
                 binding_version,
                 group_id: Some(id),

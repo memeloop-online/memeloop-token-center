@@ -28,18 +28,18 @@ test('plugin installer image uses official pinned Cosign and is non-root', (cont
   contains('Dockerfile', 'ARG GO_IMAGE=golang:1.27.3-bookworm');
   contains('Dockerfile', '/usr/local/bin/cosign');
   contains('Dockerfile', '/usr/local/bin/install-plugin-oci');
-  contains('src/plugin_runtime_companions.rs', 'COSIGN_VERIFIER_VERSION: &str = "v3.1.4"');
+  contains('src/plugin_runtime_companions.rs', 'COSIGN_VERIFIER_VERSION: &str = "v3.1.4-mtc.1"');
   contains(dockerfile, '--features plugin-distribution,experimental-plugin-revisions');
   excludes('Cargo.toml', /^sigstore\s*=/m);
   for (const builder of ['Dockerfile', dockerfile]) {
-    contains(builder, 'https://github.com/sigstore/cosign/releases/download/v3.1.4/cosign-linux-amd64');
-    contains(builder, 'sha256:424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa');
-    contains(builder, 'https://raw.githubusercontent.com/sigstore/cosign/0e48502cf5ef34e2e60bbd3617aa19945712f705/LICENSE');
-    contains(builder, 'sha256:c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4');
+    contains(builder, 'https://api.github.com/repos/sigstore/cosign/tarball/0e48502cf5ef34e2e60bbd3617aa19945712f705');
+    contains(builder, 'sha256:04215e967f12c2388c9179b0f18097626a4f1d370cf315f404bebe16218f4cb1');
+    contains(builder, 'GOSUMDB=sum.golang.org');
+    contains(builder, 'golang.org/x/net@v0.62.0');
     contains(builder, 'go version -m /tmp/cosign');
     contains(builder, 'go1\\.27\\.3$');
     contains(builder, 'github.com/klauspost/compress[[:space:]]+v1\\.20\\.1[[:space:]]');
-    excludes(builder, /\bgo\s+build\b/);
+    contains(builder, 'go build -mod=readonly');
     excludes(builder, 'v3.1.3-security.patch');
   }
   contains('.github/workflows/ci.yml', 'docker build --target cosign-builder --tag "$MTC_SIGNED_IMPORT_COSIGN_IMAGE" .');
@@ -66,9 +66,9 @@ test('plugin installer image uses official pinned Cosign and is non-root', (cont
     }
     assert.equal(run('docker', ['image', 'inspect', '--format', '{{.Config.User}}', image]).trim(), '10001:10001');
     assert.equal(run('docker', ['image', 'inspect', '--format', '{{json .Config.Entrypoint}}', image]).trim(), '["/usr/local/bin/install-plugin-oci"]');
-    assert.equal(run('docker', ['image', 'inspect', '--format', '{{index .Config.Labels "io.memeloop.cosign.version"}}', image]).trim(), 'v3.1.4');
+    assert.equal(run('docker', ['image', 'inspect', '--format', '{{index .Config.Labels "io.memeloop.cosign.version"}}', image]).trim(), 'v3.1.4-mtc.1');
     const version = JSON.parse(run('docker', ['run', '--rm', '--entrypoint', '/usr/local/bin/cosign', image, 'version', '--json'])) as { gitVersion?: string; goVersion?: string };
-    assert.equal(version.gitVersion, 'v3.1.4');
+    assert.equal(version.gitVersion, 'v3.1.4-mtc.1');
     assert.equal(version.goVersion, 'go1.27.3');
     const help = run('docker', ['run', '--rm', image, '--help']);
     assert.match(help, /--inventory-file/);
