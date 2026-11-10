@@ -271,12 +271,27 @@ pub use usage_analysis::{
     UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter,
 };
 
+fn postgres_application_name(role: &str) -> String {
+    let hostname = std::env::var("HOSTNAME").unwrap_or_default();
+    let suffix: String = hostname
+        .chars()
+        .rev()
+        .take(32)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{role}/{suffix}")
+}
+
 #[derive(Clone)]
 pub struct Database {
     pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
     archive: Option<crate::archive::ArchiveStore>,
     pool_role: &'static str,
+    auxiliary_pool_max_connections: u32,
+    connection_profile: ConnectionProfile,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
@@ -641,13 +656,18 @@ impl Database {
                 })
             });
         } else {
+            let application_name = postgres_application_name("mtc-serve");
             pool_options = pool_options.after_connect(move |connection, _metadata| {
+                let application_name = application_name.clone();
                 Box::pin(async move {
                     let settings = match profile {
                         ConnectionProfile::Serve => POSTGRES_SERVE_SETTINGS,
                         ConnectionProfile::Migration => POSTGRES_MIGRATION_SETTINGS,
                     };
-                    // One simple-query exchange instead of three serial WAN round trips.
+                    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
+                        .bind(application_name)
+                        .execute(&mut *connection)
+                        .await?;
                     sqlx::raw_sql(settings).execute(&mut *connection).await?;
                     Ok(())
                 })
@@ -691,6 +711,8 @@ impl Database {
             },
             backend,
             terminal_projection_enabled: false,
+            auxiliary_pool_max_connections: 2,
+            connection_profile: profile,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -780,21 +802,56 @@ impl Database {
         }
     }
 
+    pub(crate) fn with_auxiliary_pool_max_connections(mut self, maximum: u32) -> Self {
+        self.auxiliary_pool_max_connections = maximum.clamp(1, 2);
+        self
+    }
+
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
             archive: self.archive.clone(),
             http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
-            pool: self
-                .pool
-                .options()
-                .clone()
-                .min_connections(0)
-                .max_connections(2)
-                .connect_lazy_with(self.pool.connect_options().as_ref().clone()),
+            pool: {
+                let backend = self.backend;
+                let profile = self.connection_profile;
+                let application_name = postgres_application_name("mtc-auxiliary");
+                self.pool
+                    .options()
+                    .clone()
+                    .min_connections(0)
+                    .max_connections(self.auxiliary_pool_max_connections)
+                    .after_connect(move |connection, _| {
+                        let application_name = application_name.clone();
+                        Box::pin(async move {
+                            match backend {
+                                DatabaseBackend::Sqlite => {
+                                    sqlx::query("PRAGMA busy_timeout = 10000")
+                                        .execute(&mut *connection)
+                                        .await?;
+                                }
+                                DatabaseBackend::PostgreSql => {
+                                    let settings = match profile {
+                                        ConnectionProfile::Serve => POSTGRES_SERVE_SETTINGS,
+                                        ConnectionProfile::Migration => POSTGRES_MIGRATION_SETTINGS,
+                                    };
+                                    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
+                                        .bind(application_name)
+                                        .execute(&mut *connection)
+                                        .await?;
+                                    sqlx::raw_sql(settings).execute(&mut *connection).await?;
+                                }
+                            }
+                            Ok(())
+                        })
+                    })
+                    .connect_lazy_with(self.pool.connect_options().as_ref().clone())
+            },
             backend: self.backend,
             terminal_projection_enabled: self.terminal_projection_enabled,
+            auxiliary_pool_max_connections: self.auxiliary_pool_max_connections,
+            connection_profile: self.connection_profile,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }
