@@ -144,14 +144,27 @@ pub use time::unix_millis;
 pub(crate) use upstream_quota_reset::{PrepareQuotaReset, QuotaResetClaim, QuotaResetOperation};
 use validation::*;
 
-const POSTGRES_SERVE_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 30000";
-const POSTGRES_SERVE_LOCK_TIMEOUT: &str = "SET lock_timeout = 10000";
-const POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT: &str =
-    "SET idle_in_transaction_session_timeout = 30000";
-const POSTGRES_MIGRATION_STATEMENT_TIMEOUT: &str = "SET statement_timeout = 900000";
-const POSTGRES_MIGRATION_LOCK_TIMEOUT: &str = "SET lock_timeout = 60000";
-const POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT: &str =
-    "SET idle_in_transaction_session_timeout = 300000";
+const POSTGRES_SERVE_SETTINGS: &str = "SET statement_timeout = 30000; SET lock_timeout = 10000; SET idle_in_transaction_session_timeout = 30000";
+const POSTGRES_MIGRATION_SETTINGS: &str = "SET statement_timeout = 900000; SET lock_timeout = 60000; SET idle_in_transaction_session_timeout = 300000";
+
+async fn wait_for_initial_postgres_connection(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    let mut timeouts = 0_u64;
+    loop {
+        match pool.acquire().await {
+            Ok(connection) => {
+                drop(connection);
+                return Ok(());
+            }
+            Err(sqlx::Error::PoolTimedOut) => {
+                timeouts += 1;
+                if timeouts == 1 || timeouts.is_multiple_of(6) {
+                    tracing::warn!(timeouts, "waiting for initial PostgreSQL connection");
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 enum ConnectionProfile {
@@ -258,12 +271,27 @@ pub use usage_analysis::{
     UsageAnalysisFilter, UsageAnalysisProjection, UsageAnalysisUpstreamFilter,
 };
 
+fn postgres_application_name(role: &str) -> String {
+    let hostname = std::env::var("HOSTNAME").unwrap_or_default();
+    let suffix: String = hostname
+        .chars()
+        .rev()
+        .take(32)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    format!("{role}/{suffix}")
+}
+
 #[derive(Clone)]
 pub struct Database {
     pub(crate) http_clients: std::sync::Arc<crate::http_settings::HttpClientFactory>,
     pool: AnyPool,
     archive: Option<crate::archive::ArchiveStore>,
     pool_role: &'static str,
+    auxiliary_pool_max_connections: u32,
+    connection_profile: ConnectionProfile,
     backend: DatabaseBackend,
     terminal_projection_enabled: bool,
     gateway_persistence: std::sync::Arc<gateway_persistence::GatewayPersistence>,
@@ -628,28 +656,19 @@ impl Database {
                 })
             });
         } else {
+            let application_name = postgres_application_name("mtc-serve");
             pool_options = pool_options.after_connect(move |connection, _metadata| {
+                let application_name = application_name.clone();
                 Box::pin(async move {
-                    let (statement_timeout, lock_timeout, idle_transaction_timeout) = match profile
-                    {
-                        ConnectionProfile::Serve => (
-                            POSTGRES_SERVE_STATEMENT_TIMEOUT,
-                            POSTGRES_SERVE_LOCK_TIMEOUT,
-                            POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
-                        ),
-                        ConnectionProfile::Migration => (
-                            POSTGRES_MIGRATION_STATEMENT_TIMEOUT,
-                            POSTGRES_MIGRATION_LOCK_TIMEOUT,
-                            POSTGRES_MIGRATION_IDLE_TRANSACTION_TIMEOUT,
-                        ),
+                    let settings = match profile {
+                        ConnectionProfile::Serve => POSTGRES_SERVE_SETTINGS,
+                        ConnectionProfile::Migration => POSTGRES_MIGRATION_SETTINGS,
                     };
-                    sqlx::query(statement_timeout)
+                    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
+                        .bind(application_name)
                         .execute(&mut *connection)
                         .await?;
-                    sqlx::query(lock_timeout).execute(&mut *connection).await?;
-                    sqlx::query(idle_transaction_timeout)
-                        .execute(&mut *connection)
-                        .await?;
+                    sqlx::raw_sql(settings).execute(&mut *connection).await?;
                     Ok(())
                 })
             });
@@ -657,7 +676,13 @@ impl Database {
         // Windows test paths use `\`. SQLite's URL parser treats that as an
         // invalid URL, so the same `sqlite://...` fixtures never open a file.
         let database_url = Self::normalized_sqlite_url(database_url);
-        let pool = pool_options.connect(database_url.as_ref()).await?;
+        let pool = if matches!(backend, DatabaseBackend::PostgreSql) {
+            let pool = pool_options.connect_lazy(database_url.as_ref())?;
+            wait_for_initial_postgres_connection(&pool).await?;
+            pool
+        } else {
+            pool_options.connect(database_url.as_ref()).await?
+        };
         if matches!(backend, DatabaseBackend::Sqlite) {
             // The control, gateway, and worker roles may be separate processes
             // over the same lightweight/test database. WAL keeps readers on a
@@ -686,6 +711,8 @@ impl Database {
             },
             backend,
             terminal_projection_enabled: false,
+            auxiliary_pool_max_connections: 2,
+            connection_profile: profile,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         })
@@ -775,21 +802,56 @@ impl Database {
         }
     }
 
+    pub(crate) fn with_auxiliary_pool_max_connections(mut self, maximum: u32) -> Self {
+        self.auxiliary_pool_max_connections = maximum.clamp(1, 2);
+        self
+    }
+
     pub(crate) fn independent_persistence_pool(&self) -> Self {
         Self {
             archive: self.archive.clone(),
             http_clients: self.http_clients.clone(),
             gateway_persistence: self.gateway_persistence.clone(),
             pool_role: "independent_persistence",
-            pool: self
-                .pool
-                .options()
-                .clone()
-                .min_connections(0)
-                .max_connections(2)
-                .connect_lazy_with(self.pool.connect_options().as_ref().clone()),
+            pool: {
+                let backend = self.backend;
+                let profile = self.connection_profile;
+                let application_name = postgres_application_name("mtc-auxiliary");
+                self.pool
+                    .options()
+                    .clone()
+                    .min_connections(0)
+                    .max_connections(self.auxiliary_pool_max_connections)
+                    .after_connect(move |connection, _| {
+                        let application_name = application_name.clone();
+                        Box::pin(async move {
+                            match backend {
+                                DatabaseBackend::Sqlite => {
+                                    sqlx::query("PRAGMA busy_timeout = 10000")
+                                        .execute(&mut *connection)
+                                        .await?;
+                                }
+                                DatabaseBackend::PostgreSql => {
+                                    let settings = match profile {
+                                        ConnectionProfile::Serve => POSTGRES_SERVE_SETTINGS,
+                                        ConnectionProfile::Migration => POSTGRES_MIGRATION_SETTINGS,
+                                    };
+                                    sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
+                                        .bind(application_name)
+                                        .execute(&mut *connection)
+                                        .await?;
+                                    sqlx::raw_sql(settings).execute(&mut *connection).await?;
+                                }
+                            }
+                            Ok(())
+                        })
+                    })
+                    .connect_lazy_with(self.pool.connect_options().as_ref().clone())
+            },
             backend: self.backend,
             terminal_projection_enabled: self.terminal_projection_enabled,
+            auxiliary_pool_max_connections: self.auxiliary_pool_max_connections,
+            connection_profile: self.connection_profile,
             #[cfg(test)]
             oauth_refresh_write_phase_seam: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
         }

@@ -60,12 +60,14 @@ impl GatewayPersistence {
         let acquire_timeout = TEST_SOURCE_POOL_TIMEOUT
             .try_with(|timeout| *timeout)
             .unwrap_or(acquire_timeout);
+        let application_name = super::postgres_application_name("mtc-gateway-archive");
         let pool = AnyPoolOptions::new()
             .max_connections(1)
             .min_connections(0)
             .acquire_timeout(acquire_timeout)
             .idle_timeout(Some(Duration::from_secs(60)))
             .after_connect(move |connection, _| {
+                let application_name = application_name.clone();
                 Box::pin(async move {
                     match backend {
                         DatabaseBackend::Sqlite => {
@@ -74,16 +76,12 @@ impl GatewayPersistence {
                                 .await?;
                         }
                         DatabaseBackend::PostgreSql => {
-                            // Reuse the serving session policy in one simple
-                            // query exchange, not three prepared SET exchanges.
-                            let settings = [
-                                super::POSTGRES_SERVE_STATEMENT_TIMEOUT,
-                                super::POSTGRES_SERVE_LOCK_TIMEOUT,
-                                super::POSTGRES_SERVE_IDLE_TRANSACTION_TIMEOUT,
-                            ]
-                            .join(";");
-                            sqlx::raw_sql(sqlx::AssertSqlSafe(settings))
-                                .execute(connection)
+                            sqlx::query("SELECT set_config('application_name', CASE WHEN current_setting('application_name') = '' THEN $1 ELSE current_setting('application_name') END, false)")
+                                .bind(application_name)
+                                .execute(&mut *connection)
+                                .await?;
+                            sqlx::raw_sql(super::POSTGRES_SERVE_SETTINGS)
+                                .execute(&mut *connection)
                                 .await?;
                         }
                     }
