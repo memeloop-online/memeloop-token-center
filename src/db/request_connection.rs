@@ -145,6 +145,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(last, first);
+        let streamed: Vec<i32> =
+            sqlx::query_scalar("SELECT pg_backend_pid() FROM generate_series(1, 3)")
+                .fetch_all(&database.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            streamed,
+            vec![first; 3],
+            "complete direct streams reuse the same backend"
+        );
         database.close().await;
     }
 

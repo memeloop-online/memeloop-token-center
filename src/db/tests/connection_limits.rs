@@ -60,10 +60,6 @@ async fn pool_timeout_diagnostics_distinguish_roles_without_exposing_connection_
         directory.path().join(format!("{canary}.db")).display()
     );
     let serve = Database::connect_with_max(&database_url, 1).await.unwrap();
-    assert_eq!(
-        postgres_timeout(&serve, "client_connection_check_interval").await,
-        "1s"
-    );
     let persistence = serve.independent_persistence_pool();
     let mut archive = serve.clone();
     archive.pool = serve.gateway_persistence.pool.clone();
@@ -163,6 +159,10 @@ async fn postgres_serve_waits_without_statement_or_lock_deadlines_and_migration_
     let serve = Database::connect_with_max(&database_url, 1).await.unwrap();
     assert_eq!(postgres_timeout(&serve, "statement_timeout").await, "0");
     assert_eq!(postgres_timeout(&serve, "lock_timeout").await, "0");
+    assert_eq!(
+        postgres_timeout(&serve, "client_connection_check_interval").await,
+        "1s"
+    );
     assert_eq!(
         postgres_timeout(&serve, "idle_in_transaction_session_timeout").await,
         "30s"
