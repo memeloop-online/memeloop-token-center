@@ -396,7 +396,9 @@ impl UpstreamResponse {
         let version = self.version();
         let content_length = self.content_length();
         let validated_compact = self.validated_compact().cloned();
-        let stream = self.bytes_stream();
+        // Inspectors may consume EOF before replaying their retained prefix.
+        // Never poll an exhausted upstream again when that prefix is drained.
+        let stream = Box::pin(self.bytes_stream().fuse());
         UpstreamResponseParts {
             status,
             headers,
