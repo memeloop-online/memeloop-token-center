@@ -15,6 +15,11 @@ struct ProxySettings {
     updated_at: i64,
     credential_generation: i64,
     supported: bool,
+    source: String,
+    proxy_id: Option<Uuid>,
+    group_id: Option<Uuid>,
+    selected_member_id: Option<Uuid>,
+    configuration_state: &'static str,
 }
 
 pub(in crate::api) async fn get_upstream_proxy_settings(
@@ -37,7 +42,37 @@ pub(in crate::api) async fn get_upstream_proxy_settings(
         .upstream_account_with_current_credential(account_id, state.config.key_pepper.as_bytes())
         .await?;
     // Build a dedicated projection; never serialize the credential or account.
-    let proxy = credential.proxy();
+    let mut policy = state
+        .db
+        .get_network_proxy_selection(account_id, &query.tenant_external_id)
+        .await?;
+    state
+        .transport_proxy_groups
+        .describe_network_proxy_selection(account_id, &mut policy);
+    let source = policy["desired"]["mode"]
+        .as_str()
+        .unwrap_or("credential")
+        .to_owned();
+    let selected = state.transport_proxy_groups.select_config(
+        account_id,
+        account.credential_generation,
+        &credential,
+        &account.config,
+    );
+    let configuration_state = if source == "credential" {
+        "credential"
+    } else if selected.is_ok() {
+        "applied"
+    } else {
+        "pending"
+    };
+    let effective = selected
+        .as_ref()
+        .ok()
+        .map(|selection| &selection.credential);
+    let proxy = effective.and_then(UpstreamCredential::proxy);
+    let identity =
+        |value: &serde_json::Value| value.as_str().and_then(|id| Uuid::parse_str(id).ok());
     let body = ProxySettings {
         account_id,
         proxy_url: proxy.map(|(url, _)| url.to_owned()),
@@ -45,6 +80,11 @@ pub(in crate::api) async fn get_upstream_proxy_settings(
         updated_at: account.updated_at,
         credential_generation: account.credential_generation,
         supported: credential.supports_transport_proxy(),
+        source,
+        proxy_id: identity(&policy["desired"]["proxy_id"]),
+        group_id: identity(&policy["desired"]["group_id"]),
+        selected_member_id: identity(&policy["applied"]["selected_proxy_id"]),
+        configuration_state,
     };
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(body)))
 }

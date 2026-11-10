@@ -132,7 +132,7 @@ async function installFixture(page: Page, allowed = true, locale = 'zh-CN', tab:
           updated_at: selection.account_updated_at, credential_generation: selection.credential_generation,
           source: ['manual', 'auto', 'plugin'].includes(selection.desired.mode) ? selection.desired.mode : 'credential',
           proxy_id: selection.desired.proxy_id, group_id: selection.desired.group_id, selected_member_id: null,
-          configuration_state: selection.desired.mode === 'legacy' ? 'credential' : 'pending',
+          configuration_state: selection.desired.mode === 'credential' ? 'credential' : 'pending',
           proxy_url: 'socks5h://10.20.30.40:1080',
         }));
       }
