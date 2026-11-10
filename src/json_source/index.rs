@@ -7,15 +7,15 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
-pub(super) struct Index {
+pub(crate) struct Index {
     file: File,
     end: u64,
-    pub(super) cancelled: Arc<AtomicBool>,
+    pub(crate) cancelled: Arc<AtomicBool>,
 }
 
 // Zero is the null pointer; records start after a one-byte sentinel.
 impl Index {
-    pub(super) fn new(mut file: File) -> Result<Self> {
+    pub(crate) fn new(mut file: File) -> Result<Self> {
         file.set_len(0).map_err(|_| "compact_file_io")?;
         file.write_all(&[0]).map_err(|_| "compact_file_io")?;
         Ok(Self {
@@ -25,11 +25,11 @@ impl Index {
         })
     }
 
-    pub(super) fn end(&self) -> u64 {
+    pub(crate) fn end(&self) -> u64 {
         self.end
     }
 
-    pub(super) fn append(&mut self, bytes: &[u8]) -> Result<u64> {
+    pub(crate) fn append(&mut self, bytes: &[u8]) -> Result<u64> {
         let at = self.end;
         self.file
             .seek(SeekFrom::Start(at))
@@ -97,7 +97,7 @@ impl Index {
     // A compressed binary radix tree of SHA-256 digests. Internal bit indexes
     // strictly increase, so lookup takes at most 256 disk records, regardless
     // of object size. Equal digests still compare the complete decoded keys.
-    pub(super) fn insert_key(&mut self, root: &mut u64, digest: [u8; 32], key: Span) -> Result<()> {
+    pub(crate) fn insert_key(&mut self, root: &mut u64, digest: [u8; 32], key: Span) -> Result<()> {
         let leaf = |index: &mut Self, next: u64| -> Result<u64> {
             let mut record = [0; 64];
             record[..2].copy_from_slice(&u16::MAX.to_le_bytes());
@@ -188,7 +188,7 @@ impl Index {
         }
     }
 
-    pub(super) fn append_record(&mut self, tail: &mut u64, bytes: &[u8]) -> Result<u64> {
+    pub(crate) fn append_record(&mut self, tail: &mut u64, bytes: &[u8]) -> Result<u64> {
         let mut header = [0; 16];
         header[8..].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
         let at = self.append(&header)?;
@@ -200,7 +200,7 @@ impl Index {
         Ok(at)
     }
 
-    pub(super) fn record(&mut self, at: u64) -> Result<(Vec<u8>, u64)> {
+    pub(crate) fn record(&mut self, at: u64) -> Result<(Vec<u8>, u64)> {
         let header = self.read::<16>(at)?;
         let mut bytes = vec![
             0;
@@ -214,7 +214,7 @@ impl Index {
         Ok((bytes, u64_at(&header, 0)))
     }
 
-    pub(super) fn append_span(&mut self, tail: &mut u64, span: Span) -> Result<u64> {
+    pub(crate) fn append_span(&mut self, tail: &mut u64, span: Span) -> Result<u64> {
         let mut record = [0; 24];
         record[..8].copy_from_slice(&span.start.to_le_bytes());
         record[8..16].copy_from_slice(&span.end.to_le_bytes());
@@ -226,7 +226,7 @@ impl Index {
         Ok(at)
     }
 
-    pub(super) fn span(&mut self, at: u64) -> Result<(Span, u64)> {
+    pub(crate) fn span(&mut self, at: u64) -> Result<(Span, u64)> {
         let record = self.read::<24>(at)?;
         Ok((
             Span {
