@@ -168,3 +168,44 @@ async fn qualified_compressed_reads_and_cache_keys_keep_training_identity() {
     archive.training.as_mut().unwrap().identity = "b".repeat(64);
     assert!(archive.head_size(&object.object_locator).await.is_err());
 }
+
+#[tokio::test]
+#[ignore = "requires isolated RustFS fixture"]
+async fn training_cas_real_s3_configuration_and_reader() {
+    let mut config = crate::config::Config::for_test("sqlite::memory:".to_owned());
+    let required = |name| std::env::var(name).expect("RustFS fixture configuration");
+    config.training_s3 = Some(crate::config::TrainingS3Config {
+        endpoint: required("MTC_RUSTFS_TEST_ENDPOINT"),
+        bucket: required("MTC_RUSTFS_TEST_BUCKET"),
+        region: "us-east-1".to_owned(),
+        access_key: required("MTC_RUSTFS_TEST_ACCESS_KEY"),
+        secret_key: required("MTC_RUSTFS_TEST_SECRET_KEY"),
+        allow_http: true,
+    });
+    config.training_cas_writes = true;
+    let archive = super::ArchiveStore::from_config(&config).await.unwrap();
+    let tenant = Uuid::now_v7();
+    let bytes = Bytes::from_static(b"training fixture plaintext");
+    let reference = archive
+        .put_tenant_content(tenant, bytes.clone())
+        .await
+        .unwrap();
+    assert!(reference.object_locator.starts_with("stores/training/"));
+    let reader = super::ArchiveStore::from_config(&config).await.unwrap();
+    assert_eq!(
+        reader
+            .get_tenant_content(tenant, &reference, 100)
+            .await
+            .unwrap(),
+        bytes
+    );
+    let mut changed = config.clone();
+    changed
+        .training_s3
+        .as_mut()
+        .unwrap()
+        .bucket
+        .push_str("-changed");
+    let wrong = super::ArchiveStore::from_config(&changed).await.unwrap();
+    assert!(wrong.head_size(&reference.object_locator).await.is_err());
+}
