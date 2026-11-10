@@ -78,6 +78,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
                 .delete(unbind_transport_group)
                 .layer(middleware::map_response(transport_group_response)),
         )
+        .route(
+            "/internal/v1/upstreams/{account_id}/health-probe-settings",
+            get(get_health_probe_settings).put(put_health_probe_settings),
+        )
         .route("/internal/v1/keys", get(list_keys).post(create_key))
         .route("/internal/v1/keys/delete", post(delete_client_credentials))
         .route("/internal/v1/keys/{key_id}/rotate", post(rotate_key))
@@ -441,6 +445,10 @@ pub(in crate::api) fn control_router(state: AppState) -> Router<AppState> {
         .route(
             "/internal/v1/upstreams/{account_id}/oauth/refresh",
             post(refresh_upstream_oauth),
+        )
+        .route(
+            "/internal/v1/upstreams/{account_id}/oauth/recover",
+            post(recover_upstream_oauth),
         )
         .route(
             "/internal/v1/upstreams/{account_id}/oauth/disconnect",

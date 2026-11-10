@@ -27,7 +27,7 @@ export function UpstreamQuotaDetails({ snapshot, refreshError, diagnostic }: { s
       <span>{snapshot.observed_at === null ? t('quota.notObserved') : t(observation === 'historical' ? 'quota.lastObservedAt' : 'quota.observedAt', { time: new Date(snapshot.observed_at).toLocaleString(locale) })}</span>
       {observation === 'historical' && <span className="status pending">{t('quota.historical')}</span>}
     </div>
-    <QuotaCredits snapshot={snapshot} now={now} refreshFailed={readFailed} />
+    <QuotaCredits snapshot={snapshot} now={now} refreshFailed={readFailed} compact />
     {snapshot.status === 'unsupported' && <p>{t('quota.readUnsupported')}</p>}
     {(snapshot.status !== 'unsupported' || refreshError || refreshDiagnostic.error_code) && readFailed && <div className="notice error" role="alert" data-quota-error-code={refreshDiagnostic.error_code ?? undefined} data-quota-cache-hit={String(refreshDiagnostic.cache_hit)} data-quota-attempt-count={refreshDiagnostic.attempts.length}>
       <p>{t(errorMessage)}</p>
@@ -48,8 +48,8 @@ export function UpstreamQuotaDetails({ snapshot, refreshError, diagnostic }: { s
         {remaining && <p>{remaining.kind === 'percent'
           ? t('quota.remainingPercent', { percent: formatPercent(remaining.percent / 100, locale) })
           : t('quota.remainingWithUnit', { amount: formatNumber(remaining.amount, locale), limit: remaining.limit === null ? '—' : formatNumber(remaining.limit, locale), unit: unitMessage ? t(unitMessage) : remaining.unit })}</p>}
-        <p>{window.reset_at === null ? t('quota.resetTimeUnknown') : t(window.reset_is_estimated ? 'quota.estimatedResetAt' : 'quota.resetAt', { time: new Date(window.reset_at).toLocaleString(locale) })}</p>
-        {window.reset_at !== null && <span>{window.reset_at <= now ? t('quota.resetElapsed') : t('quota.resetIn', { time: formatCountdown(window.reset_at - now, locale) })}</span>}
+        <p className="upstream-quota-window-reset"><span>{window.reset_at === null ? t('quota.resetTimeUnknown') : t(window.reset_is_estimated ? 'quota.estimatedResetAt' : 'quota.resetAt', { time: new Date(window.reset_at).toLocaleString(locale) })}</span>
+          {window.reset_at !== null && <span>{window.reset_at <= now ? t('quota.resetElapsed') : t('quota.resetIn', { time: formatCountdown(window.reset_at - now, locale) })}</span>}</p>
         <DetailTooltip content={t('quota.sourceEvidence', { source, id: window.id, rawSource: window.source })}><small tabIndex={0} data-quota-evidence={window.id}>{t('quota.sourceLabel')}</small></DetailTooltip>
       </section>;
     })}</div>}
@@ -80,10 +80,11 @@ export function UpstreamQuotaResetSection({ accountId, accountName, tenant, toke
     : !capability.implementation_available ? 'quota.resetNotIntegrated' : 'quota.resetAvailable';
   const actionable = capability?.provider_supported === true && capability.implementation_available;
   return <section className="upstream-quota-reset" aria-label={t('quota.resetCapability')}>
-    <h3>{t('quota.resetCapability')}</h3>
+    <div className="upstream-quota-reset-heading"><h3>{t('quota.resetCapability')}</h3>
+      {capability?.available_credits !== null && capability?.available_credits !== undefined && <span>{t('quota.resetCredits', { available: formatNumber(capability.available_credits, locale), applicable: capability.applicable_credits === null ? '—' : formatNumber(capability.applicable_credits, locale) })}</span>}
+    </div>
     {snapshot ? <>
       {!actionable && <p>{t(resetMessage)}</p>}
-      {capability?.available_credits !== null && capability?.available_credits !== undefined && <span>{t('quota.resetCredits', { available: formatNumber(capability.available_credits, locale), applicable: capability.applicable_credits === null ? '—' : formatNumber(capability.applicable_credits, locale) })}</span>}
       {snapshot.provider === 'openai-codex' && <QuotaResetCreditExpiry snapshot={snapshot} />}
       {capability?.credit_error_code && <p>{t('quota.resetCreditsUnavailable')} {t(quotaReadErrorMessage(capability.credit_error_code))}</p>}
       {actionable && <UpstreamQuotaReset accountId={accountId} accountName={accountName} tenant={tenant} token={token} snapshot={snapshot} canRecover={canRecover} onQuotaChanged={onQuotaChanged} />}
