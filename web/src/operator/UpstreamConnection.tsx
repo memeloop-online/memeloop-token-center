@@ -9,7 +9,8 @@ import './upstreamConnection.css';
 import { SecretInput } from '../SecretInput';
 import { CopyButton } from '../CopyButton';
 import { providerConnectionCopy } from './providerConnectionCopy';
-import { TransportProxyGroupAction } from './TransportProxyGroupManager';
+import { NetworkProxyPolicyWorkspace } from './NetworkProxyManager';
+import './pages/identityWorkspace.css';
 
 interface ProxyConnection {
   account_id: string;
@@ -50,7 +51,27 @@ export function ProxyInput({ value, onChange, disabled = false, generic = false,
   </div>;
 }
 
-export function UpstreamConnection({ account, token, tenant, disabled, onChanged, onEditingChange, onSaved, embedded = false, readOnOpen = false }: {
+type UpstreamConnectionProps = {
+  account: UpstreamAccount; token: string; tenant: string; disabled: boolean; onChanged: () => Promise<void>;
+  onEditingChange?: (editing: boolean) => void;
+  onSaved?: (account: UpstreamAccount) => void;
+  embedded?: boolean;
+  readOnOpen?: boolean;
+};
+
+export function UpstreamConnection(props: UpstreamConnectionProps) {
+  const closeRequest = useRef<(() => Promise<boolean>) | null>(null);
+  if (props.account.driver === 'openai-codex' && props.account.auth_kind === 'oauth' && props.account.can_update_transport_proxy === true) {
+    return <section className="upstream-connection unified-account-proxy">
+      <NetworkProxyPolicyWorkspace key={`${props.token}\0${props.tenant}\0${props.account.id}\0${props.account.credential_generation}`}
+        token={props.token} tenant={props.tenant} accounts={[props.account]} initialAccountId={props.account.id}
+        onChanged={props.onChanged} closeRequest={closeRequest} embedded disabled={props.disabled} onEditingChange={props.onEditingChange} />
+    </section>;
+  }
+  return <LegacyUpstreamConnection {...props} />;
+}
+
+function LegacyUpstreamConnection({ account, token, tenant, disabled, onChanged, onEditingChange, onSaved, embedded = false, readOnOpen = false }: {
   account: UpstreamAccount; token: string; tenant: string; disabled: boolean; onChanged: () => Promise<void>;
   onEditingChange?: (editing: boolean) => void;
   onSaved?: (account: UpstreamAccount) => void;
@@ -131,7 +152,6 @@ export function UpstreamConnection({ account, token, tenant, disabled, onChanged
   const editProxyAction = canEditProxy && <Button appearance="secondary" type="button" disabled={disabled || busy} onClick={() => { setEditing(!editing); setProxy(editing ? '' : connection?.proxy_url ?? ''); setError(false); setSaved(false); }}>{t(editing ? 'common.cancel' : 'connection.editProxy')}</Button>;
   return <section className="upstream-connection" aria-label={t('connection.title')}>
     {!embedded && <h3>{t('connection.title')}</h3>}
-    {codex && canEditProxy && <TransportProxyGroupAction accountId={account.id} disabled={disabled || editing || busy} />}
     <dl>
       {(!embedded || codex) && <div><dt>{!embedded ? <DetailTooltip content={t('connection.endpointHint')}><span tabIndex={0} className="connection-help">{t('connection.baseUrl')}</span></DetailTooltip> : t('connection.baseUrl')}</dt><dd><code>{typeof account.config.base_url === 'string' ? account.config.base_url : '—'}</code>{typeof account.config.base_url === 'string' && <CopyButton fluent value={account.config.base_url} label={copy.copyEndpoint} />}{codex && <span className="connection-endpoint-kind">{t('connection.fixed')}</span>}</dd></div>}
       {!readableProxy && !editing && <div><dt>{!codex ? <DetailTooltip content={proxyHint}><span tabIndex={0} className="connection-help">{t('connection.proxy')}</span></DetailTooltip> : t('connection.proxy')}</dt><dd><span className={`status ${account.has_proxy && account.proxy_scheme ? 'ok' : 'pending'}`}>{t(account.has_proxy === undefined ? 'connection.proxyUnknown' : account.has_proxy ? proxyState : codex ? proxyState : 'connection.directEgress')}</span>{account.proxy_scheme && <code>{account.proxy_scheme}</code>}{account.has_proxy && account.proxy_scheme && <span>{t(account.proxy_remote_dns ? 'connection.remoteDns' : 'connection.localDns')}</span>}</dd></div>}

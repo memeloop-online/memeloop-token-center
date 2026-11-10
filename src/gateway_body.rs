@@ -17,6 +17,9 @@ use futures_util::StreamExt;
 pub(crate) mod memory;
 pub(crate) mod request_spool;
 
+#[derive(Clone)]
+pub(crate) struct RawAudioRequestBody(pub(crate) bytes::Bytes);
+
 #[cfg(test)]
 mod body_read_classification_tests;
 #[cfg(test)]
@@ -380,27 +383,11 @@ async fn admit_request_body_for_route(
         {
             request_spool.register_source(request_id, &spool);
         }
-        let body = if route_class == GatewayBodyRouteClass::Responses {
-            Body::empty()
-        } else {
-            if let Some(reservation) = reservation.as_ref()
-                && !request_spool.reclaim_for(|| {
-                    reservation.try_grow(spool.len(), memory::REQUEST_MEMORY_WEIGHT)
-                })
-            {
-                return Err(GatewayBodyAdmissionError::CapacityExhausted);
-            }
-            let bytes = spool
-                .read_all()
-                .await
-                .map_err(|_| GatewayBodyAdmissionError::RequestSpoolUnavailable)?;
-            Body::from(spool.shared_bytes(bytes))
-        };
         if let Some(reservation) = reservation {
             parts.extensions.insert(reservation);
         }
         parts.extensions.insert(spool);
-        return Ok(Request::from_parts(parts, body));
+        return Ok(Request::from_parts(parts, Body::empty()));
     }
     if let Some(reservation) = reservation {
         let read_maximum = declared_content_length
@@ -443,6 +430,9 @@ async fn admit_request_body_for_route(
             memory::REQUEST_MEMORY_WEIGHT,
         );
         parts.extensions.insert(reservation);
+        if parts.uri.path() == "/v1/audio/transcriptions" {
+            parts.extensions.insert(RawAudioRequestBody(bytes.clone()));
+        }
         return Ok(Request::from_parts(parts, Body::from(bytes)));
     }
     let bytes = read_with_deadline(deadline, to_bytes(body, maximum))
@@ -458,6 +448,9 @@ async fn admit_request_body_for_route(
             };
             rejected_body(route_class, declared_content_length, maximum, reason)
         })?;
+    if parts.uri.path() == "/v1/audio/transcriptions" {
+        parts.extensions.insert(RawAudioRequestBody(bytes.clone()));
+    }
     Ok(Request::from_parts(parts, Body::from(bytes)))
 }
 

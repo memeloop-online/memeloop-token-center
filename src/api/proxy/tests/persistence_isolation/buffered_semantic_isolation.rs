@@ -243,6 +243,28 @@ async fn postgres_buffered_delivery_does_not_wait_for_semantic_content_locks() {
     assert_eq!(charges, 1);
     budget_holder.commit().await.unwrap();
     upstream.verify().await;
+    state.db.drain_gateway_persistence_for_test().await;
+    state.persistence.drain_for_test().await;
+    // Raw response capture and semantic projection run independently. Finish
+    // the archive worker before claiming the conversation, as production does
+    // once its response locator is ready.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let locators = state
+                .db
+                .session_body_locators(request_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if !locators.pending {
+                break;
+            }
+            crate::response_archive_spool::process_one_for_test(&state).await;
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("raw response archive must become ready for semantic projection");
     let terminal_owner = Uuid::now_v7();
     assert!(
         state

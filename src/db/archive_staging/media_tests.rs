@@ -73,6 +73,22 @@ impl Fixture {
     async fn enqueue(&self, text: &str) -> (Uuid, Uuid) {
         let request_id = Uuid::now_v7();
         let document = request(text);
+        for (side, body) in [("request", document.clone()), ("response", response())] {
+            let object = self
+                .state
+                .archive
+                .put_tenant_content(
+                    self.key.tenant_id,
+                    Bytes::from(serde_json::to_vec(&body).unwrap()),
+                )
+                .await
+                .unwrap();
+            self.state
+                .archive
+                .publish_raw_capture(self.key.tenant_id, request_id, side, &object)
+                .await
+                .unwrap();
+        }
         let request_locator = format!("inline-json:{document}");
         let response_locator = format!("inline-json:{}", response());
         let reservation = self
@@ -228,24 +244,29 @@ async fn shared_media_contract(database_url: &str) {
                 .unwrap()
         );
         leaves.push(fixture.leaf(request_id).await);
-        let row = sqlx::query(
-            "SELECT * FROM archive_staging_attempts WHERE owner_id = $1 AND purpose = 'media'",
+        let attempts: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM archive_staging_attempts WHERE owner_id = $1 AND purpose = 'media'",
         )
         .bind(request_id.to_string())
         .fetch_one(&fixture.state.db.pool)
         .await
         .unwrap();
-        let attempt = archive_attempt_from_row(&row).unwrap();
-        assert_eq!(attempt.state, ArchiveStagingState::CleanupPending);
-        assert!(attempt.bound_at.is_some());
-        assert!(attempt.bound_locator.is_none());
-        locators.push(
-            crate::archive_staging::conversation_media_locator(
-                attempt.key,
-                blake3::hash(&[1, 2, 3, 4]).to_hex().as_ref(),
-            )
-            .unwrap(),
-        );
+        assert_eq!(attempts, 0, "new streamed media use immutable tenant CAS");
+        let turns = fixture
+            .state
+            .db
+            .export_training_dialogue(fixture.key.tenant_id, leaves.last().unwrap())
+            .await
+            .unwrap();
+        let locator = turns[0].parts[1]["object_locator"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(crate::archive::is_tenant_cas_location(
+            fixture.key.tenant_id,
+            &locator
+        ));
+        locators.push(locator);
     }
     assert_eq!(leaves[0], leaves[1]);
     assert_ne!(leaves[0], leaves[2]);
@@ -282,8 +303,10 @@ async fn shared_media_contract(database_url: &str) {
         );
     }
     fixture.retry_cleanup().await;
-    assert!(fixture.state.archive.get(&locators[1]).await.is_err());
-    assert!(fixture.state.archive.get(&locators[2]).await.is_err());
+    assert_eq!(locators[0], locators[1]);
+    assert_eq!(locators[0], locators[2]);
+    assert!(fixture.state.archive.get(&locators[1]).await.is_ok());
+    assert!(fixture.state.archive.get(&locators[2]).await.is_ok());
     assert!(fixture.state.archive.get(&locators[0]).await.is_ok());
     sqlx::query("DELETE FROM conversation_media_parts WHERE tenant_id = $1 AND turn_id = (SELECT turn_id FROM conversation_media_parts WHERE tenant_id = $1 ORDER BY turn_id LIMIT 1)")
         .bind(fixture.key.tenant_id.to_string()).execute(&fixture.state.db.pool).await.unwrap();
@@ -295,7 +318,10 @@ async fn shared_media_contract(database_url: &str) {
         .await
         .unwrap();
     fixture.retry_cleanup().await;
-    assert!(fixture.state.archive.get(&locators[0]).await.is_err());
+    assert!(
+        fixture.state.archive.get(&locators[0]).await.is_ok(),
+        "durable training media cannot be retired by cache-reference cleanup"
+    );
 }
 
 async fn fenced_media_contract(database_url: &str) {
