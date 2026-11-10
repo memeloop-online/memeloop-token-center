@@ -324,6 +324,58 @@ async fn recovery_contract(database_url: &str, reference_v2: bool) {
         assert_eq!(retained, 1);
         assert_counts(&database, request_id, reservation.id, 1).await;
     }
+    if reference_v2 {
+        // Mutate the persisted locator after the external read, while streamed
+        // materialization is running. The final source fence must fail without
+        // replacing the durable sentinel; a restarted worker must reload it.
+        let before: Option<String> = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        let change_source = match database.backend {
+            DatabaseBackend::Sqlite => {
+                "CREATE TRIGGER change_semantic_source AFTER INSERT ON semantic_atoms BEGIN UPDATE conversation_semantic_payloads SET request_json = ' ' || request_json WHERE format_version = 2; END;"
+            }
+            DatabaseBackend::PostgreSql => {
+                "CREATE FUNCTION change_semantic_source() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN UPDATE conversation_semantic_payloads SET request_json = ' ' || request_json WHERE format_version = 2; RETURN NEW; END $$; CREATE TRIGGER change_semantic_source AFTER INSERT ON semantic_atoms FOR EACH ROW EXECUTE FUNCTION change_semantic_source();"
+            }
+        };
+        sqlx::raw_sql(change_source)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        let owner = reclaim(&database, request_id).await;
+        assert!(
+            database
+                .project_claimed_conversation_projection_task(owner, request_id)
+                .await
+                .is_err()
+        );
+        let after: Option<String> = sqlx::query_scalar("SELECT semantic_snapshot_json FROM conversation_projection_outbox WHERE request_id = $1")
+            .bind(request_id.to_string()).fetch_one(&database.pool).await.unwrap();
+        assert_eq!(
+            after, before,
+            "source conflict must not durably replace the recovery sentinel"
+        );
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM conversation_semantic_payloads WHERE request_id = $1",
+        )
+        .bind(request_id.to_string())
+        .fetch_one(&database.pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, 1);
+        let drop_change = match database.backend {
+            DatabaseBackend::Sqlite => "DROP TRIGGER change_semantic_source",
+            DatabaseBackend::PostgreSql => {
+                "DROP TRIGGER change_semantic_source ON semantic_atoms; DROP FUNCTION change_semantic_source();"
+            }
+        };
+        sqlx::raw_sql(drop_change)
+            .execute(&database.pool)
+            .await
+            .unwrap();
+        // The following ACK-failure and reconnect exercise the real retry path
+        // using the changed, still valid locator rather than the stale proof.
+    }
     let reject_ack = match database.backend {
         DatabaseBackend::Sqlite => {
             "CREATE TRIGGER reject_semantic_ack BEFORE UPDATE OF projected_at ON conversation_projection_outbox BEGIN SELECT RAISE(ABORT, 'injected semantic ack failure'); END;"
