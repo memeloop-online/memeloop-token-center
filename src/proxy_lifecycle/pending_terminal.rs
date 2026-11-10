@@ -430,10 +430,29 @@ struct Pending {
 type Preparation =
     std::pin::Pin<Box<dyn std::future::Future<Output = Option<PreparedConversation>> + Send>>;
 
+const AWAITING_EVIDENCE_CAPACITY: usize = 65_536;
+
+#[derive(Default)]
+struct AwaitingEvidence {
+    entries: HashMap<Uuid, ([u8; 32], Option<[u8; 32]>)>,
+}
+
+impl AwaitingEvidence {
+    fn remember(&mut self, id: Uuid, digest: [u8; 32]) {
+        // Keep the admitted working set stable across ordered scans. FIFO/LRU
+        // eviction would turn an oversized archive into an all-miss ring.
+        if !self.entries.contains_key(&id) && self.entries.len() == AWAITING_EVIDENCE_CAPACITY {
+            return;
+        }
+        self.entries.insert(id, (digest, None));
+    }
+}
+
 pub(crate) struct Journal {
     directory: PathBuf,
     archive: Option<crate::archive::ArchiveStore>,
     pending: Mutex<HashMap<Uuid, Pending>>,
+    awaiting_evidence: Mutex<AwaitingEvidence>,
     claims: Mutex<HashMap<Uuid, ClaimState>>,
     wake: Notify,
     progress: Notify,
@@ -491,6 +510,7 @@ impl Journal {
             directory,
             archive,
             pending: Mutex::new(HashMap::new()),
+            awaiting_evidence: Mutex::new(AwaitingEvidence::default()),
             claims: Mutex::new(HashMap::new()),
             wake: Notify::new(),
             progress: Notify::new(),
@@ -1583,7 +1603,9 @@ impl Journal {
                 // A new scan from its first unknown receipt would starve later work.
                 tokio::time::sleep(RECOVERY_MIN_INTERVAL).await;
             }
-            let Ok(location) = entry else { break };
+            let Ok((location, version)) = entry else {
+                break;
+            };
             let Some(receipt_id) = location
                 .rsplit('/')
                 .next()
@@ -1601,6 +1623,16 @@ impl Journal {
             {
                 continue;
             }
+            if self
+                .awaiting_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get(&receipt_id)
+                .is_some_and(|(_, known)| known.as_ref() == Some(&version))
+            {
+                continue;
+            }
             let Ok(bytes) = archive.get(&location).await else {
                 continue;
             };
@@ -1611,6 +1643,15 @@ impl Journal {
                 continue;
             }
             progressed |= self.recover_one(database, snapshot).await;
+            if let Some((_, known)) = self
+                .awaiting_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get_mut(&receipt_id)
+            {
+                *known = Some(version);
+            }
         }
         progressed
     }
@@ -1619,6 +1660,31 @@ impl Journal {
     /// checkpoint while waiting; unknown predecessors never fill an in-memory
     /// backlog or prevent later receipts from being visited.
     async fn recover_one(&self, database: &Database, snapshot: Snapshot) -> bool {
+        let digest = serde_json::to_vec(&snapshot)
+            .ok()
+            .map(|bytes| *blake3::hash(&bytes).as_bytes());
+        if digest.is_some_and(|digest| {
+            self.awaiting_evidence
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries
+                .get(&snapshot.receipt_id)
+                .is_some_and(|(known, _)| *known == digest)
+        }) {
+            return false;
+        }
+        self.awaiting_evidence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .remove(&snapshot.receipt_id);
+        let awaiting_candidate = snapshot.claim.is_some()
+            && snapshot.financial_ack.is_none()
+            && snapshot.financial_evidence_unavailable()
+            && matches!(
+                snapshot.conversation_state,
+                ConversationState::Enqueued | ConversationState::NotRequested
+            );
         let snapshot = Arc::new(snapshot);
         let receipt_id = snapshot.receipt_id;
         let applied = snapshot.financial_ack.as_ref().is_some_and(|ack| {
@@ -1670,11 +1736,22 @@ impl Journal {
         self.attempt(database.clone(), snapshot, applied).await;
         // No process-owned body/future belongs to a recovered item. Its durable
         // receipt survives a failed or unknown attempt and will be revisited.
-        self.pending
+        let completed = self
+            .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&receipt_id)
-            .is_none()
+            .is_none();
+        if completed && awaiting_candidate {
+            if let Some(digest) = digest {
+                self.awaiting_evidence
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remember(receipt_id, digest);
+            }
+            return false;
+        }
+        completed
     }
 
     async fn attempt(&self, database: Database, snapshot: Arc<Snapshot>, mut applied: bool) {
@@ -1769,7 +1846,7 @@ impl Journal {
                 Ok(Some(FinishProxyRequestResult::Finished { .. })) => applied = true,
                 Ok(None) => {
                     reconcile = true;
-                    tracing::error!(%request_id, %receipt_id, financial_state = "unknown", "terminal lacks authoritative provider usage; receipt retained without zero-usage settlement");
+                    tracing::info!(%request_id, %receipt_id, financial_state = "awaiting_evidence", "terminal awaits authoritative provider usage; receipt retained without zero-usage settlement");
                 }
                 Ok(Some(FinishProxyRequestResult::AlreadyFinished { .. })) => {
                     reconcile = true;
@@ -2033,6 +2110,21 @@ impl Drop for Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn awaiting_evidence_keeps_a_bounded_stable_working_set_and_accepts_updates() {
+        let mut cache = AwaitingEvidence::default();
+        for index in 0..AWAITING_EVIDENCE_CAPACITY {
+            cache.remember(Uuid::from_u128(index as u128 + 1), [1; 32]);
+        }
+        let first = Uuid::from_u128(1);
+        cache.remember(Uuid::from_u128(u128::MAX), [2; 32]);
+        assert_eq!(cache.entries.len(), AWAITING_EVIDENCE_CAPACITY);
+        assert_eq!(cache.entries.get(&first).unwrap().0, [1; 32]);
+        cache.remember(first, [3; 32]);
+        assert_eq!(cache.entries.get(&first).unwrap().0, [3; 32]);
+        assert!(!cache.entries.contains_key(&Uuid::from_u128(u128::MAX)));
+    }
 
     #[tokio::test]
     async fn unavailable_journal_never_acknowledges_memory_as_durable_or_hot_loops() {
