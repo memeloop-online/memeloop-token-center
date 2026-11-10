@@ -185,6 +185,21 @@ async fn native_codex_image_uses_oauth_transport_and_non_streaming_responses_too
     assert_eq!(forwarded["store"], false);
     assert_eq!(forwarded["tools"][0]["type"], "image_generation");
     assert_eq!(forwarded["tools"][0]["model"], "gpt-image-2");
+    tokio::time::timeout(Duration::from_secs(5), fixture.state.drain_proxy_tasks())
+        .await
+        .unwrap();
+    let records = fixture
+        .state
+        .db
+        .list_requests(fixture.key_id, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        records.len(),
+        1,
+        "one media request must not create an early duplicate"
+    );
+    assert_eq!(records[0].request_id.to_string(), request_id);
 }
 
 #[tokio::test]
