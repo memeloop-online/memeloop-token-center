@@ -48,6 +48,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Publish or reclaim disposable RustFS cache copies without opening SQL.
+    ArchiveCache {
+        #[command(subcommand)]
+        command: memeloop_token_center::archive::cache_command::CacheCommand,
+    },
     Serve {
         #[arg(long, value_enum, default_value_t)]
         role: RuntimeRole,
@@ -150,6 +155,11 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), &'static str> {
     let cli = Cli::parse();
+    if let Command::ArchiveCache { command } = cli.command {
+        return memeloop_token_center::archive::cache_command::run(command)
+            .await
+            .map_err(|_| "archive_cache_operation_failed");
+    }
     #[cfg(feature = "experimental-plugin-revisions")]
     if let Command::PreparePluginInventory {
         directory,
@@ -184,6 +194,7 @@ async fn run() -> Result<(), &'static str> {
     let config = Config::from_env().map_err(|_| "configuration_invalid")?;
 
     match cli.command {
+        Command::ArchiveCache { .. } => unreachable!("handled before database configuration"),
         Command::RequestHistory { command } => {
             let result =
                 memeloop_token_center::request_history::migration::command(&config, command)

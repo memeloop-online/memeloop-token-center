@@ -144,6 +144,8 @@ pub(crate) struct OAuthRefreshStatus {
     pub http_status: Option<u16>,
     pub reauthorization_required: bool,
     pub automatic_refresh_paused: bool,
+    pub lease_expires_at: Option<i64>,
+    pub allowed_actions: Vec<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_observation: Option<OAuthRefreshObservation>,
 }
@@ -188,8 +190,23 @@ impl OAuthRefreshMetadata {
         } else {
             OAuthRefreshState::NotObserved
         };
+        let mut allowed_actions = vec!["reauthorize"];
+        if self.has_pending {
+            allowed_actions.insert(0, "resume_local");
+        } else if self.revoked_at.is_none()
+            && self.request_started_at.is_none()
+            && !self.lease_expires_at.is_some_and(|expiry| expiry > now)
+            && matches!(
+                refresh_state,
+                OAuthRefreshState::NotObserved | OAuthRefreshState::Failed
+            )
+        {
+            allowed_actions.insert(0, "refresh");
+        }
         OAuthRefreshStatus {
             credential_generation: self.generation,
+            lease_expires_at: self.lease_expires_at,
+            allowed_actions,
             access_state: if self.revoked_at.is_some() {
                 OAuthAccessState::Revoked
             } else {
@@ -260,6 +277,7 @@ mod tests {
         assert!(status.automatic_refresh_paused);
         assert!(status.attempt_finished_at.is_none());
         assert!(status.failure_class.is_none());
+        assert_eq!(status.allowed_actions, ["reauthorize"]);
     }
 
     #[test]
@@ -276,6 +294,27 @@ mod tests {
         let status = pending.status(30);
         assert_eq!(status.refresh_state, OAuthRefreshState::PendingLocal);
         assert!(!status.reauthorization_required);
+    }
+
+    #[test]
+    fn actions_separate_local_recovery_and_safe_dispatch_from_access_validity() {
+        let mut source = metadata();
+        source.expires_at = Some(100);
+        source.has_pending = true;
+        let status = source.status(30);
+        assert_eq!(status.allowed_actions, ["resume_local", "reauthorize"]);
+        assert_eq!(status.access_state, OAuthAccessState::Valid);
+        assert!(!status.reauthorization_required);
+        let mut source = metadata();
+        source.expires_at = Some(100);
+        source.request_started_at = None;
+        assert_eq!(
+            source.status(30).allowed_actions,
+            ["refresh", "reauthorize"]
+        );
+        let mut active = metadata();
+        active.request_started_at = None;
+        assert_eq!(active.status(10).allowed_actions, ["reauthorize"]);
     }
 
     #[test]

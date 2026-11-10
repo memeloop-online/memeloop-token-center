@@ -6,15 +6,24 @@ import './upstreamQuota.css';
 import { useQuotaClock } from './useQuotaClock';
 import { quotaCreditPresentation } from './upstreamQuota';
 
-export function QuotaCredits({ snapshot, now, refreshFailed = false }: { snapshot: UpstreamQuotaSnapshot; now: number; refreshFailed?: boolean }) {
+export function QuotaCredits({ snapshot, now, refreshFailed = false, compact = false }: { snapshot: UpstreamQuotaSnapshot; now: number; refreshFailed?: boolean; compact?: boolean }) {
   const { t, locale } = useI18n();
   const presentation = quotaCreditPresentation(snapshot, locale, now, refreshFailed);
   if (!presentation) return null;
   const historical = quotaObservationState(snapshot, now, refreshFailed) === 'historical';
+  const balance = typeof snapshot.credits.balance === 'string' && snapshot.credits.balance.trim() !== ''
+    ? t(historical ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })
+    : undefined;
+  const unlimited = snapshot.credits.unlimited === true ? t(historical ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits') : undefined;
+  if (compact) return <div className="upstream-quota-credit-summary" data-quota-extra-credits={presentation.state}>
+    <DetailTooltip content={<><p>{presentation.message}</p><p>{presentation.explanation}</p></>}>
+      <span tabIndex={0}>{[balance, unlimited].filter(Boolean).join(' · ') || presentation.message}<span className="quota-credit-info" aria-hidden="true">ⓘ</span></span>
+    </DetailTooltip>
+  </div>;
   return <div data-quota-extra-credits={presentation.state}>
     <p>{presentation.message}</p>
-    {typeof snapshot.credits.balance === 'string' && snapshot.credits.balance.trim() !== '' && <p>{t(historical ? 'quota.lastObservedBalance' : 'quota.balance', { amount: snapshot.credits.balance })}</p>}
-    {snapshot.credits.unlimited === true && <p>{t(historical ? 'quota.lastObservedUnlimitedCredits' : 'quota.unlimitedCredits')}</p>}
+    {balance && <p>{balance}</p>}
+    {unlimited && <p>{unlimited}</p>}
     <p>{presentation.explanation}</p>
   </div>;
 }

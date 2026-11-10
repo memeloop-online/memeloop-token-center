@@ -51,10 +51,7 @@ export function assistantRouteCatalog(items: ModelPickerProjectionItem[]): Assis
       const protocol = source.capabilities.route_protocol;
       return (protocol === 'openai' || protocol === 'anthropic')
         && source.provider.protocols.includes(protocol)
-        && source.provider.modalities.includes('text')
-        && source.catalog.status === 'ready'
-        && source.catalog.model_listed
-        && source.capabilities.catalog_model_listed;
+        && source.provider.modalities.includes('text');
     });
     if (verifiedSources.length === 0) {
       unverifiedRoutes.push({ value: item.value, label: item.label });

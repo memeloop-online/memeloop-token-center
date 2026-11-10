@@ -8,6 +8,7 @@ use crate::provider::{ResolvedUpstream, UpstreamCredential};
 use rust_decimal::Decimal;
 
 mod r1;
+mod scheduling;
 
 const TENANT: &str = "probe-model-binding";
 const PEPPER: &[u8] = b"probe model binding regression key material";
