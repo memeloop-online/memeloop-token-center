@@ -77,10 +77,12 @@ test('account recovery uses the production shell and workspace with contained Fl
       await page.setViewportSize({ width, height: 1000 });
       const directory = page.locator('.provider-list');
       if (!await directory.isVisible()) await page.locator('.provider-detail-workspace').getByRole('button', { name: '返回账号列表', exact: true }).click();
-      for (const accountId of ['kimi-0142', 'kimi-7021']) {
+      for (const [accountId, renewalLabel] of [['kimi-0142', '续期时网络读取失败，结果待核实'], ['kimi-7021', '续期结果未能保存，结果待核实']]) {
         const row = page.locator(`[data-upstream-id="${accountId}"]`);
-        assert.equal(await row.locator('.status').filter({ hasText: '续期结果待核对' }).innerText(), '续期结果待核对');
-        assert.equal(await row.getByRole('button', { name: '重新登录', exact: true }).isEnabled(), true);
+        assert.equal(await row.getByText('访问令牌已过期', { exact: true }).count(), 1);
+        assert.equal(await row.locator('.status[tabindex="0"]').innerText(), renewalLabel);
+        assert.equal(await row.getByRole('button', { name: '重新登录', exact: true }).count(), 0, 'uncertain renewal is separate from an explicit reauthorization requirement');
+        assert.equal(await row.getByRole('button', { name: '管理账号', exact: true }).isEnabled(), true);
       }
       await page.screenshot({ path: join(artifacts, `kimi-workspace-directory-${theme}-${width}.png`), fullPage: true });
       for (const [accountId, reason] of [['kimi-0142', /网络读取失败/], ['kimi-7021', /续期结果未能保存/]] as const) {

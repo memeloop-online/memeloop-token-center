@@ -5,6 +5,7 @@ declare global {
   interface Window {
     formJourneyReads: string[];
     formJourneyWrites: number;
+    formJourneyLastProxyPolicyWrite?: Record<string, unknown>;
     formJourneyQuotaBulkReads: string[];
     deferNextFormQuotaBulkRead: boolean;
     releaseFormQuotaBulkRead: () => void;
@@ -22,6 +23,8 @@ declare global {
     changeFormProviderScope: (field: 'token' | 'tenant' | 'writeTenant') => void;
     deferNextFormQuotaRead: boolean;
     releaseFormQuotaRead: () => void;
+    deferNextFormProxyPolicyWrite: boolean;
+    releaseFormProxyPolicyWrite: () => void;
     deferNextFormProxyRead: boolean;
     releaseFormProxyRead: () => void;
   }

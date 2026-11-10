@@ -467,7 +467,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       assert.equal(await workspace.count(), 1);
       assert.equal(await page.getByRole('button', { name: '选择代理组', exact: true }).count(), 0);
       assert.equal(await page.locator('.provider-detail-workspace .upstream-proxy-editor').count(), 0);
-      await workspace.getByLabel(fieldLabel(networkProxyCopy('zh-CN').targetProxy)).selectOption({ label: 'CSIL 主出口' });
+      await workspace.getByLabel(fieldLabel(networkProxyCopy('zh-CN').targetProxy)).selectOption({ label: 'CSIL' });
       await workspace.getByRole('button', { name: networkProxyCopy('zh-CN').savePolicy, exact: true }).click();
       await workspace.getByText(networkProxyCopy('zh-CN').policySaved, { exact: true }).waitFor();
       const writes = await page.evaluate(() => window.proxyGroupFixture.writes);
@@ -659,6 +659,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
         state.effective = { source: 'manual', configuration_state: 'applied', proxy_id: state.proxies[0].id, selected_member_id: 'selected-backup', proxy_url: 'socks5h://10.20.30.41:1080' };
       });
       const policies = page.locator('.network-proxy-policy-workspace');
+      await policies.getByRole('button', { name: copy.refresh, exact: true }).click();
       await policies.getByRole('button', { name: '研发订阅', exact: true }).click();
       const exit = policies.getByText(copy.effectiveExit, { exact: true }).locator('..').locator('dd');
       await exit.getByText('实际备用出口', { exact: true }).waitFor();
@@ -726,7 +727,7 @@ test('transport proxy groups: CRUD, policies, validation, CAS, secrets, permissi
       const policies = page.locator('.network-proxy-policy-workspace');
       await policies.getByRole('button', { name: '研发订阅', exact: true }).click();
       await policies.getByText(new RegExp(copy.policyLegacy)).waitFor();
-      await policies.getByLabel(fieldLabel(copy.targetProxy)).selectOption({ label: 'CSIL 主出口' });
+      await policies.getByLabel(fieldLabel(copy.targetProxy)).selectOption({ label: 'CSIL' });
       await policies.getByRole('button', { name: copy.savePolicy, exact: true }).click();
       await policies.getByText(copy.policySaved, { exact: true }).waitFor();
       await captureNavigationIdentity(page, 'proxy-groups', 'account-policy-manual', 'zh-CN');

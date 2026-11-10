@@ -408,10 +408,11 @@ function policyDraft(selection: NetworkProxySelection, strategies: NetworkProxyS
   };
 }
 
-export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsState = 'ready', initialAccountId, onChanged, closeRequest, embedded = false, disabled = false, onEditingChange }: WorkspaceProps & {
+export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsState = 'ready', initialAccountId, onChanged, closeRequest, embedded = false, disabled = false, onEditingChange, onPolicySaved }: WorkspaceProps & {
   embedded?: boolean;
   disabled?: boolean;
   onEditingChange?: (editing: boolean) => void;
+  onPolicySaved?: (saved: NetworkProxySelection) => void;
   accounts: UpstreamAccount[];
   accountsState?: 'loading' | 'failed' | 'ready';
 }) {
@@ -621,6 +622,8 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
       setSelection(saved); setEffective(undefined); setDraft(policyDraft(saved, strategies)); setDirty(false); setMessage(copy.policySaved);
       try { const current = await readEffective(saved.account_id); if (current?.credential_generation !== saved.credential_generation) throw new Error(); if (alive.current) setEffective(current); }
       catch { if (alive.current) setError(copy.accountRefreshFailed); }
+      if (!alive.current) return;
+      onPolicySaved?.(saved);
       void onChanged().catch(() => { if (alive.current) setError(copy.accountRefreshFailed); });
     } catch (reason) {
       if (alive.current) {

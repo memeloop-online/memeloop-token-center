@@ -142,11 +142,10 @@ test('independent proxy save updates concurrency metadata without dropping the p
       assert.equal(await row.locator('[data-manage-account-trigger]').evaluate(button => button === document.activeElement), true);
     }
     await row.getByRole('button', { name: '管理账号', exact: true }).click();
-    await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
-    await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.20:1080');
+    await page.getByLabel(/^固定出口\s*\*?$/).selectOption('exit-20');
     assert.equal(await page.locator('.provider-detail-workspace').getByRole('button', { name: '返回账号列表', exact: true }).isEnabled(), false);
     assert.equal(await page.locator('.provider-detail-workspace').getByRole('button', { name: '编辑', exact: true }).isEnabled(), false);
-    await page.getByRole('button', { name: '取消', exact: true }).click();
+    await page.locator('.network-proxy-policy-workspace').getByRole('button', { name: '取消修改', exact: true }).click();
     await page.locator('.provider-detail-workspace').getByRole('button', { name: '返回账号列表', exact: true }).click();
     await page.setViewportSize({ width: 1440, height: 1000 });
     const createJourney = page.locator('.create-journey');
@@ -169,30 +168,20 @@ test('independent proxy save updates concurrency metadata without dropping the p
     assert.equal(await page.locator('.provider-detail-workspace').count(), 0, 'editing replaces the account detail renderer');
     assert.equal(await row.isVisible(), false, 'another detail cannot replace an unsaved edit');
     const workspace = page.locator('.provider-edit-workspace');
-    const originalProxy = 'socks5h://fixture-user:fixture-password@10.0.0.15:1080';
-    const proxyValue = workspace.locator('.provider-proxy-value input');
+    const proxyValue = workspace.getByLabel(/^固定出口\s*\*?$/);
     await proxyValue.waitFor();
-    assert.equal(await proxyValue.inputValue(), originalProxy);
+    assert.equal(await proxyValue.inputValue(), 'exit-15');
     assert.equal(await workspace.locator('form form').count(), 0, 'connection settings share one form without nested forms');
     assert.equal(await workspace.locator('form .upstream-connection').count(), 1, 'connection settings are inside the account form');
-    assert.equal(await proxyValue.getAttribute('value'), null, 'the original is not serialized into HTML');
-    assert.equal(await proxyValue.getAttribute('type'), 'text', 'authorized proxy values are directly visible by default');
-    await workspace.getByRole('button', { name: '隐藏代理地址', exact: true }).click();
-    assert.equal(await proxyValue.getAttribute('type'), 'password', 'hiding is an explicit option');
-    await workspace.getByRole('button', { name: '查看代理地址', exact: true }).click();
-    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
-    await workspace.getByRole('button', { name: '复制代理地址', exact: true }).click();
-    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), originalProxy);
+    assert.equal(await workspace.locator('.provider-proxy-value input').count(), 0, 'one managed-exit selection replaces the competing raw-address editor');
+    assert.doesNotMatch(await workspace.innerHTML(), /fixture-user|fixture-password/, 'managed proxy credentials are not rendered');
     const name = workspace.getByLabel('备注名称', { exact: false });
     await name.fill('保留名称草稿');
-    assert.equal(await proxyValue.getAttribute('type'), 'text', 'editing another field does not conceal an authorized configuration value');
-    await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
-    assert.equal(await page.locator('.upstream-proxy-editor input').inputValue(), originalProxy, 'editing starts with the actual current address');
-    assert.equal(await page.locator('.upstream-proxy-editor input').getAttribute('type'), 'text', 'proxy edits are directly readable');
+    assert.equal(await proxyValue.inputValue(), 'exit-15', 'editing another field preserves the selected exit');
+    await proxyValue.selectOption('exit-10');
     const save = workspace.locator('.rjsf > button[type="submit"]');
     assert.equal(await save.isEnabled(), false);
-    await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.10:1080');
-    await page.getByRole('button', { name: '保存网络代理', exact: true }).click();
+    await page.getByRole('button', { name: '保存账号策略', exact: true }).click();
     await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.provider-edit-workspace .rjsf > button[type="submit"]')?.disabled);
     assert.equal(await name.inputValue(), '保留名称草稿', 'proxy refresh preserves the independent name draft');
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 1);
@@ -203,13 +192,18 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.evaluate(() => { window.deferNextFormProxyRead = true; });
     await editProviderAccount(page);
     await page.waitForFunction(() => !window.deferNextFormProxyRead);
-    await workspace.getByRole('button', { name: '配置网络代理', exact: true }).click();
-    await workspace.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.40:1080');
-    await workspace.getByRole('button', { name: '保存网络代理', exact: true }).click();
-    await workspace.locator('.provider-proxy-value input').waitFor();
+    assert.equal(await workspace.getByLabel(/^固定出口\s*\*?$/).count(), 0, 'an unresolved effective-connection read cannot expose an editable stale selection');
+    assert.equal(await workspace.locator('.rjsf > button[type="submit"]').isEnabled(), false, 'the owner waits for its scoped policy read');
+    assert.equal(await page.evaluate(() => window.formJourneyWrites), 2, 'a pending read never writes a replacement policy');
     await page.evaluate(() => window.releaseFormProxyRead());
-    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-    assert.equal(await workspace.locator('.provider-proxy-value input').inputValue(), 'socks5h://10.0.0.40:1080', 'a late old-generation read cannot restore the previous proxy');
+    await proxyValue.selectOption('exit-40');
+    await workspace.getByRole('button', { name: '保存账号策略', exact: true }).click();
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.provider-edit-workspace .rjsf > button[type="submit"]')?.disabled);
+    assert.equal(await proxyValue.inputValue(), 'exit-40');
+    assert.deepEqual(await page.evaluate(() => window.formJourneyLastProxyPolicyWrite), {
+      tenant_external_id: 'fixture', mode: 'manual', proxy_id: 'exit-40', config: {},
+      expected_selection_version: 1, expected_binding_version: 1, expected_credential_generation: 2, expected_updated_at: 3,
+    }, 'the next save uses the refreshed selection, binding, credential and account versions');
     await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-no-authority`);
     await editProviderAccount(page);
     assert.equal(await workspace.locator('.provider-proxy-value input').count(), 0);
@@ -251,9 +245,8 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await page.evaluate(() => { window.deferNextFormQuotaRead = true; });
     await quotaDetails.getByRole('button', { name: '刷新额度', exact: true }).click();
     await page.waitForFunction(() => window.formJourneyReads.filter(path => path.endsWith('/quota')).length === 3);
-    await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
-    await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.30:1080');
-    await page.getByRole('button', { name: '保存网络代理', exact: true }).click();
+    await page.getByLabel(/^固定出口\s*\*?$/).selectOption('exit-30');
+    await page.getByRole('button', { name: '保存账号策略', exact: true }).click();
     await quotaDetails.getByRole('button', { name: '查看额度', exact: true }).waitFor();
     assert.match(await row.innerText(), /尚未读取/);
     assert.equal(await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 1 额度） · 供应商窗口', { exact: true }).count(), 0);
@@ -281,6 +274,30 @@ test('independent proxy save updates concurrency metadata without dropping the p
     await row.getByRole('button', { name: '管理账号', exact: true }).click();
     await page.locator('.upstream-quota-windows').getByText('Codex 附加用量（代次 2 额度） · 供应商窗口', { exact: true }).waitFor();
     assert.equal(await page.evaluate(() => window.formJourneyWrites), 1, 'only the mocked proxy change was written; no reset operation was attempted');
+    for (const pendingPhase of ['write', 'effective-read'] as const) for (const field of ['token', 'tenant', 'writeTenant'] as const) {
+      await page.goto(`${origin}/e2e/fixtures/form-journey.html?workflows&proxy-workflow`);
+      await editProviderAccount(page);
+      await workspace.getByLabel(/^固定出口\s*\*?$/).selectOption('exit-40');
+      await page.evaluate(phase => {
+        if (phase === 'write') window.deferNextFormProxyPolicyWrite = true;
+        else window.deferNextFormProxyRead = true;
+      }, pendingPhase);
+      await workspace.getByRole('button', { name: '保存账号策略', exact: true }).click();
+      await page.waitForFunction(phase => phase === 'write' ? !window.deferNextFormProxyPolicyWrite : !window.deferNextFormProxyRead, pendingPhase);
+      assert.equal(await page.evaluate(() => window.formJourneyWrites), 1);
+      await page.evaluate(field => window.changeFormProviderScope(field), field);
+      await workspace.waitFor({ state: 'detached' });
+      const readsAfterScopeChange = await page.evaluate(() => window.formJourneyReads.filter(path => path === '/internal/v1/upstreams').length);
+      await page.evaluate(phase => {
+        if (phase === 'write') window.releaseFormProxyPolicyWrite();
+        else window.releaseFormProxyRead();
+      }, pendingPhase);
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      assert.equal(await workspace.count(), 0, `${field} prevents a late policy result from restoring its editor`);
+      assert.equal(await page.locator('.provider-detail-workspace').count(), 0);
+      assert.equal(await page.locator('.notice.success').count(), 0, 'late policy completion has no success feedback in the new scope');
+      assert.equal(await page.evaluate(() => window.formJourneyReads.filter(path => path === '/internal/v1/upstreams').length), readsAfterScopeChange, 'late policy completion never calls the previous scope list refresh');
+    }
     assert.deepEqual(errors, []);
   } finally { await browser.close(); await server.close(); }
 });
@@ -310,10 +327,10 @@ test('list quota auto-read stays single in flight and compensates a generation c
     assert.equal(await page.getByRole('button', { name: '刷新全部上游额度', exact: true }).isDisabled(), true, 'the in-flight bulk read owns the refresh-all action');
     await row.getByRole('button', { name: '管理账号', exact: true }).click();
     await page.locator('.provider-detail-workspace').waitFor();
-    await page.getByRole('button', { name: '配置网络代理', exact: true }).click();
-    await page.locator('.upstream-proxy-editor input').fill('socks5h://10.0.0.30:1080');
-    await page.getByRole('button', { name: '保存网络代理', exact: true }).click();
-    await page.locator('.provider-proxy-value input').waitFor();
+    await page.getByLabel(/^固定出口\s*\*?$/).selectOption('exit-30');
+    await page.getByRole('button', { name: '保存账号策略', exact: true }).click();
+    await page.getByLabel(/^固定出口\s*\*?$/).click({ trial: true });
+    assert.equal(await page.getByLabel(/^固定出口\s*\*?$/).inputValue(), 'exit-30', 'the remounted editor reads the saved exit');
     await page.waitForFunction(() => window.formJourneyReads.filter(path => path === '/internal/v1/upstreams').length >= 2);
     assert.equal(await page.evaluate(() => window.formJourneyQuotaBulkReads.length), 1, 'no duplicate read while the first read is in flight');
     await page.evaluate(() => window.releaseFormQuotaBulkRead());
@@ -500,7 +517,7 @@ test('account workspace returns without retained details, shares list tracks and
       const labels = { edit: chinese ? '编辑' : 'Edit', close: chinese ? '关闭' : 'Close', back: chinese ? '返回账号列表' : 'Back to account list', name: chinese ? '备注名称' : 'Display name', cancel: chinese ? '取消' : 'Cancel', proceed: chinese ? '确认继续' : 'Confirm and continue' };
       const accounts = (tenant: string) => [
         { id: `account-${tenant}`, tenant_id: `tenant-${tenant}`, tenant_external_id: tenant, name: 'Short account', driver: 'http-json', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: true, can_reauthorize: false, can_refresh: false, route_count: 1234, config: { base_url: 'https://provider.example.invalid' }, created_at: 1, updated_at: 2 },
-        { id: `expired-${tenant}`, tenant_id: `tenant-${tenant}`, tenant_external_id: tenant, name: 'Long account name 中文账号名称 '.repeat(5), driver: 'kimi-oauth', auth_kind: 'oauth', connection_method: 'oauth', credential_generation: 1, credential_expires_at: 1, status: 'active', can_rotate: false, can_reauthorize: true, can_refresh: true, route_count: 0, config: {}, created_at: 1, updated_at: 2 },
+        { id: `expired-${tenant}`, oauth_refresh: { credential_generation: 1, access_state: 'expired', refresh_state: 'reauthorization_required', failure_class: null, reauthorization_required: true, automatic_refresh_paused: false, allowed_actions: ['reauthorize'] }, tenant_id: `tenant-${tenant}`, tenant_external_id: tenant, name: 'Long account name 中文账号名称 '.repeat(5), driver: 'kimi-oauth', auth_kind: 'oauth', connection_method: 'oauth', credential_generation: 1, credential_expires_at: 1, status: 'active', can_rotate: false, can_reauthorize: true, can_refresh: true, route_count: 0, config: {}, created_at: 1, updated_at: 2 },
         { id: `retired-${tenant}`, tenant_id: `tenant-${tenant}`, tenant_external_id: tenant, name: 'VeryLongUnbrokenAccountName'.repeat(6), driver: 'retired-fixture', auth_kind: 'api_key', connection_method: 'api_key', credential_generation: 1, credential_expires_at: null, status: 'active', can_rotate: false, can_reauthorize: false, can_refresh: false, route_count: 99, config: {}, created_at: 1, updated_at: 2 },
       ];
       let state: 'normal' | 'empty' | 'denied' | 'slow' = 'normal';
@@ -562,15 +579,16 @@ test('account workspace returns without retained details, shares list tracks and
           const bounds = button.getBoundingClientRect();
           return { left: bounds.left, top: bounds.top, bottom: bounds.bottom };
         })));
-        assert.deepEqual(actions.map(buttons => buttons.length), [2, 3, 2], 'reauthorization remains available in addition to both common actions');
+        assert.deepEqual(actions.map(buttons => buttons.length), [2, 3, 2], 'an explicit reauthorization requirement adds its action beside the two common actions');
         for (const buttons of actions.slice(1)) for (const index of [0, 1]) {
           assert.ok(Math.abs(buttons[index].left - actions[0][index].left) <= 1, `${locale} ${width}px common action ${index} retains its slot`);
         }
-        assert.ok(actions[1][2].top >= Math.max(actions[1][0].bottom, actions[1][1].bottom), 'the additional authorization action occupies its own next row');
+        assert.ok(actions[1][2].top >= Math.max(actions[1][0].bottom, actions[1][1].bottom), 'the explicit authorization action occupies its own next row');
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, `${locale} ${width}px long names and actions reflow`);
         await page.screenshot({ path: `${artifacts}/normal-${locale}-${width}.png`, fullPage: true });
       }
       const expiredDetails = await manageProviderAccount(page, 'expired-fixture-a');
+      assert.equal(await expiredDetails.getByRole('button', { name: chinese ? '重新登录' : 'Sign in again', exact: true }).isEnabled(), true, 'manual reauthorization remains available from the account workspace');
       await expiredDetails.locator('.provider-model-catalog').getByText(chinese ? '已同步' : 'Synced', { exact: false }).waitFor();
       assert.equal(await expiredDetails.locator('.account-main > .status').innerText(), chinese ? '访问令牌已过期' : 'Access token expired', 'a ready catalog never overrides an expired Kimi access token');
       assert.equal(await expiredDetails.locator('.account-main > .status.ok').count(), 0);
