@@ -658,34 +658,36 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
               <div><dt>{copy.effectiveExit}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective ? proxies.find(proxy => proxy.id === effective.selected_member_id)?.name ?? groups.flatMap(group => group.members).find(member => member.id === effective.selected_member_id)?.label ?? effectiveAddress : copy.unknownSource}</dd></div>
               <div><dt>{copy.appliedStatus}</dt><dd>{effective?.configuration_state === 'pending' ? copy.appliedPending : effective?.configuration_state === 'applied' ? copy.appliedReady : effective?.configuration_state === 'credential' ? copy.credentialSource : copy.appliedUnknown}</dd></div>
             </dl>
-            <Field label={copy.mode} required><Select value={draft.mode} disabled={disabled || busy || !ready} onChange={event => changeStrategy(event.target.value)}>
-              <option value="manual">{copy.modes.manual}</option><option value="auto">{copy.modes.auto}</option>
-              {(plugins.length > 0 || selection.desired.mode === 'plugin') && <option value="plugin">{copy.modes.plugin}</option>}
-            </Select></Field>
-            {draft.mode === 'manual' ? <Field label={copy.targetProxy} required><Select value={draft.proxyId} disabled={disabled || busy || !ready}
-              onChange={event => changeDraft({ proxyId: event.target.value })}>
-              <option value="">{copy.selectProxy}</option>{proxies.map(proxy => <option key={proxy.id} value={proxy.id}>{proxy.name}</option>)}
-            </Select></Field> : <>
-              <Field label={copy.targetGroup} required><Select value={draft.groupId} disabled={disabled || busy || !ready}
-                onChange={event => changeDraft({ groupId: event.target.value })}>
-                <option value="">{copy.selectGroup}</option>{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
+            <div className="network-proxy-policy-controls">
+              <Field label={copy.mode} required><Select value={draft.mode} disabled={disabled || busy || !ready} onChange={event => changeStrategy(event.target.value)}>
+                <option value="manual">{copy.modes.manual}</option><option value="auto">{copy.modes.auto}</option>
+                {(plugins.length > 0 || selection.desired.mode === 'plugin') && <option value="plugin">{copy.modes.plugin}</option>}
               </Select></Field>
-              {draft.mode === 'plugin' && <Field label={copy.strategy} required><Select value={draft.pluginKey} disabled={disabled || busy || !ready}
-                onChange={event => changeStrategy('plugin', event.target.value)}>
-                <option value="">{copy.selectStrategy}</option>{plugins.map(item => <option key={`${item.id}\0${item.version}`} value={`${item.id}\0${item.version}`}>{item.id} · {item.version}</option>)}
-              </Select></Field>}
-              {(draft.mode === 'auto' || draft.mode === 'plugin' && strategy) && <FormSection title={copy.strategyConfig}>
-                {useJson ? <>
-                  <p className="muted">{copy.configUnsupported}</p>
-                  <Textarea rows={10} value={draft.configText} disabled={disabled || busy || !ready} onChange={(_, data) => changeDraft({ configText: data.value })} />
-                </> : Object.entries(properties).map(([key, property]) => property.type === 'boolean'
-                  ? <Checkbox key={key} label={key} checked={draft.fields[key] === true} disabled={disabled || busy || !ready}
-                    onChange={(_, data) => changeDraft({ fields: { ...draft.fields, [key]: data.checked === true } })} />
-                  : <Field key={key} label={key} required><Input type={property.type === 'string' ? 'text' : 'number'} value={String(draft.fields[key] ?? '')}
-                    min={property.minimum} max={property.maximum} maxLength={property.maxLength} step={property.type === 'integer' ? 1 : 'any'} disabled={disabled || busy || !ready}
-                    onChange={(_, data) => changeDraft({ fields: { ...draft.fields, [key]: data.value } })} /></Field>)}
-              </FormSection>}
-            </>}
+              {draft.mode === 'manual' ? <Field label={copy.targetProxy} required><Select value={draft.proxyId} disabled={disabled || busy || !ready}
+                onChange={event => changeDraft({ proxyId: event.target.value })}>
+                <option value="">{copy.selectProxy}</option>{proxies.map(proxy => <option key={proxy.id} value={proxy.id}>{proxy.name}</option>)}
+              </Select></Field> : <>
+                <Field label={copy.targetGroup} required><Select value={draft.groupId} disabled={disabled || busy || !ready}
+                  onChange={event => changeDraft({ groupId: event.target.value })}>
+                  <option value="">{copy.selectGroup}</option>{groups.map(group => <option key={group.id} value={group.id}>{group.name}</option>)}
+                </Select></Field>
+                {draft.mode === 'plugin' && <Field label={copy.strategy} required><Select value={draft.pluginKey} disabled={disabled || busy || !ready}
+                  onChange={event => changeStrategy('plugin', event.target.value)}>
+                  <option value="">{copy.selectStrategy}</option>{plugins.map(item => <option key={`${item.id}\0${item.version}`} value={`${item.id}\0${item.version}`}>{item.id} · {item.version}</option>)}
+                </Select></Field>}
+                {(draft.mode === 'auto' || draft.mode === 'plugin' && strategy) && <FormSection title={copy.strategyConfig}>
+                  {useJson ? <>
+                    <p className="muted">{copy.configUnsupported}</p>
+                    <Textarea rows={10} value={draft.configText} disabled={disabled || busy || !ready} onChange={(_, data) => changeDraft({ configText: data.value })} />
+                  </> : Object.entries(properties).map(([key, property]) => property.type === 'boolean'
+                    ? <Checkbox key={key} label={key} checked={draft.fields[key] === true} disabled={disabled || busy || !ready}
+                      onChange={(_, data) => changeDraft({ fields: { ...draft.fields, [key]: data.checked === true } })} />
+                    : <Field key={key} label={key} required><Input type={property.type === 'string' ? 'text' : 'number'} value={String(draft.fields[key] ?? '')}
+                      min={property.minimum} max={property.maximum} maxLength={property.maxLength} step={property.type === 'integer' ? 1 : 'any'} disabled={disabled || busy || !ready}
+                      onChange={(_, data) => changeDraft({ fields: { ...draft.fields, [key]: data.value } })} /></Field>)}
+                </FormSection>}
+              </>}
+            </div>
             <div className="button-row">{dirty && <Button appearance="secondary" type="button" disabled={busy} onClick={() => { setDraft(policyDraft(selection, strategies)); setDirty(false); setError(''); setMessage(''); }}>{copy.cancelPolicy}</Button>}<Button appearance="primary" type="button" disabled={disabled || busy || !ready || !dirty || !validDraft} onClick={() => void savePolicy()}>{copy.savePolicy}</Button></div>
           </>}
         </>}

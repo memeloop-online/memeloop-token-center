@@ -37,7 +37,13 @@ test('real Codex config shapes localize transport controls and preserve advanced
       const proxy = workspace.getByLabel(/^固定出口\s*\*?$/);
       await proxy.waitFor();
       assert.equal(await proxy.inputValue(), 'exit-15');
-      assert.ok(await proxy.evaluate(element => element.getBoundingClientRect().bottom < innerHeight), 'proxy action is available in the initial desktop viewport');
+      const proxyViewport = await proxy.evaluate(element => {
+        const { top, bottom, left, right } = element.getBoundingClientRect();
+        return { top, bottom, left, right, width: innerWidth, height: innerHeight };
+      });
+      assert.ok(proxyViewport.top >= 0 && proxyViewport.bottom < proxyViewport.height
+        && proxyViewport.left >= 0 && proxyViewport.right <= proxyViewport.width,
+      `proxy action is available in the initial desktop viewport (${shape}: ${JSON.stringify(proxyViewport)})`);
       assert.doesNotMatch(await workspace.innerText(), /reservation_token_bounds|Conservative token|network_scope|代理标识|synthetic-diagnostic-fingerprint/);
       assert.equal(await workspace.locator('.network-proxy-policy-workspace').count(), 1, 'one policy editor owns the selected network exit');
       assert.equal(await workspace.locator('.provider-proxy-value input').count(), 0, 'the account editor uses managed proxy identities rather than a second raw-address editor');
