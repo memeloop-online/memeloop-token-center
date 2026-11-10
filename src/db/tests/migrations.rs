@@ -46,7 +46,7 @@ async fn readiness_reuses_one_checkout_while_pool_return_is_delayed() {
             })
         })
         .connect_lazy_with(database.pool.connect_options().as_ref().clone());
-    let previous_pool = std::mem::replace(&mut database.pool, pool);
+    let previous_pool = std::mem::replace(&mut database.pool, pool.into());
     previous_pool.close().await;
     let held = database.pool.acquire().await.unwrap();
     let mut warmed = database.pool.acquire().await.unwrap();
@@ -1774,7 +1774,11 @@ async fn sqlite_request_lifecycle_uses_locators_for_finish_detail_and_events() {
     assert_eq!(detail.view.status_code, Some(200));
     assert_eq!(
         detail.response_object.as_deref(),
-        Some("memory://locator-response")
+        Some(format!("gap://{request_id}/response").as_str())
+    );
+    assert_eq!(
+        detail.response_archive_state,
+        crate::model::RequestArchiveState::Pending
     );
     let located_events: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM request_event_locators l JOIN request_events e ON e.event_id = l.id AND e.event_at = l.created_at WHERE l.request_id = $1",

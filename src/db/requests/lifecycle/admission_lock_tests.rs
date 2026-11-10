@@ -67,7 +67,7 @@ impl Fixture {
         Some(Self {
             database,
             contender,
-            admin,
+            admin: admin.into(),
             schema,
             contender_name,
             key,

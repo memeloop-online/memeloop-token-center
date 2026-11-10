@@ -25,7 +25,7 @@ fn invalid() -> AppError {
     AppError::BadRequest("invalid transport proxy group configuration".into())
 }
 
-async fn lock(tx: &mut Transaction<'_, Any>) -> Result<(), AppError> {
+pub(crate) async fn lock(tx: &mut Transaction<'_, Any>) -> Result<(), AppError> {
     sqlx::query("UPDATE transport_proxy_management_lock SET revision = revision + 1 WHERE id = 1")
         .execute(&mut **tx)
         .await?;
@@ -207,6 +207,7 @@ impl Database {
                     .find(|member| member.id == initial)
                     .ok_or_else(invalid)?;
                 let stamp = BindingStamp {
+                    mode: None,
                     selection_version: revision(tx).await?,
                     binding_version: account.try_get("version")?,
                     group_id: Some(parse_uuid(id.clone())?),
@@ -255,6 +256,7 @@ impl Database {
             }];
             for account in manual {
                 let stamp = BindingStamp {
+                    mode: Some(TransportPolicyMode::Manual),
                     selection_version: revision(tx).await?,
                     binding_version: account.try_get("version")?,
                     group_id: None,

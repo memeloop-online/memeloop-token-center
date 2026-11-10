@@ -9,17 +9,23 @@ pub(in crate::api::proxy) enum FailoverDisposition {
     ConnectionNotDelivered,
     RateLimitRejected,
     QuotaRejected,
+    ModelRejected,
     Stop,
 }
 
 impl FailoverDisposition {
     pub(in crate::api::proxy) fn is_definite_rejection(&self) -> bool {
-        matches!(self, Self::RateLimitRejected | Self::QuotaRejected)
+        matches!(
+            self,
+            Self::RateLimitRejected | Self::QuotaRejected | Self::ModelRejected
+        )
     }
 
     pub(in crate::api::proxy) fn reason(&self) -> Option<UpstreamHealthReason> {
         match self {
-            Self::CandidateNotDispatched => Some(UpstreamHealthReason::Unavailable),
+            Self::CandidateNotDispatched | Self::ModelRejected => {
+                Some(UpstreamHealthReason::Unavailable)
+            }
             Self::ConnectionNotDelivered => Some(UpstreamHealthReason::Connection),
             Self::RateLimitRejected | Self::QuotaRejected => {
                 Some(UpstreamHealthReason::RateLimited)
@@ -34,6 +40,7 @@ impl FailoverDisposition {
             Self::ConnectionNotDelivered => "connection_not_delivered",
             Self::RateLimitRejected => "rate_limit_rejected",
             Self::QuotaRejected => "quota_rejected",
+            Self::ModelRejected => "model_rejected_before_execution",
             Self::Stop => "no_replay_evidence",
         }
     }

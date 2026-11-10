@@ -190,7 +190,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
         );
         let _proxy_lifecycle_permit = proxy_lifecycle_permit;
         let _dispatch_permit = dispatch_permit;
-        let archive_memory = background_state.persistence.stream_memory.reservation();
         let request_memory = memory;
         let _stream_activity = stream_activity;
         let _upstream_activity = upstream_activity;
@@ -213,17 +212,14 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 Some(upstream_account_id),
                 Some(credential_generation),
             ));
+            // Only the host compact codec can construct this evidence. A
+            // provider header cannot opt out of ordinary SSE validation.
+            let validated_compact = upstream.validated_compact().cloned();
+            let mut compact_file_eof = false;
+            // The request owner attached the raw capture at response headers,
+            // before protocol checks or translation can stop delivery.
+
             let mut upstream_stream = upstream.bytes_stream();
-            let spool_identity = crate::db::ArchiveSpoolIdentity {
-                request_id,
-                tenant_id,
-                reservation_id: reservation.id,
-            };
-            let mut archive_sender = crate::response_archive_spool::ResponseArchiveProducer::begin(
-                &background_state,
-                spool_identity,
-                archive_memory,
-            );
             let mut usage_capture = Vec::new();
             let mut capture_memory = background_state
                 .metrics
@@ -235,7 +231,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     codex_chat_include_usage,
                 )
             });
-            let mut sse_capture = is_sse.then(|| match protocol {
+            let mut sse_capture = (is_sse && validated_compact.is_none()).then(|| match protocol {
                 Protocol::OpenAiChat if is_codex_route => {
                     ResponsesSseCapture::for_codex_responses_with_limits(sse_framing_limits)
                 }
@@ -250,7 +246,8 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 }
                 _ => ResponsesSseCapture::for_delivery_with_limits(sse_framing_limits),
             });
-            let mut responses_streaming_sanitizer = (is_sse
+            let mut responses_streaming_sanitizer = (validated_compact.is_none()
+                && is_sse
                 && (is_codex_route
                     || matches!(
                         protocol,
@@ -304,14 +301,10 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 waits.body_chunk();
                             }
                             downstream_closed_observed |= downstream_closed;
-                            if downstream_closed {
-                                drop(archive_sender.take());
-                            }
                             next
                         }
                         StreamPoll::Upstream(DownstreamAwarePoll::DownstreamClosed) => {
                             transport_error = Some("downstream_disconnected");
-                            drop(archive_sender.take());
                             break;
                         }
                         StreamPoll::ProgressHeartbeat => {
@@ -332,12 +325,26 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 }
                                 Err(_) => transport_error = Some("downstream_disconnected"),
                             }
-                            drop(archive_sender.take());
                             break;
                         }
                     }
                 };
                 let Some(next) = next else {
+                    if let Some(evidence) = validated_compact.as_ref() {
+                        if response_bytes as u64 != evidence.expected_body_bytes() {
+                            transport_error = Some("compact_file_length_mismatch");
+                            let _ = body_sender
+                                .send(downstream_stream_failure(
+                                    protocol,
+                                    is_sse,
+                                    None,
+                                    "validated compact file ended before its complete body",
+                                ))
+                                .await;
+                            break;
+                        }
+                        compact_file_eof = true;
+                    }
                     match terminal_delivery.finish_at_eof(responses_streaming_sanitizer.as_mut()) {
                         TerminalEof::Flush => continue,
                         TerminalEof::Complete => {
@@ -361,7 +368,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 downstream_closed_observed || body_sender.is_closed(),
                                 error_code,
                             ));
-                            drop(archive_sender.take());
                             let _ = tokio::time::timeout(
                                 MAX_DOWNSTREAM_SEND_WAIT,
                                 body_sender.send(downstream_stream_failure(
@@ -379,6 +385,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                 match next {
                     Ok(raw_chunk) => {
                         if is_sse
+                            && validated_compact.is_none()
                             && !flushing_terminal
                             && !raw_chunk.is_empty()
                             && _sse_streaming_memory.is_none()
@@ -390,7 +397,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     downstream_closed_observed || body_sender.is_closed(),
                                     "upstream_response_memory_capacity",
                                 ));
-                                drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
                                     body_sender.send(downstream_stream_failure(
@@ -411,7 +417,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 downstream_ready_bytes.saturating_add(raw_chunk_len);
                             if downstream_ready_bytes > sse_framing_limits.terminal_hold_bytes {
                                 transport_error = Some("downstream_disconnected");
-                                drop(archive_sender.take());
                                 break;
                             }
                         }
@@ -428,6 +433,20 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 raw_chunk.len(),
                             );
                             response_bytes = response_bytes.saturating_add(raw_chunk.len());
+                            if validated_compact.as_ref().is_some_and(|evidence| {
+                                response_bytes as u64 > evidence.expected_body_bytes()
+                            }) {
+                                transport_error = Some("compact_file_length_mismatch");
+                                let _ = body_sender
+                                    .send(downstream_stream_failure(
+                                        protocol,
+                                        is_sse,
+                                        None,
+                                        "validated compact file exceeded its complete body",
+                                    ))
+                                    .await;
+                                break;
+                            }
                             // Cumulative traffic does not occupy cumulative
                             // memory. Frame decoding, terminal retention and
                             // channel backpressure own the live working set.
@@ -455,7 +474,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                                     || body_sender.is_closed(),
                                                 error_code,
                                             ));
-                                        drop(archive_sender.take());
                                         let _ = tokio::time::timeout(
                                             MAX_DOWNSTREAM_SEND_WAIT,
                                             body_sender.send(downstream_stream_failure(
@@ -499,7 +517,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             );
                             if downstream_closed_observed && !terminal_evidence_pending {
                                 transport_error = Some("downstream_disconnected");
-                                drop(archive_sender.take());
                                 break;
                             }
                             continue;
@@ -526,7 +543,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                     downstream_closed_observed || body_sender.is_closed(),
                                     rejection.error_code(),
                                 ));
-                                drop(archive_sender.take());
                                 let _ = tokio::time::timeout(
                                     MAX_DOWNSTREAM_SEND_WAIT,
                                     body_sender.send(downstream_stream_failure(
@@ -540,6 +556,16 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                 break;
                             }
                         };
+                        if let Some(evidence) = validated_compact.as_ref() {
+                            // File fragments are not complete SSE events. The
+                            // codec records the first complete output boundary;
+                            // a created prefix alone is not delivered output.
+                            let complete_output =
+                                response_bytes as u64 >= evidence.first_billable_byte_end();
+                            for frame in &mut delivery_frames {
+                                frame.billable = complete_output;
+                            }
+                        }
                         if let Some(translator) = codex_chat_translator.as_mut() {
                             let mut translated = Vec::with_capacity(delivery_frames.len());
                             for mut frame in delivery_frames {
@@ -557,7 +583,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                                                     || body_sender.is_closed(),
                                                 error_code,
                                             ));
-                                        drop(archive_sender.take());
                                         let _ = tokio::time::timeout(
                                             MAX_DOWNSTREAM_SEND_WAIT,
                                             body_sender.send(downstream_stream_failure(
@@ -581,30 +606,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         for frame in &delivery_frames {
                             output_timing.observe(&frame.bytes, frame.terminal, observed_ms);
                         }
-                        if let Some(spool) = archive_sender.as_mut() {
-                            let mut archive_failed = false;
-                            for frame in &delivery_frames {
-                                let Some(_retention_memory) =
-                                    request_memory.try_reserve_archive_json_transform(&frame.bytes)
-                                else {
-                                    archive_failed = true;
-                                    break;
-                                };
-                                if !spool.append(vec![
-                                    super::archive_retention::sse_frame_with_limits(
-                                        &frame.bytes,
-                                        sse_framing_limits,
-                                    ),
-                                ]) {
-                                    archive_failed = true;
-                                    break;
-                                }
-                            }
-                            if archive_failed {
-                                tracing::warn!(%request_id, stage = "response_spool_ack", "proxy archive gap");
-                                drop(archive_sender.take());
-                            }
-                        }
+
                         // A successful Responses terminal is held privately
                         // until EOF validates its tail. Once the receiver is
                         // gone, do not attempt more downstream sends, but do
@@ -659,7 +661,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             }
                         }
                         if transport_error.is_some() {
-                            drop(archive_sender.take());
                             if resume_pending_delivery_after_send_disconnect(
                                 &mut transport_error,
                                 &mut downstream_closed_observed,
@@ -689,7 +690,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                         }
                         if downstream_closed_observed {
                             transport_error = Some("downstream_disconnected");
-                            drop(archive_sender.take());
                             break;
                         }
                         if codex_responses_progress_heartbeat
@@ -712,7 +712,6 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                             downstream_closed_observed || body_sender.is_closed(),
                             error_code,
                         ));
-                        drop(archive_sender.take());
                         let _ = tokio::time::timeout(
                             MAX_DOWNSTREAM_SEND_WAIT,
                             body_sender.send(downstream_stream_failure(
@@ -736,46 +735,36 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
             if let Some(phase) = first_byte.take() {
                 phase.finish("no_bytes", Some(status.as_u16()), Some(0));
             }
-            if transport_error.is_some() {
-                drop(archive_sender.take());
-            }
             let local_response_boundary =
                 transport_error.is_some_and(buffered_upstream::is_local_response_boundary);
-            let sse_summary = sse_capture.map(|capture| {
-                let mut summary =
-                    capture.finish_summary_after_local_boundary(local_response_boundary);
-                lifecycle::apply_chat_translation_usage_evidence(
-                    &mut summary,
-                    codex_chat_translation_error,
-                );
-                summary
-            });
+            let sse_summary = validated_compact
+                .as_ref()
+                .map(|evidence| {
+                    let mut summary = evidence.summary();
+                    if !compact_file_eof || transport_error.is_some() {
+                        summary.outcome = ResponsesSseOutcome::Incomplete;
+                    }
+                    summary
+                })
+                .or_else(|| {
+                    sse_capture.map(|capture| {
+                        let mut summary =
+                            capture.finish_summary_after_local_boundary(local_response_boundary);
+                        lifecycle::apply_chat_translation_usage_evidence(
+                            &mut summary,
+                            codex_chat_translation_error,
+                        );
+                        summary
+                    })
+                });
             let incomplete = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),
                 Some(ResponsesSseOutcome::Incomplete)
             );
-            if incomplete {
-                // A partial SSE event is not a deliverable response and must
-                // not leave a complete-looking archive prefix behind.
-                drop(archive_sender.take());
-            }
-            // Success terminals and EOF transfer the bounded capture to its
-            // owned writer. The terminal frame does not wait for database
-            // drain; the writer keeps the row capturing until seal commits.
+            // The original upstream owner drains and seals independently of
+            // delivery sanitization, downstream cancellation and financial ACK.
             let terminal_delivery_phase =
                 proxy_diagnostics::Phase::new(diagnostic_context, "terminal_delivery");
-            let archive_settlement: Option<
-                crate::response_archive_spool::ResponseArchiveSettlement,
-            > = match archive_sender.take() {
-                Some(spool) => spool.seal(),
-                None => None,
-            };
-            drop(archive_settlement);
-            // A spawned writer exclusively fences its failed/abandoned
-            // capture, including a begin that commits after cancellation.
-            // No writer means memory admission failed before any spool SQL;
-            // the request already has its gap locator. Do not duplicate the
-            // fence or put its database wait ahead of terminal delivery.
             let failed = matches!(
                 sse_summary.as_ref().map(|summary| &summary.outcome),
                 Some(ResponsesSseOutcome::Failed)
@@ -921,6 +910,7 @@ pub(super) async fn stream_response(input: StreamingResponse<'_>) -> Result<Resp
                     transport_error,
                     delivered_billable,
                     sse_summary,
+                    validated_compact,
                     usage_capture,
                     stored_response,
                     routing_terminal_observed_at,

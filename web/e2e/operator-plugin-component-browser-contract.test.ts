@@ -5,6 +5,68 @@ import test from 'node:test';
 import { chromium } from 'playwright';
 import { createServer } from 'vite';
 
+test('plugin charts load on demand, resize on narrow screens and unmount cleanly', { timeout: 60_000 }, async () => {
+  if (!existsSync(chromium.executablePath())) {
+    if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');
+    return test.skip('Chromium is required');
+  }
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, logLevel: 'silent', server: { host: '127.0.0.1', port: 0 } });
+  await server.listen();
+  const address = server.httpServer?.address();
+  assert.ok(address && typeof address !== 'string');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 1024, height: 768 } });
+    const errors: string[] = [];
+    let chartModuleLoads = 0;
+    page.on('pageerror', error => errors.push(error.message));
+    page.on('request', request => {
+      if (new URL(request.url()).pathname === '/src/charts/EChart.tsx') chartModuleLoads += 1;
+    });
+    await page.route('**/ui-assets/plugins/**', route => route.fulfill({
+      contentType: 'text/javascript; charset=utf-8',
+      body: `export function activateOperatorUi({ React, EChart, defineOperatorUiPackage }) {
+        function Workspace() {
+          const [visible, setVisible] = React.useState(false);
+          return React.createElement('div', { style: { minWidth: 0 } },
+            React.createElement('button', { onClick: () => setVisible(current => !current) }, visible ? 'Hide chart' : 'Show chart'),
+            visible && React.createElement(EChart, {
+              ariaLabel: 'Model latency', locale: 'en', timeZone: 'UTC',
+              style: { height: 300, width: '100%', minWidth: 0 },
+              option: { animation: false, xAxis: { type: 'category', data: ['A', 'B'] },
+                yAxis: { type: 'value' }, series: [{ type: 'bar', data: [12, 24] }] },
+            }));
+        }
+        return defineOperatorUiPackage({ apiVersion: 'operator-ui-package-v1', pluginId: 'runtime-bindings',
+          compatiblePluginVersions: ['1.0.0'], components: { workspace: Workspace } });
+      }`,
+    }));
+    await page.goto(`http://127.0.0.1:${address.port}/e2e/fixtures/operator-plugin-runtime-bindings.html`);
+    await page.getByRole('button', { name: 'Show chart', exact: true }).waitFor();
+    assert.equal(chartModuleLoads, 0, 'text-only plugins do not load the chart renderer');
+    await page.getByRole('button', { name: 'Show chart', exact: true }).click();
+    const chart = page.getByRole('img', { name: 'Model latency (UTC)', exact: true });
+    await chart.locator('canvas').waitFor();
+    assert.equal(chartModuleLoads, 1);
+    for (const width of [390, 320, 1024]) {
+      await page.setViewportSize({ width, height: 768 });
+      await page.waitForFunction(() => {
+        const host = document.querySelector<HTMLElement>('[aria-label="Model latency (UTC)"]');
+        const canvas = host?.querySelector('canvas');
+        return host && canvas && host.clientWidth > 100
+          && Math.abs(canvas.width / window.devicePixelRatio - host.clientWidth) < 2;
+      });
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth), true);
+    }
+    await page.getByRole('button', { name: 'Hide chart', exact: true }).click();
+    assert.equal(await chart.count(), 0);
+    await page.getByRole('button', { name: 'Show chart', exact: true }).click();
+    await chart.locator('canvas').waitFor();
+    assert.equal(chartModuleLoads, 1, 'remount reuses the shared chart module');
+    assert.deepEqual(errors, []);
+  } finally { await browser.close(); await server.close(); }
+});
+
 test('an installed runtime module renders without rebuilding MTC and failures stay local', { timeout: 60_000 }, async () => {
   if (!existsSync(chromium.executablePath())) {
     if (process.env.MTC_REQUIRE_BROWSER === '1') throw new Error('Chromium is required');

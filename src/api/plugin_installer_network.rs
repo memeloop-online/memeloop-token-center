@@ -98,12 +98,26 @@ pub(super) async fn installer_network_groups(
     installer_network_actor(&state, &headers).await?;
     let service = require_service(&headers, &state, "providers:read").await?;
     require_service_tenant(&service, &query.tenant_external_id)?;
-    let groups = state
+    let mut groups = state
         .db
         .list_transport_groups(
             &query.tenant_external_id,
             state.config.key_pepper.as_bytes(),
         )
         .await?;
+    // Installer selection exposes labels and connection metadata, while full
+    // authenticated URLs belong to the existing providers:write editor.
+    for group in &mut groups {
+        if let Some(members) = group
+            .get_mut("members")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for member in members {
+                if let Some(member) = member.as_object_mut() {
+                    member.remove("proxy_url");
+                }
+            }
+        }
+    }
     Ok(([(header::CACHE_CONTROL, "private, no-store")], Json(groups)))
 }

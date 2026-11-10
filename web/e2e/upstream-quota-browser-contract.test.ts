@@ -43,14 +43,15 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await page.keyboard.press('Enter');
     await page.getByLabel('Connect attempts', { exact: true }).waitFor();
     assert.equal(await advanced.getAttribute('aria-expanded'), 'true');
-    await page.getByRole('button', { name: 'Configure network proxy', exact: true }).click();
-    const proxy = page.locator('.upstream-proxy-editor input');
-    await proxy.fill('socks5://100.64.0.16:1080');
-    assert.equal(await proxy.getAttribute('aria-invalid'), 'true');
-    await proxy.fill('socks5h://100.64.0.16:1080');
-    assert.equal(await page.getByRole('button', { name: 'Save network proxy', exact: true }).isEnabled(), true);
-    // Do not save or activate any quota operation in this no-network fixture.
-    await page.getByRole('button', { name: 'Cancel', exact: true }).click();
+    const policy = page.locator('.network-proxy-policy-workspace');
+    const proxy = policy.getByLabel(/^Fixed exit\s*\*?$/);
+    await proxy.selectOption('');
+    assert.equal(await policy.getByRole('button', { name: 'Save account policy', exact: true }).isEnabled(), false);
+    await proxy.selectOption('static-exit-2');
+    assert.equal(await policy.getByRole('button', { name: 'Save account policy', exact: true }).isEnabled(), true);
+    // Discard this local selection. The fixture rejects every write.
+    await policy.getByRole('button', { name: 'Cancel changes', exact: true }).click();
+    assert.equal(await proxy.inputValue(), 'static-exit-1');
     await page.getByText('Historical snapshot', { exact: true }).waitFor();
     assert.equal(await page.getByRole('meter').count(), 1, 'unknown usage never renders a zero/full meter');
     assert.equal(await page.getByRole('button', { name: 'Reset upstream quota', exact: true }).isEnabled(), false);
@@ -127,6 +128,7 @@ test('upstream themes and mock-only quota demand, consent and reconciliation con
     await view.click();
     await page.getByRole('button', { name: 'Check operation status', exact: true }).click();
     await page.waitForFunction(() => window.quotaCurrents === 2);
+    await page.waitForFunction(() => !document.querySelector<HTMLButtonElement>('.upstream-quota-reset-action button')?.disabled);
     assert.equal(await reset.isEnabled(), true);
     await page.goto(`${base}/e2e/fixtures/upstream-quota.html?mode=reset-settled`);
     await view.click();

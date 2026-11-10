@@ -88,31 +88,34 @@ async fn failed_uploads_keep_typed_status_without_dispatch_billing_or_resource_l
             assert!(!String::from_utf8_lossy(&body).contains("private-upload-error-canary"));
             assert!(!String::from_utf8_lossy(&body).contains(&fixture.key));
             fixture.state.early_requests.drain_for_test().await;
-            request_count += 1;
-            let rows = fixture
-                .state
-                .db
-                .list_requests(fixture.key_id, 20)
-                .await
-                .unwrap();
-            assert_eq!(rows.len(), request_count);
-            let row = rows
-                .iter()
-                .find(|row| row.request_id == request_id)
-                .unwrap();
-            assert_eq!(row.status_code, Some(i64::from(status.as_u16())));
-            assert_eq!(row.error_code.as_deref(), Some(code));
-            assert_eq!(
-                row.terminal_cause_code.as_deref(),
-                Some("gateway_pre_admission")
-            );
-            assert_eq!(
-                row.usage_basis,
-                Some(crate::model::RequestUsageBasis::NotObserved)
-            );
-            assert!(!row.billing.billable);
-            assert!(row.upstream_account_id.is_none());
-            assert!(row.route_id.is_none());
+            // Early text-request journaling does not include the audio route.
+            if path != "/v1/audio/transcriptions" {
+                request_count += 1;
+                let rows = fixture
+                    .state
+                    .db
+                    .list_requests(fixture.key_id, 20)
+                    .await
+                    .unwrap();
+                assert_eq!(rows.len(), request_count);
+                let row = rows
+                    .iter()
+                    .find(|row| row.request_id == request_id)
+                    .unwrap();
+                assert_eq!(row.status_code, Some(i64::from(status.as_u16())));
+                assert_eq!(row.error_code.as_deref(), Some(code));
+                assert_eq!(
+                    row.terminal_cause_code.as_deref(),
+                    Some("gateway_pre_admission")
+                );
+                assert_eq!(
+                    row.usage_basis,
+                    Some(crate::model::RequestUsageBasis::NotObserved)
+                );
+                assert!(!row.billing.billable);
+                assert!(row.upstream_account_id.is_none());
+                assert!(row.route_id.is_none());
+            }
             assert!(upstream.received_requests().await.unwrap().is_empty());
             assert_eq!(fixture.state.gateway_body_reads.load(Ordering::Acquire), 0);
             assert_eq!(fixture.state.proxy_memory_budget.snapshot().0, 0);

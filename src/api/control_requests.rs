@@ -395,6 +395,15 @@ pub(super) async fn put_filter_assistant_settings(
     require_global_service(&service)?;
     let tenant = required_filter_tenant(&service, body.tenant_external_id)?;
     require_service(&headers, &state, "keys:write").await?;
+    if state
+        .db
+        .health_probe_credential_in_use(&tenant, body.billing_key_id)
+        .await?
+    {
+        return Err(AppError::BadRequest(
+            "system AI and health probes require different credentials".into(),
+        ));
+    }
     let previous = load_filter_assistant_settings(&state, &tenant).await?;
     if previous.as_ref().map(|value| value.updated_at) != body.expected_updated_at {
         return Err(AppError::Conflict(

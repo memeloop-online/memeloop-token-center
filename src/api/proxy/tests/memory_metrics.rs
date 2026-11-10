@@ -99,41 +99,6 @@ async fn dense_small_response_is_delivered_once_and_client_body_retains_its_leas
         .await
         .unwrap();
     assert_eq!(rows.len(), 1);
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let refs = fixture
-                .state
-                .db
-                .request_archive_refs(fixture.key_id, rows[0].request_id)
-                .await
-                .unwrap();
-            if refs
-                .response_object
-                .as_deref()
-                .is_some_and(|locator| !locator.starts_with("gap://"))
-            {
-                break;
-            }
-            crate::response_archive_spool::process_one_for_test(&fixture.state).await;
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("durable archive upload follows successful delivery independently");
-    let refs = fixture
-        .state
-        .db
-        .request_archive_refs(fixture.key_id, rows[0].request_id)
-        .await
-        .unwrap();
-    let archived = fixture
-        .state
-        .archive
-        .get(refs.response_object.as_deref().unwrap())
-        .await
-        .unwrap();
-    assert_eq!(blake3::hash(&archived), blake3::hash(&original));
-    assert_eq!(archived.as_ref(), original);
     assert!(fixture.state.proxy_memory_budget.snapshot().0 >= 64 * 1024);
     let delivered = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     assert_eq!(delivered.as_ref(), original);
@@ -145,11 +110,49 @@ async fn dense_small_response_is_delivered_once_and_client_body_retains_its_leas
         rendered.lines().any(|line| line
             == "memeloop_token_center_proxy_memory_rejections_total{stage=\"response\"} 0")
     );
+    let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: Option<(String, String)> =
+                sqlx::query_as("SELECT tenant_id, id FROM request_records LIMIT 1")
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap();
+            if let Some((tenant, request)) = row {
+                let tenant = Uuid::parse_str(&tenant).unwrap();
+                let request = Uuid::parse_str(&request).unwrap();
+                if let Some(reference) = fixture
+                    .state
+                    .archive
+                    .raw_capture_reference(tenant, request, "response")
+                    .await
+                    .unwrap()
+                {
+                    let restored = fixture
+                        .state
+                        .archive
+                        .get_tenant_content(tenant, &reference, 1024 * 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(restored.as_ref(), original.as_slice());
+                    assert_eq!(
+                        reference.blake3_digest,
+                        blake3::hash(&original).to_hex().to_string()
+                    );
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful delivery and exact durable original are separate assertions");
+    pool.close().await;
     upstream.verify().await;
 }
 
 #[tokio::test]
-async fn ingress_memory_counter_has_no_fabricated_route_label() {
+async fn source_json_memory_counter_has_no_fabricated_ingress_or_route_label() {
     let fixture = codex_route_fixture("ingress-memory-metrics").await;
     let held = fixture.state.proxy_memory_budget.reservation();
     assert!(held.try_grow(fixture.state.config.proxy_memory_budget_bytes as usize, 1));
@@ -168,9 +171,12 @@ async fn ingress_memory_counter_has_no_fabricated_route_label() {
         .state
         .metrics
         .render(&crate::metrics::RuntimeMetrics::default());
+    assert!(rendered.lines().any(
+        |line| line == "memeloop_token_center_proxy_memory_rejections_total{stage=\"json\"} 1"
+    ));
     assert!(
         rendered.lines().any(|line| line
-            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"ingress\"} 1")
+            == "memeloop_token_center_proxy_memory_rejections_total{stage=\"ingress\"} 0")
     );
     assert!(!rendered.lines().any(|line| {
         line.starts_with("memeloop_token_center_gateway_body_rejections_total{")

@@ -16,6 +16,7 @@
 {{- $roleConfig := index $.Values.roles $role }}
 {{- if $roleConfig.enabled }}
 {{- $runtimeWriter := or (eq $role "control") (eq $role "all") }}
+{{- $spoolRole := or (eq $role "gateway") (eq $role "control") (eq $role "all") }}
 {{- if or (eq $role "gateway") (eq $role "all") -}}
 {{- $memoryLimit := dig "resources" "limits" "memory" "" $roleConfig -}}
 {{- $memoryBytes := include "memeloop-token-center.memoryBytes" $memoryLimit | int64 -}}
@@ -177,6 +178,10 @@ spec:
               containerPort: 8080
           env:
             {{- include "memeloop-token-center.env" $ | nindent 12 }}
+            {{- if $spoolRole }}
+            - name: MTC_RESPONSES_REQUEST_SPOOL_PATH
+              value: /var/lib/memeloop-token-center/request-spool
+            {{- end }}
             {{- if or (eq $role "gateway") (eq $role "all") }}
             - name: MTC_TERMINAL_PROJECTION_ENABLED
               value: {{ $.Values.config.terminalProjectionEnabled | default false | quote }}
@@ -244,8 +249,12 @@ spec:
             capabilities: { drop: ["ALL"] }
           resources:
             {{- toYaml $roleConfig.resources | nindent 12 }}
-          {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
+          {{- if or $spoolRole $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
           volumeMounts:
+            {{- if $spoolRole }}
+            - name: request-spool
+              mountPath: /var/lib/memeloop-token-center/request-spool
+            {{- end }}
             {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
             {{- include "memeloop-token-center.runtimeInventory.mounts" (dict "root" $ "writer" $runtimeWriter) | nindent 12 }}
             {{- if $.Values.plugins.enabled }}
@@ -255,8 +264,12 @@ spec:
             {{- end }}
             {{- end }}
           {{- end }}
-      {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
+      {{- if or $spoolRole $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
       volumes:
+        {{- if $spoolRole }}
+        - name: request-spool
+          emptyDir: {}
+        {{- end }}
         {{- if or $.Values.plugins.enabled $.Values.plugins.runtimeInventory.enabled }}
         {{- include "memeloop-token-center.runtimeInventory.volumes" (dict "root" $ "writer" $runtimeWriter) | nindent 8 }}
         {{- if $.Values.plugins.enabled }}

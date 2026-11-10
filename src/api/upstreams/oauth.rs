@@ -881,6 +881,28 @@ pub(in crate::api) async fn refresh_upstream_oauth(
     )?))
 }
 
+/// Resume only an encrypted result that is already durable. A new
+/// refresh-token request is deliberately unavailable from this endpoint.
+pub(in crate::api) async fn recover_upstream_oauth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    let service = require_service(&headers, &state, "oauth:write").await?;
+    if let Some(tenant) = service.tenant_external_id.as_deref() {
+        state.db.require_upstream_tenant(account_id, tenant).await?;
+    }
+    let mut account = state
+        .db
+        .recover_upstream_oauth_refresh(account_id, state.config.key_pepper.as_bytes())
+        .await?;
+    super::restrict_transport_proxy_capability(&service, &mut account);
+    super::trigger_upstream_model_sync(state.clone(), account_id);
+    Ok(Json(super::config_secrets::public_account(
+        &state, account,
+    )?))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(in crate::api) struct DisconnectUpstreamOAuthRequest {

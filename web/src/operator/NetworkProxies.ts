@@ -25,6 +25,7 @@ export interface NetworkProxyProbe {
 }
 
 export interface NetworkProxy {
+  proxy_url?: string;
   id: string;
   tenant_external_id: string;
   name: string;
@@ -183,4 +184,16 @@ export function networkProxyError(reason: unknown, locale = 'zh-CN', operation: 
   if (reason.status === 404) return copy.missing;
   if (reason.status === 409) return copy.conflict;
   return operation === 'read' ? copy.load : copy.unknown;
+}
+
+export interface AccountProxyConnection {
+  account_id: string;
+  credential_generation: number;
+  updated_at: number;
+  source?: 'credential' | 'manual' | 'auto' | 'plugin';
+  proxy_id?: string | null;
+  group_id?: string | null;
+  selected_member_id?: string | null;
+  configuration_state?: 'applied' | 'pending' | 'credential';
+  proxy_url: string | null;
 }
