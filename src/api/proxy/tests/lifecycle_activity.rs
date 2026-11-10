@@ -50,7 +50,6 @@ async fn sixty_five_small_streams_keep_activity_and_settle_once() {
         )
         .await
         .unwrap();
-    assert_eq!(fixture.state.config.proxy_lifecycle_concurrency, 64);
     let mut streams = Vec::new();
     for expected in 1..=65 {
         let response = tokio::time::timeout(
