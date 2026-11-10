@@ -32,6 +32,15 @@ impl RequestConnection {
     }
 
     #[cfg(test)]
+    pub(crate) async fn close(mut self) -> Result<(), sqlx::Error> {
+        self.connection
+            .take()
+            .expect("request connection present")
+            .close()
+            .await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn return_to_pool(&mut self) {
         if let Some(mut connection) = self.connection.take() {
             connection.return_to_pool().await;
@@ -89,7 +98,6 @@ mod tests {
     use super::super::{
         Database, DatabaseReadinessPhase, DatabaseReadinessProgress, DatabaseReadinessStage,
     };
-    use super::*;
     use std::time::Duration;
 
     async fn backend_absent(database: &Database, pid: i32) {

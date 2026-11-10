@@ -92,7 +92,7 @@ async fn postgres_archive_pool_cold_reconnect_and_wait_preserve_session_policy()
             .unwrap();
         let (waiting, ()) = tokio::join!(persistence.pool.acquire(), async {
             tokio::time::sleep(Duration::from_millis(350)).await;
-            drop(connection);
+            connection.finish();
         });
         let mut reused = waiting.unwrap();
         assert_eq!(

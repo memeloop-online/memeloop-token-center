@@ -36,6 +36,7 @@ impl From<SqlxPool> for RequestPool {
 }
 
 impl RequestPool {
+    #[cfg(test)]
     pub(crate) async fn connect(url: &str) -> Result<Self, sqlx::Error> {
         SqlxPool::connect(url).await.map(Self::from)
     }
