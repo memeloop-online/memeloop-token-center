@@ -295,7 +295,10 @@ pub(super) async fn observe_http(
             phase.finish("completed", Some(response.status().as_u16()), None);
             // The same server-owned ID is used by durable proxy admission.
             // Also return it on failures before a request record can exist.
-            if let Ok(value) = HeaderValue::from_str(&context.request_id.to_string()) {
+            let response_request_id = response.extensions()
+                .get::<proxy_diagnostics::ReplayRequestIdentity>()
+                .map_or(context.request_id, |identity| identity.0);
+            if let Ok(value) = HeaderValue::from_str(&response_request_id.to_string()) {
                 response.headers_mut().insert(REQUEST_ID_HEADER, value);
             }
             proxy_diagnostics::observe_response(response, context)
