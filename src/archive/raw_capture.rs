@@ -182,6 +182,13 @@ impl ArchiveStore {
         side: &str,
         object: &CasArchiveObject,
     ) -> Result<(), AppError> {
+        if self
+            .verified_published_raw_capture(tenant, request, side, object)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
         self.verify_tenant_content(tenant, object).await?;
         let key = root(tenant, request, side)?;
         let encoded = serde_json::to_vec(object)
@@ -201,10 +208,9 @@ impl ArchiveStore {
             Ok(_) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. }) => {
                 if self
-                    .raw_capture_reference(tenant, request, side)
+                    .verified_published_raw_capture(tenant, request, side, object)
                     .await?
-                    .as_ref()
-                    == Some(object)
+                    .is_some()
                 {
                     Ok(())
                 } else {
@@ -215,6 +221,31 @@ impl ArchiveStore {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    // The immutable root owns the logical body; migration may relocate its
+    // physical locator. Replays verify the published body, not a retired copy.
+    pub(crate) async fn verified_published_raw_capture(
+        &self,
+        tenant: Uuid,
+        request: Uuid,
+        side: &str,
+        proposed: &CasArchiveObject,
+    ) -> Result<Option<CasArchiveObject>, AppError> {
+        proposed.validate_tenant(tenant)?;
+        self.resolve(&proposed.object_locator)?;
+        let Some(existing) = self.raw_capture_reference(tenant, request, side).await? else {
+            return Ok(None);
+        };
+        if existing.blake3_digest != proposed.blake3_digest
+            || existing.size_bytes != proposed.size_bytes
+        {
+            return Err(AppError::Conflict(
+                "raw archive root content conflict".into(),
+            ));
+        }
+        self.verify_tenant_content(tenant, &existing).await?;
+        Ok(Some(existing))
     }
 
     pub async fn raw_capture_reference(
