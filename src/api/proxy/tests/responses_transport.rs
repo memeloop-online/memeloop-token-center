@@ -518,7 +518,7 @@ fn assert_multi_agent_chat_limit_wire(forwarded: &Value, limit: Option<i64>) {
 }
 
 #[tokio::test]
-async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
+async fn http_json_multi_agent_chat_limits_preserve_actual_buffered_and_streamed_usage() {
     for stream in [false, true] {
         for limit in [Some(4096), Some(5000), None] {
             let upstream = MockServer::start().await;
@@ -563,15 +563,7 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
                 .await;
             let request = multi_agent_chat_limit_request(&fixture, stream, limit);
             let response = send_official_responses(&fixture, &request).await;
-            let rejected = limit == Some(4096);
-            assert_eq!(
-                response.status(),
-                if rejected && !stream {
-                    StatusCode::BAD_GATEWAY
-                } else {
-                    StatusCode::OK
-                }
-            );
+            assert_eq!(response.status(), StatusCode::OK);
             let delivered = to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BODY)
                 .await
                 .unwrap();
@@ -582,26 +574,13 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
                 assert!(body.contains(r#""output_tokens":5000"#));
             } else {
                 let body: Value = serde_json::from_slice(&delivered).unwrap();
-                if rejected {
-                    assert_eq!(body["error"]["message"], "upstream returned invalid usage");
-                } else {
-                    assert_eq!(
-                        body["output"][0]["content"][0]["text"],
-                        "translated response"
-                    );
-                    assert_eq!(body["usage"]["output_tokens"], 5000);
-                }
+                assert_eq!(
+                    body["output"][0]["content"][0]["text"],
+                    "translated response"
+                );
+                assert_eq!(body["usage"]["output_tokens"], 5000);
             }
-            if rejected {
-                cancellation::assert_single_unknown_receipt(
-                    &fixture,
-                    502,
-                    Some("upstream_invalid_usage"),
-                )
-                .await;
-            } else {
-                wait_for_key_settlement(&fixture.state, fixture.key_id).await;
-            }
+            wait_for_key_settlement(&fixture.state, fixture.key_id).await;
             let rows = fixture
                 .state
                 .db
@@ -609,21 +588,13 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
                 .await
                 .unwrap();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].status_code, Some(if rejected { 502 } else { 200 }));
+            assert_eq!(rows[0].status_code, Some(200));
+            assert_eq!(rows[0].error_code, None);
+            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (5, 5000));
             assert_eq!(
-                rows[0].error_code.as_deref(),
-                rejected.then_some("upstream_invalid_usage")
+                rows[0].cost.parse::<Decimal>().unwrap(),
+                Decimal::new(5005, 6)
             );
-            if rejected {
-                assert!(rows[0].usage.tokens.is_none());
-                assert_eq!(rows[0].billing.cost, None);
-            } else {
-                assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (5, 5000));
-                assert_eq!(
-                    rows[0].cost.parse::<Decimal>().unwrap(),
-                    Decimal::new(5005, 6)
-                );
-            }
             let pool = sqlx::AnyPool::connect(&fixture.database_url).await.unwrap();
             let row = sqlx::query("SELECT r.price_snapshot_json, r.reserved_tokens, r.status, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = r.id) AS ledgers, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS events FROM usage_reservations r JOIN request_records q ON q.reservation_id = r.id")
                 .fetch_one(&pool).await.unwrap();
@@ -631,12 +602,9 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
                 serde_json::from_str(&row.get::<String, _>("price_snapshot_json")).unwrap();
             assert_eq!(snapshot.get("output_token_limit"), Some(&json!(limit)));
             assert!(row.get::<i64, _>("reserved_tokens") >= limit.unwrap_or(4096));
-            assert_eq!(
-                row.get::<String, _>("status"),
-                if rejected { "reserved" } else { "settled" }
-            );
-            assert_eq!(row.get::<i64, _>("ledgers"), if rejected { 0 } else { 1 });
-            assert_eq!(row.get::<i64, _>("events"), if rejected { 0 } else { 1 });
+            assert_eq!(row.get::<String, _>("status"), "settled");
+            assert_eq!(row.get::<i64, _>("ledgers"), 1);
+            assert_eq!(row.get::<i64, _>("events"), 1);
             pool.close().await;
             let received = upstream.received_requests().await.unwrap();
             assert_eq!(received.len(), 1);
@@ -647,7 +615,7 @@ async fn http_json_multi_agent_chat_caps_control_buffered_and_streamed_usage() {
 }
 
 #[tokio::test]
-async fn http_json_multi_agent_chat_cap_survives_independent_connection_finish() {
+async fn http_json_multi_agent_chat_actual_usage_survives_independent_connection_finish() {
     for limit in [Some(4096), Some(5000), None] {
         let upstream = MockServer::start().await;
         let fixture = multi_agent_chat_limit_fixture(&upstream).await;
@@ -725,7 +693,6 @@ async fn http_json_multi_agent_chat_cap_survives_independent_connection_finish()
             routing_terminal_observed_at: None,
             conversation: None,
         };
-        let rejected = limit == Some(4096);
         drop(request);
         let receipt =
             cancellation::assert_single_unknown_receipt(&fixture, 499, Some("client_cancelled"))
@@ -750,47 +717,27 @@ async fn http_json_multi_agent_chat_cap_survives_independent_connection_finish()
                     ProxyRequestUpstreamAttribution::KeepSelected,
                 )
                 .await;
-            if rejected {
-                assert!(matches!(result, Err(AppError::Conflict(_))));
+            let ack = result.unwrap();
+            assert_eq!(ack.request_id, request_id);
+            assert_eq!(ack.reservation_id, reservation.id);
+            assert_eq!(ack.fence, claim.fence);
+            assert_eq!(ack.receipt_id, receipt_id);
+            assert_eq!(ack.cost_micros, 5005);
+            assert!(!ack.receipt_digest.is_empty());
+            if let Some(previous) = first_ack.as_ref() {
+                assert_eq!(&ack, previous);
             } else {
-                let ack = result.unwrap();
-                assert_eq!(ack.request_id, request_id);
-                assert_eq!(ack.reservation_id, reservation.id);
-                assert_eq!(ack.fence, claim.fence);
-                assert_eq!(ack.receipt_id, receipt_id);
-                assert_eq!(ack.cost_micros, 5005);
-                assert!(!ack.receipt_digest.is_empty());
-                if let Some(previous) = first_ack.as_ref() {
-                    assert_eq!(&ack, previous);
-                } else {
-                    first_ack = Some(ack);
-                }
+                first_ack = Some(ack);
             }
         }
-        if rejected {
-            cancellation::assert_unknown_receipt(&fixture, request_id, 499, "client_cancelled", 0)
-                .await;
-        } else {
-            wait_for_key_settlement(&fixture.state, fixture.key_id).await;
-        }
+        wait_for_key_settlement(&fixture.state, fixture.key_id).await;
         let terminal = sqlx::query("SELECT q.status_code, q.output_tokens, q.cost_micros, (SELECT COUNT(*) FROM ledger_entries l WHERE l.source = q.reservation_id) AS ledgers, (SELECT COUNT(*) FROM request_events e WHERE e.request_id = q.id AND e.event_kind = 'finished') AS events FROM request_records q WHERE q.id = $1")
             .bind(request_id.to_string()).fetch_one(&pool).await.unwrap();
-        assert_eq!(
-            terminal.get::<Option<i64>, _>("status_code"),
-            if rejected { None } else { Some(200) }
-        );
-        if !rejected {
-            assert_eq!(terminal.get::<i64, _>("output_tokens"), 5000);
-            assert_eq!(terminal.get::<i64, _>("cost_micros"), 5005);
-        }
-        assert_eq!(
-            terminal.get::<i64, _>("ledgers"),
-            if rejected { 0 } else { 1 }
-        );
-        assert_eq!(
-            terminal.get::<i64, _>("events"),
-            if rejected { 0 } else { 1 }
-        );
+        assert_eq!(terminal.get::<Option<i64>, _>("status_code"), Some(200));
+        assert_eq!(terminal.get::<i64, _>("output_tokens"), 5000);
+        assert_eq!(terminal.get::<i64, _>("cost_micros"), 5005);
+        assert_eq!(terminal.get::<i64, _>("ledgers"), 1);
+        assert_eq!(terminal.get::<i64, _>("events"), 1);
         pool.close().await;
         recovered.close().await;
         upstream.verify().await;
