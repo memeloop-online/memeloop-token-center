@@ -548,7 +548,7 @@ struct RequestSpoolUsage {
     used_bytes: AtomicUsize,
     active_files: AtomicUsize,
     durable: Option<DurableRequestBodies>,
-    /// Oldest resident first. Only a settled object-storage copy may leave memory.
+    /// Oldest resident first. A complete local or settled object copy can replace memory.
     residents: Mutex<std::collections::VecDeque<std::sync::Weak<SharedBody>>>,
     sources: Mutex<std::collections::HashMap<uuid::Uuid, std::sync::Weak<RequestSpool>>>,
 }
@@ -1000,8 +1000,9 @@ fn evict_oldest_settled(usage: &RequestSpoolUsage) -> bool {
         if !still_resident {
             continue;
         }
-        if !shared.residency.durable_settled.load(Ordering::Acquire)
-            || !shared.durable_ok.load(Ordering::Acquire)
+        if shared.local.is_none()
+            && (!shared.residency.durable_settled.load(Ordering::Acquire)
+                || !shared.durable_ok.load(Ordering::Acquire))
         {
             residents.push_back(Arc::downgrade(&shared));
             continue;

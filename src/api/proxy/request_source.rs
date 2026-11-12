@@ -51,7 +51,9 @@ pub(super) async fn parse(
     // resident cache to remain charged while JSON admission waits.
     source.release_local_retained();
     let working = memory
-        .reserve_source_json(source.len(), source.json_nodes())
+        .reserve_source_json(source.len(), source.json_nodes(), || {
+            source.reclaim_for(|| false);
+        })
         .await
         .ok_or_else(|| AppError::capacity_error("proxy_memory_json"))?;
     let download = source

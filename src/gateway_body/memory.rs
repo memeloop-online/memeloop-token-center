@@ -628,6 +628,7 @@ impl ProxyMemoryReservation {
         self: &Arc<Self>,
         bytes: usize,
         nodes: usize,
+        mut reclaim: impl FnMut(),
     ) -> Option<ArchiveOutputMemory> {
         let json = bytes.checked_mul(3)?.checked_add(nodes.checked_mul(256)?)?;
         let working = 64 * 1024;
@@ -636,6 +637,7 @@ impl ProxyMemoryReservation {
             return None;
         }
         while !self.try_grow(total, 1) {
+            reclaim();
             // No parsed tree, raw read buffer, or partial JSON permit is held.
             // Dropping the request cancels this wait without a detached task.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -746,7 +748,7 @@ mod tests {
         let active = budget.reservation();
         assert!(active.try_grow(768 * 1024, 1));
         let waiting = budget.reservation();
-        let mut admission = Box::pin(waiting.reserve_source_json(128 * 1024, 1));
+        let mut admission = Box::pin(waiting.reserve_source_json(128 * 1024, 1, || {}));
         assert!(futures_util::poll!(&mut admission).is_pending());
         assert_eq!(budget.snapshot().0, 768 * 1024);
         // The waiter must not enter the semaphore FIFO ahead of this owner.
@@ -755,7 +757,10 @@ mod tests {
         assert_eq!(budget.snapshot().0, 832 * 1024);
         drop(response);
         active.release(768 * 1024, 1);
-        let working = waiting.reserve_source_json(128 * 1024, 1).await.unwrap();
+        let working = waiting
+            .reserve_source_json(128 * 1024, 1, || {})
+            .await
+            .unwrap();
         assert!(waiting.request_json_reserved_bytes() > 0);
         drop(working);
         waiting.release_unretained_json();
