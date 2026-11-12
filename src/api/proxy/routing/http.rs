@@ -1222,6 +1222,7 @@ mod tests {
         let request_id = Uuid::now_v7();
         let account_id = Uuid::now_v7();
         let route = PreparedProxyRoute {
+            request_workspace: None,
             inspect_stream_rejection: false,
             route: ResolvedUpstream {
                 route_id: Uuid::now_v7(),
