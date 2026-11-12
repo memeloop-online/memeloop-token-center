@@ -5,6 +5,9 @@ use uuid::Uuid;
 
 mod downstream_body;
 
+#[derive(Clone, Copy)]
+pub(super) struct ReplayRequestIdentity(pub(super) Uuid);
+
 pub(super) fn observe_response(
     response: axum::response::Response,
     context: Context,
