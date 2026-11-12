@@ -1146,7 +1146,15 @@ pub struct RequestTransportDiagnosticView {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RequestArchivePreviewView {
+    Stream { bytes: u64 },
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct RequestArchiveSideView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preview: Option<RequestArchivePreviewView>,
     pub state: RequestArchiveState,
     pub complete: bool,
     pub reason: Option<String>,

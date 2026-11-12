@@ -126,7 +126,7 @@ export interface RequestDetail extends RequestView {
   request_body: unknown;
   response_body: unknown;
   archive_complete: boolean;
-  archive?: Record<'request' | 'response', { state: RequestArchiveState; complete: boolean; reason: string | null }>;
+  archive?: Record<'request' | 'response', { state: RequestArchiveState; complete: boolean; reason: string | null; preview?: { kind: 'stream'; bytes: number } }>;
   provenance?: {
     source: string;
     disposition: 'exact' | 'unlinked';
