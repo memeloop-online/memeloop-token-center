@@ -81,9 +81,10 @@ export async function bridge(options: Options, connect = (binary: string, args: 
       pending.resolve({ id: params.turn.id, status: params.turn.status, error: params.turn.error, visibleMessages: pending.items });
     }
   };
-  const run = async (model: string, task: string, dynamicTools?: unknown[]) => {
+  const run = async (model: string, task: string, dynamicTools?: unknown[], onStarted?: (threadId: string) => void) => {
     const started = await server.call('thread/start', { cwd, model, modelProvider: provider, approvalPolicy: 'never', sandbox: 'read-only', ephemeral: true, ...(dynamicTools ? { dynamicTools } : {}) });
     const threadId = started.thread.id;
+    onStarted?.(threadId);
     record.threads.push({ threadId, model, task }); await save();
     const completed = new Promise<any>((resolve, reject) => turns.set(threadId, { resolve, reject, items: [] }));
     // If turn/start fails while the subprocess also disconnects, consume both
@@ -102,18 +103,23 @@ export async function bridge(options: Options, connect = (binary: string, args: 
     if (!parent || p.threadId !== parent.threadId) throw new Error('Delegation must originate from this bridge parent');
     const delegation: any = { parentThreadId: p.threadId, turnId: p.turnId, callId: p.callId, task: p.arguments.task };
     record.delegations.push(delegation); await save();
-    const child = await run(options.kimiModel, p.arguments.task);
-    delegation.childThreadId = child.threadId; delegation.result = child.result; await save();
-    return { success: child.result.status === 'completed', contentItems: [{ type: 'inputText', text: JSON.stringify(child) }] };
+    try {
+      const child = await run(options.kimiModel, p.arguments.task, undefined, id => { delegation.childThreadId = id; });
+      delegation.result = child.result; delegation.status = child.result.status; await save();
+      return { success: child.result.status === 'completed', contentItems: [{ type: 'inputText', text: JSON.stringify(child) }] };
+    } catch (error) {
+      delegation.status = 'failed'; delegation.error = error instanceof Error ? error.message : 'child_failed'; await save();
+      return { success: false, contentItems: [{ type: 'inputText', text: JSON.stringify(delegation) }] };
+    }
   };
   try {
     await server.call('initialize', { clientInfo: { name: 'mtc-isolated-plaintext-bridge', version: '1' }, capabilities: { experimentalApi: true } });
     server.send({ method: 'initialized', params: {} });
     const parent = await run(options.parentModel, `Use ${delegateTool} to ask Kimi to perform the following complete task, then report its actual result. Do not use collaboration spawn_agent or opaque handoff.\n\n${options.task}`, [delegateSpec]);
     record.completed = parent.result.status === 'completed' && record.delegations.length > 0 && record.delegations.every((d: any) => d.result?.status === 'completed');
-    await save(); return record;
+    await save(); return JSON.parse(JSON.stringify(record).replaceAll(options.apiKey, '[redacted]'));
   } catch (error) {
-    record.error = error instanceof Error ? error.message : 'bridge_failed'; await save(); return record;
+    record.error = error instanceof Error ? error.message : 'bridge_failed'; await save(); return JSON.parse(JSON.stringify(record).replaceAll(options.apiKey, '[redacted]'));
   } finally { await server.close(); }
 }
 
