@@ -50,6 +50,30 @@ async fn qualified_cas_reads_preserve_backend_tenant_and_stream_integrity() {
     let (_, key) = super::routing::split(&object.object_locator)
         .unwrap()
         .unwrap();
+    assert!(
+        archive
+            .source_object_exists(&legacy.object_locator)
+            .await
+            .unwrap()
+    );
+    assert!(
+        archive
+            .source_object_exists(&object.object_locator)
+            .await
+            .unwrap()
+    );
+    // Bare keys retain legacy meaning even when that key exists in training.
+    assert!(!archive.source_object_exists(key).await.unwrap());
+    let wrong_identity = object
+        .object_locator
+        .replacen(&"a".repeat(64), &"b".repeat(64), 1);
+    assert!(archive.source_object_exists(&wrong_identity).await.is_err());
+    assert!(
+        archive
+            .source_object_exists("stores/training/")
+            .await
+            .is_err()
+    );
     // A same-key legacy object never substitutes for a missing training object.
     archive
         .inner
@@ -61,12 +85,26 @@ async fn qualified_cas_reads_preserve_backend_tenant_and_stream_integrity() {
         .unwrap();
     training.delete(&Path::from(key)).await.unwrap();
     assert!(
+        !archive
+            .source_object_exists(&object.object_locator)
+            .await
+            .unwrap()
+    );
+    assert!(archive.source_object_exists(key).await.unwrap());
+    assert!(
         archive
             .get_tenant_content(tenant, &object, 100)
             .await
             .is_err()
     );
     archive.training = None;
+    assert!(
+        archive
+            .source_object_exists(&object.object_locator)
+            .await
+            .is_err()
+    );
+    assert!(archive.source_object_exists(key).await.unwrap());
     assert!(archive.head_size(&object.object_locator).await.is_err());
     assert_eq!(
         archive
