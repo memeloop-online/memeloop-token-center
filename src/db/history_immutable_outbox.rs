@@ -28,7 +28,7 @@ pub(super) async fn capture_native_in_transaction(
 ) -> Result<(), AppError> {
     // An off/shadow deployment keeps the existing capture contract. The durable
     // revision already allocated by its triggers also fences this projection.
-    let identity = sqlx::query("SELECT revision, tenant_id, key_id, created_at FROM request_history_export WHERE source='native' AND request_id=$1")
+    let identity = sqlx::query("SELECT revision, tenant_id, key_id, created_at FROM request_history_export WHERE source='native' AND request_id=$1 AND EXISTS (SELECT 1 FROM request_history_state WHERE id=1 AND mode <> 'off')")
         .bind(request_id).fetch_optional(&mut **transaction).await?;
     let Some(identity) = identity else { return Ok(()); };
     let revision: i64 = identity.try_get("revision")?;
