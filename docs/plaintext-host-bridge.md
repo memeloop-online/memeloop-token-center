@@ -24,8 +24,9 @@ Use an existing authorized downstream `MTC_API_KEY` in RAM. Optional settings:
 `MTC_CODEX_BINARY` (default codex), `MTC_PARENT_MODEL` (default gpt-6.1-sol),
 `MTC_TASK_MODEL` (default k3.1-pro). Both threads use the supplied authorized MTC
 provider, read-only sandbox and no approval escalation; this does not grant
-tenant or provider access. No model/request retries or artificial task deadline
-are added. The owned app-server is terminated when the operation finishes.
+tenant or provider access. The bridge adds no model/request retry loop or artificial task deadline.
+The installed Codex transport retains its own configured retry behavior; a
+single host turn is not a promise of exactly one HTTP request. The owned app-server is terminated when the operation finishes.
 
 The private receipt records exact task text, parent/child thread IDs, call IDs,
 visible agent results and actual turn status. It excludes reasoning events and
