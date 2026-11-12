@@ -418,3 +418,68 @@ async fn request_detail_serializes_the_shared_supplier_reason_at_the_top_level()
         "RequestDetail flattens the manual RequestView serializer"
     );
 }
+
+#[tokio::test]
+async fn readable_stream_archives_are_not_reported_as_missing_or_invalid() {
+    let (state, _directory) = test_state().await;
+    let cases = [
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"original\"}}]}\n\ndata: [DONE]\n\n"
+            .to_vec(),
+        ("data: {\"choices\":[{\"delta\":{\"content\":\"original\"}}]}\n\n".repeat(3000)
+            + "data: [DONE]\n\n")
+            .into_bytes(),
+        format!(
+            "data: {{\"content\":\"{}\"}}\n\ndata: [DONE]\n\n",
+            "x".repeat(2 * 1024 * 1024)
+        )
+        .into_bytes(),
+        format!(
+            "[{}]",
+            std::iter::repeat_n("0", 17000)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+        .into_bytes(),
+    ];
+    for body in cases {
+        let location = format!("detail-preview/{}.body", Uuid::now_v7());
+        state
+            .archive
+            .put(&location, body.clone().into())
+            .await
+            .unwrap();
+        let mut refs = request_detail_refs(Uuid::now_v7());
+        refs.response_object = Some(location);
+        let download = request_archive_content_response(
+            &state,
+            &HeaderMap::new(),
+            &refs,
+            RequestArchiveSide::Response,
+        )
+        .await
+        .unwrap();
+        assert_eq!(download.status(), StatusCode::OK);
+        let downloaded = axum::body::to_bytes(download.into_body(), body.len())
+            .await
+            .unwrap();
+        assert_eq!(downloaded.as_ref(), body.as_slice());
+        let detail = crate::api::request_detail::request_detail(&state, refs).await;
+        assert!(detail.archive_complete);
+        assert!(detail.archive.response.complete);
+        assert_eq!(detail.archive.response.reason, None);
+        assert!(detail.response_body.is_null());
+        assert_eq!(
+            serde_json::to_value(detail.archive.response.preview).unwrap(),
+            json!({"kind":"stream", "bytes":body.len()})
+        );
+    }
+    let mut refs = request_detail_refs(Uuid::now_v7());
+    refs.response_object = Some(format!("detail-preview/{}.missing", Uuid::now_v7()));
+    let detail = crate::api::request_detail::request_detail(&state, refs).await;
+    assert!(!detail.archive.response.complete);
+    assert_eq!(
+        detail.archive.response.reason.as_deref(),
+        Some("archive_object_unavailable")
+    );
+    assert!(detail.archive.response.preview.is_none());
+}

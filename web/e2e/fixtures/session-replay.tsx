@@ -146,9 +146,10 @@ function waitForRelease(waiters: Set<() => void>, signal: AbortSignal) {
 }
 function releaseAll(waiters: Set<() => void>) { for (const release of [...waiters]) release(); }
 async function loadArchive(requestView: ConversationRequest, signal: AbortSignal) {
-  if (fullFixture) return { ...archive(requestView, { input: [] }, null, false), archive: {
+  const streamedPreview = !fullGap && !fullMissing && !fullInvalid && !fullInvalidPayload;
+  if (fullFixture) return { ...archive(requestView, { input: [] }, null, streamedPreview), archive: {
     request: { state: 'bound' as const, complete: true, reason: null },
-    response: { state: fullGap ? 'gap' as const : 'bound' as const, complete: false, reason: fullInvalid || fullInvalidPayload ? 'archive_payload_invalid' : 'archive_object_unavailable' },
+    response: { state: fullGap ? 'gap' as const : 'bound' as const, complete: streamedPreview, reason: streamedPreview ? null : fullInvalid || fullInvalidPayload ? 'archive_payload_invalid' : 'archive_object_unavailable', ...(streamedPreview ? { preview: { kind: 'stream' as const, bytes: fullBytes.length } } : {}) },
   } };
   window.sessionReplayReads[requestView.request_id] = (window.sessionReplayReads[requestView.request_id] ?? 0) + 1;
   if (liveFixture && scopePaused) await waitForRelease(scopeWaiters, signal);
