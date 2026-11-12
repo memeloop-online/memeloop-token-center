@@ -12,7 +12,8 @@ const DEFAULT_ARCHIVE_READ_LIMIT: usize = 16 * 1024 * 1024;
 
 impl ArchiveStore {
     pub(crate) async fn source_object_exists(&self, location: &str) -> Result<bool, AppError> {
-        match self.inner.head(&archive_path(location)?).await {
+        let (store, path) = self.resolve(location)?;
+        match store.head(&path).await {
             Ok(_) => Ok(true),
             Err(object_store::Error::NotFound { .. }) => Ok(false),
             Err(error) => Err(error.into()),
