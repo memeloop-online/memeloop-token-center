@@ -996,7 +996,8 @@ fn evict_oldest_settled(usage: &RequestSpoolUsage) -> bool {
             .body
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .is_some();
+            .as_ref()
+            .is_some_and(Bytes::is_unique);
         if !still_resident {
             continue;
         }
