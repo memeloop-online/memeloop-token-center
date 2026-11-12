@@ -59,7 +59,7 @@ async fn provider_incomplete_settles_reported_usage_through_the_codex_pipeline()
 }
 
 #[tokio::test]
-async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_unobserved() {
+async fn incomplete_invalid_usage_stays_unknown_and_valid_excess_is_settled() {
     for defect in ["error", "inconsistent", "over_budget"] {
         let fixture = codex_route_fixture(&format!("incomplete-untrusted-{defect}")).await;
         let upstream = MockServer::start().await;
@@ -70,8 +70,8 @@ async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_unobserve
             "error" => terminal["error"] = json!({"message":"PRIVATE_PROVIDER_ERROR"}),
             "inconsistent" => terminal["usage"]["total_tokens"] = json!(999),
             _ => {
-                // Codex uses the fixture's trusted reservation bound of 64,
-                // not a client-supplied output limit (which it rejects).
+                // Reported usage above the reservation estimate is still real
+                // provider cost; the reservation is not a validity limit.
                 terminal["usage"]["output_tokens"] = json!(65);
                 terminal["usage"]["total_tokens"] = json!(68);
             }
@@ -102,14 +102,40 @@ async fn incomplete_error_invalid_usage_and_out_of_budget_usage_remain_unobserve
             .unwrap();
         assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
         assert!(!String::from_utf8_lossy(&body).contains("PRIVATE_PROVIDER_ERROR"));
-        let receipt = cancellation::single_unknown_receipt(&fixture).await;
-        assert_eq!(receipt["status_code"], 502, "{defect}");
-        assert!(
-            receipt["error_code"]
-                .as_str()
-                .is_some_and(|code| !code.is_empty()),
-            "{defect}"
-        );
+        if defect == "over_budget" {
+            wait_for_request_settlement(&fixture, 1).await;
+            let rows = fixture
+                .state
+                .db
+                .list_requests(fixture.key_id, 10)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].status_code, Some(502));
+            assert_eq!(
+                rows[0].error_code.as_deref(),
+                Some("upstream_incomplete_response")
+            );
+            assert_eq!((rows[0].input_tokens, rows[0].output_tokens), (3, 65));
+            assert_eq!(
+                rows[0].usage_basis,
+                Some(crate::model::RequestUsageBasis::ProviderReported)
+            );
+            assert_eq!(
+                rows[0].cost.parse::<Decimal>().unwrap(),
+                Decimal::new(68, 6)
+            );
+            assert_exactly_once_side_effects(&fixture, rows[0].request_id, None).await;
+        } else {
+            let receipt = cancellation::single_unknown_receipt(&fixture).await;
+            assert_eq!(receipt["status_code"], 502, "{defect}");
+            assert!(
+                receipt["error_code"]
+                    .as_str()
+                    .is_some_and(|code| !code.is_empty()),
+                "{defect}"
+            );
+        }
         upstream.verify().await;
     }
 }
