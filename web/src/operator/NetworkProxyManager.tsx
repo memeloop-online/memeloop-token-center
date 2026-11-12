@@ -439,6 +439,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   const readRevision = useRef(0);
   const pendingWrite = useRef<AbortController | null>(null);
   const feedback = useRef<HTMLDivElement>(null);
+  const focusActionResult = useRef(false);
   const query = `?${new URLSearchParams({ tenant_external_id: tenant })}`;
   const effectiveAddress = (() => {
     if (!effective) return copy.unknownSource;
@@ -490,7 +491,10 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
   });
 
   useLayoutEffect(() => {
-    if (busy || error || message) feedback.current?.focus({ preventScroll: true });
+    if (!busy && focusActionResult.current && (error || message)) {
+      focusActionResult.current = false;
+      feedback.current?.focus({ preventScroll: true });
+    }
   }, [busy, error, message]);
 
   useEffect(() => {
@@ -599,6 +603,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
 
   async function savePolicy() {
     if (!selection || disabled || locked.current || !ready || !validDraft) return;
+    focusActionResult.current = true;
     const config = draftConfig();
     if (!config) { setError(copy.configInvalid); return; }
     const base = {
@@ -639,6 +644,7 @@ export function NetworkProxyPolicyWorkspace({ token, tenant, accounts, accountsS
     {!embedded && <p>{copy.policyHint}</p>}
     <div className="button-row"><Button type="button" disabled={busy} onClick={async () => {
       if (dirty && !await confirm(copy.refreshDraft)) return;
+      focusActionResult.current = true;
       void refresh();
     }}>{busy ? t('common.loading') : copy.refresh}</Button></div>
     <div ref={feedback} tabIndex={-1} aria-label={copy.operationStatus}>
