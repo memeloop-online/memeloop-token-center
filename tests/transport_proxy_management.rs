@@ -92,16 +92,16 @@ async fn proxy_group_access_reports_only_the_authenticated_provider_reader_capab
         let (status, body) = request(&state, "GET", path, &credential.token, Value::Null).await;
         assert_eq!(status, StatusCode::OK, "{name}");
         assert_eq!(body, json!({"can_manage": can_manage}), "{name}");
+        let (collection_status, collection_body) = request(
+            &state,
+            "GET",
+            "/internal/v1/transport-proxy-groups?tenant_external_id=access-tenant",
+            &credential.token,
+            Value::Null,
+        )
+        .await;
         assert_eq!(
-            request(
-                &state,
-                "GET",
-                "/internal/v1/transport-proxy-groups?tenant_external_id=access-tenant",
-                &credential.token,
-                Value::Null,
-            )
-            .await
-            .0,
+            collection_status,
             if can_manage {
                 StatusCode::OK
             } else {
@@ -109,6 +109,9 @@ async fn proxy_group_access_reports_only_the_authenticated_provider_reader_capab
             },
             "{name}",
         );
+        if !can_manage {
+            assert!(!collection_body.to_string().contains("proxy_url"), "{name}");
+        }
     }
     for token in ["", "invalid"] {
         assert_eq!(
@@ -203,9 +206,10 @@ async fn operator_api_enforces_authority_cas_redaction_and_explicit_unbind() {
     assert_eq!(group["members"][0]["scheme"], "socks5h");
     assert_eq!(group["members"][0]["host"], "10.20.30.40");
     assert_eq!(group["members"][0]["port"], 1080);
-    for secret in ["fixture-user", "fixture-password"] {
-        assert!(!group.to_string().contains(secret));
-    }
+    assert_eq!(
+        group["members"][0]["proxy_url"],
+        "socks5h://fixture-user:fixture-password@10.20.30.40:1080"
+    );
     let path = format!("{collection}/{}", group["id"].as_str().unwrap());
     assert_eq!(
         request(
@@ -249,9 +253,10 @@ async fn operator_api_enforces_authority_cas_redaction_and_explicit_unbind() {
         request(&state, "GET", &proxy_path, &operator.token, Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(proxies["items"][0], individual);
-    for secret in ["fixture-user", "fixture-password"] {
-        assert!(!proxies.to_string().contains(secret));
-    }
+    assert_eq!(
+        individual["proxy_url"],
+        "socks5h://fixture-user:fixture-password@10.20.30.40:1080"
+    );
     assert_eq!(
         request(&state, "GET", proxy_collection, &scoped.token, Value::Null)
             .await
