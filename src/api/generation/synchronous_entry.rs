@@ -540,7 +540,7 @@ mod tests {
         // Invalid authenticated requests now have early diagnostic records;
         // none may own a paid submission or a reservation.
         let submissions: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM request_records WHERE reservation_id IS NOT NULL",
+            "SELECT COUNT(*) FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id",
         )
         .fetch_one(&pool)
         .await
