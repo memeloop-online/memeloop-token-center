@@ -728,8 +728,9 @@ export async function run(binary: string, output: string): Promise<boolean> {
       const evidence = { ...result, expected_input_value_sha256: expectedInputHash, upstream_bodies: observations };
       report.phases.at(-1).result = evidence;
       assert(result.status === 200 && result.bytes === current.bytes && result.sha256 === planHash(current), "64MiB spooled input must complete with exact response bytes/hash");
-      assert(upstreamCalls === before + 1 && observations.length === 1 && observations[0].bytes === input.bytes, "64MiB input must reach upstream completely and exactly once");
-      assert(observations[0].fields_valid && observations[0].input_value_bytes === input.fillBytes && observations[0].input_value_sha256 === expectedInputHash, "64MiB upstream input content and metadata must match exactly, independent of JSON field order");
+      const observed = observations[0];
+      assert(upstreamCalls === before + 1 && observations.length === 1 && observed !== undefined && observed.bytes === input.bytes, "64MiB input must reach upstream completely and exactly once");
+      assert(observed.fields_valid && observed.input_value_bytes === input.fillBytes && observed.input_value_sha256 === expectedInputHash, "64MiB upstream input content and metadata must match exactly, independent of JSON field order");
       return evidence;
     });
     await phase("encoded-body-rejected-without-dispatch", async () => {
