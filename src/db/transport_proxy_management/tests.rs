@@ -424,6 +424,20 @@ async fn contract(database: &Database) {
         KEY,
     )
     .unwrap();
+    // Unbind now retains the selected exit as an authoritative manual policy.
+    // A cold legacy-only reader must not bypass that policy via its credential.
+    assert!(legacy
+        .select_config(
+            account.id,
+            snapshot.credential_generation,
+            &credential,
+            &snapshot.config,
+        )
+        .is_err());
+    legacy
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
     let selection = legacy
         .select_config(
             account.id,
@@ -433,7 +447,7 @@ async fn contract(database: &Database) {
         )
         .unwrap();
     assert_eq!(selection.credential.proxy().unwrap().0, BACKUP);
-    assert!(selection.member().is_none());
+    assert_eq!(selection.egress_snapshot().unwrap().member_id, Some(backup));
     database
         .delete_transport_group(
             id,
