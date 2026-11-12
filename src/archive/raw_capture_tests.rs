@@ -131,8 +131,8 @@ async fn relocated_raw_root_replays_and_binds_published_body_without_retired_cop
         .await
         .unwrap();
     let pool = sqlx::AnyPool::connect(&url).await.unwrap();
-    sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, response_object) VALUES ($1, $2, $3, 1, 'openai', 'test', 0, 0, 0, 'gap://' || $1 || '/request', 'gap://' || $1 || '/response')")
-        .bind(request.to_string()).bind(tenant.to_string()).bind(Uuid::now_v7().to_string()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO request_records (id, tenant_id, key_id, created_at, protocol, model, input_tokens, output_tokens, cost_micros, request_object, response_object, reservation_id) VALUES ($1, $2, $3, 1, 'openai', 'test', 0, 0, 0, 'gap://' || $1 || '/request', 'gap://' || $1 || '/response', $4)")
+        .bind(request.to_string()).bind(tenant.to_string()).bind(Uuid::now_v7().to_string()).bind(Uuid::now_v7().to_string()).execute(&pool).await.unwrap();
     let db = state.db.clone().with_archive(archive.clone());
     assert!(
         db.bind_raw_capture(tenant, request, "request", &legacy)
