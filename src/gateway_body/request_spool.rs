@@ -1557,7 +1557,11 @@ mod tests {
             "the newest body stays in memory"
         );
         assert_eq!(oldest.read_all().await.unwrap(), first);
-        assert_eq!(store.reads.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store.reads.load(Ordering::Acquire),
+            0,
+            "evicted cache reopens its local file"
+        );
         assert_eq!(file_count(directory.path()), 0);
     }
 
