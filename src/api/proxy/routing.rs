@@ -87,6 +87,7 @@ pub(super) fn plan_proxy_route(
                 protocol,
                 request_id,
                 request_json,
+                request_memory,
                 codex_multi_agent_v2_request,
             },
         route,
@@ -96,10 +97,6 @@ pub(super) fn plan_proxy_route(
         return Err(AppError::upstream("provider_driver_is_not_loaded"));
     }
     route.credential.validate(preparation_now)?;
-    let _planning_memory = route_temporary_memory(
-        state,
-        crate::gateway_body::memory::json_encoded_length(request_json)?.saturating_mul(3),
-    )?;
     let is_codex = codex_transport::is_driver(&route.driver);
     if is_codex {
         codex::validate_route(&route, protocol)?;
@@ -123,6 +120,31 @@ pub(super) fn plan_proxy_route(
         && state
             .providers
             .supports_responses_via_anthropic_messages_v1(&route.driver);
+    // A direct HTTP route only clones the third JSON tree already prepaid by
+    // request admission. Dialect/component/compact transformations keep their
+    // independent allowance; their extra copies do not fit this ownership proof.
+    let direct_http = (http_json || new_api)
+        && !is_codex
+        && responses_via_chat_dialect.is_none()
+        && !responses_via_anthropic
+        && !matches!(protocol, Protocol::OpenAiResponsesCompact)
+        && !crate::api::new_api_transport::has_compaction_trigger(request_json)
+        && state
+            .providers
+            .get(&route.driver)
+            .is_some_and(|provider| provider.component_adapter.is_none());
+    let request_bytes = crate::gateway_body::memory::json_encoded_length(request_json)?;
+    let request_workspace = direct_http
+        .then(|| request_memory.and_then(|memory| memory.borrow_route_workspace(request_bytes)))
+        .flatten();
+    let _planning_memory = if request_workspace.is_some() {
+        None
+    } else {
+        Some(route_temporary_memory(
+            state,
+            request_bytes.saturating_mul(3),
+        )?)
+    };
     let (mut forwarded_json, responses_chat, responses_anthropic) = if responses_via_anthropic {
         let (forwarded, context) =
             anthropic::prepare_forwarded_request(&route, request_json, bridge_multi_agent)?;
@@ -275,6 +297,7 @@ pub(super) fn plan_proxy_route(
             || (matches!(protocol, Protocol::OpenAiResponses)
                 && crate::api::new_api_transport::has_compaction_trigger(request_json)));
     Ok(PlannedProxyRoute {
+        request_workspace,
         wait_for_compaction,
         route,
         forwarded_json,
@@ -404,7 +427,19 @@ pub(super) async fn materialize_proxy_route(
         // copying. A plain HTTP route does not allocate a second encoded body.
         encoded_length
     };
-    let _temporary_memory = route_temporary_memory(state, temporary_bytes)?;
+    // The original request tree has been dropped before materialization.
+    // Serializing the forwarded tree occupies its prepaid third copy instead.
+    let borrowed_serialization = planned.component_context.is_none()
+        && planned.wire_shim_context.is_none()
+        && planned
+            .request_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.covers(encoded_length));
+    let _temporary_memory = if borrowed_serialization {
+        None
+    } else {
+        Some(route_temporary_memory(state, temporary_bytes)?)
+    };
     let component_request = if let Some(context) = planned.component_context {
         let prepared = prepare_component_provider(
             state,
@@ -412,7 +447,10 @@ pub(super) async fn materialize_proxy_route(
             context.clone(),
             planned.route.config.clone(),
             planned.forwarded_json.clone(),
-            _temporary_memory.clone(),
+            _temporary_memory
+                .as_ref()
+                .expect("component workspace reserved independently")
+                .clone(),
         )
         .await?;
         Some((prepared, context))
@@ -455,6 +493,7 @@ pub(super) async fn materialize_proxy_route(
         forwarded_body = outcome.request_json.into_bytes();
     }
     Ok(PreparedProxyRoute {
+        request_workspace: planned.request_workspace,
         inspect_stream_rejection: false,
         wait_for_compaction: planned.wait_for_compaction,
         route: planned.route,
