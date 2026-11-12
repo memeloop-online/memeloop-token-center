@@ -72,6 +72,7 @@ pub struct ArchiveStore {
     inner: Arc<dyn ObjectStore>,
     training: Option<routing::TrainingStore>,
     training_cas_writes: bool,
+    training_staging_writes: bool,
     readiness: Arc<tokio::sync::Mutex<ReadinessCache>>,
     readiness_path: object_store::path::Path,
     readiness_deadline: Duration,

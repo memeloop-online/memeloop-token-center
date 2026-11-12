@@ -101,6 +101,8 @@ pub struct ArchiveStagingKey {
     pub owner: ArchiveStagingOwner,
     pub purpose: ArchiveStagingPurpose,
     pub attempt_id: Uuid,
+    /// NULL means the original legacy backend, independent of current defaults.
+    pub(crate) backend_identity: Option<[u8; 32]>,
 }
 
 impl ArchiveStagingKey {
@@ -118,18 +120,47 @@ impl ArchiveStagingKey {
             owner,
             purpose,
             attempt_id,
+            backend_identity: None,
         })
     }
 
     /// The only prefix a cleanup worker may pass to object storage.
     pub fn canonical_prefix(self) -> String {
-        format!(
+        let key = format!(
             "staging/{}/{}/{}/{}",
             self.owner.path_kind(),
             self.owner.id(),
             self.purpose.as_str(),
             self.attempt_id
-        )
+        );
+        match self.backend_identity_text() {
+            Some(identity) => format!("stores/staging/{identity}/{key}"),
+            None => key,
+        }
+    }
+
+    pub(crate) fn backend_identity_text(self) -> Option<String> {
+        self.backend_identity
+            .map(|bytes| blake3::Hash::from(bytes).to_hex().to_string())
+    }
+
+    pub(crate) fn with_backend_identity(
+        mut self,
+        identity: Option<&str>,
+    ) -> Result<Self, AppError> {
+        self.backend_identity = identity
+            .map(|value| {
+                if !valid_blake3_hex(value) {
+                    return Err(AppError::storage(
+                        "archive_staging_backend_identity_invalid",
+                    ));
+                }
+                let hash = blake3::Hash::from_hex(value)
+                    .map_err(|_| AppError::storage("archive_staging_backend_identity_invalid"))?;
+                Ok(*hash.as_bytes())
+            })
+            .transpose()?;
+        Ok(self)
     }
 
     pub(crate) fn from_database(
