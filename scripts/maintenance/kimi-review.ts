@@ -109,12 +109,12 @@ async function main() {
     return;
   }
   const apiKey = process.env.MTC_API_KEY;
-  if (!apiKey) throw new Error('Set MTC_API_KEY to an authorized downstream API key.');
+  if (!apiKey || !process.env.MTC_BASE_URL) throw new Error('Set MTC_API_KEY and MTC_BASE_URL (including /v1).');
   let task = '';
   process.stdin.setEncoding('utf8');
   for await (const chunk of process.stdin) task += chunk;
   const result = await review({
-    baseUrl: process.env.MTC_BASE_URL ?? 'https://token.k3s.onetwo.website/v1',
+    baseUrl: process.env.MTC_BASE_URL!,
     apiKey,
     model: process.env.MTC_REVIEW_MODEL ?? 'k3.1-pro',
     task,

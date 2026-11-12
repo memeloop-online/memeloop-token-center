@@ -11,8 +11,7 @@ export MTC_TASK_MODEL=k3.1-pro # or an authorized deepseek-v4.1-flash route
 node scripts/maintenance/plaintext-file-task.ts < task.txt
 ```
 
-Set the existing authorized `MTC_API_KEY` in the environment. `MTC_BASE_URL`
-optionally selects a gateway including `/v1`. Never put credentials in task text.
+Set the existing authorized `MTC_API_KEY` in the environment. `MTC_BASE_URL` selects the required gateway including `/v1`. Never put credentials in task text.
 The tool set is `list_files`, `read_file`, and `write_file`; no shell, execution,
 network or test command is exposed. Parent directories must already exist.
 The runner continues through actual tool calls and results until a final model

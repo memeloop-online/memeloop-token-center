@@ -2481,7 +2481,12 @@ mod tests {
             true
         );
         assert_eq!(request["input"][0], native_history);
-        assert_eq!(request["tools"], native_tools);
+        let mut expected_tools = native_tools;
+        expected_tools
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"type":"image_generation", "output_format":"png"}));
+        assert_eq!(request["tools"], expected_tools);
         assert_eq!(request["input"][1], late_tools);
         assert_eq!(
             request["tools"][0]["tools"][0]["parameters"]["properties"]["message"]["description"],
