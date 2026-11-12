@@ -3736,7 +3736,7 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
                 .expect("mismatched replay has its own diagnostic identity");
             assert_eq!(rejected["status_code"], 400);
             assert_eq!(rejected["terminal_cause_code"], "gateway_pre_admission");
-            assert_eq!(rejected["billable"], false);
+            assert_eq!(rejected["billing"]["billable"], false);
             let other = world
                 .client
                 .post(format!("{}/internal/v1/keys", world.service_url))
