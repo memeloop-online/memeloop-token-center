@@ -2284,13 +2284,6 @@ mod tests {
         database.close().await;
     }
 
-    async fn finish_attempts(journal: &Journal) {
-        let tasks = std::mem::take(&mut *journal.tasks.lock().unwrap());
-        for (_, task) in tasks {
-            task.await.unwrap();
-        }
-    }
-
     fn owned_conversation() -> OwnedConversation {
         let mut key = AuthenticatedKey {
             key_id: Uuid::now_v7(),
