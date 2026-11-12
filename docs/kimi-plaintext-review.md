@@ -12,7 +12,7 @@ node scripts/maintenance/kimi-review.ts < complete-review-task.txt
 ```
 
 The default model is `k3.1-pro`. `MTC_REVIEW_MODEL` changes the model;
-`MTC_BASE_URL` changes the gateway URL, including its `/v1` prefix. The command
+`MTC_BASE_URL` is required and supplies the gateway URL, including its `/v1` prefix. The command
 collects streaming text and prints the actual review, finish reason, usage and
 request ID as JSON. Provider reasoning is not printed. Keep the
 request ID to inspect the archived plaintext task and returned review. It sends

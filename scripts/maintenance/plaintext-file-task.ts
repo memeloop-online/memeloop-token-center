@@ -166,9 +166,9 @@ export async function runTask(options: Options, send: typeof fetch = fetch) {
 async function main() {
   if (process.argv.includes('--help')) { console.log('Read task from stdin. Set MTC_API_KEY, MTC_TASK_DIRECTORY (isolated workspace), MTC_TASK_ARCHIVE (private JSON), optionally MTC_TASK_MODEL and MTC_BASE_URL. File tools only; no automatic retry, output cap or total deadline.'); return; }
   const apiKey = process.env.MTC_API_KEY, directory = process.env.MTC_TASK_DIRECTORY, archive = process.env.MTC_TASK_ARCHIVE;
-  if (!apiKey || !directory || !archive) throw new Error('Set key, isolated directory and private archive path.');
+  if (!apiKey || !directory || !archive || !process.env.MTC_BASE_URL) throw new Error('Set key, isolated directory and private archive path.');
   let task = ''; process.stdin.setEncoding('utf8'); for await (const chunk of process.stdin) task += chunk;
-  const result = await runTask({ apiKey, directory, archive, task, model: process.env.MTC_TASK_MODEL ?? 'k3.1-pro', baseUrl: process.env.MTC_BASE_URL ?? 'https://token.k3s.onetwo.website/v1' });
+  const result = await runTask({ apiKey, directory, archive, task, model: process.env.MTC_TASK_MODEL ?? 'k3.1-pro', baseUrl: process.env.MTC_BASE_URL! });
   console.log(JSON.stringify(result, null, 2));
   if (!result.completed) process.exitCode = 1;
 }
