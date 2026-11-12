@@ -88,13 +88,30 @@ pub(super) async fn capture_native_in_transaction(
         "archive_identity": {"tenant_id": tenant, "request_id": request_id},
         "payload": payload, "filter_cost_micros": filter_cost_micros, "statistics": statistics, "read_model": read_model, "originals": originals,
     });
-    let frozen = serde_json::to_string(&envelope).map_err(|_| AppError::storage("history_envelope_serialization"))?;
-    let stored: String = sqlx::query_scalar("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,'native',$2,$3,$4,$5,$6) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot RETURNING snapshot")
-        .bind(revision).bind(request_id).bind(&tenant).bind(&key).bind(identity.try_get::<i64,_>("created_at")?).bind(&frozen)
-        .fetch_one(&mut **transaction).await?;
-    if stored != frozen {
-        return Err(AppError::storage("history_envelope_revision_conflict"));
+    insert_envelope_in_transaction(transaction, &history_identity, revision, &envelope).await?;
+    let events = sqlx::query("SELECT x.revision,x.request_id,x.created_at FROM request_history_export x JOIN request_events e ON e.event_id=x.request_id AND e.tenant_id=x.tenant_id AND e.key_id=x.key_id WHERE x.source='event' AND e.request_id=$1 AND x.tenant_id=$2 AND x.key_id=$3 ORDER BY x.revision")
+        .bind(request_id).bind(&tenant).bind(&key).fetch_all(&mut **transaction).await?;
+    for event in events {
+        let event_id = parse_uuid(event.try_get("request_id")?)?;
+        let event_identity = crate::request_history::HistoryIdentity { source: "event".into(), request_id:event_id, created_at:event.try_get("created_at")?, ..history_identity.clone() };
+        let event_revision: i64 = event.try_get("revision")?;
+        let payload = Database::history_original_event_in_transaction(transaction,event_id).await?;
+        let envelope = serde_json::json!({"version":1,"source":"event","revision":event_revision,"tenant_id":tenant,"key_id":key,"request_id":event_id,"created_at":event_identity.created_at,"payload":payload,"filter_cost_micros":null,"statistics":null,"read_model":null,"archive_identity":{"tenant_id":tenant,"request_id":request_id}});
+        insert_envelope_in_transaction(transaction,&event_identity,event_revision,&envelope).await?;
     }
+    Ok(())
+}
+
+async fn insert_envelope_in_transaction(
+    transaction: &mut Transaction<'_, Any>,
+    identity: &crate::request_history::HistoryIdentity,
+    revision: i64,
+    envelope: &Value,
+) -> Result<(),AppError> {
+    let frozen=serde_json::to_string(envelope).map_err(|_|AppError::storage("history_envelope_serialization"))?;
+    let stored:String=sqlx::query_scalar("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot RETURNING snapshot")
+        .bind(revision).bind(&identity.source).bind(identity.request_id.to_string()).bind(identity.tenant_id.to_string()).bind(identity.key_id.to_string()).bind(identity.created_at).bind(&frozen).fetch_one(&mut **transaction).await?;
+    if stored!=frozen {return Err(AppError::storage("history_envelope_revision_conflict"));}
     Ok(())
 }
 
@@ -126,7 +143,7 @@ impl Database {
             }
             let original: String = row.try_get("snapshot")?;
             let envelope: Value = serde_json::from_str(&original)?;
-            if envelope["version"].as_i64() != Some(1) || envelope["source"].as_str() != Some("native") {
+            if envelope["version"].as_i64() != Some(1) || !matches!(envelope["source"].as_str(), Some("native" | "event")) {
                 return Err(HistoryError::Invalid("immutable history envelope version or source"));
             }
             let identity: HistoryIdentity = serde_json::from_value(envelope.clone())?;
@@ -141,13 +158,20 @@ impl Database {
             let frozen = if let Some(existing) = existing {
                 serde_json::to_string(&serde_json::from_str::<HistorySnapshot>(&existing)?)?
             } else {
-                let payload: Option<Value> = serde_json::from_value(envelope["payload"].clone())?;
+                let mut payload: Option<Value> = serde_json::from_value(envelope["payload"].clone())?;
                 let mut read_model = envelope["read_model"].clone();
-                let mut archive: crate::model::RequestArchiveRefs = serde_json::from_value(read_model["archive"].clone())?;
-                archive.view = serde_json::from_value(payload.clone().ok_or(HistoryError::Invalid("immutable native payload"))?)?;
-                let archive = self.resolve_raw_archive_roots(identity.tenant_id, archive).await?;
-                let payload = Some(serde_json::to_value(&archive.view)?);
-                read_model["archive"] = serde_json::to_value(archive)?;
+                if identity.source == "native" {
+                    let mut archive: crate::model::RequestArchiveRefs = serde_json::from_value(read_model["archive"].clone())?;
+                    archive.view = serde_json::from_value(payload.clone().ok_or(HistoryError::Invalid("immutable native payload"))?)?;
+                    let archive = self.resolve_raw_archive_roots(identity.tenant_id, archive).await?;
+                    payload = Some(serde_json::to_value(&archive.view)?);
+                    read_model["archive"] = serde_json::to_value(archive)?;
+                } else if let Some(payload) = &mut payload {
+                    let native_request = envelope["archive_identity"]["request_id"].as_str().ok_or(HistoryError::Invalid("immutable event archive identity"))?;
+                    if let Some(summary)=self.body_archive()?.supplier_summary(identity.tenant_id,parse_uuid(native_request.to_owned())?).await? {
+                        payload["supplier_error"]=serde_json::to_value(summary)?;
+                    }
+                }
                 serde_json::to_string(&HistorySnapshot {
                     identity, revision, payload, read_model,
                     filter_cost_micros: serde_json::from_value(envelope["filter_cost_micros"].clone())?,
