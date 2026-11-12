@@ -1635,7 +1635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unsettled_body_stays_resident_and_the_new_upload_spills() {
+    async fn local_backed_unsettled_body_is_reclaimed_for_the_new_upload() {
         let directory = tempfile::tempdir().unwrap();
         let store = MemoryObjectStore::new();
         let admission = RequestSpoolAdmission::new(directory.path().to_owned())
@@ -1681,7 +1681,8 @@ mod tests {
             reads_after_spill, 0,
             "local replay must not wait for an archive download"
         );
-        assert!(newest.shared.body.lock().unwrap().is_none());
+        assert!(oldest.shared.body.lock().unwrap().is_none());
+        assert!(newest.shared.body.lock().unwrap().is_some());
         assert!(newest.shared.local.is_some());
         assert_eq!(oldest.read_all().await.unwrap(), first);
         assert_eq!(store.reads.load(Ordering::Acquire), reads_after_spill);
