@@ -97,3 +97,60 @@ pub(super) async fn capture_native_in_transaction(
     }
     Ok(())
 }
+
+impl Database {
+    /// Resolve immutable object identities only after the producer committed.
+    /// Once resolved, delivery bytes are frozen for retries and exact ACK.
+    pub(crate) async fn history_immutable_pending(
+        &self,
+        page_size: i64,
+    ) -> Result<Vec<crate::request_history::HistorySnapshot>, crate::request_history::HistoryError> {
+        use crate::request_history::{HistoryError, HistoryIdentity, HistorySnapshot};
+        let rows = sqlx::query("SELECT revision,snapshot,delivery_snapshot FROM request_history_immutable_outbox ORDER BY revision LIMIT $1")
+            .bind(page_size).fetch_all(&self.pool).await?;
+        let mut snapshots = Vec::with_capacity(rows.len());
+        for row in rows {
+            let revision: i64 = row.try_get("revision")?;
+            if let Some(frozen) = row.try_get::<Option<String>,_>("delivery_snapshot")? {
+                snapshots.push(serde_json::from_str(&frozen)?);
+                continue;
+            }
+            let original: String = row.try_get("snapshot")?;
+            let envelope: Value = serde_json::from_str(&original)?;
+            if envelope["version"].as_i64() != Some(1) || envelope["source"].as_str() != Some("native") {
+                return Err(HistoryError::Invalid("immutable history envelope version or source"));
+            }
+            let identity: HistoryIdentity = serde_json::from_value(envelope.clone())?;
+            if envelope["revision"].as_i64() != Some(revision) {
+                return Err(HistoryError::Invalid("immutable history envelope revision"));
+            }
+            // A previously frozen legacy delivery remains authoritative for
+            // this exact revision during the incremental producer rollout.
+            let existing: Option<String> = sqlx::query_scalar("SELECT snapshot FROM request_history_export WHERE revision=$1 AND source=$2 AND request_id=$3")
+                .bind(revision).bind(&identity.source).bind(identity.request_id.to_string())
+                .fetch_optional(&self.pool).await?.flatten();
+            let frozen = if let Some(existing) = existing {
+                serde_json::to_string(&serde_json::from_str::<HistorySnapshot>(&existing)?)?
+            } else {
+                let payload: Option<Value> = serde_json::from_value(envelope["payload"].clone())?;
+                let mut read_model = envelope["read_model"].clone();
+                let mut archive: crate::model::RequestArchiveRefs = serde_json::from_value(read_model["archive"].clone())?;
+                archive.view = serde_json::from_value(payload.clone().ok_or(HistoryError::Invalid("immutable native payload"))?)?;
+                let archive = self.resolve_raw_archive_roots(identity.tenant_id, archive).await?;
+                let payload = Some(serde_json::to_value(&archive.view)?);
+                read_model["archive"] = serde_json::to_value(archive)?;
+                serde_json::to_string(&HistorySnapshot {
+                    identity, revision, payload, read_model,
+                    filter_cost_micros: serde_json::from_value(envelope["filter_cost_micros"].clone())?,
+                    statistics: serde_json::from_value(envelope["statistics"].clone())?,
+                })?
+            };
+            let stored: Option<String> = sqlx::query_scalar("UPDATE request_history_immutable_outbox SET delivery_snapshot=COALESCE(delivery_snapshot,$1) WHERE revision=$2 AND snapshot=$3 RETURNING delivery_snapshot")
+                .bind(&frozen).bind(revision).bind(&original).fetch_optional(&self.pool).await?;
+            if let Some(stored) = stored {
+                snapshots.push(serde_json::from_str(&stored)?);
+            }
+        }
+        Ok(snapshots)
+    }
+}

@@ -8,7 +8,8 @@ CREATE TABLE request_history_immutable_outbox (
     tenant_id TEXT NOT NULL,
     key_id TEXT NOT NULL,
     created_at BIGINT NOT NULL,
-    snapshot TEXT NOT NULL
+    snapshot TEXT NOT NULL,
+    delivery_snapshot TEXT
 );
 CREATE INDEX request_history_immutable_outbox_identity
     ON request_history_immutable_outbox(tenant_id, source, request_id, revision);
