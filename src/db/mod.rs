@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+mod allocation_history;
 mod quota_observations;
 
 use chrono::{Days, Utc};

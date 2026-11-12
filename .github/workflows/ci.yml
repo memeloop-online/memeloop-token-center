@@ -275,6 +275,7 @@ jobs:
         run: |
           cargo test --locked --all-features --lib request_history -- --nocapture
           cargo test --locked --all-features --lib request_history_real_services_acceptance -- --ignored --nocapture
+          cargo test --locked --all-features --lib allocation_history_real_services_acceptance -- --ignored --nocapture
           curl --fail --silent --show-error "$MTC_TEST_CLICKHOUSE_URL" --data-binary 'CREATE DATABASE IF NOT EXISTS session_tasks'
           MTC_REQUEST_HISTORY_DATABASE=session_tasks cargo test --locked --all-features --lib session_tasks_history_real_services_acceptance -- --ignored --nocapture
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
@@ -632,6 +633,11 @@ jobs:
           database="$RUNNER_TEMP/migration-smoke.sqlite"
           export MTC_DATABASE_URL="sqlite://$database?mode=rwc"
           cargo run --locked --bin memeloop-token-center -- migrate
+          # Recreate the exact predecessor schema, retaining immutable migration 153.
+          sqlite3 "$database" 'DROP TABLE group_allocation_history_hours; DROP TABLE group_allocation_history_contributions; DROP TABLE group_allocation_history_receipts; DROP TABLE group_allocation_history_state; DELETE FROM schema_migrations WHERE version = 154;'
+          test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = 153
+          cargo run --locked --bin memeloop-token-center -- migrate
+          test "$(sqlite3 "$database" 'SELECT max(version) FROM schema_migrations')" = 154
           first_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
           cargo run --locked --bin memeloop-token-center -- migrate
           second_count="$(sqlite3 "$database" 'SELECT count(*) FROM schema_migrations')"
@@ -646,6 +652,11 @@ jobs:
           MTC_ARCHIVE_PATH: /tmp/mtc-migration-smoke-archive
         run: |
           cargo run --locked --bin memeloop-token-center -- migrate
+          # Exercise upgrade from 153, then replay the release migration unchanged.
+          psql -X --no-psqlrc -v ON_ERROR_STOP=1 "$MTC_DATABASE_URL" -c 'DROP TABLE group_allocation_history_hours; DROP TABLE group_allocation_history_contributions; DROP TABLE group_allocation_history_receipts; DROP TABLE group_allocation_history_state; DELETE FROM schema_migrations WHERE version = 154;'
+          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = 153
+          cargo run --locked --bin memeloop-token-center -- migrate
+          test "$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" -c 'SELECT max(version) FROM schema_migrations')" = 154
           first_count="$(psql -X --no-psqlrc -qAt "$MTC_DATABASE_URL" \
             -c 'SELECT count(*) FROM schema_migrations')"
           cargo run --locked --bin memeloop-token-center -- migrate

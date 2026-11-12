@@ -1,3 +1,4 @@
+pub(crate) mod allocation;
 mod clickhouse;
 mod contract;
 pub mod migration;

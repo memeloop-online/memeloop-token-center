@@ -813,6 +813,11 @@ pub(crate) const SQLITE_MIGRATIONS: &[Migration] = &[
         name: "semantic payload immutable object references",
         sql: include_str!("../../../migrations/sqlite/0153_semantic_payload_object_reference.sql"),
     },
+    Migration {
+        version: 154,
+        name: "allocation history export coverage",
+        sql: include_str!("../../../migrations/common/0154_allocation_history_coverage.sql"),
+    },
 ];
 
 pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
@@ -1600,6 +1605,11 @@ pub(crate) const POSTGRES_MIGRATIONS: &[Migration] = &[
         sql: include_str!(
             "../../../migrations/postgres/0153_semantic_payload_object_reference.sql"
         ),
+    },
+    Migration {
+        version: 154,
+        name: "allocation history export coverage",
+        sql: include_str!("../../../migrations/common/0154_allocation_history_coverage.sql"),
     },
 ];
 

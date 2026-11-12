@@ -470,6 +470,8 @@ impl Database {
                 }
             }
         }
+        self.allocation_history_acknowledged(&mut transaction, snapshots)
+            .await?;
         transaction.commit().await?;
         Ok(())
     }
