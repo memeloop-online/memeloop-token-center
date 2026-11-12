@@ -1,6 +1,6 @@
 use super::{routing::TrainingStore, tests::memory_store};
 use bytes::Bytes;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
+use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
 use std::sync::Arc;
 use uuid::Uuid;
 
