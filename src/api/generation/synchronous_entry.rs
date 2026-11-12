@@ -23,6 +23,7 @@ pub(in crate::api) async fn create_image_generation(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, AppError> {
+    let context = super::super::proxy_diagnostics::Context::current();
     let operation = async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
         let result = async move {
@@ -32,6 +33,7 @@ pub(in crate::api) async fn create_image_generation(
                 let request = serde_json::from_value(value).map_err(|_| {
                     AppError::BadRequest("model and generation input are required".into())
                 })?;
+                super::super::early_request::mark_admitted();
                 return super::jobs::create_generation_for_modality(
                     state,
                     headers,
@@ -45,9 +47,10 @@ pub(in crate::api) async fn create_image_generation(
         .await;
         result.map(|response| super::super::auth::hold_response_body_permit(response, resources))
     };
+    let operation = super::super::early_request::preserve_observation(operation);
     #[cfg(test)]
-    let operation = super::super::proxy::codex_transport::inherit_test_endpoint(operation);
-    tokio::spawn(operation)
+    let operation = crate::api::proxy::codex_transport::inherit_test_endpoint(operation);
+    tokio::spawn(super::super::proxy_diagnostics::CONTEXT.scope(context, operation))
         .await
         .map_err(|_| AppError::internal("synchronous_image_owner_failed"))?
 }
@@ -102,7 +105,10 @@ async fn proxy_openai_image_generation(
                 // claim can be created or mutated.
                 authorize_applied_traffic_policy(&state, &key, "generation", &applied).await?;
             }
-            Some(replay) => return image_idempotency_replay_response(&state, replay).await,
+            Some(replay) => {
+                super::super::early_request::mark_admitted();
+                return image_idempotency_replay_response(&state, replay).await;
+            }
         }
     }
     let AppliedTraffic {
@@ -111,7 +117,7 @@ async fn proxy_openai_image_generation(
         upstream_account_hint,
         ..
     } = applied;
-    let request_id = Uuid::now_v7();
+    let request_id = super::super::proxy_diagnostics::Context::current().request_id;
     if let Some(idempotency) = image_idempotency.as_ref() {
         match state
             .db
@@ -119,7 +125,10 @@ async fn proxy_openai_image_generation(
             .await?
         {
             SynchronousImageIdempotencyClaim::Claimed => {}
-            replay => return image_idempotency_replay_response(&state, replay).await,
+            replay => {
+                super::super::early_request::mark_admitted();
+                return image_idempotency_replay_response(&state, replay).await;
+            }
         }
     }
     let preparation = async {
@@ -284,8 +293,12 @@ async fn proxy_openai_image_generation(
         })
         .await;
     let reservation = match started {
-        Ok(StartSynchronousImageResult::Started(reservation)) => reservation,
+        Ok(StartSynchronousImageResult::Started(reservation)) => {
+            super::super::early_request::mark_admitted();
+            reservation
+        }
         Ok(StartSynchronousImageResult::Replay(replay)) => {
+            super::super::early_request::mark_admitted();
             return image_idempotency_replay_response(&state, replay).await;
         }
         Err(error) => {
@@ -524,10 +537,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reservations, 0);
-        let submissions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_records")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        // Invalid authenticated requests now have early diagnostic records;
+        // none may own a paid submission or a reservation.
+        let submissions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM request_records q JOIN usage_reservations r ON r.id = q.reservation_id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(submissions, 0);
         pool.close().await;
         let first =

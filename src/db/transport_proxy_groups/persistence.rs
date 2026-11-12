@@ -9,10 +9,11 @@ impl TransportProxyGroups {
             Arc<crate::plugin::application::ApplicationPlugins>,
         >,
     ) -> Result<(), sqlx::Error> {
-        let pool = labeled_pool_options(database_url, "mtc-proxy-group")
+        let pool: AnyPool = labeled_pool_options(database_url, "mtc-proxy-group")
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_lazy(database_url)?;
+            .connect_lazy(database_url)?
+            .into();
         let groups = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(current) = groups.upgrade() {
@@ -46,10 +47,11 @@ impl TransportProxyGroups {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
-        let probe_pool = labeled_pool_options(database_url, "mtc-proxy-probe")
+        let probe_pool: AnyPool = labeled_pool_options(database_url, "mtc-proxy-probe")
             .max_connections(2)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_lazy(database_url)?;
+            .connect_lazy(database_url)?
+            .into();
         let groups = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(current) = groups.upgrade() {
@@ -60,10 +62,11 @@ impl TransportProxyGroups {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
-        let signal_pool = labeled_pool_options(database_url, "mtc-proxy-signal")
+        let signal_pool: AnyPool = labeled_pool_options(database_url, "mtc-proxy-signal")
             .max_connections(1)
             .acquire_timeout(Duration::from_secs(10))
-            .connect_lazy(database_url)?;
+            .connect_lazy(database_url)?
+            .into();
         let groups = Arc::downgrade(self);
         tokio::spawn(async move {
             while groups.upgrade().is_some() {
@@ -187,7 +190,7 @@ impl Entry {
 fn labeled_pool_options(database_url: &str, name: &'static str) -> AnyPoolOptions {
     let postgres = !database_url.starts_with("sqlite:");
     let application_name = crate::db::postgres_application_name(name);
-    AnyPoolOptions::new().after_connect(move |connection, _| {
+    AnyPoolOptions::new().test_before_acquire(!postgres).after_connect(move |connection, _| {
         let application_name = application_name.clone();
         Box::pin(async move {
             if postgres {

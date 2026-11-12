@@ -3,6 +3,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::Response,
 };
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -49,6 +50,7 @@ pub(super) async fn request_detail(
                     value,
                     complete: true,
                     reason: None,
+                    preview: None,
                 },
                 Some(_) => ArchiveValue::gap("archive_payload_invalid"),
                 None if matches!(
@@ -61,12 +63,14 @@ pub(super) async fn request_detail(
                         value: Value::Null,
                         complete: true,
                         reason: None,
+                        preview: None,
                     }
                 }
                 None => ArchiveValue {
                     value: Value::Null,
                     complete: false,
                     reason: refs.response_archive_reason.clone(),
+                    preview: None,
                 },
             },
         }
@@ -78,11 +82,13 @@ pub(super) async fn request_detail(
         archive_complete: request.complete && response.complete,
         archive: crate::model::RequestArchiveCompletenessView {
             request: crate::model::RequestArchiveSideView {
+                preview: request.preview,
                 state: refs.request_archive_state,
                 complete: request.complete,
                 reason: refs.request_archive_reason.or(request.reason),
             },
             response: crate::model::RequestArchiveSideView {
+                preview: response.preview,
                 state: refs.response_archive_state,
                 complete: response.complete,
                 reason: refs.response_archive_reason.or(response.reason),
@@ -390,6 +396,7 @@ struct ArchiveValue {
     value: Value,
     complete: bool,
     reason: Option<String>,
+    preview: Option<crate::model::RequestArchivePreviewView>,
 }
 
 fn archive_is_pending(state: crate::model::RequestArchiveState) -> bool {
@@ -402,11 +409,21 @@ fn archive_is_pending(state: crate::model::RequestArchiveState) -> bool {
 }
 
 impl ArchiveValue {
+    fn streamed(bytes: u64) -> Self {
+        Self {
+            value: Value::Null,
+            complete: true,
+            reason: None,
+            preview: Some(crate::model::RequestArchivePreviewView::Stream { bytes }),
+        }
+    }
+
     fn pending() -> Self {
         Self {
             value: Value::Null,
             complete: false,
             reason: None,
+            preview: None,
         }
     }
 
@@ -415,6 +432,7 @@ impl ArchiveValue {
             value: Value::Null,
             complete: false,
             reason: Some(reason.to_owned()),
+            preview: None,
         }
     }
 }
@@ -425,6 +443,7 @@ async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
             value: serde_json::json!({"media_archived": false}),
             complete: true,
             reason: Some("media_body_not_archived_by_policy".to_owned()),
+            preview: None,
         };
     }
     if let Some(value) = location.strip_prefix("metadata-only-json:") {
@@ -439,15 +458,55 @@ async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
     if location.starts_with("gap://") {
         return ArchiveValue::gap("archive_object_unavailable");
     }
-    match state
-        .archive
-        .get_bounded(location, MAX_ARCHIVE_DETAIL_BODY)
-        .await
-    {
-        Ok(bytes) => decode_archive_value(&bytes),
+    // Preview omission is independent of durable archive availability. Probe only
+    // a small range so SSE and large objects use the existing authenticated
+    // content reader without materializing their entire body in every detail.
+    let preview: Result<ArchiveValue, AppError> = async {
+        let size = state.archive.head_size(location).await?;
+        let mut prefix = Vec::new();
+        if size > 0 {
+            let download = state
+                .archive
+                .open_stream(location, Some(0..size.min(1024)))
+                .await?;
+            if download.object_size != size || download.range != (0..size.min(1024)) {
+                return Err(AppError::storage("archive_preview_range_mismatch"));
+            }
+            let mut stream = download.stream;
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.map_err(|_| AppError::storage("archive_preview_read_failed"))?;
+                if prefix.len().saturating_add(chunk.len()) > 1024 {
+                    return Err(AppError::storage("archive_preview_range_mismatch"));
+                }
+                prefix.extend_from_slice(&chunk);
+            }
+            if prefix.len() as u64 != size.min(1024) {
+                return Err(AppError::storage("archive_preview_range_mismatch"));
+            }
+        }
+        if size > MAX_ARCHIVE_DETAIL_BODY as u64
+            || (is_sse_prefix(&prefix) && size > MAX_ARCHIVE_DETAIL_JSON_STRING_BYTES as u64)
+        {
+            return Ok(ArchiveValue::streamed(size));
+        }
+        let bytes = state
+            .archive
+            .get_bounded(location, MAX_ARCHIVE_DETAIL_BODY)
+            .await?;
+        let value = decode_archive_value(&bytes);
+        // Structural projection budgets do not make an archived JSON invalid.
+        Ok(
+            if value.reason.as_deref() == Some("archive_payload_invalid") {
+                ArchiveValue::streamed(size)
+            } else {
+                value
+            },
+        )
+    }
+    .await;
+    match preview {
+        Ok(value) => value,
         Err(_) => {
-            // Imported locators and object-store errors can contain provider
-            // paths, signed query values, or storage identity metadata.
             tracing::warn!(
                 error_code = "archive_object_unavailable",
                 "archived request object is unavailable"
@@ -457,7 +516,28 @@ async fn archive_value(state: &AppState, location: &str) -> ArchiveValue {
     }
 }
 
+fn is_sse_prefix(bytes: &[u8]) -> bool {
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    bytes
+        .split(|byte| *byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| {
+            line.starts_with(b"data:") || line.starts_with(b"event:") || line.starts_with(b":")
+        })
+}
+
 fn decode_archive_value(bytes: &[u8]) -> ArchiveValue {
+    // SSE is framed text, not one JSON document. Preserve existing small text
+    // previews without applying JSON node/depth accounting across all frames.
+    if bytes.len() <= MAX_ARCHIVE_DETAIL_JSON_STRING_BYTES && is_sse_prefix(bytes) {
+        return ArchiveValue {
+            value: Value::String(String::from_utf8_lossy(bytes).into_owned()),
+            complete: true,
+            reason: None,
+            preview: None,
+        };
+    }
     if bytes.len() > MAX_ARCHIVE_DETAIL_BODY || !json_bytes_structure_is_bounded(bytes) {
         return ArchiveValue::gap("archive_payload_invalid");
     }
@@ -466,12 +546,14 @@ fn decode_archive_value(bytes: &[u8]) -> ArchiveValue {
             value,
             complete: true,
             reason: None,
+            preview: None,
         },
         Ok(_) => ArchiveValue::gap("archive_payload_invalid"),
         Err(_) => ArchiveValue {
             value: Value::String(String::from_utf8_lossy(bytes).into_owned()),
             complete: true,
             reason: None,
+            preview: None,
         },
     }
 }

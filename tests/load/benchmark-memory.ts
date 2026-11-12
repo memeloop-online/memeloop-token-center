@@ -16,7 +16,6 @@ import { FirstSoakFailureEvidence, readSoakFailureClassification } from "./bench
 
 export const MIB = 1024 * 1024;
 export const FORMER_RESPONSE_LIMIT_BYTES = 64 * MIB;
-export const LARGE_RESPONSE_BYTES = FORMER_RESPONSE_LIMIT_BYTES + MIB;
 export const MP4_PREFIX = Buffer.from("000000186674797069736f6d0000020069736f6d69736f32", "hex");
 export const ASSET_RANGE_START = 32;
 export const ASSET_RANGE_BYTES = 4096;
@@ -210,13 +209,11 @@ async function writeStreamChunk(response: ServerResponse, chunk: Buffer): Promis
   return !response.destroyed;
 }
 
-function chatSseTailFrames(): Buffer[] {
-  return [chatSseFrame([{ index: 0, delta: {}, finish_reason: "stop" }]), chatSseFrame([], { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 }), Buffer.from("data: [DONE]\n\n")];
-}
-
-function* chatSseFrames(total: number, maximumFrameBytes: number, includeTail = true): Generator<Buffer> {
-  const tail = chatSseTailFrames();
-  const tailBytes = tail.reduce((bytes, frame) => bytes + frame.length, 0);
+async function streamChatSse(request: IncomingMessage, response: ServerResponse, state: MockState, total: number, maximumFrameBytes: number, delayMs: number, barrier?: StreamStartBarrier): Promise<void> {
+  const finish = chatSseFrame([{ index: 0, delta: {}, finish_reason: "stop" }]);
+  const usage = chatSseFrame([], { prompt_tokens: 2, completion_tokens: 1, total_tokens: 3 });
+  const done = Buffer.from("data: [DONE]\n\n");
+  const tailBytes = finish.length + usage.length + done.length;
   const emptyContentFrameBytes = chatSseFrame([{ index: 0, delta: { content: "" }, finish_reason: null }]).length;
   const contentBytes = total - tailBytes;
   const frameCount = Math.ceil(contentBytes / maximumFrameBytes);
@@ -225,14 +222,6 @@ function* chatSseFrames(total: number, maximumFrameBytes: number, includeTail = 
   const basePayloadBytes = Math.floor(payloadBytes / frameCount);
   const extraPayloadFrames = payloadBytes % frameCount;
 
-  for (let index = 0; index < frameCount; index += 1) {
-    const payloadLength = basePayloadBytes + (index < extraPayloadFrames ? 1 : 0);
-    yield chatSseFrame([{ index: 0, delta: { content: "x".repeat(payloadLength) }, finish_reason: null }]);
-  }
-  if (includeTail) yield* tail;
-}
-
-async function streamChatSse(request: IncomingMessage, response: ServerResponse, state: MockState, total: number, maximumFrameBytes: number, delayMs: number, barrier?: StreamStartBarrier): Promise<void> {
   state.begin();
   try {
     if (!await state.waitForStreamStart(request, response, barrier)) {
@@ -240,11 +229,13 @@ async function streamChatSse(request: IncomingMessage, response: ServerResponse,
       return;
     }
     response.writeHead(200, { "content-type": "text/event-stream", "content-length": total });
-    for (const frame of chatSseFrames(total, maximumFrameBytes, false)) {
+    for (let index = 0; index < frameCount; index += 1) {
+      const payloadLength = basePayloadBytes + (index < extraPayloadFrames ? 1 : 0);
+      const frame = chatSseFrame([{ index: 0, delta: { content: "x".repeat(payloadLength) }, finish_reason: null }]);
       if (!await writeStreamChunk(response, frame)) return;
       if (delayMs) await delay(delayMs);
     }
-    for (const frame of chatSseTailFrames()) if (!await writeStreamChunk(response, frame)) return;
+    for (const frame of [finish, usage, done]) if (!await writeStreamChunk(response, frame)) return;
     response.end();
   } finally { state.end(); }
 }
@@ -386,82 +377,7 @@ async function disconnectChat(url: string, key: string, bytes: number): Promise<
     request.end(body);
   });
 }
-async function largeChat(url: string, key: string, bytes: number): Promise<Obj> {
-  const target = new URL("/v1/chat/completions", url);
-  const body = Buffer.from(JSON.stringify(chatPayload("oversize", bytes)));
-  return await new Promise<Obj>((resolveResponse) => {
-    const hash = createHash("sha256"); let status = 0; let received = 0; let requestId = ""; let settled = false; const done = Buffer.from("data: [DONE]\n\n"); let tail = Buffer.alloc(0);
-    const finish = (error?: unknown): void => {
-      if (settled) return; settled = true;
-      resolveResponse({ status, bytes_received: received, sha256: hash.digest("hex"), request_id: requestId, terminal_received: tail.equals(done), client_error: error === undefined ? null : error instanceof Error ? error.name : String(error) });
-    };
-    const request = requestForURL(target, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json", "content-length": body.length, connection: "close" } }, (response) => {
-      status = response.statusCode ?? 0; requestId = responseHeaders(response)["x-mtc-request-id"] ?? "";
-      void (async () => { try { for await (const raw of response) { const chunk = Buffer.from(raw); received += chunk.length; hash.update(chunk); tail = Buffer.concat([tail, chunk.subarray(Math.max(0, chunk.length - done.length))]).subarray(-done.length); } finish(); } catch (error) { finish(error); } })();
-    });
-    request.setTimeout(180_000, () => request.destroy(new HarnessFailure("large chat timed out after 180000 ms")));
-    request.once("error", finish); request.end(body);
-  });
-}
-
-async function verifyLargeResponseArchive(url: string, key: string, token: string, databasePath: string, client: Obj, bytes: number): Promise<Obj> {
-  const expected = createHash("sha256");
-  for (const frame of chatSseFrames(bytes, 256 * 1024)) expected.update(frame);
-  const expectedHash = expected.digest("hex");
-  if (client.status !== 200 || client.bytes_received !== bytes || client.sha256 !== expectedHash || client.client_error !== null || client.terminal_received !== true || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u.test(client.request_id)) throw new HarnessFailure(`large response client status, identity, complete bytes or hash mismatch: ${JSON.stringify({ ...client, expected_bytes: bytes, expected_sha256: expectedHash })}`);
-  const deadline = performance.now() + 20_000;
-  const reader = new DatabaseSync(databasePath, { readOnly: true, timeout: 1000 });
-  let evidence: Obj = {};
-  try {
-    while (performance.now() < deadline) {
-      const record = reader.prepare("SELECT status_code, error_code, completed_at, request_object, response_object FROM request_records WHERE id = ?").get(client.request_id) as Obj | undefined;
-      evidence = { record };
-      // Raw CAS roots, resolved by the archive HTTP API below, are the body
-      // authority. Relational locator binds and retired cipher queues are not.
-      if (record?.completed_at != null && record.status_code === 200 && record.error_code == null) {
-        const metrics = await apiRequest(url, "GET", "/metrics", token, undefined, Math.max(1, deadline - performance.now()));
-        if (metrics.status !== 200) throw new HarnessFailure("large response resource metrics unavailable");
-        const gauges = largeResponsePermitEvidence(metrics.body.toString("utf8")); evidence.permits = gauges;
-        if (Object.values(gauges).every((value) => value === 0)) {
-          const remaining = (): number => { const value = deadline - performance.now(); if (value <= 0) throw new HarnessFailure("large response archive exceeded the 20 second completion budget"); return value; };
-          const prefix = `/self/v1/requests/${encodeURIComponent(client.request_id)}/archive/`;
-          const request = await apiRequest(url, "GET", `${prefix}request`, key, undefined, remaining());
-          const expectedRequest = Buffer.from(JSON.stringify(chatPayload("oversize", bytes)));
-          const expectedRequestHash = createHash("sha256").update(expectedRequest).digest("hex");
-          const requestHash = createHash("sha256").update(request.body).digest("hex");
-          if (request.status !== 200 || !request.body.equals(expectedRequest) || requestHash !== expectedRequestHash) throw new HarnessFailure("large response original request archive mismatch");
-          const response = await streamDownloadToHash(url, `${prefix}response`, key, undefined, remaining());
-          remaining();
-          if (response.status !== 200 || response.bytes_received !== bytes || response.sha256 !== expectedHash) throw new HarnessFailure("large response archive status, complete bytes or hash mismatch");
-          return { ...client, expected_sha256: expectedHash, request_archive_bytes: request.body.length, request_archive_sha256: requestHash, expected_request_sha256: expectedRequestHash, response_archive: response, ...evidence, completion_budget_ms: 20_000 };
-        }
-      }
-      await delay(100);
-    }
-    throw new HarnessFailure(`large response did not complete and release resources within 20000 ms: ${JSON.stringify(evidence)}`);
-  } finally { reader.close(); }
-}
-
-function largeResponsePermitEvidence(metrics: string): Record<string, number> {
-  const series: Record<string, string> = {
-    lifecycle_memory: 'memeloop_token_center_proxy_memory_bytes{pool="lifecycle",measure="used"}',
-    retained_request_memory: 'memeloop_token_center_proxy_memory_bytes{pool="retained_request",measure="used"}',
-    body_readers: 'memeloop_token_center_background_work_items{queue="gateway_body_reads",state="active"}',
-    lifecycles: 'memeloop_token_center_background_work_items{queue="proxy_lifecycles",state="active"}',
-    archive_workers: 'memeloop_token_center_background_work_items{queue="proxy_archive_streams",state="active"}',
-    request_spool_memory: 'memeloop_token_center_request_spool_bytes{measure="used"}',
-    request_spools: 'memeloop_token_center_background_work_items{queue="responses_request_spools",state="active"}',
-    routing_jobs: 'memeloop_token_center_routing_persistence_jobs', routing_bytes: 'memeloop_token_center_routing_persistence_bytes',
-    deferred_jobs: 'memeloop_token_center_deferred_persistence_jobs', deferred_bytes: 'memeloop_token_center_deferred_persistence_bytes',
-    deferred_stream_bytes: 'memeloop_token_center_deferred_stream_memory_bytes', request_jobs: 'memeloop_token_center_request_persistence_jobs', request_bytes: 'memeloop_token_center_request_persistence_bytes',
-  };
-  return Object.fromEntries(Object.entries(series).map(([name, prefix]) => {
-    const line = metrics.split("\n").find((entry) => entry.startsWith(`${prefix} `));
-    const value = line === undefined ? NaN : Number(line.slice(prefix.length + 1));
-    if (!Number.isFinite(value) || value < 0) throw new HarnessFailure(`required large response permit gauge absent or invalid: ${name}`);
-    return [name, value];
-  }));
-}
+async function oversizeChat(url: string, key: string, bytes: number): Promise<[number, number, string | undefined, boolean]> { const target = new URL("/v1/chat/completions", url); const body = Buffer.from(JSON.stringify(chatPayload("oversize", bytes))); return await new Promise((resolveResponse) => { let status = 0; let received = 0; let tail = Buffer.alloc(0); const done = Buffer.from("data: [DONE]\n\n"); let settled = false; const finish = (error?: unknown): void => { if (settled) return; settled = true; resolveResponse([status, received, error === undefined ? undefined : error instanceof Error ? error.name : String(error), tail.equals(done)]); }; const request = requestForURL(target, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json", "content-length": body.length, connection: "close" } }, (response) => { status = response.statusCode ?? 0; void (async () => { try { for await (const raw of response) { const bytes = Buffer.from(raw); received += bytes.length; tail = Buffer.concat([tail, bytes.subarray(Math.max(0, bytes.length - done.length))]).subarray(-done.length); } finish(); } catch (error) { finish(error); } })(); }); request.setTimeout(180_000, () => request.destroy(new HarnessFailure("oversize chat timed out after 180000 ms"))); request.once("error", finish); request.end(body); }); }
 async function waitForRequestErrors(url: string, key: string, errorCode: string, minimum: number): Promise<number> { const deadline = performance.now() + 20_000; while (performance.now() < deadline) { const values = await apiJson(url, "GET", `/self/v1/requests?${new URLSearchParams({ status: "error", error_code: errorCode, limit: "100" })}`, key); if (Array.isArray(values) && values.length >= minimum) return values.length; await delay(200); } return 0; }
 
 export async function waitForPriorArchivePhase(databasePath: string, gateway: string, token: string): Promise<Obj> {
@@ -582,27 +498,23 @@ export async function execute(args: Arguments): Promise<[number, Obj]> {
     await delay(2000); const responsesImageBaseline = await memorySummary(children.gateway!.pid!);
     const responsesImage = await runSynchronousImages(urls.gateway!, key, children.gateway!.pid!, responsesImageBaseline.rss_mib_median, { name: "codex-responses-tool", model: "benchmark-responses-image", results: 1, upstreamRequests: () => state.responsesToolImageRequests }); responsesImage.gateway_phase_start = responsesImageBaseline;
     const disconnectAttempts = Math.max(2, Math.min(4, values.concurrency)); const disconnect = await withSampler({ gateway: children.gateway!.pid! }, async (sampler) => { const disconnected = await Promise.all(Array.from({ length: disconnectAttempts }, () => disconnectChat(urls.gateway!, key, 16 * MIB))); const errors = await waitForRequestErrors(urls.gateway!, key, "client_cancelled", disconnectAttempts); return { attempts: disconnectAttempts, client_bytes_before_close: disconnected.reduce((a, b) => a + b, 0), recorded_client_cancelled_errors: errors, gateway_peak_rss_mib: round(sampler.maxCurrentRss("gateway")), gateway_lifetime_high_water: sampler.lifetimeHighWaterEvidence("gateway"), sample_count: sampler.samples.length }; });
-    const largeResponse: Obj = await withSampler({ gateway: children.gateway!.pid! }, async (sampler) => {
-      const client = await largeChat(urls.gateway!, key, LARGE_RESPONSE_BYTES);
-      const integrity = await verifyLargeResponseArchive(urls.gateway!, key, metricsToken, database, client, LARGE_RESPONSE_BYTES);
-      return { upstream_bytes: LARGE_RESPONSE_BYTES, ...integrity, gateway_peak_rss_mib: round(sampler.maxCurrentRss("gateway")), gateway_lifetime_high_water: sampler.lifetimeHighWaterEvidence("gateway"), sample_count: sampler.samples.length };
-    });
-    const preCooldown = processMemory(children.gateway!.pid!); await delay(2000); const phaseSummary = await memorySummary(children.gateway!.pid!); const phaseStart: Obj = { pre_cooldown_rss_mib: round(preCooldown.rss_mib), cooldown_seconds: 2, sample_duration_seconds: 1, sample_interval_seconds: 0.1, ...phaseSummary };
+    const responseLimit = await withSampler({ gateway: children.gateway!.pid! }, async (sampler) => { const [status, received, clientError, terminalReceived] = await oversizeChat(urls.gateway!, key, FORMER_RESPONSE_LIMIT_BYTES + MIB); return { upstream_bytes: FORMER_RESPONSE_LIMIT_BYTES + MIB, former_limit_bytes: FORMER_RESPONSE_LIMIT_BYTES, http_status: status, client_bytes_received: received, client_error: clientError, terminal_received: terminalReceived, gateway_peak_rss_mib: round(sampler.maxCurrentRss("gateway")), gateway_lifetime_high_water: sampler.lifetimeHighWaterEvidence("gateway"), sample_count: sampler.samples.length }; });
     const priorArchiveDrain = await waitForPriorArchivePhase(database, urls.gateway!, metricsToken);
+    const preCooldown = processMemory(children.gateway!.pid!); await delay(2000); const phaseSummary = await memorySummary(children.gateway!.pid!); const phaseStart: Obj = { pre_cooldown_rss_mib: round(preCooldown.rss_mib), cooldown_seconds: 2, sample_duration_seconds: 1, sample_interval_seconds: 0.1, ...phaseSummary };
     const asset = await runAsset(urls.gateway!, key, values.asset_mib, { gateway: children.gateway!.pid!, worker: children.worker!.pid! }, archiveRoot); asset.prior_archive_phase_drain = priorArchiveDrain; asset.gateway_phase_start = phaseStart; Object.assign(asset, assetGatewayRssEvidence(asset.gateway_peak_rss_mib, phaseSummary.rss_mib_median, idleGateway)); asset.gateway_delta_rss_mib = asset.gateway_cumulative_delta_from_original_idle_mib; asset.worker_delta_rss_mib = round(asset.worker_peak_rss_mib - idleWorker);
     const routeRecovery = await waitForTextRouteRecovery(() => smallChat(urls.gateway!, key));
-    const preSoak = processMemory(children.gateway!.pid!).rss_mib as number; const soak = await runSoak(urls.gateway!, key, values.soak_seconds, Math.min(4, values.concurrency), args.targetRps, children.gateway!.pid!, () => ({ classification: readSoakFailureClassification(database, Date.now() - 60_000), diagnostic_log_tails: diagnosticLogTails(temporary) })); await delay(5000); const cooldown = await memorySummary(children.gateway!.pid!); soak.route_recovery_after_large_response = routeRecovery; soak.pre_soak_gateway_rss_mib = round(preSoak); soak.cooldown_gateway_rss_mib = cooldown.rss_mib_median; soak.retained_delta_from_idle_mib = round(cooldown.rss_mib_median - idleGateway);
+    const preSoak = processMemory(children.gateway!.pid!).rss_mib as number; const soak = await runSoak(urls.gateway!, key, values.soak_seconds, Math.min(4, values.concurrency), args.targetRps, children.gateway!.pid!, () => ({ classification: readSoakFailureClassification(database, Date.now() - 60_000), diagnostic_log_tails: diagnosticLogTails(temporary) })); await delay(5000); const cooldown = await memorySummary(children.gateway!.pid!); soak.route_recovery_after_response_limit = routeRecovery; soak.pre_soak_gateway_rss_mib = round(preSoak); soak.cooldown_gateway_rss_mib = cooldown.rss_mib_median; soak.retained_delta_from_idle_mib = round(cooldown.rss_mib_median - idleGateway);
     const checks: Obj[] = [
       check("100k-row control resources remain page bounded", controlScale.maximum_page_rows, "<=", 100, controlScale.maximum_page_rows <= 100), check("bounded control pages remain below 1 MiB", controlScale.maximum_response_bytes, "<=", MIB, controlScale.maximum_response_bytes <= MIB), check("concurrent control list RSS delta", controlScale.control_delta_rss_mib, "<=", args.controlListDeltaMaxMib, controlScale.control_delta_rss_mib <= args.controlListDeltaMaxMib), check("gateway idle RSS", idleGateway, "<=", args.idleMaxMib, idleGateway <= args.idleMaxMib),
       check("concurrent streams reached EOF", stream.bytes_received, "==", values.concurrency * streamBytes, stream.bytes_received === values.concurrency * streamBytes), check("stream start barrier admitted and released every configured stream", stream.start_barrier, "==", { required: values.concurrency, admitted: values.concurrency, released: true, failure: null }, stream.start_barrier.admitted === values.concurrency && stream.start_barrier.released && stream.start_barrier.failure === null), check("mock observed configured stream concurrency", stream.observed_peak_concurrency, ">=", values.concurrency, stream.observed_peak_concurrency >= values.concurrency), check("concurrent stream memory samples", stream.sample_count, ">=", 2, stream.sample_count >= 2), check("concurrent stream RSS delta", stream.gateway_delta_rss_mib, "<=", args.streamDeltaMaxMib, stream.gateway_delta_rss_mib <= args.streamDeltaMaxMib),
       check("two bounded standard OpenAI image responses completed", standardImage.first_responses, "==", 2, standardImage.first_responses === 2), check("standard OpenAI image response cap", standardImage.maximum_response_bytes, "<=", 16 * MIB, standardImage.maximum_response_bytes <= 16 * MIB), check("standard OpenAI image unretained replay policy", standardImage.replay_policy_verified, "==", true, standardImage.replay_policy_verified === true && standardImage.unretained_replay_rejections === 2 && standardImage.upstream_requests === 2), check("standard OpenAI image RSS delta", standardImage.gateway_delta_rss_mib, "<=", args.imageDeltaMaxMib, standardImage.gateway_delta_rss_mib <= args.imageDeltaMaxMib),
       check("two bounded Codex Responses-tool image responses completed", responsesImage.first_responses, "==", 2, responsesImage.first_responses === 2), check("Codex Responses-tool image response cap", responsesImage.maximum_response_bytes, "<=", 16 * MIB, responsesImage.maximum_response_bytes <= 16 * MIB), check("Codex Responses-tool unretained replay policy", responsesImage.replay_policy_verified, "==", true, responsesImage.replay_policy_verified === true && responsesImage.unretained_replay_rejections === 2 && responsesImage.upstream_requests === 2), check("Codex Responses-tool image RSS delta", responsesImage.gateway_delta_rss_mib, "<=", args.imageDeltaMaxMib, responsesImage.gateway_delta_rss_mib <= args.imageDeltaMaxMib), check("disconnects recorded as client cancellations", disconnect.recorded_client_cancelled_errors, ">=", disconnectAttempts, disconnect.recorded_client_cancelled_errors >= disconnectAttempts),
-      check("65 MiB durable response and both archives are complete with released resources", largeResponse.bytes_received, "==", LARGE_RESPONSE_BYTES, largeResponse.status === 200 && largeResponse.bytes_received === LARGE_RESPONSE_BYTES && largeResponse.sha256 === largeResponse.expected_sha256 && largeResponse.response_archive.sha256 === largeResponse.expected_sha256 && largeResponse.response_archive.bytes_received === LARGE_RESPONSE_BYTES && largeResponse.terminal_received === true && largeResponse.request_archive_sha256 === largeResponse.expected_request_sha256 && Object.values(largeResponse.permits).every((value) => value === 0)),
+      check("valid SSE above the former 64 MiB cumulative cap arrives complete", responseLimit.client_bytes_received, "==", FORMER_RESPONSE_LIMIT_BYTES + MIB, responseLimit.http_status === 200 && responseLimit.client_bytes_received === FORMER_RESPONSE_LIMIT_BYTES + MIB && responseLimit.client_error === undefined && responseLimit.terminal_received === true),
       check("large asset job succeeded", asset.status, "==", "succeeded", asset.status === "succeeded"), check("large media body is not archived", { archive_growth_bytes: asset.archive_growth_bytes, exact_size_asset_objects: asset.exact_size_asset_objects.length, media_archived: asset.media_archived }, "metadata only", { archive_growth_bytes: asset.archive_growth_bytes, exact_size_asset_objects: asset.exact_size_asset_objects.length, media_archived: asset.media_archived }, asset.archive_growth_bytes < MIB && asset.exact_size_asset_objects.length === 0 && asset.media_archived === false), check("large asset memory samples", asset.sample_count, ">=", 2, asset.sample_count >= 2), check("large asset phase-start RSS samples after bounded decay cooldown", phaseStart.sample_count, ">=", 8, phaseStart.sample_count >= 8), check("provider asset streamed through the gateway", asset.download.full.bytes_received, "==", asset.expected_asset_bytes, asset.download.full.bytes_received === asset.expected_asset_bytes), check("provider asset gateway download memory samples", asset.download.sample_count, ">=", 2, asset.download.sample_count >= 2), check("provider asset bounded range verified", asset.download.range.status, "==", 206, asset.download.range.status === 206 && asset.download.range.bytes_received === ASSET_RANGE_BYTES), check("large asset gateway phase RSS delta", asset.gateway_phase_delta_rss_mib, "<=", args.assetGatewayDeltaMaxMib, asset.gateway_phase_delta_rss_mib <= args.assetGatewayDeltaMaxMib), check("large asset worker RSS delta", asset.worker_delta_rss_mib, "<=", args.assetWorkerDeltaMaxMib, asset.worker_delta_rss_mib <= args.assetWorkerDeltaMaxMib),
       check("soak request failures", soak.failures, "==", 0, soak.failures === 0), check("soak memory samples", soak.sample_count, ">=", 2, soak.sample_count >= 2), check("post-soak retained RSS delta", soak.retained_delta_from_idle_mib, "<=", args.retainedDeltaMaxMib, soak.retained_delta_from_idle_mib <= args.retainedDeltaMaxMib),
     ]; if (values.soak_seconds >= 900) checks.push(check("15 minute soak RSS slope", soak.gateway_rss_slope_mib_per_minute, "<=", args.soakSlopeMaxMibPerMinute, soak.gateway_rss_slope_mib_per_minute <= args.soakSlopeMaxMibPerMinute));
     const observedPeak = processMemory(children.gateway!.pid!).high_water_mib as number; const comparison = { reference: "operator-supplied reference process", reference_rss_mib: args.comparisonRssMib, gateway_peak_rss_mib: observedPeak, measurement: "process lifetime VmHWM", gateway_to_reference_ratio: round(observedPeak / args.comparisonRssMib, 4) }; checks.push(check("gateway peak versus reference RSS", comparison.gateway_to_reference_ratio, "<=", args.comparisonMaxRatio, comparison.gateway_to_reference_ratio <= args.comparisonMaxRatio)); const rolesAlive = Object.fromEntries(Object.entries(children).map(([role, child]) => [role, child.exitCode === null])); checks.push(check("control, gateway, and worker remained alive", rolesAlive, "==", { control: true, gateway: true, worker: true }, Object.values(rolesAlive).every(Boolean))); const afterSha = fileSha256(binary); checks.push(check("release binary unchanged during the run", afterSha, "==", binarySha, afterSha === binarySha)); checks.push(check("gateway process RSS budget under the 256 MiB deployment limit", observedPeak, "<=", gatewayBudget, observedPeak <= gatewayBudget));
-    const passed = checks.every((item) => item.passed); const report: Obj = { schema_version: 5, benchmark: "memeloop-token-center-memory", profile: args.profile, started_at: startedAt.toISOString(), finished_at: new Date().toISOString(), git_revision: gitValue(repository, ["rev-parse", "HEAD"]), git_dirty: Boolean(gitValue(repository, ["status", "--porcelain"])), binary, binary_sha256: binarySha, binary_sha256_after: afterSha, binary_mtime: binaryMtime, system: { kernel: release(), architecture: arch(), logical_cpu_count: cpus().length, host_memory_mib: round(totalmem() / MIB), cgroup_memory_limit_mib: cgroupMemoryLimitMib(), node: process.version }, runtime_topology: "control/gateway/worker split; SQLite; filesystem archive", configuration: { ...values, target_rps: args.targetRps }, resource_budget: { gateway_limit_mib: args.gatewayLimitMib, required_gateway_headroom_mib: args.gatewayHeadroomMib, maximum_observed_gateway_rss_mib: gatewayBudget, measured_quantity: "gateway process RSS", observed_gateway_lifetime_high_water_rss_mib: round(observedPeak), reserved_for: "container and cgroup-charged overhead outside process RSS" }, idle, control_scale: controlScale, stream, synchronous_images: { standard_openai: standardImage, codex_responses_tool: responsesImage }, disconnect, large_response_integrity: largeResponse, asset, soak, comparison, checks, passed, exit_code: passed ? 0 : 2 }; if (!passed) report.diagnostic_log_tails = diagnosticLogTails(temporary); writeReport(output, report); return [report.exit_code, report];
+    const passed = checks.every((item) => item.passed); const report: Obj = { schema_version: 5, benchmark: "memeloop-token-center-memory", profile: args.profile, started_at: startedAt.toISOString(), finished_at: new Date().toISOString(), git_revision: gitValue(repository, ["rev-parse", "HEAD"]), git_dirty: Boolean(gitValue(repository, ["status", "--porcelain"])), binary, binary_sha256: binarySha, binary_sha256_after: afterSha, binary_mtime: binaryMtime, system: { kernel: release(), architecture: arch(), logical_cpu_count: cpus().length, host_memory_mib: round(totalmem() / MIB), cgroup_memory_limit_mib: cgroupMemoryLimitMib(), node: process.version }, runtime_topology: "control/gateway/worker split; SQLite; filesystem archive", configuration: { ...values, target_rps: args.targetRps }, resource_budget: { gateway_limit_mib: args.gatewayLimitMib, required_gateway_headroom_mib: args.gatewayHeadroomMib, maximum_observed_gateway_rss_mib: gatewayBudget, measured_quantity: "gateway process RSS", observed_gateway_lifetime_high_water_rss_mib: round(observedPeak), reserved_for: "container and cgroup-charged overhead outside process RSS" }, idle, control_scale: controlScale, stream, synchronous_images: { standard_openai: standardImage, codex_responses_tool: responsesImage }, disconnect, response_limit: responseLimit, asset, soak, comparison, checks, passed, exit_code: passed ? 0 : 2 }; if (!passed) report.diagnostic_log_tails = diagnosticLogTails(temporary); writeReport(output, report); return [report.exit_code, report];
   } catch (error) {
     // Capture each role before cleanup removes the temporary directory. The
     // caller serializes this evidence into the same report as the failure.

@@ -768,7 +768,7 @@ impl Database {
         .fetch_optional(&mut *connection)
         .await;
         let elapsed = started.elapsed();
-        drop(connection);
+        connection.finish();
         self.observe_key_authentication(
             "query",
             acquire_elapsed,

@@ -74,6 +74,7 @@ impl ProxyMemoryBudget {
     pub(crate) fn reservation(&self) -> Arc<ProxyMemoryReservation> {
         Arc::new(ProxyMemoryReservation {
             permits: self.permits.clone(),
+            capacity: self.capacity,
             held: Mutex::new((0, None)),
             response_reserved: AtomicBool::new(false),
             response_bytes: AtomicUsize::new(0),
@@ -82,6 +83,7 @@ impl ProxyMemoryBudget {
             json_body_ceiling: AtomicUsize::new(0),
             json_node_ceiling: AtomicUsize::new(0),
             json_reserved_bytes: AtomicUsize::new(0),
+            route_workspace_borrowed: AtomicBool::new(false),
         })
     }
 
@@ -130,6 +132,7 @@ impl ProxyMemoryBudget {
 }
 
 pub(crate) struct ProxyMemoryReservation {
+    capacity: usize,
     permits: Arc<Semaphore>,
     held: Mutex<(usize, Option<OwnedSemaphorePermit>)>,
     response_reserved: AtomicBool,
@@ -139,6 +142,28 @@ pub(crate) struct ProxyMemoryReservation {
     json_body_ceiling: AtomicUsize,
     json_node_ceiling: AtomicUsize,
     json_reserved_bytes: AtomicUsize,
+    route_workspace_borrowed: AtomicBool,
+}
+
+/// Exclusive use of the prepaid third request copy. This borrows an existing
+/// charge; it never creates or releases a second reservation for the same bytes.
+pub(crate) struct RequestRouteWorkspace {
+    reservation: Arc<ProxyMemoryReservation>,
+}
+
+impl RequestRouteWorkspace {
+    pub(crate) fn covers(&self, bytes: usize) -> bool {
+        bytes <= self.reservation.json_body_ceiling.load(Ordering::Acquire)
+            && self.reservation.request_json_reserved_bytes() > 0
+    }
+}
+
+impl Drop for RequestRouteWorkspace {
+    fn drop(&mut self) {
+        self.reservation
+            .route_workspace_borrowed
+            .store(false, Ordering::Release);
+    }
 }
 
 pub(crate) struct ConversationProjectionPermit {
@@ -171,6 +196,24 @@ impl Drop for SseStreamingMemory {
 }
 
 impl ProxyMemoryReservation {
+    pub(crate) fn borrow_route_workspace(
+        self: &Arc<Self>,
+        bytes: usize,
+    ) -> Option<RequestRouteWorkspace> {
+        if self.request_json_reserved_bytes() == 0
+            || bytes > self.json_body_ceiling.load(Ordering::Acquire)
+            || self
+                .route_workspace_borrowed
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return None;
+        }
+        Some(RequestRouteWorkspace {
+            reservation: self.clone(),
+        })
+    }
+
     pub(crate) fn try_reserve_ingress_bytes(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
         let units = u32::try_from(bytes.div_ceil(UNIT_BYTES)).ok()?;
         self.permits.clone().try_acquire_many_owned(units).ok()
@@ -619,6 +662,36 @@ impl ProxyMemoryReservation {
         self.try_reserve_json_shape(body.len(), nodes)
     }
 
+    /// Wait without joining the semaphore FIFO: a large JSON waiter must not
+    /// prevent active requests from acquiring small response buffers and releasing
+    /// their JSON owners. The caller retains only its locally replayable source.
+    pub(crate) async fn reserve_source_json(
+        self: &Arc<Self>,
+        bytes: usize,
+        nodes: usize,
+        mut reclaim: impl FnMut(),
+    ) -> Option<ArchiveOutputMemory> {
+        let json = bytes.checked_mul(3)?.checked_add(nodes.checked_mul(256)?)?;
+        let working = 64 * 1024;
+        let total = json.checked_add(working)?;
+        if total.div_ceil(UNIT_BYTES) > self.capacity / UNIT_BYTES {
+            return None;
+        }
+        while !self.try_grow(total, 1) {
+            reclaim();
+            // No parsed tree, raw read buffer, or partial JSON permit is held.
+            // Dropping the request cancels this wait without a detached task.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        self.json_body_ceiling.store(bytes, Ordering::Release);
+        self.json_node_ceiling.store(nodes, Ordering::Release);
+        self.json_reserved_bytes.fetch_add(json, Ordering::AcqRel);
+        Some(ArchiveOutputMemory {
+            reservation: self.clone(),
+            bytes: working,
+        })
+    }
+
     pub(crate) fn try_reserve_json_shape(&self, bytes: usize, nodes: usize) -> bool {
         let Some(required) = bytes.checked_mul(3).and_then(|bytes| {
             nodes
@@ -709,6 +782,51 @@ pub(crate) fn json_encoded_length(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn route_workspace_borrows_one_prepaid_copy_without_a_second_charge() {
+        let budget = ProxyMemoryBudget::new(256 * 1024);
+        let request = budget.reservation();
+        assert!(request.try_reserve_json_shape(64 * 1024, 1));
+        let charged = budget.snapshot().0;
+        assert!(budget.temporary(64 * 1024).is_err());
+        let workspace = request.borrow_route_workspace(64 * 1024).unwrap();
+        assert!(workspace.covers(64 * 1024));
+        assert!(!workspace.covers(64 * 1024 + 1));
+        assert_eq!(budget.snapshot().0, charged);
+        assert!(request.borrow_route_workspace(64 * 1024).is_none());
+        drop(workspace);
+        assert_eq!(budget.snapshot().0, charged);
+        assert!(request.borrow_route_workspace(64 * 1024).is_some());
+        request.release_unretained_json();
+        assert_eq!(budget.snapshot().0, 0);
+        assert!(request.borrow_route_workspace(1).is_none());
+    }
+
+    #[tokio::test]
+    async fn source_json_wait_does_not_block_response_allocation_or_leak_on_cancel() {
+        let budget = ProxyMemoryBudget::new(1024 * 1024);
+        let active = budget.reservation();
+        assert!(active.try_grow(768 * 1024, 1));
+        let waiting = budget.reservation();
+        let mut admission = Box::pin(waiting.reserve_source_json(128 * 1024, 1, || {}));
+        assert!(futures_util::poll!(&mut admission).is_pending());
+        assert_eq!(budget.snapshot().0, 768 * 1024);
+        // The waiter must not enter the semaphore FIFO ahead of this owner.
+        let response = active.try_reserve_archive_output(64 * 1024).unwrap();
+        drop(admission);
+        assert_eq!(budget.snapshot().0, 832 * 1024);
+        drop(response);
+        active.release(768 * 1024, 1);
+        let working = waiting
+            .reserve_source_json(128 * 1024, 1, || {})
+            .await
+            .unwrap();
+        assert!(waiting.request_json_reserved_bytes() > 0);
+        drop(working);
+        waiting.release_unretained_json();
+        assert_eq!(budget.snapshot().0, 0);
+    }
 
     #[test]
     fn four_gib_budget_keeps_full_capacity_and_releases_large_reservations() {

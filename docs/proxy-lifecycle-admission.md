@@ -2,11 +2,15 @@ Proxy lifecycle admission uses the shared weighted byte budget. A long stream
 does not consume a fixed process-wide request slot, so a sixty-fifth request is
 admitted when its memory reservations and credential policy allow it.
 
-The legacy `MTC_PROXY_LIFECYCLE_CONCURRENCY` configuration field is accepted for
-deployment compatibility but no longer limits requests. The active lifecycle
-metric counts actual owners, including streaming handoff and cancellation
-settlement, and can exceed the legacy value. It returns to zero only after those
-owners release their activity guards.
+The obsolete `MTC_PROXY_LIFECYCLE_CONCURRENCY` environment variable is no longer
+read or emitted by the chart. Remove `config.proxyLifecycleConcurrency` from
+deployment values before upgrading the chart: its strict schema rejects the
+removed setting. Lifecycle admission already uses bytes, so removing this
+unused setting does not change request admission.
+
+The active lifecycle metric counts actual owners, including streaming handoff
+and cancellation settlement. It returns to zero only after those owners release
+their activity guards.
 
 Request byte, JSON, SSE, retained-response and disk budgets remain enforced.
 Credential concurrency, authorization, usage reservation and settlement remain

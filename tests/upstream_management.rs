@@ -1068,6 +1068,23 @@ async fn check_codex_proxy_refresh_fence(expire_refresh: bool) {
         )
         .await
         .unwrap();
+    // Import the initial credential URL through the canonical manual policy
+    // before dispatch; same-policy replay must not create a new generation.
+    let (account, imported) = state
+        .db
+        .rotate_codex_transport_proxy(
+            account.id,
+            "codex-proxy-refresh-fence",
+            original_proxy.into(),
+            account.updated_at,
+            account.credential_generation,
+            "import-initial-manual-policy",
+            None,
+            pepper,
+        )
+        .await
+        .unwrap();
+    assert!(imported);
     let refresh_key = "codex-proxy-refresh-fence";
     let claim = state
         .db
@@ -1102,9 +1119,8 @@ async fn check_codex_proxy_refresh_fence(expire_refresh: bool) {
         .unwrap_err();
     assert!(matches!(
         &blocked,
-        memeloop_token_center::error::AppError::Conflict(_)
+        memeloop_token_center::error::AppError::ProxyGroupConflict("proxy_group_binding_conflict")
     ));
-    assert!(blocked.to_string().contains("already dispatched"));
 
     let (unchanged, changed) = state
         .db
@@ -1135,25 +1151,26 @@ async fn check_codex_proxy_refresh_fence(expire_refresh: bool) {
         .execute(&pool)
         .await
         .unwrap();
-        assert!(
-            state
-                .db
-                .rotate_codex_transport_proxy(
-                    account.id,
-                    "codex-proxy-refresh-fence",
-                    replacement_proxy.into(),
-                    account.updated_at,
-                    account.credential_generation,
-                    "proxy-with-pending-refresh-result",
-                    None,
-                    pepper,
-                )
-                .await
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("already dispatched")
-        );
+        let blocked = state
+            .db
+            .rotate_codex_transport_proxy(
+                account.id,
+                "codex-proxy-refresh-fence",
+                replacement_proxy.into(),
+                account.updated_at,
+                account.credential_generation,
+                "proxy-with-pending-refresh-result",
+                None,
+                pepper,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            blocked,
+            memeloop_token_center::error::AppError::ProxyGroupConflict(
+                "proxy_group_binding_conflict"
+            )
+        ));
         sqlx::query(
             "UPDATE upstream_oauth_refresh_leases SET pending_credential_ciphertext = NULL WHERE account_id = $1",
         )

@@ -41,6 +41,11 @@ async fn provider429_publishes_exact_model_and_next_request_uses_alternate_witho
             .unwrap();
         fixture.state.routing_persistence.drain_for_test().await;
     }
+    // The rejection reader may hand the remaining original to capture after
+    // its inspection budget. Wait for that owner to reach EOF before draining
+    // the body-derived observation it submits to routing persistence.
+    fixture.state.persistence.drain_for_test().await;
+    fixture.state.routing_persistence.drain_for_test().await;
     let evidence = sqlx::query(
         "SELECT upstream_model, failure_kind, reset_source, reset_at
          FROM upstream_supplier_availability WHERE upstream_account_id = $1",

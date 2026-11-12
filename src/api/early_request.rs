@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 use axum::{
     http::{HeaderValue, StatusCode},
@@ -10,13 +10,27 @@ use serde_json::Value;
 use crate::{AppState, db::EarlyRequestTerminal, error::PublicErrorCode, model::AuthenticatedKey};
 
 tokio::task_local! {
-    static METADATA: RefCell<Metadata>;
+    static METADATA: Arc<Mutex<Metadata>>;
 }
 
 #[derive(Default)]
 struct Metadata {
     model: String,
     admitted: bool,
+}
+
+/// Owned media execution must publish its admission handoff to the caller's
+/// observer, even though Tokio does not inherit task-local values.
+pub(super) fn preserve_observation<F: std::future::Future>(
+    future: F,
+) -> impl std::future::Future<Output = F::Output> {
+    let metadata = METADATA.try_with(Arc::clone).ok();
+    async move {
+        match metadata {
+            Some(metadata) => METADATA.scope(metadata, future).await,
+            None => future.await,
+        }
+    }
 }
 
 pub(super) fn safe_model(model: &str) -> &str {
@@ -33,19 +47,33 @@ pub(super) fn safe_model(model: &str) -> &str {
 
 pub(super) fn observe_model(model: Option<&Value>) {
     if let Some(model) = model.and_then(Value::as_str) {
-        let _ =
-            METADATA.try_with(|current| current.borrow_mut().model = safe_model(model).to_owned());
+        let _ = METADATA.try_with(|current| {
+            current
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .model = safe_model(model).to_owned()
+        });
     }
 }
 
 pub(super) fn mark_admitted() {
-    let _ = METADATA.try_with(|current| current.borrow_mut().admitted = true);
+    let _ = METADATA.try_with(|current| {
+        current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .admitted = true
+    });
 }
 
 pub(super) fn is_pre_admission_failure(status: StatusCode) -> bool {
     (status.is_client_error() || status.is_server_error())
         && METADATA
-            .try_with(|metadata| !metadata.borrow().admitted)
+            .try_with(|metadata| {
+                !metadata
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .admitted
+            })
             .unwrap_or(false)
 }
 
@@ -59,7 +87,7 @@ pub(super) async fn observe(
     let created_at = crate::db::unix_millis()
         .saturating_sub(context.elapsed_millis_at(std::time::Instant::now()));
     METADATA
-        .scope(RefCell::new(Metadata::default()), async {
+        .scope(Arc::new(Mutex::new(Metadata::default())), async {
             let mut response = operation.await;
             if is_pre_admission_failure(response.status()) {
                 let error_code = response
@@ -84,7 +112,13 @@ pub(super) async fn observe(
                     completed_at: crate::db::unix_millis().max(created_at),
                     duration_ms: context.elapsed_millis_at(std::time::Instant::now()),
                     protocol: protocol.to_owned(),
-                    model: METADATA.with(|metadata| metadata.borrow().model.clone()),
+                    model: METADATA.with(|metadata| {
+                        metadata
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .model
+                            .clone()
+                    }),
                     status_code: response.status().as_u16(),
                     error_code: error_code.to_owned(),
                 };
@@ -121,7 +155,27 @@ mod diagnostics_tests;
 
 #[cfg(test)]
 mod tests {
-    use super::safe_model;
+    use super::*;
+
+    #[tokio::test]
+    async fn owned_worker_admission_is_visible_only_to_its_request_observer() {
+        METADATA
+            .scope(Arc::new(Mutex::new(Metadata::default())), async {
+                assert!(is_pre_admission_failure(StatusCode::BAD_REQUEST));
+                let operation = preserve_observation(async {
+                    tokio::task::yield_now().await;
+                    mark_admitted();
+                });
+                tokio::spawn(operation).await.unwrap();
+                assert!(!is_pre_admission_failure(StatusCode::BAD_GATEWAY));
+                METADATA
+                    .scope(Arc::new(Mutex::new(Metadata::default())), async {
+                        assert!(is_pre_admission_failure(StatusCode::BAD_REQUEST));
+                    })
+                    .await;
+            })
+            .await;
+    }
 
     #[test]
     fn model_metadata_is_bounded_and_excludes_payload_fragments() {

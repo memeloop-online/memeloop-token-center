@@ -102,7 +102,7 @@ async fn contract(database: &Database) {
     assert_eq!(group["members"][0]["port"], 1080);
     assert!(group["probe_url"].is_null());
     assert_eq!(group["probe_attempts"], 2);
-    assert!(group["members"][0].get("proxy_url").is_none());
+    assert_eq!(group["members"][0]["proxy_url"], PRIMARY);
     let unrelated = database
         .create_transport_group(
             CreateGroup {
@@ -424,6 +424,22 @@ async fn contract(database: &Database) {
         KEY,
     )
     .unwrap();
+    // Unbind now retains the selected exit as an authoritative manual policy.
+    // A cold legacy-only reader must not bypass that policy via its credential.
+    assert!(
+        legacy
+            .select_config(
+                account.id,
+                snapshot.credential_generation,
+                &credential,
+                &snapshot.config,
+            )
+            .is_err()
+    );
+    legacy
+        .synchronize_managed_for_test(&database.pool)
+        .await
+        .unwrap();
     let selection = legacy
         .select_config(
             account.id,
@@ -433,7 +449,7 @@ async fn contract(database: &Database) {
         )
         .unwrap();
     assert_eq!(selection.credential.proxy().unwrap().0, BACKUP);
-    assert!(selection.member().is_none());
+    assert_eq!(selection.egress_snapshot().unwrap().member_id, Some(backup));
     database
         .delete_transport_group(
             id,

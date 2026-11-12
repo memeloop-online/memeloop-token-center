@@ -106,6 +106,7 @@ pub(super) async fn create_audio_transcription(
         .map_err(|_| AppError::BadRequest("plugin-rewritten audio request is invalid".into()))?;
     validate_audio_metadata(&metadata)?;
 
+    let context = super::proxy_diagnostics::Context::current();
     let request_id = resources.request_id;
     let route = crate::generation::group_routing::prepare_route_for_protocol(
         &mut state,
@@ -183,7 +184,8 @@ pub(super) async fn create_audio_transcription(
         resources.raw_request.clone(),
         resources.memory.clone(),
     );
-    let worker = tokio::spawn(async move {
+    super::early_request::mark_admitted();
+    let operation = async move {
         let _resource_owners = (&resources.lifecycle, &resources.memory);
         let result = async move {
             let started = Instant::now();
@@ -374,7 +376,8 @@ pub(super) async fn create_audio_transcription(
         }
         .await;
         result.map(|response| super::auth::hold_response_body_permit(response, resources))
-    });
+    };
+    let worker = tokio::spawn(super::proxy_diagnostics::CONTEXT.scope(context, operation));
     match worker.await {
         Ok(result) => result,
         Err(error) => {

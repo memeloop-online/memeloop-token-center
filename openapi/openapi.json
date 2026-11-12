@@ -1311,7 +1311,7 @@
         ],
         "operationId": "operatorResponse",
         "summary": "Run inference using an explicitly authorized billing credential",
-        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Only JSON\nResponses are supported; stream=true is rejected.\n",
+        "description": "Requires the same keys:write scope and tenant authorization as copying the\nselected existing key. Does not mint a credential or infer a user identity\nfrom a service token. The selected key's normal gateway model grants,\nrouting policy, expiry, rate limits, balance and billing apply. Its secret\nand the operator credential never enter the plugin request or response.\nOptional conversation identifiers connect requests to the core session and\nusage records; the wrapper is consumed by the gateway. Request and response\nbodies use the normal core archive pipeline.\nRequires an active key with a stored copyable credential. Responses support\nJSON (stream=false or omitted) and server-sent events (stream=true).\nStreaming uses the normal gateway backpressure, cancellation, request/session\narchive and usage settlement lifecycle. Consume response.completed before\ndeclaring a completed turn. Cancellation leaves usage unknown until the\nupstream reports its normal settlement.\n",
         "security": [
           {
             "serviceBearer": []
@@ -1347,8 +1347,7 @@
                     "additionalProperties": true,
                     "properties": {
                       "stream": {
-                        "type": "boolean",
-                        "const": false
+                        "type": "boolean"
                       }
                     }
                   }
@@ -1366,6 +1365,12 @@
                   "type": "object",
                   "additionalProperties": true
                 }
+              },
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
               }
             }
           },
@@ -20076,6 +20081,8 @@
           "settled_at",
           "error_code",
           "audit",
+          "dispatch_diagnostic",
+          "quota_refresh_status",
           "effect",
           "consumes_credits"
         ],
@@ -20180,6 +20187,58 @@
               "null"
             ]
           },
+          "dispatch_diagnostic": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "stage",
+              "reason",
+              "supplier_http_status"
+            ],
+            "properties": {
+              "stage": {
+                "type": "string",
+                "enum": [
+                  "prepare",
+                  "send",
+                  "response"
+                ]
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "credential_invalid",
+                  "connect_timeout",
+                  "connect_failed",
+                  "timeout",
+                  "request_invalid",
+                  "transport_failed",
+                  "unavailable",
+                  "supplier_http_status"
+                ]
+              },
+              "supplier_http_status": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 100,
+                "maximum": 599
+              }
+            }
+          },
+          "quota_refresh_status": {
+            "type": "string",
+            "enum": [
+              "not_attempted",
+              "pending",
+              "succeeded"
+            ],
+            "description": "Ordinary fresh quota read after acceptance, not proof of supplier reset completion. Accepted legacy operations without readback evidence remain pending."
+          },
           "audit": {
             "type": "array",
             "maxItems": 32,
@@ -20225,7 +20284,8 @@
                   "format": "int64"
                 }
               }
-            }
+            },
+            "description": "Latest 32 durable audit events in chronological order. Readback evidence is derived from the full audit history."
           },
           "effect": {
             "const": "supplier_defined_codex_rate_limits"

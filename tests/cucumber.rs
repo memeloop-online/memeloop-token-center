@@ -3705,11 +3705,15 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
             .json()
             .await
             .expect("image stats JSON");
-        if stats["summary"]["total_requests"] == 1 {
+        // The deliberately mismatched replay is a separate non-billable
+        // admission failure; it does not replace the paid image operation.
+        if stats["summary"]["total_requests"] == 2 {
+            assert_eq!(stats["summary"]["successful_requests"], 1);
+            assert_eq!(stats["summary"]["failed_requests"], 1);
             assert_eq!(stats["summary"]["total_cost"], "0.3");
             let requests: Value = world
                 .client
-                .get(format!("{}/self/v1/requests?limit=1", world.service_url))
+                .get(format!("{}/self/v1/requests?limit=10", world.service_url))
                 .bearer_auth(&world.current_key)
                 .send()
                 .await
@@ -3717,7 +3721,22 @@ async fn openai_image_is_archived_and_metered(world: &mut TokenCenterWorld) {
                 .json()
                 .await
                 .expect("image request history JSON");
-            assert_eq!(requests[0]["protocol"], "openai-image");
+            let records = requests.as_array().expect("image history records");
+            assert_eq!(records.len(), 2);
+            let paid = records
+                .iter()
+                .find(|record| record["request_id"] == expected_request_id)
+                .expect("original paid image operation remains visible");
+            assert_eq!(paid["protocol"], "openai-image");
+            assert_eq!(paid["status_code"], 200);
+            assert_eq!(paid["cost"], "0.3");
+            let rejected = records
+                .iter()
+                .find(|record| record["request_id"] != expected_request_id)
+                .expect("mismatched replay has its own diagnostic identity");
+            assert_eq!(rejected["status_code"], 400);
+            assert_eq!(rejected["terminal_cause_code"], "gateway_pre_admission");
+            assert_eq!(rejected["billing"]["billable"], false);
             let other = world
                 .client
                 .post(format!("{}/internal/v1/keys", world.service_url))
@@ -7957,7 +7976,7 @@ async fn mock_streaming_responses_invalid_usage(world: &mut TokenCenterWorld) {
                     concat!(
                     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-invalid-usage\"}}\n\n",
                     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"delivered output\"}\n\n",
-                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-invalid-usage\",\"usage\":{\"input_tokens\":1,\"output_tokens\":999}}}\n\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-invalid-usage\",\"usage\":{\"input_tokens\":1,\"output_tokens\":-1}}}\n\n",
                     "data: [DONE]\n\n"
                     ),
                     "text/event-stream",

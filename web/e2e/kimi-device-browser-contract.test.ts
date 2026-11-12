@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { editProviderAccount } from './support/provider-account-navigation.js';
+import { editProviderAccount, manageProviderAccount } from './support/provider-account-navigation.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
@@ -90,7 +90,8 @@ test('Kimi display-name editing saves metadata alone and keeps unknown identity 
       });
       await page.goto(`${origin}/e2e/fixtures/authorization-code.html?full-page&scope-controls&app-shell`);
       await page.locator('.app-context-bar').waitFor();
-      await page.locator(`[data-upstream-id="${account.id}"]`).getByRole('button', { name: copy[locale].reauthorize, exact: true }).click();
+      const accountWorkspace = await manageProviderAccount(page, account.id);
+      await accountWorkspace.getByRole('button', { name: copy[locale].reauthorize, exact: true }).click();
       const reauthorization = page.locator('.provider-reauthorization-workspace');
       await reauthorization.getByText('My Kimi', { exact: true }).waitFor();
       assert.equal(await reauthorization.getByLabel(chinese ? '连接名称' : 'Connection name', { exact: false }).count(), 0);
@@ -273,7 +274,9 @@ test('Kimi device login is explicit, respects poll intervals and expiry, and pre
       await details.getByRole('button', { name: chinese ? '返回账号列表' : 'Back to account list', exact: true }).click();
       assert.equal(await details.count(), 0);
       assert.equal(await manage.evaluate(button => document.activeElement === button), true, 'back returns focus to the single list entry');
-      await row.getByRole('button', { name: text.reauthorize, exact: true }).click();
+      assert.equal(await row.getByRole('button', { name: text.reauthorize, exact: true }).count(), 0, 'expiry alone does not require reauthorization');
+      await manage.click();
+      await details.getByRole('button', { name: text.reauthorize, exact: true }).click();
       const workspace = page.locator('.provider-reauthorization-workspace');
       const help = authorizationJourneyCopy(locale, 'kimi-oauth');
       await workspace.getByText(help.purpose, { exact: true }).waitFor();

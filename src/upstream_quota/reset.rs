@@ -16,7 +16,7 @@ struct DispatchCompletion {
     operation: String,
     owner: Uuid,
     accepted: bool,
-    error: Option<&'static str>,
+    error: Option<String>,
     finished: bool,
 }
 
@@ -29,13 +29,18 @@ impl Drop for DispatchCompletion {
         let operation = self.operation.clone();
         let owner = self.owner;
         let accepted = self.accepted;
-        let error = self.error;
+        let error = self.error.clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let mut delay = Duration::from_secs(1);
                 loop {
                     match db
-                        .finish_quota_reset_owned(&operation, Some(owner), accepted, error)
+                        .finish_quota_reset_owned(
+                            &operation,
+                            Some(owner),
+                            accepted,
+                            error.as_deref(),
+                        )
                         .await
                     {
                         Ok(()) => return,
@@ -643,7 +648,7 @@ async fn confirm_guarded(
             operation: claim_operation.clone(),
             owner: Uuid::now_v7(),
             accepted: false,
-            error: Some("reset_dispatch_owner_ended"),
+            error: Some("reset_dispatch_owner_ended".into()),
             finished: false,
         };
         let claim = db
@@ -670,7 +675,7 @@ async fn confirm_guarded(
     };
     // Each durable operation keeps one redeem ID and one supplier dispatch.
     let result = if guard.is_some_and(|guard| unix_millis() >= guard.deadline_ms) {
-        Err("quota_reset_deadline_elapsed")
+        Err("quota_reset_deadline_elapsed".to_owned())
     } else {
         let consume_url = CONSUME_URL;
         #[cfg(test)]
@@ -698,7 +703,7 @@ async fn confirm_guarded(
             operation,
             Some(completion.owner),
             accepted,
-            completion.error,
+            completion.error.as_deref(),
         )
         .await?;
     completion.finished = true;
@@ -728,7 +733,14 @@ async fn confirm_guarded(
                 QuotaReadTrigger::ResetWorkflow,
             )
             .await;
-        match readback.error_code {
+        let readback_error = readback
+            .error_code
+            .or(readback.reset_capability.credit_error_code);
+        state
+            .db
+            .record_quota_reset_readback(account, operation, actor, readback_error)
+            .await?;
+        match readback_error {
             None => tracing::info!(
                 upstream_account_id = %account.id,
                 credential_generation = account.credential_generation,
@@ -764,18 +776,14 @@ async fn consume_client(
     if r2_tests::fixture_url(CONSUME_URL).is_some() {
         return Ok(crate::build_no_retry_http_client(None, &[]).unwrap());
     }
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        crate::network::client_for_codex_url_without_retries(
-            &state.http,
-            CONSUME_URL,
-            &json!({"network_scope":"public"}),
-            dispatch_credential.proxy(),
-            false,
-        ),
+    crate::network::client_for_codex_url_without_retries(
+        &state.http,
+        CONSUME_URL,
+        &json!({"network_scope":"public"}),
+        dispatch_credential.proxy(),
+        false,
     )
     .await
-    .map_err(|_| temporarily_unavailable("quota_reset_transport_timeout"))?
     .map_err(|_| temporarily_unavailable("quota_reset_transport"))
 }
 
@@ -871,7 +879,7 @@ async fn dispatch_once(
     account: reqwest::header::HeaderValue,
     url: &str,
     redeem: &str,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     let request = http
         .post(url)
         .header("chatgpt-account-id", account)
@@ -887,12 +895,24 @@ async fn dispatch_once(
         .json(&json!({"redeem_request_id":redeem}));
     let request = credential
         .apply(request, unix_millis())
-        .map_err(|_| "reset_dispatch_unknown")?;
-    let response = request.send().await.map_err(|_| "reset_dispatch_unknown")?;
+        .map_err(|_| "reset_prepare_credential_invalid".to_owned())?;
+    let response = request.send().await.map_err(|error| {
+        let reason = match (error.is_connect(), error.is_timeout()) {
+            (true, true) => "connect_timeout",
+            (true, false) => "connect_failed",
+            (false, true) => "timeout",
+            _ if error.is_builder() => "request_invalid",
+            _ => "transport_failed",
+        };
+        format!("reset_send_{reason}")
+    })?;
     if response.status().is_success() {
         Ok(())
     } else {
-        Err("reset_supplier_response_unknown")
+        Err(format!(
+            "reset_response_http_{}",
+            response.status().as_u16()
+        ))
     }
 }
 
@@ -1041,7 +1061,7 @@ mod tests {
                 )
                 .await
                 .unwrap_err(),
-                "reset_supplier_response_unknown"
+                format!("reset_response_http_{status}")
             );
             assert_eq!(server.received_requests().await.unwrap().len(), 1);
         }
@@ -1085,7 +1105,7 @@ mod tests {
             )
             .await
             .unwrap_err(),
-            "reset_supplier_response_unknown"
+            "reset_response_http_307"
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }

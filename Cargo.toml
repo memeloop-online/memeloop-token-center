@@ -114,3 +114,7 @@ strip = "debuginfo"
 # feature can reach it. This source-identical, manifest-only fork removes that
 # dormant surface; see vendor/rust_decimal/MEMELOOP-FORK.md.
 rust_decimal = { path = "vendor/rust_decimal" }
+
+# Published SQLx SQLite sources with the reviewed SQLite security dependency bound.
+# See vendor/sqlx-sqlite/MEMELOOP-FORK.md.
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }

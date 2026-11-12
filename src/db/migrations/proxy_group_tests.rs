@@ -108,10 +108,6 @@ async fn upgrade_contract(database: &Database) {
         .await
         .unwrap();
     for statement in [
-        "DROP TABLE group_allocation_history_hours",
-        "DROP TABLE group_allocation_history_contributions",
-        "DROP TABLE group_allocation_history_receipts",
-        "DROP TABLE group_allocation_history_state",
         "DROP TABLE group_allocation_pending",
         "DROP TABLE group_allocation_reservations",
         "DROP TABLE group_allocation_sessions",

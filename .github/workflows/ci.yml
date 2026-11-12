@@ -108,7 +108,7 @@ jobs:
         run: cargo audit --deny warnings
       - name: Reject forbidden dependency re-entry and verify vendored provenance
         run: |
-          node --test tests/ops/rust-decimal-vendor-contract.test.ts tests/ops/wreq-util-vendor-contract.test.ts
+          node --test tests/ops/rust-decimal-vendor-contract.test.ts tests/ops/wreq-util-vendor-contract.test.ts tests/ops/sqlx-sqlite-vendor-contract.test.ts
           default_tree="$(cargo tree --locked --target all --prefix none)"
           all_features_tree="$(cargo tree --locked --all-features --target all --prefix none)"
           for crate in rsa rkyv rkyv_derive sqlx-mysql sigstore; do
@@ -1118,6 +1118,8 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             web/package-lock.json
+      - name: Validate plaintext review and isolated file-task protocols
+        run: node --test tests/ops/kimi-plaintext-review.test.ts tests/ops/plaintext-file-task.test.ts tests/ops/plaintext-host-bridge.test.ts
       - name: Install pinned workflow-policy parser dependencies
         run: |
           npm ci --ignore-scripts

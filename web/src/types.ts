@@ -126,7 +126,7 @@ export interface RequestDetail extends RequestView {
   request_body: unknown;
   response_body: unknown;
   archive_complete: boolean;
-  archive?: Record<'request' | 'response', { state: RequestArchiveState; complete: boolean; reason: string | null }>;
+  archive?: Record<'request' | 'response', { state: RequestArchiveState; complete: boolean; reason: string | null; preview?: { kind: 'stream'; bytes: number } }>;
   provenance?: {
     source: string;
     disposition: 'exact' | 'unlinked';
@@ -1106,7 +1106,7 @@ export interface PluginConfiguration {
 }
 
 export interface UpstreamAccount {
-  oauth_refresh?: import('./operator/providerAccountState').OAuthRefreshStatus | null;
+  oauth_refresh?: import('./operator/providerAccountState.js').OAuthRefreshStatus | null;
   can_update_transport_proxy?: boolean;
   has_proxy?: boolean;
   proxy_scheme?: 'socks5' | 'socks5h' | null;
