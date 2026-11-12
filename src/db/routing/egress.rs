@@ -251,6 +251,50 @@ impl Database {
             .collect()
     }
 
+    pub(crate) async fn history_egress_in_transaction(
+        transaction: &mut Transaction<'_, Any>,
+        request_id: Uuid,
+    ) -> Result<Vec<RequestEgressAttempt>, AppError> {
+        let rows = sqlx::query(
+            "SELECT * FROM request_egress_attempts WHERE request_id = $1
+             ORDER BY observed_at, attempt_id",
+        )
+        .bind(request_id.to_string())
+        .fetch_all(&mut **transaction)
+        .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(RequestEgressAttempt {
+                    request_id,
+                    attempt_id: parse_uuid(row.try_get("attempt_id")?)?,
+                    outbound_attempt: row.try_get("outbound_attempt")?,
+                    connect_attempt: row.try_get("connect_attempt")?,
+                    route_id: parse_uuid(row.try_get("route_id")?)?,
+                    upstream_account_id: parse_uuid(row.try_get("upstream_account_id")?)?,
+                    credential_generation: row.try_get("credential_generation")?,
+                    transport_revision: row.try_get("transport_revision")?,
+                    observed_at: row.try_get("observed_at")?,
+                    selected: decode_selected(&row.try_get::<String, _>("snapshot_json")?)?,
+                    transport: serde_json::from_str(&row.try_get::<String, _>("transport_json")?)
+                        .map_err(|_| {
+                        AppError::storage("egress_transport_snapshot_is_malformed")
+                    })?,
+                    connection_binding: row
+                        .try_get::<Option<String>, _>("connection_binding_json")?
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()
+                        .map_err(|_| AppError::storage("egress_connection_binding_is_malformed"))?,
+                    request_payload_bytes: row.try_get("request_payload_bytes")?,
+                    response_payload_bytes: row.try_get("response_payload_bytes")?,
+                    completed: row.try_get::<i64, _>("completed")? != 0,
+                    final_response: row.try_get::<i64, _>("final_response")? != 0,
+                    response_body_complete: row.try_get::<i64, _>("response_body_complete")? != 0,
+                    measurement_basis: "application_payload_estimate",
+                })
+            })
+            .collect()
+    }
+
     pub async fn request_egress_summary(
         &self,
         start: i64,

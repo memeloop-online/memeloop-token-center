@@ -68,13 +68,25 @@ pub(super) async fn capture_native_in_transaction(
     let payload_json = serde_json::to_value(&payload).map_err(|_| AppError::storage("history_envelope_serialization"))?;
     let statistics = Database::history_statistics_in_transaction(transaction, &history_identity, &payload_json).await?;
     let fact = Database::history_analysis_fact_in_transaction(transaction, &history_identity).await?;
+    let egress = Database::history_egress_in_transaction(transaction, history_identity.request_id).await?;
+    let transport = Database::history_transport_in_transaction(transaction, history_identity.request_id).await?;
+    let observation = sqlx::query("SELECT * FROM conversation_observations WHERE request_id=$1 AND key_id=$2 AND cluster_id=$3")
+        .bind(request_id).bind(&key).bind(payload_json["session_context"]["session_id"].as_str())
+        .fetch_optional(&mut **transaction).await?;
+    let execution = observation.as_ref().map(super::requests::conversations::execution_metadata_from_row).transpose()?.flatten();
+    let structure = observation.as_ref().map(super::requests::conversations::execution_structure_from_row).transpose()?.flatten();
+    let upstream_name: Option<String> = if let Some(upstream) = fact.get("upstream_account_id").unwrap_or(&payload_json["upstream_account_id"]).as_str().filter(|value| !value.is_empty()) {
+        sqlx::query_scalar("SELECT name FROM upstream_accounts WHERE id=$1").bind(upstream).fetch_optional(&mut **transaction).await?
+    } else { None };
+    let filter_cost_micros: Option<i64> = if request.try_get::<Option<i64>,_>("completed_at")?.is_some() { request.try_get("cost_micros")? } else { None };
+    let read_model = serde_json::json!({"archive":archive,"fact":fact,"upstream_name":upstream_name,"execution":execution,"structure":structure,"egress_attempts":egress,"transport_diagnostics":transport});
     let envelope = serde_json::json!({
         "version": 1, "source": "native", "revision": revision,
         "tenant_id": tenant, "key_id": key, "request_id": request_id,
         "created_at": identity.try_get::<i64,_>("created_at")?,
         // This exact immutable archive identity survives source-table retirement.
         "archive_identity": {"tenant_id": tenant, "request_id": request_id},
-        "payload": payload, "archive": archive, "statistics": statistics, "fact": fact, "originals": originals,
+        "payload": payload, "filter_cost_micros": filter_cost_micros, "statistics": statistics, "read_model": read_model, "originals": originals,
     });
     let frozen = serde_json::to_string(&envelope).map_err(|_| AppError::storage("history_envelope_serialization"))?;
     let stored: String = sqlx::query_scalar("INSERT INTO request_history_immutable_outbox (revision,source,request_id,tenant_id,key_id,created_at,snapshot) VALUES ($1,'native',$2,$3,$4,$5,$6) ON CONFLICT(revision) DO UPDATE SET snapshot=request_history_immutable_outbox.snapshot RETURNING snapshot")
