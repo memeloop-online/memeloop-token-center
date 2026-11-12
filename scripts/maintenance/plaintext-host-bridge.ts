@@ -67,7 +67,7 @@ export async function bridge(options: Options, connect = (binary: string, args: 
   };
   await save();
   const provider = 'mtc_plaintext_bridge';
-  const args = ['-c', `model_providers.${provider}.name="MTC plaintext bridge"`, '-c', `model_providers.${provider}.base_url=${JSON.stringify(options.baseUrl)}`, '-c', `model_providers.${provider}.wire_api="responses"`, '-c', `model_providers.${provider}.env_key="MTC_BRIDGE_API_KEY"`];
+  const args = ['-c', `model_provider=${JSON.stringify(provider)}`, '-c', `model_providers.${provider}.name="MTC plaintext bridge"`, '-c', `model_providers.${provider}.base_url=${JSON.stringify(options.baseUrl)}`, '-c', `model_providers.${provider}.wire_api="responses"`, '-c', `model_providers.${provider}.env_key="MTC_BRIDGE_API_KEY"`];
   const server = connect(options.binary, args, { ...process.env, MTC_BRIDGE_API_KEY: options.apiKey });
   const turns = new Map<string, { resolve: (turn: any) => void; reject: (error: Error) => void; items: any[] }>();
   server.disconnected = error => { for (const turn of turns.values()) turn.reject(error); turns.clear(); };

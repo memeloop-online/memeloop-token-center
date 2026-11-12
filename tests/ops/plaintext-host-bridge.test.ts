@@ -31,7 +31,10 @@ test('isolated dynamic-tool delegation forwards exact plaintext into a distinct 
     },
   };
   try {
-    const result = await bridge({ binary: 'unused', baseUrl: 'https://example.invalid/v1', apiKey: 'private-key', parentModel: 'parent', kimiModel: 'kimi', directory, receipt: path.join(root, 'receipt.json'), task: 'Useful task with private-key' }, () => fake as unknown as AppServer);
+    const result = await bridge({ binary: 'unused', baseUrl: 'https://example.invalid/v1', apiKey: 'private-key', parentModel: 'parent', kimiModel: 'kimi', directory, receipt: path.join(root, 'receipt.json'), task: 'Useful task with private-key' }, (_binary, args) => {
+      assert(args.includes('model_provider="mtc_plaintext_bridge"'));
+      return fake as unknown as AppServer;
+    });
     assert.equal(result.completed, true); assert(closed);
     assert(!JSON.stringify(result).includes('private-key'));
     const threads = calls.filter(c => c.method === 'thread/start');
