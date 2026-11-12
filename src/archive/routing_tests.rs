@@ -237,6 +237,40 @@ async fn training_cas_real_s3_configuration_and_reader() {
             .unwrap(),
         bytes
     );
+    // Exercise actual S3 multipart and copy-if-not-exists on the configured
+    // training backend; staged ownership remains fixed if defaults change.
+    let mut staged_config = config.clone();
+    staged_config.training_staging_writes = true;
+    let staged_archive = super::ArchiveStore::from_config(&staged_config)
+        .await
+        .unwrap();
+    let key = crate::archive_staging::ArchiveStagingKey::new(
+        crate::archive_staging::ArchiveStagingOwner::ProxyRequest(Uuid::now_v7()),
+        crate::archive_staging::ArchiveStagingPurpose::Request,
+        Uuid::now_v7(),
+    )
+    .unwrap();
+    let key = staged_archive.select_staging_key(key).unwrap();
+    let mut writer = staged_archive
+        .start_compressed_writer(&format!("{}/body", key.canonical_prefix()))
+        .await
+        .unwrap();
+    writer.write(bytes.clone()).await.unwrap();
+    let staged = writer.finish_staged().await.unwrap();
+    let cas = reader
+        .promote_staged_text_to_cas(tenant, &staged)
+        .await
+        .unwrap();
+    assert_eq!(
+        reader.get_tenant_content(tenant, &cas, 100).await.unwrap(),
+        bytes
+    );
+    reader.delete_archive_staging_segment(key).await.unwrap();
+    assert!(reader.archive_staging_segment_is_empty(key).await.unwrap());
+    assert_eq!(
+        reader.get_tenant_content(tenant, &cas, 100).await.unwrap(),
+        bytes
+    );
     let mut changed = config.clone();
     changed
         .training_s3
@@ -246,4 +280,98 @@ async fn training_cas_real_s3_configuration_and_reader() {
         .push_str("-changed");
     let wrong = super::ArchiveStore::from_config(&changed).await.unwrap();
     assert!(wrong.head_size(&reference.object_locator).await.is_err());
+}
+
+#[tokio::test]
+async fn typed_staging_keeps_durable_backend_through_writer_promotion_and_cleanup() {
+    use crate::archive_staging::{ArchiveStagingKey, ArchiveStagingOwner, ArchiveStagingPurpose};
+    let mut archive = super::ArchiveStore::training_staging_memory_for_test();
+    let bare = ArchiveStagingKey::new(
+        ArchiveStagingOwner::ProxyRequest(Uuid::now_v7()),
+        ArchiveStagingPurpose::Request,
+        Uuid::now_v7(),
+    )
+    .unwrap();
+    let key = archive.select_staging_key(bare).unwrap();
+    let location = format!("{}/body", key.canonical_prefix());
+    let legacy = format!("{}/body", bare.canonical_prefix());
+    archive
+        .put(&legacy, Bytes::from_static(b"legacy twin"))
+        .await
+        .unwrap();
+    let mut writer = archive.start_compressed_writer(&location).await.unwrap();
+    // Switching defaults after multipart creation cannot move its object.
+    archive.training_staging_writes = false;
+    archive.training_cas_writes = false;
+    writer
+        .write(Bytes::from_static(b"training staged plaintext"))
+        .await
+        .unwrap();
+    let staged = writer.finish_staged().await.unwrap();
+    assert_eq!(staged.object_locator, format!("{location}.mtcz1"));
+    assert_eq!(
+        archive.get(&staged.object_locator).await.unwrap(),
+        "training staged plaintext"
+    );
+    let cas = archive
+        .promote_staged_text_to_cas(Uuid::now_v7(), &staged)
+        .await
+        .unwrap();
+    assert!(cas.object_locator.starts_with("stores/training/"));
+    assert!(
+        archive
+            .delete_prefix(&key.canonical_prefix())
+            .await
+            .is_err()
+    );
+    assert!(archive.delete(&staged.object_locator).await.is_err());
+    archive.delete_archive_staging_segment(key).await.unwrap();
+    assert!(archive.archive_staging_segment_is_empty(key).await.unwrap());
+    assert_eq!(archive.get(&legacy).await.unwrap(), "legacy twin");
+    assert_eq!(
+        archive.get(&cas.object_locator).await.unwrap(),
+        "training staged plaintext"
+    );
+
+    // The inverse cleanup must not delete a training twin either.
+    archive
+        .put(&location, Bytes::from_static(b"training twin"))
+        .await
+        .unwrap();
+    archive.delete_archive_staging_segment(bare).await.unwrap();
+    assert_eq!(archive.get(&location).await.unwrap(), "training twin");
+    archive.training = None;
+    assert!(archive.get(&location).await.is_err());
+    assert!(archive.delete_archive_staging_segment(key).await.is_err());
+}
+
+#[tokio::test]
+async fn staging_identity_and_typed_segments_are_fail_closed() {
+    use crate::archive_staging::{ArchiveStagingKey, ArchiveStagingOwner, ArchiveStagingPurpose};
+    let archive = super::ArchiveStore::training_staging_memory_for_test();
+    let key = ArchiveStagingKey::new(
+        ArchiveStagingOwner::GenerationJob(Uuid::now_v7()),
+        ArchiveStagingPurpose::Assets,
+        Uuid::now_v7(),
+    )
+    .unwrap();
+    let training_key = archive.select_staging_key(key).unwrap();
+    let locator = format!("{}/asset", training_key.canonical_prefix());
+    let wrong = locator.replacen(&"a".repeat(64), &"b".repeat(64), 1);
+    assert!(archive.start_writer(&wrong).await.is_err());
+    assert!(archive.put(&wrong, Bytes::new()).await.is_err());
+    for malformed in [
+        "stores/staging/",
+        "stores/staging/no-hash/staging/proxy/x/request/y",
+        "stores/staging/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/tenants/x",
+    ] {
+        assert!(archive.start_writer(malformed).await.is_err());
+    }
+    let mut writer = archive.start_writer(&locator).await.unwrap();
+    writer
+        .write(Bytes::from_static(b"must keep qualified locator"))
+        .await
+        .unwrap();
+    // Generic finish would publish a bare location on the wrong backend.
+    assert!(writer.finish().await.is_err());
 }

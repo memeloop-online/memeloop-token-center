@@ -29,10 +29,8 @@ impl ArchiveStore {
                 "archive CAS objects are immutable".into(),
             ));
         }
-        let location = archive_path(location)?;
-        self.inner
-            .put(&location, PutPayload::from_bytes(data))
-            .await?;
+        let (store, location) = self.resolve(location)?;
+        store.put(&location, PutPayload::from_bytes(data)).await?;
         Ok(())
     }
 
@@ -43,8 +41,12 @@ impl ArchiveStore {
     }
 
     pub async fn delete(&self, location: &str) -> Result<(), AppError> {
-        if location.starts_with(super::routing::PREFIX) {
-            return Err(AppError::storage("archive_cas_objects_are_immutable"));
+        if location.starts_with(super::routing::PREFIX)
+            || location.starts_with(super::routing::STAGING_PREFIX)
+        {
+            return Err(AppError::storage(
+                "archive_typed_objects_require_cleanup_capability",
+            ));
         }
         if is_any_v1_cas_location(location) || is_conversation_root_location(location) {
             return Err(AppError::BadRequest(

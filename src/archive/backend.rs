@@ -29,6 +29,13 @@ impl ArchiveStore {
         archive
     }
 
+    #[cfg(test)]
+    pub(crate) fn training_staging_memory_for_test() -> Self {
+        let mut archive = Self::training_memory_for_test();
+        archive.training_staging_writes = true;
+        archive
+    }
+
     pub async fn from_config(config: &Config) -> Result<Self, AppError> {
         config
             .s3_timeouts
@@ -132,7 +139,7 @@ impl ArchiveStore {
                 })
             })
             .transpose()?;
-        if config.training_cas_writes && training.is_none() {
+        if (config.training_cas_writes || config.training_staging_writes) && training.is_none() {
             return Err(AppError::storage("archive_training_backend_missing"));
         }
 
@@ -141,6 +148,7 @@ impl ArchiveStore {
             inner,
             training,
             training_cas_writes: config.training_cas_writes,
+            training_staging_writes: config.training_staging_writes,
             readiness: Arc::new(tokio::sync::Mutex::new(ReadinessCache::default())),
             readiness_path,
             readiness_deadline: Duration::from_millis(config.s3_timeouts.readiness_millis.into()),

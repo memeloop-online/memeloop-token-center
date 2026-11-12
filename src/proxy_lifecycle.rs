@@ -135,7 +135,7 @@ pub(crate) async fn begin_proxy_archive_attempt(
         }
     };
     Ok(ProxyArchiveAttempt {
-        object_locator: format!("{}/body", key.canonical_prefix()),
+        object_locator: format!("{}/body", lease.key.canonical_prefix()),
         lease,
     })
 }
