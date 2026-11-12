@@ -317,6 +317,30 @@ where
     let upstream_started = Instant::now();
     let request_body = super::codex::send_diagnostics::BodyConsumption::default();
     let mut egress_recorder = None;
+    let mut client_error_observed = false;
+    let observe_error = |error: Option<&reqwest::Error>| {
+        let evidence = send_error_evidence(error);
+        tracing::warn!(
+            %request_id,
+            upstream_account_id = %route.route.account_id,
+            route_id = %route.route.route_id,
+            credential_generation = route.route.credential_generation,
+            transport_revision = route.route.transport_revision,
+            outbound_attempt,
+            stage = "http_json_send_failure",
+            failure_phase = evidence.phase,
+            timeout_source = evidence.timeout_source,
+            io_error_kind = evidence.io_kind,
+            io_raw_os_error = evidence.io_raw_os_error,
+            hyper_timeout = evidence.hyper_timeout,
+            reqwest_timeout = error.is_some_and(reqwest::Error::is_timeout),
+            response_headers_received = false,
+            elapsed_ms = upstream_started.elapsed().as_millis() as u64,
+            configured_request_timeout_ms = timeout.map(|value| value.as_millis() as u64),
+            wire_delivery_state = "unknown",
+            "upstream send failed before response headers"
+        );
+    };
     let upstream_result = send_until_request_deadline(request_deadline, async {
         let (client, request) = request.build_split();
         let mut request = request?;
@@ -330,11 +354,24 @@ where
             request_body,
         );
         IndependentProbeTarget::dispatched(&route.route);
-        let response = client.execute(request).await?;
+        let response = client.execute(request).await.inspect_err(|error| {
+            client_error_observed = true;
+            observe_error(Some(error));
+        })?;
         IndependentProbeTarget::response(response.status());
         Ok(response)
     })
     .await;
+    if !client_error_observed
+        && matches!(
+            upstream_result,
+            Err(ProxySendError::NonRetryableTransport(
+                TransportFailureKind::Timeout
+            ))
+        )
+    {
+        observe_error(None);
+    }
     state.metrics.observe_upstream(
         &route.route.driver,
         "proxy",
@@ -423,6 +460,76 @@ where
             TransportFailureKind::Timeout,
         )),
         result = &mut send => result.map_err(classify_reqwest_send_error),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SendErrorEvidence {
+    phase: &'static str,
+    timeout_source: &'static str,
+    io_kind: &'static str,
+    io_raw_os_error: Option<i32>,
+    hyper_timeout: bool,
+}
+
+fn send_error_evidence(error: Option<&reqwest::Error>) -> SendErrorEvidence {
+    let mut evidence = SendErrorEvidence {
+        phase: "before_response_headers",
+        timeout_source: "account_request_deadline",
+        io_kind: "none",
+        io_raw_os_error: None,
+        hyper_timeout: false,
+    };
+    let Some(error) = error else {
+        return evidence;
+    };
+    evidence.phase = if error.is_connect() {
+        "connect"
+    } else if error.is_body() {
+        "request_body"
+    } else {
+        // An unconsumed response head cannot prove whether sending or reading
+        // stalled. Body polling is not acknowledgement by the upstream.
+        "before_response_headers"
+    };
+    evidence.timeout_source = if error.is_timeout() {
+        "http_client_timeout_unresolved"
+    } else {
+        "not_timeout"
+    };
+    observe_error_sources(error, &mut evidence);
+    evidence
+}
+
+fn observe_error_sources(
+    error: &(dyn std::error::Error + 'static),
+    evidence: &mut SendErrorEvidence,
+) {
+    let mut source = Some(error);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<hyper::Error>() {
+            evidence.hyper_timeout |= error.is_timeout();
+        }
+        if let Some(error) = error.downcast_ref::<std::io::Error>() {
+            evidence.io_kind = match error.kind() {
+                std::io::ErrorKind::TimedOut => "timed_out",
+                std::io::ErrorKind::ConnectionReset => "connection_reset",
+                std::io::ErrorKind::ConnectionAborted => "connection_aborted",
+                std::io::ErrorKind::ConnectionRefused => "connection_refused",
+                std::io::ErrorKind::BrokenPipe => "broken_pipe",
+                std::io::ErrorKind::NotConnected => "not_connected",
+                std::io::ErrorKind::UnexpectedEof => "unexpected_eof",
+                _ => "other",
+            };
+            evidence.io_raw_os_error = error.raw_os_error();
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                evidence.timeout_source = "io_timeout";
+            }
+        }
+        source = error.source();
+    }
+    if evidence.hyper_timeout && evidence.timeout_source == "http_client_timeout_unresolved" {
+        evidence.timeout_source = "hyper_timeout";
     }
 }
 
@@ -672,6 +779,56 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn transport_timeout_evidence_distinguishes_local_deadline_from_io_without_error_text() {
+        let deadline = send_error_evidence(None);
+        assert_eq!(deadline.timeout_source, "account_request_deadline");
+        assert_eq!(deadline.phase, "before_response_headers");
+        let mut io = deadline;
+        let error = std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "sensitive upstream URL and authorization must never enter diagnostics",
+        );
+        observe_error_sources(&error, &mut io);
+        assert_eq!(io.timeout_source, "io_timeout");
+        assert_eq!(io.io_kind, "timed_out");
+        assert_eq!(io.io_raw_os_error, None);
+        assert!(!format!("{io:?}").contains("sensitive"));
+    }
+
+    #[tokio::test]
+    async fn real_http_client_timeout_retains_before_headers_phase_without_url_or_replay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            // Keep the accepted socket alive without producing response headers.
+            std::future::pending::<()>().await;
+            drop(socket);
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let error = client
+            .get(format!("http://{address}/?token=diagnostic-secret"))
+            .send()
+            .await
+            .unwrap_err();
+        let evidence = send_error_evidence(Some(&error));
+        assert_eq!(evidence.phase, "before_response_headers");
+        assert_eq!(evidence.timeout_source, "http_client_timeout_unresolved");
+        assert_eq!(evidence.io_kind, "none");
+        assert!(!format!("{evidence:?}").contains("diagnostic-secret"));
+        assert!(matches!(
+            classify_reqwest_send_error(error),
+            ProxySendError::NonRetryableTransport(TransportFailureKind::Timeout)
+        ));
+        server.abort();
+        let _ = server.await;
+    }
 
     #[test]
     fn generic_group_connection_failure_keeps_the_sticky_exit() {
